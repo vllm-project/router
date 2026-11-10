@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use uuid::Uuid;
 
+mod grpc;
+pub(super) use grpc::EncoderStageFailure;
+
 type EpdError = (StatusCode, String);
 
 struct MediaItem {

@@ -324,7 +324,7 @@ pub(crate) async fn load_boundary_matcher(model: &str) -> Result<BoundaryMatcher
 /// Added tokens as vllm-tokenizer sees them, after config checks.
 pub(crate) async fn load_added_tokens(model: &str) -> Result<AddedTokenSet> {
     let files = ResolvedModelFiles::new(model, None).await?;
-    let TokenizerSource::HuggingFace(path) = files.tokenizer else {
+    let Some(TokenizerSource::HuggingFace(path)) = files.tokenizer else {
         bail!("L1 supports tokenizer.json models only");
     };
     let json: Value = serde_json::from_slice(&std::fs::read(&path)?)

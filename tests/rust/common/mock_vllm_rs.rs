@@ -404,6 +404,7 @@ macro_rules! mock_control {
 }
 
 mock_control! {
+    shutdown(ShutdownRequest) -> ShutdownResponse;
     load_lora(LoadLoraRequest) -> LoadLoraResponse;
     unload_lora(UnloadLoraRequest) -> UnloadLoraResponse;
     list_loras(ListLorasRequest) -> ListLorasResponse;

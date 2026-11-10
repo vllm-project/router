@@ -6,8 +6,9 @@ use vllm_text::backend::hf::{ResolvedModelFiles, TokenizerSource};
 pub(crate) async fn deterministic_model(model: &str) -> Result<bool> {
     let files = ResolvedModelFiles::new(model, None).await?;
     match files.tokenizer {
-        TokenizerSource::Tiktoken(_) | TokenizerSource::Tekken(_) => Ok(true),
-        TokenizerSource::HuggingFace(path) => {
+        Some(TokenizerSource::Tiktoken(_) | TokenizerSource::Tekken(_)) => Ok(true),
+        None => Ok(false),
+        Some(TokenizerSource::HuggingFace(path)) => {
             let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
             Ok(deterministic_hf_model(&json["model"]))
         }

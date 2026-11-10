@@ -250,7 +250,9 @@ mod tests {
         fn encode(&self, text: &str, special: bool) -> vllm_tokenizer::Result<Vec<u32>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if text == "fail" {
-                return Err(TokenizerError("test failure".into()));
+                return Err(TokenizerError::Backend {
+                    message: "test failure".into(),
+                });
             }
             let mut ids = self.inner.encode(text, special)?;
             ids.extend([self.suffix, u32::from(special)]);

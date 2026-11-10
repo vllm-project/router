@@ -1610,13 +1610,34 @@ impl VllmPDRouter {
         };
         // Tokenize before admission so kv_aware and cache_aware score the
         // exact ids P will prefill.
-        let prepared = match self.grpc_frontend.prepare(body.clone()).await {
+        let prepared = if self.epd.is_some() {
+            self.grpc_frontend.prepare_with_media(body.clone()).await
+        } else {
+            self.grpc_frontend.prepare(body.clone()).await
+        };
+        let mut prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 return (prepare_error_status(&error), error.to_string()).into_response();
             }
         };
-        let router_prompts: Arc<[Vec<u32>]> = Arc::from([prepared.tokenized.token_ids.to_vec()]);
+        // Experimental gRPC E→P→D: encode before admission, so the pair is
+        // scored on P's expanded prompt. Mooncake pushes to P's address, so
+        // it encodes once the pair is chosen and routes on the marker prompt.
+        if let Some(epd) = self
+            .epd
+            .as_ref()
+            .filter(|epd| !epd.encodes_after_selection())
+        {
+            if let Err(error) = epd
+                .prepare_grpc(&self.grpc_frontend, &mut prepared, "", headers)
+                .await
+            {
+                RouterMetrics::record_request_error(path, "encoder_error");
+                return error.into_response();
+            }
+        }
+        let router_prompts: Arc<[Vec<u32>]> = Arc::from([prepared.routing_token_ids().to_vec()]);
         let Some((selection, attempt)) = self
             .admit_pair_with_tokens(
                 &prefill_workers,
@@ -1641,8 +1662,36 @@ impl VllmPDRouter {
             decode_worker.url(),
             self.policy_registry.get_decode_policy().name()
         );
+        let mut ec_transfers = None;
+        if let Some(epd) = &self.epd {
+            match epd
+                .prepare_grpc(
+                    &self.grpc_frontend,
+                    &mut prepared,
+                    prefill_worker.url(),
+                    headers,
+                )
+                .await
+            {
+                Ok(guard) => ec_transfers = guard,
+                Err(error) => {
+                    RouterMetrics::record_request_error(path, "encoder_error");
+                    let mut response = error.into_response();
+                    response
+                        .extensions_mut()
+                        .insert(super::epd::EncoderStageFailure);
+                    return attempt.track_response(response);
+                }
+            }
+        }
         let response = self
-            .process_grpc_two_stage_chat(prepared, prefill_worker, decode_worker, &attempt)
+            .process_grpc_two_stage_chat(
+                prepared,
+                prefill_worker,
+                decode_worker,
+                ec_transfers,
+                &attempt,
+            )
             .await;
         attempt.track_response(response)
     }
@@ -2024,12 +2073,14 @@ impl VllmPDRouter {
     /// HTTP path; it travels in `GenerateRequest.kv.kv_transfer_params` and
     /// comes back in `FinishInfo.kv_transfer_params`. P finishes before D
     /// starts, except in NIXL push mode once P's push identity is cached.
-    /// Admission already reserved both legs in `attempt`.
+    /// Admission already reserved both legs in `attempt`. `ec_transfers`
+    /// cancels Mooncake EC pushes unless P succeeds.
     async fn process_grpc_two_stage_chat(
         &self,
         prepared: crate::backend::PreparedRequest,
         prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>,
+        mut ec_transfers: Option<super::epd::EcTransferGuard>,
         attempt: &PdAttempt,
     ) -> Response {
         let path = "/v1/chat/completions";
@@ -2068,6 +2119,7 @@ impl VllmPDRouter {
                         prefill_params,
                         decode_params,
                         start_time,
+                        ec_transfers,
                         attempt,
                     )
                     .await;
@@ -2094,6 +2146,9 @@ impl VllmPDRouter {
                 return response;
             }
         };
+        if let Some(transfers) = ec_transfers.as_mut() {
+            transfers.disarm();
+        }
         // Same shape as an HTTP prefill body, so the connector helpers apply.
         let prefill_response_json = match prefill_kv {
             Some(kv) => json!({ "kv_transfer_params": kv }),
@@ -2120,7 +2175,12 @@ impl VllmPDRouter {
         attempt.begin_decode();
         let response = self
             .grpc_frontend
-            .dispatch_decode(decode_worker.url(), prepared, request_id, decode_params)
+            .dispatch_decode(
+                decode_worker.url(),
+                prepared.for_decode(),
+                request_id,
+                decode_params,
+            )
             .await;
         let decode_outcome = grpc_decode_outcome(&response);
         let response = own_grpc_decode(response, attempt);
@@ -2150,6 +2210,7 @@ impl VllmPDRouter {
         prefill_params: Value,
         decode_params: Value,
         start_time: Instant,
+        mut ec_transfers: Option<super::epd::EcTransferGuard>,
         attempt: &PdAttempt,
     ) -> Response {
         let path = "/v1/chat/completions";
@@ -2181,7 +2242,7 @@ impl VllmPDRouter {
                 .grpc_frontend
                 .dispatch_decode(
                     decode_worker.url(),
-                    prepared.clone(),
+                    prepared.clone().for_decode(),
                     request_id,
                     Some(decode_params),
                 )
@@ -2233,6 +2294,9 @@ impl VllmPDRouter {
                 }
             }
         };
+        if let Some(transfers) = ec_transfers.as_mut() {
+            transfers.disarm();
+        }
         if let Some(kv) = prefill_kv {
             self.maybe_cache_nixl_push_identity(
                 &prefill_base_url,
