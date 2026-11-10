@@ -907,15 +907,34 @@ impl VllmPDRouter {
         request
     }
 
-    async fn discovery_candidates(
+    async fn discovered_workers(&self, service_type: ServiceType) -> Vec<Arc<dyn Worker>> {
+        let instances = self
+            .service_registry
+            .get_routing_snapshots(
+                service_type.clone(),
+                &self.pd_router.config,
+                &self.pd_router.client,
+            )
+            .await;
+        self.discovery_candidates(instances, service_type)
+    }
+
+    async fn discovery_pools(&self) -> (Vec<Arc<dyn Worker>>, Vec<Arc<dyn Worker>>) {
+        tokio::join!(
+            self.discovered_workers(ServiceType::Prefill),
+            self.discovered_workers(ServiceType::Decode)
+        )
+    }
+
+    fn discovery_candidates(
         &self,
-        instances: Vec<(String, String, Option<usize>)>,
+        instances: Vec<(String, String, usize)>,
         service_type: ServiceType,
     ) -> Vec<Arc<dyn Worker>> {
         let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
-        for (address, _, _) in instances {
+        for (address, _, dp_size) in instances {
             let (base, rank) = dp_utils::parse_worker_url(&address);
-            let url = if base.starts_with("http://") || base.starts_with("https://") {
+            let url = if base.contains("://") {
                 base.clone()
             } else {
                 format!("http://{base}")
@@ -926,13 +945,6 @@ impl VllmPDRouter {
                 },
                 ServiceType::Decode => WorkerType::Decode,
             };
-            let dp_size = PdRouterBase::discover_worker_dp_size(
-                &self.pd_router.config,
-                &self.pd_router.client,
-                &url,
-                &role,
-            )
-            .await;
             let ranks = dp_utils::expand_dp_ranks(rank, dp_size);
             for rank in ranks {
                 let worker: Arc<dyn Worker> = match rank {
@@ -1127,15 +1139,11 @@ impl VllmPDRouter {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let decode_targets = if self.use_discovery {
-            self.discovery_candidates(
-                self.service_registry
-                    .get_instance_snapshots(ServiceType::Decode),
-                ServiceType::Decode,
-            )
-            .await
-            .iter()
-            .map(pd_program_adapter::worker_target)
-            .collect::<Vec<_>>()
+            self.discovered_workers(ServiceType::Decode)
+                .await
+                .iter()
+                .map(pd_program_adapter::worker_target)
+                .collect::<Vec<_>>()
         } else {
             self.pd_router
                 .worker_registry
@@ -1283,11 +1291,7 @@ impl VllmPDRouter {
     async fn program_decode_worker(&self, target_id: &str) -> Option<Arc<dyn Worker>> {
         if self.use_discovery {
             return self
-                .discovery_candidates(
-                    self.service_registry
-                        .get_instance_snapshots(ServiceType::Decode),
-                    ServiceType::Decode,
-                )
+                .discovered_workers(ServiceType::Decode)
                 .await
                 .into_iter()
                 .find(|worker| pd_program_adapter::worker_target(worker).id == target_id);
@@ -1309,13 +1313,15 @@ impl VllmPDRouter {
             let mut candidates = Vec::new();
             for snapshot in self
                 .service_registry
-                .get_instance_snapshots(ServiceType::Prefill)
+                .get_routing_snapshots(
+                    ServiceType::Prefill,
+                    &self.pd_router.config,
+                    &self.pd_router.client,
+                )
+                .await
             {
                 let id = pd_program_adapter::discovered_target(&snapshot.0).id;
-                for worker in self
-                    .discovery_candidates(vec![snapshot], ServiceType::Prefill)
-                    .await
-                {
+                for worker in self.discovery_candidates(vec![snapshot], ServiceType::Prefill) {
                     candidates.push((id.clone(), worker));
                 }
             }
@@ -1412,20 +1418,7 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>, PdAttempt)> {
-        let prefill_workers = self
-            .discovery_candidates(
-                self.service_registry
-                    .get_instance_snapshots(ServiceType::Prefill),
-                ServiceType::Prefill,
-            )
-            .await;
-        let decode_workers = self
-            .discovery_candidates(
-                self.service_registry
-                    .get_instance_snapshots(ServiceType::Decode),
-                ServiceType::Decode,
-            )
-            .await;
+        let (prefill_workers, decode_workers) = self.discovery_pools().await;
         let (selection, attempt) = self
             .admit_pair(
                 &prefill_workers,
@@ -2806,20 +2799,7 @@ impl RouterTrait for VllmPDRouter {
             // pair from the discovered instances and run it through the same
             // admission path as real traffic, so health checks cannot select
             // by different rules (or fail outright on the empty registry).
-            let prefill_workers = self
-                .discovery_candidates(
-                    self.service_registry
-                        .get_instance_snapshots(ServiceType::Prefill),
-                    ServiceType::Prefill,
-                )
-                .await;
-            let decode_workers = self
-                .discovery_candidates(
-                    self.service_registry
-                        .get_instance_snapshots(ServiceType::Decode),
-                    ServiceType::Decode,
-                )
-                .await;
+            let (prefill_workers, decode_workers) = self.discovery_pools().await;
             return self
                 .pd_router
                 .health_generate_for_workers(&prefill_workers, &decode_workers)

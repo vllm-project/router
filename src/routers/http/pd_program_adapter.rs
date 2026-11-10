@@ -1,11 +1,10 @@
 //! Opt-in, one-way PD Program scheduling and response-lifetime settlement.
 use super::dp_utils;
-use super::pd_router::PdRouterBase;
 use super::pd_warm_remote::{PdResponseContext, PdWarmRemoteRuntime};
 use super::program_adapter::ProgramCompletion;
-use super::vllm_service_discovery::ServiceRegistry;
+use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
 use crate::config::RouterConfig;
-use crate::core::{Worker, WorkerRegistry, WorkerType};
+use crate::core::{Worker, WorkerRegistry};
 use crate::kv_index::{HashMode, KvIndexSupervisor};
 use crate::program_scheduling::{
     max_prometheus_gauge, sum_prometheus_gauge, BackendObservationProvider, ProgramIdentity,
@@ -480,7 +479,7 @@ pub(super) fn worker_target(worker: &Arc<dyn Worker>) -> ProgramTarget {
 }
 
 pub(super) fn discovered_target(address: &str) -> ProgramTarget {
-    let url = if address.starts_with("http://") || address.starts_with("https://") {
+    let url = if address.contains("://") {
         address.to_string()
     } else {
         format!("http://{address}")
@@ -502,15 +501,11 @@ async fn decode_targets(
 ) -> Vec<ProgramTarget> {
     if discovery {
         let mut targets = Vec::new();
-        for (address, _) in services.get_decode_instances() {
+        for (address, _, size) in services
+            .get_routing_snapshots(ServiceType::Decode, config, client)
+            .await
+        {
             let endpoint = discovered_target(&address);
-            let size = PdRouterBase::discover_worker_dp_size(
-                config,
-                client,
-                &endpoint.base_url,
-                &WorkerType::Decode,
-            )
-            .await;
             for rank in dp_utils::expand_dp_ranks(endpoint.dp_rank, size) {
                 targets.push(ProgramTarget {
                     id: match rank {

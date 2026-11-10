@@ -170,6 +170,24 @@ legacy size 4 with only `--decode-data-parallel-size 2` gives Prefill 4 / Decode
 in the fallback path. The new sizes must be positive. Python exposes the same
 options as `prefill_data_parallel_size` and `decode_data_parallel_size`.
 
+ZMQ discovery caches each endpoint's engine count for the lifetime of its live
+registration. Native requests, health generation, and Program scheduling share
+this result. If metrics are unavailable, requests temporarily use the configured
+local fallback; the next request after five seconds retries discovery. Initial
+probes run concurrently, and concurrent requests share the same probe. Heartbeats
+keep the discovery state; a changed sender, transfer address, TP/DP topology, or
+expired registration causes discovery to run again. Results from superseded
+registrations are discarded.
+
+MoRI-IO registrations report the **global** transfer DP size. The router still
+checks endpoint metrics to distinguish this from the engines reachable at one
+HTTP endpoint. If metrics are unavailable, the role size or legacy shared size
+supplies the local fallback. The reported global DP never overrides either local
+configuration. The raw global topology remains separate from the cached HTTP
+count for WRITE validation and READ metadata forwarding. Multi-pod deployments
+need endpoint metrics or correct local sizes; registration alone cannot establish
+their local engine count.
+
 Static URLs, Kubernetes worker additions, and ZMQ discovery expand each endpoint
 using its own engine count. An explicit `@rank` URL remains one pinned worker.
 Prefill and Decode ranks follow their respective routing policies; Decode never

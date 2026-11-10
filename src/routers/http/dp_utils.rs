@@ -34,9 +34,21 @@ pub async fn discover_dp_size(
     fallback_dp_size: usize,
 ) -> usize {
     let fallback_dp_size = fallback_dp_size.max(1);
+    probe_dp_size(client, worker_url).await.unwrap_or_else(|| {
+        info!(
+            "Worker {} reports no engine metrics; assuming {} engine(s)",
+            worker_url, fallback_dp_size
+        );
+        fallback_dp_size
+    })
+}
+
+/// Return only an engine count confirmed by metrics. A fallback is not evidence
+/// of the endpoint's topology and must not be cached as a successful discovery.
+pub(super) async fn probe_dp_size(client: &reqwest::Client, worker_url: &str) -> Option<usize> {
     let (base_url, _) = parse_worker_url(worker_url);
     if crate::backend::is_grpc_url(&base_url) {
-        return fallback_dp_size;
+        return None;
     }
     // /metrics sits outside vLLM's authenticated path prefixes.
     let metrics_url = format!("{}/metrics", base_url.trim_end_matches('/'));
@@ -57,19 +69,11 @@ pub async fn discover_dp_size(
         }
     };
 
-    match body.as_deref().and_then(count_engine_labels) {
-        Some(dp_size) => {
-            info!("Worker {} reports {} engine(s)", base_url, dp_size);
-            dp_size
-        }
-        None => {
-            info!(
-                "Worker {} reports no engine metrics; assuming {} engine(s)",
-                base_url, fallback_dp_size
-            );
-            fallback_dp_size
-        }
+    let dp_size = body.as_deref().and_then(count_engine_labels);
+    if let Some(dp_size) = dp_size {
+        info!("Worker {} reports {} engine(s)", base_url, dp_size);
     }
+    dp_size
 }
 
 /// Given a list of worker URLs, expand them into DP-aware URLs
