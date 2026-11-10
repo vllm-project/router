@@ -20,6 +20,9 @@ pub struct RouterConfig {
     /// Workers listed here skip HTTP control-plane discovery and probing.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pd_kv_event_sources: HashMap<String, PdKvEventSources>,
+    /// Opt in to hiding KV placement until a complete authoritative recovery.
+    #[serde(default)]
+    pub kv_event_strict_recovery: bool,
     /// Worker connection mode
     #[serde(default)]
     pub connection_mode: ConnectionMode,
@@ -1300,6 +1303,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             pd_kv_event_sources: HashMap::new(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3001,
@@ -1456,6 +1460,27 @@ mod tests {
         // Other fields should be default
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 3001);
+    }
+
+    #[test]
+    fn strict_recovery_is_explicit_and_old_configs_default_to_compatibility() {
+        let mut config = RouterConfig::default();
+        assert!(!config.kv_event_strict_recovery);
+        config.kv_event_strict_recovery = true;
+        let mut json = serde_json::to_value(&config).unwrap();
+        assert!(
+            serde_json::from_value::<RouterConfig>(json.clone())
+                .unwrap()
+                .kv_event_strict_recovery
+        );
+        json.as_object_mut()
+            .unwrap()
+            .remove("kv_event_strict_recovery");
+        assert!(
+            !serde_json::from_value::<RouterConfig>(json)
+                .unwrap()
+                .kv_event_strict_recovery
+        );
     }
 
     #[test]
@@ -2080,6 +2105,7 @@ mod tests {
                 discovery_address: None,
             },
             pd_kv_event_sources: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 30,
             },
@@ -2146,6 +2172,7 @@ mod tests {
                 ],
             },
             pd_kv_event_sources: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::CacheAware {
                 cache_threshold: 0.9,
                 balance_abs_threshold: 5,
@@ -2213,6 +2240,7 @@ mod tests {
                 worker_urls: vec!["http://worker1".to_string()],
             },
             pd_kv_event_sources: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::RoundRobin,
             host: "::1".to_string(), // IPv6
             port: 8888,

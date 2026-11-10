@@ -129,13 +129,13 @@ pub enum ClearScope {
 
 /// Trust state for one independently addressed KV event source.
 ///
-/// Placement credit is available only in `Exact`. The other states preserve
-/// worker availability while withholding evidence that lacks an authoritative
-/// recovery boundary.
+/// `Observed` is compatibility-mode credit for fresh observations, not a claim
+/// that the publisher's complete history has been reconstructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SourceRecoveryState {
     Cold,
     Exact,
+    Observed,
     Degraded,
     Fallback,
 }
@@ -145,6 +145,7 @@ impl SourceRecoveryState {
         match self {
             Self::Cold => "cold",
             Self::Exact => "exact",
+            Self::Observed => "observed",
             Self::Degraded => "degraded",
             Self::Fallback => "fallback",
         }
@@ -165,6 +166,7 @@ pub(crate) enum SourceRecoveryReason {
     RankScopeChanged,
     ValidationFailed,
     ClearBarrier,
+    FreshObservation,
 }
 
 impl SourceRecoveryReason {
@@ -181,6 +183,7 @@ impl SourceRecoveryReason {
             Self::RankScopeChanged => "rank_scope_changed",
             Self::ValidationFailed => "validation_failed",
             Self::ClearBarrier => "clear_barrier",
+            Self::FreshObservation => "fresh_observation",
         }
     }
 }

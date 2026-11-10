@@ -35,6 +35,7 @@ class RouterArgs:
     kv_event_replay_source: List[str] = dataclasses.field(default_factory=list)
     kv_event_block_size: int = 16
     kv_event_model: Optional[str] = None
+    kv_event_strict_recovery: bool = False
     worker_startup_timeout_secs: int = 600
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
@@ -264,6 +265,11 @@ class RouterArgs:
             help="Shared model identity for workers with static event sources",
         )
         # PD-specific arguments
+        parser.add_argument(
+            f"--{prefix}kv-event-strict-recovery",
+            action="store_true",
+            help="Require authoritative full KV event recovery before restoring credit",
+        )
         parser.add_argument(
             f"--{prefix}pd-kv-events",
             action="append",

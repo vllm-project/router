@@ -339,6 +339,7 @@ impl Router {
                     crate::kv_index::HashMode::Sha256,
                 );
             supervisor.set_api_key(ctx.router_config.api_key.clone());
+            supervisor.set_strict_recovery(ctx.router_config.kv_event_strict_recovery);
             let static_sources = match &ctx.router_config.policy {
                 crate::config::PolicyConfig::KvAware {
                     static_kv_event_sources,
@@ -6672,6 +6673,7 @@ mod tests {
                 async move {
                     let body = if fail_body {
                         Body::from_stream(futures_util::stream::once(async {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                             Err::<bytes::Bytes, _>(std::io::Error::other("broken backend body"))
                         }))
                     } else {

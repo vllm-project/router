@@ -105,6 +105,7 @@ pub struct KvIndexSupervisor {
     api_key: Option<String>,
     hash_mode: HashMode,
     full_attention_http: bool,
+    strict_recovery: bool,
     http_pd: bool,
     /// Explicit event sources override discovery for configured regular workers.
     static_sources: HashMap<String, StaticKvEventSources>,
@@ -148,6 +149,7 @@ impl KvIndexSupervisor {
             api_key: None,
             hash_mode,
             full_attention_http: false,
+            strict_recovery: false,
             http_pd: false,
             static_sources: HashMap::new(),
             static_pd_sources: HashMap::new(),
@@ -195,6 +197,10 @@ impl KvIndexSupervisor {
 
     pub fn hash_mode(&self) -> HashMode {
         self.hash_mode
+    }
+
+    pub(crate) fn set_strict_recovery(&mut self, enabled: bool) {
+        self.strict_recovery = enabled;
     }
 
     pub(crate) fn set_api_key(&mut self, api_key: Option<String>) {
@@ -387,6 +393,7 @@ impl KvIndexSupervisor {
                 replay_endpoint,
                 topic: entry.topic.clone(),
                 hwm: entry.hwm,
+                strict_recovery: self.strict_recovery,
             };
             event_sources.push(ev);
         }
@@ -498,13 +505,16 @@ impl KvIndexSupervisor {
                 },
             });
         }
+        // Retire/forget must finish before replacement registration: source IDs
+        // are reused and late cleanup must never erase the replacement.
         if let Some(previous) = workers.remove(worker_url) {
             self.retire_worker(previous);
         }
         let indexer = self.acquire_identity(&key);
         let mut ranks = Vec::with_capacity(event_sources.len());
         let mut handles = Vec::with_capacity(event_sources.len());
-        for (ev, live) in event_sources.into_iter().zip(&live_sources) {
+        for (mut ev, live) in event_sources.into_iter().zip(&live_sources) {
+            ev.strict_recovery = self.strict_recovery;
             let rank = ev.dp_rank;
             let handle = crate::kv_index::subscriber::spawn_bound(
                 ev,
@@ -2187,6 +2197,7 @@ mod tests {
                     replay_endpoint: None,
                     topic: "kv/independent".into(),
                     hwm: None,
+                    strict_recovery: true,
                 },
                 indexer,
                 Some(neighbor_tx),
@@ -2405,6 +2416,7 @@ mod tests {
                     replay_endpoint: None,
                     topic: topic.into(),
                     hwm: None,
+                    strict_recovery: true,
                 },
                 indexer.clone(),
                 Some(tx),

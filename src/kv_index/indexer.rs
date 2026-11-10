@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use dashmap::{mapref::entry::Entry, DashMap};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::kv_index::types::{
     ClearScope, Locality, ResidencyOwner, RoutableTarget, SourceId, SourceRecoveryReason,
@@ -498,7 +498,8 @@ pub struct KvBlockIndexer {
     // ponytail: group_idx is None on the wire → 0; single-spec models have one
     // group and multi-spec always emits group_idx, so 0 is a safe default.
     shards: DashMap<u32, Arc<GroupShard>>,
-    suspended_sources: DashMap<(SourceId, u32), ()>,
+    source_mutations: Mutex<()>,
+    recovery_attempt: AtomicU64,
     source_states: DashMap<(SourceId, u32), SourceRecoveryRecord>,
     /// Reject query snapshots crossing an invalidation/resume boundary.
     source_generation: AtomicU64,
@@ -508,13 +509,16 @@ pub struct KvBlockIndexer {
 struct SourceRecoveryRecord {
     status: SourceRecoveryStatus,
     recovery_started: Option<Instant>,
+    attempt: u64,
+    replay_exact: bool,
 }
 
 impl KvBlockIndexer {
     pub fn new() -> Self {
         KvBlockIndexer {
             shards: DashMap::new(),
-            suspended_sources: DashMap::new(),
+            source_mutations: Mutex::new(()),
+            recovery_attempt: AtomicU64::new(0),
             source_states: DashMap::new(),
             source_generation: AtomicU64::new(0),
         }
@@ -524,14 +528,14 @@ impl KvBlockIndexer {
     /// Cold sources remain hidden until the subscriber establishes an
     /// authoritative sequence or clear boundary.
     pub(crate) fn register_source(&self, source: &SourceId, dp_rank: u32) {
+        let _guard = self.source_mutations.lock();
+        debug_assert!(!self.source_states.contains_key(&(source.clone(), dp_rank)));
         self.transition_source(
             source,
             dp_rank,
             SourceRecoveryState::Cold,
             SourceRecoveryReason::Registered,
         );
-        self.suspended_sources.insert((source.clone(), dp_rank), ());
-        self.source_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     fn transition_source(
@@ -547,13 +551,10 @@ impl KvBlockIndexer {
         let (previous, recovery_duration) = match self.source_states.entry(key) {
             Entry::Occupied(mut entry) => {
                 let previous = *entry.get();
-                if previous.status == status
-                    || (previous.status.state == SourceRecoveryState::Exact
-                        && state == SourceRecoveryState::Exact)
-                {
+                if previous.status == status {
                     return;
                 }
-                let recovery_duration = if state == SourceRecoveryState::Exact {
+                let recovery_duration = if Self::visible_state(state) {
                     previous
                         .recovery_started
                         .map(|started| now.saturating_duration_since(started))
@@ -564,11 +565,15 @@ impl KvBlockIndexer {
                     SourceRecoveryState::Degraded | SourceRecoveryState::Fallback => {
                         previous.recovery_started.or(Some(now))
                     }
-                    SourceRecoveryState::Cold | SourceRecoveryState::Exact => None,
+                    SourceRecoveryState::Cold
+                    | SourceRecoveryState::Exact
+                    | SourceRecoveryState::Observed => None,
                 };
                 entry.insert(SourceRecoveryRecord {
                     status,
                     recovery_started,
+                    attempt: self.recovery_attempt.fetch_add(1, Ordering::Relaxed),
+                    replay_exact: false,
                 });
                 (Some(previous.status), recovery_duration)
             }
@@ -581,10 +586,16 @@ impl KvBlockIndexer {
                 entry.insert(SourceRecoveryRecord {
                     status,
                     recovery_started,
+                    attempt: self.recovery_attempt.fetch_add(1, Ordering::Relaxed),
+                    replay_exact: false,
                 });
                 (None, None)
             }
         };
+        tracing::debug!(source = %source, rank = dp_rank,
+            from = previous.map_or("unregistered", |status| status.state.as_str()),
+            to = state.as_str(), reason = reason.as_str(),
+            "kv_index source recovery transition");
         RouterMetrics::record_kv_source_recovery_transition(
             source,
             dp_rank,
@@ -639,23 +650,66 @@ impl KvBlockIndexer {
 
     /// Hide a source's observations while contiguous replay repairs its state.
     /// Correctness does not depend on delivery of advisory ingestion signals.
-    pub fn suspend_source(&self, source: &SourceId, dp_rank: u32) {
+    #[cfg(test)]
+    pub(super) fn suspend_source(&self, source: &SourceId, dp_rank: u32) {
         self.suspend_source_for(source, dp_rank, SourceRecoveryReason::SequenceGap);
     }
 
-    pub(crate) fn suspend_source_for(
+    #[cfg(test)]
+    pub(super) fn suspend_source_for(
         &self,
         source: &SourceId,
         dp_rank: u32,
         reason: SourceRecoveryReason,
-    ) {
+    ) -> u64 {
+        let _guard = self.source_mutations.lock();
+        self.suspend_source_locked(source, dp_rank, reason, true)
+    }
+
+    fn suspend_source_locked(
+        &self,
+        source: &SourceId,
+        dp_rank: u32,
+        reason: SourceRecoveryReason,
+        replay_exact: bool,
+    ) -> u64 {
         self.transition_source(source, dp_rank, SourceRecoveryState::Degraded, reason);
-        self.suspended_sources.insert((source.clone(), dp_rank), ());
         self.source_generation.fetch_add(1, Ordering::AcqRel);
+        let attempt = self.recovery_attempt.fetch_add(1, Ordering::Relaxed);
+        let mut record = self
+            .source_states
+            .get_mut(&(source.clone(), dp_rank))
+            .unwrap();
+        record.attempt = attempt;
+        record.replay_exact = replay_exact;
+        attempt
+    }
+
+    pub(crate) fn begin_replay(
+        &self,
+        source: &SourceId,
+        dp_rank: u32,
+        last_seq: i64,
+        strict: bool,
+    ) -> (i64, u64) {
+        let _guard = self.source_mutations.lock();
+        let exact = self
+            .source_states
+            .get(&(source.clone(), dp_rank))
+            .is_some_and(|record| record.status.state == SourceRecoveryState::Exact);
+        let start = if strict && !exact { -1 } else { last_seq };
+        let attempt = self.suspend_source_locked(
+            source,
+            dp_rank,
+            SourceRecoveryReason::SequenceGap,
+            start == -1 || exact,
+        );
+        (start, attempt)
     }
 
     /// Stop crediting a lossy source and discard all its old observations.
-    pub fn invalidate_source(&self, source: &SourceId, dp_rank: u32) {
+    #[cfg(test)]
+    pub(super) fn invalidate_source(&self, source: &SourceId, dp_rank: u32) {
         self.invalidate_source_for(source, dp_rank, SourceRecoveryReason::ValidationFailed);
     }
 
@@ -665,8 +719,17 @@ impl KvBlockIndexer {
         dp_rank: u32,
         reason: SourceRecoveryReason,
     ) {
+        let _guard = self.source_mutations.lock();
+        self.invalidate_source_locked(source, dp_rank, reason);
+    }
+
+    fn invalidate_source_locked(
+        &self,
+        source: &SourceId,
+        dp_rank: u32,
+        reason: SourceRecoveryReason,
+    ) {
         self.transition_source(source, dp_rank, SourceRecoveryState::Fallback, reason);
-        self.suspended_sources.insert((source.clone(), dp_rank), ());
         self.source_generation.fetch_add(1, Ordering::AcqRel);
         let shards: Vec<Arc<GroupShard>> = self.shards.iter().map(|e| e.value().clone()).collect();
         for shard in shards {
@@ -674,43 +737,73 @@ impl KvBlockIndexer {
         }
     }
 
-    /// A cleared or not-yet-established source has no trustworthy incremental
-    /// replay boundary. Recovery must rebuild from the beginning of the stream.
-    pub(crate) fn requires_full_replay(&self, source: &SourceId, dp_rank: u32) -> bool {
-        self.source_states
-            .get(&(source.clone(), dp_rank))
-            .is_none_or(|record| {
-                matches!(
-                    record.status.state,
-                    SourceRecoveryState::Cold | SourceRecoveryState::Fallback
-                )
-            })
-    }
-
-    /// Commit replay only while the source is still in the recovery attempt
-    /// that authorized it. Bound subscribers call this under their source
-    /// lease, so an external invalidation cannot race the check and resume.
-    pub(crate) fn resume_replay_if_current(&self, source: &SourceId, dp_rank: u32) -> bool {
-        let current = self
-            .source_states
-            .get(&(source.clone(), dp_rank))
-            .map(|record| record.status);
-        if current
-            != Some(SourceRecoveryStatus {
-                state: SourceRecoveryState::Degraded,
-                reason: SourceRecoveryReason::SequenceGap,
-            })
-        {
+    /// Finish only the recovery attempt that authorized this replay. The
+    /// internal mutation lock fences check/transition even without a caller lease.
+    pub(crate) fn finish_replay_if_current(
+        &self,
+        source: &SourceId,
+        dp_rank: u32,
+        attempt: u64,
+        failure: Option<SourceRecoveryReason>,
+    ) -> bool {
+        let _guard = self.source_mutations.lock();
+        let current = self.source_states.get(&(source.clone(), dp_rank));
+        let matches = current.as_ref().is_some_and(|record| {
+            record.attempt == attempt
+                && record.status.state == SourceRecoveryState::Degraded
+                && record.status.reason == SourceRecoveryReason::SequenceGap
+        });
+        let replay_exact = current.as_ref().is_some_and(|record| record.replay_exact);
+        drop(current);
+        if !matches {
             return false;
         }
-        self.resume_source_for(source, dp_rank, SourceRecoveryReason::ReplayApplied);
+        if let Some(reason) = failure {
+            self.invalidate_source_locked(source, dp_rank, reason);
+        } else {
+            self.resume_source_locked(
+                source,
+                dp_rank,
+                if replay_exact {
+                    SourceRecoveryState::Exact
+                } else {
+                    SourceRecoveryState::Observed
+                },
+                SourceRecoveryReason::ReplayApplied,
+            );
+        }
         true
+    }
+
+    fn visible_state(state: SourceRecoveryState) -> bool {
+        matches!(
+            state,
+            SourceRecoveryState::Exact | SourceRecoveryState::Observed
+        )
+    }
+
+    pub(crate) fn resume_observed_source(&self, source: &SourceId, dp_rank: u32) {
+        let _guard = self.source_mutations.lock();
+        if self
+            .source_states
+            .get(&(source.clone(), dp_rank))
+            .is_some_and(|r| r.status.state == SourceRecoveryState::Exact)
+        {
+            return;
+        }
+        self.resume_source_locked(
+            source,
+            dp_rank,
+            SourceRecoveryState::Observed,
+            SourceRecoveryReason::FreshObservation,
+        );
     }
 
     /// Enable observations only after an authoritative initial, replay, or
     /// clear boundary.
     /// Already-active sources must not invalidate concurrent query snapshots.
-    pub fn resume_source(&self, source: &SourceId, dp_rank: u32) {
+    #[cfg(test)]
+    pub(super) fn resume_source(&self, source: &SourceId, dp_rank: u32) {
         self.resume_source_for(source, dp_rank, SourceRecoveryReason::ReplayApplied);
     }
 
@@ -720,12 +813,25 @@ impl KvBlockIndexer {
         dp_rank: u32,
         reason: SourceRecoveryReason,
     ) {
-        self.transition_source(source, dp_rank, SourceRecoveryState::Exact, reason);
-        if let Entry::Occupied(entry) = self.suspended_sources.entry((source.clone(), dp_rank)) {
-            // Fence the visibility transition before removing its hidden state.
+        let _guard = self.source_mutations.lock();
+        self.resume_source_locked(source, dp_rank, SourceRecoveryState::Exact, reason);
+    }
+
+    fn resume_source_locked(
+        &self,
+        source: &SourceId,
+        dp_rank: u32,
+        state: SourceRecoveryState,
+        reason: SourceRecoveryReason,
+    ) {
+        let was_visible = self
+            .source_states
+            .get(&(source.clone(), dp_rank))
+            .is_none_or(|record| Self::visible_state(record.status.state));
+        if !was_visible {
             self.source_generation.fetch_add(1, Ordering::AcqRel);
-            entry.remove();
         }
+        self.transition_source(source, dp_rank, state, reason);
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -742,25 +848,25 @@ impl KvBlockIndexer {
     /// Remove lifecycle state after the supervisor has invalidated and retired
     /// the only subscriber allowed to mutate this source/rank.
     pub(crate) fn forget_source(&self, source: &SourceId, dp_rank: u32) {
-        self.suspended_sources.insert((source.clone(), dp_rank), ());
-        self.source_generation.fetch_add(1, Ordering::AcqRel);
+        let _guard = self.source_mutations.lock();
+        // Hold the state entry until residency is cleared and the query fence
+        // advances, so readers cannot observe an unregistered stale claim.
+        let entry = self.source_states.entry((source.clone(), dp_rank));
         let shards: Vec<Arc<GroupShard>> = self.shards.iter().map(|e| e.value().clone()).collect();
         for shard in shards {
             shard.clear_source(source, dp_rank);
         }
-        if let Some((_, record)) = self.source_states.remove(&(source.clone(), dp_rank)) {
+        self.source_generation.fetch_add(1, Ordering::AcqRel);
+        if let Entry::Occupied(entry) = entry {
+            let record = entry.remove();
             RouterMetrics::clear_kv_source_recovery_state(
                 source,
                 dp_rank,
                 record.status.state.as_str(),
                 record.status.reason.as_str(),
-                record
-                    .recovery_started
-                    .map(|started| Instant::now().saturating_duration_since(started)),
+                record.recovery_started.map(|started| started.elapsed()),
             );
         }
-        self.suspended_sources.remove(&(source.clone(), dp_rank));
-        self.source_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     #[cfg(test)]
@@ -774,9 +880,9 @@ impl KvBlockIndexer {
         let matches = matches
             .into_iter()
             .filter(|hit| {
-                !self
-                    .suspended_sources
-                    .contains_key(&(hit.target.instance_id.clone(), hit.target.dp_rank))
+                self.source_states
+                    .get(&(hit.target.instance_id.clone(), hit.target.dp_rank))
+                    .is_none_or(|record| Self::visible_state(record.status.state))
             })
             .collect();
         if self.source_generation.load(Ordering::Acquire) != generation {
@@ -916,6 +1022,101 @@ mod tests {
     }
 
     #[test]
+    fn replay_attempt_fences_invalidation_and_replacement_without_a_caller_lease() {
+        let indexer = KvBlockIndexer::new();
+        let source = SourceId::from("w0");
+        indexer.register_source(&source, 0);
+        let old = indexer.suspend_source_for(&source, 0, SourceRecoveryReason::SequenceGap);
+        indexer.invalidate_source_for(&source, 0, SourceRecoveryReason::RankScopeChanged);
+        assert!(!indexer.finish_replay_if_current(&source, 0, old, None));
+        assert!(!indexer.finish_replay_if_current(
+            &source,
+            0,
+            old,
+            Some(SourceRecoveryReason::ReplayFailed)
+        ));
+        assert_eq!(
+            indexer.source_recovery_status(&source, 0).unwrap().reason,
+            SourceRecoveryReason::RankScopeChanged
+        );
+        indexer.forget_source(&source, 0);
+        indexer.register_source(&source, 0);
+        let new = indexer.suspend_source_for(&source, 0, SourceRecoveryReason::SequenceGap);
+        assert_ne!(old, new);
+        assert!(!indexer.finish_replay_if_current(&source, 0, old, None));
+        assert!(indexer.finish_replay_if_current(&source, 0, new, None));
+    }
+
+    #[test]
+    fn replay_boundary_and_commit_share_the_exactness_contract() {
+        let indexer = KvBlockIndexer::new();
+        let source = SourceId::from("w0");
+        indexer.register_source(&source, 0);
+        indexer.resume_observed_source(&source, 0);
+        let (start, attempt) = indexer.begin_replay(&source, 0, 20, false);
+        assert_eq!(start, 20);
+        assert!(indexer.finish_replay_if_current(&source, 0, attempt, None));
+        assert_eq!(
+            indexer.source_recovery_status(&source, 0).unwrap().state,
+            SourceRecoveryState::Observed
+        );
+        let (start, attempt) = indexer.begin_replay(&source, 0, 22, true);
+        assert_eq!(start, -1);
+        assert!(indexer.finish_replay_if_current(&source, 0, attempt, None));
+        assert_eq!(
+            indexer.source_recovery_status(&source, 0).unwrap().state,
+            SourceRecoveryState::Exact
+        );
+        indexer.invalidate_source_for(&source, 0, SourceRecoveryReason::RankScopeChanged);
+        assert_eq!(indexer.begin_replay(&source, 0, 24, true).0, -1);
+    }
+
+    #[test]
+    fn exact_reason_updates_without_invalidating_queries() {
+        let indexer = KvBlockIndexer::new();
+        let source = SourceId::from("w0");
+        indexer.register_source(&source, 0);
+        indexer.resume_source_for(&source, 0, SourceRecoveryReason::InitialSequence);
+        let generation = indexer.source_generation_for_test();
+        indexer.resume_source_for(&source, 0, SourceRecoveryReason::ClearBarrier);
+        assert_eq!(generation, indexer.source_generation_for_test());
+        assert_eq!(
+            indexer.source_recovery_status(&source, 0).unwrap().reason,
+            SourceRecoveryReason::ClearBarrier
+        );
+    }
+
+    #[test]
+    fn worker_churn_keeps_recovery_metric_labels_bounded() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let indexer = KvBlockIndexer::new();
+        for i in 0..100 {
+            let source = SourceId::from(format!("churn-{i}"));
+            indexer.register_source(&source, i);
+            indexer.resume_source_for(&source, i, SourceRecoveryReason::InitialSequence);
+            indexer.forget_source(&source, i);
+        }
+        let rendered = handle.render();
+        assert!(!rendered.contains("source="));
+        assert!(!rendered.contains("dp_rank="));
+        assert!(
+            rendered
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+                .count()
+                < 20
+        );
+        for line in rendered
+            .lines()
+            .filter(|line| line.starts_with("vllm_router_kv_source_recovery_state{"))
+        {
+            assert!(line.ends_with(" 0"), "{line}");
+        }
+    }
+
+    #[test]
     fn source_recovery_status_and_metrics_follow_transitions() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -958,18 +1159,12 @@ mod tests {
         };
         assert!(has_line(
             "vllm_router_kv_source_recovery_state",
-            &[
-                "source=\"metrics-worker\"",
-                "dp_rank=\"2\"",
-                "state=\"exact\"",
-                "reason=\"clear_barrier\"",
-            ],
+            &["state=\"exact\"", "reason=\"clear_barrier\"",],
             " 1"
         ));
         assert!(has_line(
             "vllm_router_kv_source_recovery_transitions_total",
             &[
-                "source=\"metrics-worker\"",
                 "from=\"fallback\"",
                 "to=\"exact\"",
                 "reason=\"clear_barrier\"",
@@ -978,25 +1173,17 @@ mod tests {
         ));
         assert!(has_line(
             "vllm_router_kv_source_recovery_duration_seconds_count",
-            &["source=\"metrics-worker\"", "outcome=\"exact\""],
+            &["outcome=\"exact\""],
             " 1"
         ));
         assert!(has_line(
             "vllm_router_kv_replay_outcomes_total",
-            &[
-                "source=\"metrics-worker\"",
-                "dp_rank=\"2\"",
-                "outcome=\"failed\"",
-            ],
+            &["outcome=\"failed\"",],
             " 1"
         ));
         assert!(has_line(
             "vllm_router_kv_replay_duration_seconds_count",
-            &[
-                "source=\"metrics-worker\"",
-                "dp_rank=\"2\"",
-                "outcome=\"failed\"",
-            ],
+            &["outcome=\"failed\"",],
             " 1"
         ));
 
@@ -1012,18 +1199,12 @@ mod tests {
         };
         assert!(has_line(
             "vllm_router_kv_source_recovery_state",
-            &[
-                "source=\"metrics-worker\"",
-                "dp_rank=\"2\"",
-                "state=\"exact\"",
-                "reason=\"clear_barrier\"",
-            ],
+            &["state=\"exact\"", "reason=\"clear_barrier\"",],
             " 0"
         ));
         assert!(has_line(
             "vllm_router_kv_source_recovery_transitions_total",
             &[
-                "source=\"metrics-worker\"",
                 "from=\"exact\"",
                 "to=\"forgotten\"",
                 "reason=\"source_retired\"",
