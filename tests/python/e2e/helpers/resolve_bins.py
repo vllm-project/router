@@ -10,7 +10,10 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .paths import DEFAULT_ROUTER_BINARY, repo_root
+from .repo_root import repo_root
+
+# Built with `cargo build --release` in this repository.
+DEFAULT_ROUTER_BINARY = Path("target/release/vllm-router")
 
 VLLM_RS_ENV = "VLLM_RS"
 ROUTER_BIN_ENV = "ROUTER_BIN"
@@ -27,7 +30,7 @@ def resolve_repo_path(raw: str, repo: Path | None = None) -> Path:
     return path if path.is_absolute() else (base / path).resolve()
 
 
-def resolve_binary_path(raw: str, *, repo: Path | None = None) -> str | None:
+def _resolve_binary_path(raw: str, *, repo: Path | None = None) -> str | None:
     """Absolute file, repo-relative file, or executable name on PATH."""
 
     text = (raw or "").strip()
@@ -84,7 +87,7 @@ def _resolve_vllm_rs_via_check_script(repo: Path) -> str | None:
     return None
 
 
-def discover_vllm_rs_bin(*, repo: Path | None = None, skip_env: bool = False) -> str:
+def _discover_vllm_rs_bin(*, repo: Path | None = None, skip_env: bool = False) -> str:
     """Match ``scripts/backend/common.sh`` ``vllm_rs_bin`` (+ optional check script)."""
 
     if not skip_env:
@@ -113,11 +116,11 @@ def resolve_vllm_rs(
 
     if pinned := os.environ.get(VLLM_RS_ENV, "").strip():
         return pinned
-    if resolved := resolve_binary_path(case_value, repo=repo):
+    if resolved := _resolve_binary_path(case_value, repo=repo):
         return resolved
     base = repo if repo is not None else repo_root()
     try:
-        return discover_vllm_rs_bin(repo=base, skip_env=True)
+        return _discover_vllm_rs_bin(repo=base, skip_env=True)
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"{label}: {exc}") from exc
 
@@ -131,7 +134,7 @@ def resolve_router_bin(
     base = repo if repo is not None else repo_root()
     if pinned := os.environ.get(ROUTER_BIN_ENV, "").strip():
         return pinned
-    if resolved := resolve_binary_path(case_value, repo=base):
+    if resolved := _resolve_binary_path(case_value, repo=base):
         return resolved
     default = (base / DEFAULT_ROUTER_BINARY).resolve()
     if default.is_file():

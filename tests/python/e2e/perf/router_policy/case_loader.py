@@ -18,12 +18,12 @@ for _entry in (_HELPERS, _E2E_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from helpers.binaries import (  # noqa: E402
+from helpers.repo_root import repo_root  # noqa: E402
+from helpers.resolve_bins import (  # noqa: E402
     resolve_repo_path,
     resolve_router_bin,
     resolve_vllm_rs,
 )
-from helpers.paths import repo_root  # noqa: E402
 
 RUN_SUFFIX_ENV = "AGENTX_RUN_SUFFIX"
 
