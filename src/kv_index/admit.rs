@@ -1,4 +1,5 @@
 //! Event-shape admission, separate from structural decoding and transport.
+use crate::kv_index::types::StorageTier;
 use crate::kv_index::wire::extra_keys_match;
 use crate::kv_index::wire::{BlockStored, ExternalBlockHash, KVEvent, KVEventBatch};
 
@@ -45,7 +46,7 @@ pub fn validate_device_batch(
                 )
             }
         };
-        if medium.as_deref() != Some("GPU")
+        if StorageTier::from_medium(medium.as_deref()) != Some(StorageTier::Device)
             || group.is_some_and(|group| group != 0)
             || locality
                 .as_deref()
@@ -199,12 +200,7 @@ fn is_supported_residency(
 ) -> bool {
     let pool = ownership.is_some_and(|owner| !owner.is_empty());
     locality.is_none_or(|locality| locality == if pool { "REMOTE" } else { "LOCAL" })
-        && medium.is_none_or(|medium| {
-            matches!(
-                medium.to_ascii_uppercase().as_str(),
-                "GPU" | "DEVICE" | "CPU" | "HOST" | "HOST_PINNED" | "STORAGE" | "DISK"
-            )
-        })
+        && medium.is_none_or(|medium| StorageTier::from_medium(Some(medium)).is_some())
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]

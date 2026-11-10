@@ -114,6 +114,15 @@ impl State {
         true
     }
 
+    /// A removal whose medium names no known tier drops every copy of the page:
+    /// keeping a stale claim would over-credit, dropping one costs at most a
+    /// re-prefill.
+    pub(super) fn remove_claim_all(&mut self, key: (u32, SequenceHash)) {
+        for claims in self.claims.values_mut() {
+            claims.remove(&key);
+        }
+    }
+
     /// A removal names one tier and no identity: the engine evicted that copy
     /// whichever chain produced it. A page that still has another copy stays
     /// claimed at the better remaining tier.

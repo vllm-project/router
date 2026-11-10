@@ -97,12 +97,15 @@ impl HybridEventIndex {
                     // restorable (at a transfer cost), so it is claimed at that
                     // tier instead of rejecting the batch. External owners are
                     // not this rank's residency and are skipped.
-                    let tier = StorageTier::from_medium(store.medium.as_deref());
-                    // A copy owned by another domain is not this rank's
-                    // residency; skip it instead of revoking the view.
-                    if store.ownership.is_some() || matches!(tier, StorageTier::External) {
+                    // A copy owned by another domain, or one whose medium this
+                    // build cannot place, is not this rank's addressable
+                    // residency: skip it instead of revoking the view.
+                    if store.ownership.is_some() {
                         continue;
                     }
+                    let Some(tier) = StorageTier::from_medium(store.medium.as_deref()) else {
+                        continue;
+                    };
                     if store.locality.as_deref().is_some_and(|s| s != "LOCAL")
                         || (namespace.is_none()
                             && !extra_keys_match(
@@ -195,10 +198,8 @@ impl HybridEventIndex {
                     Ok(())
                 }
                 KVEvent::BlockRemoved(remove) => {
-                    if matches!(
-                        StorageTier::from_medium(remove.medium.as_deref()),
-                        StorageTier::External
-                    ) || remove.locality.as_deref().is_some_and(|s| s != "LOCAL")
+                    if StorageTier::from_medium(remove.medium.as_deref()).is_none()
+                        || remove.locality.as_deref().is_some_and(|s| s != "LOCAL")
                         || remove.ownership.is_some()
                         || !self
                             .groups
@@ -209,12 +210,18 @@ impl HybridEventIndex {
                         Err(HybridEventError::InvalidBatch)
                     } else {
                         let group_idx = remove.group_idx.expect("validated group");
+                        // An unknown medium names no tier, so the removal
+                        // applies to every copy of the page: dropping more
+                        // evidence is safe, keeping stale claims is not.
                         let tier = StorageTier::from_medium(remove.medium.as_deref());
                         for hash in &remove.block_hashes {
                             let Some(hash) = sequence_hash(hash) else {
                                 return Self::fail(&mut state, HybridEventError::InvalidBatch);
                             };
-                            state.remove_claim((group_idx, hash), tier);
+                            match tier {
+                                Some(tier) => state.remove_claim((group_idx, hash), tier),
+                                None => state.remove_claim_all((group_idx, hash)),
+                            }
                         }
                         Ok(())
                     }

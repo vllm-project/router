@@ -466,7 +466,11 @@ fn event_owner(
 fn event_tier(owner: &ResidencyOwner, medium: Option<&str>) -> StorageTier {
     match owner {
         ResidencyOwner::CacheOwner { .. } => StorageTier::External,
-        ResidencyOwner::Worker { .. } => StorageTier::from_medium(medium),
+        // Unknown mediums are filtered out by `is_supported_residency` before a
+        // residency is recorded; the fallback only keeps this total.
+        ResidencyOwner::Worker { .. } => {
+            StorageTier::from_medium(medium).unwrap_or(StorageTier::Device)
+        }
     }
 }
 
