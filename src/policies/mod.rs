@@ -37,8 +37,9 @@ pub use kv_aware::{
     StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits, WorkerTokenInputs,
 };
 pub use kv_transfer::{
-    plan_transfer, CostEstimate, CostRuleTransferPlanner, TransferCapability, TransferOutcome,
-    TransferPlan, TransferPlanner, TransferPlannerInput, TransferPolicy, TransferSkip,
+    plan_transfer, CostEstimate, CostRuleTransferPlanner, PeerEndpoint, TransferCapability,
+    TransferOutcome, TransferPlan, TransferPlanner, TransferPlannerInput, TransferPolicy,
+    TransferSkip,
 };
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;

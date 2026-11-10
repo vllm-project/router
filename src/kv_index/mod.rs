@@ -17,7 +17,8 @@ pub mod wire;
 pub use admit::validate_device_batch;
 pub use decode::decode_batch;
 pub use discovery::{
-    CacheKey, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, WorkerKvInfo,
+    CacheKey, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, PeerLookupEntry,
+    PeerLookupRecord, WorkerKvInfo,
 };
 pub(crate) use endpoints::canonical_endpoint;
 pub use endpoints::{parse_endpoint_mapping, resolve_endpoints};

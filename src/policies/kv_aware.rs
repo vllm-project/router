@@ -6,19 +6,21 @@ use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use lru::LruCache;
 use parking_lot::Mutex;
 use rand::Rng;
 use sha2::{Digest as _, Sha256};
 
 use super::kv_transfer::{
-    TransferCapability, TransferOutcome, TransferPlan, TransferPlanner, TransferPlannerInput,
-    TransferSkip,
+    PeerEndpoint, TransferCapability, TransferOutcome, TransferPlan, TransferPlanner,
+    TransferPlannerInput, TransferSkip,
 };
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
-use crate::kv_index::{CacheKey, MatchQuery, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo};
+use crate::kv_index::{
+    CacheKey, MatchQuery, PeerLookupRecord, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo,
+};
 use crate::request_identity::StableIdentity;
 
 /// Read-only placement port owned by its policy consumer.
@@ -957,6 +959,13 @@ pub struct KvAwarePolicy {
     transfer_planner: Option<Arc<dyn TransferPlanner>>,
     /// Declared transfer capabilities, keyed by worker URL.
     transfer_capabilities: DashMap<String, TransferCapability>,
+    /// Peer fetch addresses reported by engines, keyed by worker URL. A
+    /// capability without an entry here is shadow-only.
+    peer_endpoints: DashMap<String, PeerEndpoint>,
+    /// Workers whose `transfer_capabilities` entry came from an engine record
+    /// rather than static config. Only these are removed when re-discovery
+    /// finds no record.
+    engine_capabilities: DashSet<String>,
     /// Source of `TransferPlan::plan_id`; starts at 1 so 0 means unassigned.
     next_transfer_plan_id: AtomicU64,
 }
@@ -1013,6 +1022,8 @@ impl KvAwarePolicy {
             next_generation: AtomicU64::new(1),
             transfer_planner: None,
             transfer_capabilities: DashMap::new(),
+            peer_endpoints: DashMap::new(),
+            engine_capabilities: DashSet::new(),
             next_transfer_plan_id: AtomicU64::new(1),
         }
     }
@@ -1037,8 +1048,67 @@ impl KvAwarePolicy {
         worker_url: impl Into<String>,
         capability: TransferCapability,
     ) {
-        self.transfer_capabilities
-            .insert(worker_url.into(), capability);
+        let worker_url = worker_url.into();
+        // An explicit declaration is never engine-sourced.
+        self.engine_capabilities.remove(&worker_url);
+        self.transfer_capabilities.insert(worker_url, capability);
+    }
+
+    /// Apply (or clear, with `None`) the engine's validated peer-lookup record
+    /// for a registered worker. Runs under the selection lock that register
+    /// and unregister use, and ignores a worker that is no longer registered,
+    /// so a late discovery result cannot resurrect entries for a removed one.
+    ///
+    /// A static capability for the worker wins over the engine record (an
+    /// operator override); the address is still stored. With `None`, only an
+    /// engine-sourced capability is removed.
+    pub fn apply_peer_lookup(&self, worker_url: &str, record: Option<&PeerLookupRecord>) {
+        let _guard = self.selection_lock.lock();
+        if !self.targets.contains_key(worker_url) {
+            return;
+        }
+        let Some(record) = record else {
+            self.peer_endpoints.remove(worker_url);
+            if self.engine_capabilities.remove(worker_url).is_some() {
+                self.transfer_capabilities.remove(worker_url);
+            }
+            return;
+        };
+        self.peer_endpoints.insert(
+            worker_url.to_owned(),
+            PeerEndpoint {
+                engine_id: Arc::from(record.engine_id.as_str()),
+                host: Arc::from(record.side_channel_host.as_str()),
+                port: record.side_channel_port,
+                tp_size: record.tp_size,
+                dcp_size: record.dcp_size,
+                pp_size: record.pp_size,
+            },
+        );
+        let engine_owned = self.engine_capabilities.contains(worker_url);
+        if self.transfer_capabilities.contains_key(worker_url) && !engine_owned {
+            return;
+        }
+        self.transfer_capabilities.insert(
+            worker_url.to_owned(),
+            TransferCapability {
+                can_export: true,
+                can_import: true,
+                connector: Arc::from(record.connector.as_str()),
+                connector_version: Arc::from(record.connector_version.as_str()),
+                layout_fingerprint: Arc::from(record.layout_fingerprint.as_str()),
+            },
+        );
+        self.engine_capabilities.insert(worker_url.to_owned());
+    }
+
+    /// Where `worker_url` accepts peer KV fetches, if its engine reported a
+    /// valid record. A capability without an address is shadow-only; active
+    /// mode must require this on the source.
+    pub fn peer_endpoint(&self, worker_url: &str) -> Option<PeerEndpoint> {
+        self.peer_endpoints
+            .get(worker_url)
+            .map(|endpoint| endpoint.clone())
     }
 
     /// Register a pre-validated capability table (see
@@ -1091,6 +1161,8 @@ impl KvAwarePolicy {
     pub fn unregister_target(&self, worker_url: &str) {
         let _guard = self.selection_lock.lock();
         self.transfer_capabilities.remove(worker_url);
+        self.engine_capabilities.remove(worker_url);
+        self.peer_endpoints.remove(worker_url);
         if let Some((_, binding)) = self.targets.remove(worker_url) {
             if let Some(slot_manager) = &self.slot_manager {
                 slot_manager.unregister_target(&binding.target);
@@ -2129,6 +2201,13 @@ impl KvAwareOps for KvAwarePolicy {
             }
             _ => self.register_target(worker.url(), target),
         }
+        // Each registered worker is one (URL, DP rank): attach the record whose
+        // rank matches, rank 0 for a worker without a dp_rank.
+        let rank = worker.dp_rank().unwrap_or(0) as u32;
+        self.apply_peer_lookup(
+            worker.url(),
+            info.and_then(|info| info.peer_lookup.get(&rank)),
+        );
     }
 
     fn unregister_worker(&self, worker_url: &str) {
@@ -4634,5 +4713,180 @@ mod tests {
             assert_eq!((off.0, off.1, &off.2), (shadow.0, shadow.1, &shadow.2));
             assert!(!off.3 && shadow.3);
         }
+    }
+
+    fn peer_record(fingerprint: &str, port: u16) -> PeerLookupRecord {
+        PeerLookupRecord {
+            engine_id: "engine".into(),
+            side_channel_host: "10.0.0.5".into(),
+            side_channel_port: port,
+            tp_size: 2,
+            dcp_size: 1,
+            pp_size: 1,
+            connector: "nixl".into(),
+            connector_version: "1".into(),
+            layout_fingerprint: fingerprint.into(),
+        }
+    }
+
+    fn peer_info(records: &[(u32, PeerLookupRecord)]) -> WorkerKvInfo {
+        WorkerKvInfo {
+            peer_lookup: records.iter().cloned().collect(),
+            ..WorkerKvInfo::default()
+        }
+    }
+
+    #[test]
+    fn engine_peer_record_registers_capability_and_address_for_its_rank() {
+        let policy = KvAwarePolicy::default();
+        let rank0: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            "http://w:8000".into(),
+            0,
+            2,
+            WorkerType::Regular,
+        ));
+        let rank1: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            "http://w:8000".into(),
+            1,
+            2,
+            WorkerType::Regular,
+        ));
+        let info = peer_info(&[(0, peer_record("fp0", 5600)), (1, peer_record("fp1", 5601))]);
+        for worker in [&rank0, &rank1] {
+            KvAwareOps::register_worker(&policy, worker.as_ref(), Some(&info), None);
+        }
+        for (worker, fingerprint, port) in [(&rank0, "fp0", 5600), (&rank1, "fp1", 5601)] {
+            let capability = policy.transfer_capabilities.get(worker.url()).unwrap();
+            assert!(capability.can_export && capability.can_import);
+            assert_eq!(&*capability.connector, "nixl");
+            assert_eq!(&*capability.connector_version, "1");
+            assert_eq!(&*capability.layout_fingerprint, fingerprint);
+            let endpoint = policy.peer_endpoint(worker.url()).unwrap();
+            assert_eq!((&*endpoint.host, endpoint.port), ("10.0.0.5", port));
+            assert_eq!(&*endpoint.engine_id, "engine");
+            assert_eq!(
+                (endpoint.tp_size, endpoint.dcp_size, endpoint.pp_size),
+                (2, 1, 1)
+            );
+        }
+
+        // A worker without dp_rank takes rank 0; a rank with no record gets none.
+        let plain: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://p:8000".into(),
+            WorkerType::Regular,
+        ));
+        KvAwareOps::register_worker(&policy, plain.as_ref(), Some(&info), None);
+        assert_eq!(
+            &*policy
+                .transfer_capabilities
+                .get("http://p:8000")
+                .unwrap()
+                .layout_fingerprint,
+            "fp0"
+        );
+        let missing: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            "http://m:8000".into(),
+            3,
+            4,
+            WorkerType::Regular,
+        ));
+        KvAwareOps::register_worker(&policy, missing.as_ref(), Some(&info), None);
+        assert!(policy.peer_endpoint(missing.url()).is_none());
+        assert!(policy.transfer_capabilities.get(missing.url()).is_none());
+    }
+
+    #[test]
+    fn static_capability_wins_over_engine_record_but_address_is_kept() {
+        let policy = KvAwarePolicy::default();
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://a".into(), WorkerType::Regular));
+        policy.register_transfer_capability("http://a", capability("static"));
+        let info = peer_info(&[(0, peer_record("engine", 5600))]);
+        KvAwareOps::register_worker(&policy, worker.as_ref(), Some(&info), None);
+        assert_eq!(
+            &*policy
+                .transfer_capabilities
+                .get("http://a")
+                .unwrap()
+                .layout_fingerprint,
+            "static"
+        );
+        assert_eq!(policy.peer_endpoint("http://a").unwrap().port, 5600);
+
+        // Re-discovery without a record leaves the static entry alone.
+        KvAwareOps::register_worker(&policy, worker.as_ref(), None, None);
+        assert_eq!(
+            &*policy
+                .transfer_capabilities
+                .get("http://a")
+                .unwrap()
+                .layout_fingerprint,
+            "static"
+        );
+        assert!(policy.peer_endpoint("http://a").is_none());
+
+        // A static declaration made after an engine record replaces it for good.
+        let engine_first = KvAwarePolicy::default();
+        KvAwareOps::register_worker(&engine_first, worker.as_ref(), Some(&info), None);
+        engine_first.register_transfer_capability("http://a", capability("static"));
+        KvAwareOps::register_worker(&engine_first, worker.as_ref(), None, None);
+        assert!(engine_first.transfer_capabilities.get("http://a").is_some());
+    }
+
+    #[test]
+    fn failed_rediscovery_clears_engine_sourced_entries() {
+        let policy = KvAwarePolicy::default();
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://a".into(), WorkerType::Regular));
+        let info = peer_info(&[(0, peer_record("one", 5600))]);
+        KvAwareOps::register_worker(&policy, worker.as_ref(), Some(&info), None);
+        assert!(policy.transfer_capabilities.get("http://a").is_some());
+
+        // A changed record replaces the engine-sourced capability.
+        let changed = peer_info(&[(0, peer_record("two", 5700))]);
+        KvAwareOps::register_worker(&policy, worker.as_ref(), Some(&changed), None);
+        assert_eq!(
+            &*policy
+                .transfer_capabilities
+                .get("http://a")
+                .unwrap()
+                .layout_fingerprint,
+            "two"
+        );
+        assert_eq!(policy.peer_endpoint("http://a").unwrap().port, 5700);
+
+        // No valid record (empty map, or no info at all) removes both.
+        for info in [Some(WorkerKvInfo::default()), None] {
+            KvAwareOps::register_worker(&policy, worker.as_ref(), Some(&changed), None);
+            assert!(policy.peer_endpoint("http://a").is_some());
+            KvAwareOps::register_worker(&policy, worker.as_ref(), info.as_ref(), None);
+            assert!(policy.transfer_capabilities.get("http://a").is_none());
+            assert!(policy.peer_endpoint("http://a").is_none());
+        }
+    }
+
+    #[test]
+    fn late_peer_apply_after_unregister_is_ignored_and_unregister_clears_both() {
+        let policy = KvAwarePolicy::default();
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://a".into(), WorkerType::Regular));
+        let record = peer_record("fp", 5600);
+        KvAwareOps::register_worker(
+            &policy,
+            worker.as_ref(),
+            Some(&peer_info(&[(0, record.clone())])),
+            None,
+        );
+        assert!(policy.peer_endpoint("http://a").is_some());
+
+        policy.unregister_target("http://a");
+        assert!(policy.transfer_capabilities.get("http://a").is_none());
+        assert!(policy.peer_endpoint("http://a").is_none());
+
+        // A discovery result that lands after removal must not resurrect them.
+        policy.apply_peer_lookup("http://a", Some(&record));
+        assert!(policy.transfer_capabilities.get("http://a").is_none());
+        assert!(policy.peer_endpoint("http://a").is_none());
+        assert!(policy.engine_capabilities.is_empty());
     }
 }

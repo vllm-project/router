@@ -6,7 +6,8 @@
 //! * `GET /health` -> 200
 //! * `GET /get_server_info` -> `{model_id, instance_id, kv_block_size}`
 //! * `GET /server_info?config_format=json` -> native vLLM shape (model, block size)
-//! * `GET /kv_event_sources` -> one `zmq`/`msgpack`/`schema_version: 1` entry for the DP rank
+//! * `GET /kv_event_sources` -> one `zmq`/`msgpack`/`schema_version: 1` entry for the DP rank,
+//!   with an optional `peer_lookup` object ([`KvEventMockConfig::peer_lookup`])
 //! * `POST /v1/completions` and `POST /v1/chat/completions` -> OpenAI-style replies
 //!
 //! The ZMQ socket is an XPUB so the mock can observe the router's subscription
@@ -79,6 +80,41 @@ impl Residency {
     }
 }
 
+/// What the mock reports as the rank's `peer_lookup` record.
+#[derive(Debug, Clone)]
+pub struct PeerLookupMock {
+    pub layout_fingerprint: String,
+    pub enabled: bool,
+    /// Report `side_channel_port: 0`, which the router must drop.
+    pub invalid: bool,
+}
+
+impl PeerLookupMock {
+    pub fn new(layout_fingerprint: &str) -> Self {
+        Self {
+            layout_fingerprint: layout_fingerprint.to_owned(),
+            enabled: true,
+            invalid: false,
+        }
+    }
+
+    pub fn disabled(mut self) -> Self {
+        self.enabled = false;
+        self
+    }
+
+    pub fn invalid(mut self) -> Self {
+        self.invalid = true;
+        self
+    }
+}
+
+/// Side-channel address the mock advertises for `dp_rank`.
+pub const PEER_HOST: &str = "127.0.0.1";
+pub fn peer_port(dp_rank: u32) -> u16 {
+    5600 + dp_rank as u16
+}
+
 /// What [`KvEventMock::store_prefix`] published, so it can be evicted later.
 #[derive(Debug, Clone)]
 pub struct StoredPrefix {
@@ -95,6 +131,8 @@ pub struct KvEventMockConfig {
     pub topic: String,
     /// Added to every non-held completion.
     pub response_delay: Duration,
+    /// When set, `/kv_event_sources` carries a `peer_lookup` object for the rank.
+    pub peer_lookup: Option<PeerLookupMock>,
 }
 
 impl KvEventMockConfig {
@@ -106,6 +144,7 @@ impl KvEventMockConfig {
             dp_rank: 0,
             topic: "kv-events".to_owned(),
             response_delay: Duration::ZERO,
+            peer_lookup: None,
         }
     }
 }
@@ -422,16 +461,28 @@ async fn native_server_info(State(state): State<Arc<MockState>>) -> Json<Value> 
 }
 
 async fn kv_event_sources(State(state): State<Arc<MockState>>) -> Json<Value> {
-    Json(json!({
-        state.config.dp_rank.to_string(): {
-            "endpoint": state.endpoint,
-            "topic": state.config.topic,
-            "publisher": "zmq",
-            "encoding": "msgpack",
-            "schema_version": 1,
-            "enable_kv_cache_events": true,
-        }
-    }))
+    let mut entry = json!({
+        "endpoint": state.endpoint,
+        "topic": state.config.topic,
+        "publisher": "zmq",
+        "encoding": "msgpack",
+        "schema_version": 1,
+        "enable_kv_cache_events": true,
+    });
+    if let Some(peer) = &state.config.peer_lookup {
+        let rank = state.config.dp_rank;
+        entry["peer_lookup"] = json!({
+            "enabled": peer.enabled,
+            "engine_id": format!("{}-rank{rank}", state.config.instance_id),
+            "side_channel_host": PEER_HOST,
+            "side_channel_port": if peer.invalid { 0 } else { u32::from(peer_port(rank)) },
+            "tp_size": 1, "dcp_size": 1, "pp_size": 1,
+            "connector": "nixl",
+            "connector_version": "1",
+            "layout_fingerprint": peer.layout_fingerprint,
+        });
+    }
+    Json(json!({ state.config.dp_rank.to_string(): entry }))
 }
 
 /// Shared by both completion routes. Returns the failure response when the

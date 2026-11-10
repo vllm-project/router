@@ -41,7 +41,9 @@ mod common;
 use axum::body::Body;
 use axum::http::Request;
 use axum::Router;
-use common::kv_event_mock::{KvEventMock, KvEventMockConfig, Residency, HOLD_PRIORITY};
+use common::kv_event_mock::{
+    peer_port, KvEventMock, KvEventMockConfig, PeerLookupMock, Residency, HOLD_PRIORITY, PEER_HOST,
+};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -208,6 +210,8 @@ struct Options {
     router_temperature: f64,
     session_ttl_secs: Option<u64>,
     transfer: KvTransferConfig,
+    /// `peer_lookup` record each mock reports, by instance id.
+    peers: BTreeMap<&'static str, PeerLookupMock>,
 }
 
 impl Options {
@@ -221,7 +225,16 @@ impl Options {
                 require_capability: false,
                 ..KvTransferConfig::default()
             },
+            peers: BTreeMap::new(),
         }
+    }
+
+    /// Capabilities come only from the engines' `peer_lookup` records: no
+    /// static config, `require_capability` on.
+    fn with_engine_capabilities(mut self, peers: &[(&'static str, PeerLookupMock)]) -> Self {
+        self.transfer.require_capability = true;
+        self.peers = peers.iter().cloned().collect();
+        self
     }
 }
 
@@ -242,9 +255,9 @@ impl Fixture {
 
         let mut mocks = Vec::new();
         for (instance, model) in &options.workers {
-            mocks.push(
-                KvEventMock::start(KvEventMockConfig::new(instance, model, BLOCK_SIZE)).await,
-            );
+            let mut mock_config = KvEventMockConfig::new(instance, model, BLOCK_SIZE);
+            mock_config.peer_lookup = options.peers.get(instance).cloned();
+            mocks.push(KvEventMock::start(mock_config).await);
         }
         let config = RouterConfig {
             mode: RoutingMode::Regular {
@@ -852,4 +865,109 @@ async fn removal_events_drop_credit_and_restore_recovers_it() {
     assert_eq!(status, 200);
     assert_eq!(delta, outcomes(&[("planned", 1)]));
     fx.finish().await;
+}
+
+// ---------------------------------------------------------------------------
+// Engine-reported capabilities (`peer_lookup` in /kv_event_sources), with
+// `require_capability: true` and no static `kv_transfer.capabilities`. Same
+// setup as scenario 1: A holds 100 blocks and is busy, B is idle and cold.
+// ---------------------------------------------------------------------------
+
+/// Run scenario 1's request with the given per-worker records and return the
+/// outcome delta, keeping the fixture for follow-up assertions.
+async fn engine_capability_scenario(
+    seed: u32,
+    peers: &[(&'static str, PeerLookupMock)],
+) -> (Fixture, BTreeMap<String, u64>) {
+    let options = Options::new(&[("a", "m"), ("b", "m")]).with_engine_capabilities(peers);
+    let mut fx = Fixture::start(options).await;
+    let prompt = seq(seed, 1700);
+    fx.mock("a")
+        .store_prefix(&prompt, 100, Residency::Device)
+        .await;
+    fx.converge(&prompt, "a", 100).await;
+    fx.make_busy("a", &prompt[..1600], 300, 2).await;
+    let (status, delta) = outcomes_of(fx.complete(&prompt, None)).await;
+    assert_eq!(status, 200);
+    (fx, delta)
+}
+
+fn peer_endpoint_of(
+    fx: &Fixture,
+    instance: &str,
+) -> Option<vllm_router_rs::policies::PeerEndpoint> {
+    let policy = fx.ctx.policy_registry.get_default_policy();
+    policy
+        .as_any()
+        .downcast_ref::<KvAwarePolicy>()
+        .expect("kv_aware policy")
+        .peer_endpoint(&fx.mock(instance).url)
+}
+
+/// 10: both engines report the same fingerprint -> `planned`, and the source's
+/// address is the one the mock advertised.
+#[tokio::test]
+async fn s10_engine_records_with_same_fingerprint_are_planned() {
+    let (fx, delta) = engine_capability_scenario(
+        21,
+        &[
+            ("a", PeerLookupMock::new("fp")),
+            ("b", PeerLookupMock::new("fp")),
+        ],
+    )
+    .await;
+    assert_eq!(delta, outcomes(&[("planned", 1)]));
+    let source = peer_endpoint_of(&fx, "a").expect("source address registered");
+    assert_eq!(&*source.host, PEER_HOST);
+    assert_eq!(source.port, peer_port(0));
+    assert_eq!(&*source.engine_id, "a-rank0");
+    assert!(peer_endpoint_of(&fx, "b").is_some());
+    fx.finish().await;
+}
+
+/// 11: different fingerprints -> `incompatible`. Addresses are still registered.
+#[tokio::test]
+async fn s11_engine_records_with_different_fingerprints_are_incompatible() {
+    let (fx, delta) = engine_capability_scenario(
+        22,
+        &[
+            ("a", PeerLookupMock::new("fp-a")),
+            ("b", PeerLookupMock::new("fp-b")),
+        ],
+    )
+    .await;
+    assert_eq!(delta, outcomes(&[("incompatible", 1)]));
+    assert!(peer_endpoint_of(&fx, "a").is_some());
+    fx.finish().await;
+}
+
+/// 12: one worker reports no record -> `incompatible`.
+#[tokio::test]
+async fn s12_worker_without_a_record_is_incompatible() {
+    for (seed, peers) in [
+        (23, vec![("a", PeerLookupMock::new("fp"))]),
+        (24, vec![("b", PeerLookupMock::new("fp"))]),
+    ] {
+        let (fx, delta) = engine_capability_scenario(seed, &peers).await;
+        assert_eq!(delta, outcomes(&[("incompatible", 1)]));
+        fx.finish().await;
+    }
+}
+
+/// 13: an invalid record (port 0) is dropped, and so is a disabled one, so the
+/// worker has no capability -> `incompatible`. Discovery itself still works:
+/// the request routed and the index converged.
+#[tokio::test]
+async fn s13_invalid_or_disabled_record_is_dropped_and_incompatible() {
+    for (seed, bad) in [
+        (25, PeerLookupMock::new("fp").invalid()),
+        (26, PeerLookupMock::new("fp").disabled()),
+    ] {
+        let (fx, delta) =
+            engine_capability_scenario(seed, &[("a", PeerLookupMock::new("fp")), ("b", bad)]).await;
+        assert_eq!(delta, outcomes(&[("incompatible", 1)]));
+        assert!(peer_endpoint_of(&fx, "a").is_some());
+        assert!(peer_endpoint_of(&fx, "b").is_none());
+        fx.finish().await;
+    }
 }

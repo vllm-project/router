@@ -90,6 +90,20 @@ impl TransferCapability {
     }
 }
 
+/// Where an engine rank accepts peer KV fetches, as it reported in its
+/// `peer_lookup` record. Shadow mode never uses it; a capability without an
+/// address is shadow-only, and active mode will require the address on the
+/// source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerEndpoint {
+    pub engine_id: Arc<str>,
+    pub host: Arc<str>,
+    pub port: u16,
+    pub tp_size: u32,
+    pub dcp_size: u32,
+    pub pp_size: u32,
+}
+
 /// A hypothetical transfer the planner would have made. In PR 1 it is only
 /// reported.
 #[derive(Debug, Clone, PartialEq)]
