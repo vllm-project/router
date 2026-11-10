@@ -206,7 +206,8 @@ fn spawn_inner(
                     }
                     if frames.len() != 3 || frames[1].len() != 8 {
                         if with_binding(binding.as_ref(), |_| {
-                            indexer.invalidate_source_for(
+                            retries.invalidate_once(
+                                &indexer,
                                 &source_id,
                                 dp_rank,
                                 SourceRecoveryReason::InvalidFrame,
@@ -263,23 +264,25 @@ fn spawn_inner(
                     }) else {
                         break;
                     };
-                    if (seq > last_seq + 1 || !valid_rank) && !retries.allowed(Instant::now()) {
-                        if with_binding(binding.as_ref(), |_| {
-                            indexer.invalidate_source_for(
+                    let needs_replay = seq > last_seq + 1 || !valid_rank;
+                    let can_retry = retries.allowed(Instant::now());
+                    if needs_replay
+                        && !can_retry
+                        && with_binding(binding.as_ref(), |_| {
+                            retries.invalidate_once(
+                                &indexer,
                                 &source_id,
                                 dp_rank,
                                 SourceRecoveryReason::SequenceGap,
                             );
                         })
                         .is_none()
-                        {
-                            break;
-                        }
-                        crate::kv_index::record_signal_loss();
+                    {
+                        break;
                     }
                     // Include initial attachment to an already-running publisher.
                     // A corrupt event is a one-event hole, not an applied seq.
-                    if (seq > last_seq + 1 || !valid_rank) && retries.allowed(Instant::now()) {
+                    if needs_replay && can_retry {
                         let from = last_seq + 1;
                         let to = if !valid_rank { seq } else { seq - 1 };
                         let Some((replay_start, attempt)) = with_binding(binding.as_ref(), |_| {
@@ -301,6 +304,7 @@ fn spawn_inner(
                                 ep,
                                 replay_start,
                                 seq,
+                                attempt,
                                 &ctx,
                                 &indexer,
                                 &source_id,
@@ -335,7 +339,12 @@ fn spawn_inner(
                             None
                         };
                         let current = with_binding(binding.as_ref(), |_| {
-                            indexer.finish_replay_if_current(&source_id, dp_rank, attempt, failure)
+                            indexer.finish_replay_if_current(
+                                &source_id,
+                                dp_rank,
+                                attempt,
+                                failure.map(|reason| retries.failure_reason(reason)),
+                            )
                         });
                         let outcome = if current != Some(true) {
                             "superseded"
@@ -369,8 +378,11 @@ fn spawn_inner(
                             tokio::task::yield_now().await;
                             continue;
                         }
-                        retries.failed(Instant::now());
-                        crate::kv_index::record_signal_loss();
+                        if current == Some(true) {
+                            // finish_replay_if_current already discarded any partial replay.
+                            retries.failed(Instant::now());
+                            retries.note_loss();
+                        }
                     }
                     if let Some(batch) = batch {
                         // Strict mode requires an authoritative boundary;
@@ -396,24 +408,29 @@ fn spawn_inner(
                                             dp_rank,
                                             &mut full_attention_rejection_reported,
                                         );
-                                        indexer.invalidate_source_for(
+                                        retries.invalidate_once(
+                                            &indexer,
                                             &source_id,
                                             dp_rank,
                                             SourceRecoveryReason::ValidationFailed,
                                         );
                                         return false;
                                     }
+                                    retries.loss_recorded = false;
                                     let initial_boundary = last_seq == -1 && seq == 0;
-                                    if clear_barrier || initial_boundary {
+                                    if initial_boundary {
                                         retries.reset();
                                         indexer.resume_source_for(
                                             &source_id,
                                             dp_rank,
-                                            if clear_barrier {
-                                                SourceRecoveryReason::ClearBarrier
-                                            } else {
-                                                SourceRecoveryReason::InitialSequence
-                                            },
+                                            SourceRecoveryReason::InitialSequence,
+                                        );
+                                    } else if clear_barrier {
+                                        retries.reset();
+                                        indexer.resume_after_worker_clear(
+                                            &source_id,
+                                            dp_rank,
+                                            strict_recovery,
                                         );
                                     } else if !strict_recovery {
                                         indexer.resume_observed_source(&source_id, dp_rank);
@@ -423,6 +440,7 @@ fn spawn_inner(
                                 BatchRank::Foreign => {
                                     let initial_boundary = last_seq == -1 && seq == 0;
                                     if initial_boundary {
+                                        retries.reset();
                                         indexer.resume_source_for(
                                             &source_id,
                                             dp_rank,
@@ -432,7 +450,8 @@ fn spawn_inner(
                                     true
                                 }
                                 BatchRank::Rejected => {
-                                    indexer.invalidate_source_for(
+                                    retries.invalidate_once(
+                                        &indexer,
                                         &source_id,
                                         dp_rank,
                                         SourceRecoveryReason::ValidationFailed,
@@ -480,17 +499,55 @@ fn spawn_inner(
 #[derive(Default)]
 struct ReplayRetryBudget {
     failures: u32,
+    loss_recorded: bool,
     next_attempt: Option<Instant>,
 }
 
 impl ReplayRetryBudget {
+    const MAX_FAILURES: u32 = 3;
+
+    fn note_loss(&mut self) {
+        if !self.loss_recorded {
+            self.loss_recorded = true;
+            crate::kv_index::record_signal_loss();
+        }
+    }
+
+    fn invalidate_once(
+        &mut self,
+        indexer: &KvBlockIndexer,
+        source: &SourceId,
+        rank: u32,
+        reason: SourceRecoveryReason,
+    ) {
+        if !self.loss_recorded {
+            let reason = if self.failures >= Self::MAX_FAILURES {
+                SourceRecoveryReason::RetryExhausted
+            } else {
+                reason
+            };
+            indexer.invalidate_source_for(source, rank, reason);
+            self.note_loss();
+        }
+    }
+
+    fn failure_reason(&self, reason: SourceRecoveryReason) -> SourceRecoveryReason {
+        if self.failures + 1 >= Self::MAX_FAILURES {
+            SourceRecoveryReason::RetryExhausted
+        } else {
+            reason
+        }
+    }
+
     fn allowed(&self, now: Instant) -> bool {
-        self.failures < 3 && self.next_attempt.is_none_or(|deadline| now >= deadline)
+        self.failures < Self::MAX_FAILURES
+            && self.next_attempt.is_none_or(|deadline| now >= deadline)
     }
 
     fn failed(&mut self, now: Instant) {
         self.failures = self.failures.saturating_add(1);
-        self.next_attempt = Some(now + Duration::from_secs(1 << self.failures.min(5)));
+        self.next_attempt = (self.failures < Self::MAX_FAILURES)
+            .then(|| now + Duration::from_secs(1 << self.failures));
     }
 
     fn reset(&mut self) {
@@ -653,6 +710,7 @@ async fn replay(
     endpoint: &str,
     last_seq: i64,
     through_seq: i64,
+    attempt: u64,
     ctx: &zmq::Context,
     indexer: &Arc<KvBlockIndexer>,
     source_id: &SourceId,
@@ -728,31 +786,34 @@ async fn replay(
                 }
                 let batch = decode(&frames[frames.len() - 1])?;
                 let accepted = with_binding(binding, |strict| {
-                    match batch_rank(batch.data_parallel_rank, dp_rank, strict) {
-                        BatchRank::Owned => {
-                            if let Err(rejection) = apply_batch(
-                                indexer,
-                                source_id,
-                                dp_rank,
-                                incarnation,
-                                &batch,
-                                expected_block_size,
-                            ) {
-                                report_full_attention_rejection(
-                                    rejection,
+                    indexer.with_current_replay(source_id, dp_rank, attempt, |_| {
+                        match batch_rank(batch.data_parallel_rank, dp_rank, strict) {
+                            BatchRank::Owned => {
+                                if let Err(rejection) = apply_batch(
+                                    indexer,
                                     source_id,
                                     dp_rank,
-                                    full_attention_rejection_reported,
-                                );
-                                false
-                            } else {
-                                true
+                                    incarnation,
+                                    &batch,
+                                    expected_block_size,
+                                ) {
+                                    report_full_attention_rejection(
+                                        rejection,
+                                        source_id,
+                                        dp_rank,
+                                        full_attention_rejection_reported,
+                                    );
+                                    false
+                                } else {
+                                    true
+                                }
                             }
+                            BatchRank::Foreign => true,
+                            BatchRank::Rejected => false,
                         }
-                        BatchRank::Foreign => true,
-                        BatchRank::Rejected => false,
-                    }
-                })?;
+                    })
+                })
+                .flatten()?;
                 if !accepted {
                     return None;
                 }
@@ -2531,6 +2592,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn superseded_replay_cannot_write_between_frames_before_observed_resume() {
+        let strict_rank = Arc::new(Mutex::new(false));
+        let mut f = fixture_with_recovery(
+            true,
+            Some(4),
+            Some(SubscriberBinding {
+                lease: SourceLease {
+                    strict_rank: strict_rank.clone(),
+                    active: Arc::new(AtomicBool::new(true)),
+                },
+                replay_cleanup_barrier: None,
+                replay_commit_barrier: None,
+            }),
+            false,
+        );
+        let source = SourceId::from("w0");
+        let stale = [5, 6, 7, 8];
+        let live = [9, 10, 11, 12];
+        publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            0,
+            0.0,
+            &[store_event(100, &[1, 2, 3, 4])],
+            Some(0),
+        )
+        .await;
+        f.publisher
+            .send_multipart(
+                [
+                    b"kv".as_slice(),
+                    &4i64.to_be_bytes(),
+                    &batch_payload(&[store_event(104, &live)], 0),
+                ],
+                0,
+            )
+            .unwrap();
+        let server = f.replay_server.as_ref().unwrap();
+        let request = replay_request(server).await;
+        send_replay_replies(
+            server,
+            &request,
+            &[(1, b"kv".as_slice(), batch_payload(&[], 0))],
+        );
+        async fn next_advance(rx: &mut mpsc::Receiver<IngestionSignal>) -> i64 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let IngestionSignal::Advance { last_seq, .. } = rx.recv().await.unwrap() {
+                        return last_seq;
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        }
+        assert_eq!(next_advance(&mut f.signals).await, 1);
+        {
+            let mut rank = strict_rank.lock();
+            *rank = true;
+            f.indexer
+                .invalidate_source_for(&source, 0, SourceRecoveryReason::RankScopeChanged);
+        }
+        send_replay_replies(
+            server,
+            &request,
+            &[
+                (
+                    2,
+                    b"kv".as_slice(),
+                    batch_payload(&[store_event(102, &stale)], 0),
+                ),
+                (3, b"kv".as_slice(), vec![0xc1]),
+            ],
+        );
+        assert_eq!(next_advance(&mut f.signals).await, 4);
+        assert!(hits(&f.indexer, &stale).is_empty());
+        assert_eq!(hits(&f.indexer, &live).len(), 1);
+    }
+
+    #[tokio::test]
     async fn external_invalidation_during_replay_prevents_exact_commit() {
         let strict_rank = Arc::new(Mutex::new(false));
         let commit_barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -2625,6 +2767,20 @@ mod tests {
         for token_ids in &tokens {
             assert!(hits(&fixture.indexer, token_ids).is_empty());
         }
+        // A superseded replay must not put the next genuine gap on cooldown.
+        fixture
+            .publisher
+            .send_multipart(
+                [
+                    b"kv".as_slice(),
+                    &4i64.to_be_bytes(),
+                    &batch_payload(&[], 0),
+                ],
+                0,
+            )
+            .unwrap();
+        let next = replay_request(fixture.replay_server.as_ref().unwrap()).await;
+        assert_eq!(read_seq(next.last().unwrap()), 0);
     }
 
     #[tokio::test]
@@ -2655,6 +2811,133 @@ mod tests {
     #[tokio::test]
     async fn replay_wrong_topic_clears_partial_stores() {
         check_replay_case("wrong_topic").await;
+    }
+
+    #[tokio::test]
+    async fn worker_clear_only_restores_credit_in_its_domain() {
+        let old = [1, 2, 3, 4];
+        let fresh = [5, 6, 7, 8];
+        let local = [9, 10, 11, 12];
+        let pool_store = |hash, tokens: &[u32]| {
+            KVEvent::BlockStored(stored(
+                vec![ExternalBlockHash::Int(hash)],
+                tokens.to_vec(),
+                Some("GPU"),
+                Some("pool"),
+            ))
+        };
+        let source = SourceId::from("w0");
+        use crate::kv_index::SourceRecoveryState::{Exact, Observed, WorkerExact};
+        for (strict, gap, expected) in [
+            (true, false, Exact),
+            (true, true, WorkerExact),
+            (false, true, Observed),
+        ] {
+            let mut f = fixture_with_recovery(strict && gap, Some(4), None, strict);
+            publish_until_advanced(
+                &f.publisher,
+                &mut f.signals,
+                b"kv",
+                0,
+                0.0,
+                &[pool_store(100, &old)],
+                Some(0),
+            )
+            .await;
+            if !gap {
+                publish_until_advanced(&f.publisher, &mut f.signals, b"kv", 1, 0.0, &[], Some(0))
+                    .await;
+            }
+            let clear_events = [
+                KVEvent::AllBlocksCleared(AllBlocksCleared {}),
+                store_event(101, &local),
+            ];
+            tokio::join!(
+                publish_until_advanced(
+                    &f.publisher,
+                    &mut f.signals,
+                    b"kv",
+                    2,
+                    0.0,
+                    &clear_events,
+                    Some(0)
+                ),
+                async {
+                    if let Some(server) = &f.replay_server {
+                        let request = replay_request(server).await;
+                        assert_eq!(read_seq(request.last().unwrap()), 1);
+                        send_replay_replies(server, &request, &[(END_SEQ, b"".as_slice(), vec![])]);
+                    }
+                },
+            );
+            publish_until_advanced(
+                &f.publisher,
+                &mut f.signals,
+                b"kv",
+                3,
+                0.0,
+                &[pool_store(102, &fresh)],
+                Some(0),
+            )
+            .await;
+            assert_eq!(
+                f.indexer.source_recovery_status(&source, 0).unwrap().state,
+                expected
+            );
+            assert_eq!(hits(&f.indexer, &local).len(), 1);
+            let pool_hits = |tokens: &[u32]| {
+                f.indexer
+                    .find_matches(&MatchQuery {
+                        group_idx: 0,
+                        local_hashes: crate::kv_index::local_block_hash_strings(tokens, 4, None),
+                        tiers_of_interest: vec![StorageTier::External],
+                    })
+                    .len()
+            };
+            assert_eq!(pool_hits(&old), usize::from(!gap));
+            assert_eq!(pool_hits(&fresh), usize::from(!strict || !gap));
+            if strict && gap {
+                let server = f.replay_server.as_ref().unwrap();
+                tokio::join!(
+                    publish_until_advanced(
+                        &f.publisher,
+                        &mut f.signals,
+                        b"kv",
+                        5,
+                        0.0,
+                        &[],
+                        Some(0)
+                    ),
+                    async {
+                        let request = replay_request(server).await;
+                        assert_eq!(read_seq(request.last().unwrap()), 0);
+                        let history = [
+                            vec![pool_store(100, &old)],
+                            vec![],
+                            clear_events.to_vec(),
+                            vec![pool_store(102, &fresh)],
+                            vec![],
+                            vec![],
+                        ];
+                        let replies: Vec<_> = history
+                            .iter()
+                            .enumerate()
+                            .map(|(seq, events)| {
+                                (seq as i64, b"kv".as_slice(), batch_payload(events, 0))
+                            })
+                            .collect();
+                        send_replay_replies(server, &request, &replies);
+                    },
+                );
+                assert_eq!(
+                    f.indexer.source_recovery_status(&source, 0).unwrap().state,
+                    Exact
+                );
+                assert_eq!(pool_hits(&old), 1);
+                assert_eq!(pool_hits(&fresh), 1);
+                assert_eq!(hits(&f.indexer, &local).len(), 1);
+            }
+        }
     }
 
     #[tokio::test]
@@ -2735,7 +3018,7 @@ mod tests {
         assert_eq!(
             fixture.indexer.source_recovery_status(&source, 0),
             Some(crate::kv_index::SourceRecoveryStatus {
-                state: crate::kv_index::SourceRecoveryState::Exact,
+                state: crate::kv_index::SourceRecoveryState::WorkerExact,
                 reason: crate::kv_index::SourceRecoveryReason::ClearBarrier,
             })
         );
@@ -2754,6 +3037,42 @@ mod tests {
         assert!(!retries.allowed(now));
         retries.reset();
         assert!(retries.allowed(now));
+    }
+
+    #[test]
+    fn exhausted_bad_frames_invalidate_once_until_fresh_observations() {
+        let indexer = KvBlockIndexer::new();
+        let source = SourceId::from("w0");
+        let mut retries = ReplayRetryBudget::default();
+        let start = Instant::now();
+        retries.failed(start);
+        assert!(!retries.allowed(start + Duration::from_secs(1)));
+        assert!(retries.allowed(start + Duration::from_secs(2)));
+        retries.failed(start + Duration::from_secs(2));
+        assert!(!retries.allowed(start + Duration::from_secs(5)));
+        assert!(retries.allowed(start + Duration::from_secs(6)));
+        assert_eq!(
+            retries.failure_reason(SourceRecoveryReason::ReplayFailed),
+            SourceRecoveryReason::RetryExhausted
+        );
+        retries.failed(start + Duration::from_secs(6));
+        retries.invalidate_once(&indexer, &source, 0, SourceRecoveryReason::SequenceGap);
+        let generation = indexer.source_generation_for_test();
+        for reason in [
+            SourceRecoveryReason::ValidationFailed,
+            SourceRecoveryReason::InvalidFrame,
+            SourceRecoveryReason::SequenceGap,
+        ] {
+            retries.invalidate_once(&indexer, &source, 0, reason);
+        }
+        assert_eq!(indexer.source_generation_for_test(), generation);
+        assert_eq!(
+            indexer.source_recovery_status(&source, 0).unwrap().reason,
+            SourceRecoveryReason::RetryExhausted
+        );
+        retries.loss_recorded = false;
+        retries.invalidate_once(&indexer, &source, 0, SourceRecoveryReason::SequenceGap);
+        assert_eq!(indexer.source_generation_for_test(), generation + 1);
     }
 
     #[tokio::test]
@@ -2957,6 +3276,7 @@ mod tests {
             &endpoint,
             -1,
             1,
+            attempt,
             &f._ctx,
             &f.indexer,
             &source,

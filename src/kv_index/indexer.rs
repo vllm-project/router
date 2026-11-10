@@ -566,6 +566,7 @@ impl KvBlockIndexer {
                         previous.recovery_started.or(Some(now))
                     }
                     SourceRecoveryState::Cold
+                    | SourceRecoveryState::WorkerExact
                     | SourceRecoveryState::Exact
                     | SourceRecoveryState::Observed => None,
                 };
@@ -737,8 +738,29 @@ impl KvBlockIndexer {
         }
     }
 
-    /// Finish only the recovery attempt that authorized this replay. The
-    /// internal mutation lock fences check/transition even without a caller lease.
+    /// Run one synchronous replay mutation under the same fence as source invalidation.
+    /// Drop the map entry before the operation, which may update the source state.
+    pub(super) fn with_current_replay<T>(
+        &self,
+        source: &SourceId,
+        dp_rank: u32,
+        attempt: u64,
+        operation: impl FnOnce(bool) -> T,
+    ) -> Option<T> {
+        let _guard = self.source_mutations.lock();
+        let replay_exact = {
+            let record = self.source_states.get(&(source.clone(), dp_rank))?;
+            if record.attempt != attempt
+                || record.status.state != SourceRecoveryState::Degraded
+                || record.status.reason != SourceRecoveryReason::SequenceGap
+            {
+                return None;
+            }
+            record.replay_exact
+        };
+        Some(operation(replay_exact))
+    }
+
     pub(crate) fn finish_replay_if_current(
         &self,
         source: &SourceId,
@@ -746,39 +768,31 @@ impl KvBlockIndexer {
         attempt: u64,
         failure: Option<SourceRecoveryReason>,
     ) -> bool {
-        let _guard = self.source_mutations.lock();
-        let current = self.source_states.get(&(source.clone(), dp_rank));
-        let matches = current.as_ref().is_some_and(|record| {
-            record.attempt == attempt
-                && record.status.state == SourceRecoveryState::Degraded
-                && record.status.reason == SourceRecoveryReason::SequenceGap
-        });
-        let replay_exact = current.as_ref().is_some_and(|record| record.replay_exact);
-        drop(current);
-        if !matches {
-            return false;
-        }
-        if let Some(reason) = failure {
-            self.invalidate_source_locked(source, dp_rank, reason);
-        } else {
-            self.resume_source_locked(
-                source,
-                dp_rank,
-                if replay_exact {
-                    SourceRecoveryState::Exact
-                } else {
-                    SourceRecoveryState::Observed
-                },
-                SourceRecoveryReason::ReplayApplied,
-            );
-        }
-        true
+        self.with_current_replay(source, dp_rank, attempt, |replay_exact| {
+            if let Some(reason) = failure {
+                self.invalidate_source_locked(source, dp_rank, reason);
+            } else {
+                self.resume_source_locked(
+                    source,
+                    dp_rank,
+                    if replay_exact {
+                        SourceRecoveryState::Exact
+                    } else {
+                        SourceRecoveryState::Observed
+                    },
+                    SourceRecoveryReason::ReplayApplied,
+                );
+            }
+        })
+        .is_some()
     }
 
     fn visible_state(state: SourceRecoveryState) -> bool {
         matches!(
             state,
-            SourceRecoveryState::Exact | SourceRecoveryState::Observed
+            SourceRecoveryState::Exact
+                | SourceRecoveryState::WorkerExact
+                | SourceRecoveryState::Observed
         )
     }
 
@@ -797,6 +811,24 @@ impl KvBlockIndexer {
             SourceRecoveryState::Observed,
             SourceRecoveryReason::FreshObservation,
         );
+    }
+
+    /// A worker clear leaves CacheOwner pools intact. It preserves full trust
+    /// on a contiguous exact stream, but cannot repair missing pool history.
+    pub(crate) fn resume_after_worker_clear(&self, source: &SourceId, dp_rank: u32, strict: bool) {
+        let _guard = self.source_mutations.lock();
+        let exact = self
+            .source_states
+            .get(&(source.clone(), dp_rank))
+            .is_some_and(|r| r.status.state == SourceRecoveryState::Exact);
+        let state = if exact {
+            SourceRecoveryState::Exact
+        } else if strict {
+            SourceRecoveryState::WorkerExact
+        } else {
+            SourceRecoveryState::Observed
+        };
+        self.resume_source_locked(source, dp_rank, state, SourceRecoveryReason::ClearBarrier);
     }
 
     /// Enable observations only after an authoritative initial, replay, or
@@ -824,11 +856,14 @@ impl KvBlockIndexer {
         state: SourceRecoveryState,
         reason: SourceRecoveryReason,
     ) {
-        let was_visible = self
+        let previous = self
             .source_states
             .get(&(source.clone(), dp_rank))
-            .is_none_or(|record| Self::visible_state(record.status.state));
-        if !was_visible {
+            .map(|record| record.status.state);
+        if previous.is_some_and(|s| !Self::visible_state(s))
+            || (previous == Some(SourceRecoveryState::WorkerExact))
+                != (state == SourceRecoveryState::WorkerExact)
+        {
             self.source_generation.fetch_add(1, Ordering::AcqRel);
         }
         self.transition_source(source, dp_rank, state, reason);
@@ -882,7 +917,10 @@ impl KvBlockIndexer {
             .filter(|hit| {
                 self.source_states
                     .get(&(hit.target.instance_id.clone(), hit.target.dp_rank))
-                    .is_none_or(|record| Self::visible_state(record.status.state))
+                    .is_none_or(|record| match record.status.state {
+                        SourceRecoveryState::WorkerExact => hit.tier != StorageTier::External,
+                        state => Self::visible_state(state),
+                    })
             })
             .collect();
         if self.source_generation.load(Ordering::Acquire) != generation {
@@ -1078,7 +1116,7 @@ mod tests {
         indexer.register_source(&source, 0);
         indexer.resume_source_for(&source, 0, SourceRecoveryReason::InitialSequence);
         let generation = indexer.source_generation_for_test();
-        indexer.resume_source_for(&source, 0, SourceRecoveryReason::ClearBarrier);
+        indexer.resume_after_worker_clear(&source, 0, true);
         assert_eq!(generation, indexer.source_generation_for_test());
         assert_eq!(
             indexer.source_recovery_status(&source, 0).unwrap().reason,
@@ -1140,12 +1178,12 @@ mod tests {
             "failed",
             Some(std::time::Duration::from_millis(5)),
         );
-        indexer.resume_source_for(&source, 2, SourceRecoveryReason::ClearBarrier);
+        indexer.resume_after_worker_clear(&source, 2, true);
 
         assert_eq!(
             indexer.source_recovery_status(&source, 2),
             Some(SourceRecoveryStatus {
-                state: SourceRecoveryState::Exact,
+                state: SourceRecoveryState::WorkerExact,
                 reason: SourceRecoveryReason::ClearBarrier,
             })
         );
@@ -1159,21 +1197,21 @@ mod tests {
         };
         assert!(has_line(
             "vllm_router_kv_source_recovery_state",
-            &["state=\"exact\"", "reason=\"clear_barrier\"",],
+            &["state=\"worker_exact\"", "reason=\"clear_barrier\"",],
             " 1"
         ));
         assert!(has_line(
             "vllm_router_kv_source_recovery_transitions_total",
             &[
                 "from=\"fallback\"",
-                "to=\"exact\"",
+                "to=\"worker_exact\"",
                 "reason=\"clear_barrier\"",
             ],
             " 1"
         ));
         assert!(has_line(
             "vllm_router_kv_source_recovery_duration_seconds_count",
-            &["outcome=\"exact\""],
+            &["outcome=\"worker_exact\""],
             " 1"
         ));
         assert!(has_line(
@@ -1199,13 +1237,13 @@ mod tests {
         };
         assert!(has_line(
             "vllm_router_kv_source_recovery_state",
-            &["state=\"exact\"", "reason=\"clear_barrier\"",],
+            &["state=\"worker_exact\"", "reason=\"clear_barrier\"",],
             " 0"
         ));
         assert!(has_line(
             "vllm_router_kv_source_recovery_transitions_total",
             &[
-                "from=\"exact\"",
+                "from=\"worker_exact\"",
                 "to=\"forgotten\"",
                 "reason=\"source_retired\"",
             ],

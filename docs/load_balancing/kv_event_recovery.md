@@ -14,10 +14,14 @@ Opt in to authoritative-history recovery using `--kv-event-strict-recovery`
 the corresponding RouterConfig boolean. It defaults to false in old JSON
 configurations as well. The setting applies to regular and P/D event subscribers.
 
-In strict mode, only `exact` placement is credited. `cold`, `degraded`, and
-`fallback` remain hidden. Ordinary `BlockStored` events do not leave fallback.
-Recovery requires contiguous replay from a trustworthy boundary, a validated
-`AllBlocksCleared`, or a new stream observed from sequence zero. A publisher
+Strict mode credits all covered tiers in `exact`. After a gap, a validated
+`AllBlocksCleared` establishes a boundary for worker-owned blocks only. The
+state becomes `worker_exact`: worker-owned placements can earn credit, while
+external pool placements remain hidden until complete history is recovered.
+A clear on an already exact stream preserves external placements. Compatibility
+mode credits fresh observations as `observed` after loss. In strict mode,
+ordinary stores cannot promote a source to exact. A contiguous authoritative
+replay or a new stream observed from sequence zero establishes full history. A publisher
 restart detected through a decreasing sequence resets the local cursor; a
 validated new sequence zero can establish Exact again.
 
@@ -54,15 +58,24 @@ already-incomplete local index is not an authoritative source snapshot.
 
 ## Retry and lifecycle rules
 
-Failed or superseded recovery attempts use per-subscriber exponential backoff
-(2, 4, 8 seconds after successive failures) and at most three attempts before
-an authoritative boundary or successful replay resets the budget. Backoff does
-not sleep the live ingestion loop. Gaps still revoke old claims while replay is
-suppressed, including in compatibility mode. Retries are driven by subsequent
-gap/rejected frames, not a periodic timer. Exhaustion does not restart itself in
-a healthy contiguous stream; strict mode can remain fallback as described above.
+A failed or unavailable replay consumes one of three attempts per subscriber.
+The first two failures impose delays of 2 and 4 seconds before another attempt;
+a subsequent gap or rejected frame drives the retry. After the third failure
+the source falls back with reason `retry_exhausted`. A superseded attempt
+consumes no retry budget and does not itself advance the signal-loss epoch.
 
-Each recovery has a unique local attempt ID. Finishing a stale attempt cannot
+Repeated bad frames in the same loss episode do not repeatedly flush placement
+and Program warm candidates. After a validated owned batch, a new gap must
+again discard any intervening observations, including while retries are suppressed.
+A successful replay or authoritative boundary resets the budget. A healthy
+contiguous stream alone does not re-arm an exhausted budget. If the publisher
+continues in the same incarnation, an operator can explicitly clear its KV cache
+and have the router observe the validated clear event to restore worker-local credit
+and re-arm retries.
+
+Each recovery has a unique local attempt ID. Before applying each replay batch,
+the subscriber checks the attempt under the same mutation lock used for source
+invalidation. A superseded replay stops before writing another batch. Finishing a stale attempt cannot
 restore placement or replace the reason set by an external invalidation. State
 mutators and replay completion serialize inside the indexer; callers do not
 need to rely solely on the subscriber lease convention. Source leases still
@@ -93,7 +106,7 @@ nor a transport failure. Its existing invalidation reason is preserved.
 Example alert expressions (choose windows and severity for the deployment):
 
 ```promql
-sum(increase(vllm_router_kv_source_recovery_transitions_total{from="exact",to=~"degraded|fallback"}[5m])) > 0
+sum(increase(vllm_router_kv_source_recovery_transitions_total{from=~"exact|worker_exact",to=~"degraded|fallback"}[5m])) > 0
 ```
 
 ```promql

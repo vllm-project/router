@@ -134,6 +134,8 @@ pub enum ClearScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SourceRecoveryState {
     Cold,
+    /// Strict recovery after a worker-domain clear with incomplete pool history.
+    WorkerExact,
     Exact,
     Observed,
     Degraded,
@@ -144,6 +146,7 @@ impl SourceRecoveryState {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Cold => "cold",
+            Self::WorkerExact => "worker_exact",
             Self::Exact => "exact",
             Self::Observed => "observed",
             Self::Degraded => "degraded",
@@ -159,6 +162,7 @@ pub(crate) enum SourceRecoveryReason {
     InitialSequence,
     SequenceGap,
     ReplayApplied,
+    RetryExhausted,
     ReplayUnavailable,
     ReplayFailed,
     InvalidFrame,
@@ -176,6 +180,7 @@ impl SourceRecoveryReason {
             Self::InitialSequence => "initial_sequence",
             Self::SequenceGap => "sequence_gap",
             Self::ReplayApplied => "replay_applied",
+            Self::RetryExhausted => "retry_exhausted",
             Self::ReplayUnavailable => "replay_unavailable",
             Self::ReplayFailed => "replay_failed",
             Self::InvalidFrame => "invalid_frame",
