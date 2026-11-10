@@ -5,7 +5,8 @@
 
 use std::collections::HashSet;
 
-use super::{Locality, RoutableTarget, StorageTier, TierMatch};
+use super::super::wire::BlockStored;
+use super::super::{Locality, RoutableTarget, StorageTier, TierMatch};
 
 /// The verified restore rule for a cache group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,8 +127,44 @@ fn longest_supported(group: &HybridGroupView<'_>, target: &RoutableTarget, cap: 
     best
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HybridEventGroup {
+    pub group_idx: u32,
+    /// The verified cache block size in tokens, not the hash granularity.
+    pub block_size: u32,
+    pub kind: HybridGroupKind,
+}
+
+pub(super) fn event_kind_matches(kind: HybridGroupKind, store: &BlockStored) -> bool {
+    let spec = store.kv_cache_spec_kind.as_deref();
+    match kind {
+        HybridGroupKind::FullAttention => {
+            spec == Some("full_attention") && store.kv_cache_spec_sliding_window.is_none()
+        }
+        HybridGroupKind::Checkpoint => {
+            spec == Some("mamba") && store.kv_cache_spec_sliding_window.is_none()
+        }
+    }
+}
+
+pub(super) fn stored_shape_matches(kind: HybridGroupKind, store: &BlockStored) -> bool {
+    let block_size = store.block_size as usize;
+    if block_size == 0 || store.token_ids.is_empty() {
+        return false;
+    }
+    if !store.token_ids.len().is_multiple_of(block_size) {
+        return false;
+    }
+    let blocks = store.token_ids.len() / block_size;
+    match kind {
+        HybridGroupKind::Checkpoint => store.block_hashes.len() <= blocks,
+        _ => store.block_hashes.len() == blocks,
+    }
+}
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
+
     use std::sync::Arc;
 
     use super::*;
