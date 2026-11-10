@@ -245,6 +245,7 @@ pub fn spawn_zmq(
                 required_through,
                 "hybrid subscription barrier reached"
             );
+            let mut failures = 0u32;
             loop {
                 if stopped(&shutdown_rx) || !stream.is_active(lease) {
                     return Ok(());
@@ -264,9 +265,11 @@ pub fn spawn_zmq(
                 let Some(mut next) = next else {
                     tracing::debug!("hybrid replay produced no usable history");
                     stream.invalidate_replay(lease).map_err(|_| ())?;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(replay_backoff(failures)).await;
+                    failures = failures.saturating_add(1);
                     continue;
                 };
+                failures = 0;
                 tracing::debug!(next, "hybrid replay complete");
                 let mut replaying = true;
                 loop {
@@ -348,6 +351,14 @@ pub fn spawn_zmq(
     })
 }
 
+/// Backoff for a replay that cannot recover its origin. A publisher that
+/// evicted sequence 0 cannot answer a request from zero, so retrying at a fixed
+/// interval only spins; double the wait up to five seconds and reset it once a
+/// replay lands.
+fn replay_backoff(failures: u32) -> Duration {
+    Duration::from_millis((100u64 << failures.min(6)).min(5_000))
+}
+
 fn stopped(rx: &watch::Receiver<bool>) -> bool {
     *rx.borrow() || rx.has_changed().is_err()
 }
@@ -426,6 +437,15 @@ mod tests {
     use crate::kv_index::hybrid::layout::HybridEventGroup;
     use crate::kv_index::hybrid::HybridGroupKind;
     use crate::kv_index::RoutableTarget;
+
+    #[test]
+    fn replay_backoff_doubles_and_caps() {
+        assert_eq!(replay_backoff(0), Duration::from_millis(100));
+        assert_eq!(replay_backoff(1), Duration::from_millis(200));
+        assert_eq!(replay_backoff(5), Duration::from_millis(3_200));
+        assert_eq!(replay_backoff(6), Duration::from_millis(5_000));
+        assert_eq!(replay_backoff(30), Duration::from_millis(5_000));
+    }
 
     #[test]
     fn retired_subscriber_cannot_change_replacement_replay() {
