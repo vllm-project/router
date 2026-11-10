@@ -506,7 +506,14 @@ async fn decode_targets(
             .await
         {
             let endpoint = discovered_target(&address);
-            for rank in dp_utils::expand_dp_ranks(endpoint.dp_rank, size) {
+            let ranks = match dp_utils::expand_dp_ranks(&endpoint.id, size) {
+                Ok(ranks) => ranks,
+                Err(error) => {
+                    warn!(%error, "Invalid discovered Program decode target");
+                    return Vec::new();
+                }
+            };
+            for rank in ranks {
                 targets.push(ProgramTarget {
                     id: match rank {
                         Some(rank) => format!("{}@{rank}", endpoint.base_url),

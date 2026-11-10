@@ -36,6 +36,8 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+type ProgramPrefillCandidate = (String, Arc<dyn Worker>);
+
 /// Mooncake prefill bootstrap info (engine_id per dp_rank)
 #[derive(Debug, Clone)]
 struct MooncakePrefillInfo {
@@ -907,7 +909,10 @@ impl VllmPDRouter {
         request
     }
 
-    async fn discovered_workers(&self, service_type: ServiceType) -> Vec<Arc<dyn Worker>> {
+    async fn discovered_workers(
+        &self,
+        service_type: ServiceType,
+    ) -> Result<Vec<Arc<dyn Worker>>, String> {
         let instances = self
             .service_registry
             .get_routing_snapshots(
@@ -919,8 +924,10 @@ impl VllmPDRouter {
         self.discovery_candidates(instances, service_type)
     }
 
-    async fn discovery_pools(&self) -> (Vec<Arc<dyn Worker>>, Vec<Arc<dyn Worker>>) {
-        tokio::join!(
+    async fn discovery_pools(
+        &self,
+    ) -> Result<(Vec<Arc<dyn Worker>>, Vec<Arc<dyn Worker>>), String> {
+        tokio::try_join!(
             self.discovered_workers(ServiceType::Prefill),
             self.discovered_workers(ServiceType::Decode)
         )
@@ -930,11 +937,12 @@ impl VllmPDRouter {
         &self,
         instances: Vec<(String, String, usize)>,
         service_type: ServiceType,
-    ) -> Vec<Arc<dyn Worker>> {
+    ) -> Result<Vec<Arc<dyn Worker>>, String> {
         let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
         for (address, _, dp_size) in instances {
-            let (base, rank) = dp_utils::parse_worker_url(&address);
-            let url = if base.contains("://") {
+            let (base, _) = dp_utils::parse_worker_url(&address);
+            let ranks = dp_utils::expand_dp_ranks(&address, dp_size)?;
+            let url = if base.starts_with("http://") || base.starts_with("https://") {
                 base.clone()
             } else {
                 format!("http://{base}")
@@ -945,7 +953,6 @@ impl VllmPDRouter {
                 },
                 ServiceType::Decode => WorkerType::Decode,
             };
-            let ranks = dp_utils::expand_dp_ranks(rank, dp_size);
             for rank in ranks {
                 let worker: Arc<dyn Worker> = match rank {
                     Some(rank) => {
@@ -964,7 +971,7 @@ impl VllmPDRouter {
         workers.sort_by(|left, right| {
             PdEndpoint::for_worker(left.as_ref()).cmp(&PdEndpoint::for_worker(right.as_ref()))
         });
-        workers
+        Ok(workers)
     }
 
     /// Stable session identity for the optional kv_aware decode binding.
@@ -1139,8 +1146,14 @@ impl VllmPDRouter {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let decode_targets = if self.use_discovery {
-            self.discovered_workers(ServiceType::Decode)
-                .await
+            let workers = match self.discovered_workers(ServiceType::Decode).await {
+                Ok(workers) => workers,
+                Err(error) => {
+                    RouterMetrics::record_pd_error("server_selection");
+                    return Some((StatusCode::SERVICE_UNAVAILABLE, error).into_response());
+                }
+            };
+            workers
                 .iter()
                 .map(pd_program_adapter::worker_target)
                 .collect::<Vec<_>>()
@@ -1174,26 +1187,43 @@ impl VllmPDRouter {
                 "Program decode target left the pool",
             ));
         };
+        // Snapshot once per turn: upstream returns a Result now, and the
+        // cold fallback below reuses the selection made from this snapshot.
+        let prefill_candidates = match self.program_prefill_candidates().await {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                RouterMetrics::record_pd_error("server_selection");
+                return Some(program_unavailable(&completion, &error));
+            }
+        };
+        // One selection per turn. The warm-remote attempt consumes this turn's
+        // selection, and a cold fallback dispatches the P it already chose
+        // instead of asking the policy a second time. The selection also takes
+        // the same request inputs as the cold path (prompt text or cache routing
+        // key, plus headers), so hash and cache-aware policies keep their
+        // affinity on the warm path too.
+        let mut selected = None;
         if let Some(warm_remote) = &runtime.warm_remote {
             // The warm-remote protocol has no discovery incarnation fence, and
             // execute() rejects discovery; keep discovery on the native PD path.
             if !self.use_discovery && matches!(self.kv_connector, KvConnector::Nixl) {
-                let prefill_workers = self
-                    .pd_router
-                    .worker_registry
-                    .get_prefill_workers()
-                    .into_iter()
-                    .filter(|w| w.is_available())
-                    .collect::<Vec<_>>();
-                let prefills = prefill_workers
+                // Only the warm attempt consumes the bare worker list; the cold
+                // path derives its own from `prefill_candidates`.
+                let prefill_workers = prefill_candidates
                     .iter()
-                    .map(pd_program_adapter::worker_target)
+                    .map(|(_, worker)| worker.clone())
                     .collect::<Vec<_>>();
-                let selection = self
-                    .policy_registry
-                    .get_prefill_policy()
-                    .select_worker(&prefill_workers, None);
-                if let Some(index) = selection {
+                if let Some(index) =
+                    self.select_program_prefill_index(&prefill_workers, &request, path, headers)
+                {
+                    // The target and the worker it charges travel together, so
+                    // execute() derives both from the same index.
+                    let prefills = prefill_candidates
+                        .iter()
+                        .map(|(_, worker)| {
+                            (pd_program_adapter::worker_target(worker), worker.clone())
+                        })
+                        .collect::<Vec<_>>();
                     let started = Instant::now();
                     if let Some(result) = super::pd_warm_remote::execute(
                         runtime,
@@ -1207,7 +1237,6 @@ impl VllmPDRouter {
                         &decode_targets,
                         index,
                         &self.pd_router.pd_load,
-                        prefill_workers[index].clone(),
                         decode_worker.clone(),
                     )
                     .await
@@ -1230,12 +1259,16 @@ impl VllmPDRouter {
                             }
                         });
                     }
+                    // execute() declined the warm/local protocol for this turn
+                    // (request shape, engine capability): the cold path reuses
+                    // the P selected above rather than consuming a second one.
+                    selected = Some(prefill_candidates[index].clone());
                 }
             }
         }
-        let prefill_candidates = self.program_prefill_candidates().await;
-        let selected = self.select_program_prefill(&prefill_candidates, &request, path, headers);
-        let Some((prefill_id, prefill_worker)) = selected else {
+        let Some((prefill_id, prefill_worker)) = selected
+            .or_else(|| self.select_program_prefill(&prefill_candidates, &request, path, headers))
+        else {
             RouterMetrics::record_pd_error("server_selection");
             return Some(program_unavailable(
                 &completion,
@@ -1293,6 +1326,7 @@ impl VllmPDRouter {
             return self
                 .discovered_workers(ServiceType::Decode)
                 .await
+                .ok()?
                 .into_iter()
                 .find(|worker| pd_program_adapter::worker_target(worker).id == target_id);
         }
@@ -1308,7 +1342,7 @@ impl VllmPDRouter {
     /// P candidates as `(admission id, worker)`. Discovered registrations stay
     /// keyed by their registration so a rank expansion cannot change the
     /// prefill capacity gate it is charged to.
-    async fn program_prefill_candidates(&self) -> Vec<(String, Arc<dyn Worker>)> {
+    async fn program_prefill_candidates(&self) -> Result<Vec<ProgramPrefillCandidate>, String> {
         if self.use_discovery {
             let mut candidates = Vec::new();
             for snapshot in self
@@ -1321,19 +1355,20 @@ impl VllmPDRouter {
                 .await
             {
                 let id = pd_program_adapter::discovered_target(&snapshot.0).id;
-                for worker in self.discovery_candidates(vec![snapshot], ServiceType::Prefill) {
+                for worker in self.discovery_candidates(vec![snapshot], ServiceType::Prefill)? {
                     candidates.push((id.clone(), worker));
                 }
             }
-            candidates
+            Ok(candidates)
         } else {
-            self.pd_router
+            Ok(self
+                .pd_router
                 .worker_registry
                 .get_prefill_workers()
                 .into_iter()
                 .filter(|worker| worker.is_available())
                 .map(|worker| (pd_program_adapter::worker_target(&worker).id, worker))
-                .collect()
+                .collect())
         }
     }
 
@@ -1341,7 +1376,7 @@ impl VllmPDRouter {
     /// prefill worker.
     fn select_program_prefill(
         &self,
-        candidates: &[(String, Arc<dyn Worker>)],
+        candidates: &[ProgramPrefillCandidate],
         request: &Value,
         path: &str,
         headers: Option<&HeaderMap>,
@@ -1349,11 +1384,31 @@ impl VllmPDRouter {
         if candidates.is_empty() {
             return None;
         }
-        let policy = self.policy_registry.get_prefill_policy();
         let workers = candidates
             .iter()
             .map(|(_, worker)| worker.clone())
             .collect::<Vec<_>>();
+        let index = self.select_program_prefill_index(&workers, request, path, headers)?;
+        candidates.get(index).cloned()
+    }
+
+    /// The single place Program turns ask the prefill policy for an index.
+    ///
+    /// Warm-remote and cold dispatch share it so a turn consumes exactly one
+    /// selection and both paths feed the policy the same inputs: the prompt or
+    /// cache routing key when the policy reads the request, and the request
+    /// headers when it needs affinity.
+    fn select_program_prefill_index(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request: &Value,
+        path: &str,
+        headers: Option<&HeaderMap>,
+    ) -> Option<usize> {
+        if workers.is_empty() {
+            return None;
+        }
+        let policy = self.policy_registry.get_prefill_policy();
         let request_text = if policy.needs_cache_routing_key() {
             Some(crate::protocols::spec::cache_routing::for_route(
                 request, path,
@@ -1366,48 +1421,34 @@ impl VllmPDRouter {
         let policy_headers = policy
             .needs_headers()
             .then(|| header_utils::to_policy_headers(headers).unwrap_or_default());
-        let index = policy.select_worker_with_headers(
-            &workers,
-            request_text.as_deref(),
-            policy_headers.as_ref(),
-        )?;
-        Some(candidates[index].clone())
+        // Both callers index the worker slice with this value. A policy that
+        // returns an out-of-range index is a policy bug, but it must degrade to
+        // the same "no feasible P" 503 as an empty pool instead of panicking the
+        // request task.
+        policy
+            .select_worker_with_headers(workers, request_text.as_deref(), policy_headers.as_ref())
+            .filter(|index| *index < workers.len())
     }
 
     /// Recheck the bound endpoints after a capacity wait: an expired
     /// registration or a removed worker must not receive the dispatch.
     async fn program_targets_are_live(&self, prefill_id: &str, decode_id: &str) -> bool {
-        if self.use_discovery {
-            let prefill_live =
-                self.service_registry
-                    .get_prefill_instances()
-                    .iter()
-                    .any(|(address, _)| {
-                        pd_program_adapter::discovered_target(address).id == prefill_id
-                    });
-            let decode_live = self.program_decode_worker(decode_id).await.is_some();
-            prefill_live && decode_live
+        let prefill_live = if self.use_discovery {
+            self.service_registry
+                .get_prefill_instances()
+                .iter()
+                .any(|(address, _)| pd_program_adapter::discovered_target(address).id == prefill_id)
         } else {
-            let prefill_live = self
-                .pd_router
+            self.pd_router
                 .worker_registry
                 .get_prefill_workers()
                 .iter()
                 .any(|worker| {
                     worker.is_available()
                         && pd_program_adapter::worker_target(worker).id == prefill_id
-                });
-            let decode_live = self
-                .pd_router
-                .worker_registry
-                .get_decode_workers()
-                .iter()
-                .any(|worker| {
-                    worker.is_available()
-                        && pd_program_adapter::worker_target(worker).id == decode_id
-                });
-            prefill_live && decode_live
-        }
+                })
+        };
+        prefill_live && self.program_decode_worker(decode_id).await.is_some()
     }
 
     /// Select a P/D pair among the discovered instances. Request headers reach
@@ -1417,8 +1458,8 @@ impl VllmPDRouter {
         request: &Value,
         path: &str,
         headers: Option<&HeaderMap>,
-    ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>, PdAttempt)> {
-        let (prefill_workers, decode_workers) = self.discovery_pools().await;
+    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>, PdAttempt), String> {
+        let (prefill_workers, decode_workers) = self.discovery_pools().await?;
         let (selection, attempt) = self
             .admit_pair(
                 &prefill_workers,
@@ -1428,8 +1469,9 @@ impl VllmPDRouter {
                 headers,
                 true,
             )
-            .await?;
-        Some((
+            .await
+            .ok_or_else(|| "No eligible P/D pair".to_string())?;
+        Ok((
             prefill_workers[selection.prefill.worker_index].clone(),
             decode_workers[selection.decode.worker_index].clone(),
             attempt,
@@ -1443,12 +1485,14 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Response {
-        let Some((prefill_worker, decode_worker, attempt)) =
-            self.admit_discovered_pair(&request, path, headers).await
-        else {
-            RouterMetrics::record_pd_error("server_selection");
-            return (StatusCode::SERVICE_UNAVAILABLE, "No eligible P/D pair").into_response();
-        };
+        let (prefill_worker, decode_worker, attempt) =
+            match self.admit_discovered_pair(&request, path, headers).await {
+                Ok(pair) => pair,
+                Err(error) => {
+                    RouterMetrics::record_pd_error("server_selection");
+                    return (StatusCode::SERVICE_UNAVAILABLE, error).into_response();
+                }
+            };
         match self
             .process_vllm_two_stage_request(
                 request,
@@ -1689,7 +1733,7 @@ impl VllmPDRouter {
                     .prepare(
                         &self.http_client,
                         original_request,
-                        prefill_worker.base_url(),
+                        prefill_worker.url(),
                         headers,
                         std::env::var("OPENAI_API_KEY").ok().as_deref(),
                     )
@@ -2799,7 +2843,10 @@ impl RouterTrait for VllmPDRouter {
             // pair from the discovered instances and run it through the same
             // admission path as real traffic, so health checks cannot select
             // by different rules (or fail outright on the empty registry).
-            let (prefill_workers, decode_workers) = self.discovery_pools().await;
+            let (prefill_workers, decode_workers) = match self.discovery_pools().await {
+                Ok(workers) => workers,
+                Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+            };
             return self
                 .pd_router
                 .health_generate_for_workers(&prefill_workers, &decode_workers)
@@ -4681,6 +4728,80 @@ mod tests {
         assert!(!discovery_is_ready(0, 1));
         assert!(discovery_is_ready(1, 1));
         assert!(discovery_is_ready(2, 3));
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_bad_pin_without_using_partial_pool() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend_calls = calls.clone();
+        let url = spawn_test_server(axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let calls = backend_calls.clone();
+            async move {
+                if uri.path() != "/metrics" {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                }
+                StatusCode::OK
+            }
+        }))
+        .await;
+        for service in [ServiceType::Prefill, ServiceType::Decode] {
+            let mut router = test_vllm_pd_router().await;
+            router.use_discovery = true;
+            Arc::make_mut(&mut router.pd_router.config).intra_node_data_parallel_size = 2;
+            for role in [ServiceType::Prefill, ServiceType::Decode] {
+                router
+                    .service_registry
+                    .register_service(format!("{url}@1"), String::new(), role);
+            }
+            let response = router.health_generate(Request::new(Body::empty())).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            calls.store(0, Ordering::Relaxed);
+            router
+                .service_registry
+                .register_service(format!("{url}@5"), String::new(), service);
+            let responses = [
+                router.health_generate(Request::new(Body::empty())).await,
+                router
+                    .route_transparent(
+                        None,
+                        "/v1/completions",
+                        &Method::POST,
+                        json!({"model": "test", "prompt": "hello"}),
+                    )
+                    .await,
+            ];
+            for response in responses {
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap();
+                let message = std::str::from_utf8(&bytes).unwrap();
+                assert!(message.contains(&format!("{url}@5")), "{message}");
+                assert!(message.contains("outside DP size 2"), "{message}");
+            }
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert!(router.pd_router.pd_load.snapshot().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn discovered_workers_reject_out_of_range_pinned_ranks() {
+        let router = test_vllm_pd_router().await;
+        for service in [ServiceType::Prefill, ServiceType::Decode] {
+            for rank in [2, 5] {
+                let instances = [1, rank]
+                    .into_iter()
+                    .map(|rank| (format!("worker:8000@{rank}"), String::new(), 2))
+                    .collect();
+                let error = router
+                    .discovery_candidates(instances, service.clone())
+                    .unwrap_err();
+                assert!(error.contains(&format!("worker:8000@{rank}")), "{error}");
+                assert!(error.contains("outside DP size 2"), "{error}");
+            }
+        }
     }
 
     #[tokio::test]
