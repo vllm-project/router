@@ -152,6 +152,7 @@ impl RequestLoadGuard {
                 let attempt = receipt
                     .predicted_cached_tokens
                     .or(receipt.multi_prompt.then_some(0))
+                    .filter(|_| !crate::backend::is_grpc_url(worker.url()))
                     .map(|cached_tokens| {
                         KvRouteAttempt::new(KvRoutePrediction {
                             target: receipt.decision.target.clone(),
@@ -3524,6 +3525,33 @@ mod tests {
         fn drop(&mut self) {
             self.server.abort();
         }
+    }
+
+    #[test]
+    fn grpc_selection_tracks_load_without_creating_a_kv_observation() {
+        let url = "grpc://worker:8000";
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url.into(), WorkerType::Regular));
+        worker.increment_load();
+        let receipt = KvSelectionReceipt {
+            worker_index: 0,
+            new_prefill_tokens: 4,
+            predicted_cached_tokens: Some(16),
+            multi_prompt: false,
+            decision: crate::policies::CostDecision {
+                target: crate::kv_index::RoutableTarget {
+                    instance_id: url.into(),
+                    dp_rank: 0,
+                },
+                cost: 4.0,
+                components: Default::default(),
+            },
+            slot: None,
+        };
+        let guard = RequestLoadGuard::from_selection(worker.clone(), Some(receipt), false);
+        assert!(guard.kv_attempt().is_none());
+        assert_eq!(worker.load(), 1);
+        drop(guard);
+        assert_eq!(worker.load(), 0);
     }
 
     async fn completion_response_fixture() -> CompletionResponseFixture {
