@@ -723,6 +723,22 @@ impl ProgramScheduler {
         target_id: &str,
         now: Instant,
     ) -> Option<RankAdmissionPlan> {
+        self.rank_admission_plan_for_context(state, program, target_id, now, None)
+    }
+
+    /// Admission gate for an explicit demand, without mutating state.
+    ///
+    /// `None` uses the queued front turn's applied context; `Some(tokens)`
+    /// evaluates the same count/reserve/batch-gain checks for a counterfactual
+    /// demand (for example the prepared count in shadow mode).
+    pub(crate) fn rank_admission_plan_for_context(
+        &self,
+        state: &ProgramSchedulerState,
+        program: &ProgramRef,
+        target_id: &str,
+        now: Instant,
+        context_override: Option<usize>,
+    ) -> Option<RankAdmissionPlan> {
         let runtime = state.runtime.view(program)?;
         let decision = state.decisions.get(program)?;
         if !self.config.global_queue && decision.last_target.as_deref() != Some(target_id) {
@@ -770,11 +786,14 @@ impl ProgramScheduler {
             .front_request_hints(program)
             .and_then(|hints| hints.expected_output_tokens);
         // Charge the front turn's own prompt. A later retained turn with a
-        // larger prompt must not inflate the front turn's capacity check.
-        let context_tokens = state
-            .runtime
-            .front_request_context(program)
-            .unwrap_or(decision.context_tokens);
+        // larger prompt must not inflate the front turn's capacity check. A
+        // counterfactual caller supplies its own demand instead.
+        let context_tokens = context_override.unwrap_or_else(|| {
+            state
+                .runtime
+                .front_request_context(program)
+                .unwrap_or(decision.context_tokens)
+        });
         let required_tokens = decision.private_tokens_from_context(
             context_tokens,
             self.config.progress_ttl.decode_buffer_tokens,
@@ -862,15 +881,13 @@ impl ProgramScheduler {
                         .map(|decision| decision.context_tokens)
                 })
                 .sum(),
-            candidate_context_tokens: decision.context_tokens,
+            candidate_context_tokens: context_tokens,
             used_tokens,
             required_tokens,
             protected_remaining_rounds: &protected_rounds,
             protected_recovery_cost_seconds: &protected_costs,
             candidate_recovery_cost_seconds: self.policy.cache_miss_impact_seconds(
-                decision
-                    .context_tokens
-                    .saturating_sub(decision.shared_prefix_tokens),
+                context_tokens.saturating_sub(decision.shared_prefix_tokens),
             ),
         });
         estimate.admits.then_some(RankAdmissionPlan {

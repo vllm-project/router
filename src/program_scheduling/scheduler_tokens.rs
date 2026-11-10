@@ -87,6 +87,13 @@ impl ProgramScheduler {
 
     /// Counterfactual outcome for one sampled admission, split out so tests can
     /// assert it without scraping metrics.
+    ///
+    /// Only an actual queued admission is sampled: the Program must be
+    /// paused/reasoning with exactly one retained front turn. Both the applied
+    /// and the prepared demand are then evaluated by the same rank admission
+    /// plan the dispatcher uses (count, low watermark, growth reserve, and
+    /// batch-gain admission), so the counterfactual cannot disagree with the
+    /// real gate by construction.
     pub(crate) fn shadow_admission_outcome(
         &self,
         state: &ProgramSchedulerState,
@@ -95,77 +102,29 @@ impl ProgramScheduler {
         now: Instant,
     ) -> Option<&'static str> {
         let decision = state.decisions.get(program)?;
-        let shadow_required = decision.shadow_private_tokens_with_output(
-            self.config.progress_ttl.decode_buffer_tokens,
-            decision.output_token_reservation,
-        )?;
-        let capacity = self.config.progress_ttl.token_capacity;
-        let applied_required = decision.private_tokens_with_output(
-            self.config.progress_ttl.decode_buffer_tokens,
-            decision.output_token_reservation,
-        );
-        let used = self.target_usage(state, target_id, now);
-        // For a later turn of an already-active Program the usage and the
-        // active count already include this Program. Compare only what its new
-        // demand would add instead of charging the full demand twice. The
-        // subtraction uses the Router ledger, not a native usage sample: the
-        // sample measures real KV, so subtracting an estimated demand from it
-        // would bias the counterfactual whenever the estimate is off.
-        let active_here = state
-            .runtime
-            .view(program)
-            .and_then(|view| view.placement.clone())
-            .is_some_and(|placement| placement == target_id);
-        let used_for_check = if active_here {
-            (self.ledger_target_usage(state, target_id) - applied_required).max(0.0)
-        } else {
-            used
-        };
-        let active_count = state
-            .runtime
-            .iter_views()
-            .filter(|other| {
-                other.state == super::ProgramState::Active && other.placement == Some(target_id)
-            })
-            .count();
-        let count_fits = if active_here {
-            active_count <= self.config.max_active_programs_per_target
-        } else {
-            active_count.saturating_add(1) <= self.config.max_active_programs_per_target
-        };
-        let (applied_fits, shadow_fits) = match capacity {
-            Some(capacity) => {
-                let low = capacity as f64 * self.config.progress_ttl.low_watermark_ratio;
-                (
-                    count_fits && used_for_check + applied_required <= low,
-                    count_fits && used_for_check + shadow_required <= low,
-                )
-            }
-            None => (count_fits, count_fits),
-        };
+        let shadow_tokens = decision.shadow_context_facts.map(|facts| facts.tokens())?;
+        if self.config.pd_mode {
+            return None;
+        }
+        let runtime = state.runtime.view(program)?;
+        if runtime.state != super::ProgramState::Paused
+            || runtime.status != super::ProgramStatus::Reasoning
+            || runtime.waiting_requests != 1
+        {
+            return None;
+        }
+        let applied_fits = self
+            .rank_admission_plan_for_context(state, program, target_id, now, None)
+            .is_some();
+        let shadow_fits = self
+            .rank_admission_plan_for_context(state, program, target_id, now, Some(shadow_tokens))
+            .is_some();
         Some(match (applied_fits, shadow_fits) {
             (true, true) => "both_admit",
             (false, false) => "both_deny",
             (true, false) => "estimate_admits_exact_denies",
             (false, true) => "estimate_denies_exact_admits",
         })
-    }
-
-    /// Router-ledger usage on one target, excluding native KV samples.
-    ///
-    /// Shadow counterfactuals compare like with like: both sides are Router
-    /// demand, so the baseline must be the ledger rather than a usage sample
-    /// that measures the Engine's real KV.
-    fn ledger_target_usage(&self, state: &ProgramSchedulerState, target_id: &str) -> f64 {
-        state
-            .runtime
-            .iter_views()
-            .filter(|program| {
-                program.state == super::ProgramState::Active && program.placement == Some(target_id)
-            })
-            .filter_map(|program| state.decisions.get(program.reference))
-            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens))
-            .sum()
     }
 
     /// Compare one prepared arrival count with the Engine-observed count.
@@ -283,9 +242,10 @@ impl ProgramScheduler {
 mod tests {
     use super::*;
     use crate::program_scheduling::{
-        ProgramSchedulerConfig, ProgramTarget, TokenFactSource, TokenFacts,
+        ProgramSchedulerConfig, ProgramTarget, RequestSample, TokenFactSource, TokenFacts,
     };
     use serde_json::json;
+    use std::time::Duration;
 
     fn target() -> ProgramTarget {
         ProgramTarget {
@@ -436,26 +396,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shadow_outcome_does_not_charge_an_active_program_twice() {
+    async fn shadow_outcome_is_only_sampled_for_a_queued_front_turn() {
+        // An already-active Program has no admission gate to counterfactually
+        // evaluate, so shadow sampling must not report an outcome for it.
         let mut config = ProgramSchedulerConfig {
             token_count_mode: TokenCountMode::Shadow,
             ..ProgramSchedulerConfig::default()
         };
         config.progress_ttl.token_capacity = Some(100_000);
-        config.max_active_programs_per_target = 1;
         let scheduler = ProgramScheduler::new(config);
         let fingerprint = TokenizerFingerprint::from_parts(&["model", "active"]);
-        let arrival = ArrivalTokenFacts::new(
-            60_000,
-            Some(TokenFacts::prepared_token_ids(40_000, fingerprint)),
+        let context = scheduler.resolve_arrival_tokens(
+            "model",
+            ArrivalTokenFacts::new(
+                60_000,
+                Some(TokenFacts::prepared_token_ids(40_000, fingerprint)),
+            ),
         );
-        let context = scheduler.resolve_arrival_tokens("model", arrival);
         let dispatch = scheduler
             .acquire(identity(), context, std::slice::from_ref(&target()), None)
             .await
             .unwrap();
+        assert_eq!(dispatch.context_tokens(), 60_000);
         let state = scheduler.state.lock();
-        // Used tokens and the active count both already include this Program.
         assert_eq!(
             scheduler.shadow_admission_outcome(
                 &state,
@@ -463,34 +426,24 @@ mod tests {
                 "rank-0",
                 Instant::now()
             ),
-            Some("both_admit")
+            None
         );
     }
 
-    #[tokio::test]
-    async fn shadow_outcome_for_a_new_program_still_charges_its_full_demand() {
+    #[test]
+    fn shadow_outcome_uses_the_real_rank_admission_gate() {
+        // The applied 45k demand exceeds a 40k rank while the prepared 30k
+        // fits, and the queue has no active Program (batch-gain admission is
+        // disabled), so the real gate yields the exact-deny counterfactual.
         let mut config = ProgramSchedulerConfig {
             token_count_mode: TokenCountMode::Shadow,
             ..ProgramSchedulerConfig::default()
         };
-        config.progress_ttl.token_capacity = Some(100_000);
+        config.progress_ttl.token_capacity = Some(40_000);
+        config.progress_ttl.decode_buffer_tokens = 10;
         let scheduler = ProgramScheduler::new(config);
-        let target = target();
-        // Program A holds 60k of the rank.
-        let resident =
-            scheduler.resolve_arrival_tokens("model", ArrivalTokenFacts::estimated_only(60_000));
-        scheduler
-            .acquire(
-                identity_named("resident"),
-                resident,
-                std::slice::from_ref(&target),
-                None,
-            )
-            .await
-            .unwrap();
-        // Program B arrives with an over-estimated 45k and an exact 30k:
-        // 60+45 > 100 denies by estimate, 60+30 <= 100 admits by exact count.
-        let fingerprint = TokenizerFingerprint::from_parts(&["model", "new"]);
+        scheduler.sync_targets("model", std::slice::from_ref(&target()));
+        let fingerprint = TokenizerFingerprint::from_parts(&["model", "queued"]);
         let context = scheduler.resolve_arrival_tokens(
             "model",
             ArrivalTokenFacts::new(
@@ -498,21 +451,93 @@ mod tests {
                 Some(TokenFacts::prepared_token_ids(30_000, fingerprint)),
             ),
         );
+        assert_eq!(context.tokens(), 45_000);
+        assert_eq!(context.shadow_tokens(), Some(30_000));
         let now = Instant::now();
         let mut state = scheduler.state.lock();
-        let reference =
-            crate::program_scheduling::ProgramRef::new("model".into(), "new-program".into(), 1);
+        let handle = state
+            .runtime
+            .retain_request(&identity(), context, None, now);
         scheduler.ensure_decision_state(
             &mut state,
-            &identity_named("new-program"),
-            reference.clone(),
+            &identity(),
+            handle.program().clone(),
             context,
             now,
             None,
         );
         assert_eq!(
-            scheduler.shadow_admission_outcome(&state, &reference, "rank-0", now),
+            scheduler.shadow_admission_outcome(&state, handle.program(), "rank-0", now),
             Some("estimate_denies_exact_admits")
+        );
+    }
+
+    #[test]
+    fn shadow_outcome_includes_the_growth_reserve() {
+        // A 1000-token rank with a 600-token growth reserve: the 100-token
+        // estimate fits both the low watermark and the reserve, while the
+        // prepared 800-token count fits immediate capacity but not the reserve.
+        // The old comparison (immediate headroom only) reported both_admit.
+        let mut config = ProgramSchedulerConfig {
+            token_count_mode: TokenCountMode::Shadow,
+            ..ProgramSchedulerConfig::default()
+        };
+        config.progress_ttl.token_capacity = Some(1_000);
+        config.progress_ttl.low_watermark_ratio = 1.0;
+        config.progress_ttl.decode_buffer_tokens = 10;
+        config.progress_ttl.stats_window_size = 2;
+        let scheduler = ProgramScheduler::new(config);
+        scheduler.sync_targets("model", std::slice::from_ref(&target()));
+        let now = Instant::now();
+        let fingerprint = TokenizerFingerprint::from_parts(&["model", "reserve"]);
+        let context = scheduler.resolve_arrival_tokens(
+            "model",
+            ArrivalTokenFacts::new(100, Some(TokenFacts::prepared_token_ids(800, fingerprint))),
+        );
+        let mut state = scheduler.state.lock();
+        {
+            let factors = state.rank_factors.entry("rank-0".to_string()).or_default();
+            for index in 0..2 {
+                factors.push_request(
+                    RequestSample {
+                        prompt_tokens: 100,
+                        completion_tokens: 10,
+                        cached_prompt_tokens: 0,
+                        context_growth_tokens: Some(100),
+                        e2e_seconds: 1.0,
+                        decode_seconds: Some(1.0),
+                        queue_seconds: 0.0,
+                        rounds_since_ttl_pause: 3,
+                        finished_at: now + Duration::from_millis(index),
+                    },
+                    2,
+                );
+            }
+        }
+        let handle = state
+            .runtime
+            .retain_request(&identity(), context, None, now);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &identity(),
+            handle.program().clone(),
+            context,
+            now,
+            None,
+        );
+        let applied = scheduler
+            .rank_admission_plan(&state, handle.program(), "rank-0", now)
+            .expect("the estimate fits the reserve");
+        assert_eq!(applied.reserve_tokens, 600.0);
+        assert!(
+            scheduler
+                .rank_admission_plan_for_context(&state, handle.program(), "rank-0", now, Some(800))
+                .is_none(),
+            "the prepared count exceeds the reserve"
+        );
+        assert_eq!(
+            scheduler.shadow_admission_outcome(&state, handle.program(), "rank-0", now),
+            Some("estimate_admits_exact_denies")
         );
     }
 

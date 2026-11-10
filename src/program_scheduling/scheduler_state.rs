@@ -393,25 +393,6 @@ impl ProgramDecisionState {
             ) as f64
     }
 
-    /// Demand implied by the prepared counterfactual, used only for shadow
-    /// decisions. Never feeds admission or accounting.
-    pub(crate) fn shadow_private_tokens_with_output(
-        &self,
-        decode_buffer_tokens: usize,
-        expected_output_tokens: Option<usize>,
-    ) -> Option<f64> {
-        self.shadow_context_facts.map(|facts| {
-            facts
-                .tokens()
-                .saturating_sub(self.shared_prefix_tokens)
-                .saturating_add(
-                    expected_output_tokens
-                        .or(self.output_token_reservation)
-                        .unwrap_or(decode_buffer_tokens),
-                ) as f64
-        })
-    }
-
     /// Reconcile an Engine-observed context with the current ledger demand.
     ///
     /// Trusted prepared counts may replace an older estimate immediately when

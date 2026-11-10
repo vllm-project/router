@@ -1091,6 +1091,43 @@ impl Router {
         !tracked
     }
 
+    /// Whether this request would create a Program completion at all.
+    ///
+    /// Router-side exact counting is a second tokenization, so it must not run
+    /// for identity-free requests: `acquire_program_completion` would discard
+    /// the fact after paying the tokenizer and possible cold model load.
+    fn program_identity_present<T: GenerationRequest>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        model_id: Option<&str>,
+    ) -> bool {
+        let Some(scheduler) = &self.program_scheduler else {
+            return false;
+        };
+        let model_pool = self.resolved_program_model_pool(model_id);
+        let request = typed_req.extract_program_identity_payload();
+        ProgramIdentity::from_request_with_enable_key(
+            headers,
+            request.as_ref(),
+            Some(&model_pool.scheduler_key),
+            scheduler.enable_key(),
+        )
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
+    /// Whether settlement can verify a prepared count against Engine usage.
+    fn settlement_observes_usage<T: GenerationRequest>(
+        &self,
+        pool: Option<crate::backend::WorkerPoolKind>,
+        typed_req: &T,
+    ) -> bool {
+        !matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
+            || typed_req.settlement_reports_usage()
+    }
+
     async fn acquire_program_completion<T: GenerationRequest>(
         &self,
         headers: Option<&HeaderMap>,
@@ -1098,6 +1135,7 @@ impl Router {
         model_id: Option<&str>,
         endpoint: &str,
         prepared: Option<&crate::backend::PreparedRequest>,
+        observable: bool,
     ) -> Result<Option<ProgramCompletion>, ScheduleError> {
         let Some(scheduler) = &self.program_scheduler else {
             return Ok(None);
@@ -1128,6 +1166,7 @@ impl Router {
             endpoint,
             &input_text,
             prepared_facts,
+            observable,
         )
         .await
     }
@@ -1160,6 +1199,16 @@ impl Router {
             &model_pool.scheduler_key,
             endpoint,
         );
+        // A transparent proxy only observes Engine usage on the wire: a
+        // streaming body without `stream_options.include_usage` cannot verify
+        // a prepared fact, so exact mode must keep the estimate.
+        let observable = request.is_none_or(|body| {
+            body.get("stream").and_then(serde_json::Value::as_bool) != Some(true)
+                || body
+                    .pointer("/stream_options/include_usage")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        });
         self.acquire_program_completion_for_identity(
             scheduler,
             identity,
@@ -1167,6 +1216,7 @@ impl Router {
             endpoint,
             input_text,
             prepared_facts,
+            observable,
         )
         .await
     }
@@ -1211,12 +1261,14 @@ impl Router {
         endpoint: &str,
         input_text: &str,
         prepared_facts: Option<TokenFacts>,
+        observable: bool,
     ) -> Result<Option<ProgramCompletion>, ScheduleError> {
         let (estimated_context_tokens, calibration) = self.program_token_estimator.estimate(
             TokenEstimateScope::new(&model_pool.scheduler_key, endpoint),
             input_text,
         );
-        let arrival = ArrivalTokenFacts::new(estimated_context_tokens, prepared_facts);
+        let arrival = ArrivalTokenFacts::new(estimated_context_tokens, prepared_facts)
+            .with_observability(observable);
         let context = scheduler.resolve_arrival_tokens(&model_pool.scheduler_key, arrival);
         RouterMetrics::record_agent_aware_context_token_fact(
             &model_pool.scheduler_key,
@@ -1738,7 +1790,11 @@ impl Router {
                     && scheduler.prepared_token_pool_allowed(
                         &self.resolved_program_model_pool(model_id).scheduler_key,
                     )
-            });
+            })
+            // Skip the second tokenization entirely for identity-free traffic:
+            // no Program completion would consume the prepared fact.
+            && self.program_identity_present(headers, typed_req, model_id);
+        let settlement_observable = self.settlement_observes_usage(pool, typed_req);
         let prepared = match (pool, typed_req.grpc_request()) {
             (Some(crate::backend::WorkerPoolKind::Grpc), Some(GrpcRequestRef::Chat(chat)))
                 if route == "/v1/chat/completions" =>
@@ -1864,6 +1920,7 @@ impl Router {
                         model_id,
                         route,
                         prepared.as_ref(),
+                        settlement_observable,
                     )
                     .await
                 {

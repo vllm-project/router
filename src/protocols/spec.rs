@@ -701,6 +701,15 @@ impl GenerationRequest for ChatCompletionRequest {
         program_identity_payload(Some(&self.other), self.user.as_deref())
     }
 
+    fn settlement_reports_usage(&self) -> bool {
+        !self.stream
+            || self
+                .stream_options
+                .as_ref()
+                .and_then(|options| options.include_usage)
+                == Some(true)
+    }
+
     fn affinity_identity(&self) -> IdentityFields<'_> {
         IdentityFields {
             other: Some(&self.other),
@@ -972,6 +981,15 @@ impl GenerationRequest for CompletionRequest {
 
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
         program_identity_payload(Some(&self.other), self.user.as_deref())
+    }
+
+    fn settlement_reports_usage(&self) -> bool {
+        !self.stream
+            || self
+                .stream_options
+                .as_ref()
+                .and_then(|options| options.include_usage)
+                == Some(true)
     }
 
     fn affinity_identity(&self) -> IdentityFields<'_> {
@@ -2632,6 +2650,14 @@ pub trait GenerationRequest: Send + Sync {
         None
     }
 
+    /// Whether a non-gRPC settlement can observe the Engine's own prompt
+    /// usage. gRPC paths record producer usage independently of the wire, but a
+    /// streaming HTTP client that does not request
+    /// `stream_options.include_usage` never sees a usage count.
+    fn settlement_reports_usage(&self) -> bool {
+        true
+    }
+
     /// Extract only the small body subset used for Program identity parsing.
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
         None
@@ -3289,6 +3315,45 @@ pub(crate) mod cache_routing {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_observes_usage_only_when_the_wire_reports_it() {
+        let chat = |body: serde_json::Value| {
+            serde_json::from_value::<ChatCompletionRequest>(body).unwrap()
+        };
+        let base = serde_json::json!({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        // Non-streaming bodies always carry usage.
+        assert!(chat(base.clone()).settlement_reports_usage());
+        let streaming = serde_json::json!({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        assert!(!chat(streaming.clone()).settlement_reports_usage());
+        let streaming_with_usage = serde_json::json!({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        });
+        assert!(chat(streaming_with_usage).settlement_reports_usage());
+
+        let completion =
+            |body: serde_json::Value| serde_json::from_value::<CompletionRequest>(body).unwrap();
+        assert!(
+            completion(serde_json::json!({"model": "model-a", "prompt": [1, 2]}))
+                .settlement_reports_usage()
+        );
+        assert!(!completion(serde_json::json!({
+            "model": "model-a",
+            "prompt": [1, 2],
+            "stream": true
+        }))
+        .settlement_reports_usage());
+    }
 
     #[test]
     fn token_id_prompt_count_applies_engine_truncation() {

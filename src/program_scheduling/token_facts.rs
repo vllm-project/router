@@ -163,6 +163,11 @@ impl TokenFacts {
 pub struct ArrivalTokenFacts {
     estimated_tokens: usize,
     prepared: Option<TokenFacts>,
+    /// Whether settlement can observe the Engine's own prompt count for this
+    /// request. A streaming HTTP client that does not request
+    /// `stream_options.include_usage` gets no wire usage, so a prepared fact
+    /// could never be verified and `exact_when_verified` must keep the estimate.
+    observable: bool,
 }
 
 impl ArrivalTokenFacts {
@@ -170,7 +175,19 @@ impl ArrivalTokenFacts {
         Self {
             estimated_tokens: estimated_tokens.max(1),
             prepared: prepared.filter(|facts| facts.tokens() > 0),
+            observable: true,
         }
+    }
+
+    /// Mark whether settlement can verify a prepared count against Engine usage.
+    pub fn with_observability(mut self, observable: bool) -> Self {
+        self.observable = observable;
+        self
+    }
+
+    /// Whether settlement can verify a prepared count against Engine usage.
+    pub fn observable(&self) -> bool {
+        self.observable
     }
 
     pub fn estimated_only(estimated_tokens: usize) -> Self {
@@ -198,6 +215,9 @@ pub enum TokenFactFallback {
     FingerprintRevoked,
     /// No pre-dispatch count was available for this request shape.
     NoPreparedFact,
+    /// Settlement cannot observe Engine usage (streaming HTTP client without
+    /// `stream_options.include_usage`), so a prepared count cannot be verified.
+    UnobservableStream,
 }
 
 impl TokenFactFallback {
@@ -206,6 +226,7 @@ impl TokenFactFallback {
             Self::PoolNotAllowed => "pool_not_allowed",
             Self::FingerprintRevoked => "fingerprint_revoked",
             Self::NoPreparedFact => "no_prepared_fact",
+            Self::UnobservableStream => "unobservable_stream",
         }
     }
 }
@@ -407,6 +428,9 @@ pub fn resolve_context_tokens(
             if !allowed {
                 return estimated.with_fallback(TokenFactFallback::PoolNotAllowed);
             }
+            if !arrival.observable() {
+                return estimated.with_fallback(TokenFactFallback::UnobservableStream);
+            }
             if revoked {
                 return estimated.with_fallback(TokenFactFallback::FingerprintRevoked);
             }
@@ -421,6 +445,27 @@ mod tests {
 
     fn fingerprint() -> TokenizerFingerprint {
         TokenizerFingerprint::from_parts(&["model-a", "{}", "vllm-tokenizer"])
+    }
+
+    #[test]
+    fn unobservable_stream_keeps_the_estimate() {
+        let prepared = TokenFacts::prepared_token_ids(100, fingerprint());
+        let unobservable = ArrivalTokenFacts::new(50, Some(prepared)).with_observability(false);
+        let context =
+            resolve_context_tokens(TokenCountMode::ExactWhenVerified, unobservable, true, false);
+        assert_eq!(context.tokens(), 50);
+        assert_eq!(
+            context.fallback(),
+            Some(TokenFactFallback::UnobservableStream)
+        );
+        let observable = ArrivalTokenFacts::new(50, Some(prepared));
+        let context =
+            resolve_context_tokens(TokenCountMode::ExactWhenVerified, observable, true, false);
+        assert_eq!(context.tokens(), 100);
+        assert_eq!(
+            context.source(),
+            crate::program_scheduling::TokenFactSource::PreparedTokenIds
+        );
     }
 
     #[test]
