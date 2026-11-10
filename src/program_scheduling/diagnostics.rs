@@ -44,7 +44,8 @@ pub struct ProgramDiagnostic {
     ///
     /// Kept in the serialized snapshot so existing diagnostics consumers keep
     /// working after the field was renamed; new code should use
-    /// `context_tokens`.
+    /// `context_tokens`. Despite the legacy name this may carry an exact
+    /// prepared count, not only an estimate.
     #[serde(rename = "estimated_context_tokens")]
     pub legacy_estimated_context_tokens: usize,
     /// Provenance of `context_tokens`.
@@ -161,6 +162,18 @@ pub struct ProgramSchedulerDiagnostic {
     pub prediction_mode: PredictionMode,
     pub return_time_profile_keys: usize,
     pub output_length_profile_keys: usize,
+    /// Input-token fact mode currently active.
+    pub token_count_mode: &'static str,
+    /// Matching settlements required before a fingerprint is applied exactly.
+    pub token_count_verification_settlements: usize,
+    pub token_count_model_pools: Vec<String>,
+    pub exact_text_endpoints: Vec<String>,
+    /// Fingerprints currently in the bounded revoked map.
+    pub revoked_token_fingerprints: usize,
+    /// Fingerprints that completed their probation window.
+    pub verified_token_fingerprints: usize,
+    /// Model pools whose exact facts are saturated off.
+    pub saturated_model_pools: Vec<String>,
     pub ranks: Vec<RankDiagnostic>,
 }
 
@@ -569,6 +582,17 @@ impl ProgramScheduler {
             prediction_mode: self.config.prediction_profile.mode,
             return_time_profile_keys: state.prediction_profiles.return_key_count(),
             output_length_profile_keys: state.prediction_profiles.output_key_count(),
+            token_count_mode: self.config.token_count_mode.as_str(),
+            token_count_verification_settlements: self.config.token_count_verification_settlements,
+            token_count_model_pools: self.config.token_count_model_pools.clone(),
+            exact_text_endpoints: self.config.exact_text_endpoints.clone(),
+            revoked_token_fingerprints: state.revoked_token_fingerprints.len(),
+            verified_token_fingerprints: state.verified_token_fingerprints.len(),
+            saturated_model_pools: state
+                .token_fingerprint_saturated_pools
+                .iter()
+                .cloned()
+                .collect(),
             ranks,
         }
     }

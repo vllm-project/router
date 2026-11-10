@@ -17,6 +17,11 @@ use tracing::warn;
 /// Revocation is a correctness fallback, not an audit log: the counter keeps
 /// the total. The bound only prevents unbounded scheduler memory.
 const MAX_REVOKED_FINGERPRINTS: usize = 64;
+/// Maximum fingerprints whose verification is remembered.
+///
+/// Evicting an entry only re-subjects that class to a fresh probation window;
+/// it can never make an unverified count trusted.
+const MAX_VERIFIED_FINGERPRINTS: usize = 1024;
 
 impl ProgramScheduler {
     /// Record the active token-count mode once at startup.
@@ -25,13 +30,19 @@ impl ProgramScheduler {
     }
 
     /// Whether prepared counts may be applied for this model pool.
+    ///
+    /// Operators may list either the internal pool key
+    /// (`program:model:<model>`, `program:all`, `program:fallback:unlabeled`)
+    /// or the plain model name documented for `token_count_model_pools`.
     pub(crate) fn prepared_token_pool_allowed(&self, model_pool: &str) -> bool {
-        self.config.token_count_model_pools.is_empty()
-            || self
-                .config
-                .token_count_model_pools
-                .iter()
-                .any(|allowed| allowed == model_pool)
+        if self.config.token_count_model_pools.is_empty() {
+            return true;
+        }
+        let model = model_pool.strip_prefix("program:model:");
+        self.config
+            .token_count_model_pools
+            .iter()
+            .any(|allowed| allowed == model_pool || model.is_some_and(|model| allowed == model))
     }
 
     fn fingerprint_revoked(
@@ -56,15 +67,30 @@ impl ProgramScheduler {
         arrival: ArrivalTokenFacts,
     ) -> ContextTokens {
         let allowed = self.prepared_token_pool_allowed(model_pool);
-        let revoked = {
+        let threshold = self.config.token_count_verification_settlements;
+        let (revoked, verified) = {
             let state = self.state.lock();
-            state.token_fingerprint_saturated_pools.contains(model_pool)
-                || self.fingerprint_revoked(
-                    &state,
-                    arrival.prepared().and_then(|facts| facts.fingerprint()),
-                )
+            let fingerprint = arrival.prepared().and_then(|facts| facts.fingerprint());
+            let revoked = state.token_fingerprint_saturated_pools.contains(model_pool)
+                || self.fingerprint_revoked(&state, fingerprint);
+            // `0` disables probation (legacy trust-on-first-use). Otherwise a
+            // fingerprint must have accumulated enough matching settlements.
+            let verified = threshold == 0
+                || fingerprint.is_none_or(|fingerprint| {
+                    state
+                        .verified_token_fingerprints
+                        .get(&fingerprint)
+                        .is_some_and(|(count, _)| *count >= threshold)
+                });
+            (revoked, verified)
         };
-        super::resolve_context_tokens(self.config.token_count_mode, arrival, allowed, revoked)
+        super::resolve_context_tokens(
+            self.config.token_count_mode,
+            arrival,
+            allowed,
+            revoked,
+            verified,
+        )
     }
 
     /// Record one arrival-time shadow admission counterfactual.
@@ -79,8 +105,14 @@ impl ProgramScheduler {
         program: &ProgramRef,
         target_id: &str,
         now: Instant,
+        shadow_tokens: usize,
     ) {
-        if let Some(outcome) = self.shadow_admission_outcome(state, program, target_id, now) {
+        if self.config.token_count_mode != TokenCountMode::Shadow {
+            return;
+        }
+        if let Some(outcome) =
+            self.shadow_admission_outcome(state, program, target_id, now, shadow_tokens)
+        {
             RouterMetrics::record_agent_aware_context_token_shadow(target_id, outcome);
         }
     }
@@ -100,10 +132,11 @@ impl ProgramScheduler {
         program: &ProgramRef,
         target_id: &str,
         now: Instant,
+        shadow_tokens: usize,
     ) -> Option<&'static str> {
         let decision = state.decisions.get(program)?;
-        let shadow_tokens = decision.shadow_context_facts.map(|facts| facts.tokens())?;
-        if self.config.pd_mode {
+        let _ = decision;
+        if self.config.pd_mode || shadow_tokens == 0 {
             return None;
         }
         let runtime = state.runtime.view(program)?;
@@ -127,6 +160,42 @@ impl ProgramScheduler {
         })
     }
 
+    /// Record one matching Engine settlement for a fingerprint.
+    ///
+    /// `token_count_verification_settlements` matching settlements are required
+    /// before `exact_when_verified` applies a count; `0` disables probation.
+    fn mark_fingerprint_verified(
+        &self,
+        state: &mut ProgramSchedulerState,
+        fingerprint: TokenizerFingerprint,
+    ) {
+        let threshold = self.config.token_count_verification_settlements;
+        if threshold == 0 {
+            return;
+        }
+        state.token_fingerprint_verification_sequence = state
+            .token_fingerprint_verification_sequence
+            .saturating_add(1);
+        let sequence = state.token_fingerprint_verification_sequence;
+        let entry = state
+            .verified_token_fingerprints
+            .entry(fingerprint)
+            .or_insert((0, sequence));
+        entry.0 = entry.0.saturating_add(1).min(threshold);
+        entry.1 = sequence;
+        while state.verified_token_fingerprints.len() > MAX_VERIFIED_FINGERPRINTS {
+            let Some(oldest) = state
+                .verified_token_fingerprints
+                .iter()
+                .min_by_key(|(_, (_, sequence))| *sequence)
+                .map(|(fingerprint, _)| *fingerprint)
+            else {
+                break;
+            };
+            state.verified_token_fingerprints.remove(&oldest);
+        }
+    }
+
     /// Compare one prepared arrival count with the Engine-observed count.
     ///
     /// A disagreement revokes the fingerprint so later requests for the same
@@ -142,6 +211,12 @@ impl ProgramScheduler {
         observed_tokens: Option<usize>,
     ) {
         let (Some(prepared), Some(observed)) = (prepared_tokens, observed_tokens) else {
+            if prepared_tokens.is_some() && observed_tokens.is_none() && source.is_prepared() {
+                RouterMetrics::record_agent_aware_context_token_unobserved(
+                    model_pool,
+                    source.as_str(),
+                );
+            }
             return;
         };
         if !source.is_prepared() || observed == 0 {
@@ -153,12 +228,15 @@ impl ProgramScheduler {
             observed as i64 - prepared as i64,
             observed,
         );
-        if prepared == observed {
-            return;
-        }
         let Some(fingerprint) = fingerprint else {
             return;
         };
+        if prepared == observed {
+            self.mark_fingerprint_verified(state, fingerprint);
+            return;
+        }
+        // A mismatch re-subjects the class to probation until it matches again.
+        state.verified_token_fingerprints.remove(&fingerprint);
         if state.token_fingerprint_saturated_pools.contains(model_pool) {
             // Every prepared fact for this pool already falls back to estimation.
             return;
@@ -182,6 +260,9 @@ impl ProgramScheduler {
                  falling back to estimation for this fingerprint"
             );
         }
+        RouterMetrics::set_agent_aware_context_token_revoked(
+            state.revoked_token_fingerprints.len(),
+        );
         if state.revoked_token_fingerprints.len() > MAX_REVOKED_FINGERPRINTS {
             // Keeping the bound by eviction would make an old, known-bad
             // fingerprint trusted again. Fail closed instead, but only for the
@@ -191,6 +272,7 @@ impl ProgramScheduler {
             state
                 .token_fingerprint_saturated_pools
                 .insert(model_pool.to_string());
+            RouterMetrics::set_agent_aware_context_token_pool_saturated(model_pool, true);
             RouterMetrics::record_agent_aware_context_token_revocation("saturation");
             warn!(
                 event = "token_fact_fingerprint_revocation_saturated",
@@ -274,6 +356,7 @@ mod tests {
     async fn exact_mode_admits_with_engine_scale_demand() {
         let mut config = ProgramSchedulerConfig {
             token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_verification_settlements: 0,
             ..ProgramSchedulerConfig::default()
         };
         config.progress_ttl.token_capacity = Some(100_000);
@@ -337,6 +420,7 @@ mod tests {
         // bound must fail closed for every prepared fact until restart.
         let config = ProgramSchedulerConfig {
             token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_verification_settlements: 0,
             ..ProgramSchedulerConfig::default()
         };
         let scheduler = ProgramScheduler::new(config);
@@ -409,7 +493,8 @@ mod tests {
                 &state,
                 dispatch.program(),
                 "rank-0",
-                Instant::now()
+                Instant::now(),
+                40_000,
             ),
             None
         );
@@ -452,7 +537,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            scheduler.shadow_admission_outcome(&state, handle.program(), "rank-0", now),
+            scheduler.shadow_admission_outcome(&state, handle.program(), "rank-0", now, 30_000),
             Some("estimate_denies_exact_admits")
         );
     }
@@ -521,8 +606,90 @@ mod tests {
             "the prepared count exceeds the reserve"
         );
         assert_eq!(
-            scheduler.shadow_admission_outcome(&state, handle.program(), "rank-0", now),
+            scheduler.shadow_admission_outcome(&state, handle.program(), "rank-0", now, 800),
             Some("estimate_admits_exact_denies")
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_mode_applies_only_after_a_matching_settlement() {
+        let mut config = ProgramSchedulerConfig {
+            token_count_mode: TokenCountMode::ExactWhenVerified,
+            ..ProgramSchedulerConfig::default()
+        };
+        config.progress_ttl.token_capacity = Some(1_000_000);
+        // Default probation is one matching settlement.
+        assert_eq!(config.token_count_verification_settlements, 1);
+        let scheduler = ProgramScheduler::new(config);
+        let fingerprint = TokenizerFingerprint::from_parts(&["model", "probation"]);
+        let arrival =
+            ArrivalTokenFacts::new(100, Some(TokenFacts::prepared_token_ids(500, fingerprint)));
+        let pending = scheduler.resolve_arrival_tokens("model", arrival);
+        assert_eq!(pending.tokens(), 100);
+        assert_eq!(pending.shadow_tokens(), Some(500));
+        assert_eq!(
+            pending.fallback(),
+            Some(crate::program_scheduling::TokenFactFallback::FingerprintUnverified)
+        );
+
+        let dispatch = scheduler
+            .acquire(identity(), pending, std::slice::from_ref(&target()), None)
+            .await
+            .unwrap();
+        scheduler.complete(
+            &dispatch,
+            true,
+            false,
+            crate::program_scheduling::ProgramUsageObservation {
+                prompt_tokens: Some(500),
+                completion_tokens: Some(1),
+                cached_prompt_tokens: None,
+            },
+            None,
+        );
+
+        let verified = scheduler.resolve_arrival_tokens("model", arrival);
+        assert_eq!(verified.tokens(), 500);
+        assert_eq!(
+            verified.source(),
+            crate::program_scheduling::TokenFactSource::PreparedTokenIds
+        );
+        assert_eq!(verified.fallback(), None);
+    }
+
+    #[tokio::test]
+    async fn exact_mode_mismatch_keeps_the_fingerprint_on_probation() {
+        let mut config = ProgramSchedulerConfig {
+            token_count_mode: TokenCountMode::ExactWhenVerified,
+            ..ProgramSchedulerConfig::default()
+        };
+        config.progress_ttl.token_capacity = Some(1_000_000);
+        let scheduler = ProgramScheduler::new(config);
+        let fingerprint = TokenizerFingerprint::from_parts(&["model", "mismatch"]);
+        let arrival =
+            ArrivalTokenFacts::new(100, Some(TokenFacts::prepared_token_ids(500, fingerprint)));
+        let pending = scheduler.resolve_arrival_tokens("model", arrival);
+        let dispatch = scheduler
+            .acquire(identity(), pending, std::slice::from_ref(&target()), None)
+            .await
+            .unwrap();
+        scheduler.complete(
+            &dispatch,
+            true,
+            false,
+            crate::program_scheduling::ProgramUsageObservation {
+                prompt_tokens: Some(400),
+                completion_tokens: Some(1),
+                cached_prompt_tokens: None,
+            },
+            None,
+        );
+
+        let revoked = scheduler.resolve_arrival_tokens("model", arrival);
+        assert_eq!(revoked.tokens(), 100);
+        assert_eq!(
+            revoked.fallback(),
+            Some(crate::program_scheduling::TokenFactFallback::FingerprintRevoked)
         );
     }
 
@@ -532,11 +699,13 @@ mod tests {
             token_count_mode: TokenCountMode::ExactWhenVerified,
             ..ProgramSchedulerConfig::default()
         };
-        config.token_count_model_pools = vec!["program:model:a".to_string()];
+        config.token_count_model_pools = vec!["program:model:a".to_string(), "model-c".to_string()];
         let scheduler = ProgramScheduler::new(config);
         assert!(scheduler.prepared_token_pool_allowed("program:model:a"));
         assert!(!scheduler.prepared_token_pool_allowed("program:model:b"));
         assert!(!scheduler.prepared_token_pool_allowed("program:all"));
+        // Documented plain model names match their scheduler key too.
+        assert!(scheduler.prepared_token_pool_allowed("program:model:model-c"));
 
         // An empty allowlist keeps the legacy behaviour: every pool may apply
         // a prepared count after verification.
@@ -595,6 +764,7 @@ mod tests {
         let fingerprint = TokenizerFingerprint::from_parts(&["model", "queue"]);
         let mut exact_config = ProgramSchedulerConfig {
             token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_verification_settlements: 0,
             ..ProgramSchedulerConfig::default()
         };
         exact_config.progress_ttl.token_capacity = Some(150_000);

@@ -23,8 +23,12 @@ async fn main() -> anyhow::Result<()> {
         // example tool-call `arguments` as a JSON string) while the Engine-side
         // count is produced from the form its template accepts.
         let messages = row.get("router_messages").unwrap_or(&row["messages"]);
+        let model = row
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("fixture row is missing a string `model`"))?;
         let mut body = json!({
-            "model": "pd-model",
+            "model": model,
             "messages": messages,
             "chat_template_kwargs": row["kwargs"],
         });
@@ -37,7 +41,11 @@ async fn main() -> anyhow::Result<()> {
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
         let router_tokens = prepared.tokenized.token_ids.len();
-        let hf_tokens = row["hf_tokens"].as_u64().unwrap_or(0) as usize;
+        let hf_tokens = row
+            .get("hf_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("fixture row is missing an integer `hf_tokens`"))?
+            as usize;
         checked += 1;
         if router_tokens != hf_tokens {
             mismatches += 1;

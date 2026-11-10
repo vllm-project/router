@@ -226,6 +226,18 @@ pub fn init_metrics() {
         "Tokenizer fingerprints revoked after an Engine disagreement"
     );
     describe_gauge!(
+        "vllm_router_agent_aware_context_token_revoked_fingerprints",
+        "Fingerprints currently revoked in the bounded scheduler map"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_context_token_pool_saturated",
+        "Whether exact token facts are saturated off for a model pool"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_context_token_unobserved_total",
+        "Prepared facts settled without an Engine prompt count to reconcile"
+    );
+    describe_gauge!(
         "vllm_router_agent_aware_context_token_mode",
         "Active Program context-token count mode (1 for the selected mode)"
     );
@@ -1062,6 +1074,27 @@ impl RouterMetrics {
         counter!(
             "vllm_router_agent_aware_context_token_revocations_total",
             "reason" => reason
+        )
+        .increment(1);
+    }
+
+    pub fn set_agent_aware_context_token_revoked(count: usize) {
+        gauge!("vllm_router_agent_aware_context_token_revoked_fingerprints").set(count as f64);
+    }
+
+    pub fn set_agent_aware_context_token_pool_saturated(model_pool: &str, saturated: bool) {
+        gauge!(
+            "vllm_router_agent_aware_context_token_pool_saturated",
+            "model_pool" => model_pool.to_string()
+        )
+        .set(if saturated { 1.0 } else { 0.0 });
+    }
+
+    pub fn record_agent_aware_context_token_unobserved(model_pool: &str, source: &'static str) {
+        counter!(
+            "vllm_router_agent_aware_context_token_unobserved_total",
+            "model_pool" => model_pool.to_string(),
+            "source" => source
         )
         .increment(1);
     }

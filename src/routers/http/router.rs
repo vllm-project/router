@@ -470,6 +470,65 @@ impl Drop for ProgramSettlementBody {
     }
 }
 
+/// Ensure the upstream streaming request asks for the usage chunk.
+fn inject_stream_usage(value: &mut serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    match object.get_mut("stream_options") {
+        Some(serde_json::Value::Object(options)) => {
+            options.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+        }
+        _ => {
+            object.insert(
+                "stream_options".to_string(),
+                serde_json::json!({"include_usage": true}),
+            );
+        }
+    }
+}
+
+/// Removes the trailing `usage` SSE data line from a client-visible stream.
+///
+/// The Router injects `stream_options.include_usage` upstream for exact token
+/// facts, but a client that did not request usage must not receive that chunk.
+/// Lines are buffered across chunk boundaries; other bytes pass through.
+#[derive(Debug, Default)]
+struct SseUsageStripper {
+    pending: Vec<u8>,
+}
+
+impl SseUsageStripper {
+    fn push(&mut self, chunk: &[u8]) -> Option<axum::body::Bytes> {
+        self.pending.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some(position) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line = self.pending.drain(..=position).collect::<Vec<_>>();
+            if !is_usage_sse_line(&line) {
+                out.extend_from_slice(&line);
+            }
+        }
+        (!out.is_empty()).then(|| axum::body::Bytes::from(out))
+    }
+
+    fn finish(&mut self) -> Option<axum::body::Bytes> {
+        let line = std::mem::take(&mut self.pending);
+        (!line.is_empty() && !is_usage_sse_line(&line)).then(|| axum::body::Bytes::from(line))
+    }
+}
+
+/// Whether one SSE line is a data frame carrying a top-level `usage`.
+fn is_usage_sse_line(line: &[u8]) -> bool {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let Some(data) = line.strip_prefix(b"data:") else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(data.trim_ascii())
+        .ok()
+        .is_some_and(|value| value.get("usage").is_some())
+}
+
 struct TypedDispatch<'a> {
     headers: Option<&'a HeaderMap>,
     route: &'a str,
@@ -478,6 +537,10 @@ struct TypedDispatch<'a> {
     completion: Option<&'a CompletionRoute>,
     load: RequestLoadGuard,
     prepared: Option<crate::backend::PreparedRequest>,
+    /// Body to forward instead of `typed_req` (usage-injected HTTP stream).
+    request_body: Option<serde_json::Value>,
+    /// Strip the usage chunk this Router injected upstream.
+    strip_usage: bool,
 }
 
 struct SelectedWorker {
@@ -561,9 +624,25 @@ impl Router {
             None
         };
         let request_timeout = Duration::from_secs(ctx.router_config.request_timeout_secs);
+        // HTTP pools are transparent proxies unless exact text counting is
+        // enabled; only then does the Router tokenize, so only then are the
+        // encoding caches relevant (and the warning below wrong).
+        let exact_text_tokenization =
+            ctx.router_config
+                .program_scheduling
+                .as_ref()
+                .is_some_and(|config| {
+                    config.token_count_mode.uses_prepared_facts()
+                        && !config.exact_text_endpoints.is_empty()
+                });
         let frontend = if pool_kind == Some(crate::backend::WorkerPoolKind::Http) {
-            crate::backend::frontend::warn_ignored_encoding_caches();
-            crate::backend::EngineFrontend::with_request_timeout(request_timeout)
+            if exact_text_tokenization {
+                crate::backend::EngineFrontend::from_env(request_timeout)
+                    .map_err(|error| format!("tokenizer cache: {error}"))?
+            } else {
+                crate::backend::frontend::warn_ignored_encoding_caches();
+                crate::backend::EngineFrontend::with_request_timeout(request_timeout)
+            }
         } else {
             crate::backend::EngineFrontend::from_env(request_timeout)
                 .map_err(|error| format!("tokenizer cache: {error}"))?
@@ -761,6 +840,7 @@ impl Router {
             Arc::new(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(scheduler.metrics_interval());
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut last_failed = std::collections::BTreeSet::new();
                 loop {
                     interval.tick().await;
                     Self::sync_program_targets_from_registry(&scheduler, &worker_registry);
@@ -770,13 +850,32 @@ impl Router {
                     }
                     let epoch = scheduler.begin_observation(&targets);
                     let (observations, failures) = provider.observe(&targets).await;
-                    for failure in failures {
-                        warn!(
-                            base_url = failure.base_url,
-                            error = failure.error,
-                            "Program scheduling backend observation failed"
+                    let failed_now = failures
+                        .iter()
+                        .map(|failure| failure.base_url.clone())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    for failure in &failures {
+                        if last_failed.contains(&failure.base_url) {
+                            debug!(
+                                base_url = failure.base_url,
+                                error = failure.error,
+                                "Program scheduling backend observation still failing"
+                            );
+                        } else {
+                            warn!(
+                                base_url = failure.base_url,
+                                error = failure.error,
+                                "Program scheduling backend observation failed"
+                            );
+                        }
+                    }
+                    for recovered in last_failed.difference(&failed_now) {
+                        info!(
+                            base_url = recovered,
+                            "Program scheduling backend observation recovered"
                         );
                     }
+                    last_failed = failed_now;
                     scheduler.apply_observations(epoch, observations);
                     scheduler.tick();
                     if let Some((path, revision, snapshot)) =
@@ -1793,6 +1892,29 @@ impl Router {
         // Router-side preparation is a second tokenization, so skip it when the
         // scheduler would discard the fact: the endpoint must be opted in and
         // the model pool must be allowed by `token_count_model_pools`.
+        // An HTTP stream can hide Engine usage from settlement. When exact
+        // facts are active, ask the Engine for the usage chunk and strip it
+        // again for clients that did not request it; otherwise exact mode would
+        // be a no-op for the default streaming client.
+        let inject_include_usage = matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
+            && typed_req.is_stream()
+            && !typed_req.settlement_reports_usage()
+            && self.program_scheduler.as_ref().is_some_and(|scheduler| {
+                scheduler.token_count_mode().uses_prepared_facts()
+                    && (scheduler.exact_text_endpoint_enabled(route)
+                        || typed_req.exact_input_token_count().is_some())
+                    && scheduler.prepared_token_pool_allowed(
+                        &self.resolved_program_model_pool(model_id).scheduler_key,
+                    )
+            })
+            && self.program_identity_present(headers, typed_req, model_id);
+        let settlement_observable =
+            self.settlement_observes_usage(pool, typed_req) || inject_include_usage;
+        let exact_mode_unobservable = !settlement_observable
+            && self.program_scheduler.as_ref().is_some_and(|scheduler| {
+                scheduler.token_count_mode()
+                    == crate::program_scheduling::TokenCountMode::ExactWhenVerified
+            });
         let exact_text_chat = matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
             && route == "/v1/chat/completions"
             && self.program_scheduler.as_ref().is_some_and(|scheduler| {
@@ -1801,10 +1923,11 @@ impl Router {
                         &self.resolved_program_model_pool(model_id).scheduler_key,
                     )
             })
-            // Skip the second tokenization entirely for identity-free traffic:
-            // no Program completion would consume the prepared fact.
+            // Skip the second tokenization for identity-free traffic and for
+            // exact-mode requests whose settlement cannot observe usage (the
+            // prepared fact would only be discarded as `unobservable_stream`).
+            && !exact_mode_unobservable
             && self.program_identity_present(headers, typed_req, model_id);
-        let settlement_observable = self.settlement_observes_usage(pool, typed_req);
         let prepared = match (pool, typed_req.grpc_request()) {
             (Some(crate::backend::WorkerPoolKind::Grpc), Some(GrpcRequestRef::Chat(chat)))
                 if route == "/v1/chat/completions" =>
@@ -1868,6 +1991,14 @@ impl Router {
             _ => None,
         };
 
+        let injected_body = if inject_include_usage {
+            serde_json::to_value(typed_req).ok().map(|mut value| {
+                inject_stream_usage(&mut value);
+                value
+            })
+        } else {
+            None
+        };
         let completion = match (pool, typed_req.grpc_request()) {
             (
                 Some(crate::backend::WorkerPoolKind::Http),
@@ -1887,6 +2018,7 @@ impl Router {
         };
         let text = &text;
         let prepared = &prepared;
+        let injected_body = &injected_body;
         let completion = completion.as_ref();
         let cache_key = std::sync::OnceLock::new();
         let cache_key = &cache_key;
@@ -1944,7 +2076,14 @@ impl Router {
                 let kv_ops = kv_aware_ops(policy.as_ref());
                 let workers = self.available_workers(model_id);
                 let excluded_workers = failed_workers.lock().clone();
-                let needs_http_input = prepared.is_none()
+                // Router-rendered token IDs are an exact-token fact, not a
+                // replacement for the Engine's own KV-aware input. On an HTTP
+                // pool the policy keeps using the Engine `/tokenize` path even
+                // when exact-text preparation produced IDs; only gRPC dispatch
+                // already owns the token IDs it sends.
+                let prepared_for_kv = prepared.is_some()
+                    && matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc));
+                let needs_http_input = !prepared_for_kv
                     && (kv_ops.is_some() || policy.needs_cache_routing_key());
                 let binding_skips_rpc = needs_http_input && excluded_workers.is_empty()
                     && affinity_key.as_ref().is_some_and(|key| {
@@ -1989,7 +2128,14 @@ impl Router {
                         .await
                         .as_ref()
                 };
-                let request_tokens = if let Some(prepared) = &prepared {
+                let request_tokens = if prepared_for_kv {
+                    let Some(prepared) = prepared.as_ref() else {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "prepared gRPC input missing before dispatch",
+                        )
+                            .into_response();
+                    };
                     if kv_ops.is_some() {
                         RouterMetrics::record_kv_routing_input("grpc", "prepared");
                     }
@@ -2092,6 +2238,8 @@ impl Router {
                             completion,
                             load,
                             prepared: (*prepared).clone(),
+                            request_body: injected_body.clone(),
+                            strip_usage: inject_include_usage,
                         },
                         program_completion.clone(),
                     )
@@ -2275,6 +2423,8 @@ impl Router {
             completion,
             load,
             prepared,
+            request_body,
+            strip_usage,
         } = dispatch;
         let completion_echo = completion.map(|input| input.echo);
         let load_incremented = load.tracks_worker();
@@ -2336,8 +2486,12 @@ impl Router {
                     }
                 };
 
-                // Parse the request body
-                let json_val = match serde_json::to_value(typed_req) {
+                // Parse the request body (or reuse the usage-injected body).
+                let json_val = match request_body
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(|| serde_json::to_value(typed_req))
+                {
                     Ok(j) => j,
                     Err(e) => {
                         return (
@@ -2359,7 +2513,9 @@ impl Router {
             } else {
                 let request_url = format!("{}{}", worker_url, route);
                 (
-                    if let Some(completion) = completion {
+                    if let Some(body) = request_body.as_ref() {
+                        self.client.post(&request_url).json(body)
+                    } else if let Some(completion) = completion {
                         completion.forward_request(&self.client, &request_url, headers, typed_req)
                     } else {
                         self.client.post(&request_url).json(typed_req)
@@ -2489,6 +2645,7 @@ impl Router {
             let producer_load = load.clone();
             let producer = tokio::spawn(async move {
                 let mut stream = stream;
+                let mut usage_stripper = strip_usage.then(SseUsageStripper::default);
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
                 while let Some(chunk) = stream.next().await {
@@ -2528,9 +2685,21 @@ impl Router {
                             let has_output = completion_output
                                 .as_mut()
                                 .is_some_and(|observer| observer.observe(&bytes));
+                            let outgoing = match usage_stripper.as_mut() {
+                                Some(stripper) => match stripper.push(&bytes) {
+                                    Some(bytes) => bytes,
+                                    None => {
+                                        if has_output {
+                                            producer_load.begin_decode();
+                                        }
+                                        continue;
+                                    }
+                                },
+                                None => bytes,
+                            };
                             let sent = match producer_output_frame.as_mut() {
-                                Some(output_frame) => output_frame.send(&tx, bytes, has_output),
-                                None => tx.send(Ok(bytes)).is_ok(),
+                                Some(output_frame) => output_frame.send(&tx, outgoing, has_output),
+                                None => tx.send(Ok(outgoing)).is_ok(),
                             };
                             if !sent {
                                 stream_succeeded = false;
@@ -2545,6 +2714,11 @@ impl Router {
                             let _ = tx.send(Err(format!("Stream error: {}", e)));
                             break;
                         }
+                    }
+                }
+                if let Some(stripper) = usage_stripper.as_mut() {
+                    if let Some(tail) = stripper.finish() {
+                        let _ = tx.send(Ok(tail));
                     }
                 }
                 if let Some(completion) = &completion {
@@ -5029,6 +5203,8 @@ mod tests {
                     // false` expressed before the field became a guard.
                     load: RequestLoadGuard::new(None, None),
                     prepared: None,
+                    request_body: None,
+                    strip_usage: false,
                 },
                 None,
             )
@@ -5926,6 +6102,39 @@ mod tests {
     }
 
     #[test]
+    fn sse_usage_stripper_drops_injected_usage_across_chunk_boundaries() {
+        let mut stripper = SseUsageStripper::default();
+        let first = b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n";
+        assert_eq!(stripper.push(first).as_deref(), Some(&first[..]));
+        let part_a = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3";
+        let part_b = b"}}\n\n";
+        assert!(stripper.push(part_a).is_none());
+        // The usage data line is dropped; the blank separator still passes.
+        assert_eq!(stripper.push(part_b).as_deref(), Some(&b"\n"[..]));
+        assert!(stripper.finish().is_none());
+    }
+
+    #[test]
+    fn inject_stream_usage_keeps_other_options() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "stream": true,
+            "stream_options": {"include_usage": false}
+        });
+        inject_stream_usage(&mut body);
+        assert_eq!(
+            body["stream_options"]["include_usage"],
+            serde_json::Value::Bool(true)
+        );
+        let mut without = serde_json::json!({"model": "m", "stream": true});
+        inject_stream_usage(&mut without);
+        assert_eq!(
+            without["stream_options"]["include_usage"],
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    #[test]
     fn exact_prompt_tokens_applies_transparent_truncation() {
         let with_truncate = serde_json::json!({
             "prompt": [1, 2, 3, 4, 5],
@@ -6664,6 +6873,8 @@ mod tests {
                     completion: Some(&completion),
                     load,
                     prepared: None,
+                    request_body: None,
+                    strip_usage: false,
                 },
                 None,
             )
@@ -6847,6 +7058,8 @@ mod tests {
                         completion: Some(&completion),
                         load,
                         prepared: None,
+                        request_body: None,
+                        strip_usage: false,
                     },
                     None,
                 )

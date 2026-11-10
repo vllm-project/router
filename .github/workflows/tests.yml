@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  pull_request:
+    branches: [main, "release-**"]
+  push:
+    branches: [main, "release-**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  rust-tests:
+    name: Rust unit + integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev protobuf-compiler
+      - name: Unit tests
+        run: cargo test --features cpu,ready --lib --bins
+      - name: Integration tests
+        run: cargo test --features cpu,ready --test '*'

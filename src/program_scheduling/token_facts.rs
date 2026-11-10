@@ -218,6 +218,9 @@ pub enum TokenFactFallback {
     /// Settlement cannot observe Engine usage (streaming HTTP client without
     /// `stream_options.include_usage`), so a prepared count cannot be verified.
     UnobservableStream,
+    /// The fingerprint has not yet accumulated enough matching settlements
+    /// (`token_count_verification_settlements`).
+    FingerprintUnverified,
 }
 
 impl TokenFactFallback {
@@ -227,6 +230,7 @@ impl TokenFactFallback {
             Self::FingerprintRevoked => "fingerprint_revoked",
             Self::NoPreparedFact => "no_prepared_fact",
             Self::UnobservableStream => "unobservable_stream",
+            Self::FingerprintUnverified => "fingerprint_unverified",
         }
     }
 }
@@ -282,8 +286,13 @@ pub struct ContextTokens {
     pub(crate) fallback: Option<TokenFactFallback>,
 }
 
+/// Test-only convenience: a bare count is an arrival estimate.
+///
+/// Production call sites must state where the number came from
+/// (`ContextTokens::estimated`, `from_prepared`, or an arrival fact), which is
+/// exactly the property this type exists to enforce.
+#[cfg(test)]
 impl From<usize> for ContextTokens {
-    /// Test and call-site convenience: a bare count is an arrival estimate.
     fn from(tokens: usize) -> Self {
         Self::estimated(tokens)
     }
@@ -397,13 +406,16 @@ impl ContextTokens {
 ///
 /// `allowed` is true when the model pool is allowlisted for exact counts;
 /// `revoked` is true when the request's fingerprint already disagreed with
-/// Engine usage. The returned `ContextTokens` is the only value the scheduler
-/// may use for admission, growth accounting, and TTL cost.
+/// Engine usage; `verified` is true when it accumulated enough matching
+/// settlements (or verification is disabled). The returned `ContextTokens` is
+/// the only value the scheduler may use for admission, growth accounting, and
+/// TTL cost.
 pub fn resolve_context_tokens(
     mode: TokenCountMode,
     arrival: ArrivalTokenFacts,
     allowed: bool,
     revoked: bool,
+    verified: bool,
 ) -> ContextTokens {
     let estimated = ContextTokens::estimated(arrival.estimated_tokens());
     let Some(prepared) = arrival.prepared() else {
@@ -434,6 +446,13 @@ pub fn resolve_context_tokens(
             if revoked {
                 return estimated.with_fallback(TokenFactFallback::FingerprintRevoked);
             }
+            if !verified {
+                // Probation: carry the prepared fact as the counterfactual so
+                // settlement can verify it, but keep the estimate for now.
+                return estimated
+                    .with_shadow(Some(prepared))
+                    .with_fallback(TokenFactFallback::FingerprintUnverified);
+            }
             ContextTokens::from_prepared(prepared)
         }
     }
@@ -451,21 +470,59 @@ mod tests {
     fn unobservable_stream_keeps_the_estimate() {
         let prepared = TokenFacts::prepared_token_ids(100, fingerprint());
         let unobservable = ArrivalTokenFacts::new(50, Some(prepared)).with_observability(false);
-        let context =
-            resolve_context_tokens(TokenCountMode::ExactWhenVerified, unobservable, true, false);
+        let context = resolve_context_tokens(
+            TokenCountMode::ExactWhenVerified,
+            unobservable,
+            true,
+            false,
+            true,
+        );
         assert_eq!(context.tokens(), 50);
         assert_eq!(
             context.fallback(),
             Some(TokenFactFallback::UnobservableStream)
         );
         let observable = ArrivalTokenFacts::new(50, Some(prepared));
-        let context =
-            resolve_context_tokens(TokenCountMode::ExactWhenVerified, observable, true, false);
+        let context = resolve_context_tokens(
+            TokenCountMode::ExactWhenVerified,
+            observable,
+            true,
+            false,
+            true,
+        );
         assert_eq!(context.tokens(), 100);
         assert_eq!(
             context.source(),
             crate::program_scheduling::TokenFactSource::PreparedTokenIds
         );
+    }
+
+    #[test]
+    fn exact_mode_probation_keeps_estimate_until_verified() {
+        let prepared = TokenFacts::prepared_token_ids(98_304, fingerprint());
+        let arrival = ArrivalTokenFacts::new(4, Some(prepared));
+        let pending = resolve_context_tokens(
+            TokenCountMode::ExactWhenVerified,
+            arrival,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(pending.tokens(), 4);
+        assert_eq!(pending.shadow_tokens(), Some(98_304));
+        assert_eq!(
+            pending.fallback(),
+            Some(TokenFactFallback::FingerprintUnverified)
+        );
+        let verified = resolve_context_tokens(
+            TokenCountMode::ExactWhenVerified,
+            arrival,
+            true,
+            false,
+            true,
+        );
+        assert_eq!(verified.tokens(), 98_304);
+        assert_eq!(verified.fallback(), None);
     }
 
     #[test]
@@ -484,7 +541,7 @@ mod tests {
             100,
             Some(TokenFacts::prepared_token_ids(98_304, fingerprint())),
         );
-        let context = resolve_context_tokens(TokenCountMode::Estimated, arrival, true, false);
+        let context = resolve_context_tokens(TokenCountMode::Estimated, arrival, true, false, true);
         assert_eq!(context.tokens(), 100);
         assert_eq!(context.source(), TokenFactSource::Estimated);
         assert_eq!(context.shadow_tokens(), None);
@@ -494,7 +551,7 @@ mod tests {
     fn shadow_mode_records_counterfactual_without_changing_decision() {
         let arrival =
             ArrivalTokenFacts::new(4, Some(TokenFacts::client_token_ids(98_304, fingerprint())));
-        let context = resolve_context_tokens(TokenCountMode::Shadow, arrival, true, false);
+        let context = resolve_context_tokens(TokenCountMode::Shadow, arrival, true, false, true);
         assert_eq!(context.tokens(), 4);
         assert_eq!(context.shadow_tokens(), Some(98_304));
     }
@@ -503,8 +560,13 @@ mod tests {
     fn exact_mode_applies_prepared_count_when_allowed() {
         let arrival =
             ArrivalTokenFacts::new(4, Some(TokenFacts::client_token_ids(98_304, fingerprint())));
-        let context =
-            resolve_context_tokens(TokenCountMode::ExactWhenVerified, arrival, true, false);
+        let context = resolve_context_tokens(
+            TokenCountMode::ExactWhenVerified,
+            arrival,
+            true,
+            false,
+            true,
+        );
         assert_eq!(context.tokens(), 98_304);
         assert_eq!(context.source(), TokenFactSource::ClientTokenIds);
         assert_eq!(context.fallback(), None);
@@ -514,15 +576,20 @@ mod tests {
     fn exact_mode_falls_back_when_pool_not_allowed_or_revoked() {
         let arrival =
             ArrivalTokenFacts::new(4, Some(TokenFacts::client_token_ids(98_304, fingerprint())));
-        let not_allowed =
-            resolve_context_tokens(TokenCountMode::ExactWhenVerified, arrival, false, false);
+        let not_allowed = resolve_context_tokens(
+            TokenCountMode::ExactWhenVerified,
+            arrival,
+            false,
+            false,
+            true,
+        );
         assert_eq!(not_allowed.tokens(), 4);
         assert_eq!(
             not_allowed.fallback(),
             Some(TokenFactFallback::PoolNotAllowed)
         );
         let revoked =
-            resolve_context_tokens(TokenCountMode::ExactWhenVerified, arrival, true, true);
+            resolve_context_tokens(TokenCountMode::ExactWhenVerified, arrival, true, true, true);
         assert_eq!(revoked.tokens(), 4);
         assert_eq!(
             revoked.fallback(),
@@ -537,6 +604,7 @@ mod tests {
             ArrivalTokenFacts::estimated_only(512),
             true,
             false,
+            true,
         );
         assert_eq!(context.tokens(), 512);
         assert_eq!(context.fallback(), Some(TokenFactFallback::NoPreparedFact));

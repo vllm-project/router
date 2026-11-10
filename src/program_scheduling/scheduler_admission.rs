@@ -256,13 +256,19 @@ impl ProgramScheduler {
 
             // Shadow rollout samples the prepared counterfactual once the
             // decision state reflects this arrival.
-            if context.shadow_tokens().is_some() {
+            if let Some(shadow_tokens) = context.shadow_tokens() {
                 if let Some(target_id) = state
                     .decisions
                     .get(&reference)
                     .and_then(|decision| decision.last_target.clone())
                 {
-                    self.record_shadow_admission(&state, &reference, &target_id, arrived_at);
+                    self.record_shadow_admission(
+                        &state,
+                        &reference,
+                        &target_id,
+                        arrived_at,
+                        shadow_tokens,
+                    );
                 }
             }
             let current_tokens = state.decisions[&reference]

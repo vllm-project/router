@@ -62,6 +62,8 @@ pub struct ProgramSchedulerConfig {
     pub token_count_mode: TokenCountMode,
     /// Model pools allowed to apply prepared exact counts. Empty means all.
     pub token_count_model_pools: Vec<String>,
+    /// Matching settlements required before a fingerprint is applied exactly.
+    pub token_count_verification_settlements: usize,
     /// Text endpoints allowed to apply Router-tokenized exact counts.
     pub exact_text_endpoints: Vec<String>,
     /// HTTP metrics endpoint override keyed by Program target base URL.
@@ -105,6 +107,7 @@ impl Default for ProgramSchedulerConfig {
             max_active_programs_per_target: 64,
             token_count_mode: TokenCountMode::default(),
             token_count_model_pools: Vec::new(),
+            token_count_verification_settlements: 1,
             exact_text_endpoints: Vec::new(),
             metrics_base_urls: BTreeMap::new(),
             metrics_interval: Duration::from_secs(1),
@@ -181,6 +184,7 @@ impl ProgramSchedulerConfig {
             max_active_programs_per_target,
             token_count_mode: config.token_count_mode,
             token_count_model_pools: config.token_count_model_pools.clone(),
+            token_count_verification_settlements: config.token_count_verification_settlements,
             exact_text_endpoints: config.exact_text_endpoints.clone(),
             metrics_base_urls: config.metrics_base_urls.clone(),
             metrics_interval: Duration::from_secs_f64(config.metrics_interval_seconds),
@@ -488,6 +492,13 @@ pub(crate) struct ProgramSchedulerState {
     pub(crate) token_fingerprint_saturated_pools: BTreeSet<String>,
     /// Total revocations, including entries evicted from the bounded map.
     pub(crate) token_fingerprint_revocations: u64,
+    /// Fingerprints with at least one matching Engine settlement.
+    ///
+    /// Value: `(matching_settlements, verification_sequence)`. The sequence is
+    /// used to evict the oldest entry when the map grows past its bound.
+    pub(crate) verified_token_fingerprints: BTreeMap<TokenizerFingerprint, (usize, u64)>,
+    /// Monotonic sequence for verified-fingerprint eviction.
+    pub(crate) token_fingerprint_verification_sequence: u64,
     /// Most recent P-side KV-cache pressure sample.
     pub(crate) prefill_pressure: Option<PrefillPressure>,
     /// Per-P-target metrics samples, keyed by base URL.
@@ -541,6 +552,8 @@ impl ProgramSchedulerState {
             revoked_token_fingerprints: BTreeMap::new(),
             token_fingerprint_saturated_pools: BTreeSet::new(),
             token_fingerprint_revocations: 0,
+            verified_token_fingerprints: BTreeMap::new(),
+            token_fingerprint_verification_sequence: 0,
             prefill_pressure: None,
             prefill_targets: HashMap::new(),
         }
