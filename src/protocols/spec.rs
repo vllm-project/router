@@ -2796,6 +2796,11 @@ pub(crate) mod cache_routing {
     const TEXT: &str = "\0ca:t:";
     const TOKENS: &str = "\0ca:i:";
     const SESSION: &str = "\0ca:s:";
+    /// Prefix for a request routing key matched in place of worker-prepared
+    /// token IDs. The routing key may itself encode token IDs from the request
+    /// body, which can differ from the IDs a worker prepares (for example
+    /// after truncation), so it must never share a prefix with prepared keys.
+    pub const FALLBACK: &str = "\0ca:f:";
     const TOKEN_WIDTH: usize = 8;
 
     pub fn text(value: &str) -> String {

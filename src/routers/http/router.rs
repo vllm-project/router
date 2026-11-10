@@ -1,6 +1,8 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
 use super::program_adapter::ProgramCompletion;
-use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
+use crate::backend::preprocess::{
+    http_routing_key_fallback_allowed, prepare_completion_direct_inputs, prepare_http_kv_inputs,
+};
 use crate::backend::{
     stream_output::{output_frame_tracking, OutputFrameConsumer, OutputFrameProducer},
     PrepareError,
@@ -1372,8 +1374,14 @@ impl Router {
             .as_any()
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
-            cache.select_worker_with_inputs(
-                available, token_ids, model_id, lora_name, cache_salt, "regular",
+            cache.select_worker_with_inputs_or_text(
+                available,
+                token_ids,
+                || text,
+                model_id,
+                lora_name,
+                cache_salt,
+                "regular",
             )?
         } else {
             policy.select_worker_with_headers(available, text, request_headers.as_ref())?
@@ -1506,6 +1514,14 @@ impl Router {
         let completion = completion.as_ref();
         let cache_key = std::sync::OnceLock::new();
         let cache_key = &cache_key;
+        // Shared by HTTP input preparation and the routing-key fallback check.
+        let request_body = std::sync::OnceLock::new();
+        let request_body = &request_body;
+        let request_body = move || -> Option<&serde_json::Value> {
+            request_body
+                .get_or_init(|| serde_json::to_value(typed_req).ok())
+                .as_ref()
+        };
 
         let http_inputs = tokio::sync::OnceCell::new();
 
@@ -1579,20 +1595,20 @@ impl Router {
                 } else {
                     http_inputs
                         .get_or_init(|| async {
-                            match serde_json::to_value(typed_req) {
-                                Ok(body) => Some(
+                            match request_body() {
+                                Some(body) => Some(
                                     prepare_http_kv_inputs(
                                         &self.client,
                                         &workers,
                                         headers,
-                                        &body,
+                                        body,
                                         route,
                                         self.api_key.as_deref(),
                                         Duration::from_secs(1),
                                     )
                                     .await,
                                 ),
-                                Err(_) => None,
+                                None => None,
                             }
                         })
                         .await
@@ -1652,7 +1668,20 @@ impl Router {
                         model_id,
                         &workers,
                         Some(if policy.needs_cache_routing_key() {
-                            cache_key.get_or_init(|| typed_req.extract_cache_routing_key())
+                            // Cache-aware matches this key only when workers
+                            // cannot prepare token IDs. An empty key keeps
+                            // load-only routing when it cannot stand in for
+                            // them; router-prepared gRPC inputs never need it.
+                            cache_key.get_or_init(|| {
+                                if prepared.is_none()
+                                    && request_body()
+                                        .is_some_and(http_routing_key_fallback_allowed)
+                                {
+                                    typed_req.extract_cache_routing_key()
+                                } else {
+                                    String::new()
+                                }
+                            })
                         } else {
                             text
                         }),
@@ -3124,9 +3153,13 @@ impl RouterTrait for Router {
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
             cache
-                .select_worker_with_inputs(
+                .select_worker_with_inputs_or_text(
                     &workers,
                     request_tokens,
+                    || {
+                        http_routing_key_fallback_allowed(&body)
+                            .then(|| crate::protocols::spec::cache_routing::for_route(&body, path))
+                    },
                     model_id,
                     lora_name,
                     cache_salt,
@@ -7287,5 +7320,288 @@ mod tests {
         assert!(registry.revision() > revision_before_recovery);
 
         health_checker.shutdown().await;
+    }
+    /// Issue #501. vLLM 0.30 registers `/v1/chat/completions/render` only with
+    /// `--enable-scale-out`, and `/tokenize` cannot prepare tool-bearing chat
+    /// exactly. Each mock worker records every call and reports its index.
+    struct CacheAwareChatFixture {
+        router: Router,
+        workers: Vec<Arc<dyn Worker>>,
+        servers: Vec<tokio::task::JoinHandle<()>>,
+        calls: Arc<Mutex<Vec<(usize, String)>>>,
+    }
+
+    impl Drop for CacheAwareChatFixture {
+        fn drop(&mut self) {
+            for server in &self.servers {
+                server.abort();
+            }
+        }
+    }
+
+    async fn cache_aware_chat_fixture(render_available: bool) -> CacheAwareChatFixture {
+        use axum::{extract::OriginalUri, routing::post};
+        // Stand-in for a worker's own template: one id per message byte.
+        fn rendered_ids(body: &serde_json::Value) -> Vec<u32> {
+            let mut text = body["tools"].to_string();
+            for message in body["messages"].as_array().into_iter().flatten() {
+                text.push_str(&message.to_string());
+            }
+            text.bytes().map(|byte| u32::from(byte) + 1).collect()
+        }
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 0,
+                max_tree_size: 1 << 20,
+            },
+        ));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut servers = Vec::new();
+        let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
+        for worker_index in 0..2 {
+            let captured = calls.clone();
+            let app = axum::Router::new().fallback(post(
+                move |OriginalUri(uri): OriginalUri, Json(body): Json<serde_json::Value>| {
+                    let captured = captured.clone();
+                    async move {
+                        let path = uri.path().to_string();
+                        captured.lock().push((worker_index, path.clone()));
+                        match path.as_str() {
+                            render if render.ends_with("/render") && !render_available => {
+                                StatusCode::NOT_FOUND.into_response()
+                            }
+                            "/v1/chat/completions/render" => {
+                                Json(serde_json::json!({"token_ids": rendered_ids(&body)}))
+                                    .into_response()
+                            }
+                            "/tokenize" => {
+                                let ids = rendered_ids(&body);
+                                Json(serde_json::json!({"tokens": ids, "count": ids.len()}))
+                                    .into_response()
+                            }
+                            _ => Json(serde_json::json!({"worker": worker_index, "choices": []}))
+                                .into_response(),
+                        }
+                    }
+                },
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, WorkerType::Regular));
+            router.worker_registry.register(worker.clone());
+            workers.push(worker);
+        }
+        CacheAwareChatFixture {
+            router,
+            workers,
+            servers,
+            calls,
+        }
+    }
+
+    /// One agent turn: the full history so far, optionally with tool schemas.
+    fn agent_turn(conversation: &str, turns: usize, tools: bool) -> ChatCompletionRequest {
+        let mut messages = vec![
+            serde_json::json!({"role": "system", "content": "You are a coding agent."}),
+            serde_json::json!({"role": "user", "content": format!("Fix {conversation}. ").repeat(40)}),
+        ];
+        for turn in 1..turns {
+            if tools {
+                messages.push(serde_json::json!({"role": "assistant", "content": null,
+                    "tool_calls": [{"id": format!("call_{turn}"), "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"a.py\"}"}}]}));
+                messages.push(serde_json::json!({"role": "tool",
+                    "tool_call_id": format!("call_{turn}"), "content": "def f(): pass"}));
+            } else {
+                messages.push(serde_json::json!({"role": "assistant", "content": "Looking."}));
+                messages.push(serde_json::json!({"role": "user", "content": "Continue."}));
+            }
+        }
+        let mut body = serde_json::json!({"model": "mock", "messages": messages});
+        if tools {
+            body["tools"] = serde_json::json!([{"type": "function", "function": {
+                "name": "read_file", "description": "Read a repository file.",
+                "parameters": {"type": "object",
+                    "properties": {"path": {"type": "string"}}}}}]);
+            body["tool_choice"] = serde_json::json!("auto");
+        }
+        serde_json::from_value(body).unwrap()
+    }
+
+    /// Route one turn and return the worker index that served it.
+    /// `transparent` uses the untyped proxy path (EPD chat and fallback routes).
+    async fn route_agent_turn(
+        fixture: &CacheAwareChatFixture,
+        request: &ChatCompletionRequest,
+        transparent: bool,
+    ) -> usize {
+        let route = "/v1/chat/completions";
+        let response = if transparent {
+            let body = serde_json::to_value(request).unwrap();
+            fixture
+                .router
+                .route_transparent(None, route, &Method::POST, body)
+                .await
+        } else {
+            fixture
+                .router
+                .route_typed_request(None, request, route, None)
+                .await
+        };
+        selected_http_worker(response).await
+    }
+
+    #[tokio::test]
+    async fn cache_aware_agent_turns_keep_affinity_without_worker_render() {
+        // (render available, tool-bearing agent). The last case is #501:
+        // render 404 and tools present, so no worker can prepare the input.
+        for transparent in [false, true] {
+            for (render_available, tools) in [(true, true), (false, false), (false, true)] {
+                let case = format!(
+                    "render_available={render_available}, tools={tools}, transparent={transparent}"
+                );
+                let fixture = cache_aware_chat_fixture(render_available).await;
+                let turn = |conversation, turns| agent_turn(conversation, turns, tools);
+                let first =
+                    route_agent_turn(&fixture, &turn("conversation-a", 1), transparent).await;
+                // An in-flight request on the warm worker makes load-only
+                // routing prefer the other one; it is far below the imbalance
+                // threshold.
+                fixture.workers[first].increment_load();
+                for turns in 2..=4 {
+                    assert_eq!(
+                        route_agent_turn(&fixture, &turn("conversation-a", turns), transparent)
+                            .await,
+                        first,
+                        "turn {turns} lost prefix affinity ({case})"
+                    );
+                }
+                // An unrelated conversation still balances to the idle worker.
+                assert_eq!(
+                    route_agent_turn(&fixture, &turn("conversation-b", 1), transparent).await,
+                    1 - first,
+                    "{case}"
+                );
+                // Every turn was still forwarded for generation.
+                let calls = fixture.calls.lock();
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|(_, path)| path == "/v1/chat/completions")
+                        .count(),
+                    5,
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// Codex review on #538: with render unavailable, a truncated token-array
+    /// completion must not seed affinity that a later exact-token request for
+    /// the untruncated prompt reads as a prefix hit.
+    #[tokio::test]
+    async fn cache_aware_truncated_fallback_does_not_seed_exact_token_affinity() {
+        let fixture = cache_aware_chat_fixture(false).await;
+        let ids: Vec<u32> = (1..=64).collect();
+        let completion = |extra: serde_json::Value| -> CompletionRequest {
+            let mut body = serde_json::json!({"model": "mock", "prompt": ids});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(body).unwrap()
+        };
+        let route = |request: CompletionRequest| {
+            let fixture = &fixture;
+            async move {
+                selected_http_worker(
+                    fixture
+                        .router
+                        .route_typed_request(None, &request, "/v1/completions", None)
+                        .await,
+                )
+                .await
+            }
+        };
+        // The worker processes only the last 8 tokens of this prompt.
+        let truncated = route(completion(serde_json::json!({"truncate_prompt_tokens": 8}))).await;
+        fixture.workers[truncated].increment_load();
+        // The untruncated prompt uses exact token IDs directly. The truncated
+        // request must not have recorded them against its worker.
+        let exact = route(completion(serde_json::json!({}))).await;
+        assert_eq!(
+            exact,
+            1 - truncated,
+            "truncated fallback seeded token affinity"
+        );
+        // Exact-token affinity still holds for the worker that saw the prompt.
+        fixture.workers[exact].increment_load();
+        fixture.workers[exact].increment_load();
+        assert_eq!(route(completion(serde_json::json!({}))).await, exact);
+        // Every request was still forwarded for generation; no worker RPC was
+        // attempted for the two direct token prompts.
+        let calls = fixture.calls.lock();
+        let paths = |suffix: &str| {
+            calls
+                .iter()
+                .filter(|(_, path)| path.ends_with(suffix))
+                .count()
+        };
+        assert_eq!(paths("/v1/completions"), 3);
+        assert_eq!(paths("/v1/completions/render"), 2);
+    }
+
+    /// Codex review on #538: token preparation rejects native adapter
+    /// identities, and the policy scopes keys only by `lora_name` and
+    /// `cache_salt`, so the fallback must stay load-only for them rather than
+    /// let different adapters share prefix affinity.
+    #[tokio::test]
+    async fn cache_aware_fallback_keeps_unsupported_adapter_identities_load_only() {
+        for transparent in [false, true] {
+            let fixture = cache_aware_chat_fixture(false).await;
+            let turn = |turns, identity: serde_json::Value| {
+                let mut request =
+                    serde_json::to_value(agent_turn("conversation-a", turns, true)).unwrap();
+                request
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(identity.as_object().unwrap().clone());
+                serde_json::from_value::<ChatCompletionRequest>(request).unwrap()
+            };
+            let adapter = |path: &str| serde_json::json!({"lora_path": path});
+            let first =
+                route_agent_turn(&fixture, &turn(1, adapter("adapter-a")), transparent).await;
+            fixture.workers[first].increment_load();
+            for (case, identity) in [
+                ("another lora_path", adapter("adapter-b")),
+                ("same lora_path", adapter("adapter-a")),
+                ("lora_name", serde_json::json!({"lora_name": "adapter-a"})),
+                ("no adapter", serde_json::json!({})),
+            ] {
+                // Same conversation, one turn later. Only load decides.
+                assert_eq!(
+                    route_agent_turn(&fixture, &turn(2, identity), transparent).await,
+                    1 - first,
+                    "{case} (transparent={transparent})"
+                );
+            }
+            // Supported identities keep the fallback's affinity: the base
+            // model conversation above is now warm on the idle worker.
+            let warm = 1 - first;
+            fixture.workers[warm].increment_load();
+            fixture.workers[warm].increment_load();
+            assert_eq!(
+                route_agent_turn(&fixture, &turn(3, serde_json::json!({})), transparent).await,
+                warm,
+                "transparent={transparent}"
+            );
+        }
     }
 }
