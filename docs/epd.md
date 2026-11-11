@@ -35,20 +35,139 @@ encoder are batched into a single request, like the Python EPD proxy.
 
 ## Encode policy, health, and load
 
-`encode_policy` in `--epd-config` accepts `round_robin` (the default when omitted
-or null) or `random`. The native CLI can override the JSON setting with
-`--encode-policy random`; this flag requires `--epd-config`. Unsupported Encode
-policies are rejected at startup. Rust callers set `EpdConfig.encode_policy`
-to `Some(EncodePolicy::RoundRobin)` or `Some(EncodePolicy::Random)`;
-`None` uses round-robin.
+E, P, and D use the same `LoadBalancingPolicy::select_worker_with_headers`
+interface. Encode constructs its own policy instance through the common factory:
+its counter, hash ring, and load cache are independent of consumer instances.
+All requests, registry/context clones, and EncoderStage instances for the same
+router share the Encode instance and its synchronous selection context.
 
-The Encode policy is shared across requests and independent of `--policy`,
-`--prefill-policy`, `--decode-policy`, and per-model consumer policies. For
-example, the command above uses random consumer selection and round-robin
-Encode selection. Round-robin reserves the media assignments for one request
-together, following the configured encoder order among available workers.
-Random assigns each media item uniformly among available workers. Both retain
-image batching by encoder; audio and video items remain singleton subrequests.
+Configuration priority is native CLI `--encode-policy` > JSON `epd.encode_policy`
+> the complete main `RouterConfig.policy`. Omitted or null Encode configuration
+inherits the main configuration, including its parameters, and creates a separate
+instance. P/D overrides and per-model consumer policies do not change that
+resolution. `--encode-policy` requires `--epd-config` and uses the existing CLI
+policy parameters. JSON is parsed before the override: invalid JSON, unknown
+names, and incorrect types remain errors. A known policy that is incompatible
+with Encode may be replaced by a compatible CLI override.
+
+| Policy | Encode behavior |
+| --- | --- |
+| `round_robin` | One ordinary selection per item, using the configured encoder order. |
+| `random` | One independent uniform choice per item. |
+| `power_of_two` | Compare two candidates using local in-flight HTTP batch load; no new encoder polling or item reservations. |
+| `consistent_hash`, `rendezvous_hash` | Request/session affinity within the independent Encode pool. |
+| `cache_aware` | Rejected: Encode prefix/cache affinity and initialization are not defined. |
+| `kv_aware` | Rejected: KV placement and token transfer costs do not apply to Encode. |
+
+Role compatibility is declared by each policy. Startup validation rejects an
+incompatible role before constructing any policy, including the main policy's
+cache eviction thread. A direct selector call with an unsupported role returns
+`None` before modifying state or metrics; EPD selection failure remains `503`.
+
+The CLI still defaults to main `cache_aware`, while Rust
+`RouterConfig::default()` still uses `random`. Thus enabling EPD without an
+Encode override on the default CLI now fails at startup. Preserve the consumer
+policy and explicitly configure Encode when using either cache-aware or
+KV-aware consumers:
+
+```bash
+vllm-router --worker-urls http://pd0:8000 --policy cache_aware \
+  --epd-config '{"encoder_urls":["http://e0:8000"]}' \
+  --encode-policy round_robin
+vllm-router --worker-urls http://pd0:8000 --policy kv_aware \
+  --epd-config '{"encoder_urls":["http://e0:8000"]}' \
+  --encode-policy round_robin
+```
+
+The KV-aware example is Regular E+PD; existing static P/D KV-aware restrictions
+still apply. With no override, `--policy random` uses independent Random
+instances for consumers and Encode. Explicit JSON strings `"round_robin"` and
+`"random"` retain their existing meaning and serialization. All common policy
+names accept shorthand defaults, and parameterized policies also accept tagged
+objects:
+
+```json
+{
+  "encoder_urls": ["http://e0:8000", "http://e1:8000"],
+  "encode_policy": {"type":"consistent_hash", "virtual_nodes":317}
+}
+```
+
+The resolver and factory entry retain the full `PolicyConfig`. The existing
+factories currently ignore `consistent_hash.virtual_nodes` (the ring still uses
+160 virtual nodes per worker) and `power_of_two.load_check_interval_secs`
+(which does not control polling). These fields round-trip in tagged JSON and
+must be positive, but retaining them does not make them operational. Use a
+tagged object for custom parameters; parameterized policies serialize as objects.
+
+Startup errors distinguish an explicit `--encode-policy`, explicit
+`epd.encode_policy`, and inheritance from `--policy` because Encode is unset.
+Rust/JSON validation names `RouterConfig.policy` as the inherited source.
+For example, inherited `kv_aware` reports that source, the unsupported Encode
+role, its reason, and the suggestion to set `--encode-policy round_robin`.
+Explicit incompatible configurations name the override that needs correction.
+
+A shared synchronous selection context keeps a request's RR choices consecutive
+when the candidate pool and availability are stable. Every item calls the
+ordinary selector, which rechecks health/circuit state; changing availability
+can change the sequence. The lock covers only synchronous selections, and
+policy replacement uses the same lock order. HTTP calls, response processing,
+and batch load guards run after it is released. All item assignments must
+succeed before HTTP dispatch; a failed selection does not rewind the counter.
+Images assigned to one encoder are combined into one HTTP request; audio/video
+items remain singleton calls. Common selection may scan health once per item.
+
+For hashing, provide a stable `X-Session-ID` or another existing session header.
+The existing priority is headers (`x-session-id`, `x-user-id`, `x-tenant-id`,
+`x-correlation-id`, `x-request-id`, `x-trace-id`) before body session/user fields,
+then request-content fallback. Per-request IDs do not provide cross-request
+session affinity. Without a matching header, Encode serializes and extracts or
+hashes the original body once, outside the selection lock. Each item receives
+only the prepared canonical key through internal policy data, with no repeated
+body scan and no changed key prefix. The internal key cannot be imported from
+an HTTP header and is never forwarded to encoders or consumers. The ordinary
+consumer key-extraction path is unchanged.
+
+With a stable pool and availability, all items in one hash request have the
+same key and select the same encoder, producing one image batch. A health or
+registry change may redirect selection. This is request/session affinity;
+media content cache affinity is outside this implementation. Canonical key
+preparation is at most one body scan/hash, while each item's hash policy still
+computes its ring lookup or worker scores. Long session/user keys still cost
+proportionally to their key length; one body serialization can still use a
+large allocation. The consumer's own selection cost is separate.
+
+### Rust API migration
+
+This revision changes public Rust source APIs. Replace
+`Some(EncodePolicy::Random)` with `Some(PolicyConfig::Random)` (likewise for RR);
+`EncodePolicy` is removed and `EpdConfig.encode_policy` is now
+`Option<PolicyConfig>`. Existing JSON string compatibility does not preserve the
+old Rust type. For example:
+
+```rust
+use vllm_router_rs::config::{EpdConfig, PolicyConfig};
+let epd = EpdConfig {
+    encoder_urls: vec!["http://encoder:8000".into()],
+    encode_policy: Some(PolicyConfig::Random),
+    consumer_zmq_addrs: Default::default(),
+};
+let main = PolicyConfig::RoundRobin;
+let effective: &PolicyConfig = epd.effective_encode_policy(&main);
+```
+
+`effective_encode_policy()` becomes `effective_encode_policy(&main_policy)` and
+returns a configuration reference. `PolicyRegistry::set_encode_policy` takes
+`&PolicyConfig` and returns `Result<(), PolicyRoleError>`;
+`get_encode_policy` returns `Option<Arc<dyn LoadBalancingPolicy>>` with no
+consumer fallback. Non-EPD registries leave that slot empty.
+`LoadBalancingPolicy::select_encode_batch` and the RR/random overrides are
+removed; external callers and trait implementations must migrate to repeated
+`select_worker_with_headers` calls. To keep a request's sequence together, use
+the registry's shared `get_encode_selection_context().with_selection(...)`,
+read the current policy inside that closure, and keep HTTP work outside it.
+Do not call `select_and_reserve` inside the closure: it would relock the context
+and create per-item reservations. No version bump is included in this Draft.
 
 Static encoders are registered at startup with the `Encode` role. They use the
 router's health-check endpoint (default `/health`), timeout, interval, and
@@ -64,7 +183,9 @@ adds one, and the count stays held until the response body/JSON is consumed or
 the attempt fails. Completion, failure, or dropping the encoder future releases
 that batch's load once; periodic load resets preserve active Encode batches.
 This counter measures router-side HTTP work, not media-item count or the
-engine's GPU queue. RR/random selection does not balance by this load.
+engine's GPU queue. RR/random selection does not balance by this load; power-of-two reads it.
+Item selection does not increment Encode processed/load or existing consumer
+processed/policy metrics. HTTP batch execution owns that accounting.
 
 Encode `processed_requests` counts completed HTTP batch attempts, including
 HTTP, transport, and response-JSON failures. Dropping an unfinished future
