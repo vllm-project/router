@@ -48,8 +48,10 @@ jobs:
           sed -E 's/\x1B\[[0-9;]*[mK]//g' unit-tests.log > unit-clean.log || cp unit-tests.log unit-clean.log
           if grep -q '^failures:' unit-clean.log; then
             grep -A30 '^failures:' unit-clean.log | head -30 | sed 's/^/::error::/'
+          elif grep -qE 'panicked|error\[|^error:|FAILED' unit-clean.log; then
+            grep -E 'panicked|error\[|^error:|FAILED' unit-clean.log | head -20 | sed 's/^/::error::/'
           else
-            grep -E 'panicked|error\[|^error:|FAILED' unit-clean.log | head -20 | sed 's/^/::error::/' || tail -40 unit-clean.log | sed 's/^/::error::/'
+            tail -100 unit-clean.log | sed 's/^/::error::/'
           fi
       - name: Integration tests
         run: |
