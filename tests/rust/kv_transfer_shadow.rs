@@ -30,6 +30,13 @@
 //! `(new_prefill + active_prefill_tokens) * (active_requests + 1)`, and the
 //! planner prices 50 us per prefilled token, 5 ms + 5 us per transferred token.
 //!
+//! # Active mode
+//!
+//! The last section runs the same fixture with `kv_transfer: {mode: active}`.
+//! The mocks record every request body, so those tests assert on exactly what
+//! reached the destination worker (`kv_transfer_params` from the source's
+//! `peer_lookup` record) and what did not.
+//!
 //! # Convergence
 //!
 //! Index convergence is polled through `KvAwarePolicy::decision_for` (a side
@@ -59,6 +66,7 @@ use vllm_router_rs::server::AppContext;
 
 const BLOCK_SIZE: u32 = 16;
 const COUNTER: &str = "vllm_router_kv_transfer_plans_total";
+const REQUESTS: &str = "vllm_router_kv_transfer_requests_total";
 const SAVED_MS: &str = "vllm_router_kv_transfer_estimated_saved_ms";
 const COST_MS: &str = "vllm_router_kv_transfer_estimated_cost_ms";
 
@@ -77,9 +85,14 @@ fn metrics() -> &'static PrometheusHandle {
 
 /// Every `outcome` label of the transfer-plan counter, with its current value.
 fn plan_counts() -> BTreeMap<String, u64> {
+    counter_counts(COUNTER)
+}
+
+/// Every `outcome` label of the counter `name`, with its current value.
+fn counter_counts(name: &str) -> BTreeMap<String, u64> {
     let mut counts = BTreeMap::new();
     for line in metrics().render().lines() {
-        let Some(rest) = line.strip_prefix(COUNTER).and_then(|r| r.strip_prefix('{')) else {
+        let Some(rest) = line.strip_prefix(name).and_then(|r| r.strip_prefix('{')) else {
             continue;
         };
         let outcome = rest
@@ -227,6 +240,13 @@ impl Options {
             },
             peers: BTreeMap::new(),
         }
+    }
+
+    /// Active mode: planned requests carry `kv_transfer_params`. Capabilities
+    /// come from the engines' records, as active mode requires.
+    fn active(mut self, peers: &[(&'static str, PeerLookupMock)]) -> Self {
+        self.transfer.mode = KvTransferMode::Active;
+        self.with_engine_capabilities(peers)
     }
 
     /// Capabilities come only from the engines' `peer_lookup` records: no
@@ -429,6 +449,15 @@ async fn post(app: &Router, route: &str, body: serde_json::Value, session: Optio
     // Drain the body: the router releases its load accounting when it ends.
     let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
     status
+}
+
+/// Run `request`, returning the delta of the active-mode request counter.
+async fn request_outcomes_of<F: std::future::Future>(
+    request: F,
+) -> (F::Output, BTreeMap<String, u64>) {
+    let before = counter_counts(REQUESTS);
+    let result = request.await;
+    (result, delta(&before, &counter_counts(REQUESTS)))
 }
 
 /// Run `request`, returning the outcome delta it produced.
@@ -970,4 +999,219 @@ async fn s13_invalid_or_disabled_record_is_dropped_and_incompatible() {
         assert!(peer_endpoint_of(&fx, "b").is_none());
         fx.finish().await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Active mode. Same load setup as scenario 1: A holds a 100-block prefix and is
+// busy (two held requests), B is idle and cold, so a request for the prefix is
+// planned with A as the source and B as the destination.
+// ---------------------------------------------------------------------------
+
+fn both_report_fp() -> [(&'static str, PeerLookupMock); 2] {
+    [
+        ("a", PeerLookupMock::new("fp")),
+        ("b", PeerLookupMock::new("fp")),
+    ]
+}
+
+/// What the destination must receive for a fetch from mock `a` (rank 0).
+fn expected_peer_params() -> serde_json::Value {
+    json!({
+        "do_remote_prefill": true,
+        "peer_lookup": true,
+        "remote_engine_id": "a-rank0",
+        "remote_host": PEER_HOST,
+        "remote_port": peer_port(0),
+        "tp_size": 1,
+        "dcp_size": 1,
+        "pp_size": 1,
+    })
+}
+
+fn kv_policy(fx: &Fixture) -> Arc<dyn vllm_router_rs::policies::LoadBalancingPolicy> {
+    fx.ctx.policy_registry.get_default_policy()
+}
+
+/// Start the active-mode fixture of scenario 1 and return it with the prompt.
+async fn active_fixture(seed: u32, options: Options) -> (Fixture, Vec<u32>) {
+    let mut fx = Fixture::start(options).await;
+    let prompt = seq(seed, 1700);
+    fx.mock("a")
+        .store_prefix(&prompt, 100, Residency::Device)
+        .await;
+    fx.converge(&prompt, "a", 100).await;
+    fx.make_busy("a", &prompt[..1600], 300, 2).await;
+    (fx, prompt)
+}
+
+/// 14: a planned request reaches the destination with exactly the section 4.2
+/// fields taken from the source's `peer_lookup` record; nothing else changes,
+/// and requests that were not planned carry no `kv_transfer_params`.
+#[tokio::test]
+async fn s14_active_mode_sends_peer_params_to_the_destination_only() {
+    let (fx, prompt) = active_fixture(
+        31,
+        Options::new(&[("a", "m"), ("b", "m")]).active(&both_report_fp()),
+    )
+    .await;
+    let before_body = json!({"prompt": prompt, "max_tokens": 1});
+
+    let ((status, plans), sent) = request_outcomes_of(outcomes_of(fx.post(
+        "/v1/completions",
+        before_body.clone(),
+        None,
+    )))
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(plans, outcomes(&[("planned", 1)]));
+    assert_eq!(sent, outcomes(&[("sent", 1)]));
+
+    // Destination B got the client's body plus exactly the peer params.
+    let b_bodies = fx.mock("b").bodies();
+    assert_eq!(b_bodies.len(), 1);
+    let mut expected = before_body;
+    expected["kv_transfer_params"] = expected_peer_params();
+    assert_eq!(b_bodies[0], expected);
+
+    // The source saw only its two held requests, neither with params.
+    let a_bodies = fx.mock("a").bodies();
+    assert_eq!(a_bodies.len(), 2);
+    assert!(a_bodies
+        .iter()
+        .all(|body| body.get("kv_transfer_params").is_none()));
+
+    // A request that is not planned (nobody holds its prefix) is untouched.
+    let cold = seq(32, 1700);
+    let ((status, plans), sent) = request_outcomes_of(outcomes_of(fx.complete(&cold, None))).await;
+    assert_eq!(status, 200);
+    assert!(!plans.contains_key("planned"), "{plans:?}");
+    assert!(sent.is_empty(), "{sent:?}");
+    let last = fx
+        .mock("a")
+        .bodies()
+        .into_iter()
+        .chain(fx.mock("b").bodies())
+        .filter(|body| body["prompt"] == json!(cold))
+        .collect::<Vec<_>>();
+    assert_eq!(last.len(), 1);
+    assert!(last[0].get("kv_transfer_params").is_none());
+    fx.finish().await;
+}
+
+/// 15: the kill switch drops planned requests back to shadow, and the source's
+/// in-flight slot is held for the whole request and freed when it ends.
+#[tokio::test]
+async fn s15_kill_switch_and_slot_lifetime() {
+    let (mut fx, prompt) = active_fixture(
+        33,
+        Options::new(&[("a", "m"), ("b", "m")]).active(&both_report_fp()),
+    )
+    .await;
+    let policy = kv_policy(&fx);
+    let kv = policy
+        .as_any()
+        .downcast_ref::<KvAwarePolicy>()
+        .expect("kv_aware policy");
+    let source_url = fx.mock("a").url.clone();
+    assert!(kv.peer_fetch_enabled());
+    assert_eq!(kv.peer_fetch_inflight(&source_url), 0);
+
+    // Kill switch: back to shadow. The plan is still made and counted, but the
+    // request goes out as the client sent it.
+    assert!(!kv.set_peer_fetch_enabled(false));
+    let ((status, plans), sent) =
+        request_outcomes_of(outcomes_of(fx.complete(&prompt, None))).await;
+    assert_eq!(status, 200);
+    assert_eq!(plans, outcomes(&[("planned", 1)]));
+    assert!(sent.is_empty(), "{sent:?}");
+    let b_bodies = fx.mock("b").bodies();
+    assert_eq!(b_bodies.len(), 1);
+    assert!(b_bodies[0].get("kv_transfer_params").is_none());
+    assert_eq!(kv.peer_fetch_inflight(&source_url), 0);
+
+    // Re-enabled: a planned request that stays open on B holds one slot
+    // against A.
+    assert!(kv.set_peer_fetch_enabled(true));
+    let app = fx.app.clone();
+    let held_prompt = prompt.clone();
+    fx.held.push(tokio::spawn(async move {
+        post(
+            &app,
+            "/v1/completions",
+            json!({"prompt": held_prompt, "max_tokens": 1, "priority": HOLD_PRIORITY}),
+            None,
+        )
+        .await
+    }));
+    fx.mock("b").wait_held(1).await;
+    assert_eq!(kv.peer_fetch_inflight(&source_url), 1);
+    let b_bodies = fx.mock("b").bodies();
+    assert_eq!(b_bodies[1]["kv_transfer_params"], expected_peer_params());
+
+    for mock in &fx.mocks {
+        mock.release_held();
+    }
+    // The response body being drained is what releases the guard.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while kv.peer_fetch_inflight(&source_url) != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the slot leaked after the request ended"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for task in fx.held.drain(..) {
+        assert_eq!(task.await.expect("held request task"), 200);
+    }
+}
+
+/// 16: a source that reported no valid address is planned but never fetched
+/// from: the request goes out unchanged and is counted as `no_peer_endpoint`.
+/// Capabilities are registered directly (the address only comes from an engine
+/// record, and a worker whose record is dropped loses its capability too), so
+/// the planner accepts the pair while A has no address.
+#[tokio::test]
+async fn s16_source_without_an_address_is_not_fetched_from() {
+    let mut options = Options::new(&[("a", "m"), ("b", "m")]);
+    options.transfer.mode = KvTransferMode::Active;
+    options.transfer.require_capability = true;
+    // No engine records at all; the capabilities are added below, once the
+    // mock URLs are known.
+    let (fx, prompt) = {
+        let mut fx = Fixture::start(options).await;
+        let policy = kv_policy(&fx);
+        let kv = policy
+            .as_any()
+            .downcast_ref::<KvAwarePolicy>()
+            .expect("kv_aware policy");
+        for instance in ["a", "b"] {
+            kv.register_transfer_capability(
+                fx.mock(instance).url.clone(),
+                vllm_router_rs::policies::TransferCapability {
+                    can_export: true,
+                    can_import: true,
+                    connector: Arc::from("nixl"),
+                    connector_version: Arc::from("1"),
+                    layout_fingerprint: Arc::from("fp"),
+                },
+            );
+        }
+        let prompt = seq(34, 1700);
+        fx.mock("a")
+            .store_prefix(&prompt, 100, Residency::Device)
+            .await;
+        fx.converge(&prompt, "a", 100).await;
+        fx.make_busy("a", &prompt[..1600], 300, 2).await;
+        (fx, prompt)
+    };
+
+    let ((status, plans), sent) =
+        request_outcomes_of(outcomes_of(fx.complete(&prompt, None))).await;
+    assert_eq!(status, 200);
+    assert_eq!(plans, outcomes(&[("planned", 1)]));
+    assert_eq!(sent, outcomes(&[("no_peer_endpoint", 1)]));
+    let b_bodies = fx.mock("b").bodies();
+    assert_eq!(b_bodies.len(), 1);
+    assert!(b_bodies[0].get("kv_transfer_params").is_none());
+    fx.finish().await;
 }

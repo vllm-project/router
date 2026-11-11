@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,8 +13,8 @@ use rand::Rng;
 use sha2::{Digest as _, Sha256};
 
 use super::kv_transfer::{
-    PeerEndpoint, TransferCapability, TransferOutcome, TransferPlan, TransferPlanner,
-    TransferPlannerInput, TransferSkip,
+    PeerEndpoint, PeerFetchGrant, PeerFetchLimiter, TransferCapability, TransferOutcome,
+    TransferPlan, TransferPlanner, TransferPlannerInput, TransferSkip,
 };
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
@@ -487,6 +487,11 @@ pub struct KvSelectionReceipt {
     /// would have looked like. Reported only; routing and the slot charge are
     /// unaffected. `None` when no planner is configured or no plan was made.
     pub transfer: Option<TransferPlan>,
+    /// Active mode only: where the destination should fetch `transfer` from,
+    /// with the source's in-flight slot. `None` in shadow mode, when there is
+    /// no plan, or when the plan could not be acted on (no source address, or
+    /// the source is at its in-flight cap).
+    pub peer_fetch: Option<PeerFetchGrant>,
 }
 
 /// Fixed bound of the affinity table shared by every policy instance.
@@ -969,6 +974,15 @@ pub struct KvAwarePolicy {
     engine_capabilities: DashSet<String>,
     /// Source of `TransferPlan::plan_id`; starts at 1 so 0 means unassigned.
     next_transfer_plan_id: AtomicU64,
+    /// Active-mode peer fetch; `None` unless the policy was built active.
+    peer_fetch: Option<PeerFetchState>,
+}
+
+/// Active-mode state: the per-source cap and the runtime kill switch.
+#[derive(Debug)]
+struct PeerFetchState {
+    limiter: Arc<PeerFetchLimiter>,
+    enabled: AtomicBool,
 }
 
 impl std::fmt::Debug for KvAwarePolicy {
@@ -1026,7 +1040,49 @@ impl KvAwarePolicy {
             peer_endpoints: DashMap::new(),
             engine_capabilities: DashSet::new(),
             next_transfer_plan_id: AtomicU64::new(1),
+            peer_fetch: None,
         }
+    }
+
+    /// Build the policy in active mode: planned requests get a peer fetch
+    /// grant, at most `max_inflight_per_source` at a time per source worker.
+    /// Starts enabled; see [`set_peer_fetch_enabled`](Self::set_peer_fetch_enabled).
+    pub fn with_peer_fetch(mut self, max_inflight_per_source: usize) -> Self {
+        self.peer_fetch = Some(PeerFetchState {
+            limiter: PeerFetchLimiter::new(max_inflight_per_source),
+            enabled: AtomicBool::new(true),
+        });
+        self
+    }
+
+    /// Whether planned requests are currently acted on (active mode) rather
+    /// than only reported (shadow mode).
+    pub fn peer_fetch_enabled(&self) -> bool {
+        self.peer_fetch
+            .as_ref()
+            .is_some_and(|state| state.enabled.load(Ordering::Acquire))
+    }
+
+    /// Runtime kill switch: `false` drops back to shadow mode for requests
+    /// selected from now on (in-flight fetches finish normally); `true`
+    /// re-enables active mode. Returns the resulting state. A policy that was
+    /// not built active stays shadow, because its planner was not built with
+    /// the capability requirement active mode forces.
+    pub fn set_peer_fetch_enabled(&self, enabled: bool) -> bool {
+        match &self.peer_fetch {
+            Some(state) => {
+                state.enabled.store(enabled, Ordering::Release);
+                enabled
+            }
+            None => false,
+        }
+    }
+
+    /// In-flight peer fetches against a source worker (test and diagnostics).
+    pub fn peer_fetch_inflight(&self, source_url: &str) -> usize {
+        self.peer_fetch
+            .as_ref()
+            .map_or(0, |state| state.limiter.inflight(source_url))
     }
 
     /// Enable shadow-mode transfer planning. Plans are attached to receipts
@@ -1488,6 +1544,9 @@ impl KvAwarePolicy {
                     &excluded,
                 )
             });
+            let peer_fetch = transfer
+                .as_ref()
+                .and_then(|transfer| self.peer_fetch_grant(workers, &plan, transfer));
             // Reserve the actual target's slot and worker load before unlocking.
             let slot = self.slot_manager.as_ref().map(|manager| {
                 manager.begin_prefill(&target, new_prefill_tokens);
@@ -1508,9 +1567,47 @@ impl KvAwarePolicy {
                 decision,
                 slot,
                 transfer,
+                peer_fetch,
             });
         }
         None
+    }
+
+    /// Active mode: turn a plan into a fetch address and an in-flight slot.
+    /// `None` (counted) when the source has no reported address or is at the
+    /// cap; `None` (not counted) in shadow mode. Caller holds `selection_lock`.
+    fn peer_fetch_grant(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        plan: &SelectionPlan,
+        transfer: &TransferPlan,
+    ) -> Option<PeerFetchGrant> {
+        let state = self
+            .peer_fetch
+            .as_ref()
+            .filter(|state| state.enabled.load(Ordering::Acquire))?;
+        // The plan names its source by target; peer addresses are keyed by
+        // worker URL, so go through the same snapshot the plan was made from.
+        let source_url = plan
+            .bindings
+            .iter()
+            .position(|binding| binding.target == transfer.source)
+            .and_then(|position| plan.healthy.get(position))
+            .and_then(|&index| workers.get(index))
+            .map(|worker| worker.url());
+        let Some((source_url, endpoint)) = source_url.and_then(|url| {
+            self.peer_endpoints
+                .get(url)
+                .map(|endpoint| (url, endpoint.clone()))
+        }) else {
+            crate::metrics::RouterMetrics::record_kv_transfer_request("no_peer_endpoint");
+            return None;
+        };
+        let Some(permit) = state.limiter.try_acquire(source_url) else {
+            crate::metrics::RouterMetrics::record_kv_transfer_request("inflight_cap");
+            return None;
+        };
+        Some(PeerFetchGrant { endpoint, permit })
     }
 
     /// Ask the planner what a peer fetch would have looked like for the picked
@@ -4429,6 +4526,129 @@ mod tests {
             .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
             .unwrap();
         assert_eq!(again.transfer.unwrap().plan_id, 2);
+    }
+
+    fn peer_endpoint(engine_id: &str, port: u16) -> PeerEndpoint {
+        PeerEndpoint {
+            engine_id: Arc::from(engine_id),
+            host: Arc::from("10.0.0.1"),
+            port,
+            tp_size: 1,
+            dcp_size: 1,
+            pp_size: 1,
+        }
+    }
+
+    /// `transfer_fixture` with the planner and active mode on, and `a` (the
+    /// source) reporting a peer address.
+    fn active_fixture(
+        max_inflight: usize,
+    ) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>, Vec<RoutableTarget>) {
+        let (policy, workers, targets) = transfer_fixture(true);
+        let policy = policy.with_peer_fetch(max_inflight);
+        policy
+            .peer_endpoints
+            .insert("http://a".to_owned(), peer_endpoint("engine-a", 5600));
+        (policy, workers, targets)
+    }
+
+    fn select(policy: &KvAwarePolicy, workers: &[Arc<dyn Worker>]) -> KvSelectionReceipt {
+        policy
+            .select_worker_with_receipt(workers, Some(&transfer_ids()), None, None, None, &[])
+            .unwrap()
+    }
+
+    #[test]
+    fn active_mode_grants_the_sources_address_for_a_plan() {
+        let (policy, workers, _) = active_fixture(4);
+        let receipt = select(&policy, &workers);
+        assert!(receipt.transfer.is_some());
+        let grant = receipt.peer_fetch.as_ref().expect("grant");
+        assert_eq!(grant.endpoint, peer_endpoint("engine-a", 5600));
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
+    }
+
+    #[test]
+    fn shadow_mode_never_grants_even_with_an_address() {
+        let (policy, workers, _) = transfer_fixture(true);
+        policy
+            .peer_endpoints
+            .insert("http://a".to_owned(), peer_endpoint("engine-a", 5600));
+        let receipt = select(&policy, &workers);
+        assert!(receipt.transfer.is_some());
+        assert!(receipt.peer_fetch.is_none());
+        assert!(!policy.peer_fetch_enabled());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+    }
+
+    #[test]
+    fn active_mode_without_a_source_address_plans_but_does_not_grant() {
+        let (policy, workers, _) = active_fixture(4);
+        policy.peer_endpoints.remove("http://a");
+        let receipt = select(&policy, &workers);
+        assert!(receipt.transfer.is_some());
+        assert!(receipt.peer_fetch.is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+    }
+
+    #[test]
+    fn the_endpoint_is_the_sources_not_the_destinations() {
+        let (policy, workers, _) = active_fixture(4);
+        policy
+            .peer_endpoints
+            .insert("http://b".to_owned(), peer_endpoint("engine-b", 5700));
+        let receipt = select(&policy, &workers);
+        assert_eq!(receipt.worker_index, 1, "b is the destination");
+        assert_eq!(
+            receipt
+                .peer_fetch
+                .as_ref()
+                .unwrap()
+                .endpoint
+                .engine_id
+                .as_ref(),
+            "engine-a"
+        );
+    }
+
+    #[test]
+    fn the_in_flight_cap_holds_until_the_receipt_is_dropped() {
+        let (policy, workers, _) = active_fixture(1);
+        let first = select(&policy, &workers);
+        assert!(first.peer_fetch.is_some());
+
+        // Over the cap: still planned, but no grant.
+        let second = select(&policy, &workers);
+        assert!(second.transfer.is_some());
+        assert!(second.peer_fetch.is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
+
+        drop(first);
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+        let third = select(&policy, &workers);
+        assert!(third.peer_fetch.is_some());
+    }
+
+    #[test]
+    fn kill_switch_returns_to_shadow_and_back() {
+        let (policy, workers, _) = active_fixture(4);
+        assert!(policy.peer_fetch_enabled());
+
+        assert!(!policy.set_peer_fetch_enabled(false));
+        let receipt = select(&policy, &workers);
+        assert!(receipt.transfer.is_some(), "shadow planning continues");
+        assert!(receipt.peer_fetch.is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+
+        assert!(policy.set_peer_fetch_enabled(true));
+        assert!(select(&policy, &workers).peer_fetch.is_some());
+    }
+
+    #[test]
+    fn a_policy_not_built_active_cannot_be_switched_on() {
+        let (policy, _, _) = transfer_fixture(true);
+        assert!(!policy.set_peer_fetch_enabled(true));
+        assert!(!policy.peer_fetch_enabled());
     }
 
     /// Busy worker `a` holds all of `a_prompt` in a real index; idle `b` holds

@@ -157,6 +157,8 @@ struct MockState {
     held_inflight: AtomicUsize,
     completions: AtomicUsize,
     fail_next: AtomicUsize,
+    /// JSON body of every completion request, in arrival order.
+    bodies: Mutex<Vec<Value>>,
 }
 
 enum Command {
@@ -205,6 +207,7 @@ impl KvEventMock {
             held_inflight: AtomicUsize::new(0),
             completions: AtomicUsize::new(0),
             fail_next: AtomicUsize::new(0),
+            bodies: Mutex::new(Vec::new()),
         });
 
         let (commands, command_rx) = mpsc::channel();
@@ -357,6 +360,12 @@ impl KvEventMock {
         self.state.completions.load(Ordering::Acquire)
     }
 
+    /// JSON bodies of the completion requests that reached this worker, in
+    /// arrival order (a body that is not JSON is recorded as `null`).
+    pub fn bodies(&self) -> Vec<Value> {
+        self.state.bodies.lock().unwrap().clone()
+    }
+
     /// Held requests currently open on this worker.
     pub fn held(&self) -> usize {
         self.state.held_inflight.load(Ordering::Acquire)
@@ -488,10 +497,17 @@ async fn kv_event_sources(State(state): State<Arc<MockState>>) -> Json<Value> {
 /// Shared by both completion routes. Returns the failure response when the
 /// worker was told to fail, otherwise waits (hold or delay) and returns `None`.
 async fn admit(state: &MockState, body: &Bytes) -> Option<Response> {
-    state.completions.fetch_add(1, Ordering::AcqRel);
-    let held = serde_json::from_slice::<Value>(body)
-        .ok()
+    let parsed = serde_json::from_slice::<Value>(body).ok();
+    let held = parsed
+        .as_ref()
         .is_some_and(|value| value["priority"].as_i64() == Some(HOLD_PRIORITY));
+    // Record before counting, so a test that sees the count also sees the body.
+    state
+        .bodies
+        .lock()
+        .unwrap()
+        .push(parsed.unwrap_or(Value::Null));
+    state.completions.fetch_add(1, Ordering::AcqRel);
     if held {
         state.held_inflight.fetch_add(1, Ordering::AcqRel);
         let mut release = state.release.subscribe();

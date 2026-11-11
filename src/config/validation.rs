@@ -981,11 +981,11 @@ impl ConfigValidator {
     /// Validate the `kv_aware` `kv_transfer` block. A capabilities table is
     /// ignored (but not required to be absent) when the mode is off.
     fn validate_kv_transfer(config: &KvTransferConfig) -> ConfigResult<()> {
-        if config.mode == KvTransferMode::Active {
+        if config.mode == KvTransferMode::Active && config.max_inflight_per_source == 0 {
             return Err(ConfigError::InvalidValue {
-                field: "kv_transfer.mode".to_string(),
-                value: "active".to_string(),
-                reason: "active mode is not available yet; use off or shadow".to_string(),
+                field: "kv_transfer.max_inflight_per_source".to_string(),
+                value: "0".to_string(),
+                reason: "must be greater than 0 in active mode".to_string(),
             });
         }
         if !config.transfer_policy().valid() {
@@ -1909,9 +1909,15 @@ mod tests {
             ConfigValidator::validate(&kv_transfer_config(block(mode))).unwrap();
         }
 
-        let error = ConfigValidator::validate(&kv_transfer_config(block(KvTransferMode::Active)))
-            .unwrap_err();
-        assert!(error.to_string().contains("not available yet"), "{error}");
+        // Active mode is accepted, with a positive per-source cap.
+        ConfigValidator::validate(&kv_transfer_config(block(KvTransferMode::Active))).unwrap();
+        let mut bad = block(KvTransferMode::Active);
+        bad.max_inflight_per_source = 0;
+        let error = ConfigValidator::validate(&kv_transfer_config(bad)).unwrap_err();
+        assert!(
+            error.to_string().contains("max_inflight_per_source"),
+            "{error}"
+        );
 
         for margin in [0.0, 1.5, f64::NAN] {
             let mut bad = block(KvTransferMode::Shadow);

@@ -224,7 +224,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 0.3)]
     kv_penalty_disk: f64,
     /// KV transfer planner for kv_aware: off, shadow (plan and report only), or
-    /// active (not available yet).
+    /// active (send kv_transfer_params so the destination engine fetches the prefix).
     #[arg(long, default_value = "off", value_parser = ["off", "shadow", "active"])]
     kv_transfer_mode: String,
     /// Minimum blocks the source must hold beyond the destination.
@@ -248,6 +248,9 @@ struct CliArgs {
     /// Require declared worker capability before planning a transfer.
     #[arg(long)]
     kv_transfer_require_capability: bool,
+    /// Active mode: most peer fetches in flight against one source worker.
+    #[arg(long, default_value_t = 4)]
+    kv_transfer_max_inflight_per_source: usize,
 
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
@@ -480,6 +483,7 @@ impl CliArgs {
             transfer_fixed_ms: self.kv_transfer_fixed_ms,
             transfer_us_per_token: self.kv_transfer_us_per_token,
             require_capability: self.kv_transfer_require_capability,
+            max_inflight_per_source: self.kv_transfer_max_inflight_per_source,
             capabilities: HashMap::new(),
         }))
     }
@@ -1077,6 +1081,8 @@ mod tests {
             "--kv-transfer-us-per-token",
             "7",
             "--kv-transfer-require-capability",
+            "--kv-transfer-max-inflight-per-source",
+            "2",
         ])
         .unwrap();
         assert_eq!(
@@ -1090,11 +1096,12 @@ mod tests {
                 transfer_fixed_ms: 2.5,
                 transfer_us_per_token: 7.0,
                 require_capability: true,
+                max_inflight_per_source: 2,
                 capabilities: HashMap::new(),
             }
         );
 
-        // Active is parsed so validation can reject it with a clear message.
+        // Active is parsed; validation checks the rest of the block.
         assert_eq!(
             kv_transfer(&["--kv-transfer-mode", "active"]).unwrap().mode,
             KvTransferMode::Active

@@ -102,6 +102,9 @@ impl PolicyFactory {
             policy: config.transfer_policy(),
         }));
         policy.register_static_capabilities(capabilities);
+        if config.mode == KvTransferMode::Active {
+            return policy.with_peer_fetch(config.max_inflight_per_source);
+        }
         policy
     }
 

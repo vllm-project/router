@@ -1079,7 +1079,9 @@ pub enum KvTransferMode {
     Off,
     /// Plans are computed and reported; routing and requests are unchanged.
     Shadow,
-    /// Reserved: plans are acted on. Rejected by validation for now.
+    /// Plans are acted on: the request sent to the destination carries
+    /// `kv_transfer_params` so its engine fetches the prefix from the source.
+    /// Can be switched back to shadow at runtime (`KvAwarePolicy::set_peer_fetch_enabled`).
     Active,
 }
 
@@ -1097,6 +1099,9 @@ pub struct KvTransferConfig {
     pub transfer_fixed_ms: f64,
     pub transfer_us_per_token: f64,
     pub require_capability: bool,
+    /// Active mode: most peer fetches in flight against one source worker.
+    /// Requests over the cap are sent without peer params.
+    pub max_inflight_per_source: usize,
     /// Declared per-worker capability, keyed by worker URL.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub capabilities: HashMap<String, StaticTransferCapability>,
@@ -1113,6 +1118,7 @@ impl Default for KvTransferConfig {
             transfer_fixed_ms: 5.0,
             transfer_us_per_token: 5.0,
             require_capability: false,
+            max_inflight_per_source: 4,
             capabilities: HashMap::new(),
         }
     }

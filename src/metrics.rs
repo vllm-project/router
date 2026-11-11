@@ -87,6 +87,11 @@ pub fn init_metrics() {
         "vllm_router_kv_transfer_plans_total",
         "Shadow-mode KV transfer planner outcomes (planned or the reason no plan was made)"
     );
+    describe_counter!(
+        "vllm_router_kv_transfer_requests_total",
+        "Active-mode KV transfer requests: sent with peer fetch params, or why not \
+         (no_peer_endpoint, inflight_cap, client_params_present, invalid_body)"
+    );
     describe_histogram!(
         "vllm_router_kv_transfer_estimated_saved_ms",
         "Shadow-mode estimated prefill milliseconds saved by a planned KV transfer"
@@ -588,6 +593,11 @@ impl RouterMetrics {
     }
     pub fn record_kv_transfer_plan(outcome: &'static str) {
         counter!("vllm_router_kv_transfer_plans_total", "outcome" => outcome).increment(1);
+    }
+    /// Active-mode outcome for a planned request: `sent`, `no_peer_endpoint`,
+    /// `inflight_cap`, `client_params_present` or `invalid_body`.
+    pub fn record_kv_transfer_request(outcome: &'static str) {
+        counter!("vllm_router_kv_transfer_requests_total", "outcome" => outcome).increment(1);
     }
     /// Estimated prefill milliseconds saved by a planned transfer.
     pub fn record_kv_transfer_estimated_saved_ms(saved_ms: f64) {

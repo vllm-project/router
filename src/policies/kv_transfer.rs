@@ -11,7 +11,11 @@
 //! `matches` (computed from its own prompt) only describe the cost of routing
 //! there.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 
 use super::kv_aware::{request_prefill_tokens, CandidateView, CostParams};
 use crate::kv_index::{CacheKey, Locality, RoutableTarget, StorageTier, TierMatch};
@@ -102,6 +106,111 @@ pub struct PeerEndpoint {
     pub tp_size: u32,
     pub dcp_size: u32,
     pub pp_size: u32,
+}
+
+/// Caps how many peer fetches may be in flight against one source at a time.
+///
+/// A fetch counts from the moment its [`PeerFetchPermit`] is granted until the
+/// permit is released or dropped, so a request that errors out, is cancelled or
+/// is dropped mid-stream cannot leak a slot.
+#[derive(Debug)]
+pub struct PeerFetchLimiter {
+    max_inflight: usize,
+    /// In-flight fetches by source worker URL; zero entries are removed.
+    inflight: DashMap<Arc<str>, usize>,
+}
+
+impl PeerFetchLimiter {
+    pub fn new(max_inflight_per_source: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max_inflight: max_inflight_per_source,
+            inflight: DashMap::new(),
+        })
+    }
+
+    /// Take a slot against `source`, or `None` when it is at the cap.
+    pub fn try_acquire(self: &Arc<Self>, source: &str) -> Option<PeerFetchPermit> {
+        let source: Arc<str> = Arc::from(source);
+        match self.inflight.entry(source.clone()) {
+            Entry::Occupied(mut entry) => {
+                if *entry.get() >= self.max_inflight {
+                    return None;
+                }
+                *entry.get_mut() += 1;
+            }
+            Entry::Vacant(entry) => {
+                if self.max_inflight == 0 {
+                    return None;
+                }
+                entry.insert(1);
+            }
+        }
+        Some(PeerFetchPermit {
+            inner: Arc::new(PermitInner {
+                limiter: self.clone(),
+                source,
+                released: AtomicBool::new(false),
+            }),
+        })
+    }
+
+    /// Fetches currently counted against `source`.
+    pub fn inflight(&self, source: &str) -> usize {
+        self.inflight.get(source).map_or(0, |count| *count)
+    }
+
+    fn release(&self, source: &Arc<str>) {
+        if let Entry::Occupied(mut entry) = self.inflight.entry(source.clone()) {
+            if *entry.get() <= 1 {
+                entry.remove();
+            } else {
+                *entry.get_mut() -= 1;
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PermitInner {
+    limiter: Arc<PeerFetchLimiter>,
+    source: Arc<str>,
+    released: AtomicBool,
+}
+
+impl PermitInner {
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            self.limiter.release(&self.source);
+        }
+    }
+}
+
+impl Drop for PermitInner {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// One in-flight slot against a source. Clones share the slot; it is freed by
+/// [`release`](Self::release) or when the last clone drops, whichever is first.
+#[derive(Debug, Clone)]
+pub struct PeerFetchPermit {
+    inner: Arc<PermitInner>,
+}
+
+impl PeerFetchPermit {
+    /// Free the slot now. Idempotent.
+    pub fn release(&self) {
+        self.inner.release();
+    }
+}
+
+/// Active mode's decision for one planned request: where the destination
+/// should fetch from, and the in-flight slot that fetch holds.
+#[derive(Debug, Clone)]
+pub struct PeerFetchGrant {
+    pub endpoint: PeerEndpoint,
+    pub permit: PeerFetchPermit,
 }
 
 /// A hypothetical transfer the planner would have made. In PR 1 it is only
@@ -1470,5 +1579,47 @@ mod tests {
         let outcome = plan_many_outcome(&peers, &enabled());
         assert_eq!(outcome.result, Err(TransferSkip::SourceNotBusy));
         assert_eq!(outcome.estimate, None);
+    }
+
+    #[test]
+    fn limiter_caps_per_source_and_frees_on_release_or_drop() {
+        let limiter = PeerFetchLimiter::new(2);
+        let first = limiter.try_acquire("a").expect("first");
+        let second = limiter.try_acquire("a").expect("second");
+        assert!(limiter.try_acquire("a").is_none(), "cap reached");
+        assert_eq!(limiter.inflight("a"), 2);
+        // Other sources are independent.
+        let other = limiter.try_acquire("b").expect("other source");
+
+        first.release();
+        first.release(); // idempotent
+        assert_eq!(limiter.inflight("a"), 1);
+        let third = limiter.try_acquire("a").expect("slot freed by release");
+
+        drop(second);
+        assert_eq!(limiter.inflight("a"), 1);
+        drop(third);
+        assert_eq!(limiter.inflight("a"), 0);
+        drop(other);
+        assert!(limiter.inflight.is_empty(), "idle sources are forgotten");
+        // `first` was released explicitly; dropping it must not free again.
+        drop(first);
+        assert_eq!(limiter.inflight("a"), 0);
+    }
+
+    #[test]
+    fn permit_clones_share_one_slot() {
+        let limiter = PeerFetchLimiter::new(1);
+        let permit = limiter.try_acquire("a").unwrap();
+        let clone = permit.clone();
+        drop(permit);
+        assert_eq!(limiter.inflight("a"), 1, "a clone still holds it");
+        drop(clone);
+        assert_eq!(limiter.inflight("a"), 0);
+    }
+
+    #[test]
+    fn zero_cap_admits_nothing() {
+        assert!(PeerFetchLimiter::new(0).try_acquire("a").is_none());
     }
 }
