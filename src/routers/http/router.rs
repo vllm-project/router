@@ -43,7 +43,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use parking_lot::Mutex;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -52,8 +52,153 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio_stream::wrappers::ReceiverStream;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
+
+/// Number of upstream body chunks the Router is willing to hold on behalf of a
+/// client that is not reading.
+///
+/// The forwarding task hands bytes over one chunk at a time, so this queue is
+/// the only Router-owned buffer on a streaming response. When it is unbounded
+/// the task pulls from the worker as fast as the worker produces, no matter how
+/// fast the client reads, and a stalled reader turns into unbounded memory.
+///
+/// This bounds the number of held chunks, not bytes: Router-owned memory on a
+/// stalled stream is up to `SSE_FORWARD_QUEUE_CHUNKS * max_chunk_size` plus the
+/// socket buffers, and nothing here caps how large a single upstream chunk can
+/// be. Size it as a queue depth, not as an RSS ceiling.
+pub(crate) const SSE_FORWARD_QUEUE_CHUNKS: usize = 8;
+
+/// The error that ended a forwarded stream, published beside the data queue
+/// instead of through it.
+///
+/// The forwarder can be parked on a full queue when the worker's stream fails,
+/// and it must not wait for a slot: the request is over, so its accounting has
+/// to finish. Recording the failure in a slot that never blocks lets the
+/// forwarder end immediately while the body still reports a truncated stream
+/// rather than a clean end of body. The body reads the slot only once the queue
+/// is drained, so the frames already handed over still reach the client first.
+#[derive(Default)]
+pub(crate) struct TerminalError(Mutex<Option<String>>);
+
+impl TerminalError {
+    fn set(&self, message: String) {
+        let mut slot = self.0.lock();
+        if slot.is_none() {
+            *slot = Some(message);
+        }
+    }
+
+    fn take(&self) -> Option<String> {
+        self.0.lock().take()
+    }
+}
+
+/// Hand-off from a forwarding task to the body of a streaming response: data
+/// goes through the bounded queue, the terminal error goes around it.
+pub(crate) struct SseForward {
+    tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    terminal: Arc<TerminalError>,
+    /// When a waiting hand-off gives up. Backpressure means the forwarder stops
+    /// polling the upstream body while a slot is unavailable, and a body that is
+    /// not polled cannot observe the client's request timeout: without this
+    /// deadline a client that stays connected and never reads would hold its
+    /// worker, its KV slot and the upstream response forever.
+    deadline: tokio::time::Instant,
+}
+
+impl SseForward {
+    /// Hands one upstream frame to the client, waiting for a free slot. `false`
+    /// means the client is gone, or stopped reading past the request deadline;
+    /// either way the forwarder should stop reading.
+    pub(crate) async fn send(&self, chunk: bytes::Bytes) -> bool {
+        tokio::select! {
+            biased;
+            sent = self.tx.send(chunk) => sent.is_ok(),
+            _ = tokio::time::sleep_until(self.deadline) => self.expire(),
+        }
+    }
+    pub(crate) async fn send_with_output(
+        &self,
+        chunk: bytes::Bytes,
+        output_frame: Option<&mut OutputFrameProducer>,
+        has_output: bool,
+    ) -> bool {
+        match output_frame {
+            Some(frame) => {
+                // Cancelling `send_bounded` mid-reservation leaves the output
+                // marker unpublished: it reserves capacity first and publishes
+                // only once the permit is in hand.
+                tokio::select! {
+                    biased;
+                    sent = frame.send_bounded(&self.tx, chunk, has_output) => sent,
+                    _ = tokio::time::sleep_until(self.deadline) => self.expire(),
+                }
+            }
+            None => self.send(chunk).await,
+        }
+    }
+
+    /// Records the error that ended the upstream stream, then lets the
+    /// forwarder return: this never waits for the queue.
+    pub(crate) fn fail(&self, message: String) {
+        self.terminal.set(message);
+    }
+
+    /// The client did not take the frame before the request deadline. Report it
+    /// the way an upstream failure is reported, so the body still ends with an
+    /// error instead of a clean, truncated stream.
+    fn expire(&self) -> bool {
+        self.fail("Stream error: the client did not read within the request timeout".to_string());
+        false
+    }
+}
+
+/// Body of a forwarded streaming response: every frame the worker produced,
+/// then the error that ended it, if there was one.
+pub(crate) struct SseForwardBody {
+    rx: ReceiverStream<bytes::Bytes>,
+    terminal: Arc<TerminalError>,
+    read_terminal: bool,
+}
+
+impl Stream for SseForwardBody {
+    type Item = Result<bytes::Bytes, String>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.rx).poll_next(cx) {
+            Poll::Ready(Some(chunk)) => Poll::Ready(Some(Ok(chunk))),
+            // The queue is drained, which is the first moment the client can be
+            // told the stream failed without losing frames it is owed.
+            Poll::Ready(None) if !this.read_terminal => {
+                this.read_terminal = true;
+                Poll::Ready(this.terminal.take().map(Err))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+pub(crate) fn sse_forward_channel(deadline: tokio::time::Instant) -> (SseForward, SseForwardBody) {
+    let (tx, rx) = tokio::sync::mpsc::channel(SSE_FORWARD_QUEUE_CHUNKS);
+    let terminal = Arc::new(TerminalError::default());
+    (
+        SseForward {
+            tx,
+            terminal: terminal.clone(),
+            deadline,
+        },
+        SseForwardBody {
+            rx: ReceiverStream::new(rx),
+            terminal,
+            read_terminal: false,
+        },
+    )
+}
 
 pub(super) fn prepare_error_status(error: &PrepareError) -> StatusCode {
     match error {
@@ -81,17 +226,14 @@ fn http_stages_json(http_ttfb_ms: f64, first_sse_ms: f64) -> serde_json::Value {
     })
 }
 
-fn emit_http_first_sse<E>(
-    tx: &tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, E>>,
+async fn emit_http_first_sse(
+    forward: &SseForward,
     stages: &serde_json::Value,
     output_frame: Option<&mut OutputFrameProducer>,
 ) -> bool {
     let comment = bytes::Bytes::from(format!(": router-stages {stages}\n\n"));
     info!(%stages, "http proxy stages");
-    match output_frame {
-        Some(output_frame) => output_frame.send(tx, comment, false),
-        None => tx.send(Ok(comment)).is_ok(),
-    }
+    forward.send_with_output(comment, output_frame, false).await
 }
 
 struct LoadTrackedBody {
@@ -283,6 +425,10 @@ pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
+    /// Deadline handed to every streaming forwarder: the same request timeout
+    /// that bounds the upstream call, reused to bound how long a hand-off may
+    /// wait for a client that is not reading.
+    request_timeout: Duration,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval_secs: u64,
     intra_node_data_parallel_size: usize,
@@ -320,6 +466,13 @@ struct ResolvedProgramModelPool {
 }
 
 impl Router {
+    /// Deadline for a streaming forwarder: the request timeout, counted from the
+    /// moment the response is handed over. Waiting past it means the client is
+    /// not reading, and the worker must not stay occupied for it.
+    fn forward_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.request_timeout
+    }
+
     /// Create a new router with injected policy and client
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -614,6 +767,7 @@ impl Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
+            request_timeout,
             worker_startup_timeout_secs: ctx.router_config.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: ctx
                 .router_config
@@ -2080,7 +2234,7 @@ impl Router {
             }
 
             let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (forward, body_stream) = sse_forward_channel(self.forward_deadline());
             let (mut producer_output_frame, output_frame) = if completion_echo.is_some() {
                 let (producer, consumer) = output_frame_tracking();
                 (Some(producer), Some(consumer))
@@ -2106,10 +2260,12 @@ impl Router {
                                 if stages_on {
                                     let stages = http_stages_json(http_ttfb_ms, first_ms);
                                     if !emit_http_first_sse(
-                                        &tx,
+                                        &forward,
                                         &stages,
                                         producer_output_frame.as_mut(),
-                                    ) && completion_echo.is_some()
+                                    )
+                                    .await
+                                        && completion_echo.is_some()
                                     {
                                         stream_succeeded = false;
                                         break;
@@ -2131,10 +2287,9 @@ impl Router {
                             let has_output = completion_output
                                 .as_mut()
                                 .is_some_and(|observer| observer.observe(&bytes));
-                            let sent = match producer_output_frame.as_mut() {
-                                Some(output_frame) => output_frame.send(&tx, bytes, has_output),
-                                None => tx.send(Ok(bytes)).is_ok(),
-                            };
+                            let sent = forward
+                                .send_with_output(bytes, producer_output_frame.as_mut(), has_output)
+                                .await;
                             if !sent {
                                 stream_succeeded = false;
                                 break;
@@ -2145,7 +2300,7 @@ impl Router {
                         }
                         Err(e) => {
                             stream_succeeded = false;
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                            forward.fail(format!("Stream error: {}", e));
                             break;
                         }
                     }
@@ -2155,8 +2310,7 @@ impl Router {
                 }
             });
 
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
+            let body = Body::from_stream(body_stream);
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
@@ -2174,7 +2328,7 @@ impl Router {
             }
 
             let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (forward, body_stream) = sse_forward_channel(self.forward_deadline());
             let completion = if status.is_success() {
                 program_completion
             } else {
@@ -2194,20 +2348,20 @@ impl Router {
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
                                 if stages_on {
                                     let stages = http_stages_json(http_ttfb_ms, first_ms);
-                                    emit_http_first_sse(&tx, &stages, None);
+                                    let _ = emit_http_first_sse(&forward, &stages, None).await;
                                 }
                             }
                             if let Some(completion) = &completion {
                                 completion.observe_sse_chunk(&bytes);
                             }
-                            if tx.send(Ok(bytes)).is_err() {
+                            if !forward.send(bytes).await {
                                 stream_succeeded = false;
                                 break;
                             }
                         }
                         Err(e) => {
                             stream_succeeded = false;
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                            forward.fail(format!("Stream error: {}", e));
                             break;
                         }
                     }
@@ -2217,8 +2371,7 @@ impl Router {
                 }
             });
 
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
+            let body = Body::from_stream(body_stream);
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
@@ -3341,7 +3494,7 @@ impl RouterTrait for Router {
                     }
                 } else {
                     let stream = response.bytes_stream();
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (forward, body_stream) = sse_forward_channel(self.forward_deadline());
                     let completion = status.is_success().then_some(program_completion).flatten();
                     tokio::spawn(async move {
                         let mut stream = stream;
@@ -3352,14 +3505,14 @@ impl RouterTrait for Router {
                                     if let Some(completion) = &completion {
                                         completion.observe_sse_chunk(&bytes);
                                     }
-                                    if tx.send(Ok(bytes)).is_err() {
+                                    if !forward.send(bytes).await {
                                         stream_ok = false;
                                         break;
                                     }
                                 }
                                 Err(error) => {
                                     stream_ok = false;
-                                    let _ = tx.send(Err(format!("Stream error: {error}")));
+                                    forward.fail(format!("Stream error: {error}"));
                                     break;
                                 }
                             }
@@ -3369,7 +3522,7 @@ impl RouterTrait for Router {
                         }
                     });
                     response_builder
-                        .body(Body::from_stream(UnboundedReceiverStream::new(rx)))
+                        .body(Body::from_stream(body_stream))
                         .unwrap_or_else(|error| {
                             (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -5381,6 +5534,7 @@ mod tests {
             intra_node_data_parallel_size: 1,
             api_key: None,
             client: Client::new(),
+            request_timeout: Duration::from_secs(1800),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
@@ -5415,6 +5569,7 @@ mod tests {
             intra_node_data_parallel_size: 1,
             api_key: None,
             client: Client::new(),
+            request_timeout: Duration::from_secs(1800),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
@@ -6127,20 +6282,20 @@ mod tests {
         };
         let load = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
         let (mut producer, consumer) = crate::backend::stream_output::output_frame_tracking();
-        let (tx, rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
-        assert!(emit_http_first_sse(
-            &tx,
-            &serde_json::json!({}),
-            Some(&mut producer)
-        ));
-        assert!(producer.send(
-            &tx,
-            bytes::Bytes::from_static(b"data: {\"choices\":[{\"text\":\"output\"}]}\n\n"),
-            true
-        ));
+        let (forward, body_stream) =
+            sse_forward_channel(tokio::time::Instant::now() + Duration::from_secs(5));
+        assert!(emit_http_first_sse(&forward, &serde_json::json!({}), Some(&mut producer)).await);
+        assert!(
+            producer
+                .send_bounded(
+                    &forward.tx,
+                    bytes::Bytes::from_static(b"data: {\"choices\":[{\"text\":\"output\"}]}\n\n"),
+                    true
+                )
+                .await
+        );
         let response = hold_request_load_with_output_frame(
-            Response::new(Body::from_stream(UnboundedReceiverStream::new(rx))),
+            Response::new(Body::from_stream(body_stream)),
             load,
             None,
             Some(consumer),
@@ -6856,6 +7011,7 @@ mod tests {
             intra_node_data_parallel_size: 1,
             api_key: None,
             client: Client::new(),
+            request_timeout: Duration::from_secs(1800),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
@@ -7287,5 +7443,366 @@ mod tests {
         assert!(registry.revision() > revision_before_recovery);
 
         health_checker.shutdown().await;
+    }
+    #[tokio::test]
+    async fn streaming_response_pulls_from_the_worker_only_as_the_client_reads() {
+        use axum::routing::post;
+        use std::sync::atomic::AtomicUsize;
+
+        const CHUNK_BYTES: usize = 8 * 1024;
+        const CHUNKS: usize = 8192;
+
+        let produced = Arc::new(AtomicUsize::new(0));
+        let counter = produced.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            WorkerType::Regular,
+        ));
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    let stream = futures_util::stream::iter(0..CHUNKS).map(move |_| {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b'a'; CHUNK_BYTES]))
+                    });
+                    Response::new(Body::from_stream(stream))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(worker);
+        router.policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            }));
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}], "stream": true,
+        }))
+        .unwrap();
+
+        let response = router
+            .route_typed_request(None, &request, "/v1/chat/completions", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Hold the response without reading a single byte of the body.
+        //
+        // The bar is "production stopped", not an absolute byte count. Loopback
+        // TCP buffers absorb whatever the host's sysctls allow (12-16 MiB per
+        // direction on some machines, ~1 MiB on others) before the queue becomes
+        // the only thing left, so an absolute threshold here would measure the
+        // kernel configuration instead of this bound. Waiting for a plateau and
+        // then requiring that the plateau is short of the whole response keeps the
+        // check meaningful on both: an unbounded hand-off drains all of it.
+        let mut last = produced.load(Ordering::Relaxed);
+        let mut stable = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while stable < 5 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let now = produced.load(Ordering::Relaxed);
+            stable = if now == last { stable + 1 } else { 0 };
+            last = now;
+        }
+        assert!(last > 0, "the response never started streaming");
+        assert_eq!(
+            stable, 5,
+            "the router was still pulling from the worker while the client read nothing"
+        );
+        assert!(
+            last < CHUNKS,
+            "the router pulled all {} chunks of a {} byte response while the client read nothing",
+            CHUNKS,
+            CHUNKS * CHUNK_BYTES
+        );
+
+        // Reading the body still yields every byte the worker produced.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), CHUNKS * CHUNK_BYTES);
+        assert!(body.iter().all(|byte| *byte == b'a'));
+        server.abort();
+    }
+
+    /// A worker that hands over exactly one frame per queue slot and only then
+    /// fails its stream, so the forwarder reaches the error arm with every slot
+    /// occupied.
+    ///
+    /// `reached` fires when the forwarder polls the failing chunk, which it can
+    /// only do after every data hand-off that does not need a reader has
+    /// completed. `release` keeps the failure back until the test asks for it,
+    /// so the error always lands on a full queue.
+    struct FailingStreamWorker {
+        url: String,
+        worker: Arc<dyn Worker>,
+        reached: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    /// One frame per queue slot. Frames are kept small on purpose: a large
+    /// frame can be split across reads and would fill the queue before the
+    /// error is reached, turning these tests into plain back-pressure checks.
+    const FAILING_STREAM_CHUNK_BYTES: usize = 64;
+
+    async fn spawn_worker_that_fails_on_a_full_queue() -> FailingStreamWorker {
+        use axum::routing::post;
+
+        const CHUNKS: usize = SSE_FORWARD_QUEUE_CHUNKS;
+
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (handler_reached, handler_release) = (reached.clone(), release.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular));
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let reached = handler_reached.clone();
+                let release = handler_release.clone();
+                async move {
+                    let body = futures_util::stream::iter(0..CHUNKS)
+                        .map(|_| {
+                            Ok::<_, std::io::Error>(bytes::Bytes::from(vec![
+                                b'a';
+                                FAILING_STREAM_CHUNK_BYTES
+                            ]))
+                        })
+                        .chain(futures_util::stream::once(async move {
+                            reached.notify_one();
+                            release.notified().await;
+                            Err(std::io::Error::other("backend died mid-stream"))
+                        }));
+                    Response::new(Body::from_stream(body))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        FailingStreamWorker {
+            url,
+            worker,
+            reached,
+            release,
+            server,
+        }
+    }
+
+    /// Dispatches one streaming request at `worker` and returns the response
+    /// with the body still unread, which is the state both tests below need.
+    async fn stalled_stream_response(worker: &FailingStreamWorker) -> Response {
+        let router = create_test_regular_router();
+
+        // Admission: the dispatch owns a guard on the worker, and this path
+        // releases it when the forwarding task ends — not when the body is
+        // dropped, which is why the bodies below are held for the whole check.
+        worker.worker.increment_load();
+        let response = router
+            .send_typed_request(
+                &serde_json::json!({"model": "test", "messages": [], "stream": true}),
+                TypedDispatch {
+                    headers: None,
+                    route: "/v1/chat/completions",
+                    worker_url: &worker.url,
+                    is_stream: true,
+                    completion: None,
+                    load: RequestLoadGuard::new(Some(worker.worker.clone()), None),
+                    prepared: None,
+                },
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            worker.worker.load(),
+            1,
+            "the request was never accounted for"
+        );
+        response
+    }
+
+    /// A worker that fails mid-stream must not keep the request accounted for
+    /// just because the client stopped reading.
+    #[tokio::test]
+    async fn worker_error_with_a_stalled_client_still_releases_worker_load() {
+        let worker = spawn_worker_that_fails_on_a_full_queue().await;
+        let response = stalled_stream_response(&worker).await;
+
+        tokio::time::timeout(Duration::from_secs(10), worker.reached.notified())
+            .await
+            .expect("the forwarder never reached the failing chunk");
+        assert_eq!(
+            worker.worker.load(),
+            1,
+            "the stream failed while the client was still counted"
+        );
+        worker.release.notify_one();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while worker.worker.load() != 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            worker.worker.load(),
+            0,
+            "a worker whose stream failed is still counted as running"
+        );
+
+        drop(response);
+        worker.server.abort();
+    }
+
+    /// A stream that fails while the client is not reading must still tell the
+    /// client it failed, and must do it after the frames it already handed
+    /// over: ending the body cleanly turns a truncated response into a
+    /// successful one for every client that trusts end of stream.
+    #[tokio::test]
+    async fn worker_error_with_a_stalled_client_reaches_the_client() {
+        let worker = spawn_worker_that_fails_on_a_full_queue().await;
+        let response = stalled_stream_response(&worker).await;
+
+        tokio::time::timeout(Duration::from_secs(10), worker.reached.notified())
+            .await
+            .expect("the forwarder never reached the failing chunk");
+        // The client has read nothing and the queue is full. Release the failure
+        // and wait for the forwarder to finish before touching the body: reading
+        // first would free slots, and an implementation that drops the error on a
+        // full queue would then deliver it through the freed slot and pass.
+        worker.release.notify_one();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while worker.worker.load() != 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            worker.worker.load(),
+            0,
+            "the forwarder never finished after the worker failed"
+        );
+
+        let mut frames = response.into_body().into_data_stream();
+        let mut delivered = 0;
+        let terminal = loop {
+            match tokio::time::timeout(Duration::from_secs(5), frames.next()).await {
+                Ok(Some(Ok(_))) => delivered += 1,
+                Ok(Some(Err(error))) => break Some(error.to_string()),
+                Ok(None) => break None,
+                Err(_) => panic!("the body neither produced a frame nor ended"),
+            }
+        };
+
+        assert_eq!(
+            delivered, SSE_FORWARD_QUEUE_CHUNKS,
+            "the client was not given every frame the queue held before the failure"
+        );
+        let error = terminal.expect("the body ended cleanly after the worker failed mid-stream");
+        // reqwest wraps the worker's own message ("error decoding response
+        // body"), so what is asserted here is the forwarder's error, not the
+        // text the mock backend returned.
+        assert!(
+            error.contains("Stream error"),
+            "the body ended with something other than the forwarder's error: {error}"
+        );
+
+        worker.server.abort();
+    }
+    /// A client that stays connected and never reads must not keep the worker
+    /// counted past the request timeout.
+    ///
+    /// This is the case backpressure creates: while the forwarder waits for a
+    /// slot it no longer polls the upstream body, so the request timeout that
+    /// reqwest enforces inside the body stream is never observed. Without a
+    /// deadline on the hand-off the request would hold its worker, its KV slot
+    /// and the upstream response until the client read or disconnected.
+    #[tokio::test]
+    async fn stalled_client_is_cut_off_at_the_request_timeout() {
+        use axum::routing::post;
+
+        const CHUNKS: usize = SSE_FORWARD_QUEUE_CHUNKS * 2;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular));
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move {
+                // More frames than the queue holds, then a body that stays open
+                // long past the deadline without producing anything.
+                let body = futures_util::stream::iter(0..CHUNKS)
+                    .map(|_| {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![
+                            b'a';
+                            FAILING_STREAM_CHUNK_BYTES
+                        ]))
+                    })
+                    .chain(futures_util::stream::once(async {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        Ok(bytes::Bytes::from_static(b"\n\n"))
+                    }));
+                Response::new(Body::from_stream(body))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut router = create_test_regular_router();
+        router.request_timeout = Duration::from_secs(1);
+
+        worker.increment_load();
+        let response = router
+            .send_typed_request(
+                &serde_json::json!({"model": "test", "messages": [], "stream": true}),
+                TypedDispatch {
+                    headers: None,
+                    route: "/v1/chat/completions",
+                    worker_url: &url,
+                    is_stream: true,
+                    completion: None,
+                    load: RequestLoadGuard::new(Some(worker.clone()), None),
+                    prepared: None,
+                },
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(worker.load(), 1, "the request was never accounted for");
+
+        // The client reads nothing at all.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            worker.load(),
+            0,
+            "a client that never reads kept the worker counted past the request timeout"
+        );
+
+        // The body still reports the failure instead of ending cleanly.
+        let mut frames = response.into_body().into_data_stream();
+        let mut delivered = 0;
+        let terminal = loop {
+            match tokio::time::timeout(Duration::from_secs(5), frames.next()).await {
+                Ok(Some(Ok(_))) => delivered += 1,
+                Ok(Some(Err(error))) => break Some(error.to_string()),
+                Ok(None) => break None,
+                Err(_) => panic!("the body neither produced a frame nor ended"),
+            }
+        };
+        assert_eq!(
+            delivered, SSE_FORWARD_QUEUE_CHUNKS,
+            "the frames the queue already held were lost"
+        );
+        let error = terminal.expect("the body ended cleanly after the request timeout");
+        assert!(
+            error.contains("request timeout"),
+            "the body ended with something other than the deadline error: {error}"
+        );
+
+        server.abort();
     }
 }
