@@ -1,11 +1,11 @@
 //! Concurrent radix-tree index of resident KV blocks, keyed by local hash.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use dashmap::{mapref::entry::Entry, DashMap};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::kv_index::types::{
     ClearScope, Locality, ResidencyOwner, RoutableTarget, SourceId, StorageTier,
@@ -40,11 +40,18 @@ type NodeRef = Arc<RwLock<TreeNode>>;
 type IncomingBlock = (Arc<str>, Arc<str>); // (seq_hash, local_hash)
 type EdgeBlock = (HashSet<Arc<str>>, Arc<str>); // (historical seq hashes, local_hash)
 
+/// Amortize reclamation over removals rather than walking the tree per event.
+const MIN_SWEEP_REMOVALS: usize = 1024;
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 std::thread_local! {
     static AFTER_ANCHOR_CLONE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     static AFTER_QUERY_EDGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_CHILD_CLONE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_SWEEP_ALIASES: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -80,8 +87,8 @@ fn edge_common_prefix(edge: &[EdgeBlock], incoming: &[IncomingBlock]) -> usize {
 /// one block never disturbs the claims on its siblings.
 struct TreeNode {
     /// Edge blocks with historical identities; empty on the root sentinel.
-    /// Topology and parent anchors survive removal of residency claims.
-    /// Historical aliases are retained without a memory bound.
+    /// Unclaimed topology and parent anchors survive until the next sweep.
+    /// An empty edge on a non-root node marks a detached, reclaimed node.
     edge: Vec<EdgeBlock>,
     /// Per-block residency claims, parallel to `edge`; `claims[i]` owns
     /// `edge[i]`. Empty on the root sentinel.
@@ -121,15 +128,18 @@ struct GroupShard {
     root: NodeRef,
     /// Engine seq hash → tree node, so a store jumps to its parent and a
     /// `BlockRemoved` (carrying only seq hashes) finds the node to drop.
-    // ponytail: never trimmed — topology outlives residency; unique-prefix churn
-    // grows topology and historical alias sets without limit. Revisit with an
-    // epoch leaf sweep if growth shows.
+    /// A sweep removes historical identities with no remaining observations.
     anchors: DashMap<Arc<str>, NodeRef>,
     /// Reverse lookup: (owner, tier) → seq hashes claimed.
     reverse: DashMap<OwnerTier, HashSet<Arc<str>>>,
     /// Per-(owner, tier) count of distinct active engine sequence observations.
     /// Multiple aliases of one logical block remain distinct observations.
     counts: DashMap<OwnerTier, usize>,
+    removals_since_sweep: AtomicUsize,
+    sweep_interval: AtomicUsize,
+    /// Only maintenance is serialized; stores, removals and queries retain
+    /// their existing node-level concurrency.
+    sweep: Mutex<()>,
 }
 
 impl GroupShard {
@@ -139,6 +149,9 @@ impl GroupShard {
             anchors: DashMap::new(),
             reverse: DashMap::new(),
             counts: DashMap::new(),
+            removals_since_sweep: AtomicUsize::new(0),
+            sweep_interval: AtomicUsize::new(MIN_SWEEP_REMOVALS),
+            sweep: Mutex::new(()),
         }
     }
 
@@ -172,11 +185,15 @@ impl GroupShard {
         let mut bi = 0;
         while bi < blocks.len() {
             let node = match &cursor {
-                Some(seq) => self
-                    .anchors
-                    .get(seq)
-                    .map(|node| node.clone())
-                    .expect("known cursor must remain anchored; anchors are insert-only"),
+                Some(seq) => {
+                    let Some(node) = self.anchors.get(seq).map(|node| node.clone()) else {
+                        // Reclamation can forget an unclaimed parent after
+                        // the initial lookup. Never reinterpret its suffix
+                        // as a root prefix: missing evidence earns no credit.
+                        return;
+                    };
+                    node
+                }
                 None => self.root.clone(),
             };
             #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -188,8 +205,8 @@ impl GroupShard {
                     .iter()
                     .position(|(aliases, _)| aliases.contains(seq))
                 else {
-                    // The same split-only progress argument as remove_claim
-                    // applies to this fixed cursor; resolve its moved anchor.
+                    // A split moved the anchor, or a sweep reclaimed it.
+                    // Re-resolve it before attaching any new observations.
                     drop(parent);
                     std::thread::yield_now();
                     continue;
@@ -211,9 +228,18 @@ impl GroupShard {
                 return;
             };
             drop(parent);
+            #[cfg(all(test, feature = "cpu", feature = "ready"))]
+            if let Some(hook) = AFTER_CHILD_CLONE.with(|slot| slot.borrow_mut().take()) {
+                hook();
+            }
             // Match, split, and claim under one write lock: a concurrent split
             // can't shorten this edge between the match and the split.
             let mut c = child.write();
+            if c.edge.is_empty() {
+                // The child was detached after lookup. Retry from the parent
+                // rather than publishing claims into an unreachable node.
+                continue;
+            }
             let matched = edge_common_prefix(&c.edge, &blocks[bi..]);
             debug_assert!(matched >= 1, "child key matches its first edge block");
             if matched < c.edge.len() {
@@ -222,7 +248,7 @@ impl GroupShard {
             self.record_locked(&mut c, &child, &key, &blocks[bi..bi + matched]);
             bi += matched;
             // record_locked registered this incoming key, so its current
-            // anchor remains a valid cursor even if a later split moves it.
+            // anchor can be re-resolved even if a later split moves it.
             cursor = Some(blocks[bi - 1].0.clone());
         }
     }
@@ -373,7 +399,8 @@ impl GroupShard {
     /// Drop the logical block claim only after its last active alias is gone.
     fn remove_claim(&self, seq: &Arc<str>, key: &OwnerTier) {
         // Contract: within a shard an engine key always identifies the same
-        // full logical path. Topology only splits, never merges or prepends.
+        // full logical path. Retained topology only splits, never merges or
+        // prepends; reclamation can also make an unclaimed anchor disappear.
         // Moving a fixed alias at position p cuts a nonempty prefix k, leaving
         // p-k; thus only finitely many split-induced re-resolutions are possible.
         // This does not bound elapsed time or lock starvation. Do not cap retries:
@@ -402,6 +429,120 @@ impl GroupShard {
             }
             return;
         }
+    }
+
+    fn maybe_sweep(&self, removals: usize) {
+        let removed = self
+            .removals_since_sweep
+            .fetch_add(removals, Ordering::Relaxed);
+        if removed.saturating_add(removals) >= self.sweep_interval.load(Ordering::Relaxed) {
+            self.sweep_unused();
+        }
+    }
+
+    /// Reclaim unused identities and leaf suffixes without evicting residency.
+    /// Queries may retain old node references, so detached nodes are emptied.
+    /// Writers re-resolve anchors or retry a detached child before publishing.
+    fn sweep_unused(&self) {
+        let Some(_sweep) = self.sweep.try_lock() else {
+            return;
+        };
+        self.removals_since_sweep.swap(0, Ordering::Relaxed);
+        // Iterative post-order traversal also handles very deep prefix chains.
+        let mut stack: Vec<_> = self
+            .root
+            .read()
+            .children
+            .iter()
+            .map(|(local, child)| (self.root.clone(), local.clone(), child.clone(), false))
+            .collect();
+        while let Some((parent, local, node, visited)) = stack.pop() {
+            if !visited {
+                stack.push((parent, local, node.clone(), true));
+                let n = node.read();
+                stack.extend(
+                    n.children
+                        .iter()
+                        .map(|(key, child)| (node.clone(), key.clone(), child.clone(), false)),
+                );
+                continue;
+            }
+            // Use the same parent-before-child order as insertion. A split
+            // may have moved this child since traversal; leave it for a later
+            // sweep rather than detaching it from a stale parent.
+            let mut p = parent.write();
+            if !p
+                .children
+                .get(&local)
+                .is_some_and(|child| Arc::ptr_eq(child, &node))
+            {
+                continue;
+            }
+            let mut n = node.write();
+            let TreeNode { edge, claims, .. } = &mut *n;
+            for ((aliases, _), owners) in edge.iter_mut().zip(claims.iter_mut()) {
+                aliases.retain(|seq| {
+                    let active = owners
+                        .iter()
+                        .any(|key| self.reverse.get(key).is_some_and(|seqs| seqs.contains(seq)));
+                    if !active {
+                        self.anchors
+                            .remove_if(seq, |_, anchor| Arc::ptr_eq(anchor, &node));
+                    }
+                    active
+                });
+                #[cfg(all(test, feature = "cpu", feature = "ready"))]
+                if let Some(hook) = AFTER_SWEEP_ALIASES.with(|slot| slot.borrow_mut().take()) {
+                    hook();
+                }
+                // A concurrent remove may have updated reverse and still be
+                // waiting for this node. Complete its claim cleanup too, so
+                // removing its anchor cannot strand a stale residency claim.
+                owners.retain(|key| {
+                    self.reverse
+                        .get(key)
+                        .is_some_and(|seqs| aliases.iter().any(|seq| seqs.contains(seq)))
+                });
+                aliases.shrink_to_fit();
+            }
+            if n.children.is_empty() {
+                let keep = n
+                    .claims
+                    .iter()
+                    .rposition(|claims| !claims.is_empty())
+                    .map_or(0, |i| i + 1);
+                // Reverse observations can disappear between the alias and
+                // claim passes above. Never leave an anchor to a trimmed edge.
+                for (aliases, _) in &n.edge[keep..] {
+                    for seq in aliases {
+                        self.anchors
+                            .remove_if(seq, |_, anchor| Arc::ptr_eq(anchor, &node));
+                    }
+                }
+                n.edge.truncate(keep);
+                n.claims.truncate(keep);
+                n.edge.shrink_to_fit();
+                n.claims.shrink_to_fit();
+                if keep == 0 {
+                    p.children.remove(&local);
+                }
+            }
+            n.children.shrink_to_fit();
+        }
+        self.root.write().children.shrink_to_fit();
+        self.reverse.retain(|_, seqs| !seqs.is_empty());
+        for mut seqs in self.reverse.iter_mut() {
+            seqs.shrink_to_fit();
+        }
+        self.anchors.shrink_to_fit();
+        self.reverse.shrink_to_fit();
+        self.counts.shrink_to_fit();
+        // Larger live indexes are swept less often. This is reclamation of
+        // dead metadata, not a capacity limit on active engine observations.
+        self.sweep_interval.store(
+            self.anchors.len().max(MIN_SWEEP_REMOVALS),
+            Ordering::Relaxed,
+        );
     }
 
     /// Walk the request's `local_hashes` from the root, collecting the
@@ -539,7 +680,9 @@ impl KvBlockIndexer {
         tier: StorageTier,
         seq_hashes: &[Arc<str>],
     ) {
-        self.shard(group_idx).remove(owner, tier, seq_hashes);
+        let shard = self.shard(group_idx);
+        shard.remove(owner, tier, seq_hashes);
+        shard.maybe_sweep(seq_hashes.len());
     }
 
     /// Clear one owner's residency across every group. A worker reset /
@@ -548,6 +691,7 @@ impl KvBlockIndexer {
         let shards: Vec<Arc<GroupShard>> = self.shards.iter().map(|e| e.value().clone()).collect();
         for s in shards {
             s.clear(owner, scope);
+            s.sweep_unused();
         }
     }
 
@@ -564,6 +708,7 @@ impl KvBlockIndexer {
         let shards: Vec<Arc<GroupShard>> = self.shards.iter().map(|e| e.value().clone()).collect();
         for shard in shards {
             shard.clear_source(source, dp_rank);
+            shard.sweep_unused();
         }
     }
 
@@ -619,6 +764,333 @@ mod tests {
 
     use super::*;
     use crate::kv_index::types::SourceId;
+
+    #[test]
+    fn clear_reclaims_metadata_after_unique_prefix_churn() {
+        let index = KvBlockIndexer::new();
+        let owner = worker("churn");
+        for i in 0..MIN_SWEEP_REMOVALS / 2 {
+            let seq = h(&format!("seq-{i}"));
+            let local = h(&format!("local-{i}"));
+            index.store(
+                0,
+                owner.clone(),
+                StorageTier::Device,
+                None,
+                &[(seq.clone(), local)],
+            );
+            index.remove(0, &owner, StorageTier::Device, &[seq]);
+        }
+        let shard = index.shard(0);
+        assert_eq!(shard.anchors.len(), MIN_SWEEP_REMOVALS / 2);
+        index.clear(&owner, ClearScope::Worker);
+        assert_eq!(
+            shard.anchors.len(),
+            0,
+            "evicted prefixes must not retain anchors"
+        );
+        assert!(shard.root.read().children.is_empty());
+        assert!(shard.reverse.is_empty());
+    }
+
+    #[test]
+    fn periodic_sweep_reclaims_evicted_prefixes_without_a_clear() {
+        let index = KvBlockIndexer::new();
+        let owner = worker("churn");
+        for i in 0..MIN_SWEEP_REMOVALS * 3 {
+            let seq = h(&format!("seq-{i}"));
+            index.store(
+                0,
+                owner.clone(),
+                StorageTier::Device,
+                None,
+                &[(seq.clone(), h(&format!("local-{i}")))],
+            );
+            index.remove(0, &owner, StorageTier::Device, &[seq]);
+            assert!(index.shard(0).anchors.len() < MIN_SWEEP_REMOVALS);
+        }
+        let shard = index.shard(0);
+        assert!(shard.root.read().children.is_empty());
+        assert!(shard.reverse.is_empty());
+        assert!(shard.counts.is_empty());
+    }
+
+    #[test]
+    fn sweep_reclaims_inactive_aliases_on_a_live_shared_path() {
+        let index = KvBlockIndexer::new();
+        let stable = worker("stable");
+        let churn = worker("churn");
+        index.store(0, stable, StorageTier::Device, None, &[(h("live"), h("x"))]);
+        for i in 0..MIN_SWEEP_REMOVALS * 2 {
+            let seq = h(&format!("alias-{i}"));
+            index.store(
+                0,
+                churn.clone(),
+                StorageTier::Device,
+                None,
+                &[(seq.clone(), h("x"))],
+            );
+            index.remove(0, &churn, StorageTier::Device, &[seq]);
+        }
+        let shard = index.shard(0);
+        assert_eq!(shard.anchors.len(), 1);
+        let node = shard.anchors.get("live").unwrap().clone();
+        assert_eq!(node.read().edge[0].0.len(), 1);
+        assert_eq!(
+            depth_of(
+                &index.find_matches(&query(&["x"], &[StorageTier::Device])),
+                "stable",
+                StorageTier::Device
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn sweep_keeps_unclaimed_prefix_positions_and_live_descendants() {
+        let index = KvBlockIndexer::new();
+        let owner = worker("w");
+        index.store(
+            0,
+            owner.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("sx"), h("x")), (h("sy"), h("y")), (h("sz"), h("z"))],
+        );
+        index.store(
+            0,
+            owner.clone(),
+            StorageTier::Device,
+            Some(h("sz")),
+            &[(h("st"), h("tail"))],
+        );
+        index.remove(0, &owner, StorageTier::Device, &[h("sx"), h("sy"), h("sz")]);
+        index.shard(0).sweep_unused();
+        let hits = index.find_matches(&query(&["x", "y", "z", "tail"], &[StorageTier::Device]));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].segments, vec![(3, 4)]);
+        assert!(index
+            .find_matches(&query(&["tail"], &[StorageTier::Device]))
+            .is_empty());
+        index.store(
+            0,
+            owner,
+            StorageTier::Device,
+            None,
+            &[(h("nx"), h("x")), (h("ny"), h("y")), (h("nz"), h("z"))],
+        );
+        assert_eq!(
+            depth_of(
+                &index.find_matches(&query(&["x", "y", "z", "tail"], &[StorageTier::Device])),
+                "w",
+                StorageTier::Device
+            ),
+            4
+        );
+    }
+
+    #[test]
+    fn sweep_trims_only_unclaimed_leaf_suffix() {
+        let index = KvBlockIndexer::new();
+        let owner = worker("w");
+        index.store(
+            0,
+            owner.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("sx"), h("x")), (h("sy"), h("y")), (h("sz"), h("z"))],
+        );
+        index.remove(0, &owner, StorageTier::Device, &[h("sy"), h("sz")]);
+        index.shard(0).sweep_unused();
+        let shard = index.shard(0);
+        assert_eq!(shard.anchors.len(), 1);
+        let node = shard.anchors.get("sx").unwrap().clone();
+        assert_eq!(node.read().edge.len(), 1);
+        index.store(
+            0,
+            owner,
+            StorageTier::Device,
+            Some(h("sx")),
+            &[(h("new"), h("tail"))],
+        );
+        assert_eq!(
+            depth_of(
+                &index.find_matches(&query(&["x", "tail"], &[StorageTier::Device])),
+                "w",
+                StorageTier::Device
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn store_skips_parent_reclaimed_after_anchor_lookup() {
+        let index = Arc::new(KvBlockIndexer::new());
+        let owner = worker("w");
+        index.store(
+            0,
+            owner.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("parent"), h("x"))],
+        );
+        index.remove(0, &owner, StorageTier::Device, &[h("parent")]);
+        let sweep_index = index.clone();
+        AFTER_ANCHOR_CLONE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || sweep_index.shard(0).sweep_unused()));
+        });
+        index.store(
+            0,
+            owner,
+            StorageTier::Device,
+            Some(h("parent")),
+            &[(h("child"), h("y"))],
+        );
+        assert!(index.shard(0).anchors.is_empty());
+        assert!(index
+            .find_matches(&query(&["y"], &[StorageTier::Device]))
+            .is_empty());
+    }
+
+    #[test]
+    fn store_retries_child_detached_after_lookup() {
+        let index = Arc::new(KvBlockIndexer::new());
+        let owner = worker("w");
+        index.store(
+            0,
+            owner.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("old"), h("x"))],
+        );
+        index.remove(0, &owner, StorageTier::Device, &[h("old")]);
+        let sweep_index = index.clone();
+        AFTER_CHILD_CLONE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || sweep_index.shard(0).sweep_unused()));
+        });
+        index.store(0, owner, StorageTier::Device, None, &[(h("new"), h("x"))]);
+        assert_eq!(
+            depth_of(
+                &index.find_matches(&query(&["x"], &[StorageTier::Device])),
+                "w",
+                StorageTier::Device
+            ),
+            1
+        );
+        let shard = index.shard(0);
+        let anchor = shard.anchors.get("new").unwrap().clone();
+        assert!(Arc::ptr_eq(
+            shard.root.read().children.get("x").unwrap(),
+            &anchor
+        ));
+    }
+
+    #[test]
+    fn sweep_finishes_removal_racing_between_alias_and_claim_passes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let index = Arc::new(KvBlockIndexer::new());
+        let owner = worker("w");
+        index.store(
+            0,
+            owner.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("seq"), h("x"))],
+        );
+        let (start_tx, start_rx) = mpsc::channel();
+        let (removed_tx, removed_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let remove_index = index.clone();
+        let remover = std::thread::spawn(move || {
+            start_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            AFTER_ANCHOR_CLONE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    removed_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }));
+            });
+            remove_index.remove(0, &owner, StorageTier::Device, &[h("seq")]);
+        });
+        AFTER_SWEEP_ALIASES.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                start_tx.send(()).unwrap();
+                removed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }));
+        });
+        index.shard(0).sweep_unused();
+        resume_tx.send(()).unwrap();
+        remover.join().unwrap();
+        let shard = index.shard(0);
+        assert!(shard.anchors.is_empty());
+        assert!(shard.root.read().children.is_empty());
+        assert!(index
+            .find_matches(&query(&["x"], &[StorageTier::Device]))
+            .is_empty());
+    }
+
+    #[test]
+    fn concurrent_churn_and_sweeps_preserve_live_shared_prefixes() {
+        let index = Arc::new(KvBlockIndexer::new());
+        let start = Arc::new(std::sync::Barrier::new(6));
+        let writers: Vec<_> = (0..6)
+            .map(|i| {
+                let index = index.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    let name = format!("worker-{i}");
+                    let owner = worker(&name);
+                    let parent = h(&format!("parent-{i}"));
+                    let leaf = h(&format!("live-{i}"));
+                    let local = h(&format!("tail-{i}"));
+                    index.store(
+                        0,
+                        owner.clone(),
+                        StorageTier::Device,
+                        None,
+                        &[(parent.clone(), h("shared")), (leaf, local.clone())],
+                    );
+                    start.wait();
+                    for j in 0..1024 {
+                        let seq = h(&format!("churn-{i}-{j}"));
+                        index.store(
+                            0,
+                            owner.clone(),
+                            StorageTier::Device,
+                            Some(parent.clone()),
+                            &[(seq.clone(), h(&format!("branch-{i}-{j}")))],
+                        );
+                        index.remove(0, &owner, StorageTier::Device, &[seq]);
+                        assert_eq!(
+                            depth_of(
+                                &index.find_matches(&query(
+                                    &["shared", &local],
+                                    &[StorageTier::Device]
+                                )),
+                                &name,
+                                StorageTier::Device
+                            ),
+                            2
+                        );
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let shard = index.shard(0);
+        shard.sweep_unused();
+        assert_eq!(shard.anchors.len(), 12);
+        for i in 0..6 {
+            assert_observations(
+                &shard,
+                &(worker(&format!("worker-{i}")), StorageTier::Device),
+                &[&format!("parent-{i}"), &format!("live-{i}")],
+            );
+        }
+    }
 
     fn worker(name: &str) -> ResidencyOwner {
         ResidencyOwner::Worker {
@@ -895,14 +1367,7 @@ mod tests {
         assert!(shard.reverse.get(&kb).is_none());
         assert!(shard.counts.get(&kb).is_none());
         for seq in ["i:200", "i:201", "i:202", "b:0200", "i:203"] {
-            let node = shard.anchors.get(seq).unwrap().clone();
-            let node = node.read();
-            let pos = node
-                .edge
-                .iter()
-                .position(|(aliases, _)| aliases.contains(seq))
-                .unwrap();
-            assert!(!node.claims[pos].contains(&kb));
+            assert!(!shard.anchors.contains_key(seq));
         }
         assert_eq!(
             depth_of(
