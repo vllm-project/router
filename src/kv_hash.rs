@@ -5,6 +5,7 @@
 //! `PYTHONHASHSEED` in `0..=u32::MAX`, supplied as an unsigned integer. The
 //! Worker environment must use its canonical decimal spelling (e.g. `42`,
 //! not `00042`): vLLM hashes the verbatim seed string for the initial parent.
+//! Alternatively, callers can provide the engine's verified root digest.
 //! This utility then hashes the canonical CBOR
 //! value `(parent_hash, tuple(token_ids), None)` for each complete block.
 
@@ -42,6 +43,15 @@ impl BlockKeyGenerator {
         }
     }
 
+    /// Use the engine's authenticated root digest without exposing its seed.
+    pub fn from_root_hash(block_size: usize, root_hash: SequenceHash) -> Self {
+        assert!(block_size > 0, "block_size must be greater than zero");
+        Self {
+            block_size,
+            none_hash: root_hash,
+        }
+    }
+
     pub fn block_size(&self) -> usize {
         self.block_size
     }
@@ -49,23 +59,72 @@ impl BlockKeyGenerator {
     /// Return one key per complete block. A trailing partial block is not
     /// cache-addressable and is intentionally omitted.
     pub fn generate_block_keys(&self, token_ids: &[u32]) -> Vec<SequenceHash> {
-        let mut parent = self.none_hash;
+        self.keys_after(self.none_hash, token_ids)
+    }
+
+    /// Extend a chain from an engine-supplied parent digest.
+    ///
+    /// Events carry the parent hash next to the tokens they stored, so a store
+    /// whose hashes cover only a retained tail can still be expanded to every
+    /// block it spans.
+    pub fn keys_after(&self, parent: SequenceHash, token_ids: &[u32]) -> Vec<SequenceHash> {
+        self.keys_after_with_extra(parent, token_ids, None)
+    }
+
+    /// The same chain for one LoRA adapter. vLLM hashes each adapter block with
+    /// `[["lora", name, path]]` as extra keys, where `path` is the string the
+    /// engine was launched with, so this reproduces the adapter's chain instead
+    /// of the base chain.
+    pub fn generate_block_keys_for_adapter(
+        &self,
+        token_ids: &[u32],
+        name: &str,
+        path: &str,
+    ) -> Vec<SequenceHash> {
+        self.keys_after_with_extra(self.none_hash, token_ids, Some((name, path)))
+    }
+
+    /// Extend an adapter's chain from an engine-supplied parent digest.
+    pub fn keys_after_for_adapter(
+        &self,
+        parent: SequenceHash,
+        token_ids: &[u32],
+        name: &str,
+        path: &str,
+    ) -> Vec<SequenceHash> {
+        self.keys_after_with_extra(parent, token_ids, Some((name, path)))
+    }
+
+    fn keys_after_with_extra(
+        &self,
+        parent: SequenceHash,
+        token_ids: &[u32],
+        adapter: Option<(&str, &str)>,
+    ) -> Vec<SequenceHash> {
+        let mut parent = parent;
         token_ids
             .chunks_exact(self.block_size)
             .map(|tokens| {
-                parent = hash_block(&parent, tokens);
+                parent = hash_block(&parent, tokens, adapter);
                 parent
             })
             .collect()
     }
 
-    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    /// The chain's initial parent, i.e. the digest the engine uses before any
+    /// block is stored. Only the tests need it now that claims come from the
+    /// hashes the engine published.
+    #[cfg(test)]
     pub(crate) fn none_hash(&self) -> SequenceHash {
         self.none_hash
     }
 }
 
-fn hash_block(parent: &SequenceHash, token_ids: &[u32]) -> SequenceHash {
+fn hash_block(
+    parent: &SequenceHash,
+    token_ids: &[u32],
+    adapter: Option<(&str, &str)>,
+) -> SequenceHash {
     let mut encoded = Vec::with_capacity(40 + token_ids.len() * 3);
 
     // Canonical CBOR for: [parent_hash_bytes, [token ids...], null]
@@ -76,9 +135,24 @@ fn hash_block(parent: &SequenceHash, token_ids: &[u32]) -> SequenceHash {
     for &token_id in token_ids {
         encode_major(&mut encoded, 0, u64::from(token_id));
     }
-    encoded.push(0xf6);
+    match adapter {
+        None => encoded.push(0xf6),
+        Some((name, path)) => {
+            // [["lora", name, path]]: one extra key group, one tagged tuple.
+            encode_major(&mut encoded, 4, 1);
+            encode_major(&mut encoded, 4, 3);
+            encode_text(&mut encoded, "lora");
+            encode_text(&mut encoded, name);
+            encode_text(&mut encoded, path);
+        }
+    }
 
     digest(&encoded)
+}
+
+fn encode_text(output: &mut Vec<u8>, value: &str) {
+    encode_major(output, 3, value.len() as u64);
+    output.extend_from_slice(value.as_bytes());
 }
 
 fn encode_major(output: &mut Vec<u8>, major: u8, value: u64) {

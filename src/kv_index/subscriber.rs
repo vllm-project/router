@@ -1,5 +1,6 @@
 //! ZMQ SUB + DEALER replay subscriber, one task per (worker, rank).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -465,7 +466,11 @@ fn event_owner(
 fn event_tier(owner: &ResidencyOwner, medium: Option<&str>) -> StorageTier {
     match owner {
         ResidencyOwner::CacheOwner { .. } => StorageTier::External,
-        ResidencyOwner::Worker { .. } => StorageTier::from_medium(medium),
+        // Unknown mediums are filtered out by `is_supported_residency` before a
+        // residency is recorded; the fallback only keeps this total.
+        ResidencyOwner::Worker { .. } => {
+            StorageTier::from_medium(medium).unwrap_or(StorageTier::Device)
+        }
     }
 }
 
@@ -2192,4 +2197,40 @@ mod tests {
     async fn replay_wrong_topic_clears_partial_stores() {
         check_replay_case("wrong_topic").await;
     }
+}
+
+// ---- Replay bookkeeping shared with the hybrid subscriber ----
+
+pub(crate) struct ReplayWindow {
+    pub(crate) required_through: u64,
+    pub(crate) replayed: HashMap<u64, u64>,
+}
+
+pub(crate) fn payload_fingerprint(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+// ---- Source lease and replay state shared with the hybrid subscriber ----
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HybridSourceLease(pub(crate) u64);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase {
+    Retired,
+    Replaying,
+    Live,
+}
+
+pub(crate) struct SourceState {
+    pub(crate) generation: u64,
+    pub(crate) phase: Phase,
+    /// Whether this generation already reported that the publisher's hash
+    /// encoding cannot be indexed.
+    pub(crate) reported_int_hashes: bool,
 }

@@ -202,7 +202,21 @@ async fn test_otel_integration() {
             "Backend should have received at least one request"
         );
 
-        let backend_req = &captured[0];
+        // The router probes `/v1/models` on the worker to learn its served
+        // labels, so the completion is not necessarily the first captured
+        // request. Select it by path instead of by arrival order.
+        let backend_req = captured
+            .iter()
+            .find(|request| request.path.contains("chat/completions"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "backend should receive the chat completion, got {:?}",
+                    captured
+                        .iter()
+                        .map(|request| request.path.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
 
         // The backend should have traceparent with the SAME trace_id but a
         // DIFFERENT span_id (the router's span, not the upstream's)

@@ -1,9 +1,10 @@
 use crate::core::Worker;
 use crate::policies::{AffinityKey, AffinityRecord, RequestHeaders};
 use axum::body::Body;
+use axum::http::StatusCode;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 // Custom error type for PD router operations
@@ -29,6 +30,23 @@ pub enum PDRouterError {
 
     #[error("Timeout waiting for worker: {url}")]
     Timeout { url: String },
+}
+
+impl PDRouterError {
+    /// The status a client sees for this failure.
+    ///
+    /// A prefill or decode engine that cannot be reached belongs to the gateway
+    /// upstream, not to the request: clients retry 502/503 and stop retrying
+    /// 500, so collapsing both into 500 made a vanished engine look like a bug
+    /// in the request itself.
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            Self::NetworkError { .. } | Self::Timeout { .. } | Self::HealthCheckFailed { .. } => {
+                StatusCode::BAD_GATEWAY
+            }
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
 }
 
 /// Format a full error chain for debugging (walks source() recursively).
@@ -141,7 +159,9 @@ pub struct PdPrefillInput {
 
 /// Token inputs are keyed by the P base URL: each backend renders its own
 /// effective input, so different tokenizer/template configurations never mix.
+#[derive(Clone)]
 pub struct PdRequestContext<'a> {
+    pub hybrid_pairs: Option<&'a HashSet<(PdEndpoint, PdEndpoint)>>,
     pub prefill_inputs: Option<&'a HashMap<String, PdPrefillInput>>,
     pub model_id: Option<&'a str>,
     pub legacy_policy_input: Option<&'a str>,
@@ -475,6 +495,41 @@ impl PdAttempt {
 mod tests {
     use super::*;
     use std::fmt;
+
+    #[test]
+    fn upstream_transport_failures_are_gateway_errors() {
+        // A vanished prefill or decode engine must not look like a bug in the
+        // request: clients retry 502 and give up on 500.
+        let cases = [
+            (
+                PDRouterError::NetworkError {
+                    message: "connection refused".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                PDRouterError::Timeout {
+                    url: "http://127.0.0.1:1".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                PDRouterError::HealthCheckFailed {
+                    url: "http://127.0.0.1:1".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                PDRouterError::InvalidConfiguration {
+                    reason: "no decode rank".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.status_code(), expected, "{error}");
+        }
+    }
 
     // Simple custom error for testing error chains
     #[derive(Debug)]

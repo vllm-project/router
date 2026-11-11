@@ -96,16 +96,42 @@ pub enum StorageTier {
     External,
 }
 
+/// Warn once per unknown medium value: a connector that invents a new name must
+/// not silently gain local-device credit.
+fn warn_unknown_medium(medium: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    let mut seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.insert(medium.to_owned()) {
+        tracing::warn!(
+            medium,
+            "unknown KV cache medium; treating it as unaddressable"
+        );
+    }
+}
+
 impl StorageTier {
     /// Map a worker's `medium` field to its tier. vLLM emits uppercase
-    /// `GPU`/`CPU`/`STORAGE`; matched case-insensitively. Unknown/None → Device.
-    /// `External` is not produced here — it derives from the owner domain.
-    pub fn from_medium(s: Option<&str>) -> Self {
+    /// `GPU`/`CPU`/`STORAGE`; accelerator backends name their device instead
+    /// (`NPU`, `ASCEND`, `XPU`). Those are the same local device tier, so the
+    /// mapping is by role, not by vendor. An unknown value is unaddressable:
+    /// returning `None` keeps a new connector from being priced as local HBM.
+    pub fn from_medium(s: Option<&str>) -> Option<Self> {
         match s.map(|m| m.to_ascii_uppercase()).as_deref() {
-            None | Some("GPU") | Some("DEVICE") => StorageTier::Device,
-            Some("CPU") | Some("HOST") | Some("HOST_PINNED") => StorageTier::HostPinned,
-            Some("STORAGE") | Some("DISK") => StorageTier::Disk,
-            _ => StorageTier::Device,
+            // The field is optional in the wire format; its absence means the
+            // engine's default device residency.
+            None | Some("GPU") | Some("DEVICE") | Some("NPU") | Some("ASCEND") | Some("XPU") => {
+                Some(Self::Device)
+            }
+            Some("CPU") | Some("HOST") | Some("HOST_PINNED") => Some(Self::HostPinned),
+            Some("STORAGE") | Some("DISK") => Some(Self::Disk),
+            Some(other) => {
+                warn_unknown_medium(other);
+                None
+            }
         }
     }
 }
@@ -133,58 +159,67 @@ mod tests {
 
     #[test]
     fn medium_none_maps_to_device() {
-        assert_eq!(StorageTier::from_medium(None), StorageTier::Device);
+        assert_eq!(StorageTier::from_medium(None), Some(StorageTier::Device));
     }
 
     #[test]
     fn medium_uppercase_vllm_values() {
-        assert_eq!(StorageTier::from_medium(Some("GPU")), StorageTier::Device);
+        assert_eq!(
+            StorageTier::from_medium(Some("GPU")),
+            Some(StorageTier::Device)
+        );
         assert_eq!(
             StorageTier::from_medium(Some("CPU")),
-            StorageTier::HostPinned
+            Some(StorageTier::HostPinned)
         );
-        assert_eq!(StorageTier::from_medium(Some("STORAGE")), StorageTier::Disk);
+        assert_eq!(
+            StorageTier::from_medium(Some("STORAGE")),
+            Some(StorageTier::Disk)
+        );
     }
 
     #[test]
     fn medium_case_insensitive_and_aliases() {
-        assert_eq!(StorageTier::from_medium(Some("gpu")), StorageTier::Device);
+        assert_eq!(
+            StorageTier::from_medium(Some("gpu")),
+            Some(StorageTier::Device)
+        );
         assert_eq!(
             StorageTier::from_medium(Some("device")),
-            StorageTier::Device
+            Some(StorageTier::Device)
         );
         assert_eq!(
             StorageTier::from_medium(Some("cpu")),
-            StorageTier::HostPinned
+            Some(StorageTier::HostPinned)
         );
         assert_eq!(
             StorageTier::from_medium(Some("host")),
-            StorageTier::HostPinned
+            Some(StorageTier::HostPinned)
         );
-        assert_eq!(StorageTier::from_medium(Some("disk")), StorageTier::Disk);
-    }
-
-    #[test]
-    fn medium_never_produces_external() {
-        // External derives from the owner domain, not `medium`: pool-backend
-        // medium values fall through to Device, never External.
         assert_eq!(
-            StorageTier::from_medium(Some("external")),
-            StorageTier::Device
-        );
-        assert_eq!(StorageTier::from_medium(Some("pool")), StorageTier::Device);
-        assert_eq!(
-            StorageTier::from_medium(Some("shared")),
-            StorageTier::Device
+            StorageTier::from_medium(Some("disk")),
+            Some(StorageTier::Disk)
         );
     }
 
     #[test]
-    fn medium_unknown_defaults_to_device() {
-        assert_eq!(
-            StorageTier::from_medium(Some("nonsense")),
-            StorageTier::Device
-        );
+    fn accelerator_mediums_are_the_device_tier() {
+        for medium in ["GPU", "gpu", "DEVICE", "NPU", "npu", "ASCEND", "XPU"] {
+            assert_eq!(
+                StorageTier::from_medium(Some(medium)),
+                Some(StorageTier::Device),
+                "{medium}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_medium_is_unaddressable() {
+        // External derives from the owner domain, and a new connector name must
+        // not be priced as local HBM.
+        for medium in ["external", "pool", "shared", "nonsense", "MOONCAKE"] {
+            assert_eq!(StorageTier::from_medium(Some(medium)), None, "{medium}");
+        }
     }
 
     #[test]
