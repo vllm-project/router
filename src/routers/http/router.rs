@@ -16,8 +16,8 @@ use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::kv_aware_policy;
 use crate::policies::KvRequestTokens;
 use crate::policies::{
-    kv_aware_ops, AffinityKey, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy,
-    PolicyRegistry,
+    hash_key::session_id_from_headers, kv_aware_ops, AffinityKey, KvRequestSlot,
+    KvSelectionReceipt, LoadBalancingPolicy, PolicyRegistry, RequestHeaders,
 };
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
@@ -49,7 +49,7 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -1329,11 +1329,12 @@ impl Router {
     /// Select worker for a specific model considering circuit breaker state
     #[allow(clippy::too_many_arguments)]
     fn select_worker_for_model(
-        &self,
+        policy: &dyn LoadBalancingPolicy,
         model_id: Option<&str>,
         available: &[Arc<dyn Worker>],
         text: Option<&str>,
-        headers: Option<&HeaderMap>,
+        headers: Option<&RequestHeaders>,
+        session_id: Option<&str>,
         token_ids: KvRequestTokens<'_>,
         eligibility: Option<&[bool]>,
         lora_name: Option<&str>,
@@ -1345,12 +1346,7 @@ impl Router {
             return None;
         }
 
-        let policy = self.policy_for_model(model_id);
-
-        // Convert headers for policies that need them (e.g., consistent_hash)
-        let request_headers = Self::headers_to_request_headers(headers);
-
-        if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
+        if let Some(kv_aware) = kv_aware_ops(policy) {
             // The policy sees the full list: a retry exclusion must not
             // rewrite a still-valid binding.
             let receipt = kv_aware.select_worker_with_qualified_inputs(
@@ -1376,7 +1372,7 @@ impl Router {
                 available, token_ids, model_id, lora_name, cache_salt, "regular",
             )?
         } else {
-            policy.select_worker_with_headers(available, text, request_headers.as_ref())?
+            policy.select_worker_for_session(available, text, headers, session_id)?
         };
         Some(SelectedWorker {
             worker: available.get(idx)?.clone(),
@@ -1494,18 +1490,30 @@ impl Router {
                 None
             }
         };
-        let text = match (pool, typed_req.grpc_request()) {
+        let request_headers = Self::headers_to_request_headers(headers);
+        let request_headers = request_headers.as_ref();
+        let sticky_inputs = &LazyLock::new(|| {
+            let session_id = request_headers
+                .and_then(session_id_from_headers)
+                .map(std::borrow::Cow::Borrowed)
+                .or_else(|| typed_req.sticky_session_id());
+            // Stateless chats have no routing text. Reuse a per-request key on retries
+            // so tied workers share these requests without reading the prompt.
+            let tie_break = session_id
+                .is_none()
+                .then(|| rand::random::<u64>().to_string());
+            (session_id, tie_break)
+        });
+        let routing_text = &LazyLock::new(|| match (pool, typed_req.grpc_request()) {
             (
                 Some(crate::backend::WorkerPoolKind::Grpc),
                 Some(GrpcRequestRef::Completion(completion)),
             ) if route == "/v1/completions" => completion.extract_text_for_grpc_routing(),
             _ => typed_req.extract_text_for_routing(),
-        };
-        let text = &text;
+        });
         let prepared = &prepared;
         let completion = completion.as_ref();
-        let cache_key = std::sync::OnceLock::new();
-        let cache_key = &cache_key;
+        let cache_key = &LazyLock::new(|| typed_req.extract_cache_routing_key());
 
         let http_inputs = tokio::sync::OnceCell::new();
 
@@ -1648,15 +1656,21 @@ impl Router {
                     });
                     Some(SelectedWorker { worker, kv_receipt })
                 } else {
-                    self.select_worker_for_model(
+                    let (text, session_id) = if policy.needs_session_id() {
+                        let (id, tie_break) = LazyLock::force(sticky_inputs);
+                        (tie_break.as_deref(), id.as_deref())
+                    } else if policy.needs_cache_routing_key() {
+                        (Some(cache_key.as_str()), None)
+                    } else {
+                        (Some(routing_text.as_str()), None)
+                    };
+                    Self::select_worker_for_model(
+                        policy.as_ref(),
                         model_id,
                         &workers,
-                        Some(if policy.needs_cache_routing_key() {
-                            cache_key.get_or_init(|| typed_req.extract_cache_routing_key())
-                        } else {
-                            text
-                        }),
-                        headers,
+                        text,
+                        request_headers,
+                        session_id,
                         request_tokens,
                         eligibility.as_deref(),
                         lora_name,
@@ -6926,20 +6940,21 @@ mod tests {
         // Make multiple selections with the same headers - should all pick the same worker
         let mut selected_urls: Vec<String> = Vec::new();
         for _ in 0..10 {
-            let worker = router
-                .select_worker_for_model(
-                    None,
-                    &router.available_workers(None),
-                    Some(r#"{"prompt": "test"}"#),
-                    Some(&header_map),
-                    KvRequestTokens::Shared(None),
-                    None,
-                    None,
-                    None,
-                    None,
-                    &[],
-                )
-                .expect("Should select a worker");
+            let worker = Router::select_worker_for_model(
+                router.policy_for_model(None).as_ref(),
+                None,
+                &router.available_workers(None),
+                Some(r#"{"prompt": "test"}"#),
+                Router::headers_to_request_headers(Some(&header_map)).as_ref(),
+                None,
+                KvRequestTokens::Shared(None),
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .expect("Should select a worker");
             selected_urls.push(worker.worker.url().to_string());
         }
 
@@ -6967,20 +6982,21 @@ mod tests {
             }
         }
 
-        let worker = router
-            .select_worker_for_model(
-                None,
-                &router.available_workers(None),
-                Some(r#"{"prompt": "test"}"#),
-                None,
-                KvRequestTokens::Shared(None),
-                None,
-                None,
-                None,
-                None,
-                &[],
-            )
-            .expect("Should select the remaining healthy worker");
+        let worker = Router::select_worker_for_model(
+            router.policy_for_model(None).as_ref(),
+            None,
+            &router.available_workers(None),
+            Some(r#"{"prompt": "test"}"#),
+            None,
+            None,
+            KvRequestTokens::Shared(None),
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("Should select the remaining healthy worker");
 
         assert_eq!(
             worker.worker.url(),
@@ -7000,10 +7016,12 @@ mod tests {
             w.set_healthy(false);
         }
 
-        let result = router.select_worker_for_model(
+        let result = Router::select_worker_for_model(
+            router.policy_for_model(None).as_ref(),
             None,
             &router.available_workers(None),
             Some(r#"{"prompt": "test"}"#),
+            None,
             None,
             KvRequestTokens::Shared(None),
             None,
@@ -7022,23 +7040,24 @@ mod tests {
     fn test_retry_exclusion_does_not_change_other_policies() {
         let router = create_test_consistent_hash_router();
         let select = |excluded: &[String]| {
-            router
-                .select_worker_for_model(
-                    None,
-                    &router.available_workers(None),
-                    Some(r#"{"prompt": "test"}"#),
-                    None,
-                    KvRequestTokens::Shared(None),
-                    None,
-                    None,
-                    None,
-                    None,
-                    excluded,
-                )
-                .expect("Should select a worker")
-                .worker
-                .url()
-                .to_string()
+            Router::select_worker_for_model(
+                router.policy_for_model(None).as_ref(),
+                None,
+                &router.available_workers(None),
+                Some(r#"{"prompt": "test"}"#),
+                None,
+                None,
+                KvRequestTokens::Shared(None),
+                None,
+                None,
+                None,
+                None,
+                excluded,
+            )
+            .expect("Should select a worker")
+            .worker
+            .url()
+            .to_string()
         };
         let first = select(&[]);
         assert_eq!(select(std::slice::from_ref(&first)), first);
@@ -7055,11 +7074,13 @@ mod tests {
             let session_id = format!("session-{}", i);
             header_map.insert("x-session-id", HeaderValue::from_str(&session_id).unwrap());
 
-            if let Some(worker) = router.select_worker_for_model(
+            if let Some(worker) = Router::select_worker_for_model(
+                router.policy_for_model(None).as_ref(),
                 None,
                 &router.available_workers(None),
                 Some(r#"{"prompt": "test"}"#),
-                Some(&header_map),
+                Router::headers_to_request_headers(Some(&header_map)).as_ref(),
+                None,
                 KvRequestTokens::Shared(None),
                 None,
                 None,

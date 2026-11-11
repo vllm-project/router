@@ -83,6 +83,17 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         headers: Option<&RequestHeaders>,
     ) -> Option<usize>;
 
+    /// Select a worker with the session ID resolved from the request headers or body.
+    fn select_worker_for_session(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+        _session_id: Option<&str>,
+    ) -> Option<usize> {
+        self.select_worker_with_headers(workers, request_text, headers)
+    }
+
     /// Select a worker and reserve its local load before another admission
     /// through this context can make a load-based decision.
     ///
@@ -153,6 +164,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Check if this policy needs request text for routing decisions
     fn needs_request_text(&self) -> bool {
         false // Default: most policies don't need request text
+    }
+
+    /// Whether the router should resolve the session ID before selecting a worker.
+    fn needs_session_id(&self) -> bool {
+        false
     }
 
     /// Whether request text must use the content-preserving cache routing key.

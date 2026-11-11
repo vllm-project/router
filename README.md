@@ -234,6 +234,7 @@ The router supports multiple load balancing policies:
 | `round_robin` | Sequential distribution across workers | No | General purpose, even distribution |
 | `random` | Uniform random selection | No | Simple deployments |
 | `consistent_hash` | Routes same session/user to same worker | Yes | Multi-turn chat, KV cache reuse |
+| `sticky_least_loaded` | Assigns new sessions to the worker with the fewest active sessions | Yes | Multi-turn workloads with explicit session lifetimes |
 | `power_of_two` | Picks least loaded of two random workers | No | Load-sensitive workloads |
 | `cache_aware` | Optimizes for prefix cache hits | Yes | Repeated prompts, few-shot |
 
@@ -246,6 +247,10 @@ curl -X POST http://router:8000/v1/chat/completions \
 ```
 
 For detailed configuration options, hash key priorities, and usage examples, see [Load Balancing Documentation](docs/load_balancing/README.md).
+
+#### Sticky least-loaded sessions
+
+Use `--policy sticky_least_loaded` to keep each multi-turn session on its assigned worker. Send the same `X-Session-ID` on every turn, then release the reservation after the last request completes. See [Sticky least loaded](docs/load_balancing/README.md#sticky-least-loaded) for the release endpoint, supported session IDs, and idle timeout.
 
 For the optional agent metadata contract, scheduling enablement, request-scoped hints, and engine KV-control boundary, see [Program Scheduling](docs/program_scheduling/program-scheduling.md).
 
