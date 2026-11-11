@@ -2068,6 +2068,14 @@ impl VllmPDRouter {
                 .into_response());
         }
 
+        // The encoder rewrites the body before dispatch, but a deferred
+        // commitment scores the request the client sent: `prepare_decode_inputs`
+        // tokenizes from it, and the rewritten body carries `*_embeds` parts and
+        // `ec_transfer_params` instead of media. Only a deferred EPD request
+        // pays for the copy.
+        let client_request =
+            (path == "/v1/chat/completions" && self.epd.is_some() && commit.is_some())
+                .then(|| original_request.clone());
         // The encoder stage must run before the NIXL concurrent fast path:
         // once a push identity is cached, try_build_concurrent_requests
         // returns early, and multimodal requests reaching P/D without
@@ -2297,8 +2305,11 @@ impl VllmPDRouter {
                 prefill_worker.as_ref(),
                 Some(&prefill_response_json),
             );
+            // Score the refresh against the client body, not the encoder
+            // output; without EPD the two are the same value.
+            let request = client_request.as_ref().unwrap_or(&original_request);
             match self
-                .select_and_commit_decode(&attempt, commit, &original_request, headers, pinned)
+                .select_and_commit_decode(&attempt, commit, request, headers, pinned)
                 .await
             {
                 Ok(worker) => decode_worker = worker,
