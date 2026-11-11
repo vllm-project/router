@@ -32,6 +32,10 @@ LM_EVAL_LOG_SAMPLES=${LM_EVAL_LOG_SAMPLES:-false}
 SMOKE_ONLY=${SMOKE_ONLY:-false}
 SKIP_LM_EVAL=${SKIP_LM_EVAL:-false}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-300}
+RUN_PD_LIFECYCLE=${RUN_PD_LIFECYCLE:-false}
+PD_PROBE_CONCURRENCY=${PD_PROBE_CONCURRENCY:-"1 2 4 8"}
+PD_PROBE_ROUNDS=${PD_PROBE_ROUNDS:-2}
+PD_PROBE_TIMEOUT=${PD_PROBE_TIMEOUT:-60}
 EVAL_PIP_CACHE_VOLUME=${EVAL_PIP_CACHE_VOLUME:-"vllm-router-rocm-pip-cache"}
 
 PREFILL_PORT=${PREFILL_PORT:-8100}
@@ -47,6 +51,41 @@ LOG_DIR=${LOG_DIR:-"${REPO_ROOT}/target/ci-logs/moriio-rdma-${MORIIO_READ_MODE}"
 PREFILL_CONTAINER="vllm-router-mori-rdma-prefill"
 DECODE_CONTAINER="vllm-router-mori-rdma-decode"
 EVAL_CONTAINER="vllm-router-mori-rdma-eval"
+
+evidence_mode=ro
+case "${RUN_PD_LIFECYCLE}" in
+  true|false) ;;
+  *) echo "ERROR: RUN_PD_LIFECYCLE must be true or false" >&2; exit 2 ;;
+esac
+if [[ "${RUN_PD_LIFECYCLE}" == true ]]; then
+  evidence_mode=rw
+  if [[ "${SMOKE_ONLY}" == true ]]; then
+    echo "ERROR: lifecycle probe requires SMOKE_ONLY=false" >&2
+    exit 2
+  fi
+  # These values enter the evaluation shell below; accept only bounded integers.
+  if ! [[ "${PD_PROBE_CONCURRENCY}" =~ ^[1-9][0-9]?(\ [1-9][0-9]?)*$ ]]; then
+    echo "ERROR: PD_PROBE_CONCURRENCY must be space-separated integers in 1..32" >&2
+    exit 2
+  fi
+  read -r -a probe_levels <<< "${PD_PROBE_CONCURRENCY}"
+  if (( ${#probe_levels[@]} > 8 )); then
+    echo "ERROR: at most eight concurrency levels are allowed" >&2
+    exit 2
+  fi
+  for level in "${probe_levels[@]}"; do
+    if (( level > 32 )); then
+      echo "ERROR: probe concurrency must not exceed 32" >&2
+      exit 2
+    fi
+  done
+  if ! [[ "${PD_PROBE_ROUNDS}" =~ ^([1-9]|10)$ ]] ||
+     ! [[ "${PD_PROBE_TIMEOUT}" =~ ^[1-9][0-9]{0,2}$ ]] ||
+     (( PD_PROBE_TIMEOUT > 600 )); then
+    echo "ERROR: probe rounds must be 1..10 and timeout 1..600 seconds" >&2
+    exit 2
+  fi
+fi
 
 case "${MORIIO_READ_MODE}" in
   true|false) ;;
@@ -317,6 +356,16 @@ python3 tests/python/e2e/pd_disagg_vllm/test_pd_accuracy.py \\
   --model ${MODEL_NAMES} \\
   --num-requests ${NUM_SANITY_REQUESTS} \\
   --skip-streaming
+if [[ ${RUN_PD_LIFECYCLE} == true ]]; then
+  python3 -m pip install --disable-pip-version-check --quiet aiohttp
+  python3 tests/python/helpers/pd_lifecycle.py \\
+    --router-url http://127.0.0.1:${ROUTER_PORT} \\
+    --model ${MODEL_NAMES} \\
+    --concurrency ${PD_PROBE_CONCURRENCY} \\
+    --rounds ${PD_PROBE_ROUNDS} \\
+    --timeout ${PD_PROBE_TIMEOUT} \\
+    --output /evidence/pd-lifecycle.json
+fi
 if [[ ${SKIP_LM_EVAL} == true ]]; then exit 0; fi
 args=(
   --router-url http://127.0.0.1:${ROUTER_PORT}
@@ -336,7 +385,7 @@ docker run --rm \
   --name "${EVAL_CONTAINER}" \
   --network host \
   -v "${REPO_ROOT}:/workdir" \
-  -v "${LOG_DIR}:/evidence:ro" \
+  -v "${LOG_DIR}:/evidence:${evidence_mode}" \
   -v "${EVAL_PIP_CACHE_VOLUME}:/root/.cache/pip" \
   -w /workdir \
   --entrypoint bash \
@@ -345,6 +394,8 @@ docker run --rm \
 
 if [[ "${SMOKE_ONLY}" == true ]]; then
   echo "MoRI RDMA cross-node smoke passed (read_mode=${MORIIO_READ_MODE})"
+elif [[ "${RUN_PD_LIFECYCLE}" == true && "${SKIP_LM_EVAL}" == true ]]; then
+  echo "MoRI RDMA lifecycle passed; LM-eval skipped (read_mode=${MORIIO_READ_MODE})"
 else
   echo "MoRI RDMA cross-node accuracy passed (read_mode=${MORIIO_READ_MODE})"
 fi

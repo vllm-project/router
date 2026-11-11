@@ -225,3 +225,38 @@ The tests run on a 4-GPU (L4) queue with a 30-minute timeout:
 - [vLLM P/D Disaggregation Documentation](https://docs.vllm.ai/en/latest/serving/disaggregated_prefill_decode.html)
 - [NixlConnector KV Transfer](https://github.com/vllm-project/vllm/tree/main/vllm/distributed/kv_transfer)
 - [vLLM Router Documentation](../../README.md)
+
+## Optional MoRI RDMA lifecycle validation
+
+On an allocated two-host pair, use the normal shared host lease and launcher:
+
+```bash
+HSA_NO_SCRATCH_RECLAIM=0 MORIIO_READ_MODE=true \
+RUN_PD_LIFECYCLE=true SMOKE_ONLY=false \
+bash tests/python/e2e/pd_disagg_vllm/run_moriio_rdma_accuracy_test.sh
+```
+
+The existing eval container runs completion, full-stream, active-client-disconnect,
+and recovery waves, before the normal accuracy evaluation. Defaults are
+`PD_PROBE_CONCURRENCY="1 2 4 8"`, `PD_PROBE_ROUNDS=2`, and
+`PD_PROBE_TIMEOUT=60` seconds per request. The probe stops at the first failed
+wave without retrying or increasing concurrency. Test read and write mode in
+separate allocated runs. `SKIP_LM_EVAL=true` selects diagnostics without the
+accuracy evaluation; `SMOKE_ONLY=true` with the probe is rejected before launch.
+Default CI scheduling, accuracy concurrency, and thresholds are unchanged.
+To opt in on the existing L3 RDMA jobs, set `RUN_PD_LIFECYCLE=true` in a
+scheduled default-branch `NIGHTLY=1` build or a PR build labeled `nightly-test`.
+For a manual default-branch build, also set `RUN_ROCM_RDMA=1` and `NIGHTLY=1`.
+
+`LOG_DIR/pd-lifecycle.json` records each phase, outcome, and HTTP error status,
+with an atomic checkpoint after each wave. `status=running` means incomplete,
+not passed. Full streams need non-empty text, a normal finish reason, and
+`[DONE]`. Disconnects must occur before the observed stream finishes, followed
+by successful recovery requests. The existing RDMA artifact glob includes the
+report alongside P/D/router logs.
+
+A pass demonstrates client-visible progress after disconnects, not engine abort
+propagation, KV reclamation, absence of leaks, or semantic accuracy. Inspect
+engine errors and resource trends separately; cached GPU memory need not return
+to zero. A timeout is a failure, not proof of server-side timeout handling.
+This is MoRIIO qualification, not UMBP, multi-P/D, or gRPC coverage.
