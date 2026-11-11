@@ -290,6 +290,7 @@ pub struct Router {
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
     kv_aware_session_affinity_ttl_secs: Option<u64>,
+    prefix_preparation_budget: Duration,
     health_config: HealthConfig,
     frontend: crate::backend::EngineFrontend,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
@@ -625,6 +626,7 @@ impl Router {
             kv_aware_session_affinity_ttl_secs: ctx
                 .router_config
                 .kv_aware_session_affinity_ttl_secs,
+            prefix_preparation_budget: ctx.router_config.prefix_preparation_budget(),
             health_config,
             frontend,
             _worker_loads: worker_loads,
@@ -1588,7 +1590,7 @@ impl Router {
                                         &body,
                                         route,
                                         self.api_key.as_deref(),
-                                        Duration::from_secs(1),
+                                        self.prefix_preparation_budget,
                                     )
                                     .await,
                                 ),
@@ -3058,7 +3060,7 @@ impl RouterTrait for Router {
                     &body,
                     path,
                     self.api_key.as_deref(),
-                    Duration::from_secs(1),
+                    self.prefix_preparation_budget,
                 )
                 .await,
             )
@@ -5241,6 +5243,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_aware_keeps_prefix_placement_when_a_slow_render_fits_the_budget() {
+        use axum::{extract::OriginalUri, routing::post};
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 64,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 0,
+                max_tree_size: 1 << 20,
+            },
+        ));
+        // Worker 0 renders slowly, as a busy vLLM server does; worker 1 is fast.
+        let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
+        let mut servers = Vec::new();
+        for (index, delay) in [(0usize, 300u64), (1, 0)] {
+            let app = axum::Router::new().fallback(post(
+                move |OriginalUri(uri): OriginalUri| async move {
+                    if uri.path().ends_with("/render") {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        return Json(serde_json::json!([{"token_ids":[1,2,3,4,5,6]}]))
+                            .into_response();
+                    }
+                    Json(serde_json::json!({"worker": index, "choices": []})).into_response()
+                },
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, WorkerType::Regular));
+            router.worker_registry.register(worker.clone());
+            workers.push(worker);
+        }
+        let request: CompletionRequest =
+            serde_json::from_value(serde_json::json!({"prompt":"hello"})).unwrap();
+        // The first request has no history, so it lands on the first idle worker.
+        assert_eq!(
+            selected_http_worker(
+                router
+                    .route_typed_request(None, &request, "/v1/completions", None)
+                    .await
+            )
+            .await,
+            0
+        );
+        // Make worker 1 the least loaded worker for the repeated prompt.
+        workers[0].increment_load();
+        // With a budget shorter than the slow render, worker 0 has no tokens,
+        // so its cached prefix cannot be compared and load decides.
+        router.prefix_preparation_budget = Duration::from_millis(100);
+        assert_eq!(
+            selected_http_worker(
+                router
+                    .route_typed_request(None, &request, "/v1/completions", None)
+                    .await
+            )
+            .await,
+            1
+        );
+        // A budget that covers the slow render restores the prefix placement.
+        router.prefix_preparation_budget = Duration::from_secs(2);
+        assert_eq!(
+            selected_http_worker(
+                router
+                    .route_typed_request(None, &request, "/v1/completions", None)
+                    .await
+            )
+            .await,
+            0
+        );
+        for server in servers {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn http_preparation_only_contacts_the_selected_model_pool() {
         for transparent in [false, true] {
             let ids = vec![1, 2, 3, 4, 5, 6];
@@ -5390,6 +5471,7 @@ mod tests {
             kv_index_supervisor: None,
             _kv_signal_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
+            prefix_preparation_budget: Duration::from_secs(1),
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -5425,6 +5507,7 @@ mod tests {
             kv_index_supervisor: None,
             _kv_signal_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
+            prefix_preparation_budget: Duration::from_secs(1),
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -6865,6 +6948,7 @@ mod tests {
             kv_index_supervisor: None,
             _kv_signal_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
+            prefix_preparation_budget: Duration::from_secs(1),
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),

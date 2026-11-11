@@ -31,6 +31,7 @@ class RouterArgs:
     kv_penalty_external: float = 0.6
     kv_penalty_disk: float = 0.3
     kv_aware_session_affinity_ttl_secs: Optional[int] = None
+    prefix_preparation_timeout_ms: int = 1000
     kv_event_source: List[str] = dataclasses.field(default_factory=list)
     kv_event_replay_source: List[str] = dataclasses.field(default_factory=list)
     kv_event_block_size: int = 16
@@ -236,6 +237,15 @@ class RouterArgs:
             "(1-31536000). P/D uses decode-only soft affinity based on pending "
             "plus active decode requests. Prefill remains token-cost based. "
             "Omit to disable affinity.",
+        )
+        parser.add_argument(
+            f"--{prefix}prefix-preparation-timeout-ms",
+            type=int,
+            default=RouterArgs.prefix_preparation_timeout_ms,
+            help="Milliseconds to wait for HTTP workers to prepare token IDs "
+            "(/render or /tokenize) for cache_aware and kv_aware (1-60000). "
+            "A worker that answers later has no tokens for the request, and "
+            "selection falls back to load.",
         )
         parser.add_argument(
             f"--{prefix}kv-event-source",
@@ -650,6 +660,11 @@ class RouterArgs:
         ):
             raise ValueError(
                 "kv_aware_session_affinity_ttl_secs must be between 1 and 31536000"
+            )
+
+        if not 1 <= self.prefix_preparation_timeout_ms <= 60_000:
+            raise ValueError(
+                "prefix_preparation_timeout_ms must be between 1 and 60000"
             )
 
         if self.wasm_middleware_sha256 and not self.wasm_middleware:

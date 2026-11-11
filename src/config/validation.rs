@@ -16,6 +16,13 @@ impl ConfigValidator {
                 });
             }
         }
+        if !(1..=60_000).contains(&config.prefix_preparation_timeout_ms) {
+            return Err(ConfigError::InvalidValue {
+                field: "prefix_preparation_timeout_ms".to_string(),
+                value: config.prefix_preparation_timeout_ms.to_string(),
+                reason: "Must be between 1 and 60000 milliseconds".to_string(),
+            });
+        }
         // Check if service discovery is enabled (either via discovery config or vLLM mode)
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled)
             || matches!(
@@ -1055,6 +1062,28 @@ mod tests {
         for ttl in [0, 31_536_001] {
             config.kv_aware_session_affinity_ttl_secs = Some(ttl);
             assert!(ConfigValidator::validate(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn prefix_preparation_timeout_defaults_to_one_second_and_is_bounded() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        assert_eq!(
+            config.prefix_preparation_budget(),
+            std::time::Duration::from_secs(1)
+        );
+        for ms in [1, 2500, 60_000] {
+            config.prefix_preparation_timeout_ms = ms;
+            assert!(ConfigValidator::validate(&config).is_ok(), "{ms}");
+        }
+        for ms in [0, 60_001] {
+            config.prefix_preparation_timeout_ms = ms;
+            assert!(ConfigValidator::validate(&config).is_err(), "{ms}");
         }
     }
 
