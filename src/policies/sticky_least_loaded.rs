@@ -101,9 +101,12 @@ impl StickyLeastLoadedPolicy {
     }
 
     /// Remove sessions that have not been accessed within the expiration window.
-    /// Runs at most once per [`SWEEP_INTERVAL_SECS`] to bound cost.
+    /// Runs at most once per [`SWEEP_INTERVAL_SECS`], or per expiration window
+    /// when that is shorter, so an expired session stops counting toward its
+    /// replica's load within one TTL.
     fn sweep_expired(state: &mut SllState, expiration: Duration, now: Instant) {
-        if now.duration_since(state.last_sweep) < Duration::from_secs(SWEEP_INTERVAL_SECS) {
+        let interval = Duration::from_secs(SWEEP_INTERVAL_SECS).min(expiration);
+        if now.duration_since(state.last_sweep) < interval {
             return;
         }
 
@@ -477,10 +480,9 @@ mod tests {
 
     #[test]
     fn test_expired_session_is_swept() {
-        // Zero expiration => any session is immediately eligible for expiry, but
-        // the sweep only runs every SWEEP_INTERVAL_SECS. Force the sweep by
-        // back-dating last_sweep.
-        let policy = StickyLeastLoadedPolicy::with_expiration_secs(0);
+        // A TTL shorter than SWEEP_INTERVAL_SECS sweeps once per TTL, so an idle
+        // session stops counting toward its replica's load within one TTL.
+        let policy = StickyLeastLoadedPolicy::with_expiration_secs(10);
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let session = "sess-ttl";
 
@@ -489,7 +491,9 @@ mod tests {
 
         {
             let mut state = policy.state.lock().unwrap();
-            state.last_sweep = Instant::now() - Duration::from_secs(SWEEP_INTERVAL_SECS + 1);
+            let past = Instant::now() - Duration::from_secs(11);
+            state.last_sweep = past;
+            state.sessions.get_mut(session).unwrap().last_access = past;
         }
 
         // A subsequent request triggers the sweep, removing the expired session
