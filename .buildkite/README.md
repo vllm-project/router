@@ -20,7 +20,7 @@ on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 | --- | --- | --- | --- |
 | `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, one NVIDIA P/D completion, and kv_aware e2e on 2× L4 (`ROCM_ONLY != 1` on the GPU jobs) |
 | `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), its merge queue, or any other branch labeled `merge-test` | one-mode xGMI smoke and RDMA `SMOKE_ONLY` |
-| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), router_policy TraceLab c16 on 4× L4 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA |
+| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), router_policy TraceLab c16 on 4× L4 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA, kv_aware e2e on 2× MI300X |
 | `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
 
 A pull request labeled `ready` uploads `test-ready.yml`, including forks.
@@ -200,6 +200,22 @@ Not part of the pipeline. Run them locally with `scripts/run_benchmarks.py`
 
 ### Docker Build
 Builds Docker image for the router.
+
+## ROCm KV-aware coverage
+
+`rocm-kv-aware-e2e` in `test-nightly.yml` reuses the L4 KV-aware functional
+test on two MI300X GPUs on one host. It runs when L3 is uploaded: default
+branch with `NIGHTLY=1`, or a non-default branch labeled `nightly-test`,
+including `ROCM_ONLY=1` builds. No NVIDIA image build is required.
+The job timeout accommodates the shared-host lease wait (up to six hours);
+pytest itself has a separate 30-minute timeout.
+
+The pinned ROCm image supplies `vllm-rs`; the router binary comes from this
+build. Two full Qwen3-0.6B workers publish KV events with replay enabled.
+The test primes a distinct prefix on each worker, checks streaming and
+non-streaming reuse routing, then checks concurrent completion. It does not
+validate P/D transfers or server-side resource reclamation. Worker logs,
+pytest output, and JUnit results are collected under `target/ci-logs/kv-aware-rocm`.
 
 ## Agent Queues
 
