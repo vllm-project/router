@@ -1094,8 +1094,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 &[],
                 &[],
                 None,
-                None,
-                None,
+                config.router_config.prefill_policy.as_ref(),
+                config.router_config.decode_policy.as_ref(),
                 &config.router_config.policy,
                 &app_context,
             )
