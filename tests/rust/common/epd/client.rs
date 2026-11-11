@@ -9,10 +9,10 @@ use tokio::task::JoinHandle;
 
 /// A chat request with two images. A new router sends image 0 to E0 and
 /// image 1 to E1 (round-robin per item), and E0's batch comes first.
-pub fn two_images() -> Value {
+pub fn two_images(stream: bool) -> Value {
     json!({
         "model": "test",
-        "stream": false,
+        "stream": stream,
         "max_tokens": 8,
         "messages": [{
             "role": "user",
