@@ -290,9 +290,9 @@ wait_for_health "prefill" "http://${COORDINATOR_FABRIC_IP}:${PREFILL_PORT}/healt
 wait_for_health "decode" "http://${WORKER_FABRIC_IP}:${DECODE_PORT}/health" "${ENGINE_STARTUP_TIMEOUT}"
 wait_for_health "router discovery" "http://127.0.0.1:${ROUTER_PORT}/health" "${ROUTER_STARTUP_TIMEOUT}"
 
-# This request must traverse prefill on node A and decode on node B. A correct
-# response therefore proves that MoRI registered and transferred GPU KV memory
-# across the RDMA fabric, not merely that host-memory verbs work.
+# Exercise the configured cross-node P/D path and reject invalid completions.
+# A structurally valid response alone does not establish KV-transfer integrity;
+# that requires transport evidence and accuracy validation.
 curl --fail --silent --show-error \
   --max-time "${REQUEST_TIMEOUT}" \
   -H 'Content-Type: application/json' \

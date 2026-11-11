@@ -1,4 +1,4 @@
-"""Validate a single non-streaming /v1/completions smoke response."""
+"""Validate one non-streaming smoke completion: exit 1 if invalid, 3 if unreadable."""
 
 import argparse
 import json
@@ -31,7 +31,9 @@ def main():
         validate_single_completion(
             json.loads(args.response.read_text(encoding="utf-8"))
         )
-    except (ValueError, OSError) as exc:
+    except OSError as exc:
+        parser.exit(3, f"Cannot read completion response {args.response}: {exc}\n")
+    except ValueError as exc:
         parser.exit(1, f"Invalid completion response: {exc}\n")
     print("Completion response is structurally valid and non-empty")
 

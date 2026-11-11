@@ -10,11 +10,24 @@ from tools.e2e.validate_completion import validate_single_completion
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
+@pytest.fixture
+def smoke_response():
+    # MI300X RDMA read smoke at 844a872; only the topology-bearing id is redacted.
+    path = Path(__file__).with_name("fixtures") / "moriio_smoke_completion.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 @pytest.mark.parametrize("reason", ["stop", "length"])
-def test_valid_completion(reason):
-    validate_single_completion(
-        {"choices": [{"text": "Paris", "finish_reason": reason}]}
-    )
+def test_valid_completion(smoke_response, reason):
+    # The captured response ended with length; stop is a derived valid variant.
+    smoke_response["choices"][0]["finish_reason"] = reason
+    validate_single_completion(smoke_response)
+
+
+def test_empty_completion_message(smoke_response):
+    smoke_response["choices"][0]["text"] = " "
+    with pytest.raises(ValueError, match="^completion text is empty or invalid$"):
+        validate_single_completion(smoke_response)
 
 
 @pytest.mark.parametrize(
@@ -40,31 +53,47 @@ def test_invalid_completion(data):
 
 
 @pytest.mark.parametrize(
-    "response_kind,expected_code", [("valid", 0), ("empty", 1), ("missing", 1)]
+    "response_kind,expected_code,expected_message",
+    [
+        ("valid", 0, "Completion response is structurally valid and non-empty"),
+        (
+            "empty",
+            1,
+            "Invalid completion response: completion text is empty or invalid",
+        ),
+        ("malformed", 1, "Invalid completion response:"),
+        ("missing", 3, "Cannot read completion response"),
+    ],
 )
-def test_completion_cli(tmp_path, response_kind, expected_code):
+def test_completion_cli(
+    tmp_path,
+    pytestconfig,
+    smoke_response,
+    response_kind,
+    expected_code,
+    expected_message,
+):
     response = tmp_path / "response.json"
+    if response_kind == "empty":
+        smoke_response["choices"][0]["text"] = ""
     if response_kind != "missing":
         response.write_text(
-            json.dumps(
-                {
-                    "choices": [
-                        {
-                            "text": "Paris" if response_kind == "valid" else "",
-                            "finish_reason": "stop",
-                        }
-                    ]
-                }
-            ),
+            "{" if response_kind == "malformed" else json.dumps(smoke_response),
             encoding="utf-8",
         )
     result = subprocess.run(
         [sys.executable, "-m", "tools.e2e.validate_completion", str(response)],
-        cwd=Path(__file__).resolve().parents[3],
+        cwd=pytestconfig.rootpath,
         capture_output=True,
         text=True,
         timeout=10,
     )
     assert result.returncode == expected_code, result.stdout + result.stderr
     if expected_code:
-        assert "Invalid completion response:" in result.stderr
+        assert expected_message in result.stderr
+        assert not result.stdout
+        if response_kind == "missing":
+            assert str(response) in result.stderr
+    else:
+        assert result.stdout.strip() == expected_message
+        assert not result.stderr
