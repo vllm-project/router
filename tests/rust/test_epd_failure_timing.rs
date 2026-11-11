@@ -116,8 +116,6 @@ mod consumer_2xx_with_stalled_or_invalid_body {
             rig.ec.expect_no_cancel().await;
             rig.consumer.release();
             let response = answer(client).await;
-            // gap: P's body is not usable, but the router disarms and returns
-            // D's reply. The sequential path answers 500 and cancels instead.
             assert_eq!(
                 response.status(),
                 StatusCode::OK,
