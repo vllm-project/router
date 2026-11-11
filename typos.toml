@@ -16,4 +16,6 @@ thw = "thw"
 extend-exclude = [
     "scripts/deepseek/*-oom-logs.txt",
     "tests/rust/fixtures/tokenizer/byte_level_bpe.json",
+    # TraceLab subset. tool_call_id values are opaque and must stay byte-stable.
+    "tests/python/e2e/perf/router_policy/data/tracelab-ci-uniform-28.jsonl",
 ]

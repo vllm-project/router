@@ -92,6 +92,7 @@ pub trait KvAwareOps: Send + Sync {
         &self,
         workers: &[Arc<dyn Worker>],
         session: Option<&AffinityKey>,
+        lora_name: Option<&str>,
         cache_salt: Option<&str>,
     ) -> Option<StagePick>;
     /// Whether the optional session binding is switched on for this policy.
@@ -1964,6 +1965,11 @@ impl LoadBalancingPolicy for KvAwarePolicy {
         true
     }
 
+    /// Occupancy, KV events and affinity are all read live.
+    fn can_redecide_at_dispatch(&self, _decode_cache_ready: bool) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "kv_aware"
     }
@@ -2111,6 +2117,7 @@ impl KvAwareOps for KvAwarePolicy {
         &self,
         workers: &[Arc<dyn Worker>],
         session: Option<&AffinityKey>,
+        lora_name: Option<&str>,
         cache_salt: Option<&str>,
     ) -> Option<StagePick> {
         if workers.is_empty() {
@@ -2135,9 +2142,7 @@ impl KvAwareOps for KvAwarePolicy {
                 self.register_target(worker.url(), self.target_for_worker(worker.as_ref()));
             }
         }
-        // The PD path routes no LoRA adapters today; the model scope inside
-        // the key already keeps adapter-named models distinct.
-        let digest = session.staged_digest("decode", None, cache_salt);
+        let digest = session.staged_digest("decode", lora_name, cache_salt);
         // Use the same projected request counts as P/D admission. Including
         // the incoming request allows one idle session to retain locality,
         // while simultaneous requests cannot pin an overloaded endpoint.
@@ -3295,6 +3300,7 @@ mod tests {
                 &self,
                 _workers: &[Arc<dyn Worker>],
                 _session: Option<&AffinityKey>,
+                _lora_name: Option<&str>,
                 _cache_salt: Option<&str>,
             ) -> Option<StagePick> {
                 unreachable!("ordinary-only qualification must not enter PD selection")
@@ -4143,14 +4149,18 @@ mod tests {
         let key = affinity_key("s1");
         let workers = decode_pool(&["http://d0", "http://d1"]);
 
-        let first = policy.select_decode(&workers, Some(&key), None).unwrap();
+        let first = policy
+            .select_decode(&workers, Some(&key), None, None)
+            .unwrap();
         assert_eq!((first.index, first.outcome), (0, "bind"));
         assert!(first.binding.is_some());
 
         // Equal counts preserve locality even if the picker prefers d1.
         workers[0].increment_load();
         workers[1].increment_load();
-        let hit = policy.select_decode(&workers, Some(&key), None).unwrap();
+        let hit = policy
+            .select_decode(&workers, Some(&key), None, None)
+            .unwrap();
         assert_eq!((hit.index, hit.outcome), (0, "sticky_hit"));
         first.binding.unwrap().release_ref();
         hit.binding.unwrap().release_ref();
@@ -4161,10 +4171,14 @@ mod tests {
         let policy = stage_policy();
         let key = affinity_key("s1");
         let workers = decode_pool(&["http://d0", "http://d1", "http://d2"]);
-        let first = policy.select_decode(&workers, Some(&key), None).unwrap();
+        let first = policy
+            .select_decode(&workers, Some(&key), None, None)
+            .unwrap();
         let original = first.binding.unwrap();
         workers[0].increment_load();
-        let moved = policy.select_decode(&workers, Some(&key), None).unwrap();
+        let moved = policy
+            .select_decode(&workers, Some(&key), None, None)
+            .unwrap();
         assert_eq!((moved.index, moved.outcome), (2, "rebind"));
         let replacement = moved.binding.unwrap();
         assert_eq!(original.in_flight(), 1);
@@ -4173,7 +4187,9 @@ mod tests {
         assert_eq!(original.in_flight(), 0);
         assert_eq!(replacement.in_flight(), 1);
         replacement.release_ref();
-        let hit = policy.select_decode(&workers, Some(&key), None).unwrap();
+        let hit = policy
+            .select_decode(&workers, Some(&key), None, None)
+            .unwrap();
         assert_eq!((hit.index, hit.outcome), (2, "sticky_hit"));
         hit.binding.unwrap().release_ref();
     }
@@ -4184,7 +4200,7 @@ mod tests {
         let workers = decode_pool(&["http://d0", "http://d1"]);
         workers[0].increment_load();
         let pick = policy
-            .select_decode(&workers, Some(&affinity_key("s1")), None)
+            .select_decode(&workers, Some(&affinity_key("s1")), None, None)
             .unwrap();
         assert_eq!(pick.index, 1);
         assert!(pick.binding.is_none());
@@ -4197,12 +4213,18 @@ mod tests {
             .with_shared_affinity(Arc::new(KvAffinityTable::with_ttl(Some(Duration::ZERO))));
         let workers = decode_pool(&["http://d0", "http://d1"]);
         let key = affinity_key("s1");
-        let first = policy.select_decode(&workers, Some(&key), None).unwrap();
-        let hit = policy.select_decode(&workers, Some(&key), None).unwrap();
+        let first = policy
+            .select_decode(&workers, Some(&key), None, None)
+            .unwrap();
+        let hit = policy
+            .select_decode(&workers, Some(&key), None, None)
+            .unwrap();
         assert_eq!(hit.outcome, "sticky_hit");
         first.binding.unwrap().release_ref();
         hit.binding.unwrap().release_ref();
-        let expired = policy.select_decode(&workers, Some(&key), None).unwrap();
+        let expired = policy
+            .select_decode(&workers, Some(&key), None, None)
+            .unwrap();
         assert_eq!((expired.index, expired.outcome), (1, "bind"));
         expired.binding.unwrap().release_ref();
     }
@@ -4213,10 +4235,12 @@ mod tests {
         let key = affinity_key("s1");
         let workers = decode_pool(&["http://d0"]);
         workers[0].increment_load();
-        let pick = policy.select_decode(&workers, Some(&key), None).unwrap();
+        let pick = policy
+            .select_decode(&workers, Some(&key), None, None)
+            .unwrap();
         assert_eq!(pick.index, 0);
         pick.binding.unwrap().release_ref();
-        assert!(policy.select_decode(&[], Some(&key), None).is_none());
+        assert!(policy.select_decode(&[], Some(&key), None, None).is_none());
     }
 
     #[test]
@@ -4224,14 +4248,18 @@ mod tests {
         let policy = stage_policy();
         let key = affinity_key("s1");
         let workers = decode_pool(&["http://d0", "http://d1"]);
-        let pick = policy.select_decode(&workers, Some(&key), None).unwrap();
+        let pick = policy
+            .select_decode(&workers, Some(&key), None, None)
+            .unwrap();
         assert_eq!(pick.outcome, "bind");
 
         // The pool shrank to d1: the stale binding must rebind, not fail.
         let shrunk = decode_pool(&["http://d1"]);
         policy.reconcile_decode_workers(&shrunk);
         assert!(!policy.targets.contains_key("http://d0"));
-        let rebound = policy.select_decode(&shrunk, Some(&key), None).unwrap();
+        let rebound = policy
+            .select_decode(&shrunk, Some(&key), None, None)
+            .unwrap();
         assert_eq!((rebound.index, rebound.outcome), (0, "bind"));
 
         // A re-registered target reports a new registration epoch: the old
@@ -4239,7 +4267,9 @@ mod tests {
         let moved = decode_pool(&["http://d0", "http://d1"]);
         policy.register_target("http://d1", target("http://d1", 0));
         moved[0].increment_load();
-        let rebind = policy.select_decode(&moved, Some(&key), None).unwrap();
+        let rebind = policy
+            .select_decode(&moved, Some(&key), None, None)
+            .unwrap();
         assert_eq!((rebind.index, rebind.outcome), (1, "bind"));
         policy.reconcile_decode_workers(&[]);
         assert!(policy.targets.is_empty());
@@ -4250,7 +4280,7 @@ mod tests {
         let policy = KvAwarePolicy::default();
         let workers = decode_pool(&["http://d0", "http://d1"]);
         workers[0].increment_load();
-        let pick = policy.select_decode(&workers, None, None).unwrap();
+        let pick = policy.select_decode(&workers, None, None, None).unwrap();
         assert_eq!((pick.index, pick.outcome), (1, "no_session"));
         assert!(pick.binding.is_none());
         assert!(policy.affinity.is_empty());

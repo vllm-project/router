@@ -57,7 +57,52 @@ A worker pool is all HTTP or all gRPC. Mixed schemes fail during startup or
 tonic, but still calls the gRPC port, not the OpenAI HTTP port.
 
 Worker liveness on `grpc://` uses `grpc.health.v1` Check with an empty service
-name. `--health-check-endpoint` only applies to HTTP workers.
+name. `--health-check-endpoint` only applies to HTTP workers. The router runs
+that check in the background and remembers the result. A Rust gRPC worker does
+not log this RPC. A quiet worker log during these probes is normal.
+
+Two curls are usable, and they check different things. With the ports from the
+start example below, the router is `30000` and the worker HTTP port is `8000`.
+
+The router reports the stored health flag. This request does not call the
+worker, so it adds nothing to the worker log:
+
+```bash
+curl -sS http://127.0.0.1:30000/health
+```
+
+A healthy pool prints `All servers healthy`. The status is 200. To print the
+status code itself:
+
+```bash
+curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1:30000/health
+```
+
+The worker's own HTTP server answers a separate `/health` on `--port`. The
+router does not use this URL for a `grpc://` worker. A healthy response is
+status 200 with an empty body, so a plain curl prints nothing. Print the status
+code to see it:
+
+```bash
+curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/health
+```
+
+That prints `200`. It does not mean `grpc.health.v1` is serving. The gRPC port
+does not speak HTTP, so curl against `--grpc-port` is not a health check. Probe
+the port the router actually uses:
+
+```bash
+grpc_health_probe -addr=127.0.0.1:50051
+```
+
+A healthy worker prints `status: SERVING` and the command exits 0. This is the
+same `grpc.health.v1` Check the router runs, not a copy of the stored flag.
+The flag flips only after `--health-success-threshold` consecutive successes
+(default 2) or `--health-failure-threshold` consecutive failures (default 3).
+While a worker is failing or recovering, a one-off probe can print `SERVING`
+while router `/health` is still 503, or fail while `/health` is still 200.
+This RPC is not written to the worker log either. `/health_generate` on a gRPC
+pool returns `501`.
 
 ## Request Preparation
 

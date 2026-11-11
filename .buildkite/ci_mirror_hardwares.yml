@@ -7,6 +7,7 @@
 #   l4_1       Same pool and image, one L4. 1 GPU = 10 CPU / 40Gi / 24Gi shm.
 #   l4_2       EKS l4-k8s, same l4x4 pool, pod requests 2x L4. 2 GPU = 20 CPU / 80Gi / 48Gi shm.
 #   l4_4       EKS l4-k8s, 4x L4 (vllm.ci/gpu-pool=l4x4). 4 GPU = 40 CPU / 160Gi / 96Gi shm.
+#              router_policy nightly: 4 co-located vllm-rs workers.
 #              Image is the router CI image pushed by image-build:
 #              public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT
 #   mi300_2    router_rocm_mi300_2, same-host xGMI via the ROCm Docker device mount.

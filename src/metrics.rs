@@ -622,6 +622,13 @@ impl RouterMetrics {
         .increment(1);
     }
 
+    /// Deferred decode commitment result: same / changed / empty.
+    pub fn record_pd_decode_commit(result: &str) {
+        counter!("vllm_router_pd_decode_commit_total",
+            "result" => result.to_owned())
+        .increment(1);
+    }
+
     // Request metrics
     pub fn record_request(route: &str) {
         counter!("vllm_router_requests_total",
