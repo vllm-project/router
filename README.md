@@ -23,7 +23,7 @@ OpenAI-compatible clients reach the router over HTTPS. The Axum HTTP API (defaul
 
 Regular, prefill, and decode workers all accept `http(s)` or `grpc://`. A worker pool, including a prefill/decode pool, is entirely HTTP or entirely `grpc://`; mixed schemes are rejected. In prefill/decode mode the router runs Stage 1 prefill and Stage 2 decode. KV cache bytes move worker-to-worker. The router only coordinates identities and transfer metadata.
 
-The figure was generated with [Archify](https://archify.si). The [self-contained viewer](docs/architecture/vllm-router.architecture.html) opens locally, and the [Archify source](docs/architecture/vllm-router.architecture.json) records the components above.
+The figure was generated with [Archify](https://archify.si).
 
 ## Quick Start
 
