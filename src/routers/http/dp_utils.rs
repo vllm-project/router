@@ -2,7 +2,75 @@
 // This module provides common functions for data-parallel aware routing
 // that can be reused across different router implementations.
 
-use tracing::info;
+use std::collections::HashSet;
+
+use tracing::{info, warn};
+
+/// Count the engines a vLLM server exposes on `/metrics`. It emits one series
+/// per engine it can address, the same set `X-data-parallel-rank` selects from.
+/// Hybrid load balancing labels them with global ranks, so count distinct
+/// labels rather than taking the maximum.
+fn count_engine_labels(metrics_body: &str) -> Option<usize> {
+    let engines: HashSet<&str> = metrics_body
+        .lines()
+        .filter(|line| line.starts_with("vllm:"))
+        .filter_map(|line| {
+            let (_, after_label) = line.split_once("engine=\"")?;
+            let (engine, _) = after_label.split_once('"')?;
+            Some(engine)
+        })
+        .collect();
+
+    (!engines.is_empty()).then_some(engines.len())
+}
+
+/// Number of engines a worker fronts, so prefill and decode can run different
+/// data-parallel sizes. Falls back to `fallback_dp_size` for workers exposing
+/// no vLLM metrics, e.g. under `--disable-log-stats`, and for `grpc://`
+/// workers, which serve no HTTP `/metrics`.
+pub async fn discover_dp_size(
+    client: &reqwest::Client,
+    worker_url: &str,
+    fallback_dp_size: usize,
+) -> usize {
+    let fallback_dp_size = fallback_dp_size.max(1);
+    let (base_url, _) = parse_worker_url(worker_url);
+    if crate::backend::is_grpc_url(&base_url) {
+        return fallback_dp_size;
+    }
+    // /metrics sits outside vLLM's authenticated path prefixes.
+    let metrics_url = format!("{}/metrics", base_url.trim_end_matches('/'));
+
+    let body = match client.get(&metrics_url).send().await {
+        Ok(response) if response.status().is_success() => response.text().await.ok(),
+        Ok(response) => {
+            warn!(
+                "DP discovery for {} returned {}",
+                metrics_url,
+                response.status()
+            );
+            None
+        }
+        Err(error) => {
+            warn!("DP discovery for {} failed: {}", metrics_url, error);
+            None
+        }
+    };
+
+    match body.as_deref().and_then(count_engine_labels) {
+        Some(dp_size) => {
+            info!("Worker {} reports {} engine(s)", base_url, dp_size);
+            dp_size
+        }
+        None => {
+            info!(
+                "Worker {} reports no engine metrics; assuming {} engine(s)",
+                base_url, fallback_dp_size
+            );
+            fallback_dp_size
+        }
+    }
+}
 
 /// Given a list of worker URLs, expand them into DP-aware URLs
 /// with dp_rank as suffix (format: "http://host:port@rank")
@@ -31,6 +99,11 @@ pub async fn get_dp_aware_workers(
     let mut dp_aware_workers: Vec<String> = Vec::new();
 
     for url in worker_urls {
+        if extract_dp_rank(url).is_ok() {
+            expand_dp_ranks(url, dp_size)?;
+            dp_aware_workers.push(url.clone());
+            continue;
+        }
         info!(
             "Expanding worker {} to {} DP-aware URLs (ranks 0..{})",
             url,
@@ -112,6 +185,20 @@ pub fn parse_worker_url(worker_url: &str) -> (String, Option<usize>) {
     }
 }
 
+/// Return the ranks represented by one endpoint, preserving an explicitly
+/// pinned rank and rejecting it when outside the endpoint's DP size.
+pub fn expand_dp_ranks(worker_url: &str, dp_size: usize) -> Result<Vec<Option<usize>>, String> {
+    let pinned_rank = extract_dp_rank(worker_url).ok().map(|(_, rank)| rank);
+    match pinned_rank {
+        Some(rank) if rank >= dp_size => Err(format!(
+            "Worker {worker_url} has rank {rank} outside DP size {dp_size}"
+        )),
+        Some(rank) => Ok(vec![Some(rank)]),
+        None if dp_size > 1 => Ok((0..dp_size).map(Some).collect()),
+        None => Ok(vec![None]),
+    }
+}
+
 /// Add X-data-parallel-rank header to a reqwest RequestBuilder if dp_rank is present
 ///
 /// This is a utility function to standardize how DP rank headers are added to HTTP requests.
@@ -142,9 +229,32 @@ pub fn add_dp_rank_header(
     request
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_expand_dp_ranks_checks_http_and_grpc_pins() {
+        for scheme in ["http", "grpc"] {
+            let url = format!("{scheme}://worker:8000");
+            assert_eq!(expand_dp_ranks(&url, 1).unwrap(), vec![None]);
+            assert_eq!(expand_dp_ranks(&url, 2).unwrap(), vec![Some(0), Some(1)]);
+            assert_eq!(
+                expand_dp_ranks(&format!("{url}@0"), 1).unwrap(),
+                vec![Some(0)]
+            );
+            assert_eq!(
+                expand_dp_ranks(&format!("{url}@1"), 2).unwrap(),
+                vec![Some(1)]
+            );
+            for rank in [2, 5] {
+                let pinned = format!("{url}@{rank}");
+                let error = expand_dp_ranks(&pinned, 2).unwrap_err();
+                assert!(error.contains(&pinned), "{error}");
+                assert!(error.contains("DP size 2"), "{error}");
+            }
+        }
+    }
 
     #[test]
     fn test_extract_dp_rank_valid() {

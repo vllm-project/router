@@ -20,22 +20,33 @@ class RouterArgs:
         default_factory=list
     )  # List of (url, bootstrap_port)
     decode_urls: List[str] = dataclasses.field(default_factory=list)
+    pd_kv_events: List[str] = dataclasses.field(default_factory=list)
 
     # Routing policy
     policy: str = "cache_aware"
     prefill_policy: Optional[str] = None  # Specific policy for prefill nodes in PD mode
     decode_policy: Optional[str] = None  # Specific policy for decode nodes in PD mode
+    router_temperature: float = 0.0
+    kv_penalty_host: float = 0.8
+    kv_penalty_external: float = 0.6
+    kv_penalty_disk: float = 0.3
+    kv_aware_session_affinity_ttl_secs: Optional[int] = None
+    kv_event_source: List[str] = dataclasses.field(default_factory=list)
+    kv_event_replay_source: List[str] = dataclasses.field(default_factory=list)
+    kv_event_block_size: int = 16
+    kv_event_model: Optional[str] = None
     worker_startup_timeout_secs: int = 600
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5
     eviction_interval_secs: int = 120
-    max_tree_size: int = 2**26
+    max_tree_size: int = 2**25
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
-    intra_node_data_parallel_size: int = (
-        1  # Intra-node data parallel size (DP-aware routing automatically enabled when > 1)
-    )
+    wasm_middleware: Optional[str] = None
+    wasm_middleware_sha256: Optional[str] = None
+    wasm_middleware_routes: List[str] = dataclasses.field(default_factory=list)
+    intra_node_data_parallel_size: int = 1  # Intra-node data parallel size (DP-aware routing automatically enabled when > 1)
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
     api_key: Optional[str] = None
     log_dir: Optional[str] = None
@@ -53,6 +64,9 @@ class RouterArgs:
     vllm_discovery_address: Optional[str] = None
     # KV connector for PD disaggregation (nixl pull-based or mooncake push-based)
     kv_connector: str = "nixl"
+    # Explicit Program-level scheduling switch and optional JSON overrides.
+    enable_program_scheduling: bool = False
+    program_scheduling_config_json: Optional[str] = None
     # Prometheus configuration
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
@@ -129,6 +143,20 @@ class RouterArgs:
             help="List of worker URLs (e.g., http://worker1:8000 http://worker2:8000)",
         )
 
+        parser.add_argument(
+            f"--{prefix}enable-program-scheduling",
+            action="store_true",
+            default=False,
+            help="Enable Program-level scheduling",
+        )
+
+        parser.add_argument(
+            f"--{prefix}program-scheduling-config-json",
+            type=str,
+            default=None,
+            help="JSON object overriding Program-level scheduling defaults (requires the enable flag)",
+        )
+
         # Routing policy configuration
         parser.add_argument(
             f"--{prefix}policy",
@@ -138,10 +166,12 @@ class RouterArgs:
                 "random",
                 "round_robin",
                 "cache_aware",
+                "kv_aware",
                 "power_of_two",
                 "consistent_hash",
+                "sticky_least_loaded",
             ],
-            help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
+            help="Load balancing policy to use. In PD mode, prefill and decode inherit this policy unless overridden",
         )
         parser.add_argument(
             f"--{prefix}prefill-policy",
@@ -151,8 +181,10 @@ class RouterArgs:
                 "random",
                 "round_robin",
                 "cache_aware",
+                "kv_aware",
                 "power_of_two",
                 "consistent_hash",
+                "sticky_least_loaded",
             ],
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
@@ -164,13 +196,83 @@ class RouterArgs:
                 "random",
                 "round_robin",
                 "cache_aware",
+                "kv_aware",
                 "power_of_two",
                 "consistent_hash",
+                "sticky_least_loaded",
             ],
-            help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
+            help="Specific policy for decode nodes in PD mode. Defaults to --policy",
         )
 
+        parser.add_argument(
+            f"--{prefix}router-temperature",
+            type=float,
+            default=RouterArgs.router_temperature,
+            help="Softmax temperature for kv_aware in regular mode (0 selects minimum cost)",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-penalty-host",
+            type=float,
+            default=RouterArgs.kv_penalty_host,
+            help="Host-tier KV transfer credit for kv_aware (0.0-1.0)",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-penalty-external",
+            type=float,
+            default=RouterArgs.kv_penalty_external,
+            help="External-tier KV transfer credit for kv_aware (0.0-1.0)",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-penalty-disk",
+            type=float,
+            default=RouterArgs.kv_penalty_disk,
+            help="Disk-tier KV transfer credit for kv_aware (0.0-1.0)",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-aware-session-affinity-ttl-secs",
+            type=int,
+            default=RouterArgs.kv_aware_session_affinity_ttl_secs,
+            help="Enable kv_aware session affinity with an idle TTL in seconds "
+            "(1-31536000). P/D uses decode-only soft affinity based on pending "
+            "plus active decode requests. Prefill remains token-cost based. "
+            "Omit to disable affinity.",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-event-source",
+            action="append",
+            default=[],
+            metavar="WORKER_URL=ENDPOINT[,ENDPOINT...]",
+            help="Static ZMQ KV event source for a kv_aware worker; repeat per worker",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-event-replay-source",
+            action="append",
+            default=[],
+            metavar="WORKER_URL=ENDPOINT[,ENDPOINT...]",
+            help="Optional ZMQ replay endpoints matching a worker's static event source",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-event-block-size",
+            type=int,
+            default=RouterArgs.kv_event_block_size,
+            help="KV block size for static event sources",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-event-model",
+            type=str,
+            default=None,
+            help="Shared model identity for workers with static event sources",
+        )
         # PD-specific arguments
+        parser.add_argument(
+            f"--{prefix}pd-kv-events",
+            action="append",
+            default=[],
+            metavar="URL=ENDPOINT[,ENDPOINT...]",
+            help="Static KV event sources for a prefill worker in PD mode "
+            "(requires a kv_aware prefill policy). Repeat for multiple workers; "
+            "comma-separated endpoints are ordered by DP rank. Block size is 16.",
+        )
         parser.add_argument(
             f"--{prefix}mini-lb",
             action="store_true",
@@ -236,13 +338,38 @@ class RouterArgs:
             f"--{prefix}max-tree-size",
             type=int,
             default=RouterArgs.max_tree_size,
-            help="Maximum size of the approximation tree for cache-aware routing",
+            help="Per-worker character budget in each model tree (enforced at cache eviction)",
         )
         parser.add_argument(
             f"--{prefix}max-payload-size",
             type=int,
             default=RouterArgs.max_payload_size,
             help="Maximum payload size in bytes",
+        )
+        parser.add_argument(
+            f"--{prefix}wasm-middleware",
+            type=str,
+            default=None,
+            help=(
+                "Path to a WASM Component Model OnRequest middleware artifact. "
+                "Fail-closed: plugin errors reject the request."
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}wasm-middleware-sha256",
+            type=str,
+            default=None,
+            help="Optional SHA-256 hex digest that must match --wasm-middleware.",
+        )
+        parser.add_argument(
+            f"--{prefix}wasm-middleware-route",
+            action="append",
+            dest="wasm_middleware_routes",
+            default=[],
+            help=(
+                "HTTP path that invokes the WASM middleware. Repeatable. "
+                "Defaults to /v1/chat/completions when --wasm-middleware is set."
+            ),
         )
         parser.add_argument(
             f"--{prefix}intra-node-data-parallel-size",
@@ -518,6 +645,16 @@ class RouterArgs:
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        if self.kv_aware_session_affinity_ttl_secs is not None and not (
+            1 <= self.kv_aware_session_affinity_ttl_secs <= 31_536_000
+        ):
+            raise ValueError(
+                "kv_aware_session_affinity_ttl_secs must be between 1 and 31536000"
+            )
+
+        if self.wasm_middleware_sha256 and not self.wasm_middleware:
+            raise ValueError("wasm_middleware_sha256 requires wasm_middleware")
+
         # Validate configuration based on mode
         if self.vllm_pd_disaggregation:
             # Validate PD configuration - skip URL requirements if using service discovery
@@ -571,7 +708,6 @@ class RouterArgs:
 
         prefill_urls = []
         for prefill_args in prefill_list:
-
             url = prefill_args[0]
 
             # Handle optional bootstrap port

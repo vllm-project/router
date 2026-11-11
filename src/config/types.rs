@@ -1,13 +1,25 @@
 use super::ConfigResult;
 use crate::config::validation::ConfigValidator;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+
+use crate::program_scheduling::{
+    DecodeThroughputModel, PrefillCostModel, ProgramBindingStrategy, ProgramResumeOrder,
+    ProgramSchedulingEnableKey,
+};
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
+    /// Optional encoder orchestration for E+PD or E/P/D routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epd: Option<EpdConfig>,
     /// Routing mode configuration
     pub mode: RoutingMode,
+    /// Statically configured KV event sources, keyed by prefill base URL.
+    /// Workers listed here skip HTTP control-plane discovery and probing.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pd_kv_event_sources: HashMap<String, PdKvEventSources>,
     /// Worker connection mode
     #[serde(default)]
     pub connection_mode: ConnectionMode,
@@ -63,6 +75,11 @@ pub struct RouterConfig {
     /// Disable circuit breaker (overrides circuit_breaker.failure_threshold to u32::MAX when true)
     #[serde(default)]
     pub disable_circuit_breaker: bool,
+    /// Enable stable-identity affinity in `kv_aware` and expire idle bindings after this TTL.
+    /// P/D binds decode only, yielding above the decode pool's rounded-up request mean.
+    /// `None` disables affinity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_aware_session_affinity_ttl_secs: Option<u64>,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
@@ -80,10 +97,24 @@ pub struct RouterConfig {
     /// KV connector type for PD disaggregation
     #[serde(default)]
     pub kv_connector: KvConnector,
+    /// Optional Program-level admission and continuity scheduling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_scheduling: Option<ProgramSchedulingConfig>,
 }
 
 fn default_profile_timeout_secs() -> u64 {
     10
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EpdConfig {
+    pub encoder_urls: Vec<String>,
+    /// Mooncake consumer control addresses, keyed by the P or combined PD HTTP URL
+    /// with an `@rank` suffix for DP replicas.
+    /// Omit for pull-based NIXL or the shared-file example connector.
+    #[serde(default)]
+    pub consumer_zmq_addrs: HashMap<String, String>,
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -92,6 +123,738 @@ fn default_history_backend() -> HistoryBackend {
 
 fn default_intra_node_data_parallel_size() -> usize {
     1
+}
+
+/// Router-level Program scheduling configuration.
+///
+/// This is intentionally separate from request-level `PolicyConfig`. The
+/// binding policy is evaluated once for a new Program generation; admission
+/// and resume remain ProgramScheduler decisions.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictionMode {
+    /// Disable workflow-profile prediction and online collection.
+    Off,
+    /// Collect and evaluate predictions without changing scheduling decisions.
+    #[default]
+    Shadow,
+}
+
+/// Shared configuration for workflow-profile shadow predictors.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PredictionProfileConfig {
+    #[serde(default)]
+    pub mode: PredictionMode,
+    /// Optional versioned offline seed consumed at Router startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_path: Option<String>,
+    /// Optional path used for periodic online-overlay snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_path: Option<String>,
+    #[serde(default = "default_prediction_snapshot_interval_seconds")]
+    pub snapshot_interval_seconds: f64,
+    #[serde(default = "default_prediction_prior_weight")]
+    pub prior_weight: f64,
+    #[serde(default = "default_prediction_max_keys")]
+    pub max_keys: usize,
+    #[serde(default = "default_return_time_bucket_bounds_seconds")]
+    pub return_time_bucket_bounds_seconds: Vec<f64>,
+    #[serde(default = "default_return_time_min_support")]
+    pub return_time_min_support: usize,
+    #[serde(default = "default_return_time_horizon_seconds")]
+    pub return_time_horizon_seconds: f64,
+    #[serde(default = "default_prediction_step_bucket_size")]
+    pub step_bucket_size: u64,
+    #[serde(default = "default_output_length_bucket_bounds_tokens")]
+    pub output_length_bucket_bounds_tokens: Vec<usize>,
+    #[serde(default = "default_output_length_quantile")]
+    pub output_length_quantile: f64,
+    #[serde(default = "default_output_length_min_support")]
+    pub output_length_min_support: usize,
+    #[serde(default = "default_output_length_tail_samples")]
+    pub output_length_tail_samples: usize,
+    #[serde(default = "default_prediction_stability_window_size")]
+    pub stability_window_size: usize,
+    #[serde(default = "default_prediction_stability_tolerance")]
+    pub stability_tolerance: f64,
+}
+
+impl Default for PredictionProfileConfig {
+    fn default() -> Self {
+        Self {
+            mode: PredictionMode::Shadow,
+            profile_path: None,
+            snapshot_path: None,
+            snapshot_interval_seconds: default_prediction_snapshot_interval_seconds(),
+            prior_weight: default_prediction_prior_weight(),
+            max_keys: default_prediction_max_keys(),
+            return_time_bucket_bounds_seconds: default_return_time_bucket_bounds_seconds(),
+            return_time_min_support: default_return_time_min_support(),
+            return_time_horizon_seconds: default_return_time_horizon_seconds(),
+            step_bucket_size: default_prediction_step_bucket_size(),
+            output_length_bucket_bounds_tokens: default_output_length_bucket_bounds_tokens(),
+            output_length_quantile: default_output_length_quantile(),
+            output_length_min_support: default_output_length_min_support(),
+            output_length_tail_samples: default_output_length_tail_samples(),
+            stability_window_size: default_prediction_stability_window_size(),
+            stability_tolerance: default_prediction_stability_tolerance(),
+        }
+    }
+}
+
+/// First rollout of RFC-PD-PROGRAM-SCHEDULING: one-way remote execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PdProgramSchedulingConfig {
+    /// Event residency is advisory and never authorizes a warm transfer.
+    pub kv_events: bool,
+    pub kv_hash_mode: String,
+    pub max_prefill_requests_per_target: usize,
+    /// Only bounded explicit TTL is supported; otherwise Acting TTL is zero.
+    pub explicit_ttl: bool,
+    /// Treat native D occupancy and Program reservations as overlapping
+    /// observations of the same KV instead of adding them. Enabled by default
+    /// so a Program's KV is not charged twice.
+    pub exclusive_capacity_accounting: bool,
+    /// P KV-cache usage watermark at or above which the Program-count cap
+    /// tightens back to the configured P prefill permit count. This keeps the
+    /// exclusive accounting from over-admitting into a pressured P cache.
+    /// Zero disables the guard.
+    pub prefill_kv_high_watermark: f64,
+    /// P KV-cache sampling window in seconds for the guard above.
+    pub prefill_kv_window_seconds: f64,
+
+    // Warm remote KV reuse (PD disaggregation): a Program turn may read the
+    // source KV that its previous turn left on the same decode engine instead
+    // of recomputing it on P.
+    /// Engine feedback protocol spoken by the warm-read path.
+    pub protocol_revision: String,
+    /// Route a returning turn through the warm remote read when a verified
+    /// candidate exists.
+    pub warm_remote: bool,
+    /// Keep the decode engine local when the source already holds the prefix.
+    pub local_append: bool,
+    /// Only report warm when P KV usage is at least this value (0 = always).
+    pub warm_min_p_kv_usage: f64,
+    /// Only report warm when P running requests are at most this value.
+    pub warm_max_p_running: usize,
+    /// Total prompt-prefix tokens retained across all candidates.
+    pub max_candidate_tokens: usize,
+    /// Candidate-count bound.
+    pub max_candidates: usize,
+    /// Router-side capability identity cache. 0 disables it; a restart at the
+    /// same URL is otherwise re-probed within this window.
+    pub capability_cache_seconds: f64,
+    /// Largest verified prefix that may be published or pulled.
+    pub max_prefix_tokens: usize,
+    /// Bound on the `kv_transfer_params` metadata inspected per message.
+    pub max_metadata_bytes: usize,
+    /// Bound on a buffered non-streaming response body (text, token IDs,
+    /// logprobs). Forwarded bodies are otherwise unbounded; this only limits
+    /// what the Router must hold to inspect a completed response.
+    pub max_response_bytes: usize,
+    /// Safety margin before the source lease expires.
+    pub lease_margin_seconds: f64,
+    /// Local decode requests per target.
+    pub max_local_requests_per_target: usize,
+    /// Local decode miss budget per request.
+    pub local_execution_budget_tokens: usize,
+
+    // Automatic Acting TTL for the retained seat across tool gaps.
+    /// Enable the automatic Acting TTL.
+    pub automatic_ttl: bool,
+    /// Fit the automatic TTL from online rank statistics when no versioned
+    /// calibration table is supplied. Never exceeds the verified source lease.
+    pub ttl_online: bool,
+    /// Wait-cost weight in the TTL solver.
+    pub ttl_gamma: f64,
+    /// Interval samples required before the solver may return a positive TTL.
+    pub ttl_min_samples: usize,
+    /// Minimum utility for a positive TTL.
+    pub ttl_min_gain_seconds: f64,
+    /// Use measured residency probability in TTL keep/drop.
+    pub feedback: bool,
+    /// Offline-calibrated PD cost table (optional).
+    pub calibration: Option<crate::program_scheduling::pd_cost::PdCalibration>,
+}
+
+impl Default for PdProgramSchedulingConfig {
+    fn default() -> Self {
+        Self {
+            kv_events: false,
+            kv_hash_mode: "sha256".to_string(),
+            max_prefill_requests_per_target: 1,
+            explicit_ttl: false,
+            exclusive_capacity_accounting: true,
+            prefill_kv_high_watermark: 0.85,
+            prefill_kv_window_seconds: 10.0,
+            protocol_revision: "vllm-0.28.0-pd-feedback-v1".into(),
+            warm_remote: false,
+            local_append: false,
+            warm_min_p_kv_usage: 0.0,
+            warm_max_p_running: usize::MAX,
+            max_candidate_tokens: 2_097_152,
+            max_candidates: 4096,
+            capability_cache_seconds: 15.0,
+            max_prefix_tokens: 32768,
+            max_metadata_bytes: 262144,
+            max_response_bytes: 8_388_608,
+            lease_margin_seconds: 1.0,
+            max_local_requests_per_target: 1,
+            local_execution_budget_tokens: 512,
+            automatic_ttl: false,
+            ttl_online: false,
+            ttl_gamma: 1.0,
+            ttl_min_samples: 16,
+            ttl_min_gain_seconds: 0.001,
+            feedback: false,
+            calibration: None,
+        }
+    }
+}
+
+impl PdProgramSchedulingConfig {
+    /// True when a warm-read or automatic-TTL *master* switch is on.
+    ///
+    /// `feedback` and `ttl_online` are sub-knobs: on their own they must not
+    /// enable the warm-remote executor, because it changes how every token-id
+    /// Program completion is dispatched while the sub-knob itself has no effect.
+    pub fn warm_remote_enabled(&self) -> bool {
+        self.warm_remote || self.local_append || self.automatic_ttl
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.protocol_revision != "vllm-0.28.0-pd-feedback-v1"
+            || !(1..=65536).contains(&self.max_candidates)
+            || !(1..=1048576).contains(&self.max_prefix_tokens)
+            || !(1024..=1048576).contains(&self.max_metadata_bytes)
+            || self.max_response_bytes < self.max_metadata_bytes
+            || self.max_response_bytes > 268_435_456
+            || !(1..=128).contains(&self.max_local_requests_per_target)
+            || self.local_execution_budget_tokens == 0
+            || !(2..=10000).contains(&self.ttl_min_samples)
+            || self.max_candidate_tokens < self.max_prefix_tokens
+            || self.max_candidate_tokens > 67_108_864
+            || !self.capability_cache_seconds.is_finite()
+            || !(0.0..=600.0).contains(&self.capability_cache_seconds)
+            || !self.warm_min_p_kv_usage.is_finite()
+            || !(0.0..=1.0).contains(&self.warm_min_p_kv_usage)
+        {
+            return Err("Invalid bounded PD warm-remote configuration or unknown protocol".into());
+        }
+        if !self.lease_margin_seconds.is_finite()
+            || self.lease_margin_seconds < 0.0
+            || self.lease_margin_seconds > 86400.0
+            || !self.ttl_gamma.is_finite()
+            || self.ttl_gamma <= 0.0
+            || !self.ttl_min_gain_seconds.is_finite()
+            || self.ttl_min_gain_seconds < 0.0
+        {
+            return Err("PD warm-remote TTL/lease parameters must be finite".into());
+        }
+        if self.local_append && self.calibration.is_none() {
+            return Err("LocalAppend requires a versioned PD calibration".into());
+        }
+        if self.automatic_ttl && self.calibration.is_none() && !self.ttl_online {
+            return Err("automatic TTL requires a versioned PD calibration or ttl_online".into());
+        }
+        if let Some(c) = &self.calibration {
+            c.validate()?;
+        }
+        if (self.feedback || self.ttl_online)
+            && !(self.automatic_ttl || self.warm_remote || self.local_append)
+        {
+            return Err(
+                "feedback/ttl_online are sub-knobs and require warm_remote, local_append or automatic_ttl"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProgramSchedulingConfig {
+    #[serde(default)]
+    pub pd: PdProgramSchedulingConfig,
+    /// Metadata source that opts an individual request into Program scheduling.
+    #[serde(
+        default,
+        rename = "program_scheduling_enable_key",
+        alias = "enable_key"
+    )]
+    pub enable_key: ProgramSchedulingEnableKey,
+    #[serde(default)]
+    pub binding_only: bool,
+    #[serde(default)]
+    pub global_queue: bool,
+    #[serde(default)]
+    pub resume_order: ProgramResumeOrder,
+    #[serde(default = "default_program_cross_rank_headroom_ratio")]
+    pub cross_rank_headroom_ratio: f64,
+    #[serde(default)]
+    pub binding_strategy: ProgramBindingStrategy,
+    #[serde(default = "default_program_hash_virtual_nodes")]
+    pub hash_virtual_nodes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_capacity_per_dp_rank: Option<usize>,
+    #[serde(default = "default_program_max_active_programs_per_target")]
+    pub max_active_programs_per_target: usize,
+    #[serde(default = "default_program_metrics_interval_seconds")]
+    pub metrics_interval_seconds: f64,
+    #[serde(default = "default_program_admission_waiting_request_threshold")]
+    pub admission_waiting_request_threshold: usize,
+    #[serde(default = "default_program_queue_timeout_seconds")]
+    pub queue_timeout_seconds: f64,
+    #[serde(default = "default_program_force_resume_timeout_seconds")]
+    pub force_resume_timeout_seconds: f64,
+    #[serde(default = "default_program_paused_retention_ttl_seconds")]
+    pub paused_retention_ttl_seconds: f64,
+    #[serde(default = "default_program_shared_prefix_freshness_warmup_seconds")]
+    pub shared_prefix_freshness_warmup_seconds: f64,
+    #[serde(default = "default_program_shared_prefix_freshness_kv_turnovers")]
+    pub shared_prefix_freshness_kv_turnovers: f64,
+    #[serde(default = "default_program_decode_buffer_tokens")]
+    pub decode_buffer_tokens: usize,
+    #[serde(default = "default_program_max_acting_ttl_seconds")]
+    pub max_acting_ttl_seconds: f64,
+    #[serde(default = "default_program_high_watermark_ratio")]
+    pub high_watermark_ratio: f64,
+    #[serde(default = "default_program_low_watermark_ratio")]
+    pub low_watermark_ratio: f64,
+    #[serde(default = "default_program_max_segment_rounds")]
+    pub max_segment_rounds: usize,
+    #[serde(default = "default_program_stats_window_size")]
+    pub stats_window_size: usize,
+    #[serde(default = "default_program_enable_batch_gain_admission")]
+    pub enable_batch_gain_admission: bool,
+    /// Offline-seeded, online-updated workflow prediction in off/shadow mode.
+    #[serde(default)]
+    pub prediction_profile: PredictionProfileConfig,
+    /// Offline-calibrated cold-prefill cost and mixed-batch decode impact.
+    #[serde(default)]
+    pub prefill_cost_model: PrefillCostModel,
+    /// Offline-calibrated aggregate decode-throughput surface.
+    #[serde(default)]
+    pub decode_throughput_model: DecodeThroughputModel,
+    /// Tracks which offline calibration coefficients were explicitly supplied.
+    #[serde(skip)]
+    pub(crate) explicit_calibration_fields: ExplicitCalibrationFields,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ExplicitCalibrationFields(u8);
+
+impl PartialEq for ExplicitCalibrationFields {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+const PREFILL_INTERCEPT_EXPLICIT: u8 = 1 << 0;
+const PREFILL_LINEAR_EXPLICIT: u8 = 1 << 1;
+const PREFILL_QUADRATIC_EXPLICIT: u8 = 1 << 2;
+const PREFILL_DECODE_ALPHA_EXPLICIT: u8 = 1 << 3;
+const DECODE_FIXED_EXPLICIT: u8 = 1 << 4;
+const DECODE_BATCH_EXPLICIT: u8 = 1 << 5;
+const DECODE_CONTEXT_EXPLICIT: u8 = 1 << 6;
+impl ProgramSchedulingConfig {
+    /// Resolve the explicit feature switch and its optional JSON overrides.
+    ///
+    /// Supplying configuration without enabling Program scheduling is rejected
+    /// so the configuration argument cannot act as a second, implicit switch.
+    pub fn resolve(
+        enabled: bool,
+        config_json: Option<&str>,
+    ) -> ConfigResult<Option<ProgramSchedulingConfig>> {
+        match (enabled, config_json) {
+            (false, None) => Ok(None),
+            (false, Some(_)) => Err(super::ConfigError::ValidationFailed {
+                reason: "program_scheduling_config_json requires enable_program_scheduling"
+                    .to_string(),
+            }),
+            (true, None) => Ok(Some(Self::default())),
+            (true, Some(raw)) => serde_json::from_str(raw).map(Some).map_err(|error| {
+                super::ConfigError::ValidationFailed {
+                    reason: format!("Invalid program_scheduling_config_json: {error}"),
+                }
+            }),
+        }
+    }
+
+    pub(crate) fn defaulted_calibration_fields(&self) -> Vec<&'static str> {
+        [
+            (
+                PREFILL_INTERCEPT_EXPLICIT,
+                "prefill_cost_model.intercept_seconds",
+            ),
+            (
+                PREFILL_LINEAR_EXPLICIT,
+                "prefill_cost_model.linear_seconds_per_1k_tokens",
+            ),
+            (
+                PREFILL_QUADRATIC_EXPLICIT,
+                "prefill_cost_model.quadratic_seconds_per_1k_tokens_squared",
+            ),
+            (
+                PREFILL_DECODE_ALPHA_EXPLICIT,
+                "prefill_cost_model.decode_throughput_alpha",
+            ),
+            (
+                DECODE_FIXED_EXPLICIT,
+                "decode_throughput_model.fixed_step_seconds",
+            ),
+            (
+                DECODE_BATCH_EXPLICIT,
+                "decode_throughput_model.batch_step_seconds_per_request",
+            ),
+            (
+                DECODE_CONTEXT_EXPLICIT,
+                "decode_throughput_model.context_step_seconds_per_token",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(mask, name)| (self.explicit_calibration_fields.0 & mask == 0).then_some(name))
+        .collect()
+    }
+}
+
+impl Default for ProgramSchedulingConfig {
+    fn default() -> Self {
+        Self {
+            pd: PdProgramSchedulingConfig::default(),
+            enable_key: ProgramSchedulingEnableKey::default(),
+            binding_only: false,
+            global_queue: false,
+            resume_order: ProgramResumeOrder::default(),
+            cross_rank_headroom_ratio: default_program_cross_rank_headroom_ratio(),
+            binding_strategy: ProgramBindingStrategy::default(),
+            hash_virtual_nodes: default_program_hash_virtual_nodes(),
+            token_capacity_per_dp_rank: None,
+            max_active_programs_per_target: default_program_max_active_programs_per_target(),
+            metrics_interval_seconds: default_program_metrics_interval_seconds(),
+            admission_waiting_request_threshold:
+                default_program_admission_waiting_request_threshold(),
+            queue_timeout_seconds: default_program_queue_timeout_seconds(),
+            force_resume_timeout_seconds: default_program_force_resume_timeout_seconds(),
+            paused_retention_ttl_seconds: default_program_paused_retention_ttl_seconds(),
+            shared_prefix_freshness_warmup_seconds:
+                default_program_shared_prefix_freshness_warmup_seconds(),
+            shared_prefix_freshness_kv_turnovers:
+                default_program_shared_prefix_freshness_kv_turnovers(),
+            decode_buffer_tokens: default_program_decode_buffer_tokens(),
+            max_acting_ttl_seconds: default_program_max_acting_ttl_seconds(),
+            high_watermark_ratio: default_program_high_watermark_ratio(),
+            low_watermark_ratio: default_program_low_watermark_ratio(),
+            max_segment_rounds: default_program_max_segment_rounds(),
+            stats_window_size: default_program_stats_window_size(),
+            enable_batch_gain_admission: default_program_enable_batch_gain_admission(),
+            prediction_profile: PredictionProfileConfig::default(),
+            prefill_cost_model: PrefillCostModel::default(),
+            decode_throughput_model: DecodeThroughputModel::default(),
+            explicit_calibration_fields: ExplicitCalibrationFields::default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ProgramSchedulingConfigInput {
+    #[serde(default)]
+    pd: PdProgramSchedulingConfig,
+    #[serde(
+        default,
+        rename = "program_scheduling_enable_key",
+        alias = "enable_key"
+    )]
+    enable_key: ProgramSchedulingEnableKey,
+    #[serde(default)]
+    binding_only: bool,
+    #[serde(default)]
+    global_queue: bool,
+    #[serde(default)]
+    resume_order: ProgramResumeOrder,
+    #[serde(default = "default_program_cross_rank_headroom_ratio")]
+    cross_rank_headroom_ratio: f64,
+    #[serde(default)]
+    binding_strategy: ProgramBindingStrategy,
+    #[serde(default = "default_program_hash_virtual_nodes")]
+    hash_virtual_nodes: u32,
+    #[serde(default, alias = "token_capacity_per_target")]
+    token_capacity_per_dp_rank: Option<usize>,
+    #[serde(default = "default_program_max_active_programs_per_target")]
+    max_active_programs_per_target: usize,
+    #[serde(default = "default_program_metrics_interval_seconds")]
+    metrics_interval_seconds: f64,
+    #[serde(default = "default_program_admission_waiting_request_threshold")]
+    admission_waiting_request_threshold: usize,
+    #[serde(default = "default_program_queue_timeout_seconds")]
+    queue_timeout_seconds: f64,
+    #[serde(default = "default_program_force_resume_timeout_seconds")]
+    force_resume_timeout_seconds: f64,
+    #[serde(default = "default_program_paused_retention_ttl_seconds")]
+    paused_retention_ttl_seconds: f64,
+    #[serde(default = "default_program_shared_prefix_freshness_warmup_seconds")]
+    shared_prefix_freshness_warmup_seconds: f64,
+    #[serde(default = "default_program_shared_prefix_freshness_kv_turnovers")]
+    shared_prefix_freshness_kv_turnovers: f64,
+    #[serde(default = "default_program_decode_buffer_tokens")]
+    decode_buffer_tokens: usize,
+    #[serde(default = "default_program_max_acting_ttl_seconds")]
+    max_acting_ttl_seconds: f64,
+    #[serde(default = "default_program_high_watermark_ratio")]
+    high_watermark_ratio: f64,
+    #[serde(default = "default_program_low_watermark_ratio")]
+    low_watermark_ratio: f64,
+    #[serde(default = "default_program_max_segment_rounds")]
+    max_segment_rounds: usize,
+    #[serde(default = "default_program_stats_window_size")]
+    stats_window_size: usize,
+    #[serde(default = "default_program_enable_batch_gain_admission")]
+    enable_batch_gain_admission: bool,
+    #[serde(default)]
+    prediction_profile: PredictionProfileConfig,
+    #[serde(default)]
+    prefill_cost_model: PrefillCostModelInput,
+    #[serde(default)]
+    decode_throughput_model: DecodeThroughputModelInput,
+}
+
+#[derive(Default, Deserialize)]
+struct PrefillCostModelInput {
+    intercept_seconds: Option<f64>,
+    linear_seconds_per_1k_tokens: Option<f64>,
+    quadratic_seconds_per_1k_tokens_squared: Option<f64>,
+    decode_throughput_alpha: Option<f64>,
+}
+
+#[derive(Default, Deserialize)]
+struct DecodeThroughputModelInput {
+    fixed_step_seconds: Option<f64>,
+    batch_step_seconds_per_request: Option<f64>,
+    context_step_seconds_per_token: Option<f64>,
+}
+
+impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let input = ProgramSchedulingConfigInput::deserialize(deserializer)?;
+        let mut explicit_calibration_fields = 0;
+        let prefill_defaults = PrefillCostModel::default();
+        let decode_defaults = DecodeThroughputModel::default();
+
+        macro_rules! configured_or_default {
+            ($value:expr, $default:expr, $mask:expr) => {
+                match $value {
+                    Some(value) => {
+                        explicit_calibration_fields |= $mask;
+                        value
+                    }
+                    None => $default,
+                }
+            };
+        }
+
+        let prefill_cost_model = PrefillCostModel {
+            intercept_seconds: configured_or_default!(
+                input.prefill_cost_model.intercept_seconds,
+                prefill_defaults.intercept_seconds,
+                PREFILL_INTERCEPT_EXPLICIT
+            ),
+            linear_seconds_per_1k_tokens: configured_or_default!(
+                input.prefill_cost_model.linear_seconds_per_1k_tokens,
+                prefill_defaults.linear_seconds_per_1k_tokens,
+                PREFILL_LINEAR_EXPLICIT
+            ),
+            quadratic_seconds_per_1k_tokens_squared: configured_or_default!(
+                input
+                    .prefill_cost_model
+                    .quadratic_seconds_per_1k_tokens_squared,
+                prefill_defaults.quadratic_seconds_per_1k_tokens_squared,
+                PREFILL_QUADRATIC_EXPLICIT
+            ),
+            decode_throughput_alpha: configured_or_default!(
+                input.prefill_cost_model.decode_throughput_alpha,
+                prefill_defaults.decode_throughput_alpha,
+                PREFILL_DECODE_ALPHA_EXPLICIT
+            ),
+        };
+        let decode_throughput_model = DecodeThroughputModel {
+            fixed_step_seconds: configured_or_default!(
+                input.decode_throughput_model.fixed_step_seconds,
+                decode_defaults.fixed_step_seconds,
+                DECODE_FIXED_EXPLICIT
+            ),
+            batch_step_seconds_per_request: configured_or_default!(
+                input.decode_throughput_model.batch_step_seconds_per_request,
+                decode_defaults.batch_step_seconds_per_request,
+                DECODE_BATCH_EXPLICIT
+            ),
+            context_step_seconds_per_token: configured_or_default!(
+                input.decode_throughput_model.context_step_seconds_per_token,
+                decode_defaults.context_step_seconds_per_token,
+                DECODE_CONTEXT_EXPLICIT
+            ),
+        };
+
+        Ok(Self {
+            pd: input.pd,
+            enable_key: input.enable_key,
+            binding_only: input.binding_only,
+            global_queue: input.global_queue,
+            resume_order: input.resume_order,
+            cross_rank_headroom_ratio: input.cross_rank_headroom_ratio,
+            binding_strategy: input.binding_strategy,
+            hash_virtual_nodes: input.hash_virtual_nodes,
+            token_capacity_per_dp_rank: input.token_capacity_per_dp_rank,
+            max_active_programs_per_target: input.max_active_programs_per_target,
+            metrics_interval_seconds: input.metrics_interval_seconds,
+            admission_waiting_request_threshold: input.admission_waiting_request_threshold,
+            queue_timeout_seconds: input.queue_timeout_seconds,
+            force_resume_timeout_seconds: input.force_resume_timeout_seconds,
+            paused_retention_ttl_seconds: input.paused_retention_ttl_seconds,
+            shared_prefix_freshness_warmup_seconds: input.shared_prefix_freshness_warmup_seconds,
+            shared_prefix_freshness_kv_turnovers: input.shared_prefix_freshness_kv_turnovers,
+            decode_buffer_tokens: input.decode_buffer_tokens,
+            max_acting_ttl_seconds: input.max_acting_ttl_seconds,
+            high_watermark_ratio: input.high_watermark_ratio,
+            low_watermark_ratio: input.low_watermark_ratio,
+            max_segment_rounds: input.max_segment_rounds,
+            stats_window_size: input.stats_window_size,
+            enable_batch_gain_admission: input.enable_batch_gain_admission,
+            prediction_profile: input.prediction_profile,
+            prefill_cost_model,
+            decode_throughput_model,
+            explicit_calibration_fields: ExplicitCalibrationFields(explicit_calibration_fields),
+        })
+    }
+}
+
+fn default_program_cross_rank_headroom_ratio() -> f64 {
+    1.2
+}
+
+fn default_program_hash_virtual_nodes() -> u32 {
+    160
+}
+
+fn default_program_max_active_programs_per_target() -> usize {
+    // Zero means auto: two Programs per configured P prefill permit (the
+    // configured proxy for decode slots), clamped to [4, 64].
+    0
+}
+
+fn default_program_metrics_interval_seconds() -> f64 {
+    1.0
+}
+
+fn default_program_admission_waiting_request_threshold() -> usize {
+    // Zero means auto: `2 * max_prefill_requests_per_target`, clamped to
+    // [4, 64]. Gating admission on an empty D engine queue moves the queue
+    // from the engine into the Router; admit while the engine queue still has
+    // headroom instead.
+    0
+}
+
+fn default_program_queue_timeout_seconds() -> f64 {
+    600.0
+}
+
+fn default_program_force_resume_timeout_seconds() -> f64 {
+    300.0
+}
+
+fn default_program_paused_retention_ttl_seconds() -> f64 {
+    1800.0
+}
+
+fn default_program_shared_prefix_freshness_warmup_seconds() -> f64 {
+    100.0
+}
+
+fn default_program_shared_prefix_freshness_kv_turnovers() -> f64 {
+    2.0
+}
+
+fn default_program_decode_buffer_tokens() -> usize {
+    100
+}
+
+fn default_program_max_acting_ttl_seconds() -> f64 {
+    10.0
+}
+
+fn default_program_high_watermark_ratio() -> f64 {
+    1.0
+}
+
+fn default_program_low_watermark_ratio() -> f64 {
+    1.0
+}
+
+fn default_program_max_segment_rounds() -> usize {
+    14
+}
+
+fn default_program_stats_window_size() -> usize {
+    100
+}
+
+fn default_program_enable_batch_gain_admission() -> bool {
+    true
+}
+
+fn default_prediction_snapshot_interval_seconds() -> f64 {
+    60.0
+}
+
+fn default_prediction_prior_weight() -> f64 {
+    1.0
+}
+
+fn default_prediction_max_keys() -> usize {
+    4096
+}
+
+fn default_return_time_bucket_bounds_seconds() -> Vec<f64> {
+    vec![1.0, 2.0, 5.0, 10.0]
+}
+
+fn default_return_time_min_support() -> usize {
+    20
+}
+
+fn default_return_time_horizon_seconds() -> f64 {
+    5.0
+}
+
+fn default_prediction_step_bucket_size() -> u64 {
+    4
+}
+
+fn default_output_length_bucket_bounds_tokens() -> Vec<usize> {
+    vec![32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+}
+
+fn default_output_length_quantile() -> f64 {
+    0.95
+}
+
+fn default_output_length_min_support() -> usize {
+    100
+}
+
+fn default_output_length_tail_samples() -> usize {
+    5
+}
+
+fn default_prediction_stability_window_size() -> usize {
+    100
+}
+
+fn default_prediction_stability_tolerance() -> f64 {
+    0.15
 }
 
 /// History backend configuration
@@ -129,6 +892,33 @@ pub enum ConnectionMode {
     #[default]
     #[serde(rename = "http")]
     Http,
+    /// vLLM rust Inference (`grpc://` / `grpcs://` worker URLs)
+    #[serde(rename = "grpc")]
+    Grpc,
+}
+
+/// Statically configured KV event sources for one prefill worker, used when
+/// the engine's HTTP control plane does not serve `/server_info` or
+/// `/kv_event_sources` (e.g. the `vllm-rs serve` frontend).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PdKvEventSources {
+    /// ZMQ PUB endpoints, one per data-parallel rank (index = rank).
+    pub endpoints: Vec<String>,
+    /// Optional ZMQ ROUTER (replay) endpoints, same ordering as `endpoints`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_endpoints: Option<Vec<String>>,
+    /// KV cache block size of the engine. Must match the engine's
+    /// `--block-size` (vLLM default: 16).
+    #[serde(default = "default_pd_kv_block_size")]
+    pub block_size: u32,
+    /// Model identity for the cache key. Defaults to the worker URL; the
+    /// served-model check then relies on `/v1/models`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+fn default_pd_kv_block_size() -> u32 {
+    16
 }
 
 /// Routing mode configuration
@@ -137,7 +927,7 @@ pub enum ConnectionMode {
 pub enum RoutingMode {
     #[serde(rename = "regular")]
     Regular {
-        /// List of worker URLs
+        /// Worker URLs: `http(s)://` or `grpc://`
         worker_urls: Vec<String>,
     },
     #[serde(rename = "openai")]
@@ -154,7 +944,7 @@ pub enum RoutingMode {
         /// Optional separate policy for prefill workers
         #[serde(skip_serializing_if = "Option::is_none")]
         prefill_policy: Option<PolicyConfig>,
-        /// Optional separate policy for decode workers
+        /// Optional separate policy for decode workers (defaults to the main policy)
         #[serde(skip_serializing_if = "Option::is_none")]
         decode_policy: Option<PolicyConfig>,
         /// ZMQ service discovery address (e.g., "0.0.0.0:30001")
@@ -197,7 +987,7 @@ impl RoutingMode {
     }
 
     /// Get the effective decode policy for PD mode
-    /// Falls back to the main policy if no specific decode policy is set
+    /// Falls back to the main policy if no specific decode policy is set.
     pub fn get_decode_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
         match self {
             RoutingMode::VllmPrefillDecode { decode_policy, .. } => {
@@ -232,6 +1022,25 @@ pub enum PolicyConfig {
         max_tree_size: usize,
     },
 
+    /// Event-driven, multi-tier KV placement plus live prefill/load scoring.
+    #[serde(rename = "kv_aware")]
+    KvAware {
+        /// Zero selects the minimum cost; positive values softmax-sample.
+        #[serde(default)]
+        router_temperature: f64,
+        /// Transfer credits in [0, 1]; lower means a costlier tier.
+        #[serde(default = "default_kv_penalty_host")]
+        kv_penalty_host: f64,
+        #[serde(default = "default_kv_penalty_external")]
+        kv_penalty_external: f64,
+        #[serde(default = "default_kv_penalty_disk")]
+        kv_penalty_disk: f64,
+        /// Optional static KV event sources for workers whose HTTP control
+        /// endpoint does not expose /kv_event_sources.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        static_kv_event_sources: Box<HashMap<String, StaticKvEventSources>>,
+    },
+
     #[serde(rename = "power_of_two")]
     PowerOfTwo {
         /// Interval for load monitoring (seconds)
@@ -244,8 +1053,37 @@ pub enum PolicyConfig {
         virtual_nodes: u32,
     },
 
+    /// Session-aware routing that combines session stickiness with load
+    /// balancing: existing sessions stick to their assigned replica, new
+    /// sessions are routed to the least-loaded replica (ties broken by
+    /// consistent hashing). Session expiry is configured via the
+    /// `VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S` environment variable.
+    #[serde(rename = "sticky_least_loaded")]
+    StickyLeastLoaded,
+
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
+}
+
+/// Manually configured KV event publishers for one regular-mode worker.
+///
+/// Rust struct literals must supply `topic: String::new()` to retain the
+/// previous empty subscription topic. Serde defaults preserve old JSON
+/// configurations, but do not provide Rust source compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StaticKvEventSources {
+    /// One externally reachable ZMQ PUB endpoint per DP rank.
+    pub endpoints: Vec<String>,
+    /// Optional replay ROUTER endpoint per DP rank for loss recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_endpoints: Option<Vec<String>>,
+    /// Exact ZMQ subscription topic shared by these ranks.
+    #[serde(default)]
+    pub topic: String,
+    /// KV cache block size used to calculate prefix placement.
+    pub block_size: u32,
+    /// Shared model identity across workers that serve the same model.
+    pub model: String,
 }
 
 impl PolicyConfig {
@@ -254,11 +1092,25 @@ impl PolicyConfig {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
+            PolicyConfig::KvAware { .. } => "kv_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
+            PolicyConfig::StickyLeastLoaded => "sticky_least_loaded",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
         }
     }
+}
+
+fn default_kv_penalty_host() -> f64 {
+    0.8
+}
+
+fn default_kv_penalty_external() -> f64 {
+    0.6
+}
+
+fn default_kv_penalty_disk() -> f64 {
+    0.3
 }
 
 /// Service discovery configuration
@@ -448,6 +1300,7 @@ impl Default for RouterConfig {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
+            pd_kv_event_sources: HashMap::new(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3001,
@@ -472,13 +1325,16 @@ impl Default for RouterConfig {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            epd: None,
             kv_connector: KvConnector::default(),
+            program_scheduling: None,
         }
     }
 }
@@ -541,7 +1397,7 @@ impl RouterConfig {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 
@@ -565,6 +1421,18 @@ mod tests {
         assert!(config.metrics.is_none());
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
+    }
+
+    #[test]
+    fn test_pd_exclusive_capacity_accounting_defaults_and_parses() {
+        let default = ProgramSchedulingConfig::default();
+        assert!(default.pd.exclusive_capacity_accounting);
+        assert_eq!(default.pd.prefill_kv_high_watermark, 0.85);
+        assert_eq!(default.pd.prefill_kv_window_seconds, 10.0);
+
+        let parsed: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"pd":{"exclusive_capacity_accounting":true}}"#).unwrap();
+        assert!(parsed.pd.exclusive_capacity_accounting);
     }
 
     #[test]
@@ -592,6 +1460,63 @@ mod tests {
     }
 
     #[test]
+    fn test_pd_kv_event_sources_serde_roundtrip_and_defaults() {
+        let mut config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.4,
+                static_kv_event_sources: Default::default(),
+            },
+        );
+        config.pd_kv_event_sources.insert(
+            "http://prefill:8000".to_string(),
+            PdKvEventSources {
+                endpoints: vec!["tcp://prefill:5557".to_string()],
+                replay_endpoints: Some(vec!["tcp://prefill:5558".to_string()]),
+                block_size: 32,
+                model: Some("m".to_string()),
+            },
+        );
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deserialized.pd_kv_event_sources["http://prefill:8000"].endpoints,
+            vec!["tcp://prefill:5557".to_string()]
+        );
+        assert_eq!(
+            deserialized.pd_kv_event_sources["http://prefill:8000"].block_size,
+            32
+        );
+
+        // Omitted optional fields default: block_size 16, no replay, no model.
+        let sources: PdKvEventSources =
+            serde_json::from_str(r#"{"endpoints":["tcp://p:5557"]}"#).unwrap();
+        assert_eq!(sources.block_size, 16);
+        assert!(sources.replay_endpoints.is_none());
+        assert!(sources.model.is_none());
+
+        let bare = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            PolicyConfig::RoundRobin,
+        );
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(!json.contains("pd_kv_event_sources"));
+        let empty: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert!(empty.pd_kv_event_sources.is_empty());
+    }
+
+    #[test]
     fn test_router_config_serialization() {
         let config = RouterConfig {
             mode: RoutingMode::Regular {
@@ -616,6 +1541,148 @@ mod tests {
         // discovery and metrics are None in Default implementation
         assert!(deserialized.discovery.is_none());
         assert!(deserialized.metrics.is_none());
+    }
+
+    #[test]
+    fn program_scheduling_enable_key_uses_the_roadmap_contract_name() {
+        let default: ProgramSchedulingConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            default.enable_key,
+            ProgramSchedulingEnableKey::AgenticContext
+        );
+        let auto: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"program_scheduling_enable_key":"auto"}"#).unwrap();
+        assert_eq!(auto.enable_key, ProgramSchedulingEnableKey::Auto);
+        let serialized = serde_json::to_value(default).unwrap();
+        assert_eq!(
+            serialized["program_scheduling_enable_key"],
+            "vllm_xargs.agentic_context"
+        );
+    }
+
+    #[test]
+    fn program_scheduling_requires_explicit_enablement() {
+        assert!(ProgramSchedulingConfig::resolve(false, None)
+            .unwrap()
+            .is_none());
+
+        let defaults = ProgramSchedulingConfig::resolve(true, None)
+            .unwrap()
+            .expect("the enable switch should select the default configuration");
+        assert_eq!(defaults, ProgramSchedulingConfig::default());
+
+        let configured = ProgramSchedulingConfig::resolve(true, Some(r#"{"binding_only":true}"#))
+            .unwrap()
+            .expect("enabled JSON overrides should be parsed");
+        assert!(configured.binding_only);
+
+        let missing_switch =
+            ProgramSchedulingConfig::resolve(false, Some(r#"{"binding_only":true}"#))
+                .unwrap_err()
+                .to_string();
+        assert!(missing_switch
+            .contains("program_scheduling_config_json requires enable_program_scheduling"));
+
+        let invalid = ProgramSchedulingConfig::resolve(true, Some("not-json"))
+            .unwrap_err()
+            .to_string();
+        assert!(invalid.contains("Invalid program_scheduling_config_json"));
+    }
+
+    #[test]
+    fn program_scheduling_capacity_is_named_per_dp_rank() {
+        let current: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"token_capacity_per_dp_rank":123}"#).unwrap();
+        assert_eq!(current.token_capacity_per_dp_rank, Some(123));
+
+        let legacy: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"token_capacity_per_target":456}"#).unwrap();
+        assert_eq!(legacy.token_capacity_per_dp_rank, Some(456));
+        let serialized = serde_json::to_value(legacy).unwrap();
+        assert_eq!(serialized["token_capacity_per_dp_rank"], 456);
+        assert!(serialized.get("token_capacity_per_target").is_none());
+    }
+
+    #[test]
+    fn program_scheduling_calibration_models_are_configurable() {
+        let config: ProgramSchedulingConfig = serde_json::from_str(
+            r#"{
+                "prefill_cost_model": {
+                    "intercept_seconds": 0.1,
+                    "linear_seconds_per_1k_tokens": 0.2,
+                    "quadratic_seconds_per_1k_tokens_squared": 0.3,
+                    "decode_throughput_alpha": 0.4
+                },
+                "decode_throughput_model": {
+                    "fixed_step_seconds": 0.5,
+                    "batch_step_seconds_per_request": 0.6,
+                    "context_step_seconds_per_token": 0.7
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.prefill_cost_model.intercept_seconds, 0.1);
+        assert_eq!(
+            config
+                .prefill_cost_model
+                .quadratic_seconds_per_1k_tokens_squared,
+            0.3
+        );
+        assert_eq!(config.prefill_cost_model.decode_throughput_alpha, 0.4);
+        assert_eq!(
+            config
+                .decode_throughput_model
+                .batch_step_seconds_per_request,
+            0.6
+        );
+        let scheduler = crate::program_scheduling::ProgramSchedulerConfig::from(&config);
+        assert_eq!(scheduler.progress_ttl.prefill, config.prefill_cost_model);
+        assert_eq!(
+            scheduler.progress_ttl.decode,
+            config.decode_throughput_model
+        );
+
+        let partial: ProgramSchedulingConfig = serde_json::from_str(
+            r#"{
+                "prefill_cost_model": {"decode_throughput_alpha": 0.8},
+                "decode_throughput_model": {"fixed_step_seconds": 0.25}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(partial.prefill_cost_model.decode_throughput_alpha, 0.8);
+        assert_eq!(
+            partial.prefill_cost_model.linear_seconds_per_1k_tokens,
+            PrefillCostModel::default().linear_seconds_per_1k_tokens
+        );
+        assert_eq!(partial.decode_throughput_model.fixed_step_seconds, 0.25);
+        assert_eq!(
+            partial
+                .decode_throughput_model
+                .context_step_seconds_per_token,
+            DecodeThroughputModel::default().context_step_seconds_per_token
+        );
+        assert_eq!(
+            partial.defaulted_calibration_fields(),
+            vec![
+                "prefill_cost_model.intercept_seconds",
+                "prefill_cost_model.linear_seconds_per_1k_tokens",
+                "prefill_cost_model.quadratic_seconds_per_1k_tokens_squared",
+                "decode_throughput_model.batch_step_seconds_per_request",
+                "decode_throughput_model.context_step_seconds_per_token",
+            ]
+        );
+        assert!(config.defaulted_calibration_fields().is_empty());
+
+        let omitted: ProgramSchedulingConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted.defaulted_calibration_fields().len(), 7);
+        assert_eq!(
+            serde_json::to_value(&omitted).unwrap()["prefill_cost_model"]["intercept_seconds"],
+            PrefillCostModel::default().intercept_seconds
+        );
+        let explicit_defaults: ProgramSchedulingConfig =
+            serde_json::from_value(serde_json::to_value(&omitted).unwrap()).unwrap();
+        assert!(explicit_defaults.defaulted_calibration_fields().is_empty());
+        assert_eq!(explicit_defaults, omitted);
     }
 
     // ============= RoutingMode Tests =============
@@ -1013,6 +2080,7 @@ mod tests {
                 decode_policy: None,
                 discovery_address: None,
             },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 30,
             },
@@ -1043,6 +2111,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -1052,7 +2121,9 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            epd: None,
             kv_connector: KvConnector::default(),
+            program_scheduling: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1075,6 +2146,7 @@ mod tests {
                     "http://worker3:8000".to_string(),
                 ],
             },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::CacheAware {
                 cache_threshold: 0.9,
                 balance_abs_threshold: 5,
@@ -1109,6 +2181,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -1118,7 +2191,9 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            epd: None,
             kv_connector: KvConnector::default(),
+            program_scheduling: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1138,6 +2213,7 @@ mod tests {
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://worker1".to_string()],
             },
+            pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::RoundRobin,
             host: "::1".to_string(), // IPv6
             port: 8888,
@@ -1171,6 +2247,7 @@ mod tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -1180,7 +2257,9 @@ mod tests {
             history_backend: default_history_backend(),
             enable_profiling: false,
             profile_timeout_secs: default_profile_timeout_secs(),
+            epd: None,
             kv_connector: KvConnector::default(),
+            program_scheduling: None,
         };
 
         assert!(config.has_service_discovery());
@@ -1236,7 +2315,7 @@ mod tests {
 
     #[test]
     fn test_pd_policy_fallback_only_prefill() {
-        // When only prefill policy is specified, decode should use main policy
+        // When only prefill is overridden, decode inherits the main policy.
         let pd = RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
@@ -1251,7 +2330,7 @@ mod tests {
             discovery_address: None,
         };
 
-        let main_policy = PolicyConfig::RoundRobin;
+        let main_policy = PolicyConfig::Random;
 
         // Prefill should use specific policy
         match pd.get_prefill_policy(&main_policy) {
@@ -1259,10 +2338,10 @@ mod tests {
             _ => panic!("Expected CacheAware for prefill"),
         }
 
-        // Decode should fall back to main policy
+        // Decode inherits the main policy when no decode override is set.
         match pd.get_decode_policy(&main_policy) {
-            PolicyConfig::RoundRobin => {} // Success
-            _ => panic!("Expected RoundRobin for decode"),
+            PolicyConfig::Random => {}
+            _ => panic!("Expected decode to inherit the main policy"),
         }
     }
 
@@ -1313,7 +2392,7 @@ mod tests {
             max_tree_size: 2000,
         };
 
-        // Both should fall back to main policy
+        // Both stages inherit the main policy.
         match pd.get_prefill_policy(&main_policy) {
             PolicyConfig::CacheAware {
                 cache_threshold, ..

@@ -14,28 +14,28 @@ Results from vLLM multi-node data parallelism deployment with 2 ranks (16 GPUs t
 ## Benchmark Results
 
 ============ Serving Benchmark Result ============
-Successful requests:                     100       
-Maximum request concurrency:             16        
-Benchmark duration (s):                  100.93    
-Total input tokens:                      199761    
-Total generated tokens:                  200000    
-Request throughput (req/s):              0.99      
-Output token throughput (tok/s):         1981.66   
-Peak output token throughput (tok/s):    2320.00   
-Peak concurrent requests:                32.00     
-Total Token throughput (tok/s):          3960.95   
+Successful requests:                     100
+Maximum request concurrency:             16
+Benchmark duration (s):                  100.93
+Total input tokens:                      199761
+Total generated tokens:                  200000
+Request throughput (req/s):              0.99
+Output token throughput (tok/s):         1981.66
+Peak output token throughput (tok/s):    2320.00
+Peak concurrent requests:                32.00
+Total Token throughput (tok/s):          3960.95
 ---------------Time to First Token----------------
-Mean TTFT (ms):                          47.23     
-Median TTFT (ms):                        43.61     
-P99 TTFT (ms):                           75.72     
+Mean TTFT (ms):                          47.23
+Median TTFT (ms):                        43.61
+P99 TTFT (ms):                           75.72
 -----Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          7.31      
-Median TPOT (ms):                        7.36      
-P99 TPOT (ms):                           7.37      
+Mean TPOT (ms):                          7.31
+Median TPOT (ms):                        7.36
+P99 TPOT (ms):                           7.37
 ---------------Inter-token Latency----------------
-Mean ITL (ms):                           7.31      
-Median ITL (ms):                         7.34      
-P99 ITL (ms):                            7.97     
+Mean ITL (ms):                           7.31
+Median ITL (ms):                         7.34
+P99 ITL (ms):                            7.97
 
 
 ## Evaluation Results

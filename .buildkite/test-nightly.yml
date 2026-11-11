@@ -1,0 +1,356 @@
+# L3 nightly (https://github.com/vllm-project/router/issues/273).
+# pipeline.yml uploads this file for NIGHTLY=1 or nightly-test, including forks.
+# Jobs whose gate is narrower than that upload keep their own if.
+# NIGHTLY=1 on this test pipeline does not publish images.
+
+env:
+  RUST_IMAGE: "rust:1.95.0-bookworm"
+  # Pin the ROCm nightly used by the MoRI lane so dependency changes are explicit.
+  ROCM_VLLM_IMAGE: "vllm/vllm-openai-rocm:nightly@sha256:d22922d540810d90c5a3eafe91d3b4a62c2b881f3e990d0b7180b2875a5d176d"
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+steps:
+  - group: ":test_tube: Tests"
+    key: "nightly-tests"
+    depends_on: "upload-nightly-pipeline"
+    # Skip when L1 is also uploaded. test-ready.yml runs these three jobs.
+    if: |
+      build.branch == pipeline.default_branch ||
+      !(build.pull_request.labels includes "ready")
+    steps:
+      - label: ":rust: Rust Unit Tests"
+        plugins:
+          - docker#v5.11.0:
+              image: "$RUST_IMAGE"
+              workdir: /workdir
+              volumes:
+                - ".:/workdir"
+              environment:
+                - "CARGO_INCREMENTAL=0"
+                - "RUST_BACKTRACE=1"
+              command:
+                - bash
+                - -c
+                - |
+                  bash .buildkite/scripts/install_packages.sh rust
+                  cargo test --features cpu,ready --lib --bins
+        agents:
+          queue: "medium_cpu_queue_premerge"
+
+      - label: ":rust: Rust Integration Tests"
+        plugins:
+          - docker#v5.11.0:
+              image: "$RUST_IMAGE"
+              workdir: /workdir
+              volumes:
+                - ".:/workdir"
+              environment:
+                - "CARGO_INCREMENTAL=0"
+                - "RUST_BACKTRACE=1"
+              command:
+                - bash
+                - -c
+                - |
+                  bash .buildkite/scripts/install_packages.sh rust
+                  cargo test --features cpu,ready --test '*'
+        agents:
+          queue: "medium_cpu_queue_premerge"
+
+      - label: ":python: Python Tests"
+        plugins:
+          - docker#v5.11.0:
+              image: "$RUST_IMAGE"
+              workdir: /workdir
+              volumes:
+                - ".:/workdir"
+              environment:
+                - "CARGO_INCREMENTAL=0"
+                - "RUST_BACKTRACE=1"
+              mount-buildkite-agent: true
+              command:
+                - bash
+                - -c
+                - |
+                  source .buildkite/scripts/install_packages.sh python
+                  pytest tests/python/ -v --ignore=tests/python/e2e -m "ready and cpu" --cov=vllm_router --cov-report=xml --cov-report=term
+        artifact_paths:
+          - "coverage.xml"
+        agents:
+          queue: "medium_cpu_queue_premerge"
+
+  # ============================================================================
+  # L3 P/D full GSM8K — EKS l4-k8s (4x L4). Not the default PR job.
+  # ============================================================================
+  - label: ":satellite: P/D Disaggregation Test (4 GPUs)"
+    key: "pd-disagg-test"
+    # image-build is skipped when ROCM_ONLY=1. A skipped dependency is treated
+    # as satisfied, so this job must use the same condition.
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 60
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 2
+      manual:
+        allowed: true
+        reason: "GPU tests can be flaky - retry if needed"
+    mirror_hardwares: l4_4
+    # vLLM, NIXL, lm-eval, and vllm-router are on PATH in the CI image.
+    command: bash tests/python/e2e/pd_disagg_vllm/run_accuracy_test.sh
+    depends_on:
+      - "upload-nightly-pipeline"
+      - "image-build"
+    artifact_paths:
+      - "/tmp/router.log"
+
+  # ============================================================================
+  # L3 Rust gRPC P/D full GSM8K — same layout as the HTTP job above: one
+  # prefill and one decode, each at data-parallel size 2, on four L4s.
+  # ============================================================================
+  - label: ":satellite: gRPC P/D Disaggregation Test (4 GPUs)"
+    key: "grpc-pd-disagg-test"
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 60
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 2
+      manual:
+        allowed: true
+        reason: "GPU tests can be flaky - retry if needed"
+    mirror_hardwares: l4_4
+    # vLLM 0.30.0, NIXL, lm-eval, and vllm-router are in the CI image.
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+      export RUN_LM_EVAL=1
+      export LOG_DIR=/tmp/vllm-router-grpc-pd
+      pytest tests/python/integration/test_grpc_pd_disagg.py -v -m "ready and L4 and cards_4"
+      BASH
+    depends_on:
+      - "upload-nightly-pipeline"
+      - "image-build"
+    artifact_paths:
+      - "/tmp/vllm-router-grpc-pd/*.log"
+
+  # ============================================================================
+  # L3 gRPC prefix-KV perf — rust_grpc + python_http, H100×2.
+  # c16-r32 (hit 0 and 0.99) plus hit 0.99 at c4-r8 and c64-r128.
+  # Pulls the router CI image from image-build (vLLM + vllm-router on PATH).
+  # ============================================================================
+  - label: ":python: grpc perf test case"
+    key: "grpc-perf-e2e"
+    # image-build is skipped when ROCM_ONLY=1. A skipped dependency is treated
+    # as satisfied, so this job must use the same condition.
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 90
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 1
+      manual:
+        allowed: true
+        reason: "GPU perf cold starts can be flaky — retry after checking logs"
+    mirror_hardwares: h100_2
+    depends_on:
+      - "upload-nightly-pipeline"
+      - "image-build"
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+
+      export MODEL="Qwen/Qwen3.8-27B"
+      export PERF_STACK_TIMEOUT=1800
+      export PERF_WORKER_STARTUP_TIMEOUT=1800
+
+      python -m pytest -sv tests/python/e2e/perf/grpc -k "c16-r32 or hit99-c4 or hit99-c64" --perf-case=rust_grpc
+      python -m pytest -sv tests/python/e2e/perf/grpc -k "c16-r32 or hit99-c4 or hit99-c64" --perf-case=python_http
+
+      BASH
+    artifact_paths:
+      - "tests/python/e2e/perf/grpc/results/**/*.json"
+
+  # ============================================================================
+  # L3 router_policy TraceLab replay — cache_aware / kv_aware / kv_aware_aff @ c16.
+  # 4× vllm-rs + router per cell (12GiB GPU KV/worker, no CPU offload) → L4×4.
+  # Optional: TRACELAB_JSONL_URL to replace data/tracelab-ci-uniform-28.jsonl.
+  # ============================================================================
+  - label: ":python: router policy perf (c16 × 3 policies)"
+    key: "router-policy-perf-e2e"
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 240
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 1
+      manual:
+        allowed: true
+        reason: "GPU perf cold starts / long replay — retry after checking logs"
+    mirror_hardwares: l4_4
+    depends_on:
+      - "upload-nightly-pipeline"
+      - "image-build"
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+
+      python -m pip install --no-cache-dir 'agentinfer==0.2.0'
+
+      export AGENTX_RUN_SUFFIX="${AGENTX_RUN_SUFFIX:-$(date -u +%Y%m%d%H%M%S)}"
+      export AGENTX_CELL_GAP_SEC="${AGENTX_CELL_GAP_SEC:-15}"
+      export AGENTX_PORT_SETTLE_SEC="${AGENTX_PORT_SETTLE_SEC:-5}"
+
+      trace="tests/python/e2e/perf/router_policy/data/tracelab-ci-uniform-28.jsonl"
+      if [[ -n "${TRACELAB_JSONL_URL:-}" ]]; then
+        mkdir -p "$$(dirname "$${trace}")"
+        curl -fsSL "${TRACELAB_JSONL_URL}" -o "$${trace}"
+      fi
+      test -f "$${trace}"
+
+      python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'cache_aware/c16 or kv_aware/c16 or kv_aware_aff/c16'
+
+      BASH
+    artifact_paths:
+      - "test-results/router_policy/runs/**/*"
+      - "test-results/router_policy/results/*.json"
+
+  # ============================================================================
+  # L3 L1 prefix-encoding perf — hit 0.30 and 0.99999 at c4 and c16, 1× L4.
+  # Same router CI image as the other NVIDIA jobs (vLLM + vllm-router on PATH).
+  # Case default is Qwen/Qwen3-0.6B, TP1, GPU 0. One pytest session: worker
+  # stays up through L1 on, then worker and router cold-start before L1 off.
+  # Both L1 on and L1 off; 8 waves (2 hit rates × c4/c16 × 2 arms).
+  # ============================================================================
+  - label: ":python: l1 encode perf test case"
+    key: "l1-encode-perf-e2e"
+    # image-build is skipped when ROCM_ONLY=1. A skipped dependency is treated
+    # as satisfied, so this job must use the same condition.
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 120
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 1
+      manual:
+        allowed: true
+        reason: "GPU perf cold starts can be flaky — retry after checking logs"
+    mirror_hardwares: l4_1
+    depends_on:
+      - "upload-nightly-pipeline"
+      - "image-build"
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+
+      export MODEL="Qwen/Qwen3-0.6B"
+      export CUDA_VISIBLE_DEVICES=0
+      export PERF_TENSOR_PARALLEL_SIZE=1
+      export PERF_STACK_TIMEOUT=1800
+      export PERF_WORKER_STARTUP_TIMEOUT=1800
+
+      python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py -k "(hit0.30 or hit0.99999) and (c4 or c16)"
+
+      BASH
+    artifact_paths:
+      - "tests/python/e2e/perf/l1_encode/results/**/*.json"
+
+  # This queue is intentionally separate from the shared amd_mi300_* queues.
+  # Those agents run --no-plugins, while this lane needs the Docker plugin
+  # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host.
+  # Hosts restore the digest-pinned image before the job (#363). This is the
+  # L3 matrix, not the old "every trusted PR" condition. The one-mode smoke
+  # lives in test-merge.yml. nightly-test includes forks.
+  - group: ":large_purple_circle: ROCm MoRI XGMI P/D"
+    key: "pd-disagg-moriio-tests"
+    depends_on: "upload-nightly-pipeline"
+    if: |
+      build.env("NIGHTLY") == "1" ||
+      (
+        build.branch != pipeline.default_branch &&
+        build.pull_request.labels includes "nightly-test"
+      ) ||
+      ((build.source == "ui" || build.source == "api") &&
+       build.env("RUN_ROCM_XGMI") == "1")
+    steps:
+      - label: "ROCm MoRI XGMI (read_mode={{matrix.read_mode}}, 2 GPUs)"
+        key: "pd-disagg-moriio-test"
+        timeout_in_minutes: 60
+        matrix:
+          setup:
+            read_mode:
+              - "true"
+              - "false"
+        retry:
+          automatic:
+            - exit_status: "*"
+              limit: 1
+          manual:
+            allowed: true
+            reason: "Retry transient GPU-agent failures after inspecting the logs"
+        mirror_hardwares: mi300_2
+        command: |
+          bash -euo pipefail <<'BASH'
+          export MORIIO_READ_MODE="{{matrix.read_mode}}"
+          export MORIIO_BACKEND=xgmi
+          export MODEL_NAMES=Qwen/Qwen3-0.6B
+          export ROUTER_BIN=/workdir/target/release/vllm-router
+          export LOG_DIR=/workdir/target/ci-logs/moriio-{{matrix.read_mode}}
+          export ENGINE_STARTUP_TIMEOUT=3600
+
+          bash .buildkite/scripts/install_packages.sh router-bin
+          bash .buildkite/scripts/install_packages.sh lm-eval
+
+          bash tests/python/e2e/pd_disagg_vllm/run_moriio_accuracy_test.sh
+          BASH
+        artifact_paths:
+          - "target/ci-logs/moriio-*/*.log"
+
+  # One coordinator agent owns the paired MI300X worker over a dedicated SSH
+  # link. Keeping this as one Buildkite job avoids coupled two-agent scheduling
+  # and guarantees that both halves are cleaned up together.
+  - label: ":large_purple_circle: ROCm MoRI RDMA P/D (read_mode={{matrix.read_mode}}, 2 nodes)"
+    key: "pd-disagg-moriio-rdma-test"
+    if: |
+      (build.source == "schedule" && build.env("NIGHTLY") == "1") ||
+      (
+        build.branch != pipeline.default_branch &&
+        build.pull_request.labels includes "nightly-test"
+      ) ||
+      ((build.source == "ui" || build.source == "api") &&
+       build.env("RUN_ROCM_RDMA") == "1")
+    timeout_in_minutes: 75
+    matrix:
+      setup:
+        read_mode:
+          - "true"
+          - "false"
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 1
+      manual:
+        allowed: true
+        reason: "Retry transient two-node GPU or RDMA failures after inspecting both node logs"
+    command: |
+      set -euo pipefail
+
+      bash .buildkite/scripts/install_packages.sh router-bin
+
+      export MORIIO_READ_MODE="{{matrix.read_mode}}"
+      export MODEL_NAMES="Qwen/Qwen3-0.6B"
+      export ROUTER_BIN="$$PWD/target/release/vllm-router"
+      export LOG_DIR="$$PWD/target/ci-logs/moriio-rdma-{{matrix.read_mode}}"
+      export ENGINE_STARTUP_TIMEOUT=3600
+      # amd_mori 1.0.0 is stable for sequential cross-node transfers on this
+      # cluster. Concurrency 10 remains covered by the same-host XGMI lane.
+      export NUM_LM_EVAL_CONCURRENT=1
+      export WORKER_SSH_HOST=vllm-router-rocm-worker
+      export COORDINATOR_FABRIC_IP=192.168.200.1
+      export WORKER_FABRIC_IP=192.168.200.2
+
+      bash tests/python/e2e/pd_disagg_vllm/run_moriio_rdma_accuracy_test.sh
+    mirror_hardwares: mi300_rdma
+    depends_on: "upload-nightly-pipeline"
+    artifact_paths:
+      - "target/ci-logs/moriio-rdma-*/*"

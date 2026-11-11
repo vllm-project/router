@@ -13,7 +13,7 @@ use vllm_router_rs::tokenizer::{
 };
 
 // Include the common test utilities
-#[path = "../tests/common/mod.rs"]
+#[path = "../tests/rust/common/mod.rs"]
 mod common;
 use common::ensure_tokenizer_cached;
 
