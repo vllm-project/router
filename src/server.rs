@@ -611,6 +611,15 @@ async fn scheduling_diagnostics(
     }
 }
 
+#[derive(Deserialize)]
+struct FinishSessionQuery {
+    /// Deprecated: name the session with the request's identity fields
+    /// instead.
+    session_id: Option<String>,
+}
+
+static FINISH_SESSION_QUERY_DEPRECATION: std::sync::Once = std::sync::Once::new();
+
 /// POST /finish_session
 ///
 /// Marks a session (e.g. an RL trajectory) as finished so that session-aware
@@ -618,9 +627,11 @@ async fn scheduling_diagnostics(
 /// capacity held by the session. The session is named with the same identity
 /// fields as a request: session headers, and `session_params`, `session_id`,
 /// `agent_hint` or `vllm_xargs.agentic_context` in an optional JSON body.
+/// The deprecated `?session_id=` query is used only when they name no session.
 /// `released` reports whether any policy held the session.
 async fn finish_session(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<FinishSessionQuery>,
     headers: http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -642,15 +653,31 @@ async fn finish_session(
             }
         }
     };
+    let query_session_id = query
+        .session_id
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty());
     let session_id = match resolve_session_key(Some(&headers), IdentityFields::from_body(&body)) {
         Ok(Some(session_id)) => session_id,
-        Ok(None) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "No session identity in the request headers or body",
-            )
-                .into_response()
-        }
+        Ok(None) => match query_session_id {
+            Some(session_id) => {
+                FINISH_SESSION_QUERY_DEPRECATION.call_once(|| {
+                    warn!(
+                        "POST /finish_session?session_id= is deprecated and will be removed \
+                         in a future release; send the session's identity headers or body \
+                         fields instead"
+                    )
+                });
+                session_id
+            }
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "No session identity in the request headers or body",
+                )
+                    .into_response()
+            }
+        },
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
 
@@ -1031,6 +1058,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         None
     };
     println!("DEBUG: Logging initialized");
+
+    if std::env::var_os("VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S").is_some() {
+        warn!(
+            "VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S is no longer read; set \
+             --sticky-least-loaded-session-ttl-secs (session_ttl_secs in the \
+             sticky_least_loaded policy config) instead"
+        );
+    }
 
     // Initialize prometheus metrics exporter
     println!("DEBUG: Initializing Prometheus metrics");

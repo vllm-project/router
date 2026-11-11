@@ -162,6 +162,10 @@ curl -X POST http://router:8000/finish_session -H "Content-Type: application/jso
 
 `released` is `false` when no policy held the session. A request without an identity, or with an invalid one or a body that is not JSON, gets a 400.
 
+**Upgrading from 0.1.17:**
+- `POST /finish_session?session_id=<id>` is deprecated. It still works when the request has no identity headers or body fields, and logs a deprecation warning once.
+- `VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S` is no longer read, and the router warns at startup when it is set. Use `--sticky-least-loaded-session-ttl-secs`.
+
 Session state lives in the router process, so it is lost on restart, and multiple router replicas need ingress stickiness.
 
 ### Benchmark in SkyRL

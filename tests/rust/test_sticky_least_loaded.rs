@@ -460,6 +460,22 @@ mod sticky_least_loaded_regular_tests {
     }
 
     #[tokio::test]
+    async fn test_finish_session_query_is_a_deprecated_fallback() {
+        // 0.1.17 clients finish with ?session_id= and no identity fields.
+        let fx = RegularFixture::start(vec![]).await;
+        let body = json!({"model": "m", "prompt": "hi"}).to_string();
+        let headers = [("x-session-id", "traj-1")];
+        assert_eq!(fx.post("/v1/completions", &headers, &body).await.0, 200);
+
+        let (status, response) = fx.post("/finish_session?session_id=traj-1", &[], "").await;
+        assert_eq!(status, 200);
+        assert_eq!(response["released"], true);
+        assert_eq!(fx.active_sessions(), 0);
+
+        fx.stop().await;
+    }
+
+    #[tokio::test]
     async fn test_finish_session_rejects_bad_requests() {
         let fx = RegularFixture::start(vec![]).await;
         // No identity, invalid identity metadata, and a body that is not JSON.
