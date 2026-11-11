@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -105,7 +107,31 @@ def _prepend_hf_token_export(merged: dict[str, Any]) -> None:
         merged[key] = [CUDA_HF_TOKEN_EXPORT, existing]
 
 
-def expand_steps(steps: list[Any], presets: dict[str, dict[str, Any]]) -> list[Any]:
+def shared_rocm_step(merged: dict[str, Any], count: int) -> None:
+    """Opt-in client of the host's GPU lease hook; never allocate in a PR script."""
+    plugin = merged["plugins"][0]["docker#v5.14.0"]
+    for key in ("devices", "privileged", "ipc", "shm-size"):
+        plugin.pop(key, None)
+    plugin["environment"] = ["AMD_CI_GPU_LEASE_ID", "AMD_CI_GPU_COUNT"]
+    merged["agents"] = {"queue": "router_rocm_mi300_shared"}
+    merged["env"] = {**merged.get("env", {}), "AMD_CI_GPU_COUNT": str(count)}
+    command = merged["command"]
+    # Preserve the original execution budget separately from the six-hour
+    # shared-resource wait. The host supervisor also bounds lease lifetime.
+    minutes = merged.get("timeout_in_minutes", 60)
+    merged["timeout_in_minutes"] = minutes + 390
+    merged["command"] = (
+        ': "$${AMD_CI_GPU_LEASE_ID:?shared GPU admission hook is missing}"\n'
+        "python3 -c 'import os, torch; assert torch.cuda.device_count() == "
+        'int(os.environ["AMD_CI_GPU_COUNT"])\'\n'
+        f"timeout --signal=TERM --kill-after=60s {minutes * 60} "
+        f"bash -euo pipefail -c {shlex.quote(command)}"
+    )
+
+
+def expand_steps(
+    steps: list[Any], presets: dict[str, dict[str, Any]], *, rocm_shared: bool = False
+) -> list[Any]:
     expanded: list[Any] = []
     for step in steps:
         if not isinstance(step, dict):
@@ -114,7 +140,16 @@ def expand_steps(steps: list[Any], presets: dict[str, dict[str, Any]]) -> list[A
         step = dict(step)
         nested = step.get("steps")
         if isinstance(nested, list):
-            step["steps"] = expand_steps(nested, presets)
+            step["steps"] = expand_steps(nested, presets, rocm_shared=rocm_shared)
+        shared_count = step.pop("shared_gpu_count", None)
+        if shared_count is not None and (
+            type(shared_count) is not int
+            or shared_count != 2
+            or step.get("mirror_hardwares") != "mi300_2"
+        ):
+            raise SystemExit(
+                "shared_gpu_count currently supports only the two-GPU mi300_2 functional preset"
+            )
         if "mirror_hardwares" not in step:
             expanded.append(step)
             continue
@@ -139,16 +174,18 @@ def expand_steps(steps: list[Any], presets: dict[str, dict[str, Any]]) -> list[A
             _prepend_hf_token_export(merged)
         if "retry" in step:
             merged["retry"] = step["retry"]
+        if rocm_shared and shared_count is not None:
+            shared_rocm_step(merged, shared_count)
         expanded.append(merged)
     return expanded
 
 
-def render(pipeline_path: Path) -> str:
+def render(pipeline_path: Path, *, rocm_shared: bool = False) -> str:
     doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
     if not isinstance(doc, dict) or not isinstance(doc.get("steps"), list):
         raise SystemExit(f"{pipeline_path} has no steps list")
     doc = dict(doc)
-    doc["steps"] = expand_steps(doc["steps"], load_presets())
+    doc["steps"] = expand_steps(doc["steps"], load_presets(), rocm_shared=rocm_shared)
     return yaml.dump(
         doc,
         Dumper=_Dumper,
@@ -168,7 +205,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Pass the expanded YAML to buildkite-agent pipeline upload",
     )
     args = parser.parse_args(argv)
-    content = render(args.pipeline)
+    if os.environ.get("ROCM_SHARED_GPUS", "0") not in ("0", "1"):
+        parser.error("ROCM_SHARED_GPUS must be 0 or 1")
+    content = render(
+        args.pipeline, rocm_shared=os.environ.get("ROCM_SHARED_GPUS") == "1"
+    )
     if not args.upload:
         sys.stdout.write(content)
         return 0

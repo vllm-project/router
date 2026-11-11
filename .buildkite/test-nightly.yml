@@ -289,6 +289,7 @@ steps:
             allowed: true
             reason: "Retry transient GPU-agent failures after inspecting the logs"
         mirror_hardwares: mi300_2
+        shared_gpu_count: 2
         command: |
           bash -euo pipefail <<'BASH'
           export MORIIO_READ_MODE="{{matrix.read_mode}}"
