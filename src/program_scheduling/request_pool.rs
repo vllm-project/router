@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 pub struct ProgramRequestHandle {
     program: ProgramRef,
     request_id: u64,
+    arrived_at: Instant,
     notifier: Arc<Notify>,
 }
 
@@ -21,6 +22,11 @@ impl ProgramRequestHandle {
     /// Exact Program generation that owns this request.
     pub fn program(&self) -> &ProgramRef {
         &self.program
+    }
+
+    /// When the request arrived, which its dispatch and any restart carry too.
+    pub(crate) fn arrived_at(&self) -> Instant {
+        self.arrived_at
     }
 
     /// Wait until the scheduler changes the front request's eligibility.
@@ -76,6 +82,7 @@ impl RequestPool {
         ProgramRequestHandle {
             program,
             request_id,
+            arrived_at,
             notifier,
         }
     }

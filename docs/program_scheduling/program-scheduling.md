@@ -238,7 +238,7 @@ Report absolute and relative results for job completion time, request throughput
 
 ## Engine KV-control boundary
 
-Progress-TTL currently protects KV indirectly by controlling request admission. Physical eviction, offload, and prefetch are not executed by this feature. A future Router-to-engine KV hint must receive explicit `accepted`, `rejected`, or `unsupported` feedback and an eventual `applied`, `failed`, or `expired` result. Router residency accounting must not change until the engine reports `applied`.
+Progress-TTL currently protects KV indirectly by controlling request admission. Physical eviction, offload, and prefetch are not executed by this feature. [Next-turn KV prefetch shadow](#next-turn-kv-prefetch-shadow) only scores what a prefetch would have done. A future Router-to-engine KV hint must receive explicit `accepted`, `rejected`, or `unsupported` feedback and an eventual `applied`, `failed`, or `expired` result. Router residency accounting must not change until the engine reports `applied`.
 
 ## Workflow prediction shadow profiles
 
@@ -298,6 +298,107 @@ structured logs, `/scheduling_diagnostics`, and bounded-cardinality metrics,
 but real decisions continue to use the existing rank-level fitted TTL and
 `decode_buffer_tokens` fallback. Activation requires a separate rollout after
 calibration has been evaluated.
+
+## Next-turn KV prefetch shadow
+
+The Router can score what a next-turn KV prefetch would have done during each tool wait, without doing it. In `shadow` mode no request, control message, or capacity charge reaches a worker, no prefix earns KV credit, and no scheduling decision changes. There is no active mode. The evaluation is off by default, is rejected in PD mode, and is the first stage of [#428](https://github.com/vllm-project/router/issues/428).
+
+```json
+{
+  "next_turn_prefetch": {
+    "mode": "shadow",
+    "min_idle_seconds": 1.0,
+    "validity_seconds": 10.0,
+    "min_useful_probability": 0.5,
+    "min_prefix_tokens": 1024,
+    "max_kv_cache_usage": 0.9,
+    "max_speculative_tokens_per_target": 65536,
+    "restore_evidence_window_seconds": 60.0,
+    "load_cost_model": {
+      "intercept_seconds": 0.01,
+      "seconds_per_1k_tokens": 0.0236
+    }
+  }
+}
+```
+
+| Field | Default | Allowed | Meaning |
+|---|---|---|---|
+| `mode` | `off` | `off`, `shadow` | `shadow` scores waits. PD mode rejects anything but `off`. |
+| `min_idle_seconds` | `1.0` | 0 or more | How long a wait lasts before a tick evaluates it. At 0 the first tick evaluates it while its prefix is almost surely still on the GPU, so plans count loads that a real prefetch would not make. |
+| `validity_seconds` | `10.0` | more than 0 | How long a finished load stays useful. |
+| `min_useful_probability` | `0.5` | 0 to 1 | The forecast a plan needs. |
+| `min_prefix_tokens` | `1024` | any | A smaller completed prompt keeps no wait. |
+| `max_kv_cache_usage` | `0.9` | 0 to 1 | Referenced KV usage above which no plan is made. |
+| `max_speculative_tokens_per_target` | `65536` | more than 0 | Tokens in plans not yet settled, per target. |
+| `restore_evidence_window_seconds` | `60.0` | more than 0 | How recently the target must have restored KV. |
+| `load_cost_model` | `0.01` s plus `0.0236` s per 1k tokens | 0 or more each | Modeled time to load a plan's tokens. |
+
+Every value must be finite.
+
+A wait opens when a turn completes successfully, the Program expects another, and nothing is in flight or queued for it. A request with `expected_resume: false` ends its Program, so its turn opens no wait. A completed prompt under `min_prefix_tokens` counts as `prefix_too_small` at once and keeps no wait. On each periodic tick after `min_idle_seconds`, because a prefix that has just been used is still resident, the Router evaluates the wait in this order. The first gate that fails is the wait's skip reason until a later tick passes it:
+
+| Gate | Skip reason |
+|---|---|
+| A fresh backend observation describes the target. | `observation_stale` |
+| It reports KV usage and waiting requests. A backend that lacks either gauge never passes. | `observation_incomplete` |
+| `vllm:prompt_tokens_by_source_total{source="external_kv_transfer"}` grew within `restore_evidence_window_seconds`, so this target restores KV at all. | `no_restore_evidence` |
+| KV usage is at most `max_kv_cache_usage`, and a paused Program's prefix fits the free logical capacity. | `capacity_pressure` |
+| The engine reports no waiting requests: demand comes first. | `demand_waiting` |
+| Tokens in plans not yet settled stay within `max_speculative_tokens_per_target`. A finished load stays charged until its plan settles, because the idle prefixes it displaced are gone either way. | `budget_exhausted` |
+| A fresh hint or a return-time profile with enough support gives a forecast. | `prediction_unavailable` |
+| The next turn is forecast inside the useful window with at least `min_useful_probability`. | `low_probability` |
+
+`vllm:kv_cache_usage_perc` counts referenced blocks only. An idle cached prefix is free to the allocator, so this gate cannot see which prefixes a real load would displace.
+
+The useful window starts when the load would finish and lasts `validity_seconds`. `load_cost_model` gives the load time. A target serves one modeled load at a time, oldest wait first, so a queued plan finishes later. A load that stops early, `late` or `cancelled`, frees the stream from then, and the loads queued behind it start sooner, their windows with them. The model has no demand restores in it, so read `late` as a lower bound. A wait that ends before `min_idle_seconds` counts as `short_wait`, and one that ends after it but before any tick as `not_evaluated`. Ticks follow `metrics_interval_seconds`, each after its metrics scrape, so a wait's first evaluation can come up to one interval and one scrape after the idle floor, and a shorter interval leaves fewer waits `not_evaluated`. The default load cost is a reference from one RTX 5060 Ti over PCIe Gen3 x8; calibrate it for the deployed model and host.
+
+A plan's size is the completed turn's prompt tokens, or the Router's estimate when its usage reports none. Where the next prompt repeats that turn's output token for token, a real load could also move the output, so outcome tokens may fall short by up to its length. `in_time` tokens are capped at the plan's size.
+
+A wait makes at most one plan, and every plan ends in one outcome. The first request to arrive ends the wait, and only that request settles the plan, so a concurrent request that finishes first changes nothing. If that request never completes here, the plan settles as `unused` when the Program's next wait opens or the Program is released:
+
+| Outcome | Meaning |
+|---|---|
+| `in_time` | The next turn arrived inside the useful window, ran on the planned target, and its `cached_tokens` reports at least `min_prefix_tokens`. |
+| `unverified` | As `in_time`, but the next turn reported no `cached_tokens`. Reporting them needs vLLM's `--enable-prompt-tokens-details`, and on a streaming request `stream_options.include_usage`. |
+| `no_prefix` | In time, but `cached_tokens` shows less than `min_prefix_tokens`, so there was nothing worth loading. |
+| `late` | The next turn arrived before the load would have finished. A real load would have contended with its demand restore. |
+| `expired` | No next turn arrived inside the useful window. A real load would have been wasted. |
+| `unused` | The load would have finished, but the next turn failed, was cancelled, ran on another target, or never completed here, or the Program or target went away. A real load would have been wasted. |
+| `cancelled` | The Program or target went away before the load would have finished. Only what it had moved by then is waste. |
+
+`in_time` is an upper bound on usefulness: it says a load would have landed in time, not that this prefix had left the GPU. On a target where nothing is being evicted, plans are filtered only by `no_restore_evidence`.
+
+`unverified` is no evidence of reuse, so it counts toward neither precision nor useful tokens: a target whose next turns report no `cached_tokens` has no usable result. A plan stays on the target that served the completed turn, and a next turn that runs elsewhere counts as `unused`. Where the next turn can move, as under `global_queue`, `unused` therefore mixes placement with waste.
+
+A request may carry its own forecast inside `vllm_xargs.agentic_context`. While it is fresh it replaces the profile, and the two are never combined, so a low-confidence hint refuses a wait the profile might have planned:
+
+```json
+{
+  "next_turn_hint": {
+    "version": "1",
+    "expected_return_seconds": 12.0,
+    "confidence": 0.8,
+    "support": 40,
+    "valid_for_seconds": 30.0,
+    "provenance": "harness"
+  }
+}
+```
+
+Times count from the request's completion. Only `version` and `expected_return_seconds` are required, and `confidence` defaults to 1. A hint goes stale past `valid_for_seconds` or once its expected return has passed, and then the profile takes over. A hint never fails its request: an unsupported version or a malformed value is ignored and counted in `vllm_router_next_turn_hint_ignored_total{reason}`. `provenance` is logged and is never a metric label. A request cannot know which tool its response will call, so a hint can only carry what is known before the response.
+
+The results are in `/scheduling/diagnostics`, where `next_turn_prefetch_mode` gives the mode and each rank's `next_turn_prefetch` holds its counters and unsettled `speculative_tokens`, and in these metrics:
+
+| Metric | Labels | Reads as |
+|---|---|---|
+| `vllm_router_next_turn_prefetch_shadow_plans_total` | `target`, `source` | Plans by forecast source, `hint` or `profile`. |
+| `vllm_router_next_turn_prefetch_shadow_skips_total` | `target`, `reason`, `would_have_fit` | Waits without a plan, by final reason. `would_have_fit` says a plan made at the wait's first evaluation, with no load queued ahead of it, would have landed in time, and a wait that no tick evaluated never fits. With `low_probability` or `prediction_unavailable` it counts what the forecast missed. With the other reasons it only describes the wait. |
+| `vllm_router_next_turn_prefetch_shadow_outcomes_total` | `target`, `source`, `outcome` | Plans by outcome. Precision is `in_time` over all outcomes except `cancelled` and `unverified`; read the `unverified` share beside it. |
+| `vllm_router_next_turn_prefetch_shadow_outcome_tokens_total` | `target`, `source`, `outcome` | For `in_time`, the tokens the next turn reported cached, up to the plan's size. For `cancelled`, what its load had moved. For the others, the tokens a load would have moved. Only `in_time` is useful. `late`, `expired`, `unused`, and `cancelled` are waste, and `unverified` and `no_prefix` are neither. |
+| `vllm_router_next_turn_prefetch_shadow_margin_seconds` | `target`, `outcome` | How far before the arrival a load would have finished, or after it for `late`. |
+| `vllm_router_next_turn_prefetch_shadow_plan_kv_cache_usage` | `target` | Referenced KV usage when each plan was made. |
+| `vllm_router_next_turn_prefetch_shadow_evaluation_seconds` | | Time one tick spends evaluating waits under the scheduler lock. Each tick scans every Program and sorts the open waits, so it grows as O(P + W log W) for P Programs and W open waits. |
 
 ## PD Program scheduling
 

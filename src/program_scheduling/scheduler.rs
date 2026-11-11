@@ -261,6 +261,8 @@ impl ProgramScheduler {
             state.rank_queues.remove(target_id);
             state.rank_factors.remove(target_id);
             state.observations.remove(target_id);
+            self.close_next_turn_waits_on_target(state, target_id, Instant::now());
+            state.next_turn_prefetch.remove(target_id);
         }
         let affected = state
             .runtime
@@ -502,6 +504,16 @@ impl ProgramScheduler {
             observation.kv_cache_usage = raw.kv_cache_usage;
             observation.running_requests = raw.running_requests;
             observation.waiting_requests = raw.waiting_requests;
+            if let Some(total) = raw.external_kv_prompt_tokens_total {
+                // A counter that fell belongs to a restarted engine: rebase only.
+                if observation
+                    .external_kv_prompt_tokens_total
+                    .is_some_and(|previous| total > previous)
+                {
+                    observation.last_restore_at = Some(raw.observed_at);
+                }
+                observation.external_kv_prompt_tokens_total = Some(total);
+            }
             observation.router_active_reasoning_programs = checkpoint.active_reasoning_programs;
             observation.router_active_reasoning_requests = checkpoint.active_reasoning_requests;
             observation.estimated_active_reasoning_tokens = estimated_reasoning_tokens;
@@ -1020,6 +1032,7 @@ mod tests {
                 kv_cache_usage: Some(0.5),
                 running_requests: Some(1),
                 waiting_requests: Some(0),
+                external_kv_prompt_tokens_total: None,
                 observed_at: Instant::now(),
             }],
         );
@@ -1050,6 +1063,7 @@ mod tests {
                 kv_cache_usage: Some(0.5),
                 running_requests: Some(1),
                 waiting_requests: Some(0),
+                external_kv_prompt_tokens_total: None,
                 observed_at: Instant::now(),
             }],
         );
@@ -1079,6 +1093,7 @@ mod tests {
                 kv_cache_usage: Some(0.5),
                 running_requests: Some(1),
                 waiting_requests: Some(0),
+                external_kv_prompt_tokens_total: None,
                 observed_at: Instant::now(),
             }],
         );

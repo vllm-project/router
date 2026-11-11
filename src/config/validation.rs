@@ -227,6 +227,23 @@ impl ConfigValidator {
                         .to_string(),
             });
         }
+        let prefetch = &config.next_turn_prefetch;
+        let finite_non_negative = |value: f64| value.is_finite() && value >= 0.0;
+        if !finite_non_negative(prefetch.min_idle_seconds)
+            || !prefetch.validity_seconds.is_finite()
+            || prefetch.validity_seconds <= 0.0
+            || !prefetch.restore_evidence_window_seconds.is_finite()
+            || prefetch.restore_evidence_window_seconds <= 0.0
+            || !(0.0..=1.0).contains(&prefetch.min_useful_probability)
+            || !(0.0..=1.0).contains(&prefetch.max_kv_cache_usage)
+            || prefetch.max_speculative_tokens_per_target == 0
+            || !finite_non_negative(prefetch.load_cost_model.intercept_seconds)
+            || !finite_non_negative(prefetch.load_cost_model.seconds_per_1k_tokens)
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "Next-turn prefetch windows, probabilities, budgets, and load costs must be finite and within range".to_string(),
+            });
+        }
         if prediction.mode != PredictionMode::Off {
             if let Some(path) = prediction.profile_path.as_deref() {
                 let raw = std::fs::read_to_string(path).map_err(|error| {
@@ -744,6 +761,12 @@ impl ConfigValidator {
                     });
                 }
             }
+            if pd_mode && program.next_turn_prefetch.mode != NextTurnPrefetchMode::Off {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "Next-turn prefetch shadow evaluation requires regular HTTP mode"
+                        .to_string(),
+                });
+            }
             if pd_mode
                 && (!(0.0..=1.0).contains(&program.pd.prefill_kv_high_watermark)
                     || program.pd.prefill_kv_window_seconds <= 0.0
@@ -1129,6 +1152,80 @@ mod tests {
         for config in invalid {
             assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
         }
+    }
+
+    #[test]
+    fn next_turn_prefetch_defaults_are_off_and_valid() {
+        let config = ProgramSchedulingConfig::default();
+        assert_eq!(config.next_turn_prefetch.mode, NextTurnPrefetchMode::Off);
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
+        let parsed: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"next_turn_prefetch":{"mode":"shadow"}}"#).unwrap();
+        assert_eq!(parsed.next_turn_prefetch.mode, NextTurnPrefetchMode::Shadow);
+        assert_eq!(parsed.next_turn_prefetch.validity_seconds, 10.0);
+        assert!(ConfigValidator::validate_program_scheduling(&parsed).is_ok());
+    }
+
+    #[test]
+    fn next_turn_prefetch_has_no_active_mode_and_refuses_unknown_fields() {
+        for raw in [
+            r#"{"next_turn_prefetch":{"mode":"active"}}"#,
+            r#"{"next_turn_prefetch":{"modes":"shadow"}}"#,
+            r#"{"next_turn_prefetch":{"load_cost_model":{"seconds":1.0}}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ProgramSchedulingConfig>(raw).is_err(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn next_turn_prefetch_rejects_invalid_values() {
+        let cases: [fn(&mut NextTurnPrefetchConfig); 10] = [
+            |config| config.min_idle_seconds = -1.0,
+            |config| config.min_idle_seconds = f64::NAN,
+            |config| config.validity_seconds = 0.0,
+            |config| config.restore_evidence_window_seconds = 0.0,
+            |config| config.min_useful_probability = 1.1,
+            |config| config.min_useful_probability = f64::NAN,
+            |config| config.max_kv_cache_usage = -0.1,
+            |config| config.max_speculative_tokens_per_target = 0,
+            |config| config.load_cost_model.intercept_seconds = -1.0,
+            |config| config.load_cost_model.seconds_per_1k_tokens = f64::INFINITY,
+        ];
+        for change in cases {
+            let mut config = ProgramSchedulingConfig::default();
+            change(&mut config.next_turn_prefetch);
+            assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn next_turn_prefetch_shadow_requires_regular_mode() {
+        let config = |shadow: bool| {
+            let mut program = serde_json::json!({
+                "token_capacity_per_dp_rank": 100000,
+                "enable_batch_gain_admission": false,
+            });
+            if shadow {
+                program["next_turn_prefetch"] = serde_json::json!({"mode": "shadow"});
+            }
+            RouterConfig {
+                mode: RoutingMode::VllmPrefillDecode {
+                    prefill_urls: vec![("http://p:8000".to_string(), None)],
+                    decode_urls: vec!["http://d:8000".to_string()],
+                    prefill_policy: None,
+                    decode_policy: None,
+                    discovery_address: None,
+                },
+                program_scheduling: Some(serde_json::from_value(program).unwrap()),
+                ..RouterConfig::default()
+            }
+        };
+        assert!(ConfigValidator::validate(&config(false)).is_ok());
+        let error = ConfigValidator::validate(&config(true)).unwrap_err();
+        assert!(error.to_string().contains("regular HTTP mode"), "{error}");
     }
 
     #[test]

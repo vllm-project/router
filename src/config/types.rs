@@ -202,6 +202,75 @@ impl Default for PredictionProfileConfig {
     }
 }
 
+/// Whether the Router evaluates next-turn KV prefetch.
+///
+/// `shadow` is the only other mode: the Router never asks a worker to move KV.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NextTurnPrefetchMode {
+    #[default]
+    Off,
+    /// Score what a prefetch would have done without changing any decision.
+    Shadow,
+}
+
+/// Modeled time to load a prefix into a worker's device tier.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct KvLoadCostModel {
+    pub intercept_seconds: f64,
+    pub seconds_per_1k_tokens: f64,
+}
+
+impl Default for KvLoadCostModel {
+    /// Reference values from one RTX 5060 Ti over PCIe Gen3 x8. Calibrate them
+    /// for the deployed model and host before reading the shadow outcomes.
+    fn default() -> Self {
+        Self {
+            intercept_seconds: 0.01,
+            seconds_per_1k_tokens: 0.0236,
+        }
+    }
+}
+
+/// Read-only evaluation of next-turn KV prefetch during tool waits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct NextTurnPrefetchConfig {
+    pub mode: NextTurnPrefetchMode,
+    /// A prefix idle for less than this is treated as still device-resident.
+    pub min_idle_seconds: f64,
+    /// How long after a load finishes the loaded prefix still counts as useful.
+    pub validity_seconds: f64,
+    /// Lowest forecast probability of a return inside the useful window.
+    pub min_useful_probability: f64,
+    /// Smallest prefix worth a load.
+    pub min_prefix_tokens: usize,
+    /// Highest observed KV usage at which a load may still be planned.
+    pub max_kv_cache_usage: f64,
+    /// Tokens in unsettled plans per target before new plans are refused.
+    pub max_speculative_tokens_per_target: usize,
+    /// How recently the target must have restored KV for a load to have a source.
+    pub restore_evidence_window_seconds: f64,
+    pub load_cost_model: KvLoadCostModel,
+}
+
+impl Default for NextTurnPrefetchConfig {
+    fn default() -> Self {
+        Self {
+            mode: NextTurnPrefetchMode::Off,
+            min_idle_seconds: 1.0,
+            validity_seconds: 10.0,
+            min_useful_probability: 0.5,
+            min_prefix_tokens: 1024,
+            max_kv_cache_usage: 0.9,
+            max_speculative_tokens_per_target: 65536,
+            restore_evidence_window_seconds: 60.0,
+            load_cost_model: KvLoadCostModel::default(),
+        }
+    }
+}
+
 /// First rollout of RFC-PD-PROGRAM-SCHEDULING: one-way remote execution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -431,6 +500,9 @@ pub struct ProgramSchedulingConfig {
     /// Offline-seeded, online-updated workflow prediction in off/shadow mode.
     #[serde(default)]
     pub prediction_profile: PredictionProfileConfig,
+    /// Read-only evaluation of next-turn KV prefetch.
+    #[serde(default)]
+    pub next_turn_prefetch: NextTurnPrefetchConfig,
     /// Offline-calibrated cold-prefill cost and mixed-batch decode impact.
     #[serde(default)]
     pub prefill_cost_model: PrefillCostModel,
@@ -550,6 +622,7 @@ impl Default for ProgramSchedulingConfig {
             stats_window_size: default_program_stats_window_size(),
             enable_batch_gain_admission: default_program_enable_batch_gain_admission(),
             prediction_profile: PredictionProfileConfig::default(),
+            next_turn_prefetch: NextTurnPrefetchConfig::default(),
             prefill_cost_model: PrefillCostModel::default(),
             decode_throughput_model: DecodeThroughputModel::default(),
             explicit_calibration_fields: ExplicitCalibrationFields::default(),
@@ -613,6 +686,8 @@ struct ProgramSchedulingConfigInput {
     enable_batch_gain_admission: bool,
     #[serde(default)]
     prediction_profile: PredictionProfileConfig,
+    #[serde(default)]
+    next_turn_prefetch: NextTurnPrefetchConfig,
     #[serde(default)]
     prefill_cost_model: PrefillCostModelInput,
     #[serde(default)]
@@ -724,6 +799,7 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             stats_window_size: input.stats_window_size,
             enable_batch_gain_admission: input.enable_batch_gain_admission,
             prediction_profile: input.prediction_profile,
+            next_turn_prefetch: input.next_turn_prefetch,
             prefill_cost_model,
             decode_throughput_model,
             explicit_calibration_fields: ExplicitCalibrationFields(explicit_calibration_fields),
