@@ -9,6 +9,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 pub mod discovery;
 mod endpoints;
+pub mod hybrid;
 pub mod indexer;
 pub mod subscriber;
 pub mod types;

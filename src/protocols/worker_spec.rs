@@ -162,4 +162,8 @@ pub struct ServerInfo {
     pub kv_block_size: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_attention_block_size: Option<u32>,
+    /// `--served-model-name` aliases, so the router can tell a base-model alias
+    /// from a LoRA adapter selected through the request's `model`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub served_model_aliases: Vec<String>,
 }

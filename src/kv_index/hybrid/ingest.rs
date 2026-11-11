@@ -1,0 +1,200 @@
+//! Admission and application of engine event batches.
+
+use super::super::wire::ExternalBlockHash;
+use super::super::{KVEvent, KVEventBatch};
+use super::layout::{event_kind_matches, stored_shape_matches};
+use super::residency::State;
+use super::HybridEventIndex;
+use crate::kv_hash::SequenceHash;
+use crate::kv_index::wire::extra_keys_match;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HybridEventError {
+    InvalidLayout,
+    Untrusted,
+    Sequence,
+    InvalidBatch,
+    Capacity,
+}
+
+impl HybridEventIndex {
+    /// Decode a wire payload before applying it. Corrupt payloads invalidate
+    /// all groups, including claims from previously accepted batches.
+    ///
+    pub fn apply_payload(&self, seq: u64, payload: &[u8]) -> Result<(), HybridEventError> {
+        let batch = match crate::kv_index::decode_batch(payload) {
+            Ok(batch) => batch,
+            Err(error) => {
+                tracing::warn!(
+                    error,
+                    bytes = payload.len(),
+                    "hybrid payload did not decode"
+                );
+                self.invalidate();
+                return Err(HybridEventError::InvalidBatch);
+            }
+        };
+        self.apply_batch(seq, &batch)
+    }
+
+    /// Apply an ordered batch atomically. A sequence mismatch, including a
+    /// duplicate, invalidates the view: without an independently verified
+    /// publisher epoch, a repeated sequence can also mean a restart.
+    pub fn apply_batch(&self, seq: u64, batch: &KVEventBatch) -> Result<(), HybridEventError> {
+        let mut state = self.state.write();
+        let Some(next_seq) = state.next_seq else {
+            return Err(HybridEventError::Untrusted);
+        };
+        if seq != next_seq || seq == u64::MAX {
+            return Self::fail(&mut state, HybridEventError::Sequence);
+        }
+        if batch.data_parallel_rank != Some(self.target.dp_rank)
+            || !batch.ts.is_finite()
+            || batch.ts < 0.0
+        {
+            return Self::fail(&mut state, HybridEventError::InvalidBatch);
+        }
+        for event in &batch.events {
+            let result = match event {
+                KVEvent::BlockStored(store) => {
+                    // An adapter caches its pages under its own chain, seeded
+                    // by `(name, path)`. Index them under that identity and
+                    // never as evidence for the base chain; a page this layout
+                    // cannot address is skipped rather than revoking claims it
+                    // cannot speak for.
+                    let namespace = store.lora_name.clone();
+                    let adapter_path = match namespace.as_deref() {
+                        None => None,
+                        Some(name) => match self.adapter_path(name) {
+                            Some(path) => Some(path),
+                            None => continue,
+                        },
+                    };
+                    let adapter = adapter_path.is_some();
+                    // An engine may publish several page sizes for one group
+                    // index. Only the declared granularity is addressable by
+                    // the layout; the other pages cover the same tokens and
+                    // add no boundary information.
+                    let Some(group) = self
+                        .groups
+                        .iter()
+                        .find(|group| store.group_idx == Some(group.group_idx))
+                    else {
+                        if adapter {
+                            continue;
+                        }
+                        return Self::fail(&mut state, HybridEventError::InvalidBatch);
+                    };
+                    if store.block_size != group.block_size {
+                        tracing::debug!(
+                            group_idx = group.group_idx,
+                            declared = group.block_size,
+                            published = store.block_size,
+                            "hybrid group published a secondary page size"
+                        );
+                        continue;
+                    }
+                    // Extra keys are the adapter identity; a base store must
+                    // not carry any, while an adapter store addresses its own
+                    // chain by namespace.
+                    if store.medium.as_deref() != Some("GPU")
+                        || store.locality.as_deref().is_some_and(|s| s != "LOCAL")
+                        || store.ownership.is_some()
+                        || !event_kind_matches(group.kind, store)
+                        || !stored_shape_matches(group.kind, store)
+                        || (namespace.is_none()
+                            && !extra_keys_match(
+                                store.extra_keys.as_ref(),
+                                store.block_hashes.len(),
+                                None,
+                            ))
+                        || store
+                            .parent_block_hash
+                            .as_ref()
+                            .is_some_and(|hash| sequence_hash(hash).is_none())
+                    {
+                        if adapter {
+                            continue;
+                        }
+                        return Self::fail(&mut state, HybridEventError::InvalidBatch);
+                    }
+                    let Some(keys) = store
+                        .block_hashes
+                        .iter()
+                        .map(sequence_hash)
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        if adapter {
+                            continue;
+                        }
+                        return Self::fail(&mut state, HybridEventError::InvalidBatch);
+                    };
+                    let group_idx = group.group_idx;
+                    for hash in keys {
+                        if !state.insert_claim(
+                            namespace.as_deref(),
+                            (group_idx, hash),
+                            self.max_entries,
+                        ) {
+                            // An adapter that fills its own budget must not
+                            // revoke the base model's claims; skip the page.
+                            if adapter {
+                                continue;
+                            }
+                            return Self::fail(&mut state, HybridEventError::Capacity);
+                        }
+                    }
+                    Ok(())
+                }
+                KVEvent::BlockRemoved(remove) => {
+                    if remove.medium.as_deref() != Some("GPU")
+                        || remove.locality.as_deref().is_some_and(|s| s != "LOCAL")
+                        || remove.ownership.is_some()
+                        || !self
+                            .groups
+                            .iter()
+                            .any(|group| remove.group_idx == Some(group.group_idx))
+                        || remove.block_hashes.is_empty()
+                    {
+                        Err(HybridEventError::InvalidBatch)
+                    } else {
+                        let group_idx = remove.group_idx.expect("validated group");
+                        for hash in &remove.block_hashes {
+                            let Some(hash) = sequence_hash(hash) else {
+                                return Self::fail(&mut state, HybridEventError::InvalidBatch);
+                            };
+                            state.remove_claim((group_idx, hash));
+                        }
+                        Ok(())
+                    }
+                }
+                KVEvent::AllBlocksCleared(_) => {
+                    state.claims.clear();
+                    Ok(())
+                }
+            };
+            if let Err(error) = result {
+                return Self::fail(&mut state, error);
+            }
+        }
+        state.next_seq = Some(seq + 1);
+        Ok(())
+    }
+
+    pub(super) fn fail<T>(
+        state: &mut State,
+        error: HybridEventError,
+    ) -> Result<T, HybridEventError> {
+        state.claims.clear();
+        state.next_seq = None;
+        state.visible = false;
+        Err(error)
+    }
+}
+
+fn sequence_hash(hash: &ExternalBlockHash) -> Option<SequenceHash> {
+    match hash {
+        ExternalBlockHash::Bytes(bytes) => bytes.as_slice().try_into().ok(),
+        ExternalBlockHash::Int(_) => None,
+    }
+}

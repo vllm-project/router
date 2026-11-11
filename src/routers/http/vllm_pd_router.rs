@@ -603,6 +603,116 @@ impl VllmPDRouter {
         }
     }
 
+    /// Connector evidence that prefill actually handed this request's KV to the
+    /// chosen decode engine.
+    ///
+    /// A successful prefill response is not proof. Without decode transfer
+    /// parameters, or with another request's transfer id, decode starts cold
+    /// while the router believes the prefix moved. Rejecting here keeps a
+    /// silent full recompute and a stale connector transfer from being
+    /// reported as a normal P/D request.
+    fn validate_handoff(
+        &self,
+        prefill_json: &Value,
+        transfer_id: Option<&str>,
+        decode_params: Option<&Value>,
+    ) -> Result<(), &'static str> {
+        let Some(decode_params) = decode_params else {
+            return Err("missing_decode_transfer_params");
+        };
+        let returned = prefill_json
+            .get("kv_transfer_params")
+            .and_then(|params| params.get("transfer_id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        if let (Some(expected), Some(returned)) =
+            (transfer_id.filter(|id| !id.is_empty()), returned)
+        {
+            if expected != returned {
+                return Err("transfer_id_mismatch");
+            }
+        }
+        match self.kv_connector {
+            KvConnector::Mooncake | KvConnector::MoriIO => {
+                let id = decode_params.get("transfer_id").and_then(Value::as_str);
+                if id.is_none_or(str::is_empty) {
+                    return Err("missing_decode_transfer_id");
+                }
+            }
+            KvConnector::Nixl => {
+                // A handoff has to carry something. An empty object, or one
+                // whose fields are all null or empty, is not connector
+                // evidence: dispatching decode with it starts a cold prefill
+                // that the router would still report as P/D. Fields the
+                // connector may or may not fill (`remote_engine_id`,
+                // `remote_block_ids`, a transfer id) are not required
+                // individually, because push and pull fill different ones.
+                let empty = |value: &Value| match value {
+                    Value::Null => true,
+                    Value::String(text) => text.is_empty(),
+                    Value::Array(items) => items.is_empty(),
+                    _ => false,
+                };
+                let all_empty = decode_params
+                    .as_object()
+                    .is_none_or(|fields| fields.values().all(empty));
+                if all_empty {
+                    return Err("empty_remote_identity");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Count and log a decode-leg failure after prefill reported a handoff.
+    fn note_handoff_failure(&self, prefill: &str, decode: &str, reason: &str) {
+        RouterMetrics::record_pd_handoff_failure(self.connector_label(), reason);
+        if matches!(self.kv_connector, KvConnector::Nixl) {
+            // A push identity cached before this attempt may now describe
+            // blocks the failed decode never committed. Drop it so the next
+            // attempt performs a fresh handshake instead of reusing stale
+            // transfer state.
+            self.evict_nixl_info(prefill);
+        }
+        warn!(
+            prefill,
+            decode, reason, "prefill handoff succeeded but the decode leg failed"
+        );
+    }
+
+    /// Prefill succeeded but its handoff did not validate: answer 502 without
+    /// dispatching decode, so a cold decode is never reported as P/D.
+    fn reject_handoff(
+        &self,
+        path: &str,
+        start_time: Instant,
+        prefill: &str,
+        decode: &str,
+        reason: &str,
+    ) -> Response {
+        RouterMetrics::record_pd_handoff_failure(self.connector_label(), reason);
+        RouterMetrics::record_pd_prefill_request(prefill);
+        RouterMetrics::record_pd_request(path);
+        RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+        warn!(
+            prefill,
+            decode, reason, "handoff validation failed before decode dispatch"
+        );
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Handoff validation failed for prefill {prefill} -> decode {decode}: {reason}"),
+        )
+            .into_response()
+    }
+
+    fn connector_label(&self) -> &'static str {
+        match self.kv_connector {
+            KvConnector::Nixl => "nixl",
+            KvConnector::Mooncake => "mooncake",
+            KvConnector::MoriIO => "moriio",
+        }
+    }
+
     /// Build kv_transfer_params for the decode request (Mooncake only).
     /// For NIXL, decode params come from the prefill response instead.
     fn build_mooncake_decode_kv_transfer_params(
@@ -1059,6 +1169,7 @@ impl VllmPDRouter {
         });
         let affinity_key = Self::extract_affinity_key(decode_policy.as_ref(), headers, request);
         let context = PdRequestContext {
+            hybrid_pairs: None,
             prefill_inputs: prefill_inputs.as_ref(),
             model_id,
             legacy_policy_input: text.as_deref(),
@@ -1930,7 +2041,7 @@ impl VllmPDRouter {
                 obj.remove("ec_transfer_params");
             }
         }
-        if let Some(params) = self
+        let handoff_params = self
             .build_decode_kv_transfer_params(
                 &prefill_base_url,
                 Some(&prefill_response_json),
@@ -1939,14 +2050,22 @@ impl VllmPDRouter {
                 prefill_dp_rank.map(|r| r as u32),
                 Some(&request_id),
             )
-            .await
-        {
+            .await;
+        if let Err(reason) = self.validate_handoff(
+            &prefill_response_json,
+            transfer_id.as_deref(),
+            handoff_params.as_ref(),
+        ) {
+            return Ok(self.reject_handoff(
+                path,
+                start_time,
+                &prefill_base_url,
+                decode_worker.base_url(),
+                reason,
+            ));
+        }
+        if let Some(params) = handoff_params {
             decode_request["kv_transfer_params"] = params;
-        } else {
-            warn!(
-                "No kv_transfer_params for prefill {}, decode will proceed without them",
-                prefill_base_url
-            );
         }
 
         // Use endpoint_url() to get the base URL without @rank suffix,
@@ -2012,6 +2131,7 @@ impl VllmPDRouter {
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
+                self.note_handoff_failure(&prefill_base_url, &decode_base_url, "decode_transport");
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
                 RouterMetrics::record_pd_prefill_request(&prefill_base_url);
@@ -2020,6 +2140,17 @@ impl VllmPDRouter {
                 });
             }
         };
+
+        // Prefill already reported a successful handoff. A decode failure here
+        // is a distinct outcome: count it and drop connector state that would
+        // otherwise be reused by a retry.
+        if !decode_response.status().is_success() {
+            self.note_handoff_failure(
+                &prefill_base_url,
+                &decode_base_url,
+                decode_response.status().as_str(),
+            );
+        }
 
         self.handle_decode_response(
             decode_response,
@@ -2128,17 +2259,33 @@ impl VllmPDRouter {
                 Some(&request_id),
             )
             .await;
-        if decode_params.is_none() {
-            warn!(
-                "No kv_transfer_params for prefill {}, decode will proceed without them",
-                prefill_base_url
+        if let Err(reason) = self.validate_handoff(
+            &prefill_response_json,
+            transfer_id.as_deref(),
+            decode_params.as_ref(),
+        ) {
+            attempt.release();
+            return self.reject_handoff(
+                path,
+                start_time,
+                &prefill_base_url,
+                &decode_base_url,
+                reason,
             );
         }
+        let Some(decode_params) = decode_params else {
+            unreachable!("validate_handoff rejects a missing decode handoff");
+        };
 
         attempt.begin_decode();
         let response = self
             .grpc_frontend
-            .dispatch_decode(decode_worker.url(), prepared, request_id, decode_params)
+            .dispatch_decode(
+                decode_worker.url(),
+                prepared,
+                request_id,
+                Some(decode_params),
+            )
             .await;
         let decode_outcome = grpc_decode_outcome(&response);
         let response = own_grpc_decode(response, attempt);
@@ -2151,6 +2298,11 @@ impl VllmPDRouter {
             record_grpc_decode_stream_failure(decode_outcome, &decode_base_url);
         } else {
             RouterMetrics::record_pd_decode_error(&decode_base_url);
+            self.note_handoff_failure(
+                &prefill_base_url,
+                &decode_base_url,
+                response.status().as_str(),
+            );
         }
         response
     }
@@ -4689,7 +4841,17 @@ mod tests {
                 )
                     .into_response();
             }
-            Json(json!({"kv_transfer_params": {"remote_engine_id": "P"}})).into_response()
+            Json(json!({"kv_transfer_params": {
+                "remote_engine_id": "P",
+                // Real engines echo the request's transfer id; the mock does
+                // the same so the handoff check accepts the response.
+                "transfer_id": body
+                    .get("kv_transfer_params")
+                    .and_then(|params| params.get("transfer_id"))
+                    .cloned()
+                    .unwrap_or_else(|| json!("")),
+            }}))
+            .into_response()
         }
 
         async fn decode(State(gates): State<Gates>, Json(body): Json<Value>) -> Response {
@@ -5436,10 +5598,16 @@ mod tests {
             for shape in ["streaming", "buffered", "oversized"] {
                 let body_started = Arc::new(tokio::sync::Notify::new());
                 let started = body_started.clone();
-                let prefill_url = spawn_test_server(
-                    axum::Router::new()
-                        .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
-                )
+                let prefill_url = spawn_test_server(axum::Router::new().fallback(|| async {
+                    // A handoff needs a real identity: the router rejects an
+                    // empty object before decode runs.
+                    axum::Json(json!({"kv_transfer_params": {
+                        "remote_engine_id": "test-prefill",
+                        "remote_block_ids": [1],
+                        "remote_host": "127.0.0.1",
+                        "remote_port": 1234
+                    }}))
+                }))
                 .await;
                 let decode_url = spawn_test_server(axum::Router::new().route(
                     "/v1/chat/completions",
@@ -5671,10 +5839,11 @@ mod tests {
         use std::{convert::Infallible, task::Poll};
         let entered = Arc::new(tokio::sync::Notify::new());
         let signal = entered.clone();
-        let prefill_url = spawn_test_server(
-            axum::Router::new()
-                .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
-        )
+        let prefill_url = spawn_test_server(axum::Router::new().fallback(|| async {
+            axum::Json(
+                json!({"kv_transfer_params": {"remote_engine_id": "P", "remote_block_ids": [1]}}),
+            )
+        }))
         .await;
         let decode_url = spawn_test_server(axum::Router::new().route(
             "/v1/chat/completions",
@@ -5732,10 +5901,11 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let signal = entered.clone();
         let resume = release.clone();
-        let prefill_url = spawn_test_server(
-            axum::Router::new()
-                .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
-        )
+        let prefill_url = spawn_test_server(axum::Router::new().fallback(|| async {
+            axum::Json(
+                json!({"kv_transfer_params": {"remote_engine_id": "P", "remote_block_ids": [1]}}),
+            )
+        }))
         .await;
         let decode_url = spawn_test_server(axum::Router::new().fallback(move || {
             let signal = signal.clone();
@@ -5852,7 +6022,7 @@ mod tests {
                 } else {
                     spawn_test_server(
                         axum::Router::new()
-                            .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
+                            .fallback(|| async { axum::Json(json!({"kv_transfer_params": {"remote_engine_id": "P", "remote_block_ids": [1]}})) }),
                     )
                     .await
                 };
