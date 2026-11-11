@@ -468,6 +468,10 @@ impl Worker for BasicWorker {
 
     fn increment_load(&self) {
         self.load_counter.fetch_add(1, Ordering::Relaxed);
+        RouterMetrics::set_worker_load(
+            &self.metadata.url,
+            self.load_counter.load(Ordering::Relaxed),
+        );
     }
 
     fn decrement_load(&self) {
@@ -476,10 +480,18 @@ impl Worker for BasicWorker {
                 current.checked_sub(1)
             })
             .ok();
+        RouterMetrics::set_worker_load(
+            &self.metadata.url,
+            self.load_counter.load(Ordering::Relaxed),
+        );
     }
 
     fn reset_load(&self) {
         self.load_counter.store(0, Ordering::Relaxed);
+        RouterMetrics::set_worker_load(
+            &self.metadata.url,
+            self.load_counter.load(Ordering::Relaxed),
+        );
     }
 
     fn processed_requests(&self) -> usize {
