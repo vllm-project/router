@@ -234,6 +234,7 @@ async fn check_grpc_deferred_decode(cache_aware: bool, new_worker: bool) {
         kv_penalty_external: 0.6,
         kv_penalty_disk: 0.4,
         static_kv_event_sources: Default::default(),
+        kv_transfer: None,
     };
     let decode_policy = if cache_aware {
         PolicyConfig::CacheAware {
