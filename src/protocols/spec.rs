@@ -1,6 +1,7 @@
-use crate::request_identity::IdentityFields;
+use crate::request_identity::{sticky_id_value, IdentityFields};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 // # Protocol Specifications
@@ -655,6 +656,11 @@ impl ChatCompletionRequest {
 }
 
 impl GenerationRequest for ChatCompletionRequest {
+    fn sticky_session_id(&self) -> Option<Cow<'_, str>> {
+        self.affinity_identity()
+            .sticky_session_id(self.user.as_deref())
+    }
+
     fn extract_cache_routing_key(&self) -> String {
         cache_routing::session(
             self.session_params
@@ -913,6 +919,11 @@ pub struct CompletionRequest {
 }
 
 impl GenerationRequest for CompletionRequest {
+    fn sticky_session_id(&self) -> Option<Cow<'_, str>> {
+        self.affinity_identity()
+            .sticky_session_id(self.user.as_deref())
+    }
+
     fn extract_cache_routing_key(&self) -> String {
         cache_routing::session(
             self.session_params
@@ -1562,6 +1573,11 @@ impl ResponsesRequest {
 }
 
 impl GenerationRequest for ResponsesRequest {
+    fn sticky_session_id(&self) -> Option<Cow<'_, str>> {
+        self.affinity_identity()
+            .sticky_session_id(self.user.as_deref())
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
     }
@@ -2168,6 +2184,13 @@ pub struct GenerateRequest {
 }
 
 impl GenerationRequest for GenerateRequest {
+    fn sticky_session_id(&self) -> Option<Cow<'_, str>> {
+        self.affinity_identity()
+            .sticky_session_id(None)
+            .or_else(|| self.session_id.as_ref().and_then(sticky_id_value))
+            .or_else(|| self.user_id.as_ref().and_then(sticky_id_value))
+    }
+
     fn extract_cache_routing_key(&self) -> String {
         if let Some(key) = cache_routing::session(
             self.session_params
@@ -2418,6 +2441,11 @@ impl From<V1RerankReqInput> for RerankRequest {
 
 /// Implementation of GenerationRequest trait for RerankRequest
 impl GenerationRequest for RerankRequest {
+    fn sticky_session_id(&self) -> Option<Cow<'_, str>> {
+        self.affinity_identity()
+            .sticky_session_id(self.user.as_deref())
+    }
+
     fn get_model(&self) -> Option<&str> {
         Some(&self.model)
     }
@@ -2538,6 +2566,11 @@ pub struct EmbeddingRequest {
 }
 
 impl GenerationRequest for EmbeddingRequest {
+    fn sticky_session_id(&self) -> Option<Cow<'_, str>> {
+        self.affinity_identity()
+            .sticky_session_id(self.user.as_deref())
+    }
+
     fn is_stream(&self) -> bool {
         // Embeddings are non-streaming
         false
@@ -2618,6 +2651,11 @@ pub trait GenerationRequest: Send + Sync {
     /// Borrow identity fields without serializing a separate payload.
     fn affinity_identity(&self) -> IdentityFields<'_> {
         IdentityFields::default()
+    }
+
+    /// Read the body ID used by sticky routing. String IDs borrow from the request.
+    fn sticky_session_id(&self) -> Option<Cow<'_, str>> {
+        self.affinity_identity().sticky_session_id(None)
     }
 
     /// LoRA adapter name and cache salt carried as passthrough body fields,
@@ -3265,6 +3303,40 @@ mod tests {
         assert_eq!(payload.get("user").unwrap(), "user-a");
         assert!(payload.get("prompt").is_none());
         assert!(payload.get("messages").is_none());
+    }
+
+    #[test]
+    fn sticky_session_id_uses_typed_fields_before_legacy_ids() {
+        let mut request: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "prompt": r#"{"session_id":"inside-prompt"}"#,
+            "session_params": {"session_id": 42},
+            "user": " user ",
+            "session_id": "legacy",
+            "user_id": "fallback"
+        }))
+        .unwrap();
+        assert_eq!(request.sticky_session_id().as_deref(), Some("42"));
+        request.session_params = None;
+        assert_eq!(request.sticky_session_id().as_deref(), Some(" user "));
+        request.user = Some(String::new());
+        assert_eq!(request.sticky_session_id().as_deref(), Some("legacy"));
+        request.other.insert("session_id".into(), Value::Bool(true));
+        assert_eq!(request.sticky_session_id().as_deref(), Some("fallback"));
+        request.other.clear();
+        assert_eq!(request.sticky_session_id(), None);
+    }
+
+    #[test]
+    fn sticky_session_id_reads_inference_generate_passthrough_fields() {
+        let mut request: InferenceGenerateRequest = serde_json::from_value(serde_json::json!({
+            "token_ids": [1, 2, 3],
+            "session_params": {"session_id": "nested"},
+            "user": 7
+        }))
+        .unwrap();
+        assert_eq!(request.sticky_session_id().as_deref(), Some("nested"));
+        request.other.remove("session_params");
+        assert_eq!(request.sticky_session_id().as_deref(), Some("7"));
     }
 
     #[test]

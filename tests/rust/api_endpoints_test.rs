@@ -1136,6 +1136,32 @@ mod router_policy_tests {
             .downcast_ref::<StickyLeastLoadedPolicy>()
             .unwrap();
 
+        let registered = context.worker_registry.get_all();
+        assert_eq!(registered.len(), urls.len());
+        for _ in 0..64 {
+            let request = Request::post("/v1/chat/completions")
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", "Bearer test-token")
+                .body(Body::from(
+                    r#"{"messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::OK
+            );
+            if registered
+                .iter()
+                .all(|worker| worker.processed_requests() > 0)
+            {
+                break;
+            }
+        }
+        assert!(registered
+            .iter()
+            .all(|worker| worker.processed_requests() > 0));
+        assert_eq!(policy.active_session_count(), 0);
+
         for session in ["body-a", "body-b", "body-a"] {
             let request = Request::builder()
                 .method("POST")

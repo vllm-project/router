@@ -5,6 +5,7 @@
 
 use super::RequestHeaders;
 use crate::policies::ConsistentHashPolicy;
+use crate::request_identity::sticky_id_value;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::debug;
@@ -77,14 +78,8 @@ pub(crate) fn extract_session_id(
     request_text: Option<&str>,
     headers: Option<&RequestHeaders>,
 ) -> Option<String> {
-    if let Some(hdrs) = headers {
-        for header_name in SESSION_HEADER_NAMES {
-            if let Some(value) = hdrs.get(*header_name) {
-                if !value.is_empty() {
-                    return Some(value.clone());
-                }
-            }
-        }
+    if let Some(id) = headers.and_then(session_id_from_headers) {
+        return Some(id.to_owned());
     }
 
     // Fields not listed here, such as messages and prompt, are skipped
@@ -94,10 +89,12 @@ pub(crate) fn extract_session_id(
         .session_params
         .as_ref()
         .and_then(|params| params.get("session_id"));
-    session_id_value(nested)
-        .or_else(|| session_id_value(fields.user.as_ref()))
-        .or_else(|| session_id_value(fields.session_id.as_ref()))
-        .or_else(|| session_id_value(fields.user_id.as_ref()))
+    nested
+        .and_then(sticky_id_value)
+        .or_else(|| fields.user.as_ref().and_then(sticky_id_value))
+        .or_else(|| fields.session_id.as_ref().and_then(sticky_id_value))
+        .or_else(|| fields.user_id.as_ref().and_then(sticky_id_value))
+        .map(|id| id.into_owned())
 }
 
 /// Top-level request body fields that can carry a session id.
@@ -109,13 +106,13 @@ struct SessionIdFields {
     user_id: Option<Value>,
 }
 
-/// A non-empty string or a number; other JSON types are not session ids.
-fn session_id_value(value: Option<&Value>) -> Option<String> {
-    match value? {
-        Value::String(s) if !s.is_empty() => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        _ => None,
-    }
+pub(crate) fn session_id_from_headers(headers: &RequestHeaders) -> Option<&str> {
+    SESSION_HEADER_NAMES.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    })
 }
 
 /// Extract hash key from HTTP headers

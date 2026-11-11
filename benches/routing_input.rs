@@ -335,6 +335,9 @@ fn bench_edge_long_input(c: &mut Criterion) {
         group.bench_function(format!("extract/chat/{label}"), |b| {
             b.iter(|| black_box(chat_req.extract_text_for_routing()));
         });
+        group.bench_function(format!("sticky_session_id/chat/{label}"), |b| {
+            b.iter(|| black_box(black_box(&chat_req).sticky_session_id()));
+        });
 
         // Equal byte sizes of CJK text expose character-dependent parsing cost.
         let utf8_prompt = seeded_utf8_text(SEED ^ size as u64, size);

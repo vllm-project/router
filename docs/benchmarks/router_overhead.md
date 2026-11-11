@@ -60,7 +60,7 @@ size constant within each cell. Reports distinguish `text<bytes>` from
 | `policy/{cache_aware,rendezvous_hash}` | Select among four healthy workers using a warmed hot set |
 | `cache_aware_key_format` | Insert and prefix-match raw text, one character per token, or tagged decimal IDs at 128–8192 tokens; tree operations only |
 | `edge/cache_aware` | Select from long keys, threshold cases, imbalanced loads and UTF-8 keys |
-| `edge/long_input` | Parse through `axum::Json`, extract routing text and serialize completion/chat bodies; also parse equal-sized CJK inputs |
+| `edge/long_input` | Parse and serialize completion and chat bodies, extract routing text, read the sticky session ID from typed chat requests, and parse equal-sized CJK inputs |
 | `edge/rendezvous` | Select using long prompts, session headers or JSON-like fields in prompt text |
 | `edge/sticky_least_loaded_stateless` | Select from a serialized completion body without a session ID, across 4, 16 and 64 workers |
 | `edge/token_ids` | Parse and extract routing text from ID prompts |
