@@ -50,11 +50,21 @@ functional steps to `router_rocm_mi300_shared`. The default is `0`; RDMA,
 performance and NVIDIA jobs retain their existing paths. `shared_gpu_count`
 is uploader metadata and is removed before schema validation/upload.
 
+The interface is resource-based, with no test-name allowlist: a task declares a
+positive `shared_gpu_count`, and its hardware preset declares `shared_gpu_queue`.
+The host inventory determines capacity. Another compatible single-host task can
+request 1, 2, 4 or another number of GPUs through these fields without changing
+the uploader. Only the two xGMI steps are opted in initially. Adding a different
+ROCm pool requires its queue and compatible Docker preset in the hardware registry,
+not another test-specific branch in Python. Both metadata fields are removed
+from the emitted Buildkite step.
+
 Enable only after deploying and qualifying the host admission hooks from
 [vllm-router-ci](https://github.com/andyluo7/vllm-router-ci). The dedicated agent
 must obtain a shared GPU lease and inject scoped devices, CPU/RAM limits and a
 lease marker into Docker plugin v5.14.0. The job checks that marker and the
-visible GPU count before running tests. It uses private IPC/network namespaces;
+render-device count before running tests, using only Python's standard library.
+It uses private IPC/network namespaces;
 test device IDs are local to the container. No allocator is installed by PR code.
 
 The Buildkite timeout includes a six-hour resource wait plus startup allowance;

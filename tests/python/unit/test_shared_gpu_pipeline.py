@@ -1,6 +1,7 @@
 """Validate opt-in expansion without building the router or using a GPU."""
 
 import importlib.util
+import copy
 from pathlib import Path
 import unittest
 
@@ -41,6 +42,7 @@ class SharedGpuPipelineTest(unittest.TestCase):
                     actual["timeout_in_minutes"], original["timeout_in_minutes"]
                 )
                 self.assertNotIn("shared_gpu_count", actual)
+                self.assertNotIn("shared_gpu_queue", actual)
 
     def test_opt_in_changes_only_annotated_functional_steps(self):
         presets = uploader.load_presets()
@@ -68,8 +70,51 @@ class SharedGpuPipelineTest(unittest.TestCase):
             self.assertEqual(len(changed), 1, changed)
         self.assertIn("devices", presets["mi300_2"]["plugins"][0]["docker#v5.14.0"])
 
-    def test_rejects_shared_rdma_and_invalid_count(self):
-        for preset, count in (("mi300_rdma", 2), ("mi300_2", 8), ("mi300_2", True)):
+    def test_resource_request_is_independent_of_test_and_preset_names(self):
+        preset = copy.deepcopy(uploader.load_presets()["mi300_2"])
+        preset["shared_gpu_queue"] = "another-rocm-shared-pool"
+        preset["plugins"][0]["docker#v5.14.0"]["environment"] = ["CUSTOM_ENV"]
+        presets = {"another_rocm_host": preset}
+        original = copy.deepcopy(presets)
+        for count in (1, 2, 3, 4, 8):
+            for key, command in (
+                ("command", "echo arbitrary"),
+                ("commands", ["echo one", "echo two"]),
+            ):
+                with self.subTest(count=count, command_key=key):
+                    actual = uploader.expand_steps(
+                        [
+                            {
+                                "mirror_hardwares": "another_rocm_host",
+                                "shared_gpu_count": count,
+                                key: command,
+                            }
+                        ],
+                        presets,
+                        rocm_shared=True,
+                    )[0]
+                    self.assertEqual(
+                        actual["agents"]["queue"], "another-rocm-shared-pool"
+                    )
+                    self.assertEqual(actual["env"]["AMD_CI_GPU_COUNT"], str(count))
+                    self.assertIn(
+                        "CUSTOM_ENV",
+                        actual["plugins"][0]["docker#v5.14.0"]["environment"],
+                    )
+                    self.assertNotIn("commands", actual)
+                    self.assertNotIn("shared_gpu_queue", actual)
+                    self.assertNotIn("torch", actual["command"])
+        self.assertEqual(presets, original)
+
+    def test_rejects_unsupported_hardware_and_invalid_count(self):
+        for preset, count in (
+            ("mi300_rdma", 2),
+            ("l4_2", 2),
+            ("mi300_2", 0),
+            ("mi300_2", -1),
+            ("mi300_2", "2"),
+            ("mi300_2", True),
+        ):
             with self.subTest(preset=preset, count=count), self.assertRaises(
                 SystemExit
             ):
@@ -78,6 +123,35 @@ class SharedGpuPipelineTest(unittest.TestCase):
                     uploader.load_presets(),
                     rocm_shared=True,
                 )
+
+    def test_declared_capability_still_requires_supported_container_client(self):
+        preset = copy.deepcopy(uploader.load_presets()["l4_2"])
+        preset["shared_gpu_queue"] = "not-a-docker-pool"
+        with self.assertRaises(SystemExit):
+            uploader.expand_steps(
+                [
+                    {
+                        "mirror_hardwares": "incompatible",
+                        "shared_gpu_count": 1,
+                        "command": "true",
+                    }
+                ],
+                {"incompatible": preset},
+                rocm_shared=True,
+            )
+        with self.assertRaises(SystemExit):
+            uploader.expand_steps(
+                [
+                    {
+                        "mirror_hardwares": "mi300_rdma",
+                        "shared_gpu_count": 1,
+                        "shared_gpu_queue": "step-cannot-declare-hardware-capability",
+                        "command": "true",
+                    }
+                ],
+                uploader.load_presets(),
+                rocm_shared=True,
+            )
 
 
 if __name__ == "__main__":

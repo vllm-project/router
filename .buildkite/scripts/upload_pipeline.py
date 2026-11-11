@@ -107,22 +107,38 @@ def _prepend_hf_token_export(merged: dict[str, Any]) -> None:
         merged[key] = [CUDA_HF_TOKEN_EXPORT, existing]
 
 
-def shared_rocm_step(merged: dict[str, Any], count: int) -> None:
+def shared_rocm_step(merged: dict[str, Any], count: int, queue: str) -> None:
     """Opt-in client of the host's GPU lease hook; never allocate in a PR script."""
-    plugin = merged["plugins"][0]["docker#v5.14.0"]
+    plugins = merged.get("plugins", [])
+    if len(plugins) != 1 or set(plugins[0]) != {"docker#v5.14.0"}:
+        raise SystemExit("shared GPU admission requires the Docker v5.14.0 preset")
+    plugin = plugins[0]["docker#v5.14.0"]
     for key in ("devices", "privileged", "ipc", "shm-size"):
         plugin.pop(key, None)
-    plugin["environment"] = ["AMD_CI_GPU_LEASE_ID", "AMD_CI_GPU_COUNT"]
-    merged["agents"] = {"queue": "router_rocm_mi300_shared"}
+    environment = plugin.get("environment", [])
+    if not isinstance(environment, list) or not all(isinstance(e, str) for e in environment):
+        raise SystemExit("shared Docker environment must be a list of strings")
+    plugin["environment"] = list(dict.fromkeys([
+        *environment, "AMD_CI_GPU_LEASE_ID", "AMD_CI_GPU_COUNT",
+    ]))
+    merged["agents"] = {"queue": queue}
     merged["env"] = {**merged.get("env", {}), "AMD_CI_GPU_COUNT": str(count)}
-    command = merged["command"]
+    if "command" in merged and "commands" in merged:
+        raise SystemExit("shared GPU step must use command or commands, not both")
+    command_key = "commands" if "commands" in merged else "command"
+    command = merged.pop(command_key, None)
+    if isinstance(command, list) and all(isinstance(c, str) for c in command):
+        command = "\n".join(command)
+    if not isinstance(command, str) or not command.strip():
+        raise SystemExit("shared GPU step requires a non-empty command")
     # Preserve the original execution budget separately from the six-hour
     # shared-resource wait. The host supervisor also bounds lease lifetime.
     minutes = merged.get("timeout_in_minutes", 60)
     merged["timeout_in_minutes"] = minutes + 390
     merged["command"] = (
         ': "$${AMD_CI_GPU_LEASE_ID:?shared GPU admission hook is missing}"\n'
-        "python3 -c 'import os, torch; assert torch.cuda.device_count() == "
+        "python3 -c 'import os; from pathlib import Path; "
+        'assert len(list(Path("/dev/dri").glob("renderD*"))) == '
         'int(os.environ["AMD_CI_GPU_COUNT"])\'\n'
         f"timeout --signal=TERM --kill-after=60s {minutes * 60} "
         f"bash -euo pipefail -c {shlex.quote(command)}"
@@ -144,11 +160,11 @@ def expand_steps(
         shared_count = step.pop("shared_gpu_count", None)
         if shared_count is not None and (
             type(shared_count) is not int
-            or shared_count != 2
-            or step.get("mirror_hardwares") != "mi300_2"
+            or shared_count < 1
+            or "mirror_hardwares" not in step
         ):
             raise SystemExit(
-                "shared_gpu_count currently supports only the two-GPU mi300_2 functional preset"
+                "shared_gpu_count must be a positive integer on a hardware-preset step"
             )
         if "mirror_hardwares" not in step:
             expanded.append(step)
@@ -170,12 +186,18 @@ def expand_steps(
 
         merged = {key: value for key, value in step.items() if key != "mirror_hardwares"}
         merged.update(copy.deepcopy(preset))
+        shared_queue = preset.get("shared_gpu_queue")
+        merged.pop("shared_gpu_queue", None)
+        if shared_count is not None and (
+            not isinstance(shared_queue, str) or not shared_queue.strip()
+        ):
+            raise SystemExit(f"hardware preset {name!r} does not declare shared_gpu_queue")
         if CUDA_HF_TOKEN_ENV in _preset_env_names(preset):
             _prepend_hf_token_export(merged)
         if "retry" in step:
             merged["retry"] = step["retry"]
         if rocm_shared and shared_count is not None:
-            shared_rocm_step(merged, shared_count)
+            shared_rocm_step(merged, shared_count, shared_queue)
         expanded.append(merged)
     return expanded
 
