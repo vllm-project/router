@@ -51,7 +51,7 @@ jobs:
           elif grep -qE 'panicked|error\[|^error:|FAILED' unit-clean.log; then
             grep -E 'panicked|error\[|^error:|FAILED' unit-clean.log | head -20 | sed 's/^/::error::/'
           else
-            tail -15 unit-clean.log | sed 's/^/::error::/'
+            tail -6 unit-clean.log | sed 's/^/::error::/'
           fi
       - name: Integration tests
         run: |
