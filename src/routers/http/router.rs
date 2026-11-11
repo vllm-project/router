@@ -434,7 +434,8 @@ impl Router {
             // DP endpoint shares the served names of its base URL, so the probe
             // runs once per endpoint and the labels follow the ranks.
             let labels =
-                Self::served_name_labels(ctx.router_config.api_key.as_deref(), &base_url).await;
+                Self::served_name_labels(ctx.router_config.api_key.as_deref(), &base_url, dp_rank)
+                    .await;
             let worker_arc: Arc<dyn Worker> = if dp_size > 1 {
                 Arc::new(
                     DPAwareWorker::new(
@@ -2245,6 +2246,7 @@ impl Router {
     async fn served_name_labels(
         api_key: Option<&str>,
         worker_url: &str,
+        dp_rank: Option<usize>,
     ) -> std::collections::HashMap<String, String> {
         let mut labels = std::collections::HashMap::new();
         if crate::backend::is_grpc_url(worker_url) {
@@ -2259,10 +2261,15 @@ impl Router {
         };
         let base = worker_url.trim_end_matches('/');
         let models_url = format!("{base}/v1/models");
-        let served = match crate::kv_index::discovery::worker_get(&client, &models_url, api_key)
-            .send()
-            .await
-        {
+        let mut probe = crate::kv_index::discovery::worker_get(&client, &models_url, api_key);
+        // A DP engine serves /v1/models per rank; send the rank the caller is
+        // probing for so the reply is the one that rank would serve. Without
+        // this the probe is an unranked request the engine may answer with a
+        // different rank's view.
+        if let Some(rank) = dp_rank {
+            probe = probe.header("X-data-parallel-rank", rank.to_string());
+        }
+        let served = match probe.send().await {
             Ok(response) if response.status().is_success() => response
                 .json::<serde_json::Value>()
                 .await
@@ -2397,8 +2404,12 @@ impl Router {
                         // The registered name is what the engine serves, so an
                         // adapter selected through `model` stays distinguishable
                         // from a base-model alias.
-                        let labels =
-                            Self::served_name_labels(self.api_key.as_deref(), worker_url).await;
+                        let labels = Self::served_name_labels(
+                            self.api_key.as_deref(),
+                            worker_url,
+                            dp_utils::parse_worker_url(worker_url).1,
+                        )
+                        .await;
                         let new_worker =
                             BasicWorker::new(worker_url.to_string(), WorkerType::Regular)
                                 .with_labels(labels)
