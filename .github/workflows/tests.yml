@@ -13,7 +13,6 @@ concurrency:
 
 permissions:
   contents: read
-  issues: write
 
 jobs:
   rust-tests:
@@ -42,7 +41,7 @@ jobs:
       - name: Unit tests
         run: |
           set -o pipefail
-          cargo test --features cpu,ready --lib --bins 2>&1 | tee unit-tests.log
+          cargo test --features cpu,ready --lib --bins -- --test-threads=1 2>&1 | tee unit-tests.log
       - name: Surface unit test failures
         if: failure()
         run: |
@@ -52,23 +51,6 @@ jobs:
           else
             grep -E 'panicked|error\[|^error:|FAILED' unit-clean.log | head -20 | sed 's/^/::error::/' || tail -40 unit-clean.log | sed 's/^/::error::/'
           fi
-      - name: Report unit test failure log
-        if: failure()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PY'
-          import json, os
-          log = open("unit-tests.log", errors="replace").read()
-          body = "CI-UNIT-LOG\n\n```\n" + log[-30000:] + "\n```"
-          with open("payload.json", "w") as payload:
-              json.dump({"body": body}, payload)
-          PY
-          curl -sS -X POST \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/460/comments" \
-            -d @payload.json
       - name: Integration tests
         run: |
           set -o pipefail
