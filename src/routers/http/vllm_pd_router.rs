@@ -66,6 +66,11 @@ struct ConcurrentDispatch {
     request_id: String,
 }
 
+struct GrpcPdWorkers {
+    prefill: Vec<Arc<dyn Worker>>,
+    decode: Vec<Arc<dyn Worker>>,
+}
+
 /// Terminal 503 for a Program turn whose bound endpoints could not be dispatched.
 /// The Program reservation is settled as a failure so the next turn can re-admit.
 fn program_unavailable(
@@ -1933,6 +1938,41 @@ impl VllmPDRouter {
             .is_some_and(|worker| crate::backend::is_grpc_url(worker.url()))
     }
 
+    fn available_grpc_workers(&self) -> Result<GrpcPdWorkers, Box<Response>> {
+        let prefill_workers: Vec<Arc<dyn Worker>> = self
+            .pd_router
+            .worker_registry
+            .get_prefill_workers()
+            .into_iter()
+            .filter(|worker| worker.is_available())
+            .collect();
+        let decode_workers: Vec<Arc<dyn Worker>> = self
+            .pd_router
+            .worker_registry
+            .get_decode_workers()
+            .into_iter()
+            .filter(|worker| worker.is_available())
+            .collect();
+        if prefill_workers.is_empty() || decode_workers.is_empty() {
+            RouterMetrics::record_pd_error("server_selection");
+            return Err(Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "No available workers: {} prefill, {} decode",
+                        prefill_workers.len(),
+                        decode_workers.len()
+                    ),
+                )
+                    .into_response(),
+            ));
+        }
+        Ok(GrpcPdWorkers {
+            prefill: prefill_workers,
+            decode: decode_workers,
+        })
+    }
+
     /// Chat on static `grpc://` pools: tokenize once, admit the pair through
     /// the shared P/D admission, then run both legs over gRPC with those ids.
     async fn route_grpc_chat(
@@ -1940,6 +1980,10 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::ChatCompletionRequest,
     ) -> Response {
+        let workers = match self.available_grpc_workers() {
+            Ok(workers) => workers,
+            Err(response) => return *response,
+        };
         // Tokenize before admission so kv_aware and cache_aware score the
         // exact ids P will prefill.
         let prepared = match self.grpc_frontend.prepare(body.clone()).await {
@@ -1958,8 +2002,14 @@ impl VllmPDRouter {
                     .into_response();
             }
         };
-        self.route_grpc_prepared(headers, request_json, "/v1/chat/completions", prepared)
-            .await
+        self.route_grpc_prepared(
+            headers,
+            request_json,
+            "/v1/chat/completions",
+            prepared,
+            workers,
+        )
+        .await
     }
 
     /// `/v1/completions` on static `grpc://` pools: the client already sends
@@ -1975,6 +2025,10 @@ impl VllmPDRouter {
             Ok(lowered) => lowered,
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         };
+        let workers = match self.available_grpc_workers() {
+            Ok(workers) => workers,
+            Err(response) => return *response,
+        };
         let prepared = match self
             .grpc_frontend
             .prepare_token_ids(lowered.chat, lowered.token_ids, lowered.emit_token_ids)
@@ -1985,7 +2039,7 @@ impl VllmPDRouter {
                 return (prepare_error_status(&error), error.to_string()).into_response();
             }
         };
-        self.route_grpc_prepared(headers, request_json, "/v1/completions", prepared)
+        self.route_grpc_prepared(headers, request_json, "/v1/completions", prepared, workers)
             .await
     }
 
@@ -1996,33 +2050,12 @@ impl VllmPDRouter {
         request_json: Value,
         path: &str,
         prepared: crate::backend::PreparedRequest,
+        workers: GrpcPdWorkers,
     ) -> Response {
-        let prefill_workers: Vec<Arc<dyn Worker>> = self
-            .pd_router
-            .worker_registry
-            .get_prefill_workers()
-            .into_iter()
-            .filter(|worker| worker.is_available())
-            .collect();
-        let decode_workers: Vec<Arc<dyn Worker>> = self
-            .pd_router
-            .worker_registry
-            .get_decode_workers()
-            .into_iter()
-            .filter(|worker| worker.is_available())
-            .collect();
-        if prefill_workers.is_empty() || decode_workers.is_empty() {
-            RouterMetrics::record_pd_error("server_selection");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!(
-                    "No available workers: {} prefill, {} decode",
-                    prefill_workers.len(),
-                    decode_workers.len()
-                ),
-            )
-                .into_response();
-        }
+        let GrpcPdWorkers {
+            prefill: prefill_workers,
+            decode: decode_workers,
+        } = workers;
         let router_prompts: Arc<[Vec<u32>]> = Arc::from([prepared.tokenized.token_ids.to_vec()]);
         let Some(Admission {
             selection,

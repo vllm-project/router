@@ -199,6 +199,33 @@ async fn grpc_pd_completion_rejects_text_prompts() {
 }
 
 #[tokio::test]
+async fn grpc_pd_unavailable_pool_rejects_before_request_preparation() {
+    let prefill = MockVllmRsServer::spawn().await;
+    let decode = MockVllmRsServer::spawn().await;
+    // Leave the tokenizer unpinned so preparing either request would try to
+    // resolve a model before reaching the availability guard.
+    let router = pd_router_with_pools(&[&prefill], &decode, 1, PolicyConfig::RoundRobin).await;
+    router.worker_registry().get_prefill_workers()[0].set_healthy(false);
+
+    let chat_response = router.route_chat(None, &chat(false), None).await;
+    let completion_response = router
+        .route_completion(None, &completion(json!([11, 12, 13]), false), None)
+        .await;
+    for response in [chat_response, completion_response] {
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"No available workers: 0 prefill, 1 decode");
+    }
+    assert!(prefill.captured().is_empty());
+    assert!(decode.captured().is_empty());
+}
+
+#[tokio::test]
 async fn grpc_pd_hands_prefill_kv_params_to_decode() {
     let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
         finish_kv_transfer_params: Some(prefill_kv()),
