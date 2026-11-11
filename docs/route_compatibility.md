@@ -46,13 +46,13 @@ Anthropic messages over grpc needs a messages rpc in the vllm proto first.
 | body | unknown fields are kept and forwarded, so the worker gets the same json the client sent |
 | routing text | `system` (string or text blocks), then `tools[].name` and `tools[].description`, then message text in order. image, document, tool_use and tool_result blocks add a short marker, not their payload |
 | cache aware / kv aware routing | worker tokens from each worker's `/v1/messages/render`; when a worker does not serve it (vllm exposes it with `--enable-scale-out`), `/tokenize` on the chat form vllm converts a text only body into. image and document blocks skip preparation and route least loaded; tool, thinking and inline `system` content needs render, since the `/tokenize` fallback has no exact form for it |
-| session affinity | headers first (`x-session-id`, `x-user-id`, ...), then nested `metadata.user_id` |
+| session affinity | header keyed policies: headers first (`x-session-id`, `x-user-id`, ...), then nested `metadata.user_id`. kv aware session affinity does not read `metadata.user_id` |
 | router errors | anthropic shape `{"type":"error","error":{"type":...,"message":...}}`, including invalid json and missing fields (400, `invalid_request_error`). routers on the transparent path (pd, `--backend openai`) can't tell their own errors from worker responses, so their errors (404, 405, 503 with no prefill workers) are passed through unshaped |
 | worker errors | passed through unchanged |
 | non streaming | first class |
 | streaming | forwarded as sse; anthropic event parsing for ttft and usage is a follow up |
 | `x-api-key` auth, `anthropic-version` / `anthropic-beta` forwarding | follow up |
-| pd prefill patch (`max_tokens = 1`) | follow up |
+| pd prefill patch (`max_tokens = 1`) | not needed, `prepare_prefill_request` already patches this path |
 
 ## Other backends
 
