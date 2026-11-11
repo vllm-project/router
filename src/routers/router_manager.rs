@@ -785,17 +785,17 @@ impl RouterTrait for RouterManager {
         body: &MessagesRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        let model_id = Some(body.model.as_str());
-        let router = self.select_router_for_request(headers, model_id);
+        let model_id = body.model.as_str();
+        let router = self.select_router_for_request(headers, Some(model_id));
 
         if let Some(router) = router {
-            router.route_messages(headers, body, model_id).await
+            router.route_messages(headers, body, Some(model_id)).await
         } else {
-            let msg = match model_id {
-                Some(m) => format!("Model '{}' not found or no router available", m),
-                None => "No routers registered to handle this request".to_string(),
-            };
-            (StatusCode::NOT_FOUND, msg).into_response()
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", model_id),
+            )
+                .into_response()
         }
     }
 

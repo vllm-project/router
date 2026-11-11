@@ -34,8 +34,9 @@ version moves.
 | `/v1/audio/transcriptions`, `/v1/audio/translations` | unsupported | unsupported | multipart bodies |
 | `/v1/chat/completions/render`, `/v1/completions/render`, `/v1/messages/render` | unsupported | unsupported | |
 
-gRPC workers only serve `/v1/chat/completions`. Every other typed route,
-including `/v1/messages`, is rejected with 400 before a worker is picked.
+gRPC pools serve `/v1/chat/completions` and `/v1/completions`; a gRPC P/D pool
+serves chat only. Every other typed route, including `/v1/messages`, is
+rejected with 400 before a worker is picked.
 Anthropic messages over grpc needs a messages rpc in the vllm proto first.
 
 ## `/v1/messages`

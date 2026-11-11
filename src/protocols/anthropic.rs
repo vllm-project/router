@@ -253,6 +253,7 @@ impl GenerationRequest for MessagesRequest {
     /// Program identity fields (`vllm_xargs`, `agent_hint`, `session_params`,
     /// `session_id`, `user_id`) live in the forwarded `other` fields, so a
     /// body level Program opt-in keeps working on the typed route.
+    /// `metadata.user_id` is passed as the user, the way chat passes `user`.
     fn affinity_identity(&self) -> crate::request_identity::IdentityFields<'_> {
         crate::request_identity::IdentityFields {
             other: Some(&self.other),
@@ -261,7 +262,7 @@ impl GenerationRequest for MessagesRequest {
     }
 
     fn extract_program_identity_payload(&self) -> Option<Value> {
-        crate::protocols::spec::program_identity_payload(Some(&self.other), None)
+        crate::protocols::spec::program_identity_payload(Some(&self.other), self.metadata_user_id())
     }
 
     /// `lora_name` and `cache_salt` ride in the forwarded `other` fields and
@@ -506,6 +507,8 @@ mod tests {
             "program-a"
         );
         assert_eq!(payload["agent_hint"]["session_id"], "session-a");
+        // `metadata.user_id` is the user key, as `user` is for chat.
+        assert_eq!(payload["user"], "u-1");
         // Generation content never enters the identity payload.
         assert!(payload.get("messages").is_none());
         assert!(payload.get("metadata").is_none());

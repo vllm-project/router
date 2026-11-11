@@ -1326,7 +1326,7 @@ impl Router {
     /// `metadata.user_id`) to the policy view of the headers, only when no
     /// session header is present. Headers always win, and nothing is added
     /// to the headers forwarded to the worker.
-    pub(crate) fn apply_affinity_key(
+    fn apply_affinity_key(
         request_headers: Option<crate::policies::RequestHeaders>,
         affinity_key: Option<&str>,
     ) -> Option<crate::policies::RequestHeaders> {

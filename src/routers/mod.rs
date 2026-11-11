@@ -24,10 +24,6 @@ pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience (keeps routers::openai_router path working)
 pub use http::{openai_router, pd_router, pd_types, router};
 
-/// Worker management trait for administrative operations
-///
-/// This trait is separate from RouterTrait to allow Send futures
-/// for use in service discovery and other background tasks
 /// Response extension set on responses that came from a worker (or from a
 /// transparent proxy path). `/v1/messages` rewrites only responses without it
 /// into the anthropic error shape, so worker errors always pass through as
@@ -35,6 +31,10 @@ pub use http::{openai_router, pd_router, pd_types, router};
 #[derive(Debug, Clone, Copy)]
 pub struct UpstreamResponse;
 
+/// Worker management trait for administrative operations
+///
+/// This trait is separate from RouterTrait to allow Send futures
+/// for use in service discovery and other background tasks
 #[async_trait]
 pub trait WorkerManagement: Send + Sync {
     /// Add a worker to the router
