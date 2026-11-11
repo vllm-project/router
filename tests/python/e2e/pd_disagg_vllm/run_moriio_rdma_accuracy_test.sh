@@ -94,6 +94,8 @@ else
 fi
 
 mkdir -p "${LOG_DIR}"
+# Docker bind mounts require an absolute host path, including caller overrides.
+LOG_DIR="$(cd "${LOG_DIR}" && pwd -P)"
 docker volume create "${EVAL_PIP_CACHE_VOLUME}" >/dev/null
 
 # OpenSSH joins command arguments without preserving their boundaries. Render a

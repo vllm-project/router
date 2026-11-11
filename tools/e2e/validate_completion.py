@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 
-def validate_completion(data):
+def validate_single_completion(data):
     if not isinstance(data, dict) or "error" in data:
         raise ValueError("expected a completion object without an error")
     choices = data.get("choices")
@@ -17,6 +17,8 @@ def validate_completion(data):
     text = choice.get("text")
     if not isinstance(text, str) or not text.strip():
         raise ValueError("completion text is empty or invalid")
+    # The smoke requests 8 tokens: length is the limit, stop is normal EOS.
+    # Abort/filter outcomes must fail even if the backend returns HTTP 200.
     if choice.get("finish_reason") not in ("stop", "length"):
         raise ValueError("completion did not finish with stop or length")
 
@@ -26,7 +28,9 @@ def main():
     parser.add_argument("response", type=Path)
     args = parser.parse_args()
     try:
-        validate_completion(json.loads(args.response.read_text(encoding="utf-8")))
+        validate_single_completion(
+            json.loads(args.response.read_text(encoding="utf-8"))
+        )
     except (ValueError, OSError) as exc:
         parser.exit(1, f"Invalid completion response: {exc}\n")
     print("Completion response is structurally valid and non-empty")
