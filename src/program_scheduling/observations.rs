@@ -4,6 +4,7 @@
 //! freshness, rolling statistics, logical capacity, and scheduling decisions.
 
 use super::ProgramTarget;
+use crate::protocols::prometheus_text::{parse_series, split_series_value};
 use async_trait::async_trait;
 use futures::future::join_all;
 use std::collections::{BTreeMap, HashMap};
@@ -224,56 +225,6 @@ pub(crate) fn sum_prometheus_gauge(text: &str, family: &str) -> Option<u64> {
         }
     }
     total
-}
-
-fn split_series_value(line: &str) -> Option<(&str, &str)> {
-    let split = line.rfind(char::is_whitespace)?;
-    Some((line[..split].trim(), line[split..].trim()))
-}
-
-fn parse_series(series: &str) -> (&str, HashMap<String, String>) {
-    let Some(open) = series.find('{') else {
-        return (series, HashMap::new());
-    };
-    let name = &series[..open];
-    let labels = series
-        .strip_suffix('}')
-        .map(|series| &series[open + 1..])
-        .map(parse_labels)
-        .unwrap_or_default();
-    (name, labels)
-}
-
-fn parse_labels(labels: &str) -> HashMap<String, String> {
-    let mut result = HashMap::new();
-    let mut fields = Vec::new();
-    let mut start = 0;
-    let mut quoted = false;
-    let mut escaped = false;
-    for (index, character) in labels.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match character {
-            '\\' if quoted => escaped = true,
-            '"' => quoted = !quoted,
-            ',' if !quoted => {
-                fields.push(&labels[start..index]);
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    fields.push(&labels[start..]);
-    for field in fields {
-        let Some((key, value)) = field.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().trim_matches('"').replace("\\\"", "\"");
-        result.insert(key.trim().to_string(), value);
-    }
-    result
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]

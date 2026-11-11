@@ -91,10 +91,9 @@ routing uses the existing two-stage dispatch, which does not add coordinated
 retries or record dispatch outcomes for circuit breaking. Built-in routes keep
 their existing handlers. Workers must expose the configured paths.
 
-Custom PD routes preserve token-based cache affinity, body session IDs, and
-model selection when IGW is enabled. In discovery mode, model-scoped requests
-require matching model and worker-role metadata in the worker registry. They
-return 503 when no matching prefill or decode worker is registered.
+The built-in `/inference/v1/generate` route and configured generate paths use token IDs for cache affinity. With `sticky_least_loaded`, these routes can use a session ID from the request body. This does not change sticky routing for chat or completions. With `consistent_hash` or `rendezvous_hash`, send `x-session-id` to keep affinity across requests with different token IDs.
+
+When IGW selects workers by model, PD discovery requires a matching prefill worker and decode worker in the registry. If either role is missing, the router returns 503. A direct-URL PD pool with no model labels accepts requests with a `model` field and forwards it to the workers.
 
 Rust embedders must set `ServerConfig.extra_generate_paths`. Use an empty vector
 to keep only the built-in typed routes.

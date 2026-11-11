@@ -99,6 +99,11 @@ pub async fn get_dp_aware_workers(
     let mut dp_aware_workers: Vec<String> = Vec::new();
 
     for url in worker_urls {
+        if extract_dp_rank(url).is_ok() {
+            expand_dp_ranks(url, dp_size)?;
+            dp_aware_workers.push(url.clone());
+            continue;
+        }
         info!(
             "Expanding worker {} to {} DP-aware URLs (ranks 0..{})",
             url,
@@ -181,12 +186,16 @@ pub fn parse_worker_url(worker_url: &str) -> (String, Option<usize>) {
 }
 
 /// Return the ranks represented by one endpoint, preserving an explicitly
-/// pinned rank and expanding an unpinned multi-rank endpoint.
-pub fn expand_dp_ranks(pinned_rank: Option<usize>, dp_size: usize) -> Vec<Option<usize>> {
+/// pinned rank and rejecting it when outside the endpoint's DP size.
+pub fn expand_dp_ranks(worker_url: &str, dp_size: usize) -> Result<Vec<Option<usize>>, String> {
+    let pinned_rank = extract_dp_rank(worker_url).ok().map(|(_, rank)| rank);
     match pinned_rank {
-        Some(rank) => vec![Some(rank)],
-        None if dp_size > 1 => (0..dp_size).map(Some).collect(),
-        None => vec![None],
+        Some(rank) if rank >= dp_size => Err(format!(
+            "Worker {worker_url} has rank {rank} outside DP size {dp_size}"
+        )),
+        Some(rank) => Ok(vec![Some(rank)]),
+        None if dp_size > 1 => Ok((0..dp_size).map(Some).collect()),
+        None => Ok(vec![None]),
     }
 }
 
@@ -223,6 +232,29 @@ pub fn add_dp_rank_header(
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_expand_dp_ranks_checks_http_and_grpc_pins() {
+        for scheme in ["http", "grpc"] {
+            let url = format!("{scheme}://worker:8000");
+            assert_eq!(expand_dp_ranks(&url, 1).unwrap(), vec![None]);
+            assert_eq!(expand_dp_ranks(&url, 2).unwrap(), vec![Some(0), Some(1)]);
+            assert_eq!(
+                expand_dp_ranks(&format!("{url}@0"), 1).unwrap(),
+                vec![Some(0)]
+            );
+            assert_eq!(
+                expand_dp_ranks(&format!("{url}@1"), 2).unwrap(),
+                vec![Some(1)]
+            );
+            for rank in [2, 5] {
+                let pinned = format!("{url}@{rank}");
+                let error = expand_dp_ranks(&pinned, 2).unwrap_err();
+                assert!(error.contains(&pinned), "{error}");
+                assert!(error.contains("DP size 2"), "{error}");
+            }
+        }
+    }
 
     #[test]
     fn test_extract_dp_rank_valid() {

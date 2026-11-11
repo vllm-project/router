@@ -4,7 +4,7 @@ use futures_util::future::join_all;
 use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use uuid::Uuid;
@@ -108,6 +108,29 @@ fn cancel_ec_transfers(control_addr: &str, transfer_ids: &[String]) -> anyhow::R
 }
 
 impl EncoderStage {
+    pub(super) fn validate_consumers<'a>(
+        config: &EpdConfig,
+        urls: impl Iterator<Item = &'a str>,
+    ) -> Result<(), String> {
+        if config.consumer_zmq_addrs.is_empty() {
+            return Ok(());
+        }
+        let urls: HashSet<_> = urls.collect();
+        if let Some(url) = urls
+            .iter()
+            .filter(|url| !config.consumer_zmq_addrs.contains_key(**url))
+            .min()
+        {
+            return Err(format!(
+                "EPD consumer_zmq_addrs is missing resolved consumer URL: {url}"
+            ));
+        }
+        if urls.is_empty() || config.consumer_zmq_addrs.len() != urls.len() {
+            return Err("EPD consumer_zmq_addrs must map every resolved embedding consumer URL exactly once".into());
+        }
+        Ok(())
+    }
+
     pub(super) fn new(config: EpdConfig) -> Self {
         Self {
             config,
@@ -124,6 +147,18 @@ impl EncoderStage {
         api_key: Option<&str>,
     ) -> Result<(Value, Option<EcTransferGuard>), EpdError> {
         let started = Instant::now();
+        if !self.config.consumer_zmq_addrs.is_empty()
+            && super::dp_utils::extract_dp_rank(consumer_url).is_ok()
+            && body
+                .get("ec_transfer_params")
+                .and_then(Value::as_object)
+                .is_some_and(|params| !params.is_empty())
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Mooncake DP routing cannot reuse caller-provided EC handles; send raw media instead".into(),
+            ));
+        }
         let items = collect_media_items(&body)?;
         if items.is_empty() {
             return Ok((body, None));

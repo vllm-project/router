@@ -228,6 +228,7 @@ fn select_stage(
         let pick = kv.select_decode(
             &projected,
             context.affinity_key.as_ref(),
+            context.lora_name,
             context.cache_salt,
         )?;
         (
@@ -424,8 +425,8 @@ fn build_dp_workers(
     worker_type: WorkerType,
     circuit_breaker_config: &CircuitBreakerConfig,
     health_config: Option<&HealthConfig>,
-) -> Vec<Arc<dyn Worker>> {
-    let (base_url, pinned_rank) = dp_utils::parse_worker_url(url);
+) -> Result<Vec<Arc<dyn Worker>>, String> {
+    let (base_url, _) = dp_utils::parse_worker_url(url);
 
     // DPAwareWorker strips the @rank suffix in endpoint_url(), preventing
     // IPv6+DP URL corruption where HTTP clients read @N as userinfo (RFC 3986).
@@ -439,7 +440,7 @@ fn build_dp_workers(
         Arc::new(worker)
     };
 
-    dp_utils::expand_dp_ranks(pinned_rank, dp_size)
+    Ok(dp_utils::expand_dp_ranks(url, dp_size)?
         .into_iter()
         .map(|rank| match rank {
             Some(rank) => dp_worker(rank),
@@ -454,7 +455,7 @@ fn build_dp_workers(
                 Arc::new(worker) as Arc<dyn Worker>
             }
         })
-        .collect()
+        .collect())
 }
 
 impl PdRouterBase {
@@ -852,7 +853,8 @@ impl PdRouterBase {
             worker_type,
             &self.circuit_breaker_config,
             None,
-        );
+        )
+        .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
         if workers
             .iter()
@@ -1081,9 +1083,19 @@ impl PdRouterBase {
                 worker_type,
                 &core_cb_config,
                 Some(&health_config),
-            ) {
+            )? {
                 ctx.worker_registry.register(worker);
             }
+        }
+
+        if let Some(config) = &ctx.router_config.epd {
+            super::epd::EncoderStage::validate_consumers(
+                config,
+                ctx.worker_registry
+                    .get_prefill_workers()
+                    .iter()
+                    .map(|worker| worker.url()),
+            )?;
         }
 
         // Get all workers from registry for load monitoring
@@ -1354,6 +1366,7 @@ impl PdRouterBase {
             decode_cache: None,
             headers: None,
             affinity_key: None,
+            lora_name: None,
             cache_salt: None,
             route: "/health_generate",
         };
@@ -1884,6 +1897,7 @@ mod tests {
             decode_cache: None,
             headers: None,
             affinity_key: None,
+            lora_name: None,
             cache_salt: None,
             route: "/health_generate",
         };
@@ -1913,6 +1927,7 @@ mod tests {
             decode_cache: None,
             headers: None,
             affinity_key: None,
+            lora_name: None,
             cache_salt: None,
             route: "/health_generate",
         };
@@ -2678,6 +2693,7 @@ mod admission_tests {
             decode_cache: None,
             headers: None,
             affinity_key: None,
+            lora_name: None,
             cache_salt: None,
             route: "/v1/completions",
         }
@@ -2704,6 +2720,7 @@ mod admission_tests {
             decode_cache: None,
             headers: None,
             affinity_key: Some(affinity_key(session)),
+            lora_name: None,
             cache_salt: None,
             route: "/v1/completions",
         }
@@ -2995,6 +3012,29 @@ mod admission_tests {
     }
 
     #[test]
+    fn cold_prefill_ties_use_every_worker_in_an_idle_pool() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 3);
+        let d = pool("d", 1);
+        let policy = KvAwarePolicy::default();
+        let tokens: Vec<u32> = (0..33).collect();
+        let inputs = token_inputs(&p, &tokens, &policy);
+        let mut ctx = context();
+        ctx.prefill_inputs = Some(&inputs);
+
+        // Every admission starts from an idle pool again, so the same
+        // equal-cost tie is met on each turn.
+        let mut seen = [false; 3];
+        for _ in 0..32 {
+            let (selection, attempt) = admit_with(&manager, &p, &d, &policy, &ctx);
+            assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
+            seen[selection.prefill.worker_index] = true;
+            drop(attempt);
+        }
+        assert_eq!(seen, [true, true, true], "equal costs must use every P");
+    }
+
+    #[test]
     fn equal_load_follows_caller_order() {
         let manager = Arc::new(PdLoadManager::default());
         let mut p = pool("p", 2);
@@ -3259,6 +3299,7 @@ mod admission_tests {
                 decode_cache: None,
                 headers: None,
                 affinity_key: None,
+                lora_name: None,
                 cache_salt: None,
                 route: "/v1/completions",
             }

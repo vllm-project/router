@@ -479,6 +479,16 @@ impl Router {
             }
         }
 
+        if let Some(config) = &ctx.router_config.epd {
+            super::epd::EncoderStage::validate_consumers(
+                config,
+                ctx.worker_registry
+                    .get_by_type(&WorkerType::Regular)
+                    .iter()
+                    .map(|worker| worker.url()),
+            )?;
+        }
+
         // Setup load monitoring for PowerOfTwo policy
         let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
         let worker_loads = Arc::new(rx);
@@ -1484,7 +1494,10 @@ impl Router {
                 None
             }
         };
-        let text = if self.policy_for_model(model_id).needs_request_body() {
+        let schema_route = typed_req.http_token_input_route(route);
+        let text = if schema_route == "/inference/v1/generate"
+            && self.policy_for_model(model_id).needs_request_body()
+        {
             match serde_json::to_string(typed_req) {
                 Ok(body) => body,
                 Err(error) => {
@@ -1589,7 +1602,7 @@ impl Router {
                                         &workers,
                                         headers,
                                         &body,
-                                        typed_req.http_token_input_route(route),
+                                        schema_route,
                                         self.api_key.as_deref(),
                                         Duration::from_secs(1),
                                     )
@@ -3253,6 +3266,7 @@ impl RouterTrait for Router {
                     // reqwest derives these from the body and URL it sends.
                     if name == http::header::CONTENT_LENGTH
                         || name == http::header::CONTENT_TYPE
+                        || (worker.dp_rank().is_some() && name == "x-data-parallel-rank")
                         || header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
                     {
                         continue;
@@ -3536,7 +3550,20 @@ mod tests {
         }
         server.abort();
         let requests = requests.lock();
-        assert_eq!(requests.len(), 2, "metadata requests: {requests:?}");
+        // Discovery asks every metadata source before giving up, and none of the
+        // probes may carry an Authorization header the operator did not configure.
+        let mut probed: Vec<&str> = requests.iter().map(|(path, _)| path.as_str()).collect();
+        probed.sort_unstable();
+        assert_eq!(
+            probed,
+            [
+                "/get_server_info",
+                "/kv_event_sources",
+                "/metrics",
+                "/server_info"
+            ],
+            "metadata requests: {requests:?}"
+        );
         for path in ["/get_server_info", "/kv_event_sources"] {
             assert!(
                 requests.iter().any(|(actual_path, authorization)| {
@@ -5643,6 +5670,61 @@ mod tests {
             WorkerType::Regular,
         )));
         router
+    }
+
+    #[tokio::test]
+    async fn regular_sticky_binds_body_user_only_for_inference_generate() {
+        use crate::config::PolicyConfig;
+        use crate::policies::StickyLeastLoadedPolicy;
+        use serde_json::json;
+
+        let (address, server) = spawn_header_echo_backend().await;
+        let mut router = router_pointing_at(address);
+        router.policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::StickyLeastLoaded));
+        let policy = router.policy_for_model(None);
+        let sticky = policy
+            .as_any()
+            .downcast_ref::<StickyLeastLoadedPolicy>()
+            .unwrap();
+
+        let user = "body-user";
+        let chat = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hello"}], "user": user
+        }))
+        .unwrap();
+        let response = router.route_chat(None, &chat, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            sticky.active_session_count(),
+            0,
+            "chat user is not a session"
+        );
+
+        let completion = serde_json::from_value(json!({"prompt": "hello", "user": user})).unwrap();
+        let response = router.route_completion(None, &completion, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            sticky.active_session_count(),
+            0,
+            "completion user is not a session"
+        );
+
+        let generate = serde_json::from_value(json!({"token_ids": [42], "user": user})).unwrap();
+        for path in [None, Some("/custom/v1/generate")] {
+            let response = match path {
+                None => router.route_inference_generate(None, &generate, None).await,
+                Some(path) => {
+                    router
+                        .route_inference_generate_path(None, &generate, path, None)
+                        .await
+                }
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(sticky.active_session_count(), 1);
+            sticky.finish_session(user);
+            assert_eq!(sticky.active_session_count(), 0);
+        }
+        server.abort();
     }
 
     #[tokio::test]
