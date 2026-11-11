@@ -44,10 +44,8 @@ jobs:
           pkg-config --version
       - name: Unit tests
         run: |
-          echo "::error::start cargo=$(command -v cargo || echo missing) pwd=$(pwd)"
           cargo test --features cpu,ready --lib --bins -- --test-threads=1 > unit-tests.log 2>&1
           status=$?
-          echo "::error::cargo status=$status pwd=$(pwd) log=$(wc -c < unit-tests.log 2>/dev/null || echo missing)"
           exit $status
       - name: Surface unit test failures
         if: failure()
@@ -64,7 +62,6 @@ jobs:
         run: |
           cargo test --features cpu,ready --test '*' > integration-tests.log 2>&1
           status=$?
-          echo "::error::integration status=$status pwd=$(pwd) log=$(wc -c < integration-tests.log 2>/dev/null || echo missing)"
           exit $status
       - name: Surface integration test failures
         if: failure()
