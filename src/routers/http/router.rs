@@ -1353,23 +1353,45 @@ impl Router {
             });
         }
 
-        let idx = if let Some(cache) = policy
+        if let Some(cache) = policy
             .as_any()
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
-            cache.select_worker_with_inputs(
+            let idx = cache.select_worker_with_inputs(
                 available, token_ids, model_id, lora_name, cache_salt, "regular",
-            )?
+            )?;
+            return Some(SelectedWorker {
+                worker: available.get(idx)?.clone(),
+                kv_receipt: None,
+            });
+        }
+
+        // A session's retry must not go back to the replica that just failed:
+        // without it among the candidates, the session moves as it does off an
+        // unhealthy replica. If every replica failed, retry among all of them.
+        let retry_candidates: Vec<Arc<dyn Worker>>;
+        let candidates = if policy.needs_session_id() && !excluded_workers.is_empty() {
+            retry_candidates = available
+                .iter()
+                .filter(|worker| !excluded_workers.iter().any(|url| url == worker.url()))
+                .cloned()
+                .collect();
+            if retry_candidates.is_empty() {
+                available
+            } else {
+                &retry_candidates
+            }
         } else {
-            policy.select_worker_for_session(
-                available,
-                text,
-                request_headers.as_ref(),
-                session_id,
-            )?
+            available
         };
+        let idx = policy.select_worker_for_session(
+            candidates,
+            text,
+            request_headers.as_ref(),
+            session_id,
+        )?;
         Some(SelectedWorker {
-            worker: available.get(idx)?.clone(),
+            worker: candidates.get(idx)?.clone(),
             kv_receipt: None,
         })
     }
@@ -6838,10 +6860,14 @@ mod tests {
 
     /// Create a test router with ConsistentHash policy instead of RoundRobin
     fn create_test_consistent_hash_router() -> Router {
+        create_test_router_with_policy(crate::config::types::PolicyConfig::ConsistentHash {
+            virtual_nodes: 100,
+        })
+    }
+
+    fn create_test_router_with_policy(policy: crate::config::types::PolicyConfig) -> Router {
         let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(
-            crate::config::types::PolicyConfig::ConsistentHash { virtual_nodes: 100 },
-        ));
+        let policy_registry = Arc::new(PolicyRegistry::new(policy));
 
         let worker1 = BasicWorker::new("http://worker1:8080".to_string(), WorkerType::Regular);
         let worker2 = BasicWorker::new("http://worker2:8080".to_string(), WorkerType::Regular);
@@ -7016,6 +7042,46 @@ mod tests {
         };
         let first = select(&[]);
         assert_eq!(select(std::slice::from_ref(&first)), first);
+    }
+
+    #[test]
+    fn test_retry_exclusion_moves_a_sticky_session() {
+        let router =
+            create_test_router_with_policy(crate::config::types::PolicyConfig::StickyLeastLoaded {
+                session_ttl_secs: 60,
+            });
+        let select = |excluded: &[String]| {
+            router
+                .select_worker_for_model(
+                    None,
+                    &router.available_workers(None),
+                    None,
+                    None,
+                    KvRequestTokens::Shared(None),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("traj-1"),
+                    excluded,
+                )
+                .expect("Should select a worker")
+                .worker
+                .url()
+                .to_string()
+        };
+        let first = select(&[]);
+        let retry = select(std::slice::from_ref(&first));
+        assert_ne!(retry, first);
+        // The session stays on the replica it moved to.
+        assert_eq!(select(&[]), retry);
+        // With every replica excluded, the retry still routes.
+        let all: Vec<String> = router
+            .available_workers(None)
+            .iter()
+            .map(|worker| worker.url().to_string())
+            .collect();
+        select(&all);
     }
 
     #[test]
