@@ -528,6 +528,21 @@ fn fill_engine_ms(stages: &mut serde_json::Value) {
     }
 }
 
+/// Settle the producer's terminal `finish_reason` for a streaming attempt.
+///
+/// The body ends normally after `finish_reason="abort"`, so the attempt must
+/// record an error (and therefore settle as failed) rather than succeeding on
+/// EOF.
+fn record_finish_outcome(observer: Option<&EngineOutcomeObserver>, finish: Option<&str>) -> bool {
+    let aborted = finish == Some("abort");
+    if aborted {
+        if let Some(observer) = observer {
+            observer.record_error();
+        }
+    }
+    !aborted
+}
+
 async fn stream_openai(
     mut stream: tonic::Streaming<super::pb::GenerateResponse>,
     reply: ChatReply,
@@ -696,7 +711,7 @@ async fn stream_openai(
                                 SSE_DONE.to_string(),
                                 false,
                             );
-                            return finish.as_deref() != Some("abort");
+                            return record_finish_outcome(observer.as_deref(), finish.as_deref());
                         }
                     }
                     Err(status) => {
@@ -1043,5 +1058,19 @@ mod tests {
             true,
         ));
         assert!(consumer.on_frame());
+    }
+
+    #[test]
+    fn abort_finish_records_an_error_and_fails_the_round() {
+        let observer = EngineOutcomeObserver::default();
+        assert!(!record_finish_outcome(Some(&observer), Some("abort")));
+        assert!(observer.failed());
+
+        let observer = EngineOutcomeObserver::default();
+        assert!(record_finish_outcome(Some(&observer), Some("stop")));
+        assert!(!observer.failed());
+
+        // No observer still reports the aborted round as failed.
+        assert!(!record_finish_outcome(None, Some("abort")));
     }
 }

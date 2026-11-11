@@ -28,6 +28,7 @@ pub(crate) mod l1_encode_cache;
 pub mod openai;
 pub mod outcome;
 pub mod preprocess;
+pub(crate) mod token_count;
 mod tokenizer_determinism;
 mod vllm_frontend;
 

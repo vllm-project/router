@@ -1,6 +1,9 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
 use super::program_adapter::ProgramCompletion;
 use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
+use crate::backend::token_count::{
+    client_token_ids_fingerprint, exact_prompt_tokens_from_json, prepared_chat_fingerprint,
+};
 use crate::backend::{
     stream_output::{output_frame_tracking, OutputFrameConsumer, OutputFrameProducer},
     PrepareError,
@@ -21,7 +24,7 @@ use crate::policies::{
 };
 use crate::program_scheduling::{
     ArrivalTokenFacts, BackendObservationProvider, ProgramIdentity, ProgramScheduler,
-    ProgramSchedulerConfig, ProgramTarget, ScheduleError, TokenFacts, TokenizerFingerprint,
+    ProgramSchedulerConfig, ProgramTarget, ScheduleError, TokenFacts,
     VllmMetricsObservationProvider,
 };
 use crate::protocols::spec::{
@@ -61,135 +64,6 @@ pub(super) fn prepare_error_status(error: &PrepareError) -> StatusCode {
         PrepareError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         PrepareError::Invalid(_) => StatusCode::BAD_REQUEST,
     }
-}
-
-/// Identity of a tokenizer/prompt-preparation equivalence class.
-///
-/// The Engine must tokenize the same model with the same template options and
-/// the same frontend assets for a prepared count to describe Engine input. The
-/// fingerprint covers every input that changes that mapping, so a mismatch
-/// revokes exactly one class instead of disabling a whole deployment.
-/// Canonical JSON for a fingerprint: object keys sorted at every level.
-///
-/// `chat_template_kwargs` is a `HashMap`, so plain serialization would make the
-/// fingerprint depend on iteration order and silently split one equivalence
-/// class into many.
-fn canonical_json(value: &serde_json::Value) -> String {
-    fn write(value: &serde_json::Value, out: &mut String) {
-        match value {
-            serde_json::Value::Object(map) => {
-                let mut keys = map.keys().collect::<Vec<_>>();
-                keys.sort();
-                out.push('{');
-                for (index, key) in keys.into_iter().enumerate() {
-                    if index > 0 {
-                        out.push(',');
-                    }
-                    out.push_str(&serde_json::to_string(key).unwrap_or_default());
-                    out.push(':');
-                    write(&map[key], out);
-                }
-                out.push('}');
-            }
-            serde_json::Value::Array(items) => {
-                out.push('[');
-                for (index, item) in items.iter().enumerate() {
-                    if index > 0 {
-                        out.push(',');
-                    }
-                    write(item, out);
-                }
-                out.push(']');
-            }
-            other => out.push_str(&serde_json::to_string(other).unwrap_or_default()),
-        }
-    }
-    let mut out = String::new();
-    write(value, &mut out);
-    out
-}
-
-fn prepared_chat_fingerprint(
-    request: &ChatCompletionRequest,
-    encode_backend: &str,
-) -> TokenizerFingerprint {
-    let env_model = std::env::var("VLLM_ROUTER_MODEL").unwrap_or_default();
-    let env_tokenizer = std::env::var("VLLM_ROUTER_TOKENIZER").unwrap_or_default();
-    // Only inputs that change the rendered token IDs belong in the fingerprint.
-    // Per-request identity (`vllm_xargs`, `agent_hint`, session params),
-    // sampling knobs and credentials must not split one equivalence class into
-    // thousands of fingerprints.
-    let options = canonical_json(&serde_json::json!({
-        "chat_template_kwargs": request.chat_template_kwargs,
-        "add_generation_prompt": request.add_generation_prompt,
-        "continue_final_message": request.continue_final_message,
-        "add_special_tokens": request.other.get("add_special_tokens"),
-        "chat_template": request.other.get("chat_template"),
-        "tools": request.tools,
-        "functions": request.functions,
-        "tool_choice": request.tool_choice,
-        "parallel_tool_calls": request.parallel_tool_calls,
-    }));
-    TokenizerFingerprint::from_parts(&[
-        "prepared_token_ids",
-        request.model.as_deref().unwrap_or_default(),
-        &env_model,
-        &env_tokenizer,
-        &options,
-        encode_backend,
-    ])
-}
-
-/// Fingerprint for a client-supplied token-ID prompt.
-///
-/// Those IDs are forwarded verbatim, so the only way the Engine count can differ
-/// is per-request options (for example an implicit special token) or a model
-/// mix-up; both are covered here.
-fn client_token_ids_fingerprint(
-    model_id: Option<&str>,
-    model_pool: &str,
-    endpoint: &str,
-) -> TokenizerFingerprint {
-    TokenizerFingerprint::from_parts(&[
-        "client_token_ids",
-        model_pool,
-        endpoint,
-        model_id.unwrap_or_default(),
-    ])
-}
-
-/// Exact input-token count of a transparent JSON body, when its prompt is one
-/// token-ID array.
-fn exact_prompt_tokens_from_json(request: Option<&serde_json::Value>) -> Option<usize> {
-    let request = request?;
-    // The Engine must not prepend special tokens for `len(prompt)` to be the
-    // exact Engine input count.
-    if request
-        .get("add_special_tokens")
-        .and_then(serde_json::Value::as_bool)
-        != Some(false)
-    {
-        return None;
-    }
-    let array = request.get("prompt")?.as_array()?;
-    if array.is_empty() {
-        return None;
-    }
-    if !array.iter().all(|value| value.as_u64().is_some()) {
-        return None;
-    }
-    // The Engine keeps only the last N tokens; `0`/absent means no truncation.
-    // An invalid limit falls back to the estimator instead of guessing.
-    let truncate = match request.get("truncate_prompt_tokens") {
-        None => None,
-        Some(value) if value.is_null() => None,
-        Some(value) => Some(usize::try_from(value.as_u64()?).ok()?),
-    };
-    let tokens = array.len();
-    Some(match truncate {
-        Some(limit) if limit > 0 && tokens > limit => limit,
-        _ => tokens,
-    })
 }
 
 fn insert_router_stages(headers: &mut HeaderMap, stages: &serde_json::Value) {
@@ -517,16 +391,27 @@ impl SseUsageStripper {
     }
 }
 
-/// Whether one SSE line is a data frame carrying a top-level `usage`.
+/// Whether one SSE line is the final usage-only frame.
+///
+/// Only the trailing frame emitted for `stream_options.include_usage` may be
+/// removed. A backend that also attaches `usage` (possibly `null`) to ordinary
+/// deltas, or emits usage alongside non-empty `choices`, must keep those
+/// frames: dropping them would lose content, tool calls and finish reasons.
 fn is_usage_sse_line(line: &[u8]) -> bool {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     let Some(data) = line.strip_prefix(b"data:") else {
         return false;
     };
-    serde_json::from_slice::<serde_json::Value>(data.trim_ascii())
-        .ok()
-        .is_some_and(|value| value.get("usage").is_some())
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(data.trim_ascii()) else {
+        return false;
+    };
+    let has_usage = value.get("usage").is_some_and(|usage| !usage.is_null());
+    let choices_empty = value
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|choices| choices.is_empty());
+    has_usage && choices_empty
 }
 
 struct TypedDispatch<'a> {
@@ -1205,15 +1090,13 @@ impl Router {
     /// Router-side exact counting is a second tokenization, so it must not run
     /// for identity-free requests: `acquire_program_completion` would discard
     /// the fact after paying the tokenizer and possible cold model load.
-    fn program_identity_present<T: GenerationRequest>(
+    fn resolved_program_identity<T: GenerationRequest>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
         model_id: Option<&str>,
-    ) -> bool {
-        let Some(scheduler) = &self.program_scheduler else {
-            return false;
-        };
+    ) -> Option<ProgramIdentity> {
+        let scheduler = self.program_scheduler.as_ref()?;
         let model_pool = self.resolved_program_model_pool(model_id);
         let request = typed_req.extract_program_identity_payload();
         ProgramIdentity::from_request_with_enable_key(
@@ -1224,7 +1107,6 @@ impl Router {
         )
         .ok()
         .flatten()
-        .is_some()
     }
 
     /// Whether settlement can verify a prepared count against Engine usage.
@@ -1237,37 +1119,40 @@ impl Router {
             || typed_req.settlement_reports_usage()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn acquire_program_completion<T: GenerationRequest>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
         model_id: Option<&str>,
         endpoint: &str,
-        prepared: Option<&crate::backend::PreparedRequest>,
+        prepared_facts: Option<TokenFacts>,
         observable: bool,
+        identity: Option<ProgramIdentity>,
+        identity_checked: bool,
     ) -> Result<Option<ProgramCompletion>, ScheduleError> {
         let Some(scheduler) = &self.program_scheduler else {
             return Ok(None);
         };
-        let request = typed_req.extract_program_identity_payload();
         let model_pool = self.resolved_program_model_pool(model_id);
-        let Some(identity) = ProgramIdentity::from_request_with_enable_key(
-            headers,
-            request.as_ref(),
-            Some(&model_pool.scheduler_key),
-            scheduler.enable_key(),
-        )?
-        else {
-            return Ok(None);
+        let identity = match identity {
+            Some(identity) => identity,
+            None if identity_checked => return Ok(None),
+            None => {
+                let request = typed_req.extract_program_identity_payload();
+                let Some(identity) = ProgramIdentity::from_request_with_enable_key(
+                    headers,
+                    request.as_ref(),
+                    Some(&model_pool.scheduler_key),
+                    scheduler.enable_key(),
+                )?
+                else {
+                    return Ok(None);
+                };
+                identity
+            }
         };
         let input_text = typed_req.extract_text_for_program_scheduling();
-        let prepared_facts = self.prepared_token_facts(
-            typed_req.exact_input_token_count(),
-            prepared,
-            model_id,
-            &model_pool.scheduler_key,
-            endpoint,
-        );
         self.acquire_program_completion_for_identity(
             scheduler,
             identity,
@@ -1344,6 +1229,16 @@ impl Router {
         model_pool: &str,
         endpoint: &str,
     ) -> Option<TokenFacts> {
+        // Default `estimated` mode and excluded pools discard the fact, so do
+        // not pay for canonical JSON + SHA-256 (or env lookups) to build it.
+        let Some(scheduler) = &self.program_scheduler else {
+            return None;
+        };
+        if !scheduler.token_count_mode().uses_prepared_facts()
+            || !scheduler.prepared_token_pool_allowed(model_pool)
+        {
+            return None;
+        }
         if let Some(prepared) = prepared {
             let tokens = prepared.tokenized.token_ids.len();
             if tokens > 0 {
@@ -1896,9 +1791,9 @@ impl Router {
         // facts are active, ask the Engine for the usage chunk and strip it
         // again for clients that did not request it; otherwise exact mode would
         // be a no-op for the default streaming client.
-        let inject_include_usage = matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
-            && typed_req.is_stream()
-            && !typed_req.settlement_reports_usage()
+        // Resolve Program identity once; the preparation gate and acquisition
+        // would otherwise parse the same payload twice.
+        let identity_config_applies = matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
             && self.program_scheduler.as_ref().is_some_and(|scheduler| {
                 scheduler.token_count_mode().uses_prepared_facts()
                     && (scheduler.exact_text_endpoint_enabled(route)
@@ -1906,8 +1801,14 @@ impl Router {
                     && scheduler.prepared_token_pool_allowed(
                         &self.resolved_program_model_pool(model_id).scheduler_key,
                     )
-            })
-            && self.program_identity_present(headers, typed_req, model_id);
+            });
+        let resolved_identity = identity_config_applies
+            .then(|| self.resolved_program_identity(headers, typed_req, model_id))
+            .flatten();
+        let inject_include_usage = matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
+            && typed_req.is_stream()
+            && !typed_req.settlement_reports_usage()
+            && resolved_identity.is_some();
         let settlement_observable =
             self.settlement_observes_usage(pool, typed_req) || inject_include_usage;
         let exact_mode_unobservable = !settlement_observable
@@ -1927,7 +1828,7 @@ impl Router {
             // exact-mode requests whose settlement cannot observe usage (the
             // prepared fact would only be discarded as `unobservable_stream`).
             && !exact_mode_unobservable
-            && self.program_identity_present(headers, typed_req, model_id);
+            && resolved_identity.is_some();
         let prepared = match (pool, typed_req.grpc_request()) {
             (Some(crate::backend::WorkerPoolKind::Grpc), Some(GrpcRequestRef::Chat(chat)))
                 if route == "/v1/chat/completions" =>
@@ -2017,6 +1918,14 @@ impl Router {
             _ => typed_req.extract_text_for_routing(),
         };
         let text = &text;
+        // Build the token fact once per request, not per retry attempt.
+        let prepared_facts = self.prepared_token_facts(
+            typed_req.exact_input_token_count(),
+            prepared.as_ref(),
+            model_id,
+            &self.resolved_program_model_pool(model_id).scheduler_key,
+            route,
+        );
         let prepared = &prepared;
         let injected_body = &injected_body;
         let completion = completion.as_ref();
@@ -2048,6 +1957,7 @@ impl Router {
         let http_inputs = &http_inputs;
         let failed_workers = &failed_workers;
         let affinity_key = &affinity_key;
+        let resolved_identity = &resolved_identity;
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
@@ -2061,8 +1971,10 @@ impl Router {
                         typed_req,
                         model_id,
                         route,
-                        prepared.as_ref(),
+                        prepared_facts,
                         settlement_observable,
+                        resolved_identity.as_ref().cloned(),
+                        identity_config_applies,
                     )
                     .await
                 {
@@ -6102,14 +6014,25 @@ mod tests {
     }
 
     #[test]
-    fn sse_usage_stripper_drops_injected_usage_across_chunk_boundaries() {
+    fn sse_usage_stripper_only_drops_the_final_usage_only_frame() {
         let mut stripper = SseUsageStripper::default();
         let first = b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n";
         assert_eq!(stripper.push(first).as_deref(), Some(&first[..]));
+        // Ordinary deltas may carry a null `usage`, or even a usage object,
+        // next to non-empty choices; both must be preserved.
+        let null_usage =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}],\"usage\":null}\n\n";
+        assert_eq!(stripper.push(null_usage).as_deref(), Some(&null_usage[..]));
+        let usage_with_choices =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}],\"usage\":{\"prompt_tokens\":3}}\n\n";
+        assert_eq!(
+            stripper.push(usage_with_choices).as_deref(),
+            Some(&usage_with_choices[..])
+        );
+        // The final usage-only frame is dropped even when split across chunks.
         let part_a = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3";
         let part_b = b"}}\n\n";
         assert!(stripper.push(part_a).is_none());
-        // The usage data line is dropped; the blank separator still passes.
         assert_eq!(stripper.push(part_b).as_deref(), Some(&b"\n"[..]));
         assert!(stripper.finish().is_none());
     }
