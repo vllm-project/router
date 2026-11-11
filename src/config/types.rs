@@ -110,7 +110,8 @@ fn default_profile_timeout_secs() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct EpdConfig {
     pub encoder_urls: Vec<String>,
-    /// Independent Encode instance; omission inherits the complete main configuration.
+    /// Independent Encode instance. Omission inherits the complete main
+    /// configuration when compatible, or falls back to round-robin for Encode.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -125,6 +126,9 @@ pub struct EpdConfig {
 }
 
 impl EpdConfig {
+    /// Return the explicit Encode configuration or raw main-policy inheritance.
+    /// Use `ConfigValidator::resolve_encode_policy` for startup role validation
+    /// and the round-robin fallback for an incompatible inherited main policy.
     pub fn effective_encode_policy<'a>(&'a self, main: &'a PolicyConfig) -> &'a PolicyConfig {
         self.encode_policy.as_ref().unwrap_or(main)
     }
@@ -1506,8 +1510,18 @@ mod tests {
                 PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 73,
                 },
+                PolicyConfig::RendezvousHash,
             ] {
                 assert_eq!(epd.effective_encode_policy(&main), &main);
+                let resolution = ConfigValidator::resolve_encode_policy(
+                    &epd,
+                    &main,
+                    EncodePolicySource::InheritedMain,
+                    "RouterConfig.policy",
+                )
+                .unwrap();
+                assert_eq!(resolution.policy, main);
+                assert!(resolution.fallback.is_none());
             }
             assert!(epd.consumer_zmq_addrs.is_empty());
             assert!(serde_json::to_value(&epd)

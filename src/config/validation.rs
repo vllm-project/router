@@ -4,20 +4,70 @@ use crate::program_scheduling::ProgramBindingStrategy;
 /// Configuration validator
 pub struct ConfigValidator;
 
+/// The Encode policy selected after applying configuration and role rules.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncodePolicyResolution {
+    pub policy: PolicyConfig,
+    pub fallback: Option<EncodePolicyFallback>,
+}
+
+/// Details about an inherited policy replaced for the Encode role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodePolicyFallback {
+    pub inherited_policy: &'static str,
+    pub reason: &'static str,
+}
+
 impl ConfigValidator {
-    pub fn validate_encode_policy(
-        policy: &PolicyConfig,
+    /// Resolve the policy used by Encode.
+    ///
+    /// Explicit Encode policies remain strict. An unset Encode policy inherits
+    /// the main policy when it supports the Encode role; otherwise Encode uses
+    /// an independent round-robin instance while the consumer policy remains
+    /// unchanged.
+    pub fn resolve_encode_policy(
+        epd: &EpdConfig,
+        main: &PolicyConfig,
         origin: EncodePolicySource,
         main_source: &str,
-    ) -> ConfigResult<()> {
-        Self::validate_policy(policy)?;
+    ) -> ConfigResult<EncodePolicyResolution> {
+        let candidate = epd.effective_encode_policy(main);
+        Self::validate_policy(candidate)?;
         let error = match crate::policies::PolicyFactory::validate_role(
-            policy,
+            candidate,
             crate::core::WorkerType::Encode,
         ) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                return Ok(EncodePolicyResolution {
+                    policy: candidate.clone(),
+                    fallback: None,
+                })
+            }
             Err(error) => error,
         };
+
+        if epd.encode_policy.is_none() && origin == EncodePolicySource::InheritedMain {
+            return Ok(EncodePolicyResolution {
+                policy: PolicyConfig::RoundRobin,
+                fallback: Some(EncodePolicyFallback {
+                    inherited_policy: error.policy,
+                    reason: error.reason,
+                }),
+            });
+        }
+
+        Err(Self::unsupported_encode_policy_error(
+            error,
+            origin,
+            main_source,
+        ))
+    }
+
+    fn unsupported_encode_policy_error(
+        error: crate::policies::PolicyRoleError,
+        origin: EncodePolicySource,
+        main_source: &str,
+    ) -> ConfigError {
         let source = match origin {
             EncodePolicySource::ExplicitCli => {
                 "explicitly configured by --encode-policy".to_string()
@@ -29,7 +79,7 @@ impl ConfigValidator {
                 format!("inherited from {main_source} because encode_policy is unset")
             }
         };
-        Err(ConfigError::UnsupportedEncodePolicy {
+        ConfigError::UnsupportedEncodePolicy {
             policy: error.policy,
             role: error.role,
             reason: error.reason,
@@ -39,7 +89,7 @@ impl ConfigValidator {
                  set --encode-policy round_robin (or epd.encode_policy for Rust/JSON configuration)",
                 error.policy, error.reason,
             ),
-        })
+        }
     }
 
     /// Validate a complete router configuration
@@ -290,8 +340,9 @@ impl ConfigValidator {
             return Ok(());
         };
         Self::validate_policy(&config.policy)?;
-        Self::validate_encode_policy(
-            epd.effective_encode_policy(&config.policy),
+        Self::resolve_encode_policy(
+            epd,
+            &config.policy,
             if epd.encode_policy.is_some() {
                 EncodePolicySource::ExplicitJson
             } else {
@@ -1134,6 +1185,49 @@ fn base_url_without_rank(url: &str) -> &str {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_policy_inherited_fallback_preserves_validation_errors() {
+        let epd: EpdConfig = serde_json::from_str(
+            r#"{"encoder_urls":["http://encoder:8000"],"encode_policy":null}"#,
+        )
+        .unwrap();
+        for name in ["cache_aware", "kv_aware"] {
+            let mut main: PolicyConfig = name.parse().unwrap();
+            let resolution = ConfigValidator::resolve_encode_policy(
+                &epd,
+                &main,
+                EncodePolicySource::InheritedMain,
+                "RouterConfig.policy",
+            )
+            .unwrap();
+            assert_eq!(resolution.policy, PolicyConfig::RoundRobin);
+            let fallback = resolution.fallback.unwrap();
+            assert_eq!(fallback.inherited_policy, name);
+            assert!(!fallback.reason.is_empty());
+
+            // Only role incompatibility may fall back. Invalid main policy
+            // parameters must still fail, rather than be hidden by round-robin.
+            match &mut main {
+                PolicyConfig::CacheAware {
+                    cache_threshold, ..
+                } => *cache_threshold = -1.0,
+                PolicyConfig::KvAware {
+                    router_temperature, ..
+                } => *router_temperature = -1.0,
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                ConfigValidator::resolve_encode_policy(
+                    &epd,
+                    &main,
+                    EncodePolicySource::InheritedMain,
+                    "RouterConfig.policy",
+                ),
+                Err(ConfigError::InvalidValue { .. })
+            ));
+        }
+    }
 
     #[test]
     fn session_affinity_ttl_is_optional_and_bounded() {

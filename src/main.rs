@@ -107,7 +107,8 @@ struct CliArgs {
     /// E+PD or E/P/D orchestration as JSON (encoder_urls, encode_policy, consumer_zmq_addrs).
     #[arg(long)]
     epd_config: Option<String>,
-    /// Override the JSON Encode policy; unset inherits --policy in a separate instance.
+    /// Override the JSON Encode policy. When unset, inherit --policy in a separate
+    /// instance, or use round_robin with a warning if it does not support Encode.
     #[arg(long, requires = "epd_config")]
     encode_policy: Option<PolicyConfig>,
     /// Host address to bind the router server
@@ -641,8 +642,9 @@ impl CliArgs {
         let pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
 
         if let Some(epd) = &epd {
-            vllm_router_rs::config::ConfigValidator::validate_encode_policy(
-                epd.effective_encode_policy(&policy),
+            vllm_router_rs::config::ConfigValidator::resolve_encode_policy(
+                epd,
+                &policy,
                 if self.encode_policy.is_some() {
                     EncodePolicySource::ExplicitCli
                 } else if epd.encode_policy.is_some() {
@@ -897,12 +899,11 @@ mod tests {
     }
 
     #[test]
-    fn encode_policy_errors_preserve_cli_json_and_inherited_sources() {
+    fn encode_policy_errors_preserve_explicit_cli_and_json_sources() {
         for name in ["cache_aware", "kv_aware"] {
             for source in [
                 EncodePolicySource::ExplicitCli,
                 EncodePolicySource::ExplicitJson,
-                EncodePolicySource::InheritedMain,
             ] {
                 let json = if source == EncodePolicySource::ExplicitJson {
                     serde_json::json!({"encoder_urls":["http://encoder:8000"],"encode_policy":name})
@@ -940,7 +941,7 @@ mod tests {
                         assert!(message.contains(match source {
                             EncodePolicySource::ExplicitCli => "--encode-policy",
                             EncodePolicySource::ExplicitJson => "epd.encode_policy",
-                            EncodePolicySource::InheritedMain => "inherited from --policy",
+                            EncodePolicySource::InheritedMain => unreachable!(),
                         }));
                     }
                     other => panic!("{other}"),
@@ -961,6 +962,51 @@ mod tests {
                         .unwrap()
                         .effective_encode_policy(&config.policy),
                     &PolicyConfig::RoundRobin
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encode_policy_default_and_inherited_cli_keep_consumers_and_fall_back() {
+        for main_policy in [None, Some("cache_aware"), Some("kv_aware")] {
+            for json in [
+                r#"{"encoder_urls":["http://encoder:8000"]}"#,
+                r#"{"encoder_urls":["http://encoder:8000"],"encode_policy":null}"#,
+            ] {
+                let mut argv = vec![
+                    "vllm-router",
+                    "--worker-urls",
+                    "http://consumer:8000",
+                    "--epd-config",
+                    json,
+                ];
+                if let Some(name) = main_policy {
+                    argv.extend(["--policy", name]);
+                }
+                let config = CliArgs::try_parse_from(argv)
+                    .unwrap()
+                    .to_router_config(vec![])
+                    .unwrap();
+                config.validate().unwrap();
+                assert!(config.epd.as_ref().unwrap().encode_policy.is_none());
+                let consumer_policy = main_policy.unwrap_or("cache_aware");
+                assert_eq!(config.policy.name(), consumer_policy);
+                let context = vllm_router_rs::server::AppContext::new(
+                    config,
+                    reqwest::Client::new(),
+                    64,
+                    None,
+                    vec![],
+                )
+                .unwrap();
+                assert_eq!(
+                    context.policy_registry.get_encode_policy().unwrap().name(),
+                    "round_robin"
+                );
+                assert_eq!(
+                    context.policy_registry.get_default_policy().name(),
+                    consumer_policy
                 );
             }
         }

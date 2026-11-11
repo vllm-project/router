@@ -129,7 +129,7 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
 | `--epd-config` | `string` | `unset` | — | — | JSON encoder orchestration configuration for Rust E+PD or E/P/D routing. |
-| `--encode-policy` | `PolicyConfig` | `unset` | — | — | Override JSON Encode configuration with a common policy name. Requires `--epd-config`; unset/null inherits the complete main policy in an independent instance. Encode rejects `cache_aware` and `kv_aware`; use an explicit compatible override with these consumer policies. |
+| `--encode-policy` | `PolicyConfig` | `unset` | — | — | Override JSON Encode configuration with a common policy name. Requires `--epd-config`; unset/null inherits the complete main policy in an independent instance when compatible. If the inherited main policy is `cache_aware` or `kv_aware`, Encode falls back to independent `round_robin` with a startup warning; an explicit incompatible Encode policy is rejected. |
 | `--vllm-pd-disaggregation` | `flag` | `false` | `flag` | `false` | Enable vLLM prefill/decode (PD) routing. |
 | `--prefill` | `URL [PORT or none] (repeatable)` | `[]` | `string [1..] (repeatable)` | `unset` | Add one prefill URL and optional bootstrap port: `--prefill URL [PORT]`. Omit the port or pass `none` for no bootstrap port. |
 | `--decode` | `string (repeatable)` | `[]` | `string (repeatable)` | `unset` | Add one decode URL per occurrence: `--decode URL`. |
@@ -138,8 +138,9 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill KV publishers as URL=ENDPOINT[,ENDPOINT...]; requires kv_aware prefill. Endpoints follow DP-rank order; block size is 16. |
 
 Encode supports `round_robin`, `random`, `power_of_two`, `consistent_hash`, and
-`rendezvous_hash`. The default CLI main policy is `cache_aware`, so EPD now
-requires an explicit compatible Encode policy with that default. JSON accepts
+`rendezvous_hash`. The default CLI main policy is `cache_aware`; an EPD command
+without an Encode override therefore starts Encode with independent
+`round_robin` and logs a warning. JSON accepts
 legacy RR/random strings and generic names or tagged policy objects. Existing
 `virtual_nodes` and `load_check_interval_secs` fields are retained but do not
 change the fixed 160-node ring or polling interval. See [EPD configuration and

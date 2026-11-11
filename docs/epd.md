@@ -43,10 +43,12 @@ router share the Encode instance and its synchronous selection context.
 
 Configuration priority is native CLI `--encode-policy` > JSON `epd.encode_policy`
 > the complete main `RouterConfig.policy`. Omitted or null Encode configuration
-inherits the main configuration, including its parameters, and creates a separate
-instance. P/D overrides and per-model consumer policies do not change that
-resolution. `--encode-policy` requires `--epd-config` and uses the existing CLI
-policy parameters. JSON is parsed before the override: invalid JSON, unknown
+inherits the main configuration, including its parameters, when compatible with
+Encode, and creates a separate instance. An incompatible inherited policy falls
+back to independent `round_robin` with a startup warning. P/D overrides and
+per-model consumer policies do not change that resolution. `--encode-policy`
+requires `--epd-config` and uses the existing CLI policy parameters. JSON is
+parsed before the override: invalid JSON, unknown
 names, and incorrect types remain errors. A known policy that is incompatible
 with Encode may be replaced by a compatible CLI override.
 
@@ -56,27 +58,30 @@ with Encode may be replaced by a compatible CLI override.
 | `random` | One independent uniform choice per item. |
 | `power_of_two` | Compare two candidates using local in-flight HTTP batch load; no new encoder polling or item reservations. |
 | `consistent_hash`, `rendezvous_hash` | Request/session affinity within the independent Encode pool. |
-| `cache_aware` | Rejected: Encode prefix/cache affinity and initialization are not defined. |
-| `kv_aware` | Rejected: KV placement and token transfer costs do not apply to Encode. |
+| `cache_aware` | Unsupported for Encode. An explicit Encode setting fails; an inherited main setting falls back to independent `round_robin`. |
+| `kv_aware` | Unsupported for Encode. An explicit Encode setting fails; an inherited main setting falls back to independent `round_robin`. |
 
-Role compatibility is declared by each policy. Startup validation rejects an
-incompatible role before constructing any policy, including the main policy's
-cache eviction thread. A direct selector call with an unsupported role returns
-`None` before modifying state or metrics; EPD selection failure remains `503`.
+Role compatibility is declared by each policy. Explicit incompatible Encode
+configuration is rejected before constructing any policy, including the main
+policy's cache eviction thread. An inherited incompatible main policy uses
+Encode-only `round_robin` instead. A direct selector call with an unsupported
+role returns `None` before modifying state or metrics; EPD selection failure
+remains `503`.
 
 The CLI still defaults to main `cache_aware`, while Rust
-`RouterConfig::default()` still uses `random`. Thus enabling EPD without an
-Encode override on the default CLI now fails at startup. Preserve the consumer
-policy and explicitly configure Encode when using either cache-aware or
-KV-aware consumers:
+`RouterConfig::default()` still uses `random`. When EPD is enabled without an
+Encode override, an inherited policy that is incompatible with Encode falls
+back to an independent `round_robin` instance and startup emits a warning. The
+consumer keeps the configured main policy. Explicitly configured incompatible
+Encode policies remain hard errors. Invalid policy parameters also remain
+errors. These commands start with cache-aware or KV-aware consumers and
+round-robin Encode:
 
 ```bash
-vllm-router --worker-urls http://pd0:8000 --policy cache_aware \
-  --epd-config '{"encoder_urls":["http://e0:8000"]}' \
-  --encode-policy round_robin
+vllm-router --worker-urls http://pd0:8000 \
+  --epd-config '{"encoder_urls":["http://e0:8000"]}'
 vllm-router --worker-urls http://pd0:8000 --policy kv_aware \
-  --epd-config '{"encoder_urls":["http://e0:8000"]}' \
-  --encode-policy round_robin
+  --epd-config '{"encoder_urls":["http://e0:8000"]}'
 ```
 
 The KV-aware example is Regular E+PD; existing static P/D KV-aware restrictions
@@ -100,12 +105,11 @@ factories currently ignore `consistent_hash.virtual_nodes` (the ring still uses
 must be positive, but retaining them does not make them operational. Use a
 tagged object for custom parameters; parameterized policies serialize as objects.
 
-Startup errors distinguish an explicit `--encode-policy`, explicit
-`epd.encode_policy`, and inheritance from `--policy` because Encode is unset.
-Rust/JSON validation names `RouterConfig.policy` as the inherited source.
-For example, inherited `kv_aware` reports that source, the unsupported Encode
-role, its reason, and the suggestion to set `--encode-policy round_robin`.
-Explicit incompatible configurations name the override that needs correction.
+Startup errors name an explicit `--encode-policy` or `epd.encode_policy` that
+needs correction. For inherited `cache_aware` or `kv_aware`, the startup warning
+names the inherited policy, the reason it does not support Encode, and the
+`round_robin` fallback. The warning also explains that the consumer policy
+remains unchanged and how to configure Encode explicitly.
 
 A shared synchronous selection context keeps a request's RR choices consecutive
 when the candidate pool and availability are stable. Every item calls the
@@ -146,18 +150,26 @@ This revision changes public Rust source APIs. Replace
 old Rust type. For example:
 
 ```rust
-use vllm_router_rs::config::{EpdConfig, PolicyConfig};
+use vllm_router_rs::config::{ConfigValidator, EncodePolicySource, EpdConfig, PolicyConfig};
 let epd = EpdConfig {
     encoder_urls: vec!["http://encoder:8000".into()],
     encode_policy: Some(PolicyConfig::Random),
     consumer_zmq_addrs: Default::default(),
 };
 let main = PolicyConfig::RoundRobin;
-let effective: &PolicyConfig = epd.effective_encode_policy(&main);
+let resolution = ConfigValidator::resolve_encode_policy(
+    &epd,
+    &main,
+    EncodePolicySource::ExplicitJson,
+    "RouterConfig.policy",
+)?;
+let effective: &PolicyConfig = &resolution.policy;
 ```
 
 `effective_encode_policy()` becomes `effective_encode_policy(&main_policy)` and
-returns a configuration reference. `PolicyRegistry::set_encode_policy` takes
+returns the configured value or the raw main-policy inheritance reference.
+Runtime startup resolves an inherited `cache_aware` or `kv_aware` policy to an
+independent `round_robin` Encode instance. `PolicyRegistry::set_encode_policy` takes
 `&PolicyConfig` and returns `Result<(), PolicyRoleError>`;
 `get_encode_policy` returns `Option<Arc<dyn LoadBalancingPolicy>>` with no
 consumer fallback. Non-EPD registries leave that slot empty.

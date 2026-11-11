@@ -94,8 +94,31 @@ impl AppContext {
         // only registers its consumers, and Encode does not affect their
         // per-model policy counts. Cloned contexts share these worker objects.
         if let Some(epd) = &router_config.epd {
+            // validate_epd already checked role compatibility before creating
+            // any policy. Use the same resolution for the actual Encode slot.
+            let encode_resolution = crate::config::ConfigValidator::resolve_encode_policy(
+                epd,
+                &router_config.policy,
+                if epd.encode_policy.is_some() {
+                    crate::config::EncodePolicySource::ExplicitJson
+                } else {
+                    crate::config::EncodePolicySource::InheritedMain
+                },
+                "RouterConfig.policy",
+            )
+            .map_err(|error| error.to_string())?;
+            if let Some(fallback) = &encode_resolution.fallback {
+                warn!(
+                    inherited_policy = fallback.inherited_policy,
+                    fallback_policy = encode_resolution.policy.name(),
+                    reason = fallback.reason,
+                    "Encode policy is unset and the inherited main policy does not support Encode; \
+                     using independent round_robin for Encode. Consumer policy remains unchanged. \
+                     Set --encode-policy or epd.encode_policy to select Encode explicitly"
+                );
+            }
             policy_registry
-                .set_encode_policy(epd.effective_encode_policy(&router_config.policy))
+                .set_encode_policy(&encode_resolution.policy)
                 .map_err(|error| error.to_string())?;
             let cb = router_config.effective_circuit_breaker_config();
             let circuit_breaker = CircuitBreakerConfig {
@@ -1409,63 +1432,61 @@ mod tests {
     }
 
     #[test]
-    fn context_rejects_incompatible_encode_configuration_before_construction() {
+    fn context_falls_back_for_inherited_incompatible_encode_configuration() {
         use crate::config::{EncodePolicySource, PolicyConfig};
         for policy in ["cache_aware", "kv_aware"] {
-            for explicit in [false, true] {
-                let mut config = RouterConfig {
-                    policy: policy.parse().unwrap(),
-                    epd: Some(
-                        serde_json::from_value(
-                            serde_json::json!({"encoder_urls": ["http://encoder:8000"]}),
-                        )
-                        .unwrap(),
-                    ),
-                    ..RouterConfig::default()
-                };
-                if explicit {
-                    config.epd.as_mut().unwrap().encode_policy = Some(config.policy.clone());
+            let inherited_config = RouterConfig {
+                policy: policy.parse().unwrap(),
+                epd: Some(
+                    serde_json::from_value(
+                        serde_json::json!({"encoder_urls": ["http://encoder:8000"]}),
+                    )
+                    .unwrap(),
+                ),
+                ..RouterConfig::default()
+            };
+            crate::config::ConfigValidator::validate_epd(&inherited_config).unwrap();
+            let context =
+                AppContext::new(inherited_config.clone(), Client::new(), 64, None, vec![]).unwrap();
+            assert_eq!(
+                context.policy_registry.get_encode_policy().unwrap().name(),
+                "round_robin"
+            );
+            assert_eq!(context.policy_registry.get_default_policy().name(), policy);
+
+            let mut explicit_config = inherited_config;
+            explicit_config.epd.as_mut().unwrap().encode_policy = Some(policy.parse().unwrap());
+            let error = crate::config::ConfigValidator::validate_epd(&explicit_config).unwrap_err();
+            match error {
+                crate::config::ConfigError::UnsupportedEncodePolicy {
+                    policy: name,
+                    role,
+                    reason,
+                    origin,
+                    message,
+                } => {
+                    assert_eq!(name, policy);
+                    assert_eq!(role, WorkerType::Encode);
+                    assert!(!reason.is_empty());
+                    assert_eq!(origin, EncodePolicySource::ExplicitJson);
+                    assert!(message.contains("epd.encode_policy"));
                 }
-                let error = crate::config::ConfigValidator::validate_epd(&config).unwrap_err();
-                match error {
-                    crate::config::ConfigError::UnsupportedEncodePolicy {
-                        policy: name,
-                        role,
-                        reason,
-                        origin,
-                        message,
-                    } => {
-                        assert_eq!(name, policy);
-                        assert_eq!(role, WorkerType::Encode);
-                        assert!(!reason.is_empty());
-                        assert_eq!(
-                            origin,
-                            if explicit {
-                                EncodePolicySource::ExplicitJson
-                            } else {
-                                EncodePolicySource::InheritedMain
-                            }
-                        );
-                        assert!(message.contains(if explicit {
-                            "epd.encode_policy"
-                        } else {
-                            "RouterConfig.policy"
-                        }));
-                    }
-                    other => panic!("{other}"),
-                }
-                assert!(
-                    AppContext::new(config.clone(), Client::new(), 64, None, vec![])
-                        .err()
-                        .unwrap()
-                        .contains("unsupported for Encode")
-                );
-                config.epd.as_mut().unwrap().encode_policy = Some(PolicyConfig::RoundRobin);
-                assert!(AppContext::new(config.clone(), Client::new(), 64, None, vec![]).is_ok());
-                config.epd = None;
-                let context = AppContext::new(config, Client::new(), 64, None, vec![]).unwrap();
-                assert!(context.policy_registry.get_encode_policy().is_none());
+                other => panic!("{other}"),
             }
+            assert!(
+                AppContext::new(explicit_config.clone(), Client::new(), 64, None, vec![])
+                    .err()
+                    .unwrap()
+                    .contains("unsupported for Encode")
+            );
+            explicit_config.epd.as_mut().unwrap().encode_policy = Some(PolicyConfig::RoundRobin);
+            assert!(
+                AppContext::new(explicit_config.clone(), Client::new(), 64, None, vec![]).is_ok()
+            );
+            explicit_config.epd = None;
+            let context =
+                AppContext::new(explicit_config, Client::new(), 64, None, vec![]).unwrap();
+            assert!(context.policy_registry.get_encode_policy().is_none());
         }
     }
 
