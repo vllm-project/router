@@ -56,13 +56,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          {
-            echo 'CI unit tests failed; tail of `unit-tests.log`:'
-            echo '```'
-            tail -200 unit-tests.log
-            echo '```'
-          } > failure.md
-          gh pr comment 460 --body-file failure.md
+          python3 - <<'PY'
+          import json, os
+          log = open("unit-tests.log", errors="replace").read()
+          body = "CI-UNIT-LOG\n\n```\n" + log[-30000:] + "\n```"
+          with open("payload.json", "w") as payload:
+              json.dump({"body": body}, payload)
+          PY
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/460/comments" \
+            -d @payload.json
       - name: Integration tests
         run: |
           set -o pipefail
