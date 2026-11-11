@@ -44,7 +44,11 @@ jobs:
       - name: Surface unit test failures
         if: failure()
         run: |
-          grep -A30 '^failures:' unit-tests.log | head -40 | sed 's/^/::error::/' || true
+          if grep -q '^failures:' unit-tests.log; then
+            grep -A30 '^failures:' unit-tests.log | head -40 | sed 's/^/::error::/'
+          else
+            tail -80 unit-tests.log | sed 's/^/::error::/'
+          fi
       - name: Integration tests
         run: |
           set -o pipefail
