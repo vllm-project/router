@@ -25,6 +25,14 @@ pub struct RouterConfig {
     pub connection_mode: ConnectionMode,
     /// Policy configuration
     pub policy: PolicyConfig,
+    /// Optional separate policy for prefill workers in PD mode.
+    /// Stored independently of `RoutingMode` so IGW mode can use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_policy: Option<PolicyConfig>,
+    /// Optional separate policy for decode workers in PD mode.
+    /// Stored independently of `RoutingMode` so IGW mode can use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_policy: Option<PolicyConfig>,
     /// Server host address
     pub host: String,
     /// Server port
@@ -1302,6 +1310,8 @@ impl Default for RouterConfig {
             },
             pd_kv_event_sources: HashMap::new(),
             policy: PolicyConfig::Random,
+            prefill_policy: None,
+            decode_policy: None,
             host: "127.0.0.1".to_string(),
             port: 3001,
             max_payload_size: 536_870_912, // 512MB
@@ -2084,6 +2094,8 @@ mod tests {
             policy: PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 30,
             },
+            prefill_policy: None,
+            decode_policy: None,
             host: "0.0.0.0".to_string(),
             port: 3000,
             max_payload_size: 1048576,
@@ -2154,6 +2166,8 @@ mod tests {
                 eviction_interval_secs: 600,
                 max_tree_size: 10000,
             },
+            prefill_policy: None,
+            decode_policy: None,
             host: "0.0.0.0".to_string(),
             port: 3001,
             max_payload_size: 536870912,
@@ -2215,6 +2229,8 @@ mod tests {
             },
             pd_kv_event_sources: Default::default(),
             policy: PolicyConfig::RoundRobin,
+            prefill_policy: None,
+            decode_policy: None,
             host: "::1".to_string(), // IPv6
             port: 8888,
             max_payload_size: 1024 * 1024 * 512, // 512MB
