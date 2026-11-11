@@ -86,6 +86,7 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | `--kv-event-replay-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Replay endpoint(s) for a static KV-event source, same `WORKER_URL=ENDPOINT[,ENDPOINT...]` form. |
 | `--kv-event-block-size` | `u32` | `16` | `integer` | `16` | KV cache block size in tokens for workers registered through `--kv-event-source`. |
 | `--kv-event-model` | `string` | `unset` | `string` | `unset` | Model id advertised to static KV-event sources; `unset` keeps the served model id. |
+| `--kv-hybrid-layout` | `std::path::PathBuf` | `unset` | — | — | Cache layout JSON for hybrid attention models, keyed by worker URL. See [hybrid attention models](load_balancing/http_completion_kv.md#hybrid-attention-models). |
 
 The Rust CLI requires worker URLs in regular mode unless service discovery is
 enabled. The Python launcher permits an empty worker list without service

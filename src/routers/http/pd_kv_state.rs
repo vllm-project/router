@@ -365,7 +365,10 @@ impl PdKvState {
     async fn probe_base(&self, base: &str) -> Result<Discovery, String> {
         let worker = self.supervisor.discover(base).await;
         let info = worker.server_info.as_ref().map_err(Clone::clone)?;
-        let sources = worker.sources.as_ref().map_err(Clone::clone)?;
+        let sources = worker
+            .sources
+            .as_ref()
+            .map_err(|unavailable| unavailable.detail.clone())?;
         let mut sources: Vec<_> = sources.iter().collect();
         sources.sort_by(|left, right| left.0.cmp(right.0));
         let signature = format!("{info:?}:{sources:?}");

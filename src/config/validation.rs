@@ -792,7 +792,38 @@ impl ConfigValidator {
                     .is_some_and(|discovery| discovery.enabled)
                 {
                     for worker in static_kv_event_sources.keys() {
-                        if !worker_urls.contains(worker) {
+                        // A DP-aware worker is configured as `base@rank`, while
+                        // one event-source entry covers every rank of that
+                        // base URL. Accept either the exact URL, the base of a
+                        // rank-pinned key, or a rank-pinned entry of this base.
+                        let exact = worker_urls.iter().any(|url| url == worker);
+                        let covers_ranks = worker_urls.iter().any(|url| {
+                            url.strip_prefix(worker.as_str())
+                                .is_some_and(|suffix| suffix.starts_with('@'))
+                        });
+                        let rank_pinned_under_base = !exact
+                            && worker_urls.iter().any(|url| {
+                                !url.contains('@')
+                                    && worker
+                                        .strip_prefix(url.as_str())
+                                        .is_some_and(|suffix| suffix.starts_with('@'))
+                            });
+                        if rank_pinned_under_base {
+                            // The KV index resolves static sources by exact
+                            // worker URL, so a rank-pinned declaration under a
+                            // plain base URL is accepted here and then never
+                            // applied. Ask for the rank-pinned URLs instead of
+                            // silently disabling the source.
+                            return Err(ConfigError::ValidationFailed {
+                                reason: format!(
+                                    "static KV event source '{worker}' is rank-pinned but \
+                                     --worker-urls configures only its base URL; declare the \
+                                     source under that base URL with one entry per rank, or \
+                                     enable discovery"
+                                ),
+                            });
+                        }
+                        if !exact && !covers_ranks {
                             return Err(ConfigError::ValidationFailed {
                                 reason: format!(
                                     "static KV event source worker '{worker}' is not in --worker-urls"
@@ -862,6 +893,30 @@ impl ConfigValidator {
 
         // DP-aware routing is now automatically enabled when data_parallel_size > 1
         // and is compatible with service discovery
+
+        // `base@rank` in --worker-urls is a per-rank address, not a URL: a
+        // worker is created per rank only by intra-node DP. Treating it as a
+        // plain URL silently requests `http://0.0.0.0/...` because `@rank`
+        // parses as URL userinfo, so refuse it instead.
+        if config.intra_node_data_parallel_size == 1 {
+            if let RoutingMode::Regular { worker_urls } = &config.mode {
+                if let Some(url) = worker_urls.iter().find(|url| {
+                    // gRPC worker URLs use the same suffix for a pinned rank.
+                    let is_http = url.starts_with("http://") || url.starts_with("https://");
+                    is_http
+                        && url.rsplit_once('@').is_some_and(|(base, rank)| {
+                            !base.is_empty() && !rank.is_empty() && rank.parse::<u32>().is_ok()
+                        })
+                }) {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: format!(
+                            "worker URL '{url}' pins a data-parallel rank; declare the base URL \
+                             and set --intra-node-data-parallel-size to the number of ranks"
+                        ),
+                    });
+                }
+            }
+        }
 
         // MoRI-IO requires service discovery: ZMQ addresses are obtained via instance
         // registration and are not available in direct URL mode.
@@ -1056,6 +1111,27 @@ mod tests {
             config.kv_aware_session_affinity_ttl_secs = Some(ttl);
             assert!(ConfigValidator::validate(&config).is_err());
         }
+    }
+
+    #[test]
+    fn rank_pinned_worker_url_requires_data_parallel_size() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000@1".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(
+            error.to_string().contains("pins a data-parallel rank"),
+            "{error}"
+        );
+
+        config.intra_node_data_parallel_size = 2;
+        config.mode = RoutingMode::Regular {
+            worker_urls: vec!["http://worker:8000".to_string()],
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]
