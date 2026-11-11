@@ -64,7 +64,7 @@
 
 use super::{
     get_healthy_worker_indices, CacheAwareConfig, KvRequestTokens, LoadBalancingPolicy,
-    RequestHeaders, SelectionContext,
+    RequestHeaders, SelectionContext, WorkerTokenInputs,
 };
 use crate::core::{Worker, WorkerLoadGuard};
 use crate::metrics::RouterMetrics;
@@ -94,7 +94,7 @@ pub struct CacheAwarePlacement {
 }
 
 /// Prefix matching prepared before PD admission; selection samples fresh load.
-pub(crate) struct PreparedCacheSelection {
+pub struct PreparedCacheSelection {
     tree: Arc<Tree>,
     candidates: HashMap<String, (Vec<Arc<str>>, f64)>,
 }
@@ -620,6 +620,29 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
     fn name(&self) -> &'static str {
         "cache_aware"
+    }
+
+    /// Re-running needs the prefix selection prepared at admission; without it
+    /// the request body would have to be carried across the Prefill.
+    fn can_redecide_at_dispatch(&self, decode_cache_ready: bool) -> bool {
+        decode_cache_ready
+    }
+
+    fn prepare_cache_selection(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        tokens: &WorkerTokenInputs,
+        model_id: Option<&str>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+    ) -> Option<PreparedCacheSelection> {
+        self.prepare_selection(
+            workers,
+            KvRequestTokens::PerWorker(tokens),
+            model_id,
+            lora_name,
+            cache_salt,
+        )
     }
 
     fn needs_cache_routing_key(&self) -> bool {
