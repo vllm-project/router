@@ -176,6 +176,16 @@ impl RouterManager {
         // Add configuration to labels
         labels.insert("model_id".to_string(), model_id.clone());
 
+        // vLLM selects adapters through the request's `model`, so record which
+        // other names are base-model aliases: the remaining names are adapters,
+        // whose blocks the engine caches under a separate identity.
+        if !labels.contains_key("served_model_aliases") {
+            let aliases = self.query_served_model_aliases(&config.url).await;
+            if !aliases.is_empty() {
+                labels.insert("served_model_aliases".to_string(), aliases.join(","));
+            }
+        }
+
         if let Some(priority) = config.priority {
             labels.insert("priority".to_string(), priority.to_string());
         }
@@ -330,6 +340,24 @@ impl RouterManager {
         self.worker_registry
             .get_by_url(url)
             .map(|w| self.worker_to_info("unknown", &w))
+    }
+
+    /// Names the engine serves as base-model aliases (`--served-model-name`).
+    /// Best effort: when the probe fails the aliases stay unknown, which only
+    /// makes adapter detection stricter.
+    async fn query_served_model_aliases(&self, url: &str) -> Vec<String> {
+        if crate::backend::is_grpc_url(url) {
+            return Vec::new();
+        }
+        match tokio::time::timeout(
+            Duration::from_millis(1500),
+            crate::kv_index::discovery::query_pd_server_info(&self.client, url, None),
+        )
+        .await
+        {
+            Ok(Ok(info)) => info.served_model_aliases,
+            _ => Vec::new(),
+        }
     }
 
     /// Query model identity through OpenAI `/v1/models` or the gRPC control API.
