@@ -5,6 +5,43 @@ use crate::program_scheduling::ProgramBindingStrategy;
 pub struct ConfigValidator;
 
 impl ConfigValidator {
+    pub fn validate_encode_policy(
+        policy: &PolicyConfig,
+        origin: EncodePolicySource,
+        main_source: &str,
+    ) -> ConfigResult<()> {
+        Self::validate_policy(policy)?;
+        let error = match crate::policies::PolicyFactory::validate_role(
+            policy,
+            crate::core::WorkerType::Encode,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let source = match origin {
+            EncodePolicySource::ExplicitCli => {
+                "explicitly configured by --encode-policy".to_string()
+            }
+            EncodePolicySource::ExplicitJson => {
+                "explicitly configured by epd.encode_policy".to_string()
+            }
+            EncodePolicySource::InheritedMain => {
+                format!("inherited from {main_source} because encode_policy is unset")
+            }
+        };
+        Err(ConfigError::UnsupportedEncodePolicy {
+            policy: error.policy,
+            role: error.role,
+            reason: error.reason,
+            origin,
+            message: format!(
+                "Encode policy '{}' {source} is unsupported for Encode: {}; \
+                 set --encode-policy round_robin (or epd.encode_policy for Rust/JSON configuration)",
+                error.policy, error.reason,
+            ),
+        })
+    }
+
     /// Validate a complete router configuration
     pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
         if let Some(ttl_secs) = config.kv_aware_session_affinity_ttl_secs {
@@ -252,6 +289,16 @@ impl ConfigValidator {
         let Some(epd) = &config.epd else {
             return Ok(());
         };
+        Self::validate_policy(&config.policy)?;
+        Self::validate_encode_policy(
+            epd.effective_encode_policy(&config.policy),
+            if epd.encode_policy.is_some() {
+                EncodePolicySource::ExplicitJson
+            } else {
+                EncodePolicySource::InheritedMain
+            },
+            "RouterConfig.policy",
+        )?;
         let worker_urls: Vec<&String> = match &config.mode {
             RoutingMode::Regular { worker_urls } => worker_urls.iter().collect(),
             RoutingMode::VllmPrefillDecode {

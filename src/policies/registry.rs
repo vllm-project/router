@@ -9,7 +9,7 @@ use super::{
     KvAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy,
     RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
 };
-use crate::config::types::{EncodePolicy, PolicyConfig};
+use crate::config::types::PolicyConfig;
 use crate::core::{Worker, WorkerType};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -29,7 +29,8 @@ pub struct PolicyRegistry {
     default_policy: Arc<dyn LoadBalancingPolicy>,
 
     /// Router-wide Encode policy, always independent of consumer policies.
-    encode_policy: Arc<RwLock<Arc<dyn LoadBalancingPolicy>>>,
+    encode_policy: Arc<RwLock<Option<Arc<dyn LoadBalancingPolicy>>>>,
+    encode_selection_context: Arc<super::SelectionContext>,
 
     /// Prefill policy for PD mode
     prefill_policy: Arc<RwLock<Option<Arc<dyn LoadBalancingPolicy>>>>,
@@ -61,9 +62,8 @@ impl PolicyRegistry {
             model_policies: Arc::new(RwLock::new(HashMap::new())),
             model_worker_counts: Arc::new(RwLock::new(HashMap::new())),
             default_policy,
-            encode_policy: Arc::new(RwLock::new(Self::create_encode_policy(
-                EncodePolicy::default(),
-            ))),
+            encode_policy: Arc::new(RwLock::new(None)),
+            encode_selection_context: Arc::new(super::SelectionContext::default()),
             prefill_policy: Arc::new(RwLock::new(None)),
             decode_policy: Arc::new(RwLock::new(None)),
             kv_affinity_table,
@@ -369,21 +369,24 @@ impl PolicyRegistry {
         self.kv_affinity_table.clear();
     }
 
-    fn create_encode_policy(config: EncodePolicy) -> Arc<dyn LoadBalancingPolicy> {
-        match config {
-            EncodePolicy::RoundRobin => Arc::new(RoundRobinPolicy::new()),
-            EncodePolicy::Random => Arc::new(RandomPolicy::new()),
-        }
+    /// Configure a separate E instance through the common factory. Replacement
+    /// and item selection share the context-before-slot lock order.
+    pub fn set_encode_policy(&self, config: &PolicyConfig) -> Result<(), super::PolicyRoleError> {
+        super::PolicyFactory::validate_role(config, WorkerType::Encode)?;
+        let policy = super::PolicyFactory::create_from_config(config);
+        self.encode_selection_context.with_selection(|| {
+            *self.encode_policy.write().unwrap() = Some(policy);
+        });
+        Ok(())
     }
 
-    /// Configure the independent E slot using only supported Encode policies.
-    pub fn set_encode_policy(&self, config: EncodePolicy) {
-        *self.encode_policy.write().unwrap() = Self::create_encode_policy(config);
+    /// No consumer fallback: non-EPD registries leave this slot empty.
+    pub fn get_encode_policy(&self) -> Option<Arc<dyn LoadBalancingPolicy>> {
+        self.encode_policy.read().unwrap().as_ref().map(Arc::clone)
     }
 
-    /// Get the E policy instance without falling back to any consumer policy.
-    pub fn get_encode_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
-        Arc::clone(&self.encode_policy.read().unwrap())
+    pub fn get_encode_selection_context(&self) -> Arc<super::SelectionContext> {
+        Arc::clone(&self.encode_selection_context)
     }
 
     /// Set the prefill policy for PD mode
@@ -432,28 +435,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encode_default_never_inherits_global_or_pd_policy() {
-        for global in [
+    fn encode_slot_is_optional_and_uses_independent_instances() {
+        for config in [
             PolicyConfig::Random,
             PolicyConfig::RoundRobin,
             PolicyConfig::RendezvousHash,
-            PolicyConfig::CacheAware {
-                cache_threshold: 0.3,
-                balance_abs_threshold: 64,
-                balance_rel_threshold: 1.5,
-                eviction_interval_secs: 120,
-                max_tree_size: 1000,
+            PolicyConfig::ConsistentHash { virtual_nodes: 317 },
+            PolicyConfig::PowerOfTwo {
+                load_check_interval_secs: 73,
             },
         ] {
-            let registry = PolicyRegistry::new(global);
-            let encode = registry.get_encode_policy();
-            assert_eq!(encode.name(), "round_robin");
+            let registry = PolicyRegistry::new(config.clone());
+            assert!(registry.get_encode_policy().is_none());
+            registry.set_encode_policy(&config).unwrap();
+            let encode = registry.get_encode_policy().unwrap();
+            assert_eq!(encode.name(), config.name());
             assert!(!Arc::ptr_eq(&encode, &registry.get_default_policy()));
             assert!(!Arc::ptr_eq(&encode, &registry.get_prefill_policy()));
             assert!(!Arc::ptr_eq(&encode, &registry.get_decode_policy()));
+            let clone = registry.clone();
+            assert!(Arc::ptr_eq(
+                &registry.get_encode_selection_context(),
+                &clone.get_encode_selection_context()
+            ));
             registry.set_prefill_policy(Arc::new(RandomPolicy::new()));
             registry.set_decode_policy(Arc::new(RoundRobinPolicy::new()));
-            assert!(Arc::ptr_eq(&encode, &registry.get_encode_policy()));
+            assert!(Arc::ptr_eq(&encode, &clone.get_encode_policy().unwrap()));
         }
     }
 
@@ -467,18 +474,66 @@ mod tests {
             })
             .collect();
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry
+            .set_encode_policy(&PolicyConfig::RoundRobin)
+            .unwrap();
         let global = registry.get_default_policy();
-        let encode = registry.get_encode_policy();
-        assert_eq!(global.select_worker(&workers, None), Some(0));
+        let encode = registry.get_encode_policy().unwrap();
+        let prefill: Vec<Arc<dyn Worker>> = ["http://p0", "http://p1"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new(
+                    url.into(),
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let decode: Vec<Arc<dyn Worker>> = ["http://d0", "http://d1"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new(url.into(), WorkerType::Decode)) as Arc<dyn Worker>
+            })
+            .collect();
+        registry.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
+        registry.set_decode_policy(Arc::new(RoundRobinPolicy::new()));
         assert_eq!(encode.select_worker(&workers, None), Some(0));
-        global.reset();
-        let cloned = registry.clone();
-        assert!(Arc::ptr_eq(&encode, &cloned.get_encode_policy()));
         assert_eq!(
-            cloned.get_encode_policy().select_worker(&workers, None),
+            registry.get_prefill_policy().select_worker(&prefill, None),
+            Some(0)
+        );
+        assert_eq!(
+            registry.get_decode_policy().select_worker(&decode, None),
+            Some(0)
+        );
+        let cloned = registry.clone();
+        assert!(Arc::ptr_eq(&encode, &cloned.get_encode_policy().unwrap()));
+        assert_eq!(
+            cloned
+                .get_encode_policy()
+                .unwrap()
+                .select_worker(&workers, None),
             Some(1)
         );
-        assert_eq!(global.select_worker(&workers, None), Some(0));
+        assert_eq!(
+            registry.get_prefill_policy().select_worker(&prefill, None),
+            Some(1)
+        );
+        assert_eq!(
+            registry.get_decode_policy().select_worker(&decode, None),
+            Some(1)
+        );
+        assert_eq!(global.select_worker(&prefill, None), Some(0));
+        let other = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        other.set_encode_policy(&PolicyConfig::RoundRobin).unwrap();
+        assert_eq!(
+            other
+                .get_encode_policy()
+                .unwrap()
+                .select_worker(&workers, None),
+            Some(0)
+        );
     }
 
     #[test]
@@ -486,20 +541,25 @@ mod tests {
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let cloned = registry.clone();
         let global = registry.get_default_policy();
-        registry.set_encode_policy(EncodePolicy::Random);
-        let encode = registry.get_encode_policy();
+        registry.set_encode_policy(&PolicyConfig::Random).unwrap();
+        let encode = registry.get_encode_policy().unwrap();
         assert_eq!(encode.name(), "random");
-        assert!(Arc::ptr_eq(&encode, &cloned.get_encode_policy()));
+        assert!(Arc::ptr_eq(&encode, &cloned.get_encode_policy().unwrap()));
         assert!(Arc::ptr_eq(&global, &registry.get_default_policy()));
         assert!(registry.get_worker_counts().is_empty());
         assert!(registry.get_all_mappings().is_empty());
         registry.on_worker_added("model", None);
         registry.on_worker_removed("model");
         registry.clear();
-        assert!(Arc::ptr_eq(&encode, &registry.get_encode_policy()));
-        registry.set_encode_policy(EncodePolicy::RoundRobin);
-        assert_eq!(registry.get_encode_policy().name(), "round_robin");
-        assert!(!Arc::ptr_eq(&registry.get_encode_policy(), &global));
+        assert!(Arc::ptr_eq(&encode, &registry.get_encode_policy().unwrap()));
+        registry
+            .set_encode_policy(&PolicyConfig::RoundRobin)
+            .unwrap();
+        assert_eq!(registry.get_encode_policy().unwrap().name(), "round_robin");
+        assert!(!Arc::ptr_eq(
+            &registry.get_encode_policy().unwrap(),
+            &global
+        ));
     }
 
     #[test]
@@ -512,8 +572,8 @@ mod tests {
             })
             .collect();
         let registry = PolicyRegistry::new(PolicyConfig::RendezvousHash);
-        registry.set_encode_policy(EncodePolicy::Random);
-        let policy = registry.get_encode_policy();
+        registry.set_encode_policy(&PolicyConfig::Random).unwrap();
+        let policy = registry.get_encode_policy().unwrap();
         workers[0].set_healthy(false);
         for _ in 0..8 {
             assert_eq!(policy.select_worker(&workers, None), Some(1));

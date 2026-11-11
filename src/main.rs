@@ -1,9 +1,9 @@
 use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig, EncodePolicy, EpdConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
+    EncodePolicySource, EpdConfig, HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources,
+    PolicyConfig, ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -107,9 +107,9 @@ struct CliArgs {
     /// E+PD or E/P/D orchestration as JSON (encoder_urls, encode_policy, consumer_zmq_addrs).
     #[arg(long)]
     epd_config: Option<String>,
-    /// Override the JSON Encode policy (round_robin or random; defaults to round_robin).
+    /// Override the JSON Encode policy; unset inherits --policy in a separate instance.
     #[arg(long, requires = "epd_config")]
-    encode_policy: Option<EncodePolicy>,
+    encode_policy: Option<PolicyConfig>,
     /// Host address to bind the router server
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -441,34 +441,27 @@ impl CliArgs {
     }
 
     /// Convert policy string to PolicyConfig
-    fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
-        match policy_str {
-            "random" => PolicyConfig::Random,
-            "round_robin" => PolicyConfig::RoundRobin,
-            "cache_aware" => PolicyConfig::CacheAware {
+    fn parse_policy(&self, policy_str: &str) -> ConfigResult<PolicyConfig> {
+        let policy: PolicyConfig = policy_str
+            .parse()
+            .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+        Ok(match policy {
+            PolicyConfig::CacheAware { .. } => PolicyConfig::CacheAware {
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,
                 balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
             },
-            "kv_aware" => PolicyConfig::KvAware {
+            PolicyConfig::KvAware { .. } => PolicyConfig::KvAware {
                 router_temperature: self.router_temperature,
                 kv_penalty_host: self.kv_penalty_host,
                 kv_penalty_external: self.kv_penalty_external,
                 kv_penalty_disk: self.kv_penalty_disk,
                 static_kv_event_sources: Box::default(),
             },
-            "power_of_two" => PolicyConfig::PowerOfTwo {
-                load_check_interval_secs: 5, // Default value
-            },
-            "consistent_hash" => PolicyConfig::ConsistentHash {
-                virtual_nodes: 160, // Default value
-            },
-            "sticky_least_loaded" => PolicyConfig::StickyLeastLoaded,
-            "rendezvous_hash" => PolicyConfig::RendezvousHash,
-            _ => PolicyConfig::RoundRobin, // Fallback
-        }
+            other => other,
+        })
     }
 
     fn parse_pd_kv_events(specs: &[String]) -> ConfigResult<HashMap<String, PdKvEventSources>> {
@@ -500,8 +493,8 @@ impl CliArgs {
                 reason: format!("Invalid --epd-config: {e}"),
             })?;
         if let Some(epd) = &mut epd {
-            if let Some(policy) = self.encode_policy {
-                epd.encode_policy = Some(policy);
+            if let Some(policy) = &self.encode_policy {
+                epd.encode_policy = Some(self.parse_policy(policy.name())?);
             }
         }
         // Determine routing mode
@@ -565,8 +558,16 @@ impl CliArgs {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: prefill_urls.clone(),
                 decode_urls: final_decode_urls,
-                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
-                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
+                prefill_policy: self
+                    .prefill_policy
+                    .as_ref()
+                    .map(|p| self.parse_policy(p))
+                    .transpose()?,
+                decode_policy: self
+                    .decode_policy
+                    .as_ref()
+                    .map(|p| self.parse_policy(p))
+                    .transpose()?,
                 discovery_address: self.vllm_discovery_address.clone(),
             }
         } else {
@@ -583,7 +584,7 @@ impl CliArgs {
         };
 
         // Main policy
-        let mut policy = self.parse_policy(&self.policy);
+        let mut policy = self.parse_policy(&self.policy)?;
         if let PolicyConfig::KvAware {
             static_kv_event_sources: configured,
             ..
@@ -639,6 +640,19 @@ impl CliArgs {
 
         let pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
 
+        if let Some(epd) = &epd {
+            vllm_router_rs::config::ConfigValidator::validate_encode_policy(
+                epd.effective_encode_policy(&policy),
+                if self.encode_policy.is_some() {
+                    EncodePolicySource::ExplicitCli
+                } else if epd.encode_policy.is_some() {
+                    EncodePolicySource::ExplicitJson
+                } else {
+                    EncodePolicySource::InheritedMain
+                },
+                "--policy",
+            )?;
+        }
         // Build RouterConfig
         Ok(RouterConfig {
             epd,
@@ -883,18 +897,112 @@ mod tests {
     }
 
     #[test]
+    fn encode_policy_errors_preserve_cli_json_and_inherited_sources() {
+        for name in ["cache_aware", "kv_aware"] {
+            for source in [
+                EncodePolicySource::ExplicitCli,
+                EncodePolicySource::ExplicitJson,
+                EncodePolicySource::InheritedMain,
+            ] {
+                let json = if source == EncodePolicySource::ExplicitJson {
+                    serde_json::json!({"encoder_urls":["http://encoder:8000"],"encode_policy":name})
+                } else {
+                    serde_json::json!({"encoder_urls":["http://encoder:8000"]})
+                };
+                let mut argv = vec![
+                    "vllm-router".to_owned(),
+                    "--worker-urls".into(),
+                    "http://consumer:8000".into(),
+                    "--policy".into(),
+                    name.into(),
+                    "--epd-config".into(),
+                    json.to_string(),
+                ];
+                if source == EncodePolicySource::ExplicitCli {
+                    argv.extend(["--encode-policy".into(), name.into()]);
+                }
+                let error = CliArgs::try_parse_from(&argv)
+                    .unwrap()
+                    .to_router_config(vec![])
+                    .unwrap_err();
+                match error {
+                    ConfigError::UnsupportedEncodePolicy {
+                        policy,
+                        role,
+                        reason,
+                        origin,
+                        message,
+                    } => {
+                        assert_eq!(policy, name);
+                        assert_eq!(role, vllm_router_rs::core::WorkerType::Encode);
+                        assert_eq!(origin, source);
+                        assert!(!reason.is_empty());
+                        assert!(message.contains(match source {
+                            EncodePolicySource::ExplicitCli => "--encode-policy",
+                            EncodePolicySource::ExplicitJson => "epd.encode_policy",
+                            EncodePolicySource::InheritedMain => "inherited from --policy",
+                        }));
+                    }
+                    other => panic!("{other}"),
+                }
+                if source == EncodePolicySource::ExplicitCli {
+                    argv.truncate(argv.len() - 2);
+                }
+                argv.extend(["--encode-policy".into(), "round_robin".into()]);
+                let config = CliArgs::try_parse_from(argv)
+                    .unwrap()
+                    .to_router_config(vec![])
+                    .unwrap();
+                config.validate().unwrap();
+                assert_eq!(
+                    config
+                        .epd
+                        .as_ref()
+                        .unwrap()
+                        .effective_encode_policy(&config.policy),
+                    &PolicyConfig::RoundRobin
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encode_policy_override_preserves_json_parse_errors() {
+        for value in [
+            r#"{"encode_policy":"unknown"}"#,
+            r#"{"encode_policy":42}"#,
+            r#"{"encode_policy":{"type":"consistent_hash","virtual_nodes":"bad"}}"#,
+            "{",
+        ] {
+            let args = CliArgs::try_parse_from([
+                "vllm-router",
+                "--epd-config",
+                value,
+                "--encode-policy",
+                "random",
+            ])
+            .unwrap();
+            assert!(args
+                .to_router_config(vec![])
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid --epd-config"));
+        }
+    }
+
+    #[test]
     fn encode_policy_cli_overrides_json_and_preserves_default() {
         for (json_policy, cli_policy, expected) in [
-            (None, None, EncodePolicy::RoundRobin),
-            (Some("random"), None, EncodePolicy::Random),
-            (Some("round_robin"), None, EncodePolicy::RoundRobin),
-            (None, Some("random"), EncodePolicy::Random),
+            (None, None, PolicyConfig::Random),
+            (Some("random"), None, PolicyConfig::Random),
+            (Some("round_robin"), None, PolicyConfig::RoundRobin),
+            (None, Some("random"), PolicyConfig::Random),
             (
                 Some("random"),
                 Some("round_robin"),
-                EncodePolicy::RoundRobin,
+                PolicyConfig::RoundRobin,
             ),
-            (Some("round_robin"), Some("random"), EncodePolicy::Random),
+            (Some("round_robin"), Some("random"), PolicyConfig::Random),
         ] {
             let mut json = serde_json::json!({"encoder_urls": ["http://encoder:8000"]});
             if let Some(policy) = json_policy {
@@ -902,6 +1010,8 @@ mod tests {
             }
             let mut argv = vec![
                 "vllm-router".to_string(),
+                "--policy".into(),
+                "random".into(),
                 "--worker-urls".into(),
                 "http://consumer:8000".into(),
                 "--epd-config".into(),
@@ -916,12 +1026,12 @@ mod tests {
                 .unwrap();
             config.validate().unwrap();
             let epd = config.epd.unwrap();
-            assert_eq!(epd.effective_encode_policy(), expected);
+            assert_eq!(epd.effective_encode_policy(&config.policy), &expected);
             assert_eq!(
                 epd.encode_policy.is_some(),
                 json_policy.is_some() || cli_policy.is_some()
             );
-            assert!(matches!(config.policy, PolicyConfig::CacheAware { .. }));
+            assert!(matches!(config.policy, PolicyConfig::Random));
         }
     }
 
@@ -937,7 +1047,7 @@ mod tests {
 
         // Preserve the configuration error even for direct construction of CliArgs.
         let mut args = CliArgs::try_parse_from(["vllm-router"]).unwrap();
-        args.encode_policy = Some(EncodePolicy::Random);
+        args.encode_policy = Some(PolicyConfig::Random);
         assert!(args
             .to_router_config(vec![])
             .unwrap_err()
@@ -980,7 +1090,7 @@ mod tests {
         let context =
             server::AppContext::new(config, reqwest::Client::new(), 64, None, vec![]).unwrap();
         assert_eq!(
-            context.policy_registry.get_encode_policy().name(),
+            context.policy_registry.get_encode_policy().unwrap().name(),
             "round_robin"
         );
         assert_eq!(
@@ -991,17 +1101,7 @@ mod tests {
 
     #[test]
     fn encode_policy_cli_rejects_undefined_semantics() {
-        for policy in [
-            "cache_aware",
-            "cache-aware",
-            "power_of_two",
-            "p2c",
-            "consistent_hash",
-            "rendezvous_hash",
-            "hash",
-            "program",
-            "unknown",
-        ] {
+        for policy in ["cache-aware", "p2c", "hash", "program", "unknown"] {
             let error = CliArgs::try_parse_from([
                 "vllm-router",
                 "--epd-config",
@@ -1011,7 +1111,7 @@ mod tests {
             ])
             .unwrap_err();
             assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-            assert!(error.to_string().contains("expected round_robin or random"));
+            assert!(error.to_string().contains("Unknown policy"));
         }
     }
 
@@ -1022,14 +1122,14 @@ mod tests {
             "--worker-urls",
             "http://consumer:8000",
             "--epd-config",
-            r#"{"encoder_urls":["http://encoder:8000"],"encode_policy":"cache_aware"}"#,
+            r#"{"encoder_urls":["http://encoder:8000"],"encode_policy":"unknown"}"#,
             "--encode-policy",
             "random",
         ])
         .unwrap();
         let error = args.to_router_config(vec![]).unwrap_err().to_string();
         assert!(error.contains("Invalid --epd-config"));
-        assert!(error.contains("cache_aware"));
+        assert!(error.contains("unknown"));
     }
 
     #[test]

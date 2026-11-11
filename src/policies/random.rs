@@ -2,7 +2,6 @@
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
-use crate::metrics::RouterMetrics;
 use rand::Rng;
 use std::sync::Arc;
 
@@ -19,26 +18,6 @@ impl RandomPolicy {
 }
 
 impl LoadBalancingPolicy for RandomPolicy {
-    fn select_encode_batch(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        item_count: usize,
-    ) -> Option<Vec<usize>> {
-        if item_count == 0 {
-            return Some(Vec::new());
-        }
-        let healthy_indices = get_healthy_worker_indices(workers);
-        if healthy_indices.is_empty() {
-            return None;
-        }
-        let mut rng = rand::rng();
-        Some(
-            (0..item_count)
-                .map(|_| healthy_indices[rng.random_range(0..healthy_indices.len())])
-                .collect(),
-        )
-    }
-
     fn select_worker_with_headers(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -53,10 +32,9 @@ impl LoadBalancingPolicy for RandomPolicy {
 
         let mut rng = rand::rng();
         let random_idx = rng.random_range(0..healthy_indices.len());
-        let worker = workers[healthy_indices[random_idx]].url();
+        let worker = workers[healthy_indices[random_idx]].as_ref();
 
-        RouterMetrics::record_processed_request(worker);
-        RouterMetrics::record_policy_decision(self.name(), worker);
+        super::record_selection_metrics(self.name(), worker);
         Some(healthy_indices[random_idx])
     }
 

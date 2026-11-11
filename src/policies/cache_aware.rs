@@ -482,9 +482,7 @@ impl CacheAwarePolicy {
     }
 
     fn record_selection(workers: &[Arc<dyn Worker>], idx: usize) {
-        workers[idx].increment_processed();
-        RouterMetrics::record_processed_request(workers[idx].url());
-        RouterMetrics::record_policy_decision("cache_aware", workers[idx].url());
+        super::record_processed_selection("cache_aware", workers[idx].as_ref());
     }
 
     /// Prepare cache affinity outside the admission lock, then recheck load and
@@ -561,12 +559,27 @@ impl CacheAwarePolicy {
 }
 
 impl LoadBalancingPolicy for CacheAwarePolicy {
+    fn validate_role(role: &crate::core::WorkerType) -> Result<(), super::PolicyRoleError> {
+        if *role == crate::core::WorkerType::Encode {
+            return Err(super::PolicyRoleError {
+                policy: "cache_aware",
+                role: role.clone(),
+                reason: "consumer prefix affinity is not defined for Encode",
+            });
+        }
+        Ok(())
+    }
+
     fn select_worker_with_headers(
         &self,
         workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
         _headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
+        for worker in workers {
+            Self::validate_role(&worker.worker_type()).ok()?;
+        }
+
         let healthy = get_healthy_worker_indices(workers);
         let model_id = normalize_model_key(workers[*healthy.first()?].model_id());
         let (min, max) = self.load_range(workers, &healthy);
@@ -609,6 +622,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         request_text: Option<&str>,
         _headers: Option<&RequestHeaders>,
     ) -> Option<(usize, WorkerLoadGuard<'a>)> {
+        for worker in workers {
+            Self::validate_role(&worker.worker_type()).ok()?;
+        }
+
         self.select_with_commit(context, workers, request_text, |idx| {
             WorkerLoadGuard::new(workers[idx].as_ref())
         })
@@ -767,6 +784,34 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
     use crate::protocols::spec::{CompletionRequest, GenerationRequest};
+
+    #[test]
+    fn encode_rejection_preserves_existing_affinity_state() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        policy.commit_placement("default", "prefix", "http://consumer");
+        let before = policy
+            .trees
+            .get("default")
+            .unwrap()
+            .prefix_match_tenant_char_count("prefix", "http://consumer");
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://encode".into(), WorkerType::Encode));
+        assert!(policy
+            .select_worker_with_headers(&[worker], Some("other-prefix"), None)
+            .is_none());
+        let tree = policy.trees.get("default").unwrap();
+        assert_eq!(
+            tree.prefix_match_tenant_char_count("prefix", "http://consumer"),
+            before
+        );
+        assert_eq!(
+            tree.prefix_match_tenant_char_count("other-prefix", "http://encode"),
+            0
+        );
+    }
 
     fn cache_fixture(
         worker_count: usize,

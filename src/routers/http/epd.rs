@@ -1,6 +1,6 @@
 use crate::config::EpdConfig;
 use crate::core::{Worker, WorkerLoadGuard, WorkerRegistry, WorkerType};
-use crate::policies::PolicyRegistry;
+use crate::policies::{hash_key, PolicyRegistry, RequestHeaders};
 use axum::http::{HeaderMap, StatusCode};
 use futures_util::future::join_all;
 use reqwest::{Client, RequestBuilder};
@@ -146,7 +146,15 @@ impl EncoderStage {
         }
     }
 
-    fn select_encoders(&self, item_count: usize) -> Result<Vec<Arc<dyn Worker>>, EpdError> {
+    fn select_encoders(
+        &self,
+        item_count: usize,
+        body: &Value,
+        headers: Option<&HeaderMap>,
+    ) -> Result<Vec<Arc<dyn Worker>>, EpdError> {
+        if item_count == 0 {
+            return Ok(Vec::new());
+        }
         // Query the live role pool once, then preserve static configuration order.
         // Removed/replaced workers must not fall back to the configured raw URL.
         let pool = self.worker_registry.get_by_type(&WorkerType::Encode);
@@ -157,19 +165,56 @@ impl EncoderStage {
             .iter()
             .filter_map(|url| by_url.get(url.as_str()).map(|worker| Arc::clone(worker)))
             .collect();
-        let policy = self.policy_registry.get_encode_policy();
-        let assignments = policy
-            .select_encode_batch(&workers, item_count)
-            .ok_or_else(|| {
+        let unavailable = || {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No available Encode workers".into(),
+            )
+        };
+        let context = self.policy_registry.get_encode_selection_context();
+        let mut prepared = None;
+        loop {
+            // Expensive body preparation stays outside the shared selection lock.
+            // Recheck the instance under the lock if management replaced the slot.
+            let snapshot = self.policy_registry.get_encode_policy().ok_or_else(|| {
                 (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "No available Encode workers".into(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Encode policy was not initialized".into(),
                 )
             })?;
-        Ok(assignments
-            .into_iter()
-            .map(|index| workers[index].clone())
-            .collect())
+            if prepared.is_none() && (snapshot.needs_headers() || snapshot.needs_request_text()) {
+                let headers: RequestHeaders = headers
+                    .into_iter()
+                    .flat_map(|h| h.iter())
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|v| (name.as_str().to_owned(), v.to_owned()))
+                    })
+                    .collect();
+                prepared = Some(hash_key::prepare_headers(headers, || body.to_string()));
+            }
+            let result = context.with_selection(|| {
+                let policy = self.policy_registry.get_encode_policy()?;
+                if !Arc::ptr_eq(&snapshot, &policy) {
+                    return None;
+                }
+                Some(
+                    (0..item_count)
+                        .map(|_| {
+                            let index = policy
+                                .select_worker_with_headers(&workers, None, prepared.as_ref())
+                                .ok_or_else(&unavailable)?;
+                            workers.get(index).cloned().ok_or_else(&unavailable)
+                        })
+                        .collect(),
+                )
+            });
+            if let Some(result) = result {
+                return result;
+            }
+        }
     }
 
     pub(super) async fn prepare(
@@ -226,7 +271,7 @@ impl EncoderStage {
                 "Selected embedding consumer has no EC control address".into(),
             ));
         }
-        let encoders = self.select_encoders(items.len())?;
+        let encoders = self.select_encoders(items.len(), &body, headers)?;
         let mut pending = consumer_addr.map(|control_addr| EcTransferGuard {
             control_addr: control_addr.clone(),
             transfer_ids: items.iter().map(|item| item.transfer_id.clone()).collect(),
@@ -602,6 +647,201 @@ mod tests {
     use axum::{extract::State, routing::post, Json, Router};
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn concurrent_production_selection_shares_context_and_preserves_rr_sequences() {
+        let stage = Arc::new(test_stage(EpdConfig {
+            encoder_urls: vec!["http://e0".into(), "http://e1".into(), "http://e2".into()],
+            encode_policy: None,
+            consumer_zmq_addrs: Default::default(),
+        }));
+        let barrier = Arc::new(std::sync::Barrier::new(32));
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let stage = EncoderStage::new(
+                    stage.config.clone(),
+                    stage.worker_registry.clone(),
+                    stage.policy_registry.clone(),
+                );
+                assert!(Arc::ptr_eq(
+                    &stage.policy_registry.get_encode_selection_context(),
+                    &stage.policy_registry.clone().get_encode_selection_context()
+                ));
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    stage
+                        .select_encoders(4, &Value::Null, None)
+                        .unwrap()
+                        .iter()
+                        .map(|w| w.url().to_owned())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut counts = [0; 3];
+        for thread in threads {
+            let urls = thread.join().unwrap();
+            let indices: Vec<_> = urls
+                .iter()
+                .map(|url| {
+                    stage
+                        .config
+                        .encoder_urls
+                        .iter()
+                        .position(|candidate| candidate == url)
+                        .unwrap()
+                })
+                .collect();
+            for pair in indices.windows(2) {
+                assert_eq!(pair[1], (pair[0] + 1) % 3);
+            }
+            for index in indices {
+                counts[index] += 1;
+            }
+        }
+        assert_eq!(counts, [43, 43, 42]);
+        assert!(stage
+            .select_encoders(0, &Value::Null, None)
+            .unwrap()
+            .is_empty());
+        let urls: Vec<_> = stage
+            .select_encoders(3, &Value::Null, None)
+            .unwrap()
+            .iter()
+            .map(|w| w.url().to_owned())
+            .collect();
+        assert_eq!(urls, ["http://e2", "http://e0", "http://e1"]);
+        assert!(stage
+            .worker_registry
+            .get_by_type(&WorkerType::Encode)
+            .iter()
+            .all(|w| w.load() == 0 && w.processed_requests() == 0));
+    }
+
+    #[test]
+    fn hash_selection_prepares_large_media_body_once_and_preserves_session_affinity() {
+        use crate::config::PolicyConfig;
+        for config in [
+            PolicyConfig::ConsistentHash { virtual_nodes: 317 },
+            PolicyConfig::RendezvousHash,
+        ] {
+            let stage = test_stage(EpdConfig {
+                encoder_urls: vec!["http://e0".into(), "http://e1".into(), "http://e2".into()],
+                encode_policy: Some(config),
+                consumer_zmq_addrs: Default::default(),
+            });
+            let mut body = request();
+            body["messages"][0]["content"][0]["image_url"]["url"] =
+                Value::String(format!("data:image/png;base64,{}", "a".repeat(1024 * 1024)));
+            for body_session in [None, Some("body-session")] {
+                if let Some(session) = body_session {
+                    body["session_params"] = json!({"session_id":session});
+                }
+                for use_header in [true, false] {
+                    let mut headers = HeaderMap::new();
+                    headers.insert("router-prepared-hash-key", "untrusted".parse().unwrap());
+                    if use_header {
+                        headers.insert("x-session-id", "from-header".parse().unwrap());
+                    }
+                    let before = hash_key::BODY_PREPARATIONS.with(|count| count.get());
+                    let chosen = stage.select_encoders(32, &body, Some(&headers)).unwrap();
+                    assert!(chosen.iter().all(|w| w.url() == chosen[0].url()));
+                    assert_eq!(
+                        hash_key::BODY_PREPARATIONS.with(|count| count.get()) - before,
+                        usize::from(!use_header)
+                    );
+                    let policy_headers: RequestHeaders = headers
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_string()))
+                        .collect();
+                    let pool: Vec<_> = stage
+                        .config
+                        .encoder_urls
+                        .iter()
+                        .map(|url| stage.worker_registry.get_by_url(url).unwrap())
+                        .collect();
+                    let index = stage
+                        .policy_registry
+                        .get_encode_policy()
+                        .unwrap()
+                        .select_worker_with_headers(
+                            &pool,
+                            Some(&body.to_string()),
+                            Some(&policy_headers),
+                        )
+                        .unwrap();
+                    assert_eq!(chosen[0].url(), pool[index].url());
+                    if use_header {
+                        body["user"] = "changed-body-user".into();
+                        assert_eq!(
+                            stage.select_encoders(2, &body, Some(&headers)).unwrap()[0].url(),
+                            chosen[0].url()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn power_of_two_encode_selection_uses_batch_load_without_item_reservations() {
+        let stage = test_stage(EpdConfig {
+            encoder_urls: vec!["http://e0".into(), "http://e1".into()],
+            encode_policy: Some(crate::config::PolicyConfig::PowerOfTwo {
+                load_check_interval_secs: 73,
+            }),
+            consumer_zmq_addrs: Default::default(),
+        });
+        let busy = stage.worker_registry.get_by_url("http://e0").unwrap();
+        let _batch = WorkerLoadGuard::new(busy.as_ref());
+        assert!(stage
+            .select_encoders(16, &Value::Null, None)
+            .unwrap()
+            .iter()
+            .all(|w| w.url() == "http://e1" && w.load() == 0 && w.processed_requests() == 0));
+        assert_eq!(busy.load(), 1);
+    }
+
+    #[tokio::test]
+    async fn rendezvous_prepare_groups_images_and_correlates_metadata_per_batch() {
+        let (stage0, seen0, server0) = mock("normal").await;
+        let (stage1, seen1, server1) = mock("normal").await;
+        let mut config = stage0.config.clone();
+        config
+            .encoder_urls
+            .extend(stage1.config.encoder_urls.clone());
+        config.encode_policy = Some(crate::config::PolicyConfig::RendezvousHash);
+        let stage = test_stage(config);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "stable-session".parse().unwrap());
+        let (body, guard) = stage
+            .prepare(&Client::new(), request(), "pd", Some(&headers), None)
+            .await
+            .unwrap();
+        assert!(guard.is_none());
+        assert_eq!(body["messages"][0]["content"][0]["type"], "image_embeds");
+        assert_eq!(body["messages"][0]["content"][2]["type"], "image_embeds");
+        assert_eq!(
+            body["ec_transfer_params"]["ec_items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(seen0.lock().unwrap().len() + seen1.lock().unwrap().len(), 1);
+        let workers = stage.worker_registry.get_by_type(&WorkerType::Encode);
+        assert_eq!(
+            workers
+                .iter()
+                .map(|w| w.processed_requests())
+                .sum::<usize>(),
+            1
+        );
+        assert!(workers.iter().all(|w| w.load() == 0));
+        server0.abort();
+        server1.abort();
+    }
+
     fn test_stage(config: EpdConfig) -> EncoderStage {
         let workers = Arc::new(WorkerRegistry::new());
         for url in &config.encoder_urls {
@@ -610,7 +850,11 @@ mod tests {
             )));
         }
         let policies = Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
-        policies.set_encode_policy(config.effective_encode_policy());
+        policies
+            .set_encode_policy(
+                config.effective_encode_policy(&crate::config::PolicyConfig::RoundRobin),
+            )
+            .unwrap();
         EncoderStage::new(config, workers, policies)
     }
 
@@ -821,7 +1065,7 @@ mod tests {
 
     #[test]
     fn selection_uses_live_encode_pool_in_config_order_and_independent_slot() {
-        use crate::{config::EncodePolicy, core::BasicWorker};
+        use crate::{config::PolicyConfig, core::BasicWorker};
         let stage = test_stage(EpdConfig {
             encoder_urls: vec!["http://e0".into(), "http://e1".into(), "http://e2".into()],
             encode_policy: None,
@@ -829,7 +1073,7 @@ mod tests {
         });
         let urls = |count| {
             stage
-                .select_encoders(count)
+                .select_encoders(count, &Value::Null, None)
                 .unwrap()
                 .iter()
                 .map(|w| w.url().to_owned())
@@ -843,7 +1087,7 @@ mod tests {
         );
         assert_eq!(urls(1), ["http://e0"]);
         assert_eq!(
-            second_stage.select_encoders(1).unwrap()[0].url(),
+            second_stage.select_encoders(1, &Value::Null, None).unwrap()[0].url(),
             "http://e1"
         );
         // Reinsert E0 last in the registry. Config order still determines RR.
@@ -853,7 +1097,8 @@ mod tests {
         stage.worker_registry.register(e0.clone());
         stage
             .policy_registry
-            .set_encode_policy(EncodePolicy::RoundRobin);
+            .set_encode_policy(&PolicyConfig::RoundRobin)
+            .unwrap();
         assert_eq!(urls(3), ["http://e0", "http://e1", "http://e2"]);
         let e1 = stage.worker_registry.get_by_url("http://e1").unwrap();
         e1.set_healthy(false);
@@ -870,7 +1115,8 @@ mod tests {
         assert_eq!(urls(4), ["http://e0"; 4]);
         stage
             .policy_registry
-            .set_encode_policy(EncodePolicy::Random);
+            .set_encode_policy(&PolicyConfig::Random)
+            .unwrap();
         assert_eq!(urls(8), ["http://e0"; 8]);
         // The independent global consumer RR has not advanced at all.
         assert_eq!(
@@ -882,7 +1128,7 @@ mod tests {
         );
         stage.worker_registry.remove_by_url("http://e0");
         assert_eq!(
-            stage.select_encoders(1).unwrap_err().0,
+            stage.select_encoders(1, &Value::Null, None).unwrap_err().0,
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(e0.processed_requests(), 0);
@@ -1010,7 +1256,7 @@ mod tests {
             assert_eq!(stage.worker_registry.revision() > revision, !success);
             if !success {
                 assert_eq!(
-                    stage.select_encoders(1).unwrap_err().0,
+                    stage.select_encoders(1, &Value::Null, None).unwrap_err().0,
                     StatusCode::SERVICE_UNAVAILABLE
                 );
             }

@@ -186,7 +186,7 @@ async fn assert_pd_epd_http_delete_cleans_policy(prefill_first: bool) {
             policy: main_policy,
             epd: Some(EpdConfig {
                 encoder_urls: vec![encoder_url.clone()],
-                encode_policy: None,
+                encode_policy: Some(PolicyConfig::RoundRobin),
                 consumer_zmq_addrs: Default::default(),
             }),
             worker_startup_timeout_secs: 5,

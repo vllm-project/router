@@ -552,7 +552,7 @@ mod test_pd_routing {
             policy: PolicyConfig::RoundRobin,
             epd: Some(EpdConfig {
                 encoder_urls: vec![format!("{base}/e")],
-                encode_policy: Some(vllm_router_rs::config::EncodePolicy::Random),
+                encode_policy: Some(vllm_router_rs::config::PolicyConfig::Random),
                 consumer_zmq_addrs: Default::default(),
             }),
             worker_startup_timeout_secs: 5,
@@ -573,7 +573,10 @@ mod test_pd_routing {
             .get_by_url(&format!("{base}/e"))
             .unwrap();
         let router = RouterFactory::create_router(&context).await.unwrap();
-        assert_eq!(context.policy_registry.get_encode_policy().name(), "random");
+        assert_eq!(
+            context.policy_registry.get_encode_policy().unwrap().name(),
+            "random"
+        );
         assert!(Arc::ptr_eq(
             &encoder,
             &context.worker_registry.get_by_url(encoder.url()).unwrap()

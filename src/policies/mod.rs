@@ -3,7 +3,7 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
-use crate::core::{Worker, WorkerLoadGuard};
+use crate::core::{Worker, WorkerLoadGuard, WorkerType};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -54,11 +54,50 @@ pub struct SelectionContext {
     lock: parking_lot::Mutex<()>,
 }
 
+impl SelectionContext {
+    /// Run synchronous selections for one admission without reserving item load.
+    /// Never call select_and_reserve or perform asynchronous work in this closure.
+    pub fn with_selection<T>(&self, select: impl FnOnce() -> T) -> T {
+        let _selection = self.lock.lock();
+        select()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("policy '{policy}' is unsupported for {role:?}: {reason}")]
+pub struct PolicyRoleError {
+    pub policy: &'static str,
+    pub role: WorkerType,
+    pub reason: &'static str,
+}
+
+/// Record the existing consumer metrics without counting Encode item choices.
+pub(crate) fn record_selection_metrics(policy: &str, worker: &dyn Worker) {
+    if worker.worker_type() != WorkerType::Encode {
+        crate::metrics::RouterMetrics::record_processed_request(worker.url());
+        crate::metrics::RouterMetrics::record_policy_decision(policy, worker.url());
+    }
+}
+
+pub(crate) fn record_processed_selection(policy: &str, worker: &dyn Worker) {
+    if worker.worker_type() != WorkerType::Encode {
+        worker.increment_processed();
+        record_selection_metrics(policy, worker);
+    }
+}
+
 /// Core trait for load balancing policies
 ///
 /// This trait provides a unified interface for implementing routing algorithms
 /// that can work with both regular single-worker selection and PD dual-worker selection.
 pub trait LoadBalancingPolicy: Send + Sync + Debug {
+    /// Pure capability declaration, usable before constructing a policy.
+    fn validate_role(_role: &WorkerType) -> Result<(), PolicyRoleError>
+    where
+        Self: Sized,
+    {
+        Ok(())
+    }
     /// Select a single worker from the available workers
     ///
     /// This is used for regular routing mode where requests go to a single worker.
@@ -100,17 +139,6 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         let _selection = context.lock.lock();
         let idx = self.select_worker_with_headers(workers, request_text, headers)?;
         Some((idx, WorkerLoadGuard::new(workers[idx].as_ref())))
-    }
-
-    /// Assign a request's Encode media items without emitting consumer metrics.
-    /// Only policies with defined Encode batching semantics support this method.
-    /// Returned indices refer to the supplied pool; None means no assignment.
-    fn select_encode_batch(
-        &self,
-        _workers: &[Arc<dyn Worker>],
-        _item_count: usize,
-    ) -> Option<Vec<usize>> {
-        None
     }
 
     /// Select a pair of workers (prefill and decode) for PD routing
@@ -292,6 +320,18 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
+
+    #[test]
+    fn encode_review_contract_generic_selection_preserves_batch_processed() {
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://encode".into(), WorkerType::Encode));
+        assert_eq!(
+            RendezvousHashPolicy::new()
+                .select_worker(std::slice::from_ref(&worker), Some("session")),
+            Some(0)
+        );
+        assert_eq!(worker.processed_requests(), 0);
+    }
 
     #[test]
     fn test_get_healthy_worker_indices() {

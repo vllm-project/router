@@ -110,9 +110,13 @@ fn default_profile_timeout_secs() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct EpdConfig {
     pub encoder_urls: Vec<String>,
-    /// Independent Encode policy; omission uses round-robin, never the global policy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encode_policy: Option<EncodePolicy>,
+    /// Independent Encode instance; omission inherits the complete main configuration.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_policy"
+    )]
+    pub encode_policy: Option<PolicyConfig>,
     /// Mooncake consumer control addresses, keyed by the P or combined PD HTTP URL
     /// with an `@rank` suffix for DP replicas.
     /// Omit for pull-based NIXL or the shared-file example connector.
@@ -121,30 +125,34 @@ pub struct EpdConfig {
 }
 
 impl EpdConfig {
-    pub fn effective_encode_policy(&self) -> EncodePolicy {
-        self.encode_policy.unwrap_or_default()
+    pub fn effective_encode_policy<'a>(&'a self, main: &'a PolicyConfig) -> &'a PolicyConfig {
+        self.encode_policy.as_ref().unwrap_or(main)
     }
 }
 
-/// Policies with defined semantics for the static Encode pool.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EncodePolicy {
-    #[default]
-    RoundRobin,
-    Random,
-}
-
-impl std::str::FromStr for EncodePolicy {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
+mod optional_policy {
+    use super::*;
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PolicyConfig>, D::Error> {
+        let value = Option::<serde_json::Value>::deserialize(d)?;
         match value {
-            "round_robin" => Ok(Self::RoundRobin),
-            "random" => Ok(Self::Random),
-            _ => Err(format!(
-                "Unsupported Encode policy '{value}': expected round_robin or random"
-            )),
+            None => Ok(None),
+            Some(serde_json::Value::String(name)) => {
+                name.parse().map(Some).map_err(serde::de::Error::custom)
+            }
+            Some(value) => serde_json::from_value(value)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+        }
+    }
+    pub fn serialize<S: serde::Serializer>(
+        policy: &Option<PolicyConfig>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match policy {
+            Some(PolicyConfig::RoundRobin | PolicyConfig::Random) => {
+                policy.as_ref().unwrap().name().serialize(s)
+            }
+            _ => policy.serialize(s),
         }
     }
 }
@@ -1031,7 +1039,7 @@ impl RoutingMode {
 }
 
 /// Policy configuration for routing
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum PolicyConfig {
     #[serde(rename = "random")]
@@ -1131,6 +1139,47 @@ impl PolicyConfig {
             PolicyConfig::RendezvousHash => "rendezvous_hash",
         }
     }
+}
+
+impl std::str::FromStr for PolicyConfig {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "random" => Ok(Self::Random),
+            "round_robin" => Ok(Self::RoundRobin),
+            "power_of_two" => Ok(Self::PowerOfTwo {
+                load_check_interval_secs: 5,
+            }),
+            "consistent_hash" => Ok(Self::ConsistentHash { virtual_nodes: 160 }),
+            "rendezvous_hash" => Ok(Self::RendezvousHash),
+            "cache_aware" => {
+                let c = crate::policies::CacheAwareConfig::default();
+                Ok(Self::CacheAware {
+                    cache_threshold: c.cache_threshold,
+                    balance_abs_threshold: c.balance_abs_threshold,
+                    balance_rel_threshold: c.balance_rel_threshold,
+                    eviction_interval_secs: c.eviction_interval_secs,
+                    max_tree_size: c.max_tree_size,
+                })
+            }
+            "kv_aware" => Ok(Self::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: default_kv_penalty_host(),
+                kv_penalty_external: default_kv_penalty_external(),
+                kv_penalty_disk: default_kv_penalty_disk(),
+                static_kv_event_sources: Box::default(),
+            }),
+            _ => Err(format!("Unknown policy '{name}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodePolicySource {
+    ExplicitCli,
+    ExplicitJson,
+    InheritedMain,
 }
 
 fn default_kv_penalty_host() -> f64 {
@@ -1434,14 +1483,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn epd_policy_omission_and_null_use_independent_default() {
+    fn encode_review_contract_accepts_generic_policy_object() {
+        let config = serde_json::from_value::<EpdConfig>(serde_json::json!({
+            "encoder_urls": ["http://encoder:8000"],
+            "encode_policy": {"type": "consistent_hash", "virtual_nodes": 317}
+        }));
+        assert!(config.is_ok(), "{config:?}");
+    }
+
+    #[test]
+    fn epd_policy_omission_and_null_inherit_full_main_config() {
         for json in [
             r#"{"encoder_urls":["http://encoder:8000"]}"#,
             r#"{"encoder_urls":["http://encoder:8000"],"encode_policy":null}"#,
         ] {
             let epd: EpdConfig = serde_json::from_str(json).unwrap();
             assert_eq!(epd.encode_policy, None);
-            assert_eq!(epd.effective_encode_policy(), EncodePolicy::RoundRobin);
+            for main in [
+                PolicyConfig::Random,
+                PolicyConfig::RoundRobin,
+                PolicyConfig::ConsistentHash { virtual_nodes: 317 },
+                PolicyConfig::PowerOfTwo {
+                    load_check_interval_secs: 73,
+                },
+            ] {
+                assert_eq!(epd.effective_encode_policy(&main), &main);
+            }
             assert!(epd.consumer_zmq_addrs.is_empty());
             assert!(serde_json::to_value(&epd)
                 .unwrap()
@@ -1453,24 +1520,70 @@ mod tests {
             let config: RouterConfig = serde_json::from_value(config).unwrap();
             assert!(matches!(config.policy, PolicyConfig::Random));
             assert_eq!(
-                config.epd.unwrap().effective_encode_policy(),
-                EncodePolicy::RoundRobin
+                config
+                    .epd
+                    .as_ref()
+                    .unwrap()
+                    .effective_encode_policy(&config.policy),
+                &PolicyConfig::Random
             );
+        }
+    }
+
+    #[test]
+    fn epd_generic_policy_round_trip_preserves_nondefault_configuration() {
+        for policy in [
+            PolicyConfig::ConsistentHash { virtual_nodes: 317 },
+            PolicyConfig::PowerOfTwo {
+                load_check_interval_secs: 73,
+            },
+            PolicyConfig::RendezvousHash,
+        ] {
+            let epd = EpdConfig {
+                encoder_urls: vec!["http://encoder:8000".into()],
+                encode_policy: Some(policy.clone()),
+                consumer_zmq_addrs: Default::default(),
+            };
+            let value = serde_json::to_value(&epd).unwrap();
+            assert!(value["encode_policy"].is_object());
+            let restored: EpdConfig = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                restored.effective_encode_policy(&PolicyConfig::Random),
+                &policy
+            );
+        }
+        for name in [
+            "random",
+            "round_robin",
+            "power_of_two",
+            "consistent_hash",
+            "rendezvous_hash",
+            "cache_aware",
+            "kv_aware",
+        ] {
+            let epd: EpdConfig = serde_json::from_value(
+                serde_json::json!({"encoder_urls": ["http://encoder:8000"], "encode_policy": name}),
+            )
+            .unwrap();
+            assert_eq!(epd.encode_policy.unwrap().name(), name);
         }
     }
 
     #[test]
     fn epd_policy_serde_round_trip() {
         for (name, expected) in [
-            ("round_robin", EncodePolicy::RoundRobin),
-            ("random", EncodePolicy::Random),
+            ("round_robin", PolicyConfig::RoundRobin),
+            ("random", PolicyConfig::Random),
         ] {
             let json = serde_json::json!({
                 "encoder_urls": ["http://encoder:8000"],
                 "encode_policy": name,
             });
             let epd: EpdConfig = serde_json::from_value(json).unwrap();
-            assert_eq!(epd.effective_encode_policy(), expected);
+            assert_eq!(
+                epd.effective_encode_policy(&PolicyConfig::Random),
+                &expected
+            );
             let serialized = serde_json::to_value(&epd).unwrap();
             assert_eq!(serialized["encode_policy"], name);
             let restored: EpdConfig = serde_json::from_value(serialized).unwrap();
@@ -1480,27 +1593,14 @@ mod tests {
 
     #[test]
     fn epd_policy_rejects_undefined_semantics() {
-        for name in [
-            "cache_aware",
-            "cache-aware",
-            "power_of_two",
-            "p2c",
-            "consistent_hash",
-            "rendezvous_hash",
-            "hash",
-            "program",
-            "unknown",
-        ] {
+        for name in ["cache-aware", "p2c", "hash", "program", "unknown"] {
             let error = serde_json::from_value::<EpdConfig>(serde_json::json!({
                 "encoder_urls": ["http://encoder:8000"],
                 "encode_policy": name,
             }))
             .unwrap_err()
             .to_string();
-            assert!(
-                error.contains("round_robin") && error.contains("random"),
-                "{error}"
-            );
+            assert!(error.contains("Unknown policy"), "{error}");
         }
     }
 

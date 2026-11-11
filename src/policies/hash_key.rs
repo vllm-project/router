@@ -9,6 +9,30 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::debug;
 
+// NUL cannot occur in an HTTP header name. This key exists only in policy data
+// and cannot be supplied by HeaderMap or forwarded to a backend.
+const PREPARED_KEY: &str = "\0router-prepared-hash-key";
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+thread_local! {
+    pub(crate) static BODY_PREPARATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Lazily prepare the canonical key once, before entering a selection context.
+/// The body closure is never called when a routing header already supplies it.
+pub(crate) fn prepare_headers(
+    mut headers: RequestHeaders,
+    body: impl FnOnce() -> String,
+) -> RequestHeaders {
+    let key = extract_hash_key_from_headers(&headers).unwrap_or_else(|| {
+        #[cfg(all(test, feature = "cpu", feature = "ready"))]
+        BODY_PREPARATIONS.with(|count| count.set(count.get() + 1));
+        extract_hash_key(Some(&body()), None)
+    });
+    headers.insert(PREPARED_KEY.into(), key);
+    headers
+}
+
 /// HTTP header names to check for session ID (case-insensitive, checked in order)
 pub(crate) const SESSION_HEADER_NAMES: &[&str] = &[
     "x-session-id",
@@ -32,6 +56,9 @@ pub(crate) fn extract_hash_key(
     request_text: Option<&str>,
     headers: Option<&RequestHeaders>,
 ) -> String {
+    if let Some(key) = headers.and_then(|headers| headers.get(PREPARED_KEY)) {
+        return key.clone();
+    }
     // 1. First priority: HTTP headers
     if let Some(hdrs) = headers {
         if let Some(key) = extract_hash_key_from_headers(hdrs) {
@@ -299,6 +326,42 @@ pub(crate) fn extract_field_value(text: &str, field_name: &str) -> Option<String
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn prepared_key_preserves_canonical_priority_and_cannot_be_an_http_header() {
+        assert!(axum::http::HeaderName::from_bytes(PREPARED_KEY.as_bytes()).is_err());
+        for text in [
+            "",
+            "short",
+            r#"{"session_params":{"session_id":"abc"},"user":"bob"}"#,
+            r#"{"user":""}"#,
+            r#"{"user":"bob"}"#,
+            &"x".repeat(1024),
+        ] {
+            for headers in [
+                RequestHeaders::new(),
+                RequestHeaders::from([
+                    ("x-request-id".into(), "request".into()),
+                    ("x-session-id".into(), "session".into()),
+                    ("router-prepared-hash-key".into(), "untrusted".into()),
+                ]),
+            ] {
+                let expected = extract_hash_key(Some(text), Some(&headers));
+                let calls = std::cell::Cell::new(0);
+                let prepared = prepare_headers(headers.clone(), || {
+                    calls.set(calls.get() + 1);
+                    text.into()
+                });
+                for _ in 0..32 {
+                    assert_eq!(extract_hash_key(None, Some(&prepared)), expected);
+                }
+                assert_eq!(
+                    calls.get(),
+                    usize::from(extract_hash_key_from_headers(&headers).is_none())
+                );
+            }
+        }
+    }
 
     // === extract_field_value tests ===
 

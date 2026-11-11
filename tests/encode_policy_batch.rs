@@ -5,10 +5,38 @@ use metrics::{
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier, Mutex};
 use vllm_router_rs::{
-    config::{EncodePolicy, PolicyConfig},
+    config::PolicyConfig,
     core::{BasicWorker, CircuitBreakerConfig, Worker, WorkerType},
-    policies::{LoadBalancingPolicy, PolicyRegistry, RandomPolicy, RoundRobinPolicy},
+    policies::{
+        LoadBalancingPolicy, PolicyFactory, PolicyRegistry, RandomPolicy, RoundRobinPolicy,
+        SelectionContext,
+    },
 };
+
+fn assign(
+    policy: &dyn LoadBalancingPolicy,
+    context: &SelectionContext,
+    pool: &[Arc<dyn Worker>],
+    count: usize,
+) -> Option<Vec<usize>> {
+    context.with_selection(|| {
+        (0..count)
+            .map(|_| policy.select_worker_with_headers(pool, None, None))
+            .collect()
+    })
+}
+
+fn supported_configs() -> Vec<PolicyConfig> {
+    vec![
+        PolicyConfig::RoundRobin,
+        PolicyConfig::Random,
+        PolicyConfig::PowerOfTwo {
+            load_check_interval_secs: 73,
+        },
+        PolicyConfig::ConsistentHash { virtual_nodes: 317 },
+        PolicyConfig::RendezvousHash,
+    ]
+}
 
 fn workers() -> Vec<Arc<dyn Worker>> {
     (0..3)
@@ -25,16 +53,22 @@ fn workers() -> Vec<Arc<dyn Worker>> {
 }
 
 #[test]
-fn round_robin_reserves_a_contiguous_sequence_per_concurrent_request() {
+fn round_robin_context_keeps_a_contiguous_sequence_per_concurrent_request() {
     let pool = workers();
     let policy = Arc::new(RoundRobinPolicy::new());
+    let context = Arc::new(SelectionContext::default());
     let barrier = Arc::new(Barrier::new(32));
     let threads: Vec<_> = (0..32)
         .map(|_| {
-            let (pool, policy, barrier) = (pool.clone(), policy.clone(), barrier.clone());
+            let (pool, policy, barrier, context) = (
+                pool.clone(),
+                policy.clone(),
+                barrier.clone(),
+                context.clone(),
+            );
             std::thread::spawn(move || {
                 barrier.wait();
-                policy.select_encode_batch(&pool, 4).unwrap()
+                assign(policy.as_ref(), &context, &pool, 4).unwrap()
             })
         })
         .collect();
@@ -49,41 +83,48 @@ fn round_robin_reserves_a_contiguous_sequence_per_concurrent_request() {
         }
     }
     assert_eq!(counts, [43, 43, 42]);
-    assert_eq!(policy.select_encode_batch(&pool, 3), Some(vec![2, 0, 1]));
+    assert_eq!(
+        assign(policy.as_ref(), &context, &pool, 3),
+        Some(vec![2, 0, 1])
+    );
 }
 
 #[test]
 fn batch_policies_exclude_unhealthy_and_open_circuit_workers() {
-    for policy in [
-        Box::new(RoundRobinPolicy::new()) as Box<dyn LoadBalancingPolicy>,
-        Box::new(RandomPolicy::new()),
-    ] {
+    for config in supported_configs() {
+        let policy = PolicyFactory::create_from_config(&config);
+        let context = SelectionContext::default();
         let pool = workers();
         pool[0].set_healthy(false);
         pool[1].record_outcome(false);
-        assert_eq!(policy.select_encode_batch(&pool, 8), Some(vec![2; 8]));
+        assert_eq!(
+            assign(policy.as_ref(), &context, &pool, 8),
+            Some(vec![2; 8])
+        );
         pool[2].set_healthy(false);
-        assert!(policy.select_encode_batch(&pool, 1).is_none());
-        assert_eq!(policy.select_encode_batch(&pool, 0), Some(vec![]));
-        assert!(policy.select_encode_batch(&[], 1).is_none());
+        assert!(assign(policy.as_ref(), &context, &pool, 1).is_none());
+        assert_eq!(assign(policy.as_ref(), &context, &pool, 0), Some(vec![]));
+        assert!(assign(policy.as_ref(), &context, &[], 1).is_none());
     }
 }
 
 #[test]
 fn empty_assignment_does_not_advance_round_robin() {
     let policy = RoundRobinPolicy::new();
+    let context = SelectionContext::default();
     let pool = workers();
-    assert_eq!(policy.select_encode_batch(&pool, 1), Some(vec![0]));
-    assert_eq!(policy.select_encode_batch(&pool, 0), Some(vec![]));
-    assert!(policy.select_encode_batch(&[], 5).is_none());
-    assert_eq!(policy.select_encode_batch(&pool, 2), Some(vec![1, 2]));
+    assert_eq!(assign(&policy, &context, &pool, 1), Some(vec![0]));
+    assert_eq!(assign(&policy, &context, &pool, 0), Some(vec![]));
+    assert!(assign(&policy, &context, &[], 5).is_none());
+    assert_eq!(assign(&policy, &context, &pool, 2), Some(vec![1, 2]));
 }
 
 #[test]
 fn random_assignments_remain_within_the_supplied_encode_pool() {
     let pool = workers();
+    let context = SelectionContext::default();
     let policy = RandomPolicy::new();
-    let assignment = policy.select_encode_batch(&pool, 128).unwrap();
+    let assignment = assign(&policy, &context, &pool, 128).unwrap();
     assert_eq!(assignment.len(), 128);
     assert!(assignment.iter().all(|index| *index < pool.len()));
 }
@@ -131,11 +172,11 @@ impl Recorder for CapturingRecorder {
 
 #[test]
 fn encode_item_assignment_does_not_emit_consumer_processed_or_policy_metrics() {
-    for config in [EncodePolicy::RoundRobin, EncodePolicy::Random] {
+    for config in supported_configs() {
         let counts = Counts::default();
         let recorder = CapturingRecorder(counts.clone());
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        registry.set_encode_policy(config);
+        registry.set_encode_policy(&config).unwrap();
         let encoders = workers();
         let consumers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
             "http://consumer".into(),
@@ -143,10 +184,13 @@ fn encode_item_assignment_does_not_emit_consumer_processed_or_policy_metrics() {
         ))];
         metrics::with_local_recorder(&recorder, || {
             for _ in 0..3 {
-                registry
-                    .get_encode_policy()
-                    .select_encode_batch(&encoders, 5)
-                    .unwrap();
+                assign(
+                    registry.get_encode_policy().unwrap().as_ref(),
+                    &registry.get_encode_selection_context(),
+                    &encoders,
+                    5,
+                )
+                .unwrap();
             }
             assert!(
                 counts.lock().unwrap().is_empty(),
@@ -176,5 +220,81 @@ fn encode_item_assignment_does_not_emit_consumer_processed_or_policy_metrics() {
         assert!(encoders
             .iter()
             .all(|worker| worker.load() == 0 && worker.processed_requests() == 0));
+    }
+}
+
+#[test]
+fn incompatible_roles_are_rejected_before_selection_side_effects() {
+    use vllm_router_rs::policies::{CacheAwareConfig, CacheAwarePolicy, KvAwarePolicy};
+    let pool = workers();
+    let counts = Counts::default();
+    let recorder = CapturingRecorder(counts.clone());
+    let cache = CacheAwarePolicy::with_config(CacheAwareConfig {
+        eviction_interval_secs: 0,
+        ..Default::default()
+    });
+    let kv = KvAwarePolicy::default();
+    metrics::with_local_recorder(&recorder, || {
+        for name in ["cache_aware", "kv_aware"] {
+            let config = name.parse::<PolicyConfig>().unwrap();
+            let error = PolicyFactory::validate_role(&config, WorkerType::Encode).unwrap_err();
+            assert_eq!(error.policy, name);
+            assert_eq!(error.role, WorkerType::Encode);
+            assert!(!error.reason.is_empty());
+        }
+        for policy in [&cache as &dyn LoadBalancingPolicy, &kv] {
+            assert!(policy
+                .select_worker_with_headers(&pool, Some("affinity-key"), None)
+                .is_none());
+            assert!(policy
+                .select_and_reserve(
+                    &SelectionContext::default(),
+                    &pool,
+                    Some("affinity-key"),
+                    None
+                )
+                .is_none());
+        }
+    });
+    assert!(counts.lock().unwrap().is_empty());
+    assert!(pool
+        .iter()
+        .all(|w| w.load() == 0 && w.processed_requests() == 0));
+}
+
+#[test]
+fn consumer_selection_keeps_each_policies_existing_accounting() {
+    for config in supported_configs() {
+        for size in [1, 2] {
+            let policy = PolicyFactory::create_from_config(&config);
+            let pool: Vec<Arc<dyn Worker>> = (0..size)
+                .map(|i| {
+                    Arc::new(BasicWorker::new(
+                        format!("http://consumer-{i}"),
+                        WorkerType::Regular,
+                    )) as Arc<dyn Worker>
+                })
+                .collect();
+            let counts = Counts::default();
+            let recorder = CapturingRecorder(counts.clone());
+            metrics::with_local_recorder(&recorder, || {
+                assert!(policy
+                    .select_worker_with_headers(&pool, Some("session"), None)
+                    .is_some());
+            });
+            let processed: usize = pool.iter().map(|w| w.processed_requests()).sum();
+            let fast_p2c = matches!(config, PolicyConfig::PowerOfTwo { .. }) && size == 1;
+            let expected_processed =
+                !matches!(config, PolicyConfig::Random | PolicyConfig::RoundRobin) && !fast_p2c;
+            assert_eq!(
+                processed,
+                usize::from(expected_processed),
+                "{} size={size}",
+                config.name()
+            );
+            let counts = counts.lock().unwrap();
+            assert_eq!(counts.len(), if fast_p2c { 0 } else { 2 });
+            assert!(counts.values().all(|count| *count == 1));
+        }
     }
 }

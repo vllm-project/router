@@ -94,7 +94,9 @@ impl AppContext {
         // only registers its consumers, and Encode does not affect their
         // per-model policy counts. Cloned contexts share these worker objects.
         if let Some(epd) = &router_config.epd {
-            policy_registry.set_encode_policy(epd.effective_encode_policy());
+            policy_registry
+                .set_encode_policy(epd.effective_encode_policy(&router_config.policy))
+                .map_err(|error| error.to_string())?;
             let cb = router_config.effective_circuit_breaker_config();
             let circuit_breaker = CircuitBreakerConfig {
                 failure_threshold: cb.failure_threshold,
@@ -1389,12 +1391,109 @@ mod tests {
     use super::*;
 
     #[test]
+    fn encode_review_contract_inherits_main_policy() {
+        let config = RouterConfig {
+            epd: Some(
+                serde_json::from_value(
+                    serde_json::json!({"encoder_urls": ["http://encoder:8000"]}),
+                )
+                .unwrap(),
+            ),
+            ..RouterConfig::default()
+        };
+        let context = AppContext::new(config, Client::new(), 64, None, vec![]).unwrap();
+        assert_eq!(
+            context.policy_registry.get_encode_policy().unwrap().name(),
+            "random"
+        );
+    }
+
+    #[test]
+    fn context_rejects_incompatible_encode_configuration_before_construction() {
+        use crate::config::{EncodePolicySource, PolicyConfig};
+        for policy in ["cache_aware", "kv_aware"] {
+            for explicit in [false, true] {
+                let mut config = RouterConfig {
+                    policy: policy.parse().unwrap(),
+                    epd: Some(
+                        serde_json::from_value(
+                            serde_json::json!({"encoder_urls": ["http://encoder:8000"]}),
+                        )
+                        .unwrap(),
+                    ),
+                    ..RouterConfig::default()
+                };
+                if explicit {
+                    config.epd.as_mut().unwrap().encode_policy = Some(config.policy.clone());
+                }
+                let error = crate::config::ConfigValidator::validate_epd(&config).unwrap_err();
+                match error {
+                    crate::config::ConfigError::UnsupportedEncodePolicy {
+                        policy: name,
+                        role,
+                        reason,
+                        origin,
+                        message,
+                    } => {
+                        assert_eq!(name, policy);
+                        assert_eq!(role, WorkerType::Encode);
+                        assert!(!reason.is_empty());
+                        assert_eq!(
+                            origin,
+                            if explicit {
+                                EncodePolicySource::ExplicitJson
+                            } else {
+                                EncodePolicySource::InheritedMain
+                            }
+                        );
+                        assert!(message.contains(if explicit {
+                            "epd.encode_policy"
+                        } else {
+                            "RouterConfig.policy"
+                        }));
+                    }
+                    other => panic!("{other}"),
+                }
+                assert!(
+                    AppContext::new(config.clone(), Client::new(), 64, None, vec![])
+                        .err()
+                        .unwrap()
+                        .contains("unsupported for Encode")
+                );
+                config.epd.as_mut().unwrap().encode_policy = Some(PolicyConfig::RoundRobin);
+                assert!(AppContext::new(config.clone(), Client::new(), 64, None, vec![]).is_ok());
+                config.epd = None;
+                let context = AppContext::new(config, Client::new(), 64, None, vec![]).unwrap();
+                assert!(context.policy_registry.get_encode_policy().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn context_validates_generic_encode_parameters() {
+        for policy in [
+            crate::config::PolicyConfig::ConsistentHash { virtual_nodes: 0 },
+            crate::config::PolicyConfig::PowerOfTwo {
+                load_check_interval_secs: 0,
+            },
+        ] {
+            let mut config = RouterConfig::default();
+            config.epd = Some(crate::config::EpdConfig {
+                encoder_urls: vec!["http://encoder:8000".into()],
+                encode_policy: Some(policy),
+                consumer_zmq_addrs: Default::default(),
+            });
+            assert!(AppContext::new(config, Client::new(), 64, None, vec![]).is_err());
+        }
+    }
+
+    #[test]
     fn context_initializes_independent_encode_policy_from_rust_and_json_configs() {
-        use crate::config::{EncodePolicy, EpdConfig, PolicyConfig, RoutingMode};
+        use crate::config::{EpdConfig, PolicyConfig, RoutingMode};
         for policy in [
             None,
-            Some(EncodePolicy::RoundRobin),
-            Some(EncodePolicy::Random),
+            Some(PolicyConfig::RoundRobin),
+            Some(PolicyConfig::Random),
         ] {
             let config = RouterConfig {
                 mode: RoutingMode::Regular {
@@ -1403,7 +1502,7 @@ mod tests {
                 policy: PolicyConfig::RendezvousHash,
                 epd: Some(EpdConfig {
                     encoder_urls: vec!["http://encoder:8000".into()],
-                    encode_policy: policy,
+                    encode_policy: policy.clone(),
                     consumer_zmq_addrs: Default::default(),
                 }),
                 ..RouterConfig::default()
@@ -1412,15 +1511,14 @@ mod tests {
             for config in [config, restored] {
                 let context = AppContext::new(config, Client::new(), 64, None, vec![]).unwrap();
                 let registry = &context.policy_registry;
-                let expected = if policy == Some(EncodePolicy::Random) {
-                    "random"
-                } else {
-                    "round_robin"
-                };
-                assert_eq!(registry.get_encode_policy().name(), expected);
+                let expected = policy
+                    .as_ref()
+                    .map(PolicyConfig::name)
+                    .unwrap_or("rendezvous_hash");
+                assert_eq!(registry.get_encode_policy().unwrap().name(), expected);
                 assert_eq!(registry.get_default_policy().name(), "rendezvous_hash");
                 assert!(!Arc::ptr_eq(
-                    &registry.get_encode_policy(),
+                    &registry.get_encode_policy().unwrap(),
                     &registry.get_default_policy()
                 ));
                 assert!(registry.get_worker_counts().is_empty());
