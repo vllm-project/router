@@ -4417,6 +4417,383 @@ mod tests {
         supervisor.shutdown();
         server.abort();
     }
+
+    // A real supervisor and HTTP consumer, with acknowledgements on both sides:
+    // ingestion signals fence event processing; a oneshot holds backend work
+    // while its actual reservation is inspected.
+    struct RecoveryCompletionFixture {
+        router: Arc<Router>,
+        workers: Vec<Arc<dyn Worker>>,
+        publishers: Vec<zmq::Socket>,
+        replay: zmq::Socket,
+        signals: tokio::sync::mpsc::Receiver<crate::kv_index::IngestionSignal>,
+        requests: tokio::sync::mpsc::UnboundedReceiver<(
+            usize,
+            bytes::Bytes,
+            tokio::sync::oneshot::Sender<()>,
+        )>,
+        servers: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Drop for RecoveryCompletionFixture {
+        fn drop(&mut self) {
+            self.router.kv_index_supervisor.as_ref().unwrap().shutdown();
+            for server in &self.servers {
+                server.abort();
+            }
+        }
+    }
+
+    impl RecoveryCompletionFixture {
+        async fn new() -> Self {
+            let mut router = create_test_kv_router();
+            router.retry_config.max_retries = 0;
+            let (mut supervisor, signals) =
+                crate::kv_index::KvIndexSupervisor::new_http_full_attention(
+                    Client::new(),
+                    crate::kv_index::HashMode::Sha256,
+                );
+            supervisor.set_strict_recovery(true);
+
+            let supervisor = Arc::new(supervisor);
+            let context = zmq::Context::new();
+            let replay = context.socket(zmq::ROUTER).unwrap();
+            replay.bind("tcp://127.0.0.1:*").unwrap();
+            let replay_endpoint = replay.get_last_endpoint().unwrap().unwrap();
+            let (captured, requests) = tokio::sync::mpsc::unbounded_channel();
+            let mut workers = Vec::new();
+            let mut publishers = Vec::new();
+            let mut servers = Vec::new();
+            for index in 0..2 {
+                let publisher = context.socket(zmq::XPUB).unwrap();
+                publisher.bind("tcp://127.0.0.1:*").unwrap();
+                let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let source = url.clone();
+                let replay_endpoint = (index == 0).then(|| replay_endpoint.clone());
+                let captured = captured.clone();
+                let app = axum::Router::new()
+                    .route("/get_server_info", axum::routing::get(move || {
+                        let source = source.clone();
+                        async move { Json(serde_json::json!({"model_id":"qwen3","instance_id":source,"kv_block_size":16})) }
+                    }))
+                    .route("/kv_event_sources", axum::routing::get(move || {
+                        let (endpoint, replay_endpoint) = (endpoint.clone(), replay_endpoint.clone());
+                        async move { Json(serde_json::json!({"0":{"endpoint":endpoint,"replay_endpoint":replay_endpoint,"publisher":"zmq","encoding":"msgpack","schema_version":1,"enable_kv_cache_events":true}})) }
+                    }))
+                    .route("/v1/completions", axum::routing::post(move |body: bytes::Bytes| {
+                        let captured = captured.clone();
+                        async move {
+                            let (release, wait) = tokio::sync::oneshot::channel();
+                            captured.send((index, body, release)).unwrap();
+                            wait.await.unwrap();
+                            Json(serde_json::json!({"choices":[{"text":"ok","finish_reason":"stop"}]}))
+                        }
+                    }));
+                servers.push(tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap()
+                }));
+                let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, WorkerType::Regular));
+                router.worker_registry.register(worker.clone());
+                let info = supervisor.on_worker_added(worker.url()).await.unwrap();
+                let policy = router.policy_registry.get_default_policy();
+                kv_aware_ops(policy.as_ref()).unwrap().register_worker(
+                    worker.as_ref(),
+                    Some(&info),
+                    supervisor.match_provider_for_worker(worker.url()),
+                );
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match publisher.recv_bytes(zmq::DONTWAIT) {
+                            Ok(subscription) => {
+                                assert_eq!(subscription, [1]);
+                                break;
+                            }
+                            Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                            Err(error) => panic!("subscription handshake: {error}"),
+                        }
+                    }
+                })
+                .await
+                .expect("subscriber handshake");
+                workers.push(worker);
+                publishers.push(publisher);
+            }
+            router.kv_index_supervisor = Some(supervisor);
+            Self {
+                router: Arc::new(router),
+                workers,
+                publishers,
+                replay,
+                signals,
+                requests,
+                servers,
+            }
+        }
+
+        fn stored(first: u32) -> crate::kv_index::KVEvent {
+            use crate::kv_index::{wire::ExternalBlockHash, BlockStored, KVEvent};
+            KVEvent::BlockStored(BlockStored {
+                extra_keys: None,
+                block_hashes: vec![
+                    ExternalBlockHash::Int(first as u64),
+                    ExternalBlockHash::Int(first as u64 + 1),
+                ],
+                parent_block_hash: None,
+                token_ids: (first..first + 32).collect(),
+                block_size: 16,
+                lora_id: None,
+                medium: Some("GPU".into()),
+                lora_name: None,
+                group_idx: Some(0),
+                kv_cache_spec_kind: Some("full_attention".into()),
+                kv_cache_spec_sliding_window: None,
+                locality: Some("LOCAL".into()),
+                ownership: None,
+                session_id: None,
+            })
+        }
+
+        fn payload(events: Vec<crate::kv_index::KVEvent>) -> bytes::Bytes {
+            rmp_serde::to_vec_named(&(0.0, events, Some(0u32)))
+                .unwrap()
+                .into()
+        }
+
+        fn publish(&self, worker: usize, seq: i64, payload: &bytes::Bytes) {
+            self.publishers[worker]
+                .send_multipart(
+                    [
+                        b"".as_slice(),
+                        seq.to_be_bytes().as_slice(),
+                        payload.as_ref(),
+                    ],
+                    0,
+                )
+                .unwrap();
+        }
+
+        async fn advanced(&mut self, worker: usize, seq: i64) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match self.signals.recv().await.expect("ingestion signal") {
+                        crate::kv_index::IngestionSignal::Advance { source, last_seq }
+                            if source.as_ref() == self.workers[worker].url() && last_seq == seq =>
+                        {
+                            break
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("source-specific processing barrier");
+        }
+
+        async fn replay_request(&self, from: i64, replies: &[(i64, bytes::Bytes)]) {
+            let request = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match self.replay.recv_multipart(zmq::DONTWAIT) {
+                        Ok(request) => break request,
+                        Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                        Err(error) => panic!("replay request: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("replay requested");
+            assert_eq!(request.len(), 3);
+            assert_eq!(request[2], from.to_be_bytes());
+
+            for (seq, payload) in replies {
+                self.replay
+                    .send_multipart(
+                        [
+                            request[0].as_slice(),
+                            b"".as_slice(),
+                            b"".as_slice(),
+                            seq.to_be_bytes().as_slice(),
+                            payload.as_ref(),
+                        ],
+                        0,
+                    )
+                    .unwrap();
+            }
+        }
+
+        fn assert_prefix(&self, worker: usize, first: u32, present: bool) {
+            use crate::kv_index::{MatchQuery, StorageTier};
+            let policy = self.router.policy_registry.get_default_policy();
+            let kv = kv_aware_policy(policy.as_ref()).unwrap();
+            let target = kv.target_for_worker(self.workers[worker].as_ref());
+            let hits = self
+                .router
+                .kv_index_supervisor
+                .as_ref()
+                .unwrap()
+                .match_provider_for_worker(self.workers[worker].url())
+                .unwrap()
+                .find_tiered_matches(&MatchQuery {
+                    group_idx: 0,
+                    local_hashes: crate::policies::KvAwarePolicy::local_hashes(
+                        &(first..first + 33).collect::<Vec<_>>(),
+                        16,
+                    ),
+                    tiers_of_interest: vec![StorageTier::Device],
+                });
+            let own: Vec<_> = hits.iter().filter(|hit| hit.target == target).collect();
+            if present {
+                assert_eq!(own.len(), 1);
+                assert_eq!(own[0].tier, StorageTier::Device);
+                assert_eq!(own[0].target.dp_rank, 0);
+                assert_eq!(own[0].segments, vec![(0, 2)]);
+            } else {
+                assert!(own.is_empty(), "unexpected prefix: {own:?}");
+            }
+        }
+
+        async fn request_a(&mut self, first: u32, expected_tokens: u64) {
+            let policy = self.router.policy_registry.get_default_policy();
+            let kv = kv_aware_policy(policy.as_ref()).unwrap();
+            let manager = kv.slot_manager().unwrap();
+            let a = kv.target_for_worker(self.workers[0].as_ref());
+            let b = kv.target_for_worker(self.workers[1].as_ref());
+            let background = crate::policies::LoadSample {
+                active_prefill_tokens: 100,
+                active_requests: 1,
+            };
+            manager.begin_prefill(&b, 100);
+            self.workers[1].increment_load();
+            let raw = bytes::Bytes::from(format!(
+                " {{ \"model\":\"qwen3\", \"prompt\":{} }} ",
+                serde_json::to_string(&(first..first + 33).collect::<Vec<_>>()).unwrap()
+            ));
+            let request = Arc::new(serde_json::from_slice(&raw).unwrap());
+            let router = self.router.clone();
+            let dispatch = tokio::spawn({
+                let raw = raw.clone();
+                async move { router.route_completion_raw(None, request, raw, None).await }
+            });
+            let (backend, body, release) =
+                tokio::time::timeout(Duration::from_secs(5), self.requests.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let during = manager.sample(&a);
+            let b_during = manager.sample(&b);
+            let loads = (self.workers[0].load(), self.workers[1].load());
+            release.send(()).unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(5), dispatch)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let after = manager.sample(&a);
+            let b_after = manager.sample(&b);
+            manager.begin_decode(&b, &b, 100);
+            manager.free(&b);
+            self.workers[1].decrement_load();
+
+            assert_eq!(backend, 0, "A remains a legal candidate");
+            assert_eq!(body, raw);
+            assert_eq!(loads, (1, 1));
+            assert_eq!(b_during, background);
+            assert_eq!(b_after, background);
+            assert_eq!(manager.sample(&b), crate::policies::LoadSample::default());
+            assert_eq!(after, crate::policies::LoadSample::default());
+            assert_eq!((self.workers[0].load(), self.workers[1].load()), (0, 0));
+            assert_eq!(
+                during,
+                crate::policies::LoadSample {
+                    active_prefill_tokens: expected_tokens,
+                    active_requests: 1
+                }
+            );
+        }
+
+        async fn seeded_then_failed_replay(&mut self) -> std::time::Instant {
+            self.publish(0, 0, &Self::payload(vec![Self::stored(100)]));
+            self.advanced(0, 0).await;
+            self.publish(1, 0, &Self::payload(vec![Self::stored(500)]));
+            self.advanced(1, 0).await;
+            self.assert_prefix(0, 100, true);
+            self.assert_prefix(1, 500, true);
+            self.request_a(100, 1).await;
+            let seq2 = Self::payload(vec![Self::stored(200)]);
+            self.publish(0, 2, &seq2);
+            // The retained frame is identical to live; missing seq 1 prevents recovery.
+            self.replay_request(1, &[(2, seq2), (-1, bytes::Bytes::new())])
+                .await;
+            self.advanced(0, 2).await;
+            let retry_after = std::time::Instant::now() + Duration::from_secs(2);
+            self.request_a(200, 33).await;
+            self.assert_prefix(0, 100, false);
+            self.assert_prefix(0, 200, false);
+            self.assert_prefix(1, 500, true);
+            retry_after
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_failed_replay_then_suffix_replay_keeps_full_cost() {
+        let mut fixture = RecoveryCompletionFixture::new().await;
+        let retry_after = fixture.seeded_then_failed_replay().await;
+        // This wait only permits the std::time retry backoff; Advance(2) above
+        // and Advance(5) below, not elapsed time, fence ingestion processing.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(remaining) =
+                retry_after.checked_duration_since(std::time::Instant::now())
+            {
+                tokio::time::sleep(remaining).await;
+            }
+        })
+        .await
+        .expect("bounded real replay cooldown");
+
+        let seq3 = RecoveryCompletionFixture::payload(vec![]);
+        let seq4 = RecoveryCompletionFixture::payload(vec![RecoveryCompletionFixture::stored(300)]);
+        fixture.publish(0, 4, &seq4);
+        fixture
+            .replay_request(0, &[(3, seq3), (4, seq4), (-1, bytes::Bytes::new())])
+            .await;
+        fixture.publish(0, 5, &RecoveryCompletionFixture::payload(vec![]));
+        fixture.advanced(0, 5).await;
+        fixture.assert_prefix(1, 500, true);
+        // Inspect actual dispatch and cleanup before checking placement visibility.
+        fixture.request_a(300, 33).await;
+        fixture.assert_prefix(0, 300, false);
+    }
+
+    #[tokio::test]
+    async fn completion_validated_clear_restores_only_new_prefix_credit() {
+        let mut fixture = RecoveryCompletionFixture::new().await;
+        fixture.seeded_then_failed_replay().await;
+        fixture.publish(
+            0,
+            3,
+            &RecoveryCompletionFixture::payload(vec![crate::kv_index::KVEvent::AllBlocksCleared(
+                crate::kv_index::AllBlocksCleared {},
+            )]),
+        );
+        fixture.advanced(0, 3).await;
+        fixture.assert_prefix(0, 100, false);
+        fixture.assert_prefix(0, 200, false);
+        fixture.request_a(200, 33).await;
+        fixture.publish(
+            0,
+            4,
+            &RecoveryCompletionFixture::payload(vec![RecoveryCompletionFixture::stored(300)]),
+        );
+        fixture.advanced(0, 4).await;
+        fixture.assert_prefix(0, 300, true);
+        fixture.assert_prefix(1, 500, true);
+        fixture.request_a(300, 1).await;
+        fixture.assert_prefix(0, 100, false);
+        fixture.assert_prefix(0, 200, false);
+    }
+
     #[tokio::test]
     async fn completion_non_kv_drops_unused_raw_before_backend_wait() {
         struct RawOwner {
