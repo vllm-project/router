@@ -6,6 +6,7 @@
 use http::HeaderMap;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::io::{self, Write};
+use tracing::debug;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -112,6 +113,14 @@ pub fn resolve_affinity_identity(
             .transpose()?
             .flatten(),
     };
+    if session_id
+        .as_ref()
+        .is_some_and(|id| id.len() > MAX_IDENTITY_COMPONENT_BYTES)
+    {
+        return Err(IdentityError(format!(
+            "session_id exceeds {MAX_IDENTITY_COMPONENT_BYTES} bytes"
+        )));
+    }
     Ok(session_id.map(|id| StableIdentity {
         source: IdentitySource::BodySession,
         program_id: id,
@@ -138,9 +147,13 @@ pub fn routing_session_key(
     headers: Option<&HeaderMap>,
     fields: IdentityFields<'_>,
 ) -> Option<String> {
-    needed
-        .then(|| resolve_session_key(headers, fields).ok().flatten())
-        .flatten()
+    if !needed {
+        return None;
+    }
+    resolve_session_key(headers, fields).unwrap_or_else(|error| {
+        debug!("Routing without a session: invalid session identity: {error}");
+        None
+    })
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -481,5 +494,25 @@ mod tests {
             resolve_session_key(Some(&request_scoped), IdentityFields::from_body(&body)).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn body_session_id_is_capped_like_other_ids() {
+        let at_cap = "s".repeat(MAX_IDENTITY_COMPONENT_BYTES);
+        let over_cap = "s".repeat(MAX_IDENTITY_COMPONENT_BYTES + 1);
+        let key = |body: &JsonValue| resolve_session_key(None, IdentityFields::from_body(body));
+
+        let body = serde_json::json!({"session_id": at_cap});
+        assert_eq!(key(&body).unwrap().as_deref(), Some(at_cap.as_str()));
+        for body in [
+            serde_json::json!({"session_id": over_cap}),
+            serde_json::json!({"session_params": {"session_id": over_cap}}),
+        ] {
+            assert!(key(&body).is_err(), "{body}");
+            assert_eq!(
+                routing_session_key(true, None, IdentityFields::from_body(&body)),
+                None
+            );
+        }
     }
 }
