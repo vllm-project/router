@@ -18,6 +18,10 @@ jobs:
   rust-tests:
     name: Rust unit + integration tests
     runs-on: ubuntu-latest
+    # Same image as the Buildkite CPU lane. The GitHub host image's libzmq
+    # crashes several zmq-backed tests with SIGSEGV; bookworm matches the
+    # environment the suite is validated in.
+    container: rust:1.95.0-bookworm
     timeout-minutes: 60
     env:
       CARGO_INCREMENTAL: "0"
@@ -39,16 +43,9 @@ jobs:
           done
           pkg-config --version
       - name: Unit tests
-        # GitHub's runner SIGSEGVs inside the zmq-backed kv_index tests
-        # (signal 11 after the test starts; two different tests reproduced it).
-        # This is unrelated to Program scheduling and the Buildkite CPU lane
-        # still runs the full suite, so skip the module only in this lane.
         run: |
           set -o pipefail
-          cargo test --features cpu,ready --lib --bins -- \
-            --test-threads=1 \
-            --skip kv_index:: \
-            2>&1 | tee unit-tests.log
+          cargo test --features cpu,ready --lib --bins -- --test-threads=1 2>&1 | tee unit-tests.log
       - name: Surface unit test failures
         if: failure()
         run: |
