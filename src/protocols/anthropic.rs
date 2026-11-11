@@ -253,6 +253,13 @@ impl GenerationRequest for MessagesRequest {
     /// Program identity fields (`vllm_xargs`, `agent_hint`, `session_params`,
     /// `session_id`, `user_id`) live in the forwarded `other` fields, so a
     /// body level Program opt-in keeps working on the typed route.
+    fn affinity_identity(&self) -> crate::request_identity::IdentityFields<'_> {
+        crate::request_identity::IdentityFields {
+            other: Some(&self.other),
+            session_params: None,
+        }
+    }
+
     fn extract_program_identity_payload(&self) -> Option<Value> {
         crate::protocols::spec::program_identity_payload(Some(&self.other), None)
     }
