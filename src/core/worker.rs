@@ -15,6 +15,20 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to create worker HTTP client")
 });
 
+/// GET request to a worker, with the router's API key as a bearer token when
+/// one is configured.
+pub(crate) fn worker_get(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = client.get(url);
+    match api_key {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    }
+}
+
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug {
@@ -289,7 +303,7 @@ pub struct WorkerMetadata {
 pub struct BasicWorker {
     metadata: WorkerMetadata,
     dp_size: Option<usize>,
-    api_key: Option<String>,
+    api_key: Option<Arc<str>>,
     load_counter: Arc<AtomicUsize>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
@@ -357,8 +371,8 @@ impl BasicWorker {
         self
     }
 
-    /// Configure the API key used to authenticate worker health checks.
-    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+    /// Set the API key sent as a bearer token on this worker's HTTP health checks.
+    pub fn with_worker_api_key(mut self, api_key: Option<Arc<str>>) -> Self {
         self.api_key = api_key;
         self
     }
@@ -424,11 +438,11 @@ impl Worker for BasicWorker {
                 let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
 
                 // Use the shared client with a custom timeout for this request
-                let mut request = WORKER_CLIENT.get(&health_url).timeout(timeout);
-                if let Some(api_key) = self.api_key.as_deref() {
-                    request = request.bearer_auth(api_key);
-                }
-                match request.send().await {
+                match worker_get(&WORKER_CLIENT, &health_url, self.api_key.as_deref())
+                    .timeout(timeout)
+                    .send()
+                    .await
+                {
                     Ok(response) => response.status().is_success(),
                     Err(_) => false,
                 }
@@ -555,9 +569,9 @@ impl DPAwareWorker {
         self
     }
 
-    /// Configure the API key used to authenticate worker health checks.
-    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
-        self.base_worker = self.base_worker.with_api_key(api_key);
+    /// Set the API key sent as a bearer token on this worker's HTTP health checks.
+    pub fn with_worker_api_key(mut self, api_key: Option<Arc<str>>) -> Self {
+        self.base_worker = self.base_worker.with_worker_api_key(api_key);
         self
     }
 }
@@ -1106,9 +1120,33 @@ mod tests {
     fn test_worker_api_key_is_redacted_from_debug_output() {
         let api_key = "worker-secret";
         let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
-            .with_api_key(Some(api_key.to_string()));
+            .with_worker_api_key(Some(Arc::from(api_key)));
+        let dp_worker =
+            DPAwareWorker::new("http://test:8080".to_string(), 0, 2, WorkerType::Regular)
+                .with_worker_api_key(Some(Arc::from(api_key)));
 
         assert!(!format!("{:?}", worker).contains(api_key));
+        assert!(!format!("{:?}", dp_worker).contains(api_key));
+    }
+
+    #[test]
+    fn test_worker_get_uses_only_the_configured_key() {
+        let client = reqwest::Client::new();
+        for (key, expected) in [
+            (None, None),
+            (Some("backend-key"), Some("Bearer backend-key")),
+        ] {
+            let request = worker_get(&client, "https://worker/v1/models", key)
+                .build()
+                .unwrap();
+            assert_eq!(
+                request
+                    .headers()
+                    .get("authorization")
+                    .map(|value| value.to_str().unwrap()),
+                expected
+            );
+        }
     }
 
     // Test Worker trait implementation

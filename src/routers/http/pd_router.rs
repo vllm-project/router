@@ -633,6 +633,8 @@ impl PdRouterBase {
             &[url.to_string()],
             self.worker_startup_timeout_secs,
             self.worker_startup_check_interval_secs,
+            // PD health checks do not send the API key yet.
+            None,
         )
         .await
         .map_err(|_| PDRouterError::HealthCheckFailed {
@@ -1048,6 +1050,8 @@ impl PdRouterBase {
                     urls,
                     ctx.router_config.worker_startup_timeout_secs,
                     ctx.router_config.worker_startup_check_interval_secs,
+                    // PD health checks do not send the API key yet.
+                    None,
                 )
                 .await?;
             }
