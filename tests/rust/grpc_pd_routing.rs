@@ -351,6 +351,37 @@ async fn check_grpc_deferred_decode(cache_aware: bool, new_worker: bool) {
 }
 
 #[tokio::test]
+async fn grpc_pd_messages_rejected_before_pair_admission() {
+    let prefill = MockVllmRsServer::spawn().await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router(&prefill, &decode).await;
+    let body = serde_json::from_value(json!({
+        "model": "test-model", "max_tokens": 8,
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap();
+    let workers = router.worker_registry().get_all();
+    for available in [true, false] {
+        for worker in &workers {
+            worker.set_healthy(available);
+        }
+        let response = router.route_messages(None, &body, None).await;
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(prefill.captured().is_empty() && decode.captured().is_empty());
+        assert!(workers.iter().all(|worker| worker.load() == 0));
+        // Admission publishes per-worker occupancy even after its permit is
+        // released; no series means this request never admitted a pair.
+        assert!(
+            !metrics().render().lines().any(|line| {
+                line.starts_with("vllm_router_pd_")
+                    && (line.contains(&prefill.grpc_url) || line.contains(&decode.grpc_url))
+            }),
+            "messages touched P/D admission"
+        );
+    }
+}
+
+#[tokio::test]
 async fn grpc_pd_aborted_prefill_skips_decode() {
     let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
         finish_kv_transfer_params: Some(prefill_kv()),

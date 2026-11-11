@@ -80,6 +80,7 @@ impl MockWorker {
             .route("/v1/completions", post(completions_handler))
             .route("/v1/rerank", post(rerank_handler))
             .route("/v1/responses", post(responses_handler))
+            .route("/v1/messages", post(messages_handler))
             .route("/v1/responses/{response_id}", get(responses_get_handler))
             .route(
                 "/v1/responses/{response_id}/cancel",
@@ -467,6 +468,74 @@ async fn chat_completions_handler(
         }))
         .into_response()
     }
+}
+
+/// Anthropic messages handler. Echoes the received body and the worker port so
+/// tests can check passthrough and routing.
+async fn messages_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let config = config.read().await;
+    capture_request(config.port, "/v1/messages", &headers);
+
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "type": "error",
+                "error": {"type": "api_error", "message": "mock worker failure"}
+            })),
+        )
+            .into_response();
+    }
+
+    if payload.get("stream").and_then(|v| v.as_bool()) == Some(true) {
+        // Anthropic sse: named events and no `data: [DONE]` at the end.
+        let id = format!("msg_{}", Uuid::new_v4());
+        let model = payload.get("model").cloned().unwrap_or(json!("mock-model"));
+        let events = vec![
+            (
+                "message_start",
+                json!({"type": "message_start", "message": {"id": id, "type": "message", "role": "assistant", "model": model, "content": [], "worker_port": config.port}}),
+            ),
+            (
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "ok"}}),
+            ),
+            (
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            (
+                "message_delta",
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}}),
+            ),
+            ("message_stop", json!({"type": "message_stop"})),
+        ];
+        let stream = stream::iter(events.into_iter().map(|(name, data)| {
+            Ok::<_, Infallible>(Event::default().event(name).data(data.to_string()))
+        }));
+        return Sse::new(stream).into_response();
+    }
+
+    Json(json!({
+        "id": format!("msg_{}", Uuid::new_v4()),
+        "type": "message",
+        "role": "assistant",
+        "model": payload.get("model").cloned().unwrap_or(json!("mock-model")),
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 3, "output_tokens": 1},
+        "worker_port": config.port,
+        "echo": payload,
+    }))
+    .into_response()
 }
 
 async fn completions_handler(

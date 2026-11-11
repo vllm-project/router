@@ -2617,9 +2617,15 @@ pub trait GenerationRequest: Send + Sync {
     fn cache_identity(&self) -> (Option<&str>, Option<&str>) {
         (None, None)
     }
+
+    /// Body level session affinity key, used only when no session header is
+    /// present (for example anthropic `metadata.user_id`).
+    fn affinity_user_key(&self) -> Option<&str> {
+        None
+    }
 }
 
-fn passthrough_string<'a>(
+pub(crate) fn passthrough_string<'a>(
     other: &'a serde_json::Map<String, serde_json::Value>,
     name: &str,
 ) -> Option<&'a str> {
@@ -2629,7 +2635,7 @@ fn passthrough_string<'a>(
         .filter(|value| !value.is_empty())
 }
 
-fn program_identity_payload(
+pub(crate) fn program_identity_payload(
     other: Option<&serde_json::Map<String, serde_json::Value>>,
     user: Option<&str>,
 ) -> Option<serde_json::Value> {

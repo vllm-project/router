@@ -72,8 +72,26 @@ pub(crate) const NAMED_LORA_FIELD: &str = "lora_name";
 pub(crate) const ADAPTER_FIELDS: [&str; 3] =
     [NAMED_LORA_FIELD, "lora_path", "prompt_adapter_request"];
 
+/// Messages blocks other than images and documents render to text, so they
+/// keep their cache identity; a tool_result can nest image blocks.
+fn text_only_part(part: &serde_json::Value, route: &str) -> bool {
+    match part.get("type").and_then(serde_json::Value::as_str) {
+        Some("text") => true,
+        Some("tool_use" | "thinking" | "redacted_thinking") => route == "/v1/messages",
+        Some("tool_result") => {
+            route == "/v1/messages"
+                && part
+                    .get("content")
+                    .and_then(serde_json::Value::as_array)
+                    .is_none_or(|nested| nested.iter().all(|p| text_only_part(p, route)))
+        }
+        _ => false,
+    }
+}
+
 fn http_cache_identity(
     fields: &serde_json::Map<String, serde_json::Value>,
+    route: &str,
 ) -> Result<(), &'static str> {
     // The event index cannot identify multimodal/embedding or prompt-adapter
     // cache keys from token IDs alone. HTTP adapter names also need an explicit
@@ -95,9 +113,7 @@ fn http_cache_identity(
     if let Some(messages) = fields.get("messages").and_then(serde_json::Value::as_array) {
         for message in messages {
             if let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) {
-                if parts.iter().any(|part| {
-                    part.get("type").and_then(serde_json::Value::as_str) != Some("text")
-                }) {
+                if parts.iter().any(|part| !text_only_part(part, route)) {
                     return Err("multimodal_input");
                 }
             }
@@ -108,7 +124,7 @@ fn http_cache_identity(
 
 fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &'static str> {
     if let Some(fields) = body.as_object() {
-        http_cache_identity(fields)?;
+        http_cache_identity(fields, route)?;
     }
     let path = match route {
         "/v1/completions" => {
@@ -153,6 +169,9 @@ fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &
                 &body["token_ids"],
             )?])))
         }
+        // Same render contract as chat; without it, /tokenize takes the chat
+        // form vLLM itself converts text only Messages bodies into.
+        "/v1/messages" => "/v1/messages/render",
         _ => return Err("unsupported_route"),
     };
     Ok(HttpKvInput::Render { path })
@@ -173,7 +192,7 @@ pub(crate) fn router_token_inputs(
     prompts: &Arc<[Vec<u32>]>,
 ) -> std::collections::HashMap<String, Result<HttpTokenInput, &'static str>> {
     let checked = match body.as_object() {
-        Some(fields) => http_cache_identity(fields),
+        Some(fields) => http_cache_identity(fields, "/v1/chat/completions"),
         None => Ok(()),
     };
     let input = checked.map(|()| HttpTokenInput {
@@ -323,6 +342,75 @@ async fn http_input_json(
         .map_err(|_| "invalid_preparation_response")
 }
 
+/// Text of a Messages content value, mirroring vLLM's Anthropic conversion:
+/// a string stays as is, text blocks become chat text parts. Any other block
+/// (image, tool_use, tool_result, thinking) has no exact chat form here.
+fn messages_text_parts(content: &serde_json::Value) -> Option<Vec<String>> {
+    match content {
+        serde_json::Value::String(text) => Some(vec![text.clone()]),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| {
+                if block.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+                    return Some(None);
+                }
+                match block.get("text").and_then(serde_json::Value::as_str) {
+                    Some("") | None => None,
+                    Some(text) => Some(Some(text.to_owned())),
+                }
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
+/// Text only Messages body as the chat messages vLLM renders for it.
+/// Inline system turns are declined: vLLM may merge them into the leading
+/// system prompt depending on the chat template.
+fn messages_as_chat(body: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    const BILLING: &str = "x-anthropic-billing-header";
+    let mut out = Vec::new();
+    if let Some(system) = body.get("system").filter(|value| !value.is_null()) {
+        // vLLM preserves a string system verbatim; billing metadata is only
+        // removed when converting a list of system text blocks.
+        let text: String = match system {
+            serde_json::Value::String(text) => text.clone(),
+            _ => messages_text_parts(system)?
+                .into_iter()
+                .filter(|text| !text.starts_with(BILLING))
+                .collect(),
+        };
+        if !text.is_empty() {
+            out.push(serde_json::json!({"role": "system", "content": text}));
+        }
+    }
+    for message in body.get("messages")?.as_array()? {
+        let role = message.get("role")?.as_str()?;
+        if !matches!(role, "user" | "assistant") {
+            return None;
+        }
+        let content = message.get("content")?;
+        let parts = messages_text_parts(content)?;
+        let content = match (content, parts.as_slice()) {
+            (serde_json::Value::String(text), _) => serde_json::Value::from(text.as_str()),
+            (_, []) => {
+                if role == "user" {
+                    continue;
+                }
+                out.push(serde_json::json!({"role": role}));
+                continue;
+            }
+            (_, [text]) => serde_json::Value::from(text.as_str()),
+            (_, parts) => parts
+                .iter()
+                .map(|text| serde_json::json!({"type": "text", "text": text}))
+                .collect(),
+        };
+        out.push(serde_json::json!({"role": role, "content": content}));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 pub(crate) fn http_tokenize_fallback(
     body: &serde_json::Value,
     route: &str,
@@ -390,6 +478,19 @@ pub(crate) fn http_tokenize_fallback(
             payload.insert("messages".into(), body["messages"].clone());
             Some(vec![serde_json::Value::Object(payload)])
         }
+        "/v1/messages" => {
+            // thinking and output_config change the chat template (reasoning_effort /
+            // enable_thinking on the worker). /tokenize cannot reproduce that, so decline
+            // and wait for /v1/messages/render instead of hashing the wrong prefix.
+            if ["thinking", "output_config"]
+                .iter()
+                .any(|field| body.get(field).is_some_and(|value| !value.is_null()))
+            {
+                return None;
+            }
+            payload.insert("messages".into(), messages_as_chat(body)?.into());
+            Some(vec![serde_json::Value::Object(payload)])
+        }
         _ => None,
     }
 }
@@ -421,7 +522,7 @@ pub(crate) fn prepare_completion_direct_inputs(
     request: &CompletionRequest,
     workers: &[Arc<dyn Worker>],
 ) -> Option<WorkerTokenInputs> {
-    http_cache_identity(&request.other).ok()?;
+    http_cache_identity(&request.other, "/v1/completions").ok()?;
     // Flattened fields serialize last, including duplicates in borrowed API requests.
     let lora_is_null = request.other.get("lora_path").map_or_else(
         || matches!(request.lora_path, None | Some(LoRAPath::Single(None))),
@@ -989,6 +1090,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn messages_tokenize_body_mirrors_vllm_chat_conversion() {
+        use serde_json::json;
+        let body = json!({"model": "m", "max_tokens": 4,
+            "system": [{"type": "text", "text": "x-anthropic-billing-header: a"},
+                       {"type": "text", "text": "be "}, {"type": "text", "text": "brief"}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                {"role": "user", "content": "c"}]});
+        assert!(matches!(
+            super::http_kv_input(&body, "/v1/messages"),
+            Ok(super::HttpKvInput::Render {
+                path: "/v1/messages/render"
+            })
+        ));
+        let requests = super::http_tokenize_fallback(&body, "/v1/messages").unwrap();
+        assert_eq!(
+            requests,
+            vec![json!({"model": "m", "messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "c"}]})]
+        );
+        // Tool and thinking blocks render on the worker; images and documents,
+        // including images nested in a tool_result, have no token cache identity.
+        let tool_turn = json!({"messages": [{"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "t"},
+            {"type": "tool_use", "id": "t", "name": "f", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t",
+                "content": [{"type": "text", "text": "done"}]}]}]});
+        assert!(super::http_kv_input(&tool_turn, "/v1/messages").is_ok());
+        assert_eq!(
+            super::http_kv_input(&tool_turn, "/v1/chat/completions").err(),
+            Some("multimodal_input")
+        );
+        for block in [
+            json!({"type": "image", "source": {"type": "url", "url": "u"}}),
+            json!({"type": "document", "source": {"type": "text", "data": "d"}}),
+            json!({"type": "tool_result", "tool_use_id": "t",
+                "content": [{"type": "image", "source": {"type": "url", "url": "u"}}]}),
+        ] {
+            let body = json!({"messages": [{"role": "user", "content": [block]}]});
+            assert_eq!(
+                super::http_kv_input(&body, "/v1/messages").err(),
+                Some("multimodal_input")
+            );
+        }
+        // No exact chat form: tools, thinking, output_config effort, inline system
+        // and non-text blocks. output_config maps to reasoning_effort on the worker.
+        for body in [
+            json!({"messages": [{"role": "user", "content": "a"}], "tools": [{"name": "f"}]}),
+            json!({"messages": [{"role": "user", "content": "a"}], "thinking": {"type": "enabled"}}),
+            json!({"messages": [{"role": "user", "content": "a"}], "output_config": {"effort": "high"}}),
+            json!({"messages": [{"role": "user", "content": "a"}], "output_config": {"effort": "low"}}),
+            json!({"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "a"}]}),
+            json!({"messages": [{"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "f", "input": {}}]}]}),
+        ] {
+            assert!(super::http_tokenize_fallback(&body, "/v1/messages").is_none());
+        }
+    }
+
+    #[test]
+    fn messages_tokenize_preserves_billing_header_in_string_system() {
+        use serde_json::json;
+        let system = "x-anthropic-billing-header: a\nkeep these instructions";
+        let body = json!({"model": "m", "max_tokens": 4,
+            "system": system,
+            "messages": [{"role": "user", "content": "hi"}]});
+        let requests = super::http_tokenize_fallback(&body, "/v1/messages").unwrap();
+        assert_eq!(
+            requests,
+            vec![json!({"model": "m", "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "hi"}]})]
+        );
+    }
+
     #[tokio::test]
     async fn shared_http_preparation_retains_good_workers_and_exact_tool_payloads() {
         use super::prepare_http_token_inputs;
@@ -1060,7 +1240,7 @@ mod tests {
                     fields.insert(field.into(), value);
                 }
                 assert_eq!(
-                    super::http_cache_identity(&fields),
+                    super::http_cache_identity(&fields, "/v1/chat/completions"),
                     expected,
                     "{field}: {state}"
                 );
@@ -1098,7 +1278,7 @@ mod tests {
             ("salt", json!({"cache_salt":"tenant"}), Ok(())),
         ] {
             assert_eq!(
-                super::http_cache_identity(fields.as_object().unwrap()),
+                super::http_cache_identity(fields.as_object().unwrap(), "/v1/chat/completions"),
                 expected,
                 "{name}"
             );
