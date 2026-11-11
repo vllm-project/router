@@ -301,24 +301,11 @@ curl --fail --silent --show-error \
   | tee "${LOG_DIR}/smoke-response.json"
 echo
 
-# HTTP 200 alone does not establish a successful completion. Validate in the
-# pinned image so the coordinator needs no additional Python dependencies.
-docker run --rm \
-  --name "${EVAL_CONTAINER}" \
-  -v "${REPO_ROOT}:/workdir:ro" \
-  -v "${LOG_DIR}:/evidence:ro" \
-  -w /workdir \
-  --entrypoint python3 \
-  "${ROCM_VLLM_IMAGE}" \
-  -m tools.e2e.validate_completion /evidence/smoke-response.json
-
-if [[ "${SMOKE_ONLY}" == "true" ]]; then
-  echo "MoRI RDMA cross-node smoke passed (read_mode=${MORIIO_READ_MODE})"
-  exit 0
-fi
-
 EVAL_COMMAND=$(cat <<EOF
 set -Eeuo pipefail
+# Validate before installing dependencies, including in smoke-only mode.
+python3 tests/python/helpers/completion_validation.py /evidence/smoke-response.json
+if [[ "${SMOKE_ONLY}" == true ]]; then exit 0; fi
 export PIP_ROOT_USER_ACTION=ignore
 export PIP_CACHE_DIR=/root/.cache/pip
 python3 -m pip install --disable-pip-version-check --quiet requests
@@ -349,10 +336,15 @@ docker run --rm \
   --name "${EVAL_CONTAINER}" \
   --network host \
   -v "${REPO_ROOT}:/workdir" \
+  -v "${LOG_DIR}:/evidence:ro" \
   -v "${EVAL_PIP_CACHE_VOLUME}:/root/.cache/pip" \
   -w /workdir \
   --entrypoint bash \
   "${ROCM_VLLM_IMAGE}" \
   -lc "${EVAL_COMMAND}"
 
-echo "MoRI RDMA cross-node accuracy passed (read_mode=${MORIIO_READ_MODE})"
+if [[ "${SMOKE_ONLY}" == true ]]; then
+  echo "MoRI RDMA cross-node smoke passed (read_mode=${MORIIO_READ_MODE})"
+else
+  echo "MoRI RDMA cross-node accuracy passed (read_mode=${MORIIO_READ_MODE})"
+fi

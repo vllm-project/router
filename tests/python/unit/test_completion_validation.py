@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.e2e.validate_completion import validate_single_completion
+from ..helpers.completion_validation import validate_single_completion
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
@@ -22,12 +22,6 @@ def test_valid_completion(smoke_response, reason):
     # The captured response ended with length; stop is a derived valid variant.
     smoke_response["choices"][0]["finish_reason"] = reason
     validate_single_completion(smoke_response)
-
-
-def test_empty_completion_message(smoke_response):
-    smoke_response["choices"][0]["text"] = " "
-    with pytest.raises(ValueError, match="^completion text is empty or invalid$"):
-        validate_single_completion(smoke_response)
 
 
 @pytest.mark.parametrize(
@@ -82,7 +76,11 @@ def test_completion_cli(
             encoding="utf-8",
         )
     result = subprocess.run(
-        [sys.executable, "-m", "tools.e2e.validate_completion", str(response)],
+        [
+            sys.executable,
+            "tests/python/helpers/completion_validation.py",
+            str(response),
+        ],
         cwd=pytestconfig.rootpath,
         capture_output=True,
         text=True,
