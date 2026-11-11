@@ -51,6 +51,18 @@ jobs:
           else
             grep -E 'panicked|error\[|^error:|FAILED' unit-clean.log | head -20 | sed 's/^/::error::/' || tail -40 unit-clean.log | sed 's/^/::error::/'
           fi
+      - name: Report unit test failure log
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo 'CI unit tests failed; tail of `unit-tests.log`:'
+            echo '```'
+            tail -200 unit-tests.log
+            echo '```'
+          } > failure.md
+          gh pr comment 460 --body-file failure.md
       - name: Integration tests
         run: |
           set -o pipefail
