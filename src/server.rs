@@ -136,15 +136,9 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
     let method = req.method().clone();
 
     // Read body
-    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+    let body_bytes = match axum::body::Bytes::from_request(req, &()).await {
         Ok(bytes) => bytes,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to read request body: {}", e),
-            )
-                .into_response()
-        }
+        Err(rejection) => return rejection.into_response(),
     };
 
     // Parse body as JSON

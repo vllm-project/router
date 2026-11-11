@@ -1,22 +1,29 @@
 """Worker argv and process start/stop for the perf suites.
 
 ``vllm_rs_serve_cmd``, ``vllm_serve_cmd``, and ``router_cmd`` build argv.
+Keyword arguments become flags, so each suite passes only the flags it needs.
 ``launch_worker`` and ``launch_router`` start the processes. Callers decide
-when to start them.
+when to start them. ``reserve_port`` and the ``release_*_port_holders``
+helpers keep an OS-assigned port until the process that binds it is started.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +63,7 @@ def _pipe(
     label: str,
     sink: list[str] | None,
     lock: threading.Lock,
+    log_fp=None,
 ) -> threading.Thread:
     def _reader() -> None:
         stream = proc.stdout
@@ -63,6 +71,9 @@ def _pipe(
             return
         for line in stream:
             print(f"[{label}] {line}", end="", file=sys.stderr, flush=True)
+            if log_fp is not None:
+                log_fp.write(line)
+                log_fp.flush()
             if sink is not None:
                 with lock:
                     sink.append(line)
@@ -103,7 +114,43 @@ def _wait_http(
     raise TimeoutError(f"{label} not ready at {url} within {timeout}s")
 
 
-def graceful_stop(proc: subprocess.Popen, timeout: float = 120.0) -> None:
+def graceful_stop(
+    proc: subprocess.Popen,
+    timeout: float = 120.0,
+    *,
+    process_group: bool = False,
+    kill_grace: float = 15.0,
+) -> None:
+    """Terminate, then kill. ``process_group`` signals the whole session.
+
+    Replay is started with ``start_new_session=True``. If its leader has
+    already exited, the children can still hold ports, so that path still
+    sends ``SIGKILL`` to the group.
+    """
+
+    if process_group:
+        if proc.poll() is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        proc.wait(timeout=kill_grace)
+        return
+
     if proc.poll() is not None:
         return
     proc.terminate()
@@ -141,6 +188,7 @@ class RunningProc:
     log_prefix: str = "perf"
     lines: list[str] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    log_fp: object | None = None
 
     def alive(self) -> bool:
         return self.proc.poll() is None
@@ -153,6 +201,86 @@ class RunningProc:
             self.label,
             prefix=self.log_prefix,
         )
+        if self.log_fp is not None:
+            self.log_fp.close()
+            self.log_fp = None
+
+
+def reserve_port(holders: list[socket.socket | None], host: str = "127.0.0.1") -> int:
+    """Bind ``host:0``, keep the socket in ``holders``, and return the port.
+
+    Holder order for a multi-worker cell is HTTP ports, then gRPC ports, then
+    the router port, then the Prometheus port. ``release_worker_port_holders``
+    and ``release_router_port_holders`` use that order.
+    """
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind((host, 0))
+    port = int(sock.getsockname()[1])
+    holders.append(sock)
+    return port
+
+
+def _close_port_holder(holders: list[socket.socket | None], index: int) -> None:
+    if index >= len(holders) or holders[index] is None:
+        return
+    try:
+        holders[index].close()
+    except OSError:
+        pass
+    holders[index] = None
+
+
+def release_all_port_holders(holders: list[socket.socket | None]) -> None:
+    """Close every reserved socket and clear the list."""
+
+    for index in range(len(holders)):
+        _close_port_holder(holders, index)
+    holders.clear()
+
+
+def release_worker_port_holders(
+    holders: list[socket.socket | None], worker: int, worker_count: int
+) -> None:
+    """Close the HTTP and gRPC holders for one worker."""
+
+    for index in (worker, worker_count + worker):
+        _close_port_holder(holders, index)
+
+
+def release_router_port_holders(
+    holders: list[socket.socket | None], worker_count: int
+) -> None:
+    """Close the router and Prometheus holders."""
+
+    for index in (2 * worker_count, 2 * worker_count + 1):
+        _close_port_holder(holders, index)
+
+
+def _cli_flags(options: Mapping[str, Any]) -> list[str]:
+    """Turn keyword arguments into CLI flags, in the order they were passed.
+
+    ``None`` and ``False`` are left out. ``True`` is a bare flag. A list or
+    tuple is one flag followed by each item. A dict is one JSON value.
+    ``max_model_len=32768`` becomes ``--max-model-len 32768``.
+    """
+
+    args: list[str] = []
+    for key, value in options.items():
+        if value is None or value is False:
+            continue
+        flag = "--" + key.replace("_", "-")
+        if value is True:
+            args.append(flag)
+            continue
+        args.append(flag)
+        if isinstance(value, (list, tuple)):
+            args.extend(str(item) for item in value)
+        elif isinstance(value, dict):
+            args.append(json.dumps(value))
+        else:
+            args.append(str(value))
+    return args
 
 
 def vllm_rs_serve_cmd(
@@ -165,8 +293,16 @@ def vllm_rs_serve_cmd(
     cli: Sequence[str] = (),
     served_model_name: str | None = None,
     extra_args: Sequence[str] = (),
+    engine_flags: Mapping[str, Any] | None = None,
+    **flags: Any,
 ) -> list[str]:
-    """``vllm-rs serve`` argv. Callers append their own extra flags."""
+    """``vllm-rs serve`` argv.
+
+    Keyword arguments become flags before ``--``. ``engine_flags`` are the
+    engine arguments after ``--``. ``cli`` and ``extra_args`` stay raw argv
+    for callers that already store a flag list.
+    """
+
     cmd = [
         binary,
         "serve",
@@ -177,11 +313,15 @@ def vllm_rs_serve_cmd(
         str(port),
         "--grpc-port",
         str(grpc_port),
+        *_cli_flags(flags),
         *cli,
     ]
     if served_model_name:
         cmd.extend(["--served-model-name", served_model_name])
     cmd.extend(extra_args)
+    if engine_flags:
+        cmd.append("--")
+        cmd.extend(_cli_flags(engine_flags))
     return cmd
 
 
@@ -192,8 +332,10 @@ def vllm_serve_cmd(
     host: str,
     port: int,
     cli: Sequence[str] = (),
+    **flags: Any,
 ) -> list[str]:
-    """``vllm serve`` argv."""
+    """``vllm serve`` argv. Extra keyword arguments are appended as flags."""
+
     return [
         binary,
         "serve",
@@ -202,6 +344,7 @@ def vllm_serve_cmd(
         host,
         "--port",
         str(port),
+        *_cli_flags(flags),
         *cli,
     ]
 
@@ -211,12 +354,20 @@ def router_cmd(
     *,
     host: str,
     port: int,
-    worker_urls: str,
+    worker_urls: str | Sequence[str],
     worker_startup_timeout_secs: int,
     prometheus_host: str | None = None,
     prometheus_port: int | None = None,
+    **flags: Any,
 ) -> list[str]:
-    """``vllm-router`` argv. Prometheus flags are omitted when unset."""
+    """``vllm-router`` argv.
+
+    ``worker_urls`` is one URL or a list of URLs after a single
+    ``--worker-urls``. Other keyword arguments are appended as flags.
+    Prometheus flags are omitted when unset.
+    """
+
+    urls = [worker_urls] if isinstance(worker_urls, str) else list(worker_urls)
     cmd = [
         binary,
         "--host",
@@ -224,14 +375,22 @@ def router_cmd(
         "--port",
         str(port),
         "--worker-urls",
-        worker_urls,
+        *urls,
     ]
     if prometheus_host:
         cmd.extend(["--prometheus-host", prometheus_host])
     if prometheus_port is not None:
         cmd.extend(["--prometheus-port", str(prometheus_port)])
     cmd.extend(["--worker-startup-timeout-secs", str(int(worker_startup_timeout_secs))])
+    cmd.extend(_cli_flags(flags))
     return cmd
+
+
+def _open_log(log_path: Path | None):
+    if log_path is None:
+        return None
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    return open(log_path, "w", encoding="utf-8")
 
 
 def launch_worker(
@@ -243,10 +402,16 @@ def launch_worker(
     sleep_s: float = 0,
     timeout: float = 1800,
     log_prefix: str = "perf",
+    log_path: Path | None = None,
 ) -> RunningProc:
-    """Start a worker. L1 passes ``ready_url`` (``/v1/models``). gRPC passes ``sleep_s``."""
+    """Start a worker. L1 passes ``ready_url`` (``/v1/models``). gRPC passes ``sleep_s``.
+
+    ``log_path`` also copies stdout into that file. Callers that omit it only
+    stream to stderr.
+    """
+    log_fp = _open_log(log_path)
     proc = _popen(cmd, env, prefix=log_prefix)
-    thread = _pipe(proc, label, None, threading.Lock())
+    thread = _pipe(proc, label, None, threading.Lock(), log_fp)
     try:
         if ready_url:
             _wait_http(ready_url, timeout, proc, label, prefix=log_prefix)
@@ -258,8 +423,16 @@ def launch_worker(
             )
     except Exception:
         _stop_proc(proc, thread, 120.0, label, prefix=log_prefix)
+        if log_fp is not None:
+            log_fp.close()
         raise
-    return RunningProc(proc=proc, thread=thread, label=label, log_prefix=log_prefix)
+    return RunningProc(
+        proc=proc,
+        thread=thread,
+        label=label,
+        log_prefix=log_prefix,
+        log_fp=log_fp,
+    )
 
 
 def launch_router(
@@ -270,12 +443,18 @@ def launch_router(
     timeout: float = 1800,
     keep_log: bool = False,
     log_prefix: str = "perf",
+    log_path: Path | None = None,
 ) -> RunningProc:
-    """Start a router and block until ``/health`` is OK."""
+    """Start a router and block until ``/health`` is OK.
+
+    ``log_path`` also copies stdout into that file. Callers that omit it only
+    stream to stderr.
+    """
     lock = threading.Lock()
     lines: list[str] = []
+    log_fp = _open_log(log_path)
     proc = _popen(cmd, env, prefix=log_prefix)
-    thread = _pipe(proc, "vllm-router", lines if keep_log else None, lock)
+    thread = _pipe(proc, "vllm-router", lines if keep_log else None, lock, log_fp)
     try:
         _wait_http(
             router_url.rstrip("/") + "/health",
@@ -291,6 +470,8 @@ def launch_router(
             )
     except Exception:
         _stop_proc(proc, thread, 120.0, "router", prefix=log_prefix)
+        if log_fp is not None:
+            log_fp.close()
         raise
     return RunningProc(
         proc=proc,
@@ -299,4 +480,5 @@ def launch_router(
         log_prefix=log_prefix,
         lines=lines,
         lock=lock,
+        log_fp=log_fp,
     )
