@@ -663,7 +663,9 @@ class RouterArgs:
             )
 
         if not 1 <= self.prefix_preparation_timeout_ms <= 60_000:
-            raise ValueError("prefix_preparation_timeout_ms must be between 1 and 60000")
+            raise ValueError(
+                "prefix_preparation_timeout_ms must be between 1 and 60000"
+            )
 
         if self.wasm_middleware_sha256 and not self.wasm_middleware:
             raise ValueError("wasm_middleware_sha256 requires wasm_middleware")
