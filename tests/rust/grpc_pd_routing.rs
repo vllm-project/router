@@ -242,6 +242,177 @@ async fn grpc_pd_hands_prefill_kv_params_to_decode() {
 }
 
 #[tokio::test]
+async fn grpc_pd_selects_decode_after_prefill_finishes() {
+    check_grpc_deferred_decode(false, false).await;
+}
+
+#[tokio::test]
+async fn grpc_pd_cache_selection_refreshes_after_prefill() {
+    check_grpc_deferred_decode(true, false).await;
+}
+
+#[tokio::test]
+async fn grpc_pd_cache_selection_includes_new_decode_worker() {
+    check_grpc_deferred_decode(true, true).await;
+}
+
+async fn check_grpc_deferred_decode(cache_aware: bool, new_worker: bool) {
+    use common::mock_vllm_rs::HoldGate;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let p_gate = HoldGate::hold_all();
+    let d_gate = HoldGate::hold_all();
+    let p0 = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        hold: Some(p_gate.clone()),
+        finish_kv_transfer_params: Some(prefill_kv()),
+        ..Default::default()
+    })
+    .await;
+    let p1 = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        finish_kv_transfer_params: Some(prefill_kv()),
+        ..Default::default()
+    })
+    .await;
+    let d0 = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        hold: (!new_worker).then(|| d_gate.clone()),
+        ..Default::default()
+    })
+    .await;
+    let d1 = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        hold: new_worker.then(|| d_gate.clone()),
+        ..Default::default()
+    })
+    .await;
+    let p_urls = vec![(p0.grpc_url.clone(), None), (p1.grpc_url.clone(), None)];
+    let d_urls = if new_worker {
+        vec![d0.grpc_url.clone()]
+    } else {
+        vec![d0.grpc_url.clone(), d1.grpc_url.clone()]
+    };
+    let kv = PolicyConfig::KvAware {
+        router_temperature: 0.0,
+        kv_penalty_host: 0.8,
+        kv_penalty_external: 0.6,
+        kv_penalty_disk: 0.4,
+        static_kv_event_sources: Default::default(),
+    };
+    let decode_policy = if cache_aware {
+        PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 3600,
+            max_tree_size: 100_000,
+        }
+    } else {
+        kv
+    };
+    let config = RouterConfig {
+        mode: RoutingMode::VllmPrefillDecode {
+            prefill_urls: p_urls.clone(),
+            decode_urls: d_urls.clone(),
+            prefill_policy: Some(PolicyConfig::RoundRobin),
+            decode_policy: Some(decode_policy.clone()),
+            discovery_address: None,
+        },
+        kv_connector: KvConnector::Nixl,
+        worker_startup_timeout_secs: 5,
+        ..Default::default()
+    };
+    let ctx = create_test_context(config);
+    ctx.policy_registry
+        .set_prefill_policy(PolicyFactory::create_from_config(
+            &PolicyConfig::RoundRobin,
+            None,
+        ));
+    ctx.policy_registry
+        .set_decode_policy(PolicyFactory::create_from_config(&decode_policy, None));
+    let router = Arc::new(VllmPDRouter::new(p_urls, d_urls, None, &ctx).await.unwrap());
+    router.pin_test_token_ids(vec![1, 2, 3]);
+    let first = {
+        let router = router.clone();
+        tokio::spawn(async move { router.route_chat(None, &chat(false), None).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while p0.captured().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let removed = if new_worker {
+        let registry = router.worker_registry();
+        let old = registry.remove_by_url(&d0.grpc_url).unwrap();
+        registry.register(Arc::new(vllm_router_rs::core::BasicWorker::new(
+            d1.grpc_url.clone(),
+            vllm_router_rs::core::WorkerType::Decode,
+        )));
+        Some(old)
+    } else {
+        None
+    };
+    let second = {
+        let router = router.clone();
+        tokio::spawn(async move { router.route_chat(None, &chat(false), None).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while if new_worker {
+            d1.captured().is_empty()
+        } else {
+            d0.captured().is_empty()
+        } {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    if let Some(old) = removed {
+        router.worker_registry().register(old);
+    }
+    p_gate.release();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while d0.captured().len() + d1.captured().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    if new_worker {
+        assert_eq!(
+            d1.captured().len(),
+            2,
+            "new worker's warmed prefix must be scored at commit"
+        );
+    } else if cache_aware {
+        assert_eq!(
+            d0.captured().len(),
+            2,
+            "the first request must see the prefix warmed while prefill waited"
+        );
+    } else {
+        assert_eq!(
+            d1.captured().len(),
+            1,
+            "the first request must see D0's new load"
+        );
+    }
+    d_gate.release();
+    assert!(tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .unwrap()
+        .unwrap()
+        .status()
+        .is_success());
+    assert!(tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .unwrap()
+        .unwrap()
+        .status()
+        .is_success());
+}
+
+#[tokio::test]
 async fn grpc_pd_aborted_prefill_skips_decode() {
     let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
         finish_kv_transfer_params: Some(prefill_kv()),
