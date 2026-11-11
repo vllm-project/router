@@ -114,8 +114,9 @@ impl EcRecorder {
     }
 
     /// `[EC cancel]`: after a `peers` query, every transfer in `ids` gets a
-    /// cancel with `abandon: true`, and no other transfer does.
-    pub async fn expect_cancel(&mut self, ids: &[String]) {
+    /// cancel with `abandon: true`, and no other transfer does, up to `QUIET`
+    /// after the last expected cancel.
+    async fn expect_cancel(&mut self, ids: &[String]) {
         let deadline = tokio::time::Instant::now() + WAIT_DURATION;
         loop {
             self.take_new();
@@ -134,6 +135,9 @@ impl EcRecorder {
                 }
             }
         }
+        // A cancel for another transfer can come after the last expected one.
+        tokio::time::sleep(QUIET_DURATION).await;
+        self.take_new();
         assert_eq!(
             self.seen[0]["op"], "peers",
             "[EC cancel] shard discovery comes first: {:?}",
@@ -146,10 +150,11 @@ impl EcRecorder {
                 "[EC cancel] unexpected transfer: {message}"
             );
         }
+        self.expect_running();
     }
 
     /// `[EC cancel]`: the control address gets no traffic during `QUIET`.
-    pub async fn expect_no_cancel(&mut self) {
+    async fn expect_no_cancel(&mut self) {
         tokio::time::sleep(QUIET_DURATION).await;
         self.take_new();
         assert!(
@@ -336,7 +341,7 @@ impl Rig {
 
     /// The transfer IDs that the router gave the two images, as the encoder
     /// requests carry them.
-    pub fn transfer_ids(&self) -> Vec<String> {
+    fn transfer_ids(&self) -> Vec<String> {
         self.expect_encoder_assignment();
         let mut ids = Vec::new();
         for request in self.e0.requests().into_iter().chain(self.e1.requests()) {
@@ -352,6 +357,21 @@ impl Rig {
         }
         assert_eq!(ids.len(), 2, "[dispatch] one transfer per image: {ids:?}");
         ids
+    }
+
+    /// `[EC cancel]`: the request has two transfers for this consumer (so
+    /// there is something to cancel), and the control address gets no traffic
+    /// during `QUIET`.
+    pub async fn expect_no_cancel(&mut self) {
+        self.transfer_ids();
+        self.ec.expect_no_cancel().await;
+    }
+
+    /// `[EC cancel]`: each of the request's transfers gets a cancel, and no
+    /// other transfer does.
+    pub async fn expect_cancel(&mut self) {
+        let ids = self.transfer_ids();
+        self.ec.expect_cancel(&ids).await;
     }
 }
 

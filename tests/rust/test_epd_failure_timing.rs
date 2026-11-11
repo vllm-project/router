@@ -30,7 +30,7 @@ mod consumer_2xx_with_stalled_or_invalid_body {
             let mut body = response.into_body().into_data_stream();
             assert_eq!(next_chunk(&mut body).await, "{", "[client] first part");
             // Disarmed at the headers: nothing to cancel while the body stalls.
-            rig.ec.expect_no_cancel().await;
+            rig.expect_no_cancel().await;
             rig.consumer.release();
             let (rest, broken) = rest_of_body(body).await;
             assert!(!broken, "[client] the body ends normally");
@@ -38,7 +38,7 @@ mod consumer_2xx_with_stalled_or_invalid_body {
                 serde_json::from_str::<Value>(&format!("{{{rest}")).is_err(),
                 "[client] the invalid body comes through as it is: {rest:?}"
             );
-            rig.ec.expect_no_cancel().await;
+            rig.expect_no_cancel().await;
         }
         // The client goes away while the body stalls.
         {
@@ -49,7 +49,7 @@ mod consumer_2xx_with_stalled_or_invalid_body {
             next_chunk(&mut body).await;
             drop(body); // [local drop]: the response body
             rig.consumer.expect_aborted().await;
-            rig.ec.expect_no_cancel().await;
+            rig.expect_no_cancel().await;
         }
     }
 
@@ -72,7 +72,7 @@ mod consumer_2xx_with_stalled_or_invalid_body {
             rig.consumer.wait_requests(1).await;
             // While P's body stalls, the guard is armed and D waits.
             expect_waiting(&mut client).await;
-            rig.ec.expect_no_cancel().await;
+            rig.expect_no_cancel().await;
             rig.decode.expect_no_request();
             rig.consumer.release();
             let response = answer(client).await;
@@ -83,8 +83,7 @@ mod consumer_2xx_with_stalled_or_invalid_body {
             );
             let text = text(response).await;
             assert!(text.contains(error), "[client] {text}");
-            let ids = rig.transfer_ids();
-            rig.ec.expect_cancel(&ids).await;
+            rig.expect_cancel().await;
             rig.decode.expect_no_request();
         }
         // The client goes away while P's body stalls.
@@ -95,8 +94,7 @@ mod consumer_2xx_with_stalled_or_invalid_body {
         expect_waiting(&mut client).await;
         disconnect(client).await;
         rig.consumer.expect_aborted().await;
-        let ids = rig.transfer_ids();
-        rig.ec.expect_cancel(&ids).await;
+        rig.expect_cancel().await;
         rig.decode.expect_no_request();
     }
 
@@ -113,7 +111,7 @@ mod consumer_2xx_with_stalled_or_invalid_body {
             // [dispatch] D got its request at the same time as P, and answered.
             rig.decode.expect_completed().await;
             expect_waiting(&mut client).await;
-            rig.ec.expect_no_cancel().await;
+            rig.expect_no_cancel().await;
             rig.consumer.release();
             let response = answer(client).await;
             assert_eq!(
@@ -126,7 +124,7 @@ mod consumer_2xx_with_stalled_or_invalid_body {
                 reply["choices"][0]["message"]["content"], "A",
                 "[client] D's reply"
             );
-            rig.ec.expect_no_cancel().await;
+            rig.expect_no_cancel().await;
         }
         // The client goes away while P's body stalls. D has sent its headers
         // and holds its body.
@@ -141,7 +139,6 @@ mod consumer_2xx_with_stalled_or_invalid_body {
         rig.consumer.expect_aborted().await;
         // D's cleanup is a separate observation: its connection closes too.
         rig.decode.expect_aborted().await;
-        let ids = rig.transfer_ids();
-        rig.ec.expect_cancel(&ids).await;
+        rig.expect_cancel().await;
     }
 }
