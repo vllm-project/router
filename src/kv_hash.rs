@@ -5,8 +5,12 @@
 //! `PYTHONHASHSEED` in `0..=u32::MAX`, supplied as an unsigned integer. The
 //! Worker environment must use its canonical decimal spelling (e.g. `42`,
 //! not `00042`): vLLM hashes the verbatim seed string for the initial parent.
+//! Alternatively, callers can provide the engine's verified root digest.
 //! This utility then hashes the canonical CBOR
-//! value `(parent_hash, tuple(token_ids), None)` for each complete block.
+//! value `(parent_hash, tuple(token_ids), extra_keys)` for each complete block,
+//! where `extra_keys` is null for the base model and `[["lora", name, path]]`
+//! for an adapter: vLLM seeds an adapter's chain with the adapter identity, so
+//! the same tokens under a different adapter is a different chain.
 
 use sha2::{Digest, Sha256};
 
@@ -42,6 +46,15 @@ impl BlockKeyGenerator {
         }
     }
 
+    /// Use the engine's authenticated root digest without exposing its seed.
+    pub fn from_root_hash(block_size: usize, root_hash: SequenceHash) -> Self {
+        assert!(block_size > 0, "block_size must be greater than zero");
+        Self {
+            block_size,
+            none_hash: root_hash,
+        }
+    }
+
     pub fn block_size(&self) -> usize {
         self.block_size
     }
@@ -49,11 +62,32 @@ impl BlockKeyGenerator {
     /// Return one key per complete block. A trailing partial block is not
     /// cache-addressable and is intentionally omitted.
     pub fn generate_block_keys(&self, token_ids: &[u32]) -> Vec<SequenceHash> {
+        self.generate_block_keys_with_extra(token_ids, None)
+    }
+
+    /// The same chain for one LoRA adapter. The engine hashes each adapter
+    /// block with `[["lora", name, path]]` as extra keys, where `path` is the
+    /// string the engine was launched with, so this reproduces the adapter's
+    /// chain instead of the base chain.
+    pub fn generate_block_keys_for_adapter(
+        &self,
+        token_ids: &[u32],
+        name: &str,
+        path: &str,
+    ) -> Vec<SequenceHash> {
+        self.generate_block_keys_with_extra(token_ids, Some((name, path)))
+    }
+
+    fn generate_block_keys_with_extra(
+        &self,
+        token_ids: &[u32],
+        adapter: Option<(&str, &str)>,
+    ) -> Vec<SequenceHash> {
         let mut parent = self.none_hash;
         token_ids
             .chunks_exact(self.block_size)
             .map(|tokens| {
-                parent = hash_block(&parent, tokens);
+                parent = hash_block(&parent, tokens, adapter);
                 parent
             })
             .collect()
@@ -65,10 +99,14 @@ impl BlockKeyGenerator {
     }
 }
 
-fn hash_block(parent: &SequenceHash, token_ids: &[u32]) -> SequenceHash {
+fn hash_block(
+    parent: &SequenceHash,
+    token_ids: &[u32],
+    adapter: Option<(&str, &str)>,
+) -> SequenceHash {
     let mut encoded = Vec::with_capacity(40 + token_ids.len() * 3);
 
-    // Canonical CBOR for: [parent_hash_bytes, [token ids...], null]
+    // Canonical CBOR for: [parent_hash_bytes, [token ids...], extra_keys]
     encode_major(&mut encoded, 4, 3);
     encode_major(&mut encoded, 2, parent.len() as u64);
     encoded.extend_from_slice(parent);
@@ -76,9 +114,24 @@ fn hash_block(parent: &SequenceHash, token_ids: &[u32]) -> SequenceHash {
     for &token_id in token_ids {
         encode_major(&mut encoded, 0, u64::from(token_id));
     }
-    encoded.push(0xf6);
+    match adapter {
+        None => encoded.push(0xf6),
+        Some((name, path)) => {
+            // [["lora", name, path]]: one extra key group, one tagged tuple.
+            encode_major(&mut encoded, 4, 1);
+            encode_major(&mut encoded, 4, 3);
+            encode_text(&mut encoded, "lora");
+            encode_text(&mut encoded, name);
+            encode_text(&mut encoded, path);
+        }
+    }
 
     digest(&encoded)
+}
+
+fn encode_text(output: &mut Vec<u8>, value: &str) {
+    encode_major(output, 3, value.len() as u64);
+    output.extend_from_slice(value.as_bytes());
 }
 
 fn encode_major(output: &mut Vec<u8>, major: u8, value: u64) {
@@ -102,6 +155,56 @@ fn encode_major(output: &mut Vec<u8>, major: u8, value: u64) {
             output.push(prefix | 27);
             output.extend_from_slice(&value.to_be_bytes());
         }
+    }
+}
+
+/// The engine-verified digest of one full-attention page stored under an
+/// adapter, captured from vLLM 0.33 and reproduced here from the root digest:
+/// the declaration is only useful if this stays byte-identical.
+#[cfg(test)]
+mod adapter_chain_tests {
+    use super::*;
+
+    fn from_hex(value: &str) -> SequenceHash {
+        let mut out = [0u8; 32];
+        for (slot, pair) in out.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+            let text = std::str::from_utf8(pair).expect("hex");
+            *slot = u8::from_str_radix(text, 16).expect("hex");
+        }
+        out
+    }
+
+    fn hex(value: &SequenceHash) -> String {
+        value.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn adapter_extra_keys_reproduce_the_engine_digest() {
+        let root = from_hex("9bd96a485ad84efdafb72ee48a1d7a69bcead0f8f0433173941b276b9581eef0");
+        let tokens: Vec<u32> = (0..576u32).map(|index| 100 + index % 100).collect();
+        let keys = BlockKeyGenerator::from_root_hash(576, root);
+        assert_eq!(
+            hex(&keys.generate_block_keys(&tokens)[0]),
+            "fd9b68ba7d50a4838b5b54fe698e76011ea1689b846702657129f5a9b774c725"
+        );
+        assert_eq!(
+            hex(&keys.generate_block_keys_for_adapter(
+                &tokens,
+                "lora1",
+                "/tmp/zjy-lora-link/adapter"
+            )[0]),
+            "47682e772ff1d8826fbd3a9b793a4f2c4d97ba96beeb4dac9990e5bcd38c961f"
+        );
+        // The adapter path is part of the input: a different path is a
+        // different chain, which is what makes a re-pointed adapter a miss.
+        assert_ne!(
+            hex(&keys.generate_block_keys_for_adapter(
+                &tokens,
+                "lora1",
+                "/home/zjy/hybrid-verify/lora-adapter"
+            )[0]),
+            "47682e772ff1d8826fbd3a9b793a4f2c4d97ba96beeb4dac9990e5bcd38c961f"
+        );
     }
 }
 
