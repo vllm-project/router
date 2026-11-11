@@ -185,4 +185,55 @@ mod tests {
             );
         }
     }
+
+    /// Stage overrides on `RouterConfig` reach the PD router even in IGW mode,
+    /// where `RoutingMode` is a `Regular` placeholder.  Before the fix the IGW
+    /// path in `server.rs` passed `None` for both stage policies, so both
+    /// stages silently fell back to the main `--policy`.
+    #[tokio::test]
+    async fn igw_stage_policy_overrides_reach_pd_router() {
+        let config = RouterConfig {
+            enable_igw: true,
+            policy: PolicyConfig::RoundRobin,
+            prefill_policy: Some(PolicyConfig::CacheAware {
+                cache_threshold: 0.3,
+                balance_abs_threshold: 18,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 120,
+                max_tree_size: 1_000_000,
+            }),
+            decode_policy: Some(PolicyConfig::ConsistentHash { virtual_nodes: 160 }),
+            mode: RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            ..RouterConfig::default()
+        };
+        let ctx = Arc::new(
+            AppContext::new(config.clone(), reqwest::Client::new(), 8, None, vec![])
+                .expect("test app context"),
+        );
+        // Simulate the IGW PD router creation path (server.rs).
+        RouterFactory::create_vllm_pd_router(
+            &[],
+            &[],
+            None,
+            config.prefill_policy.as_ref(),
+            config.decode_policy.as_ref(),
+            &config.policy,
+            &ctx,
+        )
+        .await
+        .expect("PD router creation");
+
+        assert_eq!(
+            ctx.policy_registry.get_prefill_policy().name(),
+            "cache_aware",
+            "prefill must use the stage override, not the main policy"
+        );
+        assert_eq!(
+            ctx.policy_registry.get_decode_policy().name(),
+            "consistent_hash",
+            "decode must use the stage override, not the main policy"
+        );
+    }
 }

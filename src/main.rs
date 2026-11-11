@@ -631,6 +631,8 @@ impl CliArgs {
             mode,
             pd_kv_event_sources,
             policy,
+            prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
+            decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
             connection_mode,
             host: self.host.clone(),
             port: self.port,
@@ -982,5 +984,30 @@ mod tests {
                 "should reject '{bad}'"
             );
         }
+    }
+
+    #[test]
+    fn igw_stage_policies_survive_config_conversion() {
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--enable-igw",
+            "--prefill-policy",
+            "cache_aware",
+            "--decode-policy",
+            "consistent_hash",
+        ])
+        .unwrap();
+        let config = args.to_router_config(vec![]).unwrap();
+        assert!(
+            matches!(config.prefill_policy, Some(PolicyConfig::CacheAware { .. })),
+            "prefill_policy must survive IGW config conversion"
+        );
+        assert!(
+            matches!(
+                config.decode_policy,
+                Some(PolicyConfig::ConsistentHash { .. })
+            ),
+            "decode_policy must survive IGW config conversion"
+        );
     }
 }

@@ -230,6 +230,8 @@ impl Router {
             mode,
             pd_kv_event_sources: config::parse_pd_kv_events(&self.pd_kv_events)?,
             policy,
+            prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
+            decode_policy: self.decode_policy.as_ref().map(convert_policy),
             host: self.host.clone(),
             port: self.port,
             connection_mode: config::ConnectionMode::Http,
