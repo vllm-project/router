@@ -125,6 +125,7 @@ impl HybridEventIndex {
             adapters: Vec::new(),
             max_entries,
             state: RwLock::new(State {
+                claim_tokens: HashMap::new(),
                 next_seq: None,
                 visible: false,
                 claims: HashMap::new(),
@@ -240,6 +241,27 @@ impl HybridEventIndex {
             return (0, None);
         };
         let page_evidence = state.page_evidence_in(namespace);
+        let claim_tokens = state.claim_tokens_in(namespace);
+        // vLLM also caches a prefix that ends inside a page (`cache_partial_block`
+        // at a mamba checkpoint or a shared prefix boundary). Those stores carry
+        // the shorter length and their own hash, so the boundary they prove is
+        // that hash position -- find it in the query chain.
+        let hash_positions: std::collections::HashMap<SequenceHash, usize> =
+            hashes.iter().enumerate().map(|(i, h)| (*h, i)).collect();
+        let partial_end = |group_idx: u32, page: u64| -> u64 {
+            let Some(widths) = claim_tokens else {
+                return 0;
+            };
+            let granule = u64::from(self.keys.block_size() as u32);
+            widths
+                .iter()
+                .filter(|((idx, _), width)| *idx == group_idx && u64::from(**width) < page)
+                .filter_map(|((_, hash), _)| hash_positions.get(hash))
+                .map(|position| (u64::try_from(*position).unwrap_or(u64::MAX) + 1) * granule)
+                .filter(|end| end % page != 0)
+                .max()
+                .unwrap_or(0)
+        };
         let matches: Vec<Vec<TierMatch>> = self
             .groups
             .iter()
@@ -280,6 +302,7 @@ impl HybridEventIndex {
                 matches,
                 page_evidence: page_evidence
                     .is_some_and(|evidence| evidence.contains(&group.group_idx)),
+                partial_end: partial_end(group.group_idx, u64::from(group.block_size)),
             })
             .collect();
         let boundary = common_reusable_tokens(

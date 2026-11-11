@@ -44,6 +44,9 @@ pub struct HybridGroupView<'a> {
     /// publishes key-only stores reports no addressable page, so it cannot
     /// constrain the boundary; the layout's other groups do.
     pub page_evidence: bool,
+    /// Token end of a prefix that stops inside a page, when the engine published
+    /// a partial prefix entry for it (`cache_partial_block`).
+    pub partial_end: u64,
 }
 
 /// Round `tokens` down to `block_size`.
@@ -99,24 +102,19 @@ pub fn common_reusable_tokens(
     // the loop repeats because that smaller cap can invalidate a sliding
     // group's window.
     let mut boundary = max_reusable_tokens;
-    let unit = constraining
-        .iter()
-        .map(|group| group.block_size)
-        .min()
-        .unwrap_or(1);
     loop {
         let mut next = boundary;
         for group in &constraining {
-            next = next.min(align_down(
-                supported_at(group, target, boundary),
-                group.block_size,
-            ));
+            // The group already reports a boundary it can restore; snapping it
+            // to the page would discard a partial-page entry the engine
+            // published. The caller aligns to the hash granule at the end.
+            next = next.min(supported_at(group, target, boundary));
         }
         if next == 0 {
             return 0;
         }
         if next == boundary {
-            return align_down(boundary, unit);
+            return boundary;
         }
         boundary = next;
     }
@@ -226,6 +224,24 @@ fn longest_supported(group: &HybridGroupView<'_>, target: &RoutableTarget, cap: 
                 }
             };
             best = best.max(candidate);
+        }
+    }
+    // A partial prefix entry proves a boundary inside a page the page-level
+    // hashes have not covered yet. A checkpoint needs only itself; a dense run
+    // must already hold every page before that one.
+    let page = u64::from(group.block_size).max(1);
+    if group.partial_end > best {
+        let page_start = (group.partial_end / page) * page;
+        let dense_ready = best >= page_start;
+        if dense_ready
+            && matches!(
+                group.kind,
+                HybridGroupKind::FullAttention
+                    | HybridGroupKind::CompressedFullAttention { .. }
+                    | HybridGroupKind::Checkpoint
+            )
+        {
+            best = group.partial_end;
         }
     }
     best
@@ -573,7 +589,28 @@ mod tests {
             kind,
             matches,
             page_evidence: true,
+            partial_end: 0,
         }
+    }
+
+    /// vLLM also caches a prefix ending inside a page (`cache_partial_block`).
+    /// The boundary is the partial token end, not the page end.
+    #[test]
+    fn a_partial_page_boundary_is_restorable() {
+        let worker = target("w", 0);
+        // Page 576, a partial entry at 560: no page-level hash exists yet.
+        let mut full_group = group(0, 576, HybridGroupKind::FullAttention, &[]);
+        full_group.partial_end = 560;
+        assert_eq!(common_reusable_tokens(&worker, &[full_group], 1024), 560);
+    }
+
+    /// A checkpoint needs only itself, so its partial entry alone is enough.
+    #[test]
+    fn a_partial_checkpoint_is_restorable_on_its_own() {
+        let worker = target("w", 0);
+        let mut checkpoint = group(0, 576, HybridGroupKind::Checkpoint, &[]);
+        checkpoint.partial_end = 560;
+        assert_eq!(common_reusable_tokens(&worker, &[checkpoint], 1024), 560);
     }
 
     #[test]

@@ -185,6 +185,7 @@ impl HybridEventIndex {
                             namespace.as_deref(),
                             (group_idx, hash),
                             tier,
+                            store.block_size,
                             self.max_entries,
                         ) {
                             // An adapter that fills its own budget must not

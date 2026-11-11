@@ -19,6 +19,9 @@ pub(super) struct State {
     /// that only publishes key-only stores reports no addressable page, so it
     /// cannot bound the shared prefix.
     pub(super) page_evidence: HashMap<Option<String>, HashSet<u32>>,
+    /// Tokens one claim covers. A store of a full page records the page size;
+    /// vLLM's partial prefix entry records the shorter length it represents.
+    pub(super) claim_tokens: HashMap<Option<String>, HashMap<(u32, SequenceHash), u32>>,
 }
 
 /// The tiers one page is resident on. A store adds a tier, a removal clears
@@ -85,6 +88,17 @@ impl State {
             .map(|(_, claims)| claims)
     }
 
+    /// Tokens one claim covers, for the partial-boundary check.
+    pub(super) fn claim_tokens_in(
+        &self,
+        namespace: Option<&str>,
+    ) -> Option<&HashMap<(u32, SequenceHash), u32>> {
+        self.claim_tokens
+            .iter()
+            .find(|(identity, _)| identity.as_deref() == namespace)
+            .map(|(_, widths)| widths)
+    }
+
     /// The groups one identity has page evidence for.
     pub(super) fn page_evidence_in(&self, namespace: Option<&str>) -> Option<&HashSet<u32>> {
         self.page_evidence
@@ -100,6 +114,7 @@ impl State {
         namespace: Option<&str>,
         key: (u32, SequenceHash),
         tier: StorageTier,
+        tokens: u32,
         max_entries: usize,
     ) -> bool {
         let claims = self.claims.entry(namespace.map(str::to_owned)).or_default();
@@ -111,6 +126,10 @@ impl State {
             return false;
         }
         claims.insert(key, TierSet::default().with(tier));
+        self.claim_tokens
+            .entry(namespace.map(str::to_owned))
+            .or_default()
+            .insert(key, tokens);
         true
     }
 
@@ -118,6 +137,9 @@ impl State {
     /// keeping a stale claim would over-credit, dropping one costs at most a
     /// re-prefill.
     pub(super) fn remove_claim_all(&mut self, key: (u32, SequenceHash)) {
+        for widths in self.claim_tokens.values_mut() {
+            widths.remove(&key);
+        }
         for claims in self.claims.values_mut() {
             claims.remove(&key);
         }
@@ -127,6 +149,9 @@ impl State {
     /// whichever chain produced it. A page that still has another copy stays
     /// claimed at the better remaining tier.
     pub(super) fn remove_claim(&mut self, key: (u32, SequenceHash), tier: StorageTier) {
+        for widths in self.claim_tokens.values_mut() {
+            widths.remove(&key);
+        }
         for claims in self.claims.values_mut() {
             if let Some(resident) = claims.get_mut(&key) {
                 *resident = resident.without(tier);
