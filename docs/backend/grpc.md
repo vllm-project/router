@@ -64,8 +64,8 @@ not log this RPC. A quiet worker log during these probes is normal.
 Two curls are usable, and they check different things. With the ports from the
 start example below, the router is `30000` and the worker HTTP port is `8000`.
 
-The router reports the stored probe. This request does not call the worker, so
-it adds nothing to the worker log:
+The router reports the stored health flag. This request does not call the
+worker, so it adds nothing to the worker log:
 
 ```bash
 curl -sS http://127.0.0.1:30000/health
@@ -95,9 +95,14 @@ the port the router actually uses:
 grpc_health_probe -addr=127.0.0.1:50051
 ```
 
-A healthy worker prints `status: SERVING` and the command exits 0. That is the
-result the router stored, and this RPC is not written to the worker log either.
-`/health_generate` on a gRPC pool returns `501`.
+A healthy worker prints `status: SERVING` and the command exits 0. This is the
+same `grpc.health.v1` Check the router runs, not a copy of the stored flag.
+The flag flips only after `--health-success-threshold` consecutive successes
+(default 2) or `--health-failure-threshold` consecutive failures (default 3).
+While a worker is failing or recovering, a one-off probe can print `SERVING`
+while router `/health` is still 503, or fail while `/health` is still 200.
+This RPC is not written to the worker log either. `/health_generate` on a gRPC
+pool returns `501`.
 
 ## Request Preparation
 
