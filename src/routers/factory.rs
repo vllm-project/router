@@ -56,27 +56,28 @@ impl RouterFactory {
         Ok(Box::new(router))
     }
 
-    /// Build the prefill and decode stage policies. Shadow transfer planning
-    /// runs on the decode stage only: the prefill policy is built from a copy
-    /// of its effective config with `kv_transfer` cleared, so one request
-    /// yields one shadow outcome instead of one per stage.
+    /// Build the prefill and decode stage policies. Neither stage gets a
+    /// transfer planner: PD selects through `pd_router::select_stage`, which
+    /// never calls it, and config validation rejects `kv_transfer` in PD mode.
+    /// Clearing it here keeps a config built without validation from carrying
+    /// a planner that would never run.
     pub(crate) fn build_pd_stage_policies(
         prefill_policy_config: Option<&PolicyConfig>,
         decode_policy_config: Option<&PolicyConfig>,
         main_policy_config: &PolicyConfig,
         kv_affinity_table: &Arc<KvAffinityTable>,
     ) -> (Arc<dyn LoadBalancingPolicy>, Arc<dyn LoadBalancingPolicy>) {
-        let mut prefill_config = prefill_policy_config.unwrap_or(main_policy_config).clone();
-        if let PolicyConfig::KvAware { kv_transfer, .. } = &mut prefill_config {
-            *kv_transfer = None;
-        }
-        let prefill_policy =
-            PolicyFactory::create_from_config(&prefill_config, Some(kv_affinity_table));
-        let decode_policy = PolicyFactory::create_from_config(
-            decode_policy_config.unwrap_or(main_policy_config),
-            Some(kv_affinity_table),
-        );
-        (prefill_policy, decode_policy)
+        let without_planner = |config: &PolicyConfig| {
+            let mut config = config.clone();
+            if let PolicyConfig::KvAware { kv_transfer, .. } = &mut config {
+                *kv_transfer = None;
+            }
+            PolicyFactory::create_from_config(&config, Some(kv_affinity_table))
+        };
+        (
+            without_planner(prefill_policy_config.unwrap_or(main_policy_config)),
+            without_planner(decode_policy_config.unwrap_or(main_policy_config)),
+        )
     }
 
     /// Create a vLLM PD router with service discovery and/or static URLs
@@ -90,7 +91,7 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
         // Both stages inherit the main policy unless they have a stage override;
-        // only the decode stage keeps a kv_transfer shadow planner.
+        // neither keeps a kv_transfer planner (PD does not plan).
         // Build both policies against the registry-owned affinity table so the
         // router-level kv_aware session-affinity TTL applies to the PD path too.
         let kv_affinity_table = ctx.policy_registry.kv_affinity_table();
@@ -235,30 +236,26 @@ mod tests {
     }
 
     #[test]
-    fn pd_shadow_planner_is_decode_stage_only() {
+    fn pd_stages_never_carry_a_transfer_planner() {
         let table = Arc::new(KvAffinityTable::with_ttl(None));
         let main = kv_aware(true);
-        let (prefill, decode) = RouterFactory::build_pd_stage_policies(None, None, &main, &table);
-        assert!(!has_planner(&prefill));
-        assert!(has_planner(&decode));
+        for (prefill_override, decode_override) in [
+            (None, None),
+            (Some(kv_aware(true)), None),
+            (None, Some(kv_aware(true))),
+            (Some(kv_aware(true)), Some(kv_aware(false))),
+        ] {
+            let (prefill, decode) = RouterFactory::build_pd_stage_policies(
+                prefill_override.as_ref(),
+                decode_override.as_ref(),
+                &main,
+                &table,
+            );
+            assert!(!has_planner(&prefill));
+            assert!(!has_planner(&decode));
+        }
 
-        // A prefill override carrying its own kv_transfer is stripped too.
-        let (prefill, decode) =
-            RouterFactory::build_pd_stage_policies(Some(&kv_aware(true)), None, &main, &table);
-        assert!(!has_planner(&prefill));
-        assert!(has_planner(&decode));
-    }
-
-    #[test]
-    fn pd_stage_override_without_kv_transfer_stays_without() {
-        let table = Arc::new(KvAffinityTable::with_ttl(None));
-        let main = kv_aware(true);
-        let (prefill, decode) =
-            RouterFactory::build_pd_stage_policies(None, Some(&kv_aware(false)), &main, &table);
-        assert!(!has_planner(&prefill));
-        assert!(!has_planner(&decode));
-
-        // Non-kv_aware decode override: no shadow anywhere.
+        // A non-kv_aware decode override is kept as is.
         let (prefill, decode) = RouterFactory::build_pd_stage_policies(
             None,
             Some(&PolicyConfig::RoundRobin),

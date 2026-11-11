@@ -713,6 +713,34 @@ impl ConfigValidator {
 
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        // Shadow transfer planning runs only in the colocated kv_aware
+        // selector. PD picks its prefill and decode workers through
+        // pd_router::select_stage, which never calls the planner, so a PD
+        // config with a planner would accept the setting and record nothing.
+        if let RoutingMode::VllmPrefillDecode {
+            prefill_policy,
+            decode_policy,
+            ..
+        } = &config.mode
+        {
+            let plans = |policy: &PolicyConfig| {
+                matches!(
+                    policy,
+                    PolicyConfig::KvAware { kv_transfer: Some(kv_transfer), .. }
+                        if kv_transfer.mode != KvTransferMode::Off
+                )
+            };
+            if plans(&config.policy)
+                || prefill_policy.as_ref().is_some_and(plans)
+                || decode_policy.as_ref().is_some_and(plans)
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "kv_transfer planning is not supported with PD routing yet; \
+                             set kv_transfer.mode to off or use regular mode"
+                        .to_string(),
+                });
+            }
+        }
         if let Some(program) = &config.program_scheduling {
             let pd_mode = matches!(config.mode, RoutingMode::VllmPrefillDecode { .. });
             if (!matches!(config.mode, RoutingMode::Regular { .. }) && !pd_mode)
@@ -1901,5 +1929,51 @@ mod tests {
         // The same table is ignored when the planner is off.
         bad.mode = KvTransferMode::Off;
         ConfigValidator::validate(&kv_transfer_config(bad)).unwrap();
+    }
+
+    #[test]
+    fn test_kv_transfer_planning_is_rejected_in_pd_mode() {
+        let kv_aware = |mode| PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+            kv_transfer: Some(Box::new(KvTransferConfig {
+                mode,
+                ..Default::default()
+            })),
+        };
+        let pd = |prefill_policy, decode_policy, main| {
+            RouterConfig::new(
+                RoutingMode::VllmPrefillDecode {
+                    prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                    decode_urls: vec!["http://decode:8000".to_string()],
+                    prefill_policy,
+                    decode_policy,
+                    discovery_address: None,
+                },
+                main,
+            )
+        };
+        let shadow = || kv_aware(KvTransferMode::Shadow);
+        for config in [
+            pd(None, None, shadow()),
+            pd(Some(shadow()), None, PolicyConfig::RoundRobin),
+            pd(None, Some(shadow()), PolicyConfig::RoundRobin),
+        ] {
+            let error = ConfigValidator::validate(&config).unwrap_err();
+            assert!(
+                error.to_string().contains("not supported with PD"),
+                "{error}"
+            );
+        }
+        // Off stays accepted, and regular mode still accepts shadow.
+        ConfigValidator::validate(&pd(None, None, kv_aware(KvTransferMode::Off))).unwrap();
+        ConfigValidator::validate(&kv_transfer_config(KvTransferConfig {
+            mode: KvTransferMode::Shadow,
+            ..Default::default()
+        }))
+        .unwrap();
     }
 }
