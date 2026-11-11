@@ -44,8 +44,13 @@ jobs:
           pkg-config --version
       - name: Unit tests
         run: |
+          echo "::error::cargo=$(command -v cargo || echo missing) pwd=$(pwd)"
+          cargo --version || true
           set -o pipefail
           cargo test --features cpu,ready --lib --bins -- --test-threads=1 2>&1 | tee unit-tests.log
+          status=${PIPESTATUS[0]}
+          ls -l unit-tests.log || true
+          exit ${status}
       - name: Surface unit test failures
         if: failure()
         run: |
