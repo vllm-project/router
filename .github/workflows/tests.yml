@@ -30,8 +30,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev protobuf-compiler
+          for attempt in 1 2 3; do
+            sudo apt-get update -o Acquire::Retries=5 &&
+              sudo apt-get install -y --no-install-recommends                 pkg-config libssl-dev protobuf-compiler && break
+            echo "apt attempt ${attempt} failed; retrying" >&2
+            sleep 10
+          done
+          pkg-config --version
       - name: Unit tests
         run: |
           set -o pipefail
