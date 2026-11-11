@@ -38,18 +38,6 @@ impl<S> KvResponseStream<S> {
             finished: false,
         }
     }
-    pub(super) fn merged_pd_sse(
-        inner: S,
-        attempt: Arc<KvRouteAttempt>,
-        status: StatusCode,
-        cached: u64,
-    ) -> Self {
-        let mut stream = Self::new(inner, attempt, status, true);
-        if let Some(observer) = &mut stream.sse {
-            observer.merged_prefill = Some(cached);
-        }
-        stream
-    }
 }
 
 impl<S, E> futures_util::Stream for KvResponseStream<S>
@@ -202,24 +190,6 @@ enum CacheObservation {
     Unavailable(UnavailableReason),
 }
 
-fn response_cached_tokens(value: &Value) -> Option<u64> {
-    let usage = usage_merge::usage_object(value)?;
-    [
-        ("prompt_tokens_details", "prompt_tokens"),
-        ("input_tokens_details", "input_tokens"),
-    ]
-    .iter()
-    .find_map(|(details_key, input_key)| {
-        let cached = usage.get(*details_key)?.get("cached_tokens")?.as_u64()?;
-        if let Some(input) = usage.get(*input_key) {
-            if cached > input.as_u64()? {
-                return None;
-            }
-        }
-        Some(cached)
-    })
-}
-
 fn record_observation(prediction: &KvRoutePrediction, observation: CacheObservation) {
     let observation = if prediction.multi_prompt
         && matches!(
@@ -284,7 +254,7 @@ pub(super) fn observe_json_response(attempt: &KvRouteAttempt, status: StatusCode
         CacheObservation::Unavailable(reason)
     } else {
         match serde_json::from_slice::<Value>(body) {
-            Ok(value) => response_cached_tokens(&value)
+            Ok(value) => usage_merge::cached_tokens(&value)
                 .map(CacheObservation::Observed)
                 .unwrap_or(CacheObservation::Unavailable(
                     UnavailableReason::MissingUsage,
@@ -296,7 +266,7 @@ pub(super) fn observe_json_response(attempt: &KvRouteAttempt, status: StatusCode
 }
 
 pub(super) fn observe_merged_json(attempt: &KvRouteAttempt, merged: &Value, prefill: u64) {
-    let observation = response_cached_tokens(merged)
+    let observation = usage_merge::cached_tokens(merged)
         .map(CacheObservation::Observed)
         .unwrap_or(CacheObservation::Unavailable(
             UnavailableReason::MissingUsage,
@@ -327,36 +297,35 @@ pub(super) fn observe_unavailable(
 }
 
 pub(super) struct KvSseObserver {
-    merged_prefill: Option<u64>,
-    attempt: Arc<KvRouteAttempt>,
-    status: StatusCode,
     scanner: FrameScanner,
     frame: Vec<u8>,
     discarding_frame: bool,
+    usage: SseUsageObservation,
+}
+
+pub(super) struct SseUsageObservation {
+    merged_prefill: Option<u64>,
+    attempt: Arc<KvRouteAttempt>,
+    status: StatusCode,
     observed_cached_tokens: Option<u64>,
     ambiguous: bool,
     fallback_reason: Option<UnavailableReason>,
+    incomplete: bool,
     finished: bool,
 }
 
 impl KvSseObserver {
     pub(super) fn new(attempt: Arc<KvRouteAttempt>, status: StatusCode) -> Self {
         Self {
-            attempt,
-            status,
             scanner: FrameScanner::default(),
-            merged_prefill: None,
             frame: Vec::new(),
             discarding_frame: false,
-            observed_cached_tokens: None,
-            ambiguous: false,
-            fallback_reason: None,
-            finished: false,
+            usage: SseUsageObservation::new(attempt, status, None),
         }
     }
 
     pub(super) fn observe(&mut self, chunk: &Bytes) {
-        if !self.status.is_success() || self.finished {
+        if !self.usage.status.is_success() || self.usage.finished {
             return;
         }
 
@@ -368,7 +337,7 @@ impl KvSseObserver {
                 if self.frame.len().saturating_add(consumed) > MAX_OBSERVATION_BYTES {
                     self.frame.clear();
                     self.discarding_frame = true;
-                    self.fallback_reason = Some(UnavailableReason::OversizedSseFrame);
+                    self.usage.reject(UnavailableReason::OversizedSseFrame);
                 } else {
                     self.frame.extend_from_slice(&remaining[..consumed]);
                 }
@@ -409,32 +378,67 @@ impl KvSseObserver {
         }
 
         match serde_json::from_slice::<Value>(&data) {
-            Ok(value) => {
-                let Some(cached_tokens) = response_cached_tokens(&value) else {
-                    if usage_merge::usage_object(&value).is_some_and(|usage| {
-                        ["prompt_tokens_details", "input_tokens_details"]
-                            .iter()
-                            .any(|key| {
-                                usage
-                                    .get(*key)
-                                    .and_then(|details| details.get("cached_tokens"))
-                                    .is_some_and(|cached| !cached.is_null())
-                            })
-                    }) {
-                        self.fallback_reason = Some(UnavailableReason::InvalidUsage);
-                    }
-                    return;
-                };
-                if self
-                    .observed_cached_tokens
-                    .is_some_and(|previous| previous != cached_tokens)
-                {
-                    self.ambiguous = true;
-                } else {
-                    self.observed_cached_tokens = Some(cached_tokens);
-                }
+            Ok(value) => self.usage.observe_value(&value),
+            Err(_) => self.usage.reject(UnavailableReason::MalformedUsage),
+        }
+    }
+
+    pub(super) fn finish(&mut self, succeeded: bool) {
+        self.usage
+            .set_incomplete(self.frame.iter().any(|b| !matches!(b, b'\r' | b'\n')));
+        self.usage.finish(succeeded);
+    }
+}
+
+impl SseUsageObservation {
+    pub(super) fn new(
+        attempt: Arc<KvRouteAttempt>,
+        status: StatusCode,
+        merged_prefill: Option<u64>,
+    ) -> Self {
+        Self {
+            attempt,
+            status,
+            merged_prefill,
+            observed_cached_tokens: None,
+            ambiguous: false,
+            fallback_reason: None,
+            incomplete: false,
+            finished: false,
+        }
+    }
+
+    pub(super) fn reject(&mut self, reason: UnavailableReason) {
+        self.fallback_reason = Some(reason);
+    }
+
+    pub(super) fn set_incomplete(&mut self, incomplete: bool) {
+        self.incomplete = incomplete;
+    }
+
+    pub(super) fn observe_value(&mut self, value: &Value) {
+        let Some(cached_tokens) = usage_merge::cached_tokens(value) else {
+            if usage_merge::usage_object(value).is_some_and(|usage| {
+                ["prompt_tokens_details", "input_tokens_details"]
+                    .iter()
+                    .any(|key| {
+                        usage
+                            .get(*key)
+                            .and_then(|details| details.get("cached_tokens"))
+                            .is_some_and(|cached| !cached.is_null())
+                    })
+            }) {
+                self.fallback_reason = Some(UnavailableReason::InvalidUsage);
             }
-            Err(_) => self.fallback_reason = Some(UnavailableReason::MalformedUsage),
+            return;
+        };
+        if self
+            .observed_cached_tokens
+            .is_some_and(|previous| previous != cached_tokens)
+        {
+            self.ambiguous = true;
+        } else {
+            self.observed_cached_tokens = Some(cached_tokens);
         }
     }
 
@@ -443,7 +447,7 @@ impl KvSseObserver {
             CacheObservation::Unavailable(reason)
         } else if let Some(reason) = self.fallback_reason {
             CacheObservation::Unavailable(reason)
-        } else if self.frame.iter().any(|byte| !matches!(byte, b'\r' | b'\n')) {
+        } else if self.incomplete {
             CacheObservation::Unavailable(UnavailableReason::IncompleteSseFrame)
         } else if self.ambiguous {
             CacheObservation::Ambiguous
@@ -467,6 +471,14 @@ impl KvSseObserver {
 }
 
 impl Drop for KvSseObserver {
+    fn drop(&mut self) {
+        if !self.usage.finished {
+            self.finish(false);
+        }
+    }
+}
+
+impl Drop for SseUsageObservation {
     fn drop(&mut self) {
         if !self.finished {
             self.finish(false);
@@ -547,8 +559,8 @@ mod tests {
                 }
             }
         });
-        assert_eq!(response_cached_tokens(&completions), Some(32));
-        assert_eq!(response_cached_tokens(&responses), Some(32));
+        assert_eq!(usage_merge::cached_tokens(&completions), Some(32));
+        assert_eq!(usage_merge::cached_tokens(&responses), Some(32));
     }
 
     #[test]
@@ -709,8 +721,8 @@ mod tests {
             b"data: {\"choices\":[]}\n\ndata: {\"usage\":{\"prompt_tokens_details\":{\"cached_",
         ));
         observer.observe(&Bytes::from_static(b"tokens\":32}}}\n\ndata: [DONE]\n\n"));
-        assert_eq!(observer.observed_cached_tokens, Some(32));
-        assert!(!observer.ambiguous);
+        assert_eq!(observer.usage.observed_cached_tokens, Some(32));
+        assert!(!observer.usage.ambiguous);
     }
 
     #[test]
@@ -723,7 +735,7 @@ mod tests {
         observer.observe(&Bytes::from_static(
             b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":32}}}\n\n",
         ));
-        assert!(observer.ambiguous);
+        assert!(observer.usage.ambiguous);
     }
 
     #[test]

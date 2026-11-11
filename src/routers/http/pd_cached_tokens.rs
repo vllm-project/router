@@ -1,6 +1,7 @@
 //! Reconcile Prefill-owned prefix-cache usage in vLLM PD responses.
 
 use super::{
+    kv_observation::{SseUsageObservation, UnavailableReason},
     sse::{sse_lines, FrameScanner},
     usage_merge,
 };
@@ -20,28 +21,6 @@ pub(super) fn is_supported_path(path: &str) -> bool {
         path,
         "/v1/chat/completions" | "/v1/completions" | "/v1/responses"
     )
-}
-
-pub(super) fn prefill_cached_tokens(prefill: Option<&Value>) -> Option<u64> {
-    let usage = usage_merge::usage_object(prefill?)?;
-    // Validate each candidate against its matching input count, so an invalid
-    // legacy spelling cannot hide a valid Responses spelling. Keep support for
-    // details-only snapshots; an explicit input count must be valid and bound
-    // the cache count. Zero remains a valid cache count.
-    [
-        ("prompt_tokens_details", "prompt_tokens"),
-        ("input_tokens_details", "input_tokens"),
-    ]
-    .iter()
-    .find_map(|(details_key, input_key)| {
-        let cached = usage.get(*details_key)?.get("cached_tokens")?.as_u64()?;
-        if let Some(input) = usage.get(*input_key) {
-            if cached > input.as_u64()? {
-                return None;
-            }
-        }
-        Some(cached)
-    })
 }
 
 /// Change only the cached-token detail. A missing Prefill value removes a
@@ -88,7 +67,12 @@ pub(super) fn reconcile_usage(
     }
 }
 
-fn rewrite_frame(frame: &[u8], cached: Option<u64>, prefill: Option<&Value>) -> Bytes {
+fn rewrite_frame(
+    frame: &[u8],
+    cached: Option<u64>,
+    prefill: Option<&Value>,
+    observation: Option<&mut SseUsageObservation>,
+) -> Bytes {
     // Most delta frames carry no usage. Avoid collecting data or allocating a
     // JSON tree for them. Any escape conservatively takes the parse path, since
     // a valid JSON key can spell "usage" with Unicode escapes.
@@ -111,7 +95,13 @@ fn rewrite_frame(frame: &[u8], cached: Option<u64>, prefill: Option<&Value>) -> 
         }
     }
 
+    if data.is_empty() || data == b"[DONE]" {
+        return Bytes::copy_from_slice(frame);
+    }
     let Ok(mut json) = serde_json::from_slice::<Value>(&data) else {
+        if let Some(obs) = observation {
+            obs.reject(UnavailableReason::MalformedUsage);
+        }
         return Bytes::copy_from_slice(frame);
     };
     if usage_merge::usage_object(&json).is_none() {
@@ -125,9 +115,15 @@ fn rewrite_frame(frame: &[u8], cached: Option<u64>, prefill: Option<&Value>) -> 
         Err(reason) => tracing::warn!("Cannot rewrite PD SSE usage: {}", reason),
     }
     if !changed {
+        if let Some(obs) = observation {
+            obs.observe_value(&json);
+        }
         return Bytes::copy_from_slice(frame);
     }
     let Ok(encoded) = serde_json::to_vec(&json) else {
+        if let Some(obs) = observation {
+            obs.reject(UnavailableReason::MalformedUsage);
+        }
         return Bytes::copy_from_slice(frame);
     };
 
@@ -150,6 +146,14 @@ fn rewrite_frame(frame: &[u8], cached: Option<u64>, prefill: Option<&Value>) -> 
         }
         result.extend_from_slice(ending);
     }
+    if let Some(obs) = observation {
+        // A rewrite can grow an in-limit input past the observation budget.
+        if result.len() > MAX_SSE_FRAME_BYTES {
+            obs.reject(UnavailableReason::OversizedSseFrame);
+        } else {
+            obs.observe_value(&json);
+        }
+    }
     Bytes::from(result)
 }
 
@@ -160,6 +164,7 @@ struct SseState<S> {
     scanner: FrameScanner,
     cached: Option<u64>,
     prefill: Option<Value>,
+    observation: Option<SseUsageObservation>,
     passthrough: bool,
     error: Option<io::Error>,
     done: bool,
@@ -169,12 +174,13 @@ pub(super) fn rewrite_sse_stream<S, E>(
     source: S,
     cached: Option<u64>,
     prefill: Option<Value>,
+    observation: Option<SseUsageObservation>,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
-    rewrite_sse_stream_with_limit(source, cached, MAX_SSE_FRAME_BYTES, prefill)
+    rewrite_sse_stream_with_limit(source, cached, MAX_SSE_FRAME_BYTES, prefill, observation)
 }
 
 // An explicit limit lets tests exercise frame boundaries with smaller inputs.
@@ -183,6 +189,7 @@ fn rewrite_sse_stream_with_limit<S, E>(
     cached: Option<u64>,
     max_frame_bytes: usize,
     prefill: Option<Value>,
+    observation: Option<SseUsageObservation>,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -195,6 +202,7 @@ where
         scanner: FrameScanner::default(),
         cached,
         prefill,
+        observation,
         passthrough: false,
         error: None,
         done: false,
@@ -238,6 +246,9 @@ where
                 }
                 let remaining = max_frame_bytes.saturating_sub(state.buffer.len());
                 if remaining == 0 {
+                    if let Some(obs) = &mut state.observation {
+                        obs.reject(UnavailableReason::OversizedSseFrame);
+                    }
                     state.passthrough = true;
                     return Some((Ok(Bytes::from(std::mem::take(&mut state.buffer))), state));
                 }
@@ -252,6 +263,9 @@ where
                     // Prevent Vec's geometric growth from exceeding the limit.
                     state.buffer.reserve_exact(capacity - state.buffer.len());
                 }
+                if let Some(obs) = &mut state.observation {
+                    obs.set_incomplete(end.is_none());
+                }
                 state.buffer.extend_from_slice(&state.pending[..consumed]);
                 state.pending.advance(consumed);
                 if state.pending.is_empty() {
@@ -260,8 +274,12 @@ where
                     state.pending = Bytes::new();
                 }
                 if end.is_some() {
-                    let rewritten =
-                        rewrite_frame(&state.buffer, state.cached, state.prefill.as_ref());
+                    let rewritten = rewrite_frame(
+                        &state.buffer,
+                        state.cached,
+                        state.prefill.as_ref(),
+                        state.observation.as_mut(),
+                    );
                     state.buffer.clear();
                     return Some((Ok(rewritten), state));
                 }
@@ -280,7 +298,12 @@ where
                     }
                     return Some((Err(error), state));
                 }
-                None if state.buffer.is_empty() => return None,
+                None if state.buffer.is_empty() => {
+                    if let Some(obs) = &mut state.observation {
+                        obs.finish(true);
+                    }
+                    return None;
+                }
                 None => {
                     // Preserve the existing EOF behavior: an in-limit final
                     // fragment is forwarded verbatim, without synthesizing a
@@ -337,6 +360,7 @@ mod tests {
                         None,
                         limit,
                         None,
+                        None,
                     )
                     .try_collect::<Vec<_>>()
                     .await;
@@ -351,10 +375,11 @@ mod tests {
         let limit = 128;
         let frame = comment_frame(limit, b"\r\n");
         let input = Bytes::from(frame.repeat(1024));
-        let output = rewrite_sse_stream_with_limit(chunks(&input, input.len()), None, limit, None)
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let output =
+            rewrite_sse_stream_with_limit(chunks(&input, input.len()), None, limit, None, None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
         assert_eq!(output.len(), 1024);
         assert_eq!(output.concat(), input);
     }
@@ -366,12 +391,17 @@ mod tests {
         let usage = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":99}}}\n\n";
         let input = Bytes::from([oversized.as_ref(), usage, b"data: [DONE]\n\n"].concat());
         for chunk_size in [1, 7, limit, input.len()] {
-            let output =
-                rewrite_sse_stream_with_limit(chunks(&input, chunk_size), Some(4), limit, None)
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .unwrap()
-                    .concat();
+            let output = rewrite_sse_stream_with_limit(
+                chunks(&input, chunk_size),
+                Some(4),
+                limit,
+                None,
+                None,
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .concat();
             assert!(output.starts_with(&oversized));
             let tail = String::from_utf8(output[oversized.len()..].to_vec()).unwrap();
             assert!(tail.contains("\"cached_tokens\":4"));
@@ -386,20 +416,26 @@ mod tests {
         for size in [limit - 1, limit, limit + 1] {
             let input = Bytes::from(vec![b'x'; size]);
             for chunk_size in [1, size] {
-                let output =
-                    rewrite_sse_stream_with_limit(chunks(&input, chunk_size), None, limit, None)
-                        .try_collect::<Vec<_>>()
-                        .await;
+                let output = rewrite_sse_stream_with_limit(
+                    chunks(&input, chunk_size),
+                    None,
+                    limit,
+                    None,
+                    None,
+                )
+                .try_collect::<Vec<_>>()
+                .await;
                 assert_eq!(output.unwrap().concat(), input);
             }
         }
         let incomplete = Bytes::from_static(
             b"data: {\"choices\":[],\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":99}}}",
         );
-        let output = rewrite_sse_stream_with_limit(chunks(&incomplete, 1), Some(64), limit, None)
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let output =
+            rewrite_sse_stream_with_limit(chunks(&incomplete, 1), Some(64), limit, None, None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
         assert_eq!(output.concat(), incomplete);
     }
 
@@ -410,7 +446,7 @@ mod tests {
         let suffix = "data: not-json\n\ndata: [DONE]\r\n\r\n";
         let input = Bytes::from(format!("{prefix}{usage}{suffix}"));
         for chunk_size in [1, 2, 3, 7, input.len()] {
-            let output = rewrite_sse_stream(chunks(&input, chunk_size), Some(64), None)
+            let output = rewrite_sse_stream(chunks(&input, chunk_size), Some(64), None, None)
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();
@@ -433,7 +469,7 @@ mod tests {
             Ok(Bytes::from_static(b"data: [DONE]\n\ndata: partial")),
             Err(io::Error::new(io::ErrorKind::ConnectionReset, "reset")),
         ]);
-        let output = rewrite_sse_stream(source, None, None);
+        let output = rewrite_sse_stream(source, None, None, None);
         futures_util::pin_mut!(output);
         assert_eq!(
             output.next().await.unwrap().unwrap(),
@@ -474,7 +510,7 @@ mod tests {
             dropped: dropped.clone(),
         });
         let source = stream::iter([Ok::<_, io::Error>(input)]).chain(stream::pending());
-        let output = rewrite_sse_stream(source, None, None);
+        let output = rewrite_sse_stream(source, None, None, None);
         futures_util::pin_mut!(output);
         assert_eq!(
             output.next().await.unwrap().unwrap(),
@@ -503,7 +539,7 @@ mod tests {
                 json!({"id":"cmpl-sizing","object":"text_completion","created":0,"model":"sizing","choices":[choice]})
             ));
             assert!(frame.len() > 1024 * 1024);
-            let output = rewrite_sse_stream(chunks(&frame, 8191), Some(64), None)
+            let output = rewrite_sse_stream(chunks(&frame, 8191), Some(64), None, None)
                 .try_collect::<Vec<_>>()
                 .await;
             assert_eq!(output.unwrap().concat(), frame);
@@ -513,9 +549,9 @@ mod tests {
     #[test]
     fn prefill_zero_and_missing_are_distinct() {
         assert_eq!(
-            prefill_cached_tokens(Some(
+            usage_merge::cached_tokens(
                 &json!({"usage": {"prompt_tokens_details": {"cached_tokens": 0}}})
-            )),
+            ),
             Some(0)
         );
         for value in [
@@ -527,7 +563,7 @@ mod tests {
             )
             .unwrap(),
         ] {
-            assert_eq!(prefill_cached_tokens(Some(&value)), None);
+            assert_eq!(usage_merge::cached_tokens(&value), None);
         }
     }
 
@@ -550,14 +586,14 @@ mod tests {
                     if nested {
                         prefill = json!({"response": prefill});
                     }
-                    assert_eq!(prefill_cached_tokens(Some(&prefill)), expected, "{prefill}");
+                    assert_eq!(usage_merge::cached_tokens(&prefill), expected, "{prefill}");
                 }
                 for invalid_input in [json!(null), json!(-1), json!("70"), json!(1.5)] {
                     let mut prefill = json!({"usage": {input_key: invalid_input, details_key: {"cached_tokens": 4}}});
                     if nested {
                         prefill = json!({"response": prefill});
                     }
-                    assert_eq!(prefill_cached_tokens(Some(&prefill)), None, "{prefill}");
+                    assert_eq!(usage_merge::cached_tokens(&prefill), None, "{prefill}");
                 }
             }
         }
@@ -565,7 +601,7 @@ mod tests {
             "prompt_tokens": 70, "prompt_tokens_details": {"cached_tokens": 90},
             "input_tokens": 100, "input_tokens_details": {"cached_tokens": 80}
         }});
-        assert_eq!(prefill_cached_tokens(Some(&prefill)), Some(80));
+        assert_eq!(usage_merge::cached_tokens(&prefill), Some(80));
     }
 
     #[test]
@@ -575,7 +611,7 @@ mod tests {
                 "prompt_tokens_details": {"cached_tokens": invalid},
                 "input_tokens_details": {"cached_tokens": 0}
             }});
-            assert_eq!(prefill_cached_tokens(Some(&prefill)), Some(0));
+            assert_eq!(usage_merge::cached_tokens(&prefill), Some(0));
         }
     }
 
@@ -597,7 +633,7 @@ mod tests {
         let prefill = json!({"usage": {"prompt_tokens": 70, "completion_tokens": 1}});
         let frame = Bytes::from_static(b"data: {\"choices\":[{\"text\":\"A\"}],\"usage\":{\"prompt_tokens\":999,\"completion_tokens\":2,\"total_tokens\":1001,\"prompt_tokens_details\":{\"cached_tokens\":99}}}\n\n");
         let source = stream::iter([Ok::<_, io::Error>(frame)]).chain(stream::pending());
-        let output = rewrite_sse_stream(source, Some(4), Some(prefill));
+        let output = rewrite_sse_stream(source, Some(4), Some(prefill), None);
         futures_util::pin_mut!(output);
         let output = tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
             .await
@@ -616,7 +652,7 @@ mod tests {
         let frame = Bytes::from_static(b"event: message\rdata: {\"choices\":[],\"usage\":{\"prompt_tokens\":999,\"completion_tokens\":2,\"total_tokens\":1001,\"prompt_tokens_details\":{\"cached_tokens\":99}}}\r\r");
         let source = stream::iter([Ok::<_, io::Error>(frame)]).chain(stream::pending());
         let prefill = json!({"usage": {"prompt_tokens": 70}});
-        let output = rewrite_sse_stream(source, Some(4), Some(prefill));
+        let output = rewrite_sse_stream(source, Some(4), Some(prefill), None);
         futures_util::pin_mut!(output);
         let bytes = tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
             .await
@@ -647,7 +683,7 @@ mod tests {
                 Ok::<_, io::Error>(input.slice(..split)),
                 Ok(input.slice(split..)),
             ]);
-            let output = rewrite_sse_stream(source, Some(16), Some(prefill.clone()))
+            let output = rewrite_sse_stream(source, Some(16), Some(prefill.clone()), None)
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap()
@@ -696,7 +732,7 @@ mod tests {
             ready.await.unwrap();
             Ok(Bytes::from_static(b"\ndata: [DONE]\r\n\r\n"))
         }));
-        let output = rewrite_sse_stream(source, Some(4), None);
+        let output = rewrite_sse_stream(source, Some(4), None, None);
         futures_util::pin_mut!(output);
         let first = tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
             .await
@@ -726,11 +762,15 @@ mod tests {
             ": heartbeat\n\ndata: [DONE]\n\n"
         ).as_bytes());
         for chunk_size in [1, 2, 7, input.len()] {
-            let output =
-                rewrite_sse_stream(chunks(&input, chunk_size), Some(16), Some(prefill.clone()))
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .unwrap();
+            let output = rewrite_sse_stream(
+                chunks(&input, chunk_size),
+                Some(16),
+                Some(prefill.clone()),
+                None,
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
             let output = output.concat();
             let wire = std::str::from_utf8(&output).unwrap();
             let normalized = wire.replace("\r\n", "\n").replace('\r', "\n");
@@ -845,7 +885,7 @@ mod tests {
             "data: [DONE]\n\n"
         ).as_bytes());
         for size in [1, 7, input.len()] {
-            let output = rewrite_sse_stream(chunks(&input, size), Some(4), None)
+            let output = rewrite_sse_stream(chunks(&input, size), Some(4), None, None)
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap()
@@ -867,7 +907,7 @@ mod tests {
                     usage
                 };
                 let input = Bytes::from(format!("data: {payload}\n\n"));
-                let output = rewrite_sse_stream(chunks(&input, 1), None, None)
+                let output = rewrite_sse_stream(chunks(&input, 1), None, None, None)
                     .try_collect::<Vec<_>>()
                     .await
                     .unwrap()
@@ -887,7 +927,7 @@ mod tests {
             .chunks(7)
             .map(|part| Ok::<_, io::Error>(Bytes::copy_from_slice(part)))
             .collect::<Vec<_>>();
-        let output = rewrite_sse_stream(stream::iter(chunks), Some(64), None)
+        let output = rewrite_sse_stream(stream::iter(chunks), Some(64), None, None)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -904,10 +944,11 @@ mod tests {
     #[tokio::test]
     async fn missing_prefill_cache_removes_decode_cache_from_usage_frame() {
         let input = Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":30,\"audio_tokens\":1}}}\n\n");
-        let output = rewrite_sse_stream(stream::iter([Ok::<_, io::Error>(input)]), None, None)
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let output =
+            rewrite_sse_stream(stream::iter([Ok::<_, io::Error>(input)]), None, None, None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
         let output = String::from_utf8(output.concat()).unwrap();
         assert!(!output.contains("cached_tokens"));
         assert!(output.contains("audio_tokens"));

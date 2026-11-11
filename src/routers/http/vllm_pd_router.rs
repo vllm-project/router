@@ -2,7 +2,8 @@
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
 use super::kv_observation::{
-    observe_merged_json, observe_unavailable, KvResponseStream, KvRouteAttempt, UnavailableReason,
+    observe_merged_json, observe_unavailable, KvRouteAttempt, SseUsageObservation,
+    UnavailableReason,
 };
 use super::logprobs_merge;
 use super::pd_cached_tokens;
@@ -375,26 +376,25 @@ fn finalize_decode_stream(
         && is_sse
         && !is_encoded
     {
-        let cached = pd_cached_tokens::prefill_cached_tokens(prefill_response_json);
-        let rewritten = pd_cached_tokens::rewrite_sse_stream(
+        let cached = prefill_response_json.and_then(usage_merge::cached_tokens);
+        let observer = match (observation, cached) {
+            (Some(attempt), Some(count)) => Some(SseUsageObservation::new(
+                attempt.clone(),
+                status,
+                Some(count),
+            )),
+            (Some(attempt), None) => {
+                observe_unavailable(attempt, status, UnavailableReason::MissingUsage);
+                None
+            }
+            _ => None,
+        };
+        Body::from_stream(pd_cached_tokens::rewrite_sse_stream(
             stream,
             cached,
             prefill_response_json.and_then(usage_merge::usage_snapshot),
-        );
-        match (observation, cached) {
-            (Some(attempt), Some(count)) => Body::from_stream(KvResponseStream::merged_pd_sse(
-                rewritten,
-                attempt.clone(),
-                status,
-                count,
-            )),
-            (observation, _) => {
-                if let Some(attempt) = observation {
-                    observe_unavailable(attempt, status, UnavailableReason::MissingUsage);
-                }
-                Body::from_stream(rewritten)
-            }
-        }
+            observer,
+        ))
     } else {
         if let Some(attempt) = observation {
             observe_unavailable(attempt, status, UnavailableReason::PdUsageNotComparable);
@@ -438,7 +438,7 @@ fn finalize_decode_body(
         }
         return response_with_body(status, &headers, Body::from(original));
     }
-    let cached = pd_cached_tokens::prefill_cached_tokens(prefill_response_json);
+    let cached = prefill_response_json.and_then(usage_merge::cached_tokens);
     let mut json: Value = match serde_json::from_slice(&original) {
         Ok(json) => json,
         Err(error) if reconcile_cache => {
@@ -3858,6 +3858,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn pd_sse_passthrough_invalidates_earlier_usage() {
+        use super::super::kv_observation::KvRoutePrediction;
+        let usage =
+            r#"data: {"usage":{"prompt_tokens":33,"prompt_tokens_details":{"cached_tokens":0}}}"#;
+        let oversized = format!(
+            "data: {{\"padding\":\"{}\",\"usage\":{{}}}}\n\n",
+            "a".repeat(1024 * 1024)
+        );
+        let input = format!("{usage}\n\n{oversized}");
+        let server = spawn_test_server(axum::Router::new().fallback(move || {
+            let input = input.clone();
+            async move { ([("content-type", "text/event-stream")], input) }
+        }))
+        .await;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let attempt = KvRouteAttempt::new(KvRoutePrediction {
+            target: crate::kv_index::RoutableTarget {
+                instance_id: Arc::from("prefill-A"),
+                dp_rank: 0,
+            },
+            cached_tokens: Some(32),
+            multi_prompt: false,
+        });
+        let prefill =
+            json!({"usage":{"prompt_tokens":33,"prompt_tokens_details":{"cached_tokens":32}}});
+        let response = finalize_decode_stream(
+            reqwest::get(server).await.unwrap(),
+            Some(&prefill),
+            "/v1/completions",
+            Some(&attempt),
+        )
+        .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(bytes.ends_with(oversized.as_bytes()));
+        let metrics = handle.render();
+        assert!(metrics.contains("reason=\"oversized_sse_frame\""));
+        assert!(!metrics.contains("vllm_router_kv_actual_cached_tokens_count"));
     }
 
     #[tokio::test]
