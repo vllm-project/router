@@ -62,5 +62,15 @@ jobs:
           fi
       - name: Integration tests
         run: |
-          set -o pipefail
-          cargo test --features cpu,ready --test '*' 2>&1 | tee integration-tests.log
+          cargo test --features cpu,ready --test '*' > integration-tests.log 2>&1
+          status=$?
+          echo "::error::integration status=$status pwd=$(pwd) log=$(wc -c < integration-tests.log 2>/dev/null || echo missing)"
+          exit $status
+      - name: Surface integration test failures
+        if: failure()
+        run: |
+          if grep -qE 'FAILED|panicked|^failures:|^error' integration-tests.log; then
+            grep -E 'FAILED|panicked|^failures:|^error' integration-tests.log | head -20 | sed 's/^/::error::/'
+          else
+            tail -10 integration-tests.log | sed 's/^/::error::/'
+          fi
