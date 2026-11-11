@@ -257,6 +257,24 @@ Enable KV events on the workers. HTTP text requests also need a render endpoint 
 
 For regular pools without event discovery, configure `--kv-event-source WORKER_URL=tcp://HOST:PORT` per worker, plus matching `--kv-event-model` and `--kv-event-block-size`.
 
+### Index metadata reclamation
+
+The full-attention index periodically reclaims identities and leaf suffixes
+that no longer have any residency observations. Removals trigger a sweep
+after at least 1,024 block hashes have been processed. The interval increases
+to the number of retained identities after the previous sweep. Worker clears and
+source invalidations also request a sweep. Concurrent changes that a sweep
+cannot visit are left for the next pass.
+
+Active observations and the prefix positions leading to live descendants are
+preserved. Historical engine hashes are not permanent parent references: if a
+later event refers to a reclaimed parent, that continuation earns no cache
+credit until its prefix is observed again. The index never treats an unknown
+parent's suffix as a root prefix.
+
+Reclamation controls dead metadata from cache churn. It does not impose a
+capacity limit on active observations or derive a budget from engine capacity.
+
 ### P/D disaggregation
 
 ```bash
