@@ -122,7 +122,8 @@ def perf_output_dir(perf_case, bench_mod) -> str:
         return ""
     path = bench_mod.default_output_dir(
         {"backend_label": perf_case.backend},
-        results_parent=_PERF_DIR / "results",
+        # Dashboard copies tests/python/e2e/results only.
+        results_parent=_PERF_DIR.parents[1] / "results" / "perf" / "grpc",
     )
     os.environ["PERF_OUTPUT_DIR"] = path
     _progress(f"results directory: {Path(path).resolve()}")
@@ -182,10 +183,6 @@ def _wave_params(case) -> tuple[list[tuple], list[str]]:
 
 
 def pytest_generate_tests(metafunc):
-    if "run_idx" in metafunc.fixturenames:
-        runs = max(1, int(os.environ.get("RUNS", "1")))
-        metafunc.parametrize("run_idx", range(1, runs + 1))
-
     if "hit_rate" not in metafunc.fixturenames:
         return
     if metafunc.definition.name != "test_prefix_kvhit_waves":

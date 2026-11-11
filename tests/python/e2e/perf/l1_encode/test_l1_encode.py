@@ -70,13 +70,13 @@ def _bind_case(case):
                     "prompt_tokens + max_tokens. Do not set them equal to --tokens."
                 ) from None
 
-            row_id = wave_id(l1_on, hit_rate, concurrency, requests)
+            row_id = wave_id(hit_rate, concurrency, requests)
             summary = (payload.get("wave") or {}).get("summary") or {}
             metrics = l1_stack.l1_metrics_text()
             artifact = write_result(l1_output_dir, row_id, payload)
             print(
                 format_scenario_result(
-                    scenario_id=row_id,
+                    scenario_id=f"{case.test_name}/{row_id}",
                     summary=summary,
                     artifact=artifact,
                 ),

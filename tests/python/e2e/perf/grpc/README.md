@@ -35,7 +35,7 @@ Model path or HF id: set `"model"` in `cases/<name>.json`, or `export MODEL=...`
 export MODEL=/path/to/model   # required unless case JSON defines model
 export VLLM_RS=/path/to/vllm-rs          # rust_grpc
 export ROUTER_BIN=$PWD/target/release/vllm-router   # optional
-# results JSON (default on, dir created at run time): tests/python/e2e/perf/grpc/results/<backend>_<ts>/
+# results JSON (default on, dir created at run time): tests/python/e2e/results/perf/grpc/<backend>_<YYYYMMDD_HHMMSS>/hit<rate>_c<concurrency>_r<requests>.json
 # export PERF_SAVE_RESULTS=0   # disable file output
 
 pytest tests/python/e2e/perf/grpc --perf-case=rust_grpc
@@ -123,7 +123,7 @@ Override bench via env: `PERF_TOKENS`, `PERF_MAX_TOKENS`, `PERF_TIMEOUT`.
 
 Each wave prints a **`perf summary`** block to stderr after the test (use `-sv`).
 Set `PERF_QUIET=1` to disable terminal summary. Wave JSON is written under
-`tests/python/e2e/perf/grpc/results/` **by default**; use `PERF_SAVE_RESULTS=0` to skip files.
+`tests/python/e2e/results/perf/grpc/` **by default**; use `PERF_SAVE_RESULTS=0` to skip files.
 
 One wave equals:
 
@@ -168,7 +168,7 @@ Buildkite step **`:python: grpc perf test case`** (`key: grpc-perf-e2e` in
 
 `python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=python_http`
 
-Wave JSON under `results/` is collected as build artifacts.
+Wave JSON under `tests/python/e2e/results/perf/grpc/` is collected as build artifacts. The nightly dashboard copies `tests/python/e2e/results` only.
 
 ## Related
 

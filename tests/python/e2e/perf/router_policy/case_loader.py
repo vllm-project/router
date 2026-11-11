@@ -13,11 +13,15 @@ from typing import Any
 
 RUN_SUFFIX_ENV = "AGENTX_RUN_SUFFIX"
 
+# Dashboard copies results/ only; run/ keeps replay rows and snapshots (see README).
+_E2E_DIR = Path(__file__).resolve().parents[2]
+PERF_RESULTS_DIR = _E2E_DIR / "results" / "perf" / "router_policy"
+PERF_RUN_DIR = _E2E_DIR / "run" / "perf" / "router_policy"
+
 MODEL_ENV = "MODEL"
 PYTHON_ENV_KEYS = ("AGENTX_PYTHON", "PYTHON")
 
 _PATH_KEYS = (
-    "perf_work_root",
     "trace_path",
     "replay_config",
     "openssl_lib_dir",
@@ -144,7 +148,7 @@ def resolve_runtime(case: dict[str, Any]) -> dict[str, Any]:
     for key in _PATH_KEYS:
         val = str(rt.get(key, "") or "").strip()
         if not val:
-            if key in ("perf_work_root", "trace_path"):
+            if key == "trace_path":
                 raise RuntimeError(f"case {case_id}: runtime.{key} is required")
             continue
         rt[key] = str(_abs_repo_path(val, repo))
@@ -252,7 +256,7 @@ def load_router_policy_case(
         python=runtime["python"],
         vllm_rs=runtime["vllm_rs"],
         router_bin=runtime["router_binary"],
-        perf_work_root=Path(runtime["perf_work_root"]),
+        perf_work_root=PERF_RUN_DIR,
         trace_path=Path(runtime["trace_path"]),
         trace_type=str(runtime.get("trace_type") or "tracelab"),
         endpoint=str(runtime.get("endpoint") or "/v1/chat/completions"),
@@ -286,21 +290,22 @@ def cell_run_suffix(*, run_suffix: str | None = None) -> str:
     from_env = os.environ.get(RUN_SUFFIX_ENV)
     if from_env:
         return from_env
-    return datetime.now().strftime("%Y%m%d%H%M%S")
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def cell_output_dir(case: dict[str, Any], *, run_suffix: str | None = None) -> Path:
-    runtime = resolve_runtime(case)
     cell_id = str(case["id"])
     suffix = cell_run_suffix(run_suffix=run_suffix)
-    return Path(runtime["perf_work_root"]) / "runs" / f"{cell_id}-{suffix}"
+    return PERF_RUN_DIR / f"{cell_id}-{suffix}"
 
 
-def cell_results_summary_path(case: dict[str, Any], *, run_suffix: str) -> Path:
-    cell_id = str(case["id"])
-    return cell_results_dir(case) / f"{cell_id}-{run_suffix}.json"
+def router_policy_result_path(
+    policy: str, concurrency: int, task_num: int, run_suffix: str
+) -> Path:
+    """``results/perf/router_policy/<policy>_<stamp>/c<concurrency>_t<task_num>.json``."""
 
-
-def cell_results_dir(case: dict[str, Any]) -> Path:
-    runtime = resolve_runtime(case)
-    return Path(runtime["perf_work_root"]) / "results"
+    return (
+        PERF_RESULTS_DIR
+        / f"{policy}_{run_suffix}"
+        / f"c{int(concurrency)}_t{int(task_num)}.json"
+    )

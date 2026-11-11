@@ -33,7 +33,6 @@ def test_prefix_kvhit_waves(
     perf_stack,
     perf_settings,
     perf_case,
-    run_idx: int,
     hit_rate: float,
     concurrency: int,
     requests: int,
@@ -51,11 +50,9 @@ def test_prefix_kvhit_waves(
         hit_rate=hit_rate,
         concurrency=concurrency,
         requests=requests,
-        run_idx=run_idx,
     )
     result_path = bench_mod.maybe_write_result(
         perf_settings,
-        run_idx=run_idx,
         hit_rate=hit_rate,
         concurrency=concurrency,
         requests=requests,

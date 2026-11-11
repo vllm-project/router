@@ -19,9 +19,9 @@ def hit_tag(hit_rate: float) -> str:
     return f"{hit_rate:.2f}"
 
 
-def wave_id(l1_on: bool, hit_rate: float, concurrency: int, requests: int) -> str:
-    arm = "l1on" if l1_on else "l1off"
-    return f"{arm}-hit{hit_tag(hit_rate)}-c{concurrency}-r{requests}"
+def wave_id(hit_rate: float, concurrency: int, requests: int) -> str:
+    """File stem for one wave. The L1 arm is in the directory (test name), not here."""
+    return f"hit{hit_tag(hit_rate)}_c{concurrency}_r{requests}"
 
 
 def summary_p50(summary: dict[str, Any], key: str) -> float | None:
