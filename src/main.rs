@@ -203,6 +203,11 @@ struct CliArgs {
     /// Omit to disable session affinity while keeping KV-aware routing enabled.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=31_536_000))]
     kv_aware_session_affinity_ttl_secs: Option<u64>,
+    /// Milliseconds to wait for HTTP workers to prepare token IDs (/render or
+    /// /tokenize) for cache_aware and kv_aware. A worker that answers later
+    /// has no tokens for the request, and selection falls back to load.
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..=60_000))]
+    prefix_preparation_timeout_ms: u64,
     /// Static KV event publishers for regular kv_aware workers.
     #[arg(long = "kv-event-source", action = ArgAction::Append, value_name = "WORKER_URL=ENDPOINT[,ENDPOINT...]")]
     kv_event_source: Vec<String>,
@@ -670,6 +675,7 @@ impl CliArgs {
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
             kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
+            prefix_preparation_timeout_ms: self.prefix_preparation_timeout_ms,
             health_check: HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
@@ -866,6 +872,30 @@ mod tests {
         assert_eq!(args.prefill_policy.as_deref(), Some("kv_aware"));
         assert_eq!(args.decode_policy.as_deref(), Some("kv_aware"));
         assert_eq!(args.kv_aware_session_affinity_ttl_secs, Some(1800));
+    }
+
+    #[test]
+    fn parses_prefix_preparation_timeout() {
+        let args = CliArgs::try_parse_from(["vllm-router"]).unwrap();
+        assert_eq!(args.prefix_preparation_timeout_ms, 1000);
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--worker-urls",
+            "http://worker:8000",
+            "--prefix-preparation-timeout-ms",
+            "2500",
+        ])
+        .unwrap();
+        let config = args.to_router_config(vec![]).unwrap();
+        assert_eq!(config.prefix_preparation_timeout_ms, 2500);
+        for value in ["0", "60001"] {
+            assert!(CliArgs::try_parse_from([
+                "vllm-router",
+                "--prefix-preparation-timeout-ms",
+                value
+            ])
+            .is_err());
+        }
     }
 
     #[test]

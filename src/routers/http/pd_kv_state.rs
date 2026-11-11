@@ -93,6 +93,7 @@ fn probe_outcome(existing: Option<&Binding>, signature: Option<&str>) -> ProbeOu
 pub(super) struct PdKvState {
     client: reqwest::Client,
     api_key: Option<String>,
+    preparation_budget: Duration,
     supervisor: KvIndexSupervisor,
     bindings: Mutex<HashMap<String, Binding>>,
     targets: Mutex<HashMap<String, String>>,
@@ -117,12 +118,14 @@ impl PdKvState {
     pub(super) async fn start(
         client: reqwest::Client,
         api_key: Option<String>,
+        preparation_budget: Duration,
         sources: HashMap<String, crate::config::types::PdKvEventSources>,
         workers: Vec<Arc<dyn Worker>>,
         policy: Arc<dyn LoadBalancingPolicy>,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
         state.api_key = api_key;
+        state.preparation_budget = preparation_budget;
         state.supervisor.set_api_key(state.api_key.clone());
         state.refresh_inputs = Mutex::new(RefreshInputs {
             workers: workers.iter().cloned().collect(),
@@ -162,6 +165,9 @@ impl PdKvState {
             client,
             supervisor,
             api_key: None,
+            preparation_budget: Duration::from_millis(
+                crate::config::types::DEFAULT_PREFIX_PREPARATION_TIMEOUT_MS,
+            ),
             bindings: Mutex::new(HashMap::new()),
             targets: Mutex::new(HashMap::new()),
             bind_lock: Mutex::new(()),
@@ -458,7 +464,7 @@ impl PdKvState {
                     route,
                     headers,
                     self.api_key.as_deref(),
-                    Duration::from_secs(1),
+                    self.preparation_budget,
                 )
                 .await
             }

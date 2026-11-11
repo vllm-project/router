@@ -4904,6 +4904,7 @@ mod tests {
                 static_kv_event_sources: Default::default(),
             },
             kv_aware_session_affinity_ttl_secs: Some(1800),
+            prefix_preparation_timeout_ms: 1000,
             ..Default::default()
         };
         let ctx = Arc::new(

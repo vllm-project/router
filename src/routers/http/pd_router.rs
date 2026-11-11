@@ -508,6 +508,7 @@ pub struct PdRouterBase {
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub client: Client,
     api_key: Option<String>,
+    prefix_preparation_budget: Duration,
     pub circuit_breaker_config: CircuitBreakerConfig,
     // Fallback DP size for servers that report no engine metrics
     pub dp_size: usize,
@@ -651,7 +652,7 @@ impl PdRouterBase {
                     route,
                     headers,
                     self.api_key.as_deref(),
-                    Duration::from_secs(1),
+                    self.prefix_preparation_budget,
                 )
                 .await
             }
@@ -1285,6 +1286,7 @@ impl PdRouterBase {
                 PdKvState::start(
                     ctx.client.clone(),
                     ctx.router_config.api_key.clone(),
+                    ctx.router_config.prefix_preparation_budget(),
                     ctx.router_config.pd_kv_event_sources.clone(),
                     ctx.worker_registry.get_prefill_workers(),
                     prefill_policy.clone(),
@@ -1307,6 +1309,7 @@ impl PdRouterBase {
             load_monitor_handle,
             client: ctx.client.clone(),
             api_key: ctx.router_config.api_key.clone(),
+            prefix_preparation_budget: ctx.router_config.prefix_preparation_budget(),
             circuit_breaker_config: core_cb_config,
             dp_size: fallback_dp_size,
         })
@@ -1835,6 +1838,7 @@ mod tests {
             load_monitor_handle: None,
             client: Client::new(),
             api_key: None,
+            prefix_preparation_budget: Duration::from_secs(1),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size: 1,
         }
@@ -1856,6 +1860,7 @@ mod tests {
             load_monitor_handle: None,
             client: Client::new(),
             api_key: None,
+            prefix_preparation_budget: Duration::from_secs(1),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size,
         }

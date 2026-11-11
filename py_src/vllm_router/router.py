@@ -84,6 +84,8 @@ class Router:
         kv_penalty_disk: Disk-tier transfer credit for kv_aware. Default: 0.3
         kv_aware_session_affinity_ttl_secs: Idle TTL in seconds for kv_aware session
             affinity (1-31536000). None disables affinity. Default: None
+        prefix_preparation_timeout_ms: Milliseconds to wait for HTTP workers to
+            prepare token IDs for cache_aware and kv_aware (1-60000). Default: 1000
         pd_kv_events: Static prefill KV sources as URL=ENDPOINT[,ENDPOINT...],
             one entry per worker. Endpoints are ordered by DP rank; block size is 16.
             Requires PD mode and a kv_aware prefill policy. Default: []
