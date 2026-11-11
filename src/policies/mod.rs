@@ -20,7 +20,7 @@ mod rendezvous_hash;
 mod round_robin;
 mod sticky_least_loaded;
 
-pub(crate) use cache_aware::PreparedCacheSelection;
+pub use cache_aware::PreparedCacheSelection;
 pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy};
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
@@ -183,6 +183,22 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// again without the request body.
     fn can_redecide_at_dispatch(&self, _decode_cache_ready: bool) -> bool {
         false
+    }
+
+    /// Prepare the prefix selection this policy scores with.
+    ///
+    /// Only policies that keep a prefix tree answer; the caller prepares it at
+    /// admission and again at dispatch, so both sites ask the same question of
+    /// the same boundary instead of downcasting to a concrete policy.
+    fn prepare_cache_selection(
+        &self,
+        _workers: &[Arc<dyn Worker>],
+        _tokens: &WorkerTokenInputs,
+        _model_id: Option<&str>,
+        _lora_name: Option<&str>,
+        _cache_salt: Option<&str>,
+    ) -> Option<PreparedCacheSelection> {
+        None
     }
 
     /// Update worker load information

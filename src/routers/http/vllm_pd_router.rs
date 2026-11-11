@@ -15,8 +15,7 @@ use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{
-    kv_aware_ops, AffinityKey, CacheAwarePolicy, KvRequestTokens, LoadBalancingPolicy,
-    PolicyRegistry, WorkerTokenInputs,
+    kv_aware_ops, AffinityKey, LoadBalancingPolicy, PolicyRegistry, WorkerTokenInputs,
 };
 use crate::program_scheduling::ProgramIdentity;
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
@@ -178,11 +177,8 @@ pub(super) enum DecodePoolSource {
 struct AdmittedPair {
     prefill: Arc<dyn Worker>,
     decode: Arc<dyn Worker>,
-    attempt: PdAttempt,
-    /// Admission-time token inputs for the decode pool.
-    decode_tokens: Option<WorkerTokenInputs>,
-    /// Admission resolved affinity key, reused by the commitment.
-    affinity_key: Option<AffinityKey>,
+    /// The admission that chose them, including the commitment inputs.
+    admission: Admission,
 }
 
 /// Admission result, carrying what a deferred commitment needs to re-decide.
@@ -1173,18 +1169,7 @@ impl VllmPDRouter {
             (decode_policy.as_ref(), decode_workers, &decode_tokens),
         ]
         .map(|(policy, workers, inputs)| {
-            policy
-                .as_any()
-                .downcast_ref::<CacheAwarePolicy>()
-                .and_then(|cache| {
-                    cache.prepare_selection(
-                        workers,
-                        KvRequestTokens::PerWorker(inputs),
-                        model_id,
-                        None,
-                        cache_salt,
-                    )
-                })
+            policy.prepare_cache_selection(workers, inputs, model_id, None, cache_salt)
         });
         let affinity_key = Self::extract_affinity_key(decode_policy.as_ref(), headers, request);
         // The prepared selection gates deferral; token inputs are retained so
@@ -1343,18 +1328,13 @@ impl VllmPDRouter {
             }
         }
         let decode_cache = tokens.as_ref().and_then(|tokens| {
-            decode_policy
-                .as_any()
-                .downcast_ref::<CacheAwarePolicy>()
-                .and_then(|cache| {
-                    cache.prepare_selection(
-                        &candidates,
-                        KvRequestTokens::PerWorker(tokens),
-                        input.model_id.as_deref(),
-                        None,
-                        input.cache_salt.as_deref(),
-                    )
-                })
+            decode_policy.prepare_cache_selection(
+                &candidates,
+                tokens,
+                input.model_id.as_deref(),
+                None,
+                input.cache_salt.as_deref(),
+            )
         });
         let context = PdRequestContext {
             prefill_inputs: None,
@@ -1769,12 +1749,7 @@ impl VllmPDRouter {
                 .get_instance_snapshots(ServiceType::Decode),
             ServiceType::Decode,
         )?;
-        let Admission {
-            selection,
-            attempt,
-            decode_tokens,
-            affinity_key,
-        } = self
+        let admission = self
             .admit_pair(
                 &prefill_workers,
                 &decode_workers,
@@ -1786,12 +1761,11 @@ impl VllmPDRouter {
             )
             .await
             .ok_or_else(|| "No eligible P/D pair".to_string())?;
+        let selection = &admission.selection;
         Ok(AdmittedPair {
             prefill: prefill_workers[selection.prefill.worker_index].clone(),
             decode: decode_workers[selection.decode.worker_index].clone(),
-            attempt,
-            decode_tokens,
-            affinity_key,
+            admission,
         })
     }
 
@@ -1802,24 +1776,26 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Response {
-        let prefill_worker;
-        let decode_worker;
-        let attempt;
-        let decode_tokens;
-        let affinity_key;
-        match self.admit_discovered_pair(&request, path, headers).await {
-            Ok(pair) => {
-                prefill_worker = pair.prefill;
-                decode_worker = pair.decode;
-                attempt = pair.attempt;
-                decode_tokens = pair.decode_tokens;
-                affinity_key = pair.affinity_key;
-            }
+        let (
+            prefill_worker,
+            decode_worker,
+            Admission {
+                attempt,
+                decode_tokens,
+                affinity_key,
+                ..
+            },
+        ) = match self.admit_discovered_pair(&request, path, headers).await {
+            Ok(AdmittedPair {
+                prefill,
+                decode,
+                admission,
+            }) => (prefill, decode, admission),
             Err(error) => {
                 RouterMetrics::record_pd_error("server_selection");
                 return (StatusCode::SERVICE_UNAVAILABLE, error).into_response();
             }
-        }
+        };
         // The admission-time decode pick is provisional when the commitment is
         // deferred: it seeds the request id and the Prefill parameters only.
         let commit = attempt.decode_pending_commit().then(|| {
