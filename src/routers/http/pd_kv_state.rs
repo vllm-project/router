@@ -792,6 +792,7 @@ mod kv_input_tests {
                     group_idx: 0,
                     local_hashes: crate::kv_index::local_block_hash_strings(&tokens, 16, None),
                     tiers_of_interest: vec![StorageTier::Device],
+                    request: None,
                 };
                 assert_eq!(provider.find_tiered_matches(&query).len(), 1);
                 let valid = source_metadata.lock()["0"].clone();

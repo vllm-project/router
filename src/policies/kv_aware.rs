@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,12 +14,250 @@ use sha2::{Digest as _, Sha256};
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
-use crate::kv_index::{CacheKey, MatchQuery, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo};
+use crate::kv_index::{
+    CacheKey, MatchQuery, MatchRequest, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo,
+};
+use crate::metrics::ConductorMetrics;
 use crate::request_identity::StableIdentity;
 
 /// Read-only placement port owned by its policy consumer.
 pub trait TieredMatchProvider: Send + Sync {
-    fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch>;
+    fn find_tiered_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch>;
+
+    /// Variant that reports whether the placement query actually succeeded.
+    ///
+    /// Providers that do not override this are treated as **always healthy**:
+    /// the circuit breaker has no way to observe a failure through
+    /// [`find_tiered_matches`](Self::find_tiered_matches), so it can never
+    /// trip. Network-backed providers must implement it.
+    fn try_find_tiered_matches(
+        &self,
+        query: &MatchQuery<'_>,
+    ) -> Result<Vec<TierMatch>, MatchError> {
+        Ok(self.find_tiered_matches(query))
+    }
+}
+
+/// Failure of a placement query, as seen by the circuit breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchError {
+    /// Backend unavailable (timeout, transport error, 5xx). A health signal:
+    /// it counts towards opening the circuit.
+    Unavailable,
+    /// Backend rejected the request (4xx). The backend is alive and the error
+    /// is deterministic, so it must not open the circuit for everybody.
+    Rejected,
+}
+
+/// Tunables for the Conductor-placement circuit-breaker (RFC #414 §3).
+#[derive(Debug, Clone, Copy)]
+pub struct CircuitBreakerConfig {
+    /// Consecutive query failures that open the circuit.
+    pub max_failures: u32,
+    /// How long the circuit stays open before a half-open probe.
+    pub cooldown: Duration,
+    /// Probe requests allowed per half-open window.
+    pub half_open_max: u32,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            max_failures: 3,
+            cooldown: Duration::from_millis(5000),
+            half_open_max: 1,
+        }
+    }
+}
+
+/// Wraps a [`TieredMatchProvider`] with a circuit-breaker. While the circuit is
+/// open it returns an empty match set (so `kv_aware` falls back to load-only
+/// scoring) without issuing a network call to a backend the breaker considers
+/// unhealthy. On a successful half-open probe the circuit closes again.
+/// Async placement port (RFC #414 §3): lets the Conductor `/query` run without
+/// blocking a tokio worker. Only network-backed providers implement it.
+#[async_trait::async_trait]
+pub trait AsyncTieredMatchProvider: Send + Sync {
+    async fn find_tiered_matches_async(
+        &self,
+        query: &MatchQuery<'_>,
+    ) -> Result<Vec<TierMatch>, MatchError>;
+}
+
+/// One circuit breaker for both the sync and the async placement paths, so the
+/// failure budget and the open state are shared instead of duplicated.
+pub struct CircuitBreakerMatchProvider<P> {
+    inner: Arc<P>,
+    config: CircuitBreakerConfig,
+    state: Mutex<BreakerState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum BreakerMode {
+    #[default]
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+#[derive(Debug, Default)]
+struct BreakerState {
+    failures: u32,
+    opened_at: Option<Instant>,
+    half_open_seen: u32,
+}
+
+/// RAII guard for an admitted half-open probe: a cancelled request (client
+/// disconnect) releases the slot instead of wedging the circuit in half-open.
+struct ProbeGuard<'a> {
+    state: &'a Mutex<BreakerState>,
+    is_probe: bool,
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.is_probe {
+            let mut state = self.state.lock();
+            state.half_open_seen = state.half_open_seen.saturating_sub(1);
+        }
+    }
+}
+
+impl<P> CircuitBreakerMatchProvider<P>
+where
+    P: TieredMatchProvider + AsyncTieredMatchProvider,
+{
+    pub fn new(inner: Arc<P>, mut config: CircuitBreakerConfig) -> Self {
+        // A zero half-open budget would leave the circuit open forever (no
+        // probe could ever close it); a zero failure budget would trip on the
+        // first request. Clamp both; the validator rejects them as well.
+        config.max_failures = config.max_failures.max(1);
+        config.half_open_max = config.half_open_max.max(1);
+        Self {
+            inner,
+            config,
+            state: Mutex::new(BreakerState::default()),
+        }
+    }
+
+    fn mode(&self, state: &BreakerState) -> BreakerMode {
+        match state {
+            BreakerState {
+                opened_at: Some(at),
+                ..
+            } if at.elapsed() >= self.config.cooldown => BreakerMode::HalfOpen,
+            BreakerState {
+                opened_at: Some(_), ..
+            } => BreakerMode::Open,
+            _ => BreakerMode::Closed,
+        }
+    }
+
+    fn admit(&self) -> Option<ProbeGuard<'_>> {
+        let mut state = self.state.lock();
+        match self.mode(&state) {
+            BreakerMode::Open => None,
+            BreakerMode::Closed => Some(ProbeGuard {
+                state: &self.state,
+                is_probe: false,
+            }),
+            BreakerMode::HalfOpen if state.half_open_seen >= self.config.half_open_max => None,
+            BreakerMode::HalfOpen => {
+                state.half_open_seen += 1;
+                Some(ProbeGuard {
+                    state: &self.state,
+                    is_probe: true,
+                })
+            }
+        }
+    }
+
+    fn record(&self, result: &Result<Vec<TierMatch>, MatchError>) {
+        let mut state = self.state.lock();
+        let before = self.mode(&state);
+        // `Rejected` means the backend answered, so it is not a health failure.
+        let failure = matches!(result, Err(MatchError::Unavailable));
+        match (before, failure) {
+            (BreakerMode::Open, _) => {}
+            (BreakerMode::Closed, false) => state.failures = 0,
+            (BreakerMode::HalfOpen, false) => {
+                *state = BreakerState::default();
+            }
+            (BreakerMode::Closed, true) => {
+                state.failures += 1;
+                if state.failures >= self.config.max_failures {
+                    state.failures = 0;
+                    state.opened_at = Some(Instant::now());
+                    state.half_open_seen = 0;
+                }
+            }
+            (BreakerMode::HalfOpen, true) => {
+                state.opened_at = Some(Instant::now());
+                state.half_open_seen = 0;
+                state.failures = 0;
+            }
+        }
+        let after = self.mode(&state);
+        if before != after {
+            ConductorMetrics::record_breaker_transition(match after {
+                BreakerMode::Closed => "closed",
+                BreakerMode::Open => "open",
+                BreakerMode::HalfOpen => "half_open",
+            });
+            ConductorMetrics::set_breaker_open(!matches!(after, BreakerMode::Closed));
+        }
+    }
+}
+
+impl<P> TieredMatchProvider for CircuitBreakerMatchProvider<P>
+where
+    P: TieredMatchProvider + AsyncTieredMatchProvider,
+{
+    fn find_tiered_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch> {
+        let Some(_guard) = self.admit() else {
+            return Vec::new();
+        };
+        let result = self.inner.try_find_tiered_matches(query);
+        self.record(&result);
+        result.unwrap_or_default()
+    }
+}
+
+#[async_trait::async_trait]
+impl<P> AsyncTieredMatchProvider for CircuitBreakerMatchProvider<P>
+where
+    P: TieredMatchProvider + AsyncTieredMatchProvider,
+{
+    async fn find_tiered_matches_async(
+        &self,
+        query: &MatchQuery<'_>,
+    ) -> Result<Vec<TierMatch>, MatchError> {
+        let Some(_guard) = self.admit() else {
+            return Ok(Vec::new());
+        };
+        let result = self.inner.find_tiered_matches_async(query).await;
+        self.record(&result);
+        result
+    }
+}
+
+/// Matches gathered before the selection retry loop (RFC #414 §3), keyed by
+/// cache identity so a retried request reuses them instead of re-querying.
+#[derive(Debug, Clone, Default)]
+pub struct KvPrefetch {
+    matches: Option<HashMap<CacheKey, Vec<TierMatch>>>,
+}
+
+impl KvPrefetch {
+    fn from_matches(matches: HashMap<CacheKey, Vec<TierMatch>>) -> Self {
+        Self {
+            matches: Some(matches),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<&HashMap<CacheKey, Vec<TierMatch>>> {
+        self.matches.as_ref()
+    }
 }
 
 /// Exact prompt sequences rendered by each HTTP backend. DP ranks share their
@@ -67,6 +305,7 @@ pub struct PrefillWorkEstimate {
 }
 
 /// Optional operations used by adapters with tokenized requests and KV discovery.
+#[async_trait::async_trait]
 pub trait KvAwareOps: Send + Sync {
     /// P/D uses the same placement/credit contract as colocated routing,
     /// but accounts token backlog in the shared P/D admission manager.
@@ -91,6 +330,16 @@ pub trait KvAwareOps: Send + Sync {
     ) -> Option<StagePick>;
     /// Whether the optional session binding is switched on for this policy.
     fn session_affinity_enabled(&self) -> bool;
+    /// Gather placement before the retry loop. Default: no snapshot.
+    async fn prefetch_matches(
+        &self,
+        _model_id: Option<&str>,
+        _tokens: KvRequestTokens<'_>,
+        _lora_name: Option<&str>,
+        _cache_salt: Option<&str>,
+    ) -> KvPrefetch {
+        KvPrefetch::default()
+    }
     fn register_worker(
         &self,
         worker: &dyn Worker,
@@ -168,6 +417,31 @@ pub trait KvAwareOps: Send + Sync {
             cache_salt,
             affinity_key,
             excluded_workers,
+        )
+    }
+
+    /// Selection with placement gathered before the retry loop.
+    #[allow(clippy::too_many_arguments)]
+    fn select_worker_with_prefetch(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        tokens: KvRequestTokens<'_>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        affinity_key: Option<&AffinityKey>,
+        excluded_workers: &[String],
+        eligibility: Option<&[bool]>,
+        prefetch: Option<&KvPrefetch>,
+    ) -> Option<KvSelectionReceipt> {
+        let _ = prefetch;
+        self.select_worker_with_qualified_inputs(
+            workers,
+            tokens,
+            lora_name,
+            cache_salt,
+            affinity_key,
+            excluded_workers,
+            eligibility,
         )
     }
 }
@@ -739,27 +1013,50 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
                 .min(u32::MAX as usize) as u32,
         );
 
-    let mut best_continuation = (0_u32, 0.0_f64);
-    for hit in candidate
-        .matches
-        .iter()
-        .filter(|hit| hit.tier != StorageTier::Device)
-    {
-        for &(start, end) in &hit.segments {
-            if start <= device_blocks && device_blocks < end {
-                let blocks = end - device_blocks;
-                let credit = params.transfer_credits.for_tier(hit.tier);
-                if blocks > best_continuation.0
-                    || (blocks == best_continuation.0 && credit > best_continuation.1)
-                {
-                    best_continuation = (blocks, credit);
+    // Credit a chain of continuation tiers instead of a single one (RFC #414).
+    // Starting at the device prefix boundary, repeatedly take the best-credit
+    // covering segment among non-device tiers, advance to its end, and repeat
+    // until nothing covers the current position. This handles both Conductor's
+    // disjoint per-tier ceilings (device..host..pool..disk) and vLLM's classic
+    // two-segment (device + one external) reuse: when only a single
+    // continuation segment touches the device boundary, the walk credits it
+    // and then stops, matching the pre-chain behaviour.
+    let mut credited_continuation = 0.0_f64;
+    let mut pos = device_blocks;
+    loop {
+        let mut best: Option<(u32, f64)> = None; // (end, credit)
+        for hit in candidate
+            .matches
+            .iter()
+            .filter(|hit| hit.tier != StorageTier::Device)
+        {
+            for &(start, end) in &hit.segments {
+                if start <= pos && pos < end {
+                    let credit = params.transfer_credits.for_tier(hit.tier);
+                    let blocks = end - pos;
+                    let better = match best {
+                        None => true,
+                        Some((best_end, best_credit)) => {
+                            blocks > best_end - pos
+                                || (blocks == best_end - pos && credit > best_credit)
+                        }
+                    };
+                    if better {
+                        best = Some((end, credit));
+                    }
                 }
             }
         }
+        match best {
+            Some((end, credit)) => {
+                credited_continuation += f64::from(end - pos) * credit;
+                pos = end;
+            }
+            None => break,
+        }
     }
 
-    let credited_blocks =
-        f64::from(device_blocks) + f64::from(best_continuation.0) * best_continuation.1;
+    let credited_blocks = f64::from(device_blocks) + credited_continuation;
     // External reuse may have a different alignment, but it cannot eliminate
     // the last-token logits work either.
     (credited_blocks * f64::from(params.block_size))
@@ -893,7 +1190,7 @@ fn pick_minimum(costs: &[f64]) -> Option<usize> {
 struct EmptyMatchProvider;
 
 impl TieredMatchProvider for EmptyMatchProvider {
-    fn find_tiered_matches(&self, _query: &MatchQuery) -> Vec<TierMatch> {
+    fn find_tiered_matches(&self, _query: &MatchQuery<'_>) -> Vec<TierMatch> {
         Vec::new()
     }
 }
@@ -905,6 +1202,8 @@ struct TargetBinding {
     cache_key: Option<CacheKey>,
     matches: Arc<dyn TieredMatchProvider>,
     block_size: u32,
+    /// Engine model identity, forwarded to an external provider if set.
+    model_id: Option<Arc<str>>,
 }
 
 /// One prepared selection snapshot: KV queries fill `grouped` outside every
@@ -923,6 +1222,9 @@ struct SelectionPlan {
 /// placement provider for its cache identity.
 pub struct KvAwarePolicy {
     matches: Arc<dyn TieredMatchProvider>,
+    /// Async view of the same provider, used by `prefetch_matches` so the
+    /// Conductor `/query` never blocks a tokio worker.
+    async_provider: Option<Arc<dyn AsyncTieredMatchProvider>>,
     load: Arc<dyn LoadProvider>,
     slot_manager: Option<Arc<dyn SlotManager>>,
     scorers: Vec<Arc<dyn Scorer>>,
@@ -938,6 +1240,31 @@ pub struct KvAwarePolicy {
     selection_lock: Mutex<()>,
     /// Every registration gets a new generation, including load-only targets.
     next_generation: AtomicU64,
+    /// When true, worker bindings use the policy-level `matches` provider
+    /// (e.g. the shared ConductorMatchProvider) instead of the per-worker
+    /// provider discovered by the local KV-index supervisor. This is what makes
+    /// `--kv-index-backend conductor` actually consult Conductor for placement.
+    prefer_policy_provider: bool,
+    /// The shared Conductor provider, when `--kv-index-backend conductor` is
+    /// active. Used to dynamically register/unregister workers against
+    /// Conductor so it can run with zero static service configuration.
+    conductor: Option<Arc<dyn super::ConductorRegistrar>>,
+    /// Whether the router drives Conductor registration itself. False when an
+    /// operator or sidecar owns registration (RFC #414 §4).
+    register_enabled: bool,
+    /// Last-seen `WorkerKvInfo` per worker URL, kept so the heartbeat can renew
+    /// each registration periodically (keeps idle workers alive).
+    registered: Arc<Mutex<HashMap<String, crate::kv_index::WorkerKvInfo>>>,
+    /// Set on drop so the heartbeat thread exits instead of holding the policy
+    /// state alive for the rest of the process lifetime.
+    heartbeat_stop: Arc<AtomicBool>,
+    /// Serialises Conductor registration mutations (heartbeat renewal, worker
+    /// registration, removal). A renewal holds it for the whole
+    /// "is this worker still registered?" check *and* the `/register` call, so
+    /// it cannot interleave with a removal and resurrect an unregistered
+    /// worker. Held across one control-path call, so the longest a removal
+    /// waits is one `--conductor-register-timeout-ms`.
+    registration_gate: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for KvAwarePolicy {
@@ -971,6 +1298,193 @@ impl KvAwarePolicy {
         self
     }
 
+    /// Build a `kv_aware` policy backed by the Mooncake Conductor as its KV
+    /// placement provider (RFC #414). The provider answers `/query` over HTTP,
+    /// degrades to "no placement credit" on any failure (so load scoring always
+    /// remains the floor), and dynamically registers workers so Conductor can be
+    /// configured with zero static services.
+    pub fn new_with_conductor(
+        params: CostParams,
+        options: super::ConductorOptions,
+        register_enabled: bool,
+    ) -> Self {
+        let circuit_breaker = options.circuit_breaker;
+        let heartbeat_secs = options.heartbeat_secs;
+        let provider = Arc::new(super::ConductorMatchProvider::with_options(options));
+        Self::from_conductor_provider(
+            params,
+            provider,
+            circuit_breaker,
+            heartbeat_secs,
+            register_enabled,
+        )
+    }
+
+    /// Conductor placement over the optional coro_rpc transport.
+    ///
+    /// Returns `Err` when the C++ client cannot be initialised so the caller
+    /// can fall back to the local index instead of panicking.
+    #[cfg(feature = "conductor-rpc")]
+    pub fn new_with_cororpc(
+        params: CostParams,
+        options: super::ConductorRpcOptions,
+        register_enabled: bool,
+    ) -> Result<Self, String> {
+        let circuit_breaker = options.circuit_breaker;
+        let heartbeat_secs = options.heartbeat_secs;
+        let provider = Arc::new(super::CoroRpcMatchProvider::new(options)?);
+        Ok(Self::from_conductor_provider(
+            params,
+            provider,
+            circuit_breaker,
+            heartbeat_secs,
+            register_enabled,
+        ))
+    }
+
+    /// Assemble the policy around any Conductor transport: one shared breaker
+    /// for both paths, a registrar handle for registration/heartbeat, and the
+    /// request-scoped registration bookkeeping.
+    fn from_conductor_provider<P>(
+        params: CostParams,
+        conductor_provider: Arc<P>,
+        circuit_breaker: Option<CircuitBreakerConfig>,
+        heartbeat_secs: u64,
+        register_enabled: bool,
+    ) -> Self
+    where
+        P: TieredMatchProvider + AsyncTieredMatchProvider + super::ConductorRegistrar + 'static,
+    {
+        let registrar: Arc<dyn super::ConductorRegistrar> = conductor_provider.clone();
+        let (matches, async_provider): (
+            Arc<dyn TieredMatchProvider>,
+            Arc<dyn AsyncTieredMatchProvider>,
+        ) = match circuit_breaker {
+            Some(config) => {
+                let breaker = Arc::new(CircuitBreakerMatchProvider::new(
+                    conductor_provider.clone(),
+                    config,
+                ));
+                (breaker.clone(), breaker)
+            }
+            None => (conductor_provider.clone(), conductor_provider.clone()),
+        };
+        let registered: Arc<Mutex<HashMap<String, crate::kv_index::WorkerKvInfo>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let registration_gate = Arc::new(Mutex::new(()));
+        let heartbeat_stop = Arc::new(AtomicBool::new(false));
+        if register_enabled && heartbeat_secs > 0 {
+            if heartbeat_secs > 30 {
+                tracing::warn!(
+                    heartbeat_secs,
+                    "conductor heartbeat period exceeds the Conductor's default 30s lease; \
+                     registrations may expire between renewals"
+                );
+            }
+            spawn_heartbeat(
+                registrar.clone(),
+                registered.clone(),
+                registration_gate.clone(),
+                heartbeat_stop.clone(),
+                heartbeat_secs,
+            );
+        }
+        let slots = Arc::new(InMemorySlotManager::new());
+        let mut policy = Self::with_components(
+            matches,
+            slots.clone(),
+            vec![Arc::new(MultiplicativeScorer)],
+            Arc::new(TemperaturePicker::new(params.router_temperature)),
+            params,
+        );
+        policy.slot_manager = Some(slots);
+        policy.prefer_policy_provider = true;
+        policy.conductor = Some(registrar);
+        policy.register_enabled = register_enabled;
+        policy.registered = registered;
+        policy.registration_gate = registration_gate;
+        policy.heartbeat_stop = heartbeat_stop;
+        policy.async_provider = Some(async_provider);
+        policy
+    }
+
+    /// Gather Conductor placement for every registered identity before the
+    /// retry loop (RFC #414 §3): a retried request reuses this snapshot instead
+    /// of issuing another `/query` per attempt.
+    pub async fn prefetch_matches(
+        &self,
+        model_id: Option<&str>,
+        tokens: KvRequestTokens<'_>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+    ) -> KvPrefetch {
+        let Some(provider) = self.async_provider.clone() else {
+            return KvPrefetch::default();
+        };
+        if self.conductor.is_none() {
+            return KvPrefetch::default();
+        }
+        let token_ids = match tokens {
+            KvRequestTokens::Shared(Some(ids)) if !ids.is_empty() => ids,
+            _ => {
+                ConductorMetrics::record_skipped("no_tokens");
+                return KvPrefetch::default();
+            }
+        };
+        let mut seen = HashSet::new();
+        let mut queries = Vec::new();
+        for entry in self.targets.iter() {
+            let binding = entry.value();
+            let Some(cache_key) = binding.cache_key.clone() else {
+                continue;
+            };
+            if model_id.is_some_and(|model| binding.model_id.as_deref() != Some(model)) {
+                continue;
+            }
+            if !seen.insert(cache_key.clone()) {
+                continue;
+            }
+            let Some(model) = binding.model_id.as_ref() else {
+                ConductorMetrics::record_skipped("no_cache_identity");
+                continue;
+            };
+            let query = MatchQuery {
+                group_idx: 0,
+                local_hashes: Vec::new(),
+                tiers_of_interest: Self::tiers_of_interest(),
+                request: Some(MatchRequest {
+                    model_id: Some(model.to_string()),
+                    block_size: binding.block_size,
+                    token_ids,
+                    lora_name: lora_name.map(str::to_owned),
+                    cache_salt: cache_salt.map(str::to_owned),
+                }),
+            };
+            let provider = provider.clone();
+            queries
+                .push(async move { (cache_key, provider.find_tiered_matches_async(&query).await) });
+        }
+        if queries.is_empty() {
+            return KvPrefetch::default();
+        }
+        let mut matches = HashMap::new();
+        for (cache_key, result) in futures::future::join_all(queries).await {
+            match result {
+                Ok(hits) => {
+                    matches.insert(cache_key, hits);
+                }
+                Err(error) => {
+                    ConductorMetrics::record_query_error(match error {
+                        MatchError::Unavailable => "unavailable",
+                        MatchError::Rejected => "rejected",
+                    });
+                    matches.insert(cache_key, Vec::new());
+                }
+            }
+        }
+        KvPrefetch::from_matches(matches)
+    }
+
     pub fn with_components(
         matches: Arc<dyn TieredMatchProvider>,
         load: Arc<dyn LoadProvider>,
@@ -980,6 +1494,7 @@ impl KvAwarePolicy {
     ) -> Self {
         Self {
             matches,
+            async_provider: None,
             load,
             slot_manager: None,
             scorers,
@@ -990,6 +1505,12 @@ impl KvAwarePolicy {
             affinity: Arc::new(KvAffinityTable::new()),
             selection_lock: Mutex::new(()),
             next_generation: AtomicU64::new(1),
+            prefer_policy_provider: false,
+            conductor: None,
+            register_enabled: false,
+            registered: Arc::new(Mutex::new(HashMap::new())),
+            heartbeat_stop: Arc::new(AtomicBool::new(false)),
+            registration_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1003,6 +1524,7 @@ impl KvAwarePolicy {
                 cache_key: None,
                 matches: self.matches.clone(),
                 block_size: self.params.block_size,
+                model_id: None,
             },
         );
     }
@@ -1016,6 +1538,17 @@ impl KvAwarePolicy {
     ) {
         let _guard = self.selection_lock.lock();
         let block_size = cache_key.block_size;
+        let model_id = Some(cache_key.model.clone());
+        // In conductor mode (`--kv-index-backend conductor`) placement must be
+        // answered by the shared ConductorMatchProvider, not the local per-worker
+        // indexer that `match_provider_for_worker` normally supplies. `block_size`
+        // and `model_id` still come from the discovered cache identity so the
+        // Conductor /query targets the right hash profile.
+        let matches = if self.prefer_policy_provider {
+            self.matches.clone()
+        } else {
+            matches
+        };
         self.targets.insert(
             worker_url.into(),
             TargetBinding {
@@ -1024,6 +1557,7 @@ impl KvAwarePolicy {
                 cache_key: Some(cache_key),
                 matches,
                 block_size,
+                model_id,
             },
         );
     }
@@ -1084,6 +1618,7 @@ impl KvAwarePolicy {
                 cache_key: None,
                 matches: self.matches.clone(),
                 block_size: self.params.block_size,
+                model_id: None,
             })
     }
 
@@ -1124,10 +1659,18 @@ impl KvAwarePolicy {
         if local_hashes.is_empty() {
             Vec::new()
         } else {
+            let request = token_ids.map(|ids| MatchRequest {
+                model_id: binding.model_id.as_ref().map(|model| model.to_string()),
+                block_size: binding.block_size,
+                token_ids: ids,
+                lora_name: lora_name.map(str::to_owned),
+                cache_salt: None,
+            });
             let hits = binding.matches.find_tiered_matches(&MatchQuery {
                 group_idx: 0,
                 local_hashes,
                 tiers_of_interest: Self::tiers_of_interest(),
+                request,
             });
             crate::metrics::RouterMetrics::record_kv_placement_lookup(
                 if binding.cache_key.is_none() {
@@ -1168,6 +1711,7 @@ impl KvAwarePolicy {
             },
             lora_name,
             cache_salt,
+            None,
         )?;
         let candidates = self.candidate_views(workers, &plan);
         let (costs, components) = self.score_candidates(&plan, &candidates)?;
@@ -1232,6 +1776,28 @@ impl KvAwarePolicy {
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
     ) -> Option<KvSelectionReceipt> {
+        self.select_worker_with_prefetch_inner(
+            workers,
+            input,
+            lora_name,
+            cache_salt,
+            affinity_key,
+            excluded_workers,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn select_worker_with_prefetch_inner(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        input: QualifiedKvInput<'_>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        affinity_key: Option<&AffinityKey>,
+        excluded_workers: &[String],
+        prefetch: Option<&KvPrefetch>,
+    ) -> Option<KvSelectionReceipt> {
         let digest = affinity_key.map(|key| key.scoped_digest(lora_name, cache_salt));
         // Re-query at most three times under registration churn. The final
         // attempt snapshots current targets and reserves using live load only.
@@ -1249,7 +1815,7 @@ impl KvAwarePolicy {
                     has_tokens: false,
                 }
             } else {
-                self.prepare_selection(workers, input, lora_name, cache_salt)?
+                self.prepare_selection(workers, input, lora_name, cache_salt, prefetch)?
             };
             let excluded = |position: usize| {
                 excluded_workers
@@ -1277,6 +1843,35 @@ impl KvAwarePolicy {
             }
             let candidates = self.candidate_views(workers, &plan);
             let (costs, components) = self.score_candidates(&plan, &candidates)?;
+
+            for (index, candidate) in candidates.iter().enumerate() {
+                let device_blocks: u32 = candidate
+                    .matches
+                    .iter()
+                    .filter(|hit| hit.tier == StorageTier::Device)
+                    .flat_map(|hit| hit.segments.iter())
+                    .map(|(start, end)| end - start)
+                    .sum();
+                let total_matched: u32 = candidate
+                    .matches
+                    .iter()
+                    .flat_map(|hit| hit.segments.iter())
+                    .map(|(start, end)| end - start)
+                    .sum();
+                tracing::info!(
+                    worker = %candidate.target.instance_id,
+                    rank = candidate.target.dp_rank,
+                    token_ids_present = plan.has_tokens,
+                    input_tokens = candidate.input_tokens,
+                    tier_matches = candidate.matches.len(),
+                    device_blocks,
+                    total_matched_blocks = total_matched,
+                    cost = costs[index],
+                    ptoken = components[index].ptoken,
+                    batchsize = components[index].batchsize,
+                    "kv_aware_select: candidate"
+                );
+            }
 
             // Recheck the table inside the critical section.
             let acquired = digest
@@ -1318,6 +1913,20 @@ impl KvAwarePolicy {
 
             let (worker_index, new_prefill_tokens, decision) =
                 self.decision_for_position(&plan, &candidates, &costs, &components, position);
+            tracing::info!(
+                worker = %target.instance_id,
+                rank = target.dp_rank,
+                token_ids_present = plan.has_tokens,
+                input_tokens = plan.input_tokens[position],
+                pick_kind = if plan.has_tokens {
+                    "kv-aware"
+                } else {
+                    "load-fallback"
+                },
+                cost = costs[position],
+                new_prefill_tokens,
+                "kv_aware_select: picked"
+            );
             let outcome = if used_binding {
                 "sticky_hit"
             } else if !plan.has_tokens {
@@ -1420,6 +2029,7 @@ impl KvAwarePolicy {
         input: QualifiedKvInput<'_>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
+        prefetch: Option<&KvPrefetch>,
     ) -> Option<SelectionPlan> {
         let (healthy, bindings) = {
             let _guard = self.selection_lock.lock();
@@ -1444,6 +2054,9 @@ impl KvAwarePolicy {
         let has_tokens = known_input_tokens > 0;
         if !has_tokens {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("missing_tokens");
+            if self.conductor.is_some() {
+                crate::metrics::ConductorMetrics::record_skipped("no_tokens");
+            }
         }
         let mut query_cache: HashMap<(Option<CacheKey>, &[u32]), Vec<TierMatch>> = HashMap::new();
         let mut grouped = Vec::with_capacity(bindings.len());
@@ -1460,34 +2073,87 @@ impl KvAwarePolicy {
                         total_prefill = total_prefill.saturating_add(ids.len() as u64);
                         continue;
                     }
-                    let hits = query_cache
-                        .entry((binding.cache_key.clone(), ids))
-                        .or_insert_with(|| {
-                            if let Some(reason) = credit_fallback {
-                                crate::metrics::RouterMetrics::record_kv_placement_lookup(reason);
-                                return Vec::new();
-                            }
-                            let local_hashes =
-                                Self::local_hashes_with_lora(ids, binding.block_size, lora_name);
-                            if local_hashes.is_empty() {
-                                return Vec::new();
-                            }
-                            let hits = binding.matches.find_tiered_matches(&MatchQuery {
-                                group_idx: 0,
-                                local_hashes,
-                                tiers_of_interest: Self::tiers_of_interest(),
-                            });
-                            crate::metrics::RouterMetrics::record_kv_placement_lookup(
-                                if binding.cache_key.is_none() {
-                                    "index_unavailable"
-                                } else if hits.is_empty() {
-                                    "miss"
+                    let prefetched = prefetch.and_then(KvPrefetch::snapshot).and_then(|matches| {
+                        binding
+                            .cache_key
+                            .as_ref()
+                            .and_then(|key| matches.get(key))
+                            .cloned()
+                    });
+                    let hits: Vec<TierMatch> = if let Some(hits) = prefetched {
+                        crate::metrics::RouterMetrics::record_kv_placement_lookup(
+                            if hits.is_empty() { "miss" } else { "hit" },
+                        );
+                        hits
+                    } else if self.conductor.is_some()
+                        && prefetch.and_then(KvPrefetch::snapshot).is_some()
+                    {
+                        // The async snapshot was supplied but has no entry for
+                        // this identity: never fall back to a blocking query on
+                        // the request path.
+                        crate::metrics::RouterMetrics::record_kv_placement_lookup("miss");
+                        Vec::new()
+                    } else {
+                        query_cache
+                            .entry((binding.cache_key.clone(), ids))
+                            .or_insert_with(|| {
+                                let ids: &[u32] = ids;
+                                let external = self.conductor.is_some();
+                                if external && binding.model_id.is_none() {
+                                    // Conductor cannot resolve an empty model, and a
+                                    // 400 would also count against the breaker.
+                                    crate::metrics::ConductorMetrics::record_skipped(
+                                        "no_cache_identity",
+                                    );
+                                    return Vec::new();
+                                }
+                                if !external {
+                                    if let Some(reason) = credit_fallback {
+                                        crate::metrics::RouterMetrics::record_kv_placement_lookup(
+                                            reason,
+                                        );
+                                        return Vec::new();
+                                    }
+                                }
+                                // The local indexer hashes tokens itself; Conductor
+                                // reproduces the engine chain from token ids and must
+                                // not receive local hashes.
+                                let local_hashes = if external {
+                                    Vec::new()
                                 } else {
-                                    "hit"
-                                },
-                            );
-                            hits
-                        });
+                                    Self::local_hashes_with_lora(ids, binding.block_size, lora_name)
+                                };
+                                if !external && local_hashes.is_empty() {
+                                    return Vec::new();
+                                }
+                                let hits = binding.matches.find_tiered_matches(&MatchQuery {
+                                    group_idx: 0,
+                                    local_hashes,
+                                    tiers_of_interest: Self::tiers_of_interest(),
+                                    request: Some(MatchRequest {
+                                        model_id: binding
+                                            .model_id
+                                            .as_ref()
+                                            .map(|model| model.to_string()),
+                                        block_size: binding.block_size,
+                                        token_ids: ids,
+                                        lora_name: lora_name.map(str::to_owned),
+                                        cache_salt: cache_salt.map(str::to_owned),
+                                    }),
+                                });
+                                crate::metrics::RouterMetrics::record_kv_placement_lookup(
+                                    if binding.cache_key.is_none() {
+                                        "index_unavailable"
+                                    } else if hits.is_empty() {
+                                        "miss"
+                                    } else {
+                                        "hit"
+                                    },
+                                );
+                                hits
+                            })
+                            .clone()
+                    };
                     let matches: Vec<_> = hits
                         .iter()
                         .filter(|hit| hit.target == binding.target)
@@ -1700,6 +2366,116 @@ impl KvAwarePolicy {
     }
 }
 
+/// Renew `url`'s Conductor registration if it is still wanted.
+///
+/// Returns `None` when nothing was sent (the worker was removed, has no source
+/// endpoints, or Conductor already knows every rank), `Some(Ok(()))` when the
+/// renewal succeeded, and `Some(Err(_))` when it failed.
+///
+/// The whole decision — membership check *and* the `/register` call — runs
+/// under `registration_gate`, the same lock `register_worker` and
+/// `unregister_worker` take. Without that, a renewal could pass the membership
+/// check, then observe a removal, and finally re-register a worker that no
+/// longer exists locally: the stale Conductor subscription would have no local
+/// entry left to clean it up, and it can block a replacement reusing the same
+/// endpoint. The current `WorkerKvInfo` is re-read under the gate, so a
+/// renewal can never send the snapshot of a worker that has since been
+/// re-registered with different sources.
+fn renew_registration(
+    gate: &Mutex<()>,
+    provider: &dyn super::ConductorRegistrar,
+    registered: &Mutex<HashMap<String, WorkerKvInfo>>,
+    url: &str,
+    known: Option<&HashSet<(String, u32)>>,
+) -> Option<Result<(), String>> {
+    let _gate = gate.lock();
+    let info = registered.lock().get(url).cloned()?;
+    // `/register` creates one service entry per source rank; a worker without
+    // discovered endpoints has nothing to renew.
+    if info.sources.is_empty() {
+        return None;
+    }
+    if let Some(known) = known {
+        let all_present = info.sources.iter().all(|src| {
+            !src.pub_endpoint.is_empty() && known.contains(&(info.instance_id.clone(), src.dp_rank))
+        });
+        if all_present {
+            return None;
+        }
+    }
+    Some(provider.register_worker(&info))
+}
+
+/// Renew dynamic Conductor registrations in the background.
+///
+/// Every `period_secs` it reconciles against `GET /services` and re-registers
+/// only the workers whose services are missing (this also covers a Conductor
+/// restart). When `/services` is unavailable it falls back to an identical
+/// `/register` per worker, which Conductor treats as a no-op if the service
+/// still exists.
+fn spawn_heartbeat(
+    provider: Arc<dyn super::ConductorRegistrar>,
+    registered: Arc<Mutex<HashMap<String, WorkerKvInfo>>>,
+    registration_gate: Arc<Mutex<()>>,
+    stop: Arc<AtomicBool>,
+    period_secs: u64,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("conductor-heartbeat".into())
+        .spawn(move || {
+            let period = Duration::from_secs(period_secs);
+            let mut warned = false;
+            loop {
+                std::thread::sleep(period);
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let known = provider.list_services().ok();
+                // Snapshot the URLs only: membership and the info itself are
+                // re-read under the gate for every worker below.
+                let urls: Vec<String> = registered.lock().keys().cloned().collect();
+                for url in urls {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    match renew_registration(
+                        &registration_gate,
+                        provider.as_ref(),
+                        &registered,
+                        &url,
+                        known.as_ref(),
+                    ) {
+                        Some(Ok(())) => warned = false,
+                        Some(Err(error)) => {
+                            if !warned {
+                                warned = true;
+                                tracing::warn!(
+                                    worker = %url,
+                                    %error,
+                                    "conductor heartbeat re-register failed; will keep retrying"
+                                );
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(
+            %error,
+            "failed to start the conductor heartbeat thread; idle workers may expire on the conductor"
+        );
+    }
+}
+
+impl Drop for KvAwarePolicy {
+    fn drop(&mut self) {
+        // The thread wakes at most one heartbeat period later and exits.
+        self.heartbeat_stop.store(true, Ordering::Relaxed);
+    }
+}
+
 impl Default for KvAwarePolicy {
     fn default() -> Self {
         Self::new(CostParams::default())
@@ -1734,6 +2510,7 @@ impl LoadBalancingPolicy for KvAwarePolicy {
     }
 }
 
+#[async_trait::async_trait]
 impl KvAwareOps for KvAwarePolicy {
     fn has_affinity(
         &self,
@@ -1961,9 +2738,67 @@ impl KvAwareOps for KvAwarePolicy {
             }
             _ => self.register_target(worker.url(), target),
         }
+        // In conductor mode, register the worker with Conductor so it can run
+        // with zero static service configuration. Failure is logged but never
+        // blocks local admission (placement degrades to load-only). The gate
+        // makes the map update and the `/register` call atomic with respect to
+        // a concurrent heartbeat renewal or removal of the same worker.
+        if let (Some(conductor), Some(info)) = (
+            self.conductor.as_ref().filter(|_| self.register_enabled),
+            info,
+        ) {
+            let _gate = self.registration_gate.lock();
+            match conductor.register_worker(info) {
+                Ok(()) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        "kv_aware conductor register failed instance_id={} worker={} error={}",
+                        info.instance_id,
+                        worker.url(),
+                        error
+                    );
+                }
+            }
+            // Remember the discovered info even when registration failed: the
+            // heartbeat retries it, which also covers a Conductor restart.
+            self.registered
+                .lock()
+                .insert(worker.url().to_string(), info.clone());
+        }
     }
 
     fn unregister_worker(&self, worker_url: &str) {
+        // Hold the registration gate across { remove, `/unregister` }: a
+        // concurrent heartbeat renewal either finished first — and then this
+        // `/unregister` covers the ranks it registered — or runs afterwards and
+        // finds no local entry, so it skips. Dropping the entry before calling
+        // Conductor also means a failed `/unregister` cannot leave a renewable
+        // entry behind.
+        {
+            let _gate = self.registration_gate.lock();
+            let removed = self.registered.lock().remove(worker_url);
+            if let Some(conductor) = self.conductor.as_ref().filter(|_| self.register_enabled) {
+                if let Some(info) = removed {
+                    let instance_id = info.instance_id.clone();
+                    // TODO(RFC #414 §4, DP > 1): every DP worker of an instance
+                    // registers all of its source ranks (registration enumerates
+                    // `info.sources`), so unregistering one DP worker also removes
+                    // the ranks other DP workers share until their heartbeat
+                    // re-registers them. Rank-level ownership is required before
+                    // DP engines can be supported without this churn.
+                    let ranks: Vec<u32> = info.sources.iter().map(|src| src.dp_rank).collect();
+                    if !instance_id.is_empty() && !ranks.is_empty() {
+                        if let Err(error) = conductor.unregister_worker(&instance_id, &ranks) {
+                            tracing::warn!(
+                                "kv_aware conductor unregister failed worker={} error={}",
+                                worker_url,
+                                error
+                            );
+                        }
+                    }
+                }
+            }
+        }
         self.unregister_target(worker_url);
     }
 
@@ -1988,6 +2823,42 @@ impl KvAwareOps for KvAwarePolicy {
             cache_salt,
             affinity_key,
             excluded_workers,
+        )
+    }
+
+    async fn prefetch_matches(
+        &self,
+        model_id: Option<&str>,
+        tokens: KvRequestTokens<'_>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+    ) -> KvPrefetch {
+        KvAwarePolicy::prefetch_matches(self, model_id, tokens, lora_name, cache_salt).await
+    }
+
+    fn select_worker_with_prefetch(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        tokens: KvRequestTokens<'_>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        affinity_key: Option<&AffinityKey>,
+        excluded_workers: &[String],
+        eligibility: Option<&[bool]>,
+        prefetch: Option<&KvPrefetch>,
+    ) -> Option<KvSelectionReceipt> {
+        KvAwarePolicy::select_worker_with_prefetch_inner(
+            self,
+            workers,
+            QualifiedKvInput {
+                tokens,
+                eligibility,
+            },
+            lora_name,
+            cache_salt,
+            affinity_key,
+            excluded_workers,
+            prefetch,
         )
     }
 
@@ -2082,7 +2953,7 @@ mod tests {
             hits: Vec<TierMatch>,
         }
         impl TieredMatchProvider for Matches {
-            fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
+            fn find_tiered_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch> {
                 self.queries.fetch_add(1, Ordering::Relaxed);
                 self.blocks
                     .store(query.local_hashes.len(), Ordering::Relaxed);
@@ -2372,6 +3243,57 @@ mod tests {
         assert_eq!(
             cost_components(&candidate, &CostParams::default()).ptoken,
             112
+        );
+    }
+
+    #[test]
+    fn chained_continuation_credits_each_tier_in_sequence() {
+        // RFC #414: credit a chain of continuation tiers, not just one.
+        // device [0,3) then host [3,6) then external [6,9): each block is
+        // credited at its own tier's transfer ratio as the walk advances.
+        let t = target("w", 0);
+        let matches = vec![
+            tier_match(&t, StorageTier::Device, &[(0, 3)]),
+            tier_match(&t, StorageTier::HostPinned, &[(3, 6)]),
+            tier_match(&t, StorageTier::External, &[(6, 9)]),
+        ];
+        let candidate = CandidateView {
+            target: &t,
+            matches: &matches,
+            load: LoadSample::default(),
+            prefill_tokens: None,
+            input_tokens: 160, // 10 blocks at block_size 16
+        };
+        // 3 device + 3*0.8 host + 3*0.6 external = 3 + 2.4 + 1.8 = 7.2 blocks
+        // = 115.2 tokens; ptoken = ceil(160 - 115.2) = ceil(44.8) = 45.
+        assert_eq!(
+            cost_components(&candidate, &CostParams::default()).ptoken,
+            45
+        );
+    }
+
+    #[test]
+    fn chained_walk_stops_at_first_uncovered_position() {
+        // The chain stops at the first position no tier covers: host [3,6)
+        // then a gap before external [8,10) — external is not reached.
+        let t = target("w", 0);
+        let matches = vec![
+            tier_match(&t, StorageTier::Device, &[(0, 3)]),
+            tier_match(&t, StorageTier::HostPinned, &[(3, 6)]),
+            tier_match(&t, StorageTier::External, &[(8, 10)]),
+        ];
+        let candidate = CandidateView {
+            target: &t,
+            matches: &matches,
+            load: LoadSample::default(),
+            prefill_tokens: None,
+            input_tokens: 160,
+        };
+        // 3 device + 3*0.8 host = 5.4 blocks = 86.4 tokens;
+        // ptoken = ceil(160 - 86.4) = ceil(73.6) = 74.
+        assert_eq!(
+            cost_components(&candidate, &CostParams::default()).ptoken,
+            74
         );
     }
 
@@ -3341,10 +4263,8 @@ mod tests {
 
     #[test]
     fn affinity_releases_reference_without_slot_manager() {
-        let policy = KvAwarePolicy {
-            slot_manager: None,
-            ..KvAwarePolicy::default()
-        };
+        let mut policy = KvAwarePolicy::default();
+        policy.slot_manager = None;
         let table = policy.affinity.clone();
         let workers = registered_worker_pair(&policy);
         let key = affinity_key("session-a");
@@ -3592,7 +4512,7 @@ mod tests {
             hits: Vec<TierMatch>,
         }
         impl TieredMatchProvider for Matches {
-            fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
+            fn find_tiered_matches(&self, _: &MatchQuery<'_>) -> Vec<TierMatch> {
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 self.hits.clone()
             }
@@ -3658,7 +4578,7 @@ mod tests {
             AtomicUsize,
         );
         impl TieredMatchProvider for QueryBlocks {
-            fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
+            fn find_tiered_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch> {
                 self.0.store(query.local_hashes.len(), Ordering::Relaxed);
                 self.2.fetch_add(1, Ordering::Relaxed);
                 if let Some(mutate) = self.1.lock().as_mut() {
@@ -4041,5 +4961,583 @@ mod tests {
                     as Arc<dyn Worker>
             })
             .collect()
+    }
+
+    #[test]
+    fn conductor_mode_maps_hits_by_instance_id_not_order() {
+        /// Returns hits in an order deliberately different from worker
+        /// registration order, so a position-based mapper would mis-assign them.
+        #[derive(Default)]
+        struct ShuffledProvider(HashMap<String, Vec<TierMatch>>);
+        impl TieredMatchProvider for ShuffledProvider {
+            fn find_tiered_matches(&self, _query: &MatchQuery<'_>) -> Vec<TierMatch> {
+                let mut out: Vec<TierMatch> = self.0.values().flatten().cloned().collect();
+                // Reverse by instance_id so w2 surfaces first, w0 second — the
+                // opposite of registration order (w0, w1, w2).
+                out.sort_by(|a, b| b.target.instance_id.cmp(&a.target.instance_id));
+                out
+            }
+        }
+
+        let mut policy = KvAwarePolicy::new_with_conductor(
+            CostParams {
+                block_size: 2,
+                ..CostParams::default()
+            },
+            crate::policies::ConductorOptions {
+                url: "http://127.0.0.1:1".into(),
+                connect_timeout: std::time::Duration::from_millis(10),
+                query_timeout: std::time::Duration::from_millis(10),
+                register_timeout: std::time::Duration::from_millis(10),
+                hash_profile: Default::default(),
+                circuit_breaker: None,
+                heartbeat_secs: 0,
+            },
+            true,
+        );
+        let mut map = HashMap::new();
+        map.insert(
+            "w2".into(),
+            vec![tier_match(&target("w2", 0), StorageTier::Device, &[(0, 4)])],
+        );
+        map.insert(
+            "w0".into(),
+            vec![tier_match(&target("w0", 0), StorageTier::Device, &[(0, 2)])],
+        );
+        policy.matches = Arc::new(ShuffledProvider(map));
+
+        let key = CacheKey {
+            model: Arc::from("model-a"),
+            hash_mode: crate::kv_index::HashMode::Sha256,
+            block_size: 2,
+        };
+        // All three workers share one cache identity (single Conductor tree).
+        for (url, name) in [
+            ("http://w0", "w0"),
+            ("http://w1", "w1"),
+            ("http://w2", "w2"),
+        ] {
+            policy.register_target_with_cache_identity(
+                url,
+                target(name, 0),
+                key.clone(),
+                Arc::new(crate::kv_index::KvBlockIndexer::new()),
+            );
+        }
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new("http://w0".into(), WorkerType::Regular)),
+            Arc::new(BasicWorker::new("http://w1".into(), WorkerType::Regular)),
+            Arc::new(BasicWorker::new("http://w2".into(), WorkerType::Regular)),
+        ];
+        for w in &workers {
+            w.increment_load();
+        }
+
+        // 8 tokens = 4 blocks. w2 has all 4 device blocks -> zero work.
+        let receipt = policy
+            .select_worker_with_receipt(
+                &workers,
+                Some(&[1, 2, 3, 4, 5, 6, 7, 8]),
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(receipt.worker_index, 2);
+        assert_eq!(receipt.decision.target, target("w2", 0));
+    }
+
+    fn conductor_policy(matches: Arc<dyn TieredMatchProvider>) -> KvAwarePolicy {
+        let mut policy = KvAwarePolicy::new_with_conductor(
+            CostParams {
+                block_size: 2,
+                ..CostParams::default()
+            },
+            crate::policies::ConductorOptions {
+                url: "http://127.0.0.1:1".into(),
+                connect_timeout: std::time::Duration::from_millis(10),
+                query_timeout: std::time::Duration::from_millis(10),
+                register_timeout: std::time::Duration::from_millis(10),
+                hash_profile: Default::default(),
+                circuit_breaker: None,
+                heartbeat_secs: 0,
+            },
+            true,
+        );
+        policy.matches = matches;
+        policy
+    }
+
+    #[test]
+    fn conductor_skips_query_without_a_cache_identity() {
+        struct Panics;
+        impl TieredMatchProvider for Panics {
+            fn find_tiered_matches(&self, _query: &MatchQuery<'_>) -> Vec<TierMatch> {
+                panic!("must not query Conductor without a cache identity")
+            }
+        }
+
+        let policy = conductor_policy(Arc::new(Panics));
+        // `register_target` has no cache identity, so `model_id` is absent.
+        policy.register_target("http://w0", target("w0", 0));
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://w0".into(),
+            WorkerType::Regular,
+        ))];
+
+        let receipt = policy
+            .select_worker_with_receipt(&workers, Some(&[1, 2, 3, 4]), None, None, None, &[])
+            .expect("selection still falls back to load scoring");
+        assert_eq!(receipt.worker_index, 0);
+    }
+
+    #[test]
+    fn conductor_queries_salted_requests() {
+        struct Counts(AtomicUsize);
+        impl TieredMatchProvider for Counts {
+            fn find_tiered_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(
+                    query.request.as_ref().and_then(|r| r.cache_salt.as_deref()),
+                    Some("tenant-a")
+                );
+                Vec::new()
+            }
+        }
+
+        let counts = Arc::new(Counts(AtomicUsize::new(0)));
+        let policy = conductor_policy(counts.clone());
+        let key = CacheKey {
+            model: Arc::from("model-a"),
+            hash_mode: crate::kv_index::HashMode::Sha256,
+            block_size: 2,
+        };
+        policy.register_target_with_cache_identity(
+            "http://w0",
+            target("w0", 0),
+            key,
+            Arc::new(crate::kv_index::KvBlockIndexer::new()),
+        );
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://w0".into(),
+            WorkerType::Regular,
+        ))];
+
+        // The salted short-circuit belongs to the local indexer only; Conductor
+        // models `cache_salt` in its hash chain, so it must still be queried.
+        policy
+            .select_worker_with_receipt(
+                &workers,
+                Some(&[1, 2, 3, 4]),
+                None,
+                Some("tenant-a"),
+                None,
+                &[],
+            )
+            .expect("selection succeeds");
+        assert_eq!(counts.0.load(Ordering::Relaxed), 1);
+    }
+
+    /// Registrar that records every control-path call, so a test can assert what
+    /// Conductor was told.
+    #[derive(Debug, Default)]
+    struct RecordingRegistrar {
+        registers: Mutex<Vec<String>>,
+        unregisters: Mutex<Vec<(String, Vec<u32>)>>,
+    }
+
+    impl crate::policies::ConductorRegistrar for RecordingRegistrar {
+        fn register_worker(&self, info: &WorkerKvInfo) -> Result<(), String> {
+            self.registers.lock().push(info.instance_id.clone());
+            Ok(())
+        }
+
+        fn unregister_worker(&self, instance_id: &str, dp_ranks: &[u32]) -> Result<(), String> {
+            self.unregisters
+                .lock()
+                .push((instance_id.to_string(), dp_ranks.to_vec()));
+            Ok(())
+        }
+    }
+
+    impl TieredMatchProvider for RecordingRegistrar {
+        fn find_tiered_matches(&self, _query: &MatchQuery<'_>) -> Vec<TierMatch> {
+            Vec::new()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncTieredMatchProvider for RecordingRegistrar {
+        async fn find_tiered_matches_async(
+            &self,
+            _query: &MatchQuery<'_>,
+        ) -> Result<Vec<TierMatch>, MatchError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn registrar_info() -> WorkerKvInfo {
+        WorkerKvInfo {
+            instance_id: "engine-0".into(),
+            block_size: Some(2),
+            sources: vec![crate::kv_index::KvSourceEndpoint {
+                dp_rank: 0,
+                pub_endpoint: "tcp://w0:5557".into(),
+                replay_endpoint: None,
+            }],
+            ..WorkerKvInfo::default()
+        }
+    }
+
+    /// A heartbeat renewal must never re-register a worker that was removed
+    /// between the renewal's snapshot and its `/register` call: the stale
+    /// Conductor subscription would have no local entry left to clean it up, and
+    /// it can block a replacement reusing the same endpoint.
+    #[test]
+    fn renewal_cannot_resurrect_a_removed_worker() {
+        let registrar = Arc::new(RecordingRegistrar::default());
+        let policy = KvAwarePolicy::from_conductor_provider(
+            CostParams {
+                block_size: 2,
+                ..CostParams::default()
+            },
+            registrar.clone(),
+            None,
+            0,    // heartbeat_secs: renewals are driven by hand
+            true, // register_enabled
+        );
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://w0".into(), WorkerType::Regular));
+        let info = registrar_info();
+        let url = worker.url().to_string();
+
+        policy.register_worker(worker.as_ref(), Some(&info), None);
+        assert_eq!(registrar.registers.lock().len(), 1);
+
+        policy.unregister_worker(&url);
+        assert_eq!(registrar.unregisters.lock().len(), 1);
+        assert!(policy.registered.lock().is_empty());
+
+        // The ordering the heartbeat used to allow: the membership snapshot was
+        // taken while the worker was still registered, then the removal
+        // completed. The renewal must now be a no-op.
+        assert!(
+            renew_registration(
+                &policy.registration_gate,
+                registrar.as_ref(),
+                &policy.registered,
+                &url,
+                None,
+            )
+            .is_none(),
+            "a removed worker must not be renewed"
+        );
+        assert_eq!(
+            registrar.registers.lock().len(),
+            1,
+            "the removal must not be undone by a later renewal"
+        );
+
+        // Complement: when the renewal wins the race, the removal's
+        // `/unregister` still covers the ranks that were just registered.
+        policy.register_worker(worker.as_ref(), Some(&info), None);
+        assert!(
+            renew_registration(
+                &policy.registration_gate,
+                registrar.as_ref(),
+                &policy.registered,
+                &url,
+                None,
+            )
+            .is_some_and(|sent| sent.is_ok()),
+            "a live worker is renewed"
+        );
+        assert_eq!(registrar.registers.lock().len(), 3);
+        policy.unregister_worker(&url);
+        let (instance_id, ranks) = registrar.unregisters.lock()[1].clone();
+        assert_eq!((instance_id.as_str(), ranks), ("engine-0", vec![0]));
+    }
+
+    /// Provider whose `try_` outcome is controllable, counting every call.
+    struct CountingProvider {
+        calls: AtomicUsize,
+        outcome: Option<MatchError>,
+    }
+
+    impl CountingProvider {
+        fn new(outcome: Option<MatchError>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                outcome,
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl TieredMatchProvider for CountingProvider {
+        fn find_tiered_matches(&self, _query: &MatchQuery<'_>) -> Vec<TierMatch> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
+        }
+
+        fn try_find_tiered_matches(
+            &self,
+            _query: &MatchQuery<'_>,
+        ) -> Result<Vec<TierMatch>, MatchError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match self.outcome {
+                Some(error) => Err(error),
+                None => Ok(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncTieredMatchProvider for CountingProvider {
+        async fn find_tiered_matches_async(
+            &self,
+            query: &MatchQuery<'_>,
+        ) -> Result<Vec<TierMatch>, MatchError> {
+            self.try_find_tiered_matches(query)
+        }
+    }
+
+    fn empty_query() -> MatchQuery<'static> {
+        MatchQuery {
+            group_idx: 0,
+            local_hashes: Vec::new(),
+            tiers_of_interest: Vec::new(),
+            request: None,
+        }
+    }
+
+    #[test]
+    fn breaker_half_open_failure_reopens() {
+        let inner = CountingProvider::new(Some(MatchError::Unavailable));
+        let breaker = CircuitBreakerMatchProvider::new(
+            inner.clone(),
+            CircuitBreakerConfig {
+                max_failures: 1,
+                cooldown: Duration::from_millis(40),
+                half_open_max: 1,
+            },
+        );
+        let q = empty_query();
+        // Failure opens the circuit.
+        breaker.find_tiered_matches(&q);
+        assert_eq!(inner.calls(), 1);
+        // Open: short-circuited.
+        breaker.find_tiered_matches(&q);
+        assert_eq!(inner.calls(), 1);
+        // After cooldown the half-open probe runs and fails -> re-open.
+        std::thread::sleep(Duration::from_millis(60));
+        breaker.find_tiered_matches(&q);
+        assert_eq!(inner.calls(), 2);
+        breaker.find_tiered_matches(&q);
+        assert_eq!(inner.calls(), 2);
+    }
+
+    #[test]
+    fn breaker_does_not_open_on_rejected() {
+        // A 4xx means the backend is alive; it must not disable placement for
+        // every model.
+        let inner = CountingProvider::new(Some(MatchError::Rejected));
+        let breaker = CircuitBreakerMatchProvider::new(
+            inner.clone(),
+            CircuitBreakerConfig {
+                max_failures: 1,
+                cooldown: Duration::from_secs(60),
+                half_open_max: 1,
+            },
+        );
+        let q = empty_query();
+        for _ in 0..3 {
+            breaker.find_tiered_matches(&q);
+        }
+        assert_eq!(inner.calls(), 3);
+    }
+
+    #[test]
+    fn breaker_never_trips_for_providers_without_try_override() {
+        // `try_` defaults to `Ok(find(...))`, so a provider that only
+        // implements `find_tiered_matches` can never look unhealthy. Pinned
+        // here so a future provider split does not assume otherwise.
+        struct OnlyFind(AtomicUsize);
+        impl TieredMatchProvider for OnlyFind {
+            fn find_tiered_matches(&self, _query: &MatchQuery<'_>) -> Vec<TierMatch> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Vec::new()
+            }
+        }
+        #[async_trait::async_trait]
+        impl AsyncTieredMatchProvider for OnlyFind {
+            async fn find_tiered_matches_async(
+                &self,
+                query: &MatchQuery<'_>,
+            ) -> Result<Vec<TierMatch>, MatchError> {
+                Ok(self.find_tiered_matches(query))
+            }
+        }
+        let inner = Arc::new(OnlyFind(AtomicUsize::new(0)));
+        let breaker = CircuitBreakerMatchProvider::new(
+            inner.clone(),
+            CircuitBreakerConfig {
+                max_failures: 1,
+                cooldown: Duration::from_secs(60),
+                half_open_max: 1,
+            },
+        );
+        let q = empty_query();
+        for _ in 0..3 {
+            breaker.find_tiered_matches(&q);
+        }
+        assert_eq!(inner.0.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn breaker_zero_budgets_are_clamped() {
+        // max_failures=0 / half_open_max=0 would otherwise open on the first
+        // request and never let a probe through. The constructor clamps both.
+        let inner = CountingProvider::new(Some(MatchError::Unavailable));
+        let breaker = CircuitBreakerMatchProvider::new(
+            inner.clone(),
+            CircuitBreakerConfig {
+                max_failures: 0,
+                cooldown: Duration::from_millis(40),
+                half_open_max: 0,
+            },
+        );
+        let q = empty_query();
+        breaker.find_tiered_matches(&q);
+        assert_eq!(inner.calls(), 1);
+        std::thread::sleep(Duration::from_millis(60));
+        // A probe must be allowed despite half_open_max=0.
+        breaker.find_tiered_matches(&q);
+        assert_eq!(inner.calls(), 2);
+    }
+
+    /// Minimal HTTP stub that counts requests and always answers 200 with an
+    /// empty body (so `/services` decode fails and the heartbeat falls back to
+    /// a blind re-register, which is what we want to observe here).
+    fn spawn_stub_server() -> (String, Arc<AtomicUsize>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(mut stream) = incoming else {
+                    continue;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                counter.fetch_add(1, Ordering::Relaxed);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        (format!("http://{addr}"), count)
+    }
+
+    fn test_worker_info() -> crate::kv_index::WorkerKvInfo {
+        crate::kv_index::WorkerKvInfo {
+            instance_id: "inst-0".into(),
+            block_size: Some(4),
+            ranks: vec![0],
+            sources: vec![crate::kv_index::discovery::KvSourceEndpoint {
+                dp_rank: 0,
+                pub_endpoint: "tcp://127.0.0.1:5557".into(),
+                replay_endpoint: None,
+            }],
+            cache_key: Some(CacheKey {
+                model: Arc::from("model-a"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size: 4,
+            }),
+        }
+    }
+
+    #[test]
+    fn heartbeat_renews_and_unregister_removes_every_rank() {
+        let (url, count) = spawn_stub_server();
+        let policy = KvAwarePolicy::new_with_conductor(
+            CostParams::default(),
+            crate::policies::ConductorOptions {
+                url,
+                connect_timeout: Duration::from_millis(100),
+                query_timeout: Duration::from_millis(100),
+                register_timeout: Duration::from_millis(100),
+                hash_profile: crate::config::types::ConductorHashProfile {
+                    python_hash_seed: Some("1".into()),
+                    ..Default::default()
+                },
+                circuit_breaker: None,
+                heartbeat_secs: 1,
+            },
+            true,
+        );
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://w0".into(), WorkerType::Regular));
+        let info = test_worker_info();
+        kv_aware_ops(&policy)
+            .unwrap()
+            .register_worker(worker.as_ref(), Some(&info), None);
+        let after_register = count.load(Ordering::Relaxed);
+        assert_eq!(after_register, 1);
+
+        std::thread::sleep(Duration::from_millis(1300));
+        assert!(
+            count.load(Ordering::Relaxed) > after_register,
+            "heartbeat must renew the registration"
+        );
+
+        let before_unregister = count.load(Ordering::Relaxed);
+        kv_aware_ops(&policy)
+            .unwrap()
+            .unregister_worker("http://w0");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            before_unregister + 1,
+            "every registered source rank must be unregistered"
+        );
+    }
+
+    #[test]
+    fn heartbeat_is_disabled_when_registration_is_external() {
+        let (url, count) = spawn_stub_server();
+        let policy = KvAwarePolicy::new_with_conductor(
+            CostParams::default(),
+            crate::policies::ConductorOptions {
+                url,
+                connect_timeout: Duration::from_millis(100),
+                query_timeout: Duration::from_millis(100),
+                register_timeout: Duration::from_millis(100),
+                hash_profile: crate::config::types::ConductorHashProfile {
+                    python_hash_seed: Some("1".into()),
+                    ..Default::default()
+                },
+                circuit_breaker: None,
+                heartbeat_secs: 1,
+            },
+            false,
+        );
+        // Registration is owned elsewhere: the policy must neither call
+        // Conductor nor remember the worker for a heartbeat.
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://w0".into(), WorkerType::Regular));
+        let info = test_worker_info();
+        kv_aware_ops(&policy)
+            .unwrap()
+            .register_worker(worker.as_ref(), Some(&info), None);
+        std::thread::sleep(Duration::from_millis(1300));
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert!(policy.registered.lock().is_empty());
     }
 }

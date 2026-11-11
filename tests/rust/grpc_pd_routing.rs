@@ -635,13 +635,18 @@ async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
                 )
             })
             .collect();
-        let policy = PolicyConfig::KvAware {
+        let policy = PolicyConfig::KvAware(Box::new(vllm_router_rs::config::KvAwareConfig {
             router_temperature: 0.0,
             kv_penalty_host: 0.8,
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.4,
             static_kv_event_sources: Default::default(),
-        };
+            kv_index_backend: "local".to_string(),
+            conductor_url: None,
+            conductor_query_timeout_ms: 10,
+            conductor_hash_profile: None,
+            ..vllm_router_rs::config::KvAwareConfig::default()
+        }));
         let router =
             pd_router_with_kv_sources(&[&prefills[0], &prefills[1]], &decode, 1, policy, sources)
                 .await;

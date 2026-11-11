@@ -66,12 +66,8 @@ impl AppContext {
         rate_limit_tokens_per_second: Option<usize>,
         api_key_validation_urls: Vec<String>,
     ) -> Result<Self, String> {
-        if let crate::config::PolicyConfig::KvAware {
-            static_kv_event_sources,
-            ..
-        } = &router_config.policy
-        {
-            for (worker, source) in static_kv_event_sources.iter() {
+        if let crate::config::PolicyConfig::KvAware(config) = &router_config.policy {
+            for (worker, source) in config.static_kv_event_sources.iter() {
                 source.validate(worker).map_err(|error| error.to_string())?;
             }
         }
@@ -1470,13 +1466,18 @@ mod tests {
             .unwrap();
         });
         let config = RouterConfig {
-            policy: crate::config::PolicyConfig::KvAware {
+            policy: crate::config::PolicyConfig::KvAware(Box::new(crate::config::KvAwareConfig {
                 router_temperature: 0.0,
                 kv_penalty_host: 0.3,
                 kv_penalty_external: 0.05,
                 kv_penalty_disk: 0.01,
                 static_kv_event_sources: Default::default(),
-            },
+                kv_index_backend: "local".to_string(),
+                conductor_url: None,
+                conductor_query_timeout_ms: 10,
+                conductor_hash_profile: None,
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let context = Arc::new(

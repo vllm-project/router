@@ -58,12 +58,26 @@ pub struct KvEventSourceEntry {
 /// /kv_event_sources body: a JSON object keyed by DP rank (as string).
 pub type KvEventSourcesResponse = HashMap<String, KvEventSourceEntry>;
 
+/// One resolved ZMQ endpoint per DP rank, used to register the worker with an
+/// external index (e.g. Mooncake Conductor) that subscribes to KV events.
+#[derive(Debug, Clone, Default)]
+pub struct KvSourceEndpoint {
+    pub dp_rank: u32,
+    /// Resolved PUB (publish) endpoint Conductor connects to.
+    pub pub_endpoint: String,
+    /// Resolved ROUTER (replay) endpoint, when the engine exposes one.
+    pub replay_endpoint: Option<String>,
+}
+
 /// What on_worker_added learned and spawned.
 #[derive(Debug, Clone, Default)]
 pub struct WorkerKvInfo {
     pub instance_id: String,
     pub block_size: Option<u32>,
     pub ranks: Vec<u32>,
+    /// Resolved per-rank ZMQ endpoints (empty when discovery could not reach
+    /// /kv_event_sources or KV events are disabled).
+    pub sources: Vec<KvSourceEndpoint>,
     /// Cache identity shared by every worker feeding the same placement index.
     /// Absent when discovery cannot create an index for this worker.
     pub cache_key: Option<CacheKey>,
@@ -331,6 +345,7 @@ impl KvIndexSupervisor {
                     instance_id,
                     block_size,
                     ranks: vec![],
+                    sources: vec![],
                     cache_key: None,
                 });
             }
@@ -346,6 +361,7 @@ impl KvIndexSupervisor {
                 instance_id,
                 block_size: None,
                 ranks: vec![],
+                sources: vec![],
                 cache_key: None,
             });
         };
@@ -354,6 +370,7 @@ impl KvIndexSupervisor {
                 instance_id,
                 block_size: Some(block_size),
                 ranks: vec![],
+                sources: vec![],
                 cache_key: None,
             });
         };
@@ -366,6 +383,7 @@ impl KvIndexSupervisor {
         let source_id: SourceId = Arc::from(instance_id.as_str());
         let mut event_sources = Vec::with_capacity(sources.len());
         let mut normalized_ranks = HashSet::new();
+        let mut source_endpoints = Vec::with_capacity(sources.len());
 
         for (rank_str, entry) in &sources {
             if !events_enabled(entry) {
@@ -383,6 +401,11 @@ impl KvIndexSupervisor {
                 .map(|e| resolve_endpoint(e, &worker_host))
                 .transpose()
                 .map_err(|error| format!("invalid KV replay endpoint: {error}"))?;
+            source_endpoints.push(KvSourceEndpoint {
+                dp_rank: rank,
+                pub_endpoint: pub_endpoint.clone(),
+                replay_endpoint: replay_endpoint.clone(),
+            });
             let ev = EventSource {
                 source: source_id.clone(),
                 dp_rank: rank,
@@ -542,6 +565,7 @@ impl KvIndexSupervisor {
             instance_id,
             block_size: Some(block_size),
             ranks,
+            sources: source_endpoints,
             cache_key: Some(key),
         })
     }
@@ -1723,11 +1747,12 @@ mod tests {
         rmp_serde::to_vec(&(1.0, [stored_block(hash, tokens, block_size, medium)], rank)).unwrap()
     }
 
-    fn block_query(tokens: &[u32], block_size: u32, tiers: &[StorageTier]) -> MatchQuery {
+    fn block_query(tokens: &[u32], block_size: u32, tiers: &[StorageTier]) -> MatchQuery<'static> {
         MatchQuery {
             group_idx: 0,
             local_hashes: crate::kv_index::local_block_hash_strings(tokens, block_size, None),
             tiers_of_interest: tiers.to_vec(),
+            request: None,
         }
     }
 

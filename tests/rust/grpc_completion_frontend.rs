@@ -23,13 +23,18 @@ async fn grpc_prefix_selection_uses_the_ids_actually_dispatched() {
     let warm = common::mock_vllm_rs::MockVllmRsServer::spawn().await;
     let cold = common::mock_vllm_rs::MockVllmRsServer::spawn().await;
     let config = RouterConfig {
-        policy: PolicyConfig::KvAware {
+        policy: PolicyConfig::KvAware(Box::new(vllm_router_rs::config::KvAwareConfig {
             router_temperature: 0.0,
             kv_penalty_host: 0.8,
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.3,
             static_kv_event_sources: Default::default(),
-        },
+            kv_index_backend: "local".to_string(),
+            conductor_url: None,
+            conductor_query_timeout_ms: 10,
+            conductor_hash_profile: None,
+            ..vllm_router_rs::config::KvAwareConfig::default()
+        })),
         disable_circuit_breaker: true,
         ..Default::default()
     };

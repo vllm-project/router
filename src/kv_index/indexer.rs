@@ -8,18 +8,21 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::RwLock;
 
 use crate::kv_index::types::{
-    ClearScope, Locality, ResidencyOwner, RoutableTarget, SourceId, StorageTier,
+    ClearScope, Locality, MatchRequest, ResidencyOwner, RoutableTarget, SourceId, StorageTier,
 };
 
 /// One request's query against the index.
 #[derive(Debug, Clone)]
-pub struct MatchQuery {
+pub struct MatchQuery<'a> {
     /// kv-cache-spec group to query — selects the shard within the indexer.
     pub group_idx: u32,
     /// Block-local hashes, walked from the shard root in prefix order.
     pub local_hashes: Vec<Arc<str>>,
     /// Tiers to report; the cost model requests the tiers it scores.
     pub tiers_of_interest: Vec<StorageTier>,
+    /// Optional request identity. The in-process indexer ignores it (it hashes
+    /// the blocks itself); an external provider (e.g. Conductor) consumes it.
+    pub request: Option<MatchRequest<'a>>,
 }
 
 /// One hit: the block intervals `[start, end)` a target holds at this tier,
@@ -159,6 +162,13 @@ impl GroupShard {
         parent_seq: Option<Arc<str>>,
         blocks: &[IncomingBlock],
     ) {
+        tracing::debug!(
+            ?owner,
+            ?tier,
+            has_parent = parent_seq.is_some(),
+            nblocks = blocks.len(),
+            "kv_index: store"
+        );
         let key = (owner, tier);
         // An unknown ancestor cannot be replaced by root: block-local hashes
         // do not prove that this suffix is a stand-alone request prefix.
@@ -408,7 +418,7 @@ impl GroupShard {
     /// per-position `(owner, tier)` claims along the matched prefix; the
     /// collapse below builds maximal `[start, end)` segments from them. Each
     /// edge element's claims are the claims of the node that edge belongs to.
-    pub fn find_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
+    pub fn find_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch> {
         let mut node_claims: Vec<Vec<OwnerTier>> = Vec::with_capacity(query.local_hashes.len());
         let mut qi = 0; // index into query.local_hashes
         let mut next = query
@@ -583,7 +593,7 @@ impl KvBlockIndexer {
         self.source_generation.load(Ordering::Acquire)
     }
 
-    pub fn find_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
+    pub fn find_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch> {
         let generation = self.source_generation.load(Ordering::Acquire);
         let matches = self.shard(query.group_idx).find_matches(query);
         let matches = matches
@@ -608,7 +618,7 @@ impl Default for KvBlockIndexer {
 }
 
 impl crate::policies::TieredMatchProvider for KvBlockIndexer {
-    fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
+    fn find_tiered_matches(&self, query: &MatchQuery<'_>) -> Vec<TierMatch> {
         self.find_matches(query)
     }
 }
@@ -644,19 +654,25 @@ mod tests {
         }
     }
 
-    fn query(hashes: &[&str], tiers: &[StorageTier]) -> MatchQuery {
+    fn query<'a>(hashes: &'a [&'a str], tiers: &'a [StorageTier]) -> MatchQuery<'a> {
         MatchQuery {
             group_idx: 0,
             local_hashes: hashes.iter().map(|h| Arc::<str>::from(*h)).collect(),
             tiers_of_interest: tiers.to_vec(),
+            request: None,
         }
     }
 
-    fn query_group(group: u32, hashes: &[&str], tiers: &[StorageTier]) -> MatchQuery {
+    fn query_group<'a>(
+        group: u32,
+        hashes: &'a [&'a str],
+        tiers: &'a [StorageTier],
+    ) -> MatchQuery<'a> {
         MatchQuery {
             group_idx: group,
             local_hashes: hashes.iter().map(|h| Arc::<str>::from(*h)).collect(),
             tiers_of_interest: tiers.to_vec(),
+            request: None,
         }
     }
 

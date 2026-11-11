@@ -223,6 +223,85 @@ struct CliArgs {
     #[arg(long, default_value_t = 0.3)]
     kv_penalty_disk: f64,
 
+    /// KV-placement index backend for kv_aware: `local` (built-in event-driven
+    /// indexer, default) or `conductor` (external Mooncake Conductor).
+    #[arg(long, value_parser = ["local", "conductor"], default_value_t = String::from("local"))]
+    kv_index_backend: String,
+
+    /// Conductor HTTP base URL (e.g. http://127.0.0.1:13333) for the
+    /// `conductor` kv_index_backend.
+    #[arg(long)]
+    conductor_url: Option<String>,
+
+    /// Conductor transport: `http` (HTTP+msgpack) or `coro-rpc` (Mooncake
+    /// native RPC; requires a build with the `conductor-rpc` feature).
+    #[arg(long, value_parser = ["http", "coro-rpc"], default_value = "http")]
+    conductor_transport: String,
+
+    /// `host:port` of Conductor's coro_rpc channel when
+    /// `--conductor-transport=coro-rpc` (Conductor `rpc_server_port`).
+    #[arg(long, default_value = "127.0.0.1:13334")]
+    conductor_rpc_addr: String,
+
+    /// Disable router-driven Conductor registration (an operator or sidecar
+    /// manages registrations instead). Registration is on by default.
+    #[arg(long)]
+    no_conductor_register: bool,
+
+    /// TCP connect timeout (ms) for the Conductor HTTP clients.
+    #[arg(long, default_value_t = 100)]
+    conductor_connect_timeout_ms: u64,
+
+    /// Per-query timeout (ms) for the Conductor placement provider. This call
+    /// sits on the request path, so keep it small.
+    #[arg(long, default_value_t = 10)]
+    conductor_query_timeout_ms: u64,
+
+    /// Per-register/unregister timeout (ms). Control path only; can be much
+    /// larger than the query budget.
+    #[arg(long, default_value_t = 1000)]
+    conductor_register_timeout_ms: u64,
+
+    /// Disable the circuit breaker around Conductor `/query`. It is enabled by
+    /// default so a hung Conductor cannot add its timeout to every request.
+    #[arg(long)]
+    no_conductor_circuit_breaker: bool,
+
+    /// Consecutive Conductor `/query` failures that open the circuit.
+    #[arg(long, default_value_t = 3)]
+    conductor_circuit_breaker_max_failures: u32,
+
+    /// How long (ms) the circuit stays open before a half-open probe.
+    #[arg(long, default_value_t = 5000)]
+    conductor_circuit_breaker_cooldown_ms: u64,
+
+    /// Half-open probes allowed before re-opening. Must be > 0.
+    #[arg(long, default_value_t = 1)]
+    conductor_circuit_breaker_half_open_max: u32,
+
+    /// Heartbeat period (seconds) renewing dynamic registrations; 0 disables
+    /// it. Must be shorter than Conductor's register_lease_secs (default 30s).
+    #[arg(long, default_value_t = 10)]
+    conductor_heartbeat_secs: u64,
+
+    /// Engine hash strategy registered with Conductor (vllm_v1).
+    #[arg(long, default_value = "vllm_v1")]
+    conductor_hash_strategy: String,
+
+    /// Engine hash algorithm registered with Conductor (sha256, sha256_cbor).
+    #[arg(long, default_value = "sha256")]
+    conductor_hash_algorithm: String,
+
+    /// Digest-to-prefix-key projection registered with Conductor (low64_be).
+    #[arg(long, default_value = "low64_be")]
+    conductor_hash_index_projection: String,
+
+    /// Raw PYTHONHASHSEED the engine ran with ("random" or a decimal in
+    /// 0..=4294967295). Required for conductor until Conductor accepts an
+    /// absent seed (vLLM's "vllm-none-hash" default).
+    #[arg(long)]
+    conductor_hash_python_seed: Option<String>,
+
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
     max_payload_size: usize,
@@ -449,13 +528,37 @@ impl CliArgs {
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
             },
-            "kv_aware" => PolicyConfig::KvAware {
+            "kv_aware" => PolicyConfig::KvAware(Box::new(vllm_router_rs::config::KvAwareConfig {
                 router_temperature: self.router_temperature,
                 kv_penalty_host: self.kv_penalty_host,
                 kv_penalty_external: self.kv_penalty_external,
                 kv_penalty_disk: self.kv_penalty_disk,
                 static_kv_event_sources: Box::default(),
-            },
+                kv_index_backend: self.kv_index_backend.clone(),
+                conductor_url: self.conductor_url.clone(),
+                conductor_transport: self.conductor_transport.clone(),
+                conductor_rpc_addr: self.conductor_rpc_addr.clone(),
+                conductor_register: !self.no_conductor_register,
+                conductor_connect_timeout_ms: self.conductor_connect_timeout_ms,
+                conductor_query_timeout_ms: self.conductor_query_timeout_ms,
+                conductor_register_timeout_ms: self.conductor_register_timeout_ms,
+                conductor_circuit_breaker: if self.no_conductor_circuit_breaker {
+                    None
+                } else {
+                    Some(vllm_router_rs::config::ConductorCircuitBreakerConfig {
+                        max_failures: self.conductor_circuit_breaker_max_failures,
+                        cooldown_ms: self.conductor_circuit_breaker_cooldown_ms,
+                        half_open_max: self.conductor_circuit_breaker_half_open_max,
+                    })
+                },
+                conductor_heartbeat_secs: self.conductor_heartbeat_secs,
+                conductor_hash_profile: Some(vllm_router_rs::config::ConductorHashProfile {
+                    strategy: self.conductor_hash_strategy.clone(),
+                    algorithm: self.conductor_hash_algorithm.clone(),
+                    index_projection: self.conductor_hash_index_projection.clone(),
+                    python_hash_seed: self.conductor_hash_python_seed.clone(),
+                }),
+            })),
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5, // Default value
             },
@@ -483,6 +586,26 @@ impl CliArgs {
             self.kv_event_block_size,
             self.kv_event_model.as_deref(),
         )?;
+        // RFC #414 §6: the `--conductor-*` / `--kv-index-backend` options are
+        // rejected unless the policy is `kv_aware`, instead of being silently
+        // ignored (which looks like they took effect).
+        if !self.policy.eq_ignore_ascii_case("kv_aware")
+            && (self.kv_index_backend != "local"
+                || self.conductor_url.is_some()
+                || self.conductor_hash_python_seed.is_some()
+                || self.no_conductor_register
+                || self.conductor_circuit_breaker_max_failures != 3
+                || self.conductor_circuit_breaker_cooldown_ms != 5000
+                || self.conductor_circuit_breaker_half_open_max != 1
+                || self.conductor_heartbeat_secs != 10
+                || self.conductor_transport != "http"
+                || self.conductor_rpc_addr != "127.0.0.1:13334")
+        {
+            return Err(vllm_router_rs::config::ConfigError::ValidationFailed {
+                reason: "conductor options require --policy kv_aware".to_string(),
+            });
+        }
+
         // Determine routing mode
         let mode = if self.enable_igw {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
@@ -563,12 +686,8 @@ impl CliArgs {
 
         // Main policy
         let mut policy = self.parse_policy(&self.policy);
-        if let PolicyConfig::KvAware {
-            static_kv_event_sources: configured,
-            ..
-        } = &mut policy
-        {
-            **configured = static_kv_event_sources;
+        if let PolicyConfig::KvAware(config) = &mut policy {
+            *config.static_kv_event_sources = static_kv_event_sources;
         } else if !static_kv_event_sources.is_empty() {
             return Err(ConfigError::IncompatibleConfig {
                 reason: "--kv-event-source requires --policy kv_aware in regular mode".to_string(),
@@ -890,6 +1009,32 @@ mod tests {
             args.wasm_middleware_routes,
             vec!["/v1/chat/completions", "/v1/completions"]
         );
+    }
+
+    #[test]
+    fn rejects_conductor_options_for_non_kv_aware_policies() {
+        // RFC #414 §6: these flags must not be silently ignored.
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--policy",
+            "round_robin",
+            "--kv-index-backend",
+            "conductor",
+            "--conductor-url",
+            "http://conductor:13333",
+        ])
+        .unwrap();
+        assert!(args.to_router_config(vec![]).is_err());
+
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--policy",
+            "round_robin",
+            "--conductor-hash-python-seed",
+            "1",
+        ])
+        .unwrap();
+        assert!(args.to_router_config(vec![]).is_err());
     }
 
     #[test]
