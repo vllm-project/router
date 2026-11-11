@@ -202,6 +202,15 @@ fn discovery_is_ready(prefill_count: usize, decode_count: usize) -> bool {
     prefill_count > 0 && decode_count > 0
 }
 
+/// Body a deferred commitment tokenizes for a Decode that was not admitted.
+///
+/// The encoder rewrites the request before dispatch, so the commitment scores
+/// the body the client sent. `None` means nothing rewrote it and the dispatched
+/// body is the client's.
+fn commit_scoring_body<'a>(client_request: Option<&'a Value>, encoded: &'a Value) -> &'a Value {
+    client_request.unwrap_or(encoded)
+}
+
 /// Whether a deferred commitment has to stay on the provisional Decode.
 ///
 /// Only Nixl can push: its engine reads the destination from the request id,
@@ -2307,7 +2316,7 @@ impl VllmPDRouter {
             );
             // Score the refresh against the client body, not the encoder
             // output; without EPD the two are the same value.
-            let request = client_request.as_ref().unwrap_or(&original_request);
+            let request = commit_scoring_body(client_request.as_ref(), &original_request);
             match self
                 .select_and_commit_decode(&attempt, commit, request, headers, pinned)
                 .await
@@ -5712,6 +5721,287 @@ mod tests {
             Some(&push),
             true
         ));
+    }
+
+    /// EPD rewrites the body before dispatch; a Decode that joins during
+    /// Prefill must still be scored from the messages the client sent.
+    #[tokio::test]
+    async fn test_epd_defer_scores_the_newcomer_from_the_client_body() {
+        use crate::config::{EpdConfig, PolicyConfig, RouterConfig, RoutingMode};
+        use axum::{
+            extract::State,
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::Mutex;
+        use tokio::sync::{mpsc, Semaphore};
+
+        use crate::routers::http::pd_types::Stage;
+
+        type Seen = Arc<Mutex<Vec<(String, Value)>>>;
+
+        fn record(seen: &Seen, path: &str, body: Value) {
+            seen.lock().unwrap().push((path.to_owned(), body));
+        }
+
+        #[derive(Clone)]
+        struct PrefillMock {
+            seen: Seen,
+            entered: mpsc::UnboundedSender<&'static str>,
+            gate: Arc<Semaphore>,
+        }
+
+        async fn prefill_render(State(s): State<PrefillMock>, Json(body): Json<Value>) -> Response {
+            record(&s.seen, "/render", body);
+            Json(json!({"token_ids": [1u32, 2, 3]})).into_response()
+        }
+
+        async fn prefill(State(s): State<PrefillMock>, Json(body): Json<Value>) -> Response {
+            record(&s.seen, "/v1/chat/completions", body);
+            s.entered.send("P").unwrap();
+            s.gate.acquire().await.unwrap().forget();
+            Json(json!({"kv_transfer_params": {
+                "transfer_id": "t1",
+                "remote_bootstrap_addr": "127.0.0.1:1234",
+                "remote_engine_id": "P",
+            }}))
+            .into_response()
+        }
+
+        #[derive(Clone)]
+        struct DecodeMock {
+            seen: Seen,
+        }
+
+        async fn decode_render(State(d): State<DecodeMock>, Json(body): Json<Value>) -> Response {
+            record(&d.seen, "/render", body);
+            Json(json!({"token_ids": [1u32, 2, 3]})).into_response()
+        }
+
+        async fn decode(State(d): State<DecodeMock>, Json(body): Json<Value>) -> Response {
+            record(&d.seen, "/v1/chat/completions", body);
+            Json(json!({"choices": [{"message": {"content": "A"}}]})).into_response()
+        }
+
+        #[derive(Clone)]
+        struct EncoderMock {
+            seen: Seen,
+        }
+
+        async fn encode(State(e): State<EncoderMock>, Json(body): Json<Value>) -> Response {
+            let uuid = body["messages"][0]["content"][0]["uuid"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            record(&e.seen, "/v1/chat/completions", body);
+            Json(json!({"ec_transfer_params": {uuid: {
+                "metadata": {"image_grid_thw": [[1, 2, 3]]},
+            }}}))
+            .into_response()
+        }
+
+        let gate = Arc::new(Semaphore::new(0));
+        let (entered, mut events) = mpsc::unbounded_channel();
+        let prefill_seen: Seen = Arc::default();
+        let d0_seen: Seen = Arc::default();
+        let d1_seen: Seen = Arc::default();
+        let encoder_seen: Seen = Arc::default();
+
+        let prefill_app = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            // Mooncake queries the Prefill bootstrap port for DP engine ids.
+            .route(
+                "/query",
+                get(|| async { Json(json!({"0": {"engine_id": "P0"}})) }),
+            )
+            .route("/v1/chat/completions/render", post(prefill_render))
+            .route("/v1/chat/completions", post(prefill))
+            .with_state(PrefillMock {
+                seen: prefill_seen.clone(),
+                entered,
+                gate: gate.clone(),
+            });
+        let encoder_app = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route("/v1/chat/completions", post(encode))
+            .with_state(EncoderMock {
+                seen: encoder_seen.clone(),
+            });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bootstrap_port = listener.local_addr().unwrap().port();
+        let p = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, prefill_app).await.unwrap() });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let encoder = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, encoder_app).await.unwrap() });
+
+        let mut decode_urls = Vec::new();
+        for seen in [d0_seen.clone(), d1_seen.clone()] {
+            let app = Router::new()
+                .route("/health", get(|| async { "ok" }))
+                .route("/v1/chat/completions/render", post(decode_render))
+                .route("/v1/chat/completions", post(decode))
+                .with_state(DecodeMock { seen });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            decode_urls.push(base);
+        }
+        let (d0, d1) = (decode_urls[0].clone(), decode_urls[1].clone());
+
+        let config = RouterConfig {
+            kv_connector: KvConnector::Mooncake,
+            policy: PolicyConfig::CacheAware {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 2,
+                balance_rel_threshold: 1.5,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            },
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(p.clone(), Some(bootstrap_port))],
+                decode_urls: vec![d0.clone()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            epd: Some(EpdConfig {
+                encoder_urls: vec![encoder],
+                consumer_zmq_addrs: Default::default(),
+            }),
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+        let ctx = Arc::new(
+            crate::server::AppContext::new(config, reqwest::Client::new(), 64, None, vec![])
+                .unwrap(),
+        );
+        let router = Arc::new(
+            VllmPDRouter::new(
+                vec![(p.clone(), Some(bootstrap_port))],
+                vec![d0.clone()],
+                None,
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let request = json!({
+            "model": "test",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+                    {"type": "text", "text": "describe"},
+                ],
+            }],
+        });
+        let request_router = router.clone();
+        let dispatched = tokio::spawn(async move {
+            request_router
+                .route_transparent(None, "/v1/chat/completions", &Method::POST, request)
+                .await
+        });
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .unwrap(),
+            Some("P")
+        );
+
+        // The newcomer appears while Prefill is still running. Admission must
+        // have left the Decode pool uncharged, otherwise there is no deferred
+        // commitment for the newcomer to join.
+        assert!(
+            router
+                .pd_router
+                .pd_load
+                .snapshot()
+                .keys()
+                .all(|(stage, _)| *stage != Stage::Decode),
+            "EPD on Mooncake must still defer"
+        );
+        router
+            .pd_router
+            .add_decode_server(d1.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            router.pd_router.worker_registry.get_decode_workers().len(),
+            2
+        );
+        gate.add_permits(1);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), dispatched)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let first_media = |body: &Value| {
+            body["messages"][0]["content"][0]["type"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        };
+
+        // The encoder ran once and the Prefill leg got the embeddings.
+        let encoded = encoder_seen.lock().unwrap();
+        assert_eq!(encoded.len(), 1);
+        assert_eq!(first_media(&encoded[0].1), "image_url");
+        drop(encoded);
+        let prefill_bodies = prefill_seen.lock().unwrap();
+        let prefill_body = prefill_bodies
+            .iter()
+            .find(|(path, _)| path == "/v1/chat/completions")
+            .map(|(_, body)| body)
+            .expect("prefill must run");
+        assert_eq!(first_media(prefill_body), "image_embeds");
+        assert!(prefill_body.get("ec_transfer_params").is_some());
+        drop(prefill_bodies);
+
+        // The Decode body still drops the EC reservations.
+        let mut answered = false;
+        for seen in [&d0_seen, &d1_seen] {
+            let bodies = seen.lock().unwrap();
+            for (path, body) in bodies
+                .iter()
+                .filter(|(path, _)| path == "/v1/chat/completions")
+            {
+                answered = true;
+                assert!(
+                    body.get("ec_transfer_params").is_none(),
+                    "{path} must not carry ec_transfer_params"
+                );
+            }
+        }
+        assert!(answered, "one Decode must serve the request");
+
+        // `http_cache_identity` rejects any non-text message part, so neither
+        // body can be tokenized for a multimodal request and the refresh has
+        // nothing to score. The commitment still hands it the client body:
+        // `commit_scoring_body` below keeps that choice explicit.
+        for seen in [&d0_seen, &d1_seen] {
+            assert!(seen
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(path, _)| path != "/render"));
+        }
+        let client = json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+        ]}]});
+        let encoded = json!({"messages": [{"role": "user", "content": [
+            {"type": "image_embeds", "image_embeds": {}},
+        ]}], "ec_transfer_params": {}});
+        let chosen = commit_scoring_body(Some(&client), &encoded);
+        assert_eq!(first_media(chosen), "image_url");
+        assert_eq!(
+            first_media(commit_scoring_body(None, &encoded)),
+            "image_embeds"
+        );
     }
 
     #[tokio::test]
