@@ -53,6 +53,126 @@ pub struct KvEventSourceEntry {
     pub schema_version: Option<u32>,
     #[serde(default)]
     pub enable_kv_cache_events: Option<bool>,
+    /// Peer KV lookup record, when the engine reports one. Unknown to older
+    /// routers (no `deny_unknown_fields`); a malformed object is kept as a
+    /// default entry so `validate` drops it with a warning instead of failing
+    /// the whole discovery response.
+    #[serde(default, deserialize_with = "lenient_peer_lookup")]
+    pub peer_lookup: Option<PeerLookupEntry>,
+}
+
+fn lenient_peer_lookup<'de, D>(deserializer: D) -> Result<Option<PeerLookupEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| serde_json::from_value(value).unwrap_or_default()))
+}
+
+/// The engine's per-rank `peer_lookup` object, exactly as reported. Untrusted:
+/// it names a host and port the router may later send traffic to, so it is only
+/// used after [`PeerLookupEntry::validate`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct PeerLookupEntry {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub engine_id: String,
+    #[serde(default)]
+    pub side_channel_host: String,
+    #[serde(default)]
+    pub side_channel_port: u32,
+    #[serde(default)]
+    pub tp_size: u32,
+    #[serde(default)]
+    pub dcp_size: u32,
+    #[serde(default)]
+    pub pp_size: u32,
+    #[serde(default)]
+    pub connector: String,
+    #[serde(default)]
+    pub connector_version: String,
+    #[serde(default)]
+    pub layout_fingerprint: String,
+}
+
+/// A `peer_lookup` entry that passed validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerLookupRecord {
+    pub engine_id: String,
+    pub side_channel_host: String,
+    pub side_channel_port: u16,
+    pub tp_size: u32,
+    pub dcp_size: u32,
+    pub pp_size: u32,
+    pub connector: String,
+    pub connector_version: String,
+    pub layout_fingerprint: String,
+}
+
+impl PeerLookupEntry {
+    /// Reject disabled records, empty (or blank) strings, port 0 or above
+    /// 65535, and zero sizes.
+    pub fn validate(&self) -> Result<PeerLookupRecord, &'static str> {
+        if !self.enabled {
+            return Err("not enabled");
+        }
+        let strings = [
+            &self.engine_id,
+            &self.side_channel_host,
+            &self.connector,
+            &self.connector_version,
+            &self.layout_fingerprint,
+        ];
+        if strings.iter().any(|value| value.trim().is_empty()) {
+            return Err("empty string field");
+        }
+        let port = u16::try_from(self.side_channel_port)
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or("side_channel_port out of range")?;
+        if self.tp_size == 0 || self.dcp_size == 0 || self.pp_size == 0 {
+            return Err("zero parallel size");
+        }
+        Ok(PeerLookupRecord {
+            engine_id: self.engine_id.clone(),
+            side_channel_host: self.side_channel_host.clone(),
+            side_channel_port: port,
+            tp_size: self.tp_size,
+            dcp_size: self.dcp_size,
+            pp_size: self.pp_size,
+            connector: self.connector.clone(),
+            connector_version: self.connector_version.clone(),
+            layout_fingerprint: self.layout_fingerprint.clone(),
+        })
+    }
+}
+
+/// Validated records by rank. An invalid record is dropped with one warning
+/// naming the worker and rank; the worker and its other ranks are unaffected.
+fn validated_peer_lookups(
+    worker_url: &str,
+    sources: &KvEventSourcesResponse,
+) -> HashMap<u32, PeerLookupRecord> {
+    let mut records = HashMap::new();
+    for (rank_str, entry) in sources {
+        let Some(peer) = &entry.peer_lookup else {
+            continue;
+        };
+        let Ok(rank) = rank_str.parse::<u32>() else {
+            continue;
+        };
+        match peer.validate() {
+            Ok(record) => {
+                records.insert(rank, record);
+            }
+            Err(reason) => warn!(
+                worker_url,
+                rank, reason, "kv_index: dropping invalid peer_lookup record"
+            ),
+        }
+    }
+    records
 }
 
 /// /kv_event_sources body: a JSON object keyed by DP rank (as string).
@@ -67,6 +187,9 @@ pub struct WorkerKvInfo {
     /// Cache identity shared by every worker feeding the same placement index.
     /// Absent when discovery cannot create an index for this worker.
     pub cache_key: Option<CacheKey>,
+    /// Validated `peer_lookup` records by DP rank. Empty when the engine
+    /// reports none.
+    pub peer_lookup: HashMap<u32, PeerLookupRecord>,
 }
 
 pub(crate) struct WorkerDiscovery {
@@ -332,6 +455,7 @@ impl KvIndexSupervisor {
                     block_size,
                     ranks: vec![],
                     cache_key: None,
+                    ..WorkerKvInfo::default()
                 });
             }
         };
@@ -347,6 +471,7 @@ impl KvIndexSupervisor {
                 block_size: None,
                 ranks: vec![],
                 cache_key: None,
+                ..WorkerKvInfo::default()
             });
         };
         let Some(model_id) = model_id else {
@@ -355,6 +480,7 @@ impl KvIndexSupervisor {
                 block_size: Some(block_size),
                 ranks: vec![],
                 cache_key: None,
+                ..WorkerKvInfo::default()
             });
         };
         let key = CacheKey {
@@ -538,11 +664,13 @@ impl KvIndexSupervisor {
             },
         );
         self.check_block_size(worker_url, Some(block_size));
+        let peer_lookup = validated_peer_lookups(worker_url, &sources);
         Ok(WorkerKvInfo {
             instance_id,
             block_size: Some(block_size),
             ranks,
             cache_key: Some(key),
+            peer_lookup,
         })
     }
 
@@ -812,6 +940,7 @@ fn grpc_kv_event_source_entries(
                     // The Control RPC has no per-source enable flag; it only
                     // returns sources when KV events are enabled.
                     enable_kv_cache_events: Some(true),
+                    peer_lookup: None,
                 },
             ))
         })
@@ -3140,5 +3269,99 @@ vllm:cache_config_info{block_size=\"16\",effective_attention_block_size=\"16\",e
         assert!(error.contains("server_info"), "{error}");
         assert!(error.contains("metrics"), "{error}");
         server.abort();
+    }
+
+    fn peer_json() -> serde_json::Value {
+        serde_json::json!({
+            "enabled": true,
+            "engine_id": "engine-0",
+            "side_channel_host": "10.0.0.5",
+            "side_channel_port": 5600,
+            "tp_size": 2, "dcp_size": 1, "pp_size": 1,
+            "connector": "nixl",
+            "connector_version": "1",
+            "layout_fingerprint": "fp"
+        })
+    }
+
+    fn parse_entry(peer: serde_json::Value) -> KvEventSourceEntry {
+        serde_json::from_value(serde_json::json!({"endpoint": "tcp://x:1", "peer_lookup": peer}))
+            .unwrap()
+    }
+
+    #[test]
+    fn peer_lookup_valid_record_parses_and_validates() {
+        let record = parse_entry(peer_json())
+            .peer_lookup
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert_eq!(record.engine_id, "engine-0");
+        assert_eq!(record.side_channel_host, "10.0.0.5");
+        assert_eq!(record.side_channel_port, 5600);
+        assert_eq!((record.tp_size, record.dcp_size, record.pp_size), (2, 1, 1));
+        assert_eq!(record.layout_fingerprint, "fp");
+    }
+
+    #[test]
+    fn peer_lookup_invalid_records_are_rejected() {
+        let cases: [(&str, serde_json::Value); 11] = [
+            ("enabled", serde_json::json!(false)),
+            ("engine_id", serde_json::json!("")),
+            ("side_channel_host", serde_json::json!("  ")),
+            ("connector", serde_json::json!("")),
+            ("connector_version", serde_json::json!("")),
+            ("layout_fingerprint", serde_json::json!("")),
+            ("side_channel_port", serde_json::json!(0)),
+            ("side_channel_port", serde_json::json!(70_000)),
+            ("tp_size", serde_json::json!(0)),
+            ("dcp_size", serde_json::json!(0)),
+            ("pp_size", serde_json::json!(0)),
+        ];
+        for (field, bad) in cases {
+            let mut json = peer_json();
+            json[field] = bad.clone();
+            let entry = parse_entry(json).peer_lookup.unwrap();
+            assert!(entry.validate().is_err(), "{field}={bad} must be rejected");
+        }
+        // A missing field takes the zero value and is rejected too.
+        let entry = parse_entry(serde_json::json!({"enabled": true})).peer_lookup;
+        assert!(entry.unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn peer_lookup_unknown_keys_absent_and_malformed_objects() {
+        let mut json = peer_json();
+        json["future_field"] = serde_json::json!({"a": 1});
+        assert!(parse_entry(json).peer_lookup.unwrap().validate().is_ok());
+
+        let absent: KvEventSourceEntry =
+            serde_json::from_value(serde_json::json!({"endpoint": "tcp://x:1"})).unwrap();
+        assert!(absent.peer_lookup.is_none());
+        let null = parse_entry(serde_json::Value::Null);
+        assert!(null.peer_lookup.is_none());
+
+        // A malformed record must not fail the entry (or the whole response).
+        let mut json = peer_json();
+        json["side_channel_port"] = serde_json::json!("not a port");
+        let entry = parse_entry(json);
+        assert_eq!(entry.endpoint, "tcp://x:1");
+        assert!(entry.peer_lookup.unwrap().validate().is_err());
+        let not_object = parse_entry(serde_json::json!("nope"));
+        assert!(not_object.peer_lookup.unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn validated_peer_lookups_keep_valid_ranks_and_drop_invalid_ones() {
+        let mut bad = peer_json();
+        bad["side_channel_port"] = serde_json::json!(0);
+        let sources: KvEventSourcesResponse = HashMap::from([
+            ("0".to_string(), parse_entry(peer_json())),
+            ("1".to_string(), parse_entry(bad)),
+            ("2".to_string(), KvEventSourceEntry::default()),
+        ]);
+        let records = validated_peer_lookups("http://w", &sources);
+        assert_eq!(records.len(), 1);
+        assert!(records.contains_key(&0));
     }
 }

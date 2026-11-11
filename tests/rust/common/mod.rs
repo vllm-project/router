@@ -5,6 +5,7 @@
 pub mod bench_corpus;
 pub mod bench_mock;
 pub mod http;
+pub mod kv_event_mock;
 pub mod mock_openai_server;
 pub mod mock_vllm_rs;
 pub mod mock_worker;

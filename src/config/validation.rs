@@ -1,4 +1,6 @@
 use super::*;
+use crate::config::types::{KvTransferConfig, KvTransferMode};
+use crate::policies::kv_transfer_capability::parse_static_capabilities;
 use crate::program_scheduling::ProgramBindingStrategy;
 
 /// Configuration validator
@@ -460,6 +462,7 @@ impl ConfigValidator {
                 kv_penalty_external,
                 kv_penalty_disk,
                 static_kv_event_sources,
+                kv_transfer,
             } => {
                 if !router_temperature.is_finite() || *router_temperature < 0.0 {
                     return Err(ConfigError::InvalidValue {
@@ -483,6 +486,9 @@ impl ConfigValidator {
                 }
                 for (worker, source) in static_kv_event_sources.iter() {
                     source.validate(worker)?;
+                }
+                if let Some(kv_transfer) = kv_transfer {
+                    Self::validate_kv_transfer(kv_transfer)?;
                 }
             }
             PolicyConfig::PowerOfTwo {
@@ -707,6 +713,34 @@ impl ConfigValidator {
 
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        // Shadow transfer planning runs only in the colocated kv_aware
+        // selector. PD picks its prefill and decode workers through
+        // pd_router::select_stage, which never calls the planner, so a PD
+        // config with a planner would accept the setting and record nothing.
+        if let RoutingMode::VllmPrefillDecode {
+            prefill_policy,
+            decode_policy,
+            ..
+        } = &config.mode
+        {
+            let plans = |policy: &PolicyConfig| {
+                matches!(
+                    policy,
+                    PolicyConfig::KvAware { kv_transfer: Some(kv_transfer), .. }
+                        if kv_transfer.mode != KvTransferMode::Off
+                )
+            };
+            if plans(&config.policy)
+                || prefill_policy.as_ref().is_some_and(plans)
+                || decode_policy.as_ref().is_some_and(plans)
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "kv_transfer planning is not supported with PD routing yet; \
+                             set kv_transfer.mode to off or use regular mode"
+                        .to_string(),
+                });
+            }
+        }
         if let Some(program) = &config.program_scheduling {
             let pd_mode = matches!(config.mode, RoutingMode::VllmPrefillDecode { .. });
             if (!matches!(config.mode, RoutingMode::Regular { .. }) && !pd_mode)
@@ -941,6 +975,43 @@ impl ConfigValidator {
             }
         }
 
+        Ok(())
+    }
+
+    /// Validate the `kv_aware` `kv_transfer` block. A capabilities table is
+    /// ignored (but not required to be absent) when the mode is off.
+    fn validate_kv_transfer(config: &KvTransferConfig) -> ConfigResult<()> {
+        if config.mode == KvTransferMode::Active && config.max_inflight_per_source == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "kv_transfer.max_inflight_per_source".to_string(),
+                value: "0".to_string(),
+                reason: "must be greater than 0 in active mode".to_string(),
+            });
+        }
+        if !config.transfer_policy().valid() {
+            return Err(ConfigError::InvalidValue {
+                field: "kv_transfer".to_string(),
+                value: format!(
+                    "margin={}, prefill_us_per_token={}, transfer_fixed_ms={}, \
+                     transfer_us_per_token={}",
+                    config.margin,
+                    config.prefill_us_per_token,
+                    config.transfer_fixed_ms,
+                    config.transfer_us_per_token
+                ),
+                reason: "margin must be in (0, 1] and cost constants must be finite and >= 0"
+                    .to_string(),
+            });
+        }
+        if config.mode != KvTransferMode::Off {
+            parse_static_capabilities(&config.capabilities).map_err(|error| {
+                ConfigError::InvalidValue {
+                    field: "kv_transfer.capabilities".to_string(),
+                    value: format!("{} entries", config.capabilities.len()),
+                    reason: error,
+                }
+            })?;
+        }
         Ok(())
     }
 
@@ -1518,6 +1589,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                kv_transfer: None,
             },
         );
 
@@ -1678,6 +1750,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                kv_transfer: None,
             },
         );
         config.pd_kv_event_sources.insert(
@@ -1792,5 +1865,121 @@ mod tests {
         };
         let err = ConfigValidator::validate(&config).unwrap_err().to_string();
         assert!(err.contains("requires a kv_aware prefill policy"), "{err}");
+    }
+
+    fn kv_transfer_config(block: KvTransferConfig) -> RouterConfig {
+        RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://a:8000".to_string()],
+            },
+            PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+                kv_transfer: Some(Box::new(block)),
+            },
+        )
+    }
+
+    fn bad_capability() -> std::collections::HashMap<
+        String,
+        crate::policies::kv_transfer_capability::StaticTransferCapability,
+    > {
+        std::collections::HashMap::from([(
+            "http://a:8000".to_string(),
+            crate::policies::kv_transfer_capability::StaticTransferCapability {
+                can_export: true,
+                can_import: true,
+                connector: " ".to_string(),
+                connector_version: "1".to_string(),
+                layout_fingerprint: "fp".to_string(),
+            },
+        )])
+    }
+
+    #[test]
+    fn test_validate_kv_transfer() {
+        let block = |mode| KvTransferConfig {
+            mode,
+            ..Default::default()
+        };
+        for mode in [KvTransferMode::Off, KvTransferMode::Shadow] {
+            ConfigValidator::validate(&kv_transfer_config(block(mode))).unwrap();
+        }
+
+        // Active mode is accepted, with a positive per-source cap.
+        ConfigValidator::validate(&kv_transfer_config(block(KvTransferMode::Active))).unwrap();
+        let mut bad = block(KvTransferMode::Active);
+        bad.max_inflight_per_source = 0;
+        let error = ConfigValidator::validate(&kv_transfer_config(bad)).unwrap_err();
+        assert!(
+            error.to_string().contains("max_inflight_per_source"),
+            "{error}"
+        );
+
+        for margin in [0.0, 1.5, f64::NAN] {
+            let mut bad = block(KvTransferMode::Shadow);
+            bad.margin = margin;
+            assert!(ConfigValidator::validate(&kv_transfer_config(bad)).is_err());
+        }
+        let mut bad = block(KvTransferMode::Shadow);
+        bad.transfer_us_per_token = -1.0;
+        assert!(ConfigValidator::validate(&kv_transfer_config(bad)).is_err());
+
+        let mut bad = block(KvTransferMode::Shadow);
+        bad.capabilities = bad_capability();
+        let error = ConfigValidator::validate(&kv_transfer_config(bad.clone())).unwrap_err();
+        assert!(error.to_string().contains("http://a:8000"), "{error}");
+        // The same table is ignored when the planner is off.
+        bad.mode = KvTransferMode::Off;
+        ConfigValidator::validate(&kv_transfer_config(bad)).unwrap();
+    }
+
+    #[test]
+    fn test_kv_transfer_planning_is_rejected_in_pd_mode() {
+        let kv_aware = |mode| PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+            kv_transfer: Some(Box::new(KvTransferConfig {
+                mode,
+                ..Default::default()
+            })),
+        };
+        let pd = |prefill_policy, decode_policy, main| {
+            RouterConfig::new(
+                RoutingMode::VllmPrefillDecode {
+                    prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                    decode_urls: vec!["http://decode:8000".to_string()],
+                    prefill_policy,
+                    decode_policy,
+                    discovery_address: None,
+                },
+                main,
+            )
+        };
+        let shadow = || kv_aware(KvTransferMode::Shadow);
+        for config in [
+            pd(None, None, shadow()),
+            pd(Some(shadow()), None, PolicyConfig::RoundRobin),
+            pd(None, Some(shadow()), PolicyConfig::RoundRobin),
+        ] {
+            let error = ConfigValidator::validate(&config).unwrap_err();
+            assert!(
+                error.to_string().contains("not supported with PD"),
+                "{error}"
+            );
+        }
+        // Off stays accepted, and regular mode still accepts shadow.
+        ConfigValidator::validate(&pd(None, None, kv_aware(KvTransferMode::Off))).unwrap();
+        ConfigValidator::validate(&kv_transfer_config(KvTransferConfig {
+            mode: KvTransferMode::Shadow,
+            ..Default::default()
+        }))
+        .unwrap();
     }
 }

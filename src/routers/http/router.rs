@@ -1,4 +1,5 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
+use super::peer_fetch::{apply_peer_fetch, PeerFetchApply};
 use super::program_adapter::ProgramCompletion;
 use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
 use crate::backend::{
@@ -17,7 +18,7 @@ use crate::policies::kv_aware_policy;
 use crate::policies::KvRequestTokens;
 use crate::policies::{
     kv_aware_ops, AffinityKey, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy,
-    PolicyRegistry,
+    PeerEndpoint, PeerFetchPermit, PolicyRegistry,
 };
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
@@ -108,6 +109,8 @@ struct LoadTrackedBody {
 struct RequestLoadState {
     worker: Option<Arc<dyn Worker>>,
     kv_slot: Option<KvRequestSlot>,
+    /// Active-mode peer fetch slot against the source; freed with the load.
+    peer_permit: Option<PeerFetchPermit>,
     released: AtomicBool,
 }
 
@@ -120,10 +123,19 @@ pub(super) struct RequestLoadGuard {
 
 impl RequestLoadGuard {
     pub(super) fn new(worker: Option<Arc<dyn Worker>>, kv_slot: Option<KvRequestSlot>) -> Self {
+        Self::with_peer_permit(worker, kv_slot, None)
+    }
+
+    fn with_peer_permit(
+        worker: Option<Arc<dyn Worker>>,
+        kv_slot: Option<KvRequestSlot>,
+        peer_permit: Option<PeerFetchPermit>,
+    ) -> Self {
         Self {
             state: Arc::new(RequestLoadState {
                 worker,
                 kv_slot,
+                peer_permit,
                 released: AtomicBool::new(false),
             }),
         }
@@ -141,10 +153,19 @@ impl RequestLoadGuard {
             }
             RouterMetrics::set_running_requests(worker.url(), worker.load());
         }
-        Self::new(
-            tracked.then_some(worker),
-            receipt.and_then(|receipt| receipt.slot),
-        )
+        let (kv_slot, peer_permit) = match receipt {
+            Some(receipt) => (receipt.slot, receipt.peer_fetch.map(|grant| grant.permit)),
+            None => (None, None),
+        };
+        Self::with_peer_permit(tracked.then_some(worker), kv_slot, peer_permit)
+    }
+
+    /// Free the peer fetch slot before the request ends (the fetch was not
+    /// requested after all). Idempotent; `release` frees it too.
+    fn release_peer_fetch(&self) {
+        if let Some(permit) = &self.state.peer_permit {
+            permit.release();
+        }
     }
 
     fn tracks_worker(&self) -> bool {
@@ -164,6 +185,7 @@ impl RequestLoadGuard {
         if let Some(slot) = &self.state.kv_slot {
             slot.release();
         }
+        self.release_peer_fetch();
         if let Some(worker) = &self.state.worker {
             worker.decrement_load();
             RouterMetrics::set_running_requests(worker.url(), worker.load());
@@ -269,6 +291,8 @@ struct TypedDispatch<'a> {
     completion: Option<&'a CompletionRoute>,
     load: RequestLoadGuard,
     prepared: Option<crate::backend::PreparedRequest>,
+    /// Active mode: the source this attempt's destination should fetch from.
+    peer_fetch: Option<PeerEndpoint>,
 }
 
 struct SelectedWorker {
@@ -1684,6 +1708,12 @@ impl Router {
                     };
                     debug!(attempt, worker_url = worker.url(), target = %receipt.decision.target.instance_id, rank = receipt.decision.target.dp_rank, new_prefill_tokens = receipt.new_prefill_tokens, input_known = input_tokens.is_some(), input_tokens, "KV request selected");
                 }
+                // The permit rides in the load guard; the dispatch only needs
+                // the address.
+                let peer_fetch = kv_receipt
+                    .as_ref()
+                    .and_then(|receipt| receipt.peer_fetch.as_ref())
+                    .map(|grant| grant.endpoint.clone());
                 let load = RequestLoadGuard::from_selection(
                     worker.clone(),
                     kv_receipt,
@@ -1701,6 +1731,7 @@ impl Router {
                             completion,
                             load,
                             prepared: (*prepared).clone(),
+                            peer_fetch,
                         },
                         program_completion.clone(),
                     )
@@ -1868,6 +1899,39 @@ impl Router {
             .await
     }
 
+    /// Count an active-mode outcome; anything but `Applied` means the request
+    /// goes out without a fetch, so its source slot is freed right away.
+    fn record_peer_fetch(outcome: PeerFetchApply, load: &RequestLoadGuard) {
+        RouterMetrics::record_kv_transfer_request(outcome.label());
+        if outcome != PeerFetchApply::Applied {
+            load.release_peer_fetch();
+        }
+    }
+
+    /// The body to send to the destination with peer fetch params added, built
+    /// from the client's original body for this attempt only. `None` when the
+    /// params were not added; the caller then sends the original body.
+    fn peer_fetch_body<T: serde::Serialize>(
+        typed_req: &T,
+        completion: Option<&CompletionRoute>,
+        source: &PeerEndpoint,
+        load: &RequestLoadGuard,
+    ) -> Option<serde_json::Value> {
+        // A raw Completion body is what the client sent byte for byte; parse
+        // that rather than the typed copy so nothing else about it changes.
+        let body = match completion.and_then(|completion| completion.raw_body.as_ref()) {
+            Some(raw) => serde_json::from_slice::<serde_json::Value>(raw).ok(),
+            None => serde_json::to_value(typed_req).ok(),
+        };
+        let Some(mut body) = body else {
+            Self::record_peer_fetch(PeerFetchApply::InvalidBody, load);
+            return None;
+        };
+        let outcome = apply_peer_fetch(&mut body, source);
+        Self::record_peer_fetch(outcome, load);
+        (outcome == PeerFetchApply::Applied).then_some(body)
+    }
+
     // Send typed request directly without conversion
     #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
@@ -1884,6 +1948,7 @@ impl Router {
             completion,
             load,
             prepared,
+            peer_fetch,
         } = dispatch;
         let completion_echo = completion.map(|input| input.echo);
         let load_incremented = load.tracks_worker();
@@ -1951,7 +2016,10 @@ impl Router {
                     }
                 };
 
-                // Use the original json_val without modification
+                let mut json_val = json_val;
+                if let Some(source) = &peer_fetch {
+                    Self::record_peer_fetch(apply_peer_fetch(&mut json_val, source), &load);
+                }
 
                 let request_url = format!("{}{}", worker_url_prefix, route);
                 (
@@ -1961,8 +2029,13 @@ impl Router {
                 )
             } else {
                 let request_url = format!("{}{}", worker_url, route);
+                let peer_body = peer_fetch
+                    .as_ref()
+                    .and_then(|source| Self::peer_fetch_body(typed_req, completion, source, &load));
                 (
-                    if let Some(completion) = completion {
+                    if let Some(body) = &peer_body {
+                        self.client.post(&request_url).json(body)
+                    } else if let Some(completion) = completion {
                         completion.forward_request(&self.client, &request_url, headers, typed_req)
                     } else {
                         self.client.post(&request_url).json(typed_req)
@@ -3166,6 +3239,10 @@ impl RouterTrait for Router {
         let url = worker.endpoint_url(path);
 
         let load_tracked = policy.tracks_request_load() || program_completion.is_some();
+        let peer_fetch = kv_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.peer_fetch.as_ref())
+            .map(|grant| grant.endpoint.clone());
         let load = load_tracked
             .then(|| RequestLoadGuard::from_selection(worker.clone(), kv_receipt, true));
 
@@ -3193,6 +3270,18 @@ impl RouterTrait for Router {
         } else {
             (body, None)
         };
+
+        // Active mode: only POST bodies on the generation routes carry
+        // `kv_transfer_params`, and the permit lives in `load` (kept until the
+        // response body ends), so without a guard there is no slot to hold.
+        let mut body = body;
+        if let (Some(source), Some(load)) = (&peer_fetch, &load) {
+            if *method == Method::POST {
+                Self::record_peer_fetch(apply_peer_fetch(&mut body, source), load);
+            } else {
+                load.release_peer_fetch();
+            }
+        }
 
         debug!("Transparent proxy: forwarding to {}", url);
 
@@ -3421,6 +3510,32 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn load_guard_frees_the_peer_fetch_slot_on_release_early_release_and_drop() {
+        let limiter = crate::policies::PeerFetchLimiter::new(1);
+        let guard = |limiter: &Arc<crate::policies::PeerFetchLimiter>| {
+            let permit = limiter.try_acquire("http://a").expect("slot");
+            RequestLoadGuard::with_peer_permit(None, None, Some(permit))
+        };
+
+        let held = guard(&limiter);
+        assert!(limiter.try_acquire("http://a").is_none());
+        held.release();
+        assert_eq!(limiter.inflight("http://a"), 0);
+
+        // The client sent its own params: the slot goes back before the request ends.
+        let early = guard(&limiter);
+        early.release_peer_fetch();
+        assert_eq!(limiter.inflight("http://a"), 0);
+        drop(early);
+
+        // A cancelled request drops the guard without ever calling release.
+        let dropped = guard(&limiter);
+        assert_eq!(limiter.inflight("http://a"), 1);
+        drop(dropped);
+        assert_eq!(limiter.inflight("http://a"), 0);
+    }
+
     struct CompletionResponseFixture {
         router: Arc<Router>,
         worker: Arc<dyn Worker>,
@@ -3504,6 +3619,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                kv_transfer: None,
             },
             worker_startup_timeout_secs: 5,
             ..Default::default()
@@ -3598,6 +3714,7 @@ mod tests {
                     }}))
                     .unwrap(),
                 ),
+                kv_transfer: None,
             },
             worker_startup_timeout_secs: 5,
             ..Default::default()
@@ -3720,6 +3837,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
+                    kv_transfer: None,
                 },
                 worker_startup_timeout_secs: 5,
                 worker_startup_check_interval_secs: 1,
@@ -4499,6 +4617,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
+                    kv_transfer: None,
                 }
             }));
             router.policy_registry.on_worker_added(
@@ -4631,6 +4750,7 @@ mod tests {
                     // a worker's load — the same state the old `load_incremented:
                     // false` expressed before the field became a guard.
                     load: RequestLoadGuard::new(None, None),
+                    peer_fetch: None,
                     prepared: None,
                 },
                 None,
@@ -5354,6 +5474,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                kv_transfer: None,
             }));
         router
     }
@@ -5807,6 +5928,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                kv_transfer: None,
             }));
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "messages": [{"role": "user", "content": "hello"}]
@@ -5854,6 +5976,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                kv_transfer: None,
             }));
 
         let request = serde_json::json!({"messages": []});
@@ -6032,6 +6155,7 @@ mod tests {
                     completion: Some(&completion),
                     load,
                     prepared: None,
+                    peer_fetch: None,
                 },
                 None,
             )
@@ -6215,6 +6339,7 @@ mod tests {
                         completion: Some(&completion),
                         load,
                         prepared: None,
+                        peer_fetch: None,
                     },
                     None,
                 )
@@ -6631,6 +6756,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
+                    kv_transfer: None,
                 }));
             let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
                 "messages": [{"role": "user", "content": "hello"}], "stream": streaming,
@@ -6696,6 +6822,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                kv_transfer: None,
             }));
         router.retry_config.max_retries = 0;
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({

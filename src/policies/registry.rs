@@ -6,10 +6,10 @@
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, CostParams, KvAffinityTable,
-    KvAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy,
-    RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
+    KvAwarePolicy, LoadBalancingPolicy, PolicyFactory, PowerOfTwoPolicy, RandomPolicy,
+    RendezvousHashPolicy, RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
 };
-use crate::config::types::PolicyConfig;
+use crate::config::types::{KvTransferConfig, PolicyConfig};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -36,6 +36,11 @@ pub struct PolicyRegistry {
     /// Affinity table shared by every KV-aware policy this registry creates,
     /// bounding affinity state across models.
     kv_affinity_table: Arc<KvAffinityTable>,
+
+    /// `kv_transfer` block of the main `kv_aware` policy config, applied to
+    /// hint-created `kv_aware` policies. `None` when the main policy is not
+    /// `kv_aware` or has no block.
+    kv_transfer: Option<Arc<KvTransferConfig>>,
 }
 
 impl PolicyRegistry {
@@ -52,6 +57,12 @@ impl PolicyRegistry {
         let kv_affinity_table = Arc::new(KvAffinityTable::with_ttl(affinity_ttl));
         let default_policy =
             Self::create_policy_from_config(&default_policy_config, &kv_affinity_table);
+        let kv_transfer = match &default_policy_config {
+            PolicyConfig::KvAware { kv_transfer, .. } => {
+                kv_transfer.as_deref().cloned().map(Arc::new)
+            }
+            _ => None,
+        };
 
         Self {
             model_policies: Arc::new(RwLock::new(HashMap::new())),
@@ -60,6 +71,7 @@ impl PolicyRegistry {
             prefill_policy: Arc::new(RwLock::new(None)),
             decode_policy: Arc::new(RwLock::new(None)),
             kv_affinity_table,
+            kv_transfer,
         }
     }
 
@@ -195,9 +207,10 @@ impl PolicyRegistry {
             "round_robin" => Arc::new(RoundRobinPolicy::new()),
             "random" => Arc::new(RandomPolicy::new()),
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
-            "kv_aware" => Arc::new(
+            "kv_aware" => Arc::new(PolicyFactory::apply_kv_transfer(
                 KvAwarePolicy::default().with_shared_affinity(Arc::clone(&self.kv_affinity_table)),
-            ),
+                self.kv_transfer.as_deref(),
+            )),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             "consistent_hash" => Arc::new(ConsistentHashPolicy::new()),
             "sticky_least_loaded" => Arc::new(StickyLeastLoadedPolicy::new()),
@@ -238,8 +251,9 @@ impl PolicyRegistry {
                 kv_penalty_host,
                 kv_penalty_external,
                 kv_penalty_disk,
+                kv_transfer,
                 ..
-            } => Arc::new(
+            } => Arc::new(PolicyFactory::apply_kv_transfer(
                 KvAwarePolicy::new(CostParams {
                     router_temperature: *router_temperature,
                     transfer_credits: TransferCredits {
@@ -251,7 +265,8 @@ impl PolicyRegistry {
                     ..CostParams::default()
                 })
                 .with_shared_affinity(Arc::clone(kv_affinity_table)),
-            ),
+                kv_transfer.as_deref(),
+            )),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
             PolicyConfig::StickyLeastLoaded => Arc::new(StickyLeastLoadedPolicy::new()),
@@ -411,5 +426,40 @@ mod tests {
         // Get default directly
         let default = registry.get_default_policy();
         assert_eq!(default.name(), "round_robin");
+    }
+
+    fn kv_aware_main(kv_transfer: Option<crate::config::types::KvTransferConfig>) -> PolicyConfig {
+        PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+            kv_transfer: kv_transfer.map(Box::new),
+        }
+    }
+
+    #[test]
+    fn hint_created_kv_aware_inherits_main_shadow_planner() {
+        use crate::config::types::KvTransferMode::{Off, Shadow};
+        let block = |mode| crate::config::types::KvTransferConfig {
+            mode,
+            ..Default::default()
+        };
+        let cases = [
+            (kv_aware_main(Some(block(Shadow))), true),
+            (kv_aware_main(Some(block(Off))), false),
+            (kv_aware_main(None), false),
+            (PolicyConfig::RoundRobin, false),
+        ];
+        for (main, expect_planner) in cases {
+            let registry = PolicyRegistry::new(main);
+            let policy = registry.on_worker_added("m", Some("kv_aware"));
+            let policy = policy
+                .as_any()
+                .downcast_ref::<KvAwarePolicy>()
+                .expect("kv_aware policy");
+            assert_eq!(policy.has_transfer_planner(), expect_planner);
+        }
     }
 }

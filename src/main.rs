@@ -2,8 +2,9 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    HealthCheckConfig, HistoryBackend, KvConnector, KvTransferConfig, KvTransferMode,
+    MetricsConfig, PdKvEventSources, PolicyConfig, ProgramSchedulingConfig, RetryConfig,
+    RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -222,6 +223,34 @@ struct CliArgs {
     kv_penalty_external: f64,
     #[arg(long, default_value_t = 0.3)]
     kv_penalty_disk: f64,
+    /// KV transfer planner for kv_aware: off, shadow (plan and report only), or
+    /// active (send kv_transfer_params so the destination engine fetches the prefix).
+    #[arg(long, default_value = "off", value_parser = ["off", "shadow", "active"])]
+    kv_transfer_mode: String,
+    /// Minimum blocks the source must hold beyond the destination.
+    #[arg(long, default_value_t = 64)]
+    kv_transfer_min_prefix_blocks: u32,
+    /// The source counts as busy at this many active requests.
+    #[arg(long, default_value_t = 1)]
+    kv_transfer_source_load_threshold: usize,
+    /// Transfer must cost less than this fraction of the prefill it saves.
+    #[arg(long, default_value_t = 0.8)]
+    kv_transfer_margin: f64,
+    /// Estimated prefill cost in microseconds per token.
+    #[arg(long, default_value_t = 50.0)]
+    kv_transfer_prefill_us_per_token: f64,
+    /// Estimated fixed transfer cost in milliseconds.
+    #[arg(long, default_value_t = 5.0)]
+    kv_transfer_fixed_ms: f64,
+    /// Estimated transfer cost in microseconds per token.
+    #[arg(long, default_value_t = 5.0)]
+    kv_transfer_us_per_token: f64,
+    /// Require declared worker capability before planning a transfer.
+    #[arg(long)]
+    kv_transfer_require_capability: bool,
+    /// Active mode: most peer fetches in flight against one source worker.
+    #[arg(long, default_value_t = 4)]
+    kv_transfer_max_inflight_per_source: usize,
 
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
@@ -437,6 +466,28 @@ impl CliArgs {
         map
     }
 
+    /// The `kv_transfer` block, or `None` when the mode is off so existing
+    /// invocations build exactly the config they did before.
+    fn kv_transfer_config(&self) -> Option<Box<KvTransferConfig>> {
+        let mode = match self.kv_transfer_mode.as_str() {
+            "shadow" => KvTransferMode::Shadow,
+            "active" => KvTransferMode::Active,
+            _ => return None,
+        };
+        Some(Box::new(KvTransferConfig {
+            mode,
+            min_prefix_blocks: self.kv_transfer_min_prefix_blocks,
+            source_load_threshold: self.kv_transfer_source_load_threshold,
+            margin: self.kv_transfer_margin,
+            prefill_us_per_token: self.kv_transfer_prefill_us_per_token,
+            transfer_fixed_ms: self.kv_transfer_fixed_ms,
+            transfer_us_per_token: self.kv_transfer_us_per_token,
+            require_capability: self.kv_transfer_require_capability,
+            max_inflight_per_source: self.kv_transfer_max_inflight_per_source,
+            capabilities: HashMap::new(),
+        }))
+    }
+
     /// Convert policy string to PolicyConfig
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
         match policy_str {
@@ -455,6 +506,7 @@ impl CliArgs {
                 kv_penalty_external: self.kv_penalty_external,
                 kv_penalty_disk: self.kv_penalty_disk,
                 static_kv_event_sources: Box::default(),
+                kv_transfer: self.kv_transfer_config(),
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5, // Default value
@@ -572,6 +624,12 @@ impl CliArgs {
         } else if !static_kv_event_sources.is_empty() {
             return Err(ConfigError::IncompatibleConfig {
                 reason: "--kv-event-source requires --policy kv_aware in regular mode".to_string(),
+            });
+        }
+
+        if self.kv_transfer_mode != "off" && !matches!(policy, PolicyConfig::KvAware { .. }) {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "--kv-transfer-mode requires --policy kv_aware".to_string(),
             });
         }
 
@@ -982,5 +1040,72 @@ mod tests {
                 "should reject '{bad}'"
             );
         }
+    }
+
+    #[test]
+    fn kv_transfer_flags_map_into_the_kv_aware_config() {
+        let kv_transfer = |extra: &[&str]| {
+            let mut argv = vec!["vllm-router", "--policy", "kv_aware"];
+            argv.extend_from_slice(extra);
+            let args = CliArgs::try_parse_from(argv).unwrap();
+            match args.parse_policy("kv_aware") {
+                PolicyConfig::KvAware { kv_transfer, .. } => kv_transfer,
+                other => panic!("unexpected policy {other:?}"),
+            }
+        };
+        assert!(kv_transfer(&[]).is_none());
+        assert!(kv_transfer(&["--kv-transfer-mode", "off"]).is_none());
+
+        let block = kv_transfer(&["--kv-transfer-mode", "shadow"]).unwrap();
+        assert_eq!(
+            *block,
+            KvTransferConfig {
+                mode: KvTransferMode::Shadow,
+                ..Default::default()
+            }
+        );
+
+        let block = kv_transfer(&[
+            "--kv-transfer-mode",
+            "shadow",
+            "--kv-transfer-min-prefix-blocks",
+            "8",
+            "--kv-transfer-source-load-threshold",
+            "3",
+            "--kv-transfer-margin",
+            "0.5",
+            "--kv-transfer-prefill-us-per-token",
+            "40",
+            "--kv-transfer-fixed-ms",
+            "2.5",
+            "--kv-transfer-us-per-token",
+            "7",
+            "--kv-transfer-require-capability",
+            "--kv-transfer-max-inflight-per-source",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(
+            *block,
+            KvTransferConfig {
+                mode: KvTransferMode::Shadow,
+                min_prefix_blocks: 8,
+                source_load_threshold: 3,
+                margin: 0.5,
+                prefill_us_per_token: 40.0,
+                transfer_fixed_ms: 2.5,
+                transfer_us_per_token: 7.0,
+                require_capability: true,
+                max_inflight_per_source: 2,
+                capabilities: HashMap::new(),
+            }
+        );
+
+        // Active is parsed; validation checks the rest of the block.
+        assert_eq!(
+            kv_transfer(&["--kv-transfer-mode", "active"]).unwrap().mode,
+            KvTransferMode::Active
+        );
+        assert!(CliArgs::try_parse_from(["vllm-router", "--kv-transfer-mode", "loud"]).is_err());
     }
 }

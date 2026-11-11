@@ -13,6 +13,8 @@ mod consistent_hash;
 mod factory;
 pub(crate) mod hash_key;
 mod kv_aware;
+mod kv_transfer;
+pub mod kv_transfer_capability;
 mod power_of_two;
 mod random;
 mod registry;
@@ -33,6 +35,11 @@ pub use kv_aware::{
     KvRequestSlot, KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample,
     MultiplicativeScorer, Picker, PrefillWorkEstimate, Scorer, SelectionError, SlotManager,
     StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits, WorkerTokenInputs,
+};
+pub use kv_transfer::{
+    plan_transfer, CostEstimate, CostRuleTransferPlanner, PeerEndpoint, PeerFetchGrant,
+    PeerFetchLimiter, PeerFetchPermit, TransferCapability, TransferOutcome, TransferPlan,
+    TransferPlanner, TransferPlannerInput, TransferPolicy, TransferSkip,
 };
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;

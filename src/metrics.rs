@@ -84,6 +84,23 @@ pub fn init_metrics() {
         "KV-aware placement lookups and reasons for skipping them"
     );
     describe_counter!(
+        "vllm_router_kv_transfer_plans_total",
+        "Shadow-mode KV transfer planner outcomes (planned or the reason no plan was made)"
+    );
+    describe_counter!(
+        "vllm_router_kv_transfer_requests_total",
+        "Active-mode KV transfer requests: sent with peer fetch params, or why not \
+         (no_peer_endpoint, inflight_cap, client_params_present, invalid_body)"
+    );
+    describe_histogram!(
+        "vllm_router_kv_transfer_estimated_saved_ms",
+        "Shadow-mode estimated prefill milliseconds saved by a planned KV transfer"
+    );
+    describe_histogram!(
+        "vllm_router_kv_transfer_estimated_cost_ms",
+        "Shadow-mode estimated milliseconds of the fetch and wait paths when the transfer cost rule was evaluated"
+    );
+    describe_counter!(
         "vllm_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
     );
@@ -481,6 +498,9 @@ fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuild
     ];
     const RATIO_BUCKETS: &[f64] = &[0.25, 0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 3.0, 4.0];
     const REQUEST_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
+    const MILLISECOND_BUCKETS: &[f64] = &[
+        1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1_000.0, 2_000.0, 5_000.0,
+    ];
 
     let exact = |name: &str| Matcher::Full(name.to_string());
     let set = |builder: PrometheusBuilder, name: &str, buckets: &[f64]| {
@@ -528,6 +548,12 @@ fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuild
     ] {
         builder = set(builder, name, REQUEST_BUCKETS);
     }
+    for name in [
+        "vllm_router_kv_transfer_estimated_saved_ms",
+        "vllm_router_kv_transfer_estimated_cost_ms",
+    ] {
+        builder = set(builder, name, MILLISECOND_BUCKETS);
+    }
     set(
         builder,
         "vllm_router_agent_aware_admission_capacity_observation_age_seconds",
@@ -564,6 +590,22 @@ impl RouterMetrics {
 
     pub fn record_kv_placement_lookup(result: &'static str) {
         counter!("vllm_router_kv_placement_lookups_total", "result" => result).increment(1);
+    }
+    pub fn record_kv_transfer_plan(outcome: &'static str) {
+        counter!("vllm_router_kv_transfer_plans_total", "outcome" => outcome).increment(1);
+    }
+    /// Active-mode outcome for a planned request: `sent`, `no_peer_endpoint`,
+    /// `inflight_cap`, `client_params_present` or `invalid_body`.
+    pub fn record_kv_transfer_request(outcome: &'static str) {
+        counter!("vllm_router_kv_transfer_requests_total", "outcome" => outcome).increment(1);
+    }
+    /// Estimated prefill milliseconds saved by a planned transfer.
+    pub fn record_kv_transfer_estimated_saved_ms(saved_ms: f64) {
+        histogram!("vllm_router_kv_transfer_estimated_saved_ms").record(saved_ms);
+    }
+    /// Estimated cost of the two compared paths; `path` is `fetch` or `wait`.
+    pub fn record_kv_transfer_estimated_cost_ms(path: &'static str, cost_ms: f64) {
+        histogram!("vllm_router_kv_transfer_estimated_cost_ms", "path" => path).record(cost_ms);
     }
     pub fn record_kv_routing_input(transport: &'static str, result: &'static str) {
         counter!("vllm_router_kv_routing_inputs_total", "transport" => transport, "result" => result).increment(1);

@@ -307,6 +307,7 @@ async fn grpc_kv_routing_keeps_unavailable_control_a_legal_fallback(
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                kv_transfer: None,
             },
             ..Default::default()
         };

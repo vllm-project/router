@@ -5,7 +5,7 @@ use super::{
     RouterTrait,
 };
 use crate::config::{PolicyConfig, RoutingMode};
-use crate::policies::PolicyFactory;
+use crate::policies::{KvAffinityTable, LoadBalancingPolicy, PolicyFactory};
 use crate::server::AppContext;
 use std::sync::Arc;
 
@@ -56,6 +56,30 @@ impl RouterFactory {
         Ok(Box::new(router))
     }
 
+    /// Build the prefill and decode stage policies. Neither stage gets a
+    /// transfer planner: PD selects through `pd_router::select_stage`, which
+    /// never calls it, and config validation rejects `kv_transfer` in PD mode.
+    /// Clearing it here keeps a config built without validation from carrying
+    /// a planner that would never run.
+    pub(crate) fn build_pd_stage_policies(
+        prefill_policy_config: Option<&PolicyConfig>,
+        decode_policy_config: Option<&PolicyConfig>,
+        main_policy_config: &PolicyConfig,
+        kv_affinity_table: &Arc<KvAffinityTable>,
+    ) -> (Arc<dyn LoadBalancingPolicy>, Arc<dyn LoadBalancingPolicy>) {
+        let without_planner = |config: &PolicyConfig| {
+            let mut config = config.clone();
+            if let PolicyConfig::KvAware { kv_transfer, .. } = &mut config {
+                *kv_transfer = None;
+            }
+            PolicyFactory::create_from_config(&config, Some(kv_affinity_table))
+        };
+        (
+            without_planner(prefill_policy_config.unwrap_or(main_policy_config)),
+            without_planner(decode_policy_config.unwrap_or(main_policy_config)),
+        )
+    }
+
     /// Create a vLLM PD router with service discovery and/or static URLs
     pub async fn create_vllm_pd_router(
         prefill_urls: &[(String, Option<u16>)],
@@ -66,17 +90,16 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // Both stages inherit the main policy unless they have a stage override.
+        // Both stages inherit the main policy unless they have a stage override;
+        // neither keeps a kv_transfer planner (PD does not plan).
         // Build both policies against the registry-owned affinity table so the
         // router-level kv_aware session-affinity TTL applies to the PD path too.
         let kv_affinity_table = ctx.policy_registry.kv_affinity_table();
-        let prefill_policy = PolicyFactory::create_from_config(
-            prefill_policy_config.unwrap_or(main_policy_config),
-            Some(&kv_affinity_table),
-        );
-        let decode_policy = PolicyFactory::create_from_config(
-            decode_policy_config.unwrap_or(main_policy_config),
-            Some(&kv_affinity_table),
+        let (prefill_policy, decode_policy) = Self::build_pd_stage_policies(
+            prefill_policy_config,
+            decode_policy_config,
+            main_policy_config,
+            &kv_affinity_table,
         );
 
         // Set the prefill and decode policies in the registry
@@ -147,6 +170,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                kv_transfer: None,
             },
             kv_aware_session_affinity_ttl_secs: Some(1800),
             // Worker lists stay empty on purpose: the prefill/decode policies
@@ -184,5 +208,61 @@ mod tests {
                 "{name} policy must inherit the registry affinity TTL"
             );
         }
+    }
+
+    fn kv_aware(shadow: bool) -> PolicyConfig {
+        use crate::config::types::{KvTransferConfig, KvTransferMode};
+        PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+            kv_transfer: shadow.then(|| {
+                Box::new(KvTransferConfig {
+                    mode: KvTransferMode::Shadow,
+                    ..Default::default()
+                })
+            }),
+        }
+    }
+
+    fn has_planner(policy: &Arc<dyn LoadBalancingPolicy>) -> bool {
+        policy
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>()
+            .expect("kv_aware policy")
+            .has_transfer_planner()
+    }
+
+    #[test]
+    fn pd_stages_never_carry_a_transfer_planner() {
+        let table = Arc::new(KvAffinityTable::with_ttl(None));
+        let main = kv_aware(true);
+        for (prefill_override, decode_override) in [
+            (None, None),
+            (Some(kv_aware(true)), None),
+            (None, Some(kv_aware(true))),
+            (Some(kv_aware(true)), Some(kv_aware(false))),
+        ] {
+            let (prefill, decode) = RouterFactory::build_pd_stage_policies(
+                prefill_override.as_ref(),
+                decode_override.as_ref(),
+                &main,
+                &table,
+            );
+            assert!(!has_planner(&prefill));
+            assert!(!has_planner(&decode));
+        }
+
+        // A non-kv_aware decode override is kept as is.
+        let (prefill, decode) = RouterFactory::build_pd_stage_policies(
+            None,
+            Some(&PolicyConfig::RoundRobin),
+            &main,
+            &table,
+        );
+        assert!(!has_planner(&prefill));
+        assert_eq!(decode.name(), "round_robin");
     }
 }
