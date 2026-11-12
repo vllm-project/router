@@ -84,42 +84,17 @@ impl TokenBucket {
 
     /// Acquire tokens, waiting if necessary
     pub async fn acquire(&self, tokens: f64) -> Result<(), tokio::time::error::Elapsed> {
-        // First try to acquire immediately
-        if self.try_acquire(tokens).await.is_ok() {
-            return Ok(());
-        }
-
-        // Calculate wait time
-        let wait_time = {
-            let inner = self.inner.lock();
-            let tokens_needed = (tokens - inner.tokens).max(0.0);
-            let wait_secs = (tokens_needed / self.refill_rate).max(0.0);
-            Duration::from_secs_f64(wait_secs)
-        };
-
-        debug!(
-            "Token bucket: waiting {:?} for {} tokens",
-            wait_time, tokens
-        );
-
-        // Wait for tokens to be available
-        tokio::time::timeout(wait_time, async {
-            loop {
-                // Check if we can acquire now
-                if self.try_acquire(tokens).await.is_ok() {
-                    return;
-                }
-
-                // Wait for notification or small interval
-                tokio::select! {
-                    _ = self.notify.notified() => {},
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {},
-                }
+        loop {
+            if self.try_acquire(tokens).await.is_ok() {
+                return Ok(());
             }
-        })
-        .await?;
-
-        Ok(())
+            // Other waiters may consume a refill first. Only the caller's
+            // timeout may end the wait; a predicted refill interval cannot.
+            tokio::select! {
+                _ = self.notify.notified() => {},
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+            }
+        }
     }
 
     /// Acquire tokens with custom timeout
@@ -189,6 +164,31 @@ mod tests {
 
         // Should have ~1.5 tokens now
         assert!(bucket.try_acquire(1.0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn queued_waiters_can_wait_for_multiple_refill_intervals() {
+        let bucket = TokenBucket::new(1, 5);
+        bucket.try_acquire(1.0).await.unwrap();
+        let timeout = Duration::from_secs(2);
+        let (a, b, c) = tokio::join!(
+            bucket.acquire_timeout(1.0, timeout),
+            bucket.acquire_timeout(1.0, timeout),
+            bucket.acquire_timeout(1.0, timeout),
+        );
+        assert!(a.is_ok() && b.is_ok() && c.is_ok(), "{a:?} {b:?} {c:?}");
+    }
+
+    #[tokio::test]
+    async fn queued_waiter_still_respects_caller_timeout() {
+        let bucket = TokenBucket::new(1, 1);
+        bucket.try_acquire(1.0).await.unwrap();
+        let start = Instant::now();
+        assert!(bucket
+            .acquire_timeout(1.0, Duration::from_millis(80))
+            .await
+            .is_err());
+        assert!(start.elapsed() >= Duration::from_millis(60));
     }
 
     #[tokio::test]
