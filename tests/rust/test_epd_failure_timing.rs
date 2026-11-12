@@ -42,15 +42,17 @@ mod consumer_2xx_with_stalled_or_invalid_body {
                 "[client] the 2xx headers come through at once"
             );
             let mut body = response.into_body().into_data_stream();
-            assert_eq!(next_chunk(&mut body).await, "{", "[client] first part");
+            let first = next_chunk(&mut body).await;
+            assert_eq!(first, "{", "[client] first part");
             // Disarmed at the headers: nothing to cancel while the body stalls.
             rig.expect_no_cancel().await;
             rig.consumer.release();
             let (rest, broken) = rest_of_body(body).await;
             assert!(!broken, "[client] the body ends normally");
-            assert!(
-                serde_json::from_str::<Value>(&format!("{{{rest}")).is_err(),
-                "[client] the invalid body comes through as it is: {rest:?}"
+            assert_eq!(
+                format!("{first}{rest}"),
+                INVALID_JSON_BODY,
+                "[client] the invalid body comes through as it is"
             );
             rig.expect_no_cancel().await;
         }

@@ -37,6 +37,10 @@ pub enum Mode {
     BreakBody,
 }
 
+/// The whole body that `Mode::StallBodyInvalidJson` sends. It starts like a
+/// JSON object, but it is not JSON.
+pub const INVALID_JSON_BODY: &str = "{\"choices\": [not json";
+
 /// Which worker the mock plays. The role picks the normal reply body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -226,7 +230,7 @@ impl Mock {
     /// part at once and hold the rest.
     fn body(&self, request: &Value, mode: Mode) -> (String, String) {
         let whole = match (mode, self.0.role) {
-            (Mode::StallBodyInvalidJson, _) => "{\"choices\": [not json".to_owned(),
+            (Mode::StallBodyInvalidJson, _) => INVALID_JSON_BODY.to_owned(),
             (Mode::StallBodyWithoutKv, _) => json!({"choices": []}).to_string(),
             (_, Role::Encoder) => encoder_reply(request).to_string(),
             (_, Role::Prefill { push }) => prefill_reply(push).to_string(),
