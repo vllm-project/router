@@ -12,6 +12,20 @@ use serde_json::Value;
 /// The EC consumer sends 2xx headers, then its body stalls or is invalid.
 mod consumer_2xx_with_stalled_or_invalid_body {
     use super::*;
+    use axum::response::Response;
+    use tokio::task::JoinHandle;
+
+    /// Sends a request with P in `mode`. Returns while P's body stalls: P has
+    /// the request, the client waits, and the armed guard sends nothing.
+    async fn p_body_stalled(path: Path, mode: Mode) -> (Rig, JoinHandle<Response>) {
+        let mut rig = Rig::new(path).await;
+        rig.consumer.set_mode(mode);
+        let mut client = rig.send(two_images());
+        rig.consumer.wait_requests(1).await;
+        expect_waiting(&mut client).await;
+        rig.expect_no_cancel().await;
+        (rig, client)
+    }
 
     /// E+PD hands off at PD's 2xx headers, so a stalled or invalid body comes
     /// after the handoff.
@@ -66,13 +80,8 @@ mod consumer_2xx_with_stalled_or_invalid_body {
             (Mode::StallBodyWithoutKv, "refusing metadata-only decode"),
             (Mode::BreakBody, "Failed to read response body"),
         ] {
-            let mut rig = Rig::new(Path::SplitPdSequential).await;
-            rig.consumer.set_mode(mode);
-            let mut client = rig.send(two_images());
-            rig.consumer.wait_requests(1).await;
-            // While P's body stalls, the guard is armed and D waits.
-            expect_waiting(&mut client).await;
-            rig.expect_no_cancel().await;
+            let (mut rig, client) = p_body_stalled(Path::SplitPdSequential, mode).await;
+            // While P's body stalls, D waits.
             rig.decode.expect_no_request();
             rig.consumer.release();
             let response = answer(client).await;
@@ -100,18 +109,14 @@ mod consumer_2xx_with_stalled_or_invalid_body {
 
     /// The concurrent path joins P's whole body with D's headers, parses P's
     /// body with `.ok()` and disarms even when that gives nothing. It has no
-    /// KV check, and D is already running.
+    /// KV check, and D is already running. A read error in P's body returns
+    /// before the disarm, so the guard cancels and D's reply is dropped.
     #[tokio::test]
     async fn concurrent_nixl() {
         for mode in [Mode::StallBodyInvalidJson, Mode::StallBodyWithoutKv] {
-            let mut rig = Rig::new(Path::SplitPdConcurrent).await;
-            rig.consumer.set_mode(mode);
-            let mut client = rig.send(two_images());
-            rig.consumer.wait_requests(1).await;
+            let (mut rig, client) = p_body_stalled(Path::SplitPdConcurrent, mode).await;
             // [dispatch] D got its request at the same time as P, and answered.
             rig.decode.expect_completed().await;
-            expect_waiting(&mut client).await;
-            rig.expect_no_cancel().await;
             rig.consumer.release();
             let response = answer(client).await;
             assert_eq!(
@@ -125,6 +130,25 @@ mod consumer_2xx_with_stalled_or_invalid_body {
                 "[client] D's reply"
             );
             rig.expect_no_cancel().await;
+        }
+        // P's body ends with an error instead of the rest.
+        {
+            let (mut rig, client) = p_body_stalled(Path::SplitPdConcurrent, Mode::BreakBody).await;
+            // [dispatch] D got its request at the same time as P, and answered.
+            rig.decode.expect_completed().await;
+            rig.consumer.release();
+            let response = answer(client).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "[client] P's read error, although D answered"
+            );
+            let text = text(response).await;
+            assert!(
+                text.contains("Failed to read response body"),
+                "[client] {text}"
+            );
+            rig.expect_cancel().await;
         }
         // The client goes away while P's body stalls. D has sent its headers
         // and holds its body.
