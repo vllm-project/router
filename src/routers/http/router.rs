@@ -1494,12 +1494,28 @@ impl Router {
                 None
             }
         };
-        let text = match (pool, typed_req.grpc_request()) {
-            (
-                Some(crate::backend::WorkerPoolKind::Grpc),
-                Some(GrpcRequestRef::Completion(completion)),
-            ) if route == "/v1/completions" => completion.extract_text_for_grpc_routing(),
-            _ => typed_req.extract_text_for_routing(),
+        let schema_route = typed_req.http_token_input_route(route);
+        let text = if schema_route == "/inference/v1/generate"
+            && self.policy_for_model(model_id).needs_request_body()
+        {
+            match serde_json::to_string(typed_req) {
+                Ok(body) => body,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Serialization error: {error}"),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            match (pool, typed_req.grpc_request()) {
+                (
+                    Some(crate::backend::WorkerPoolKind::Grpc),
+                    Some(GrpcRequestRef::Completion(completion)),
+                ) if route == "/v1/completions" => completion.extract_text_for_grpc_routing(),
+                _ => typed_req.extract_text_for_routing(),
+            }
         };
         let text = &text;
         let prepared = &prepared;
@@ -1586,7 +1602,7 @@ impl Router {
                                         &workers,
                                         headers,
                                         &body,
-                                        route,
+                                        schema_route,
                                         self.api_key.as_deref(),
                                         Duration::from_secs(1),
                                     )
@@ -2768,6 +2784,17 @@ impl RouterTrait for Router {
         model_id: Option<&str>,
     ) -> Response {
         self.route_typed_request(headers, body, "/inference/v1/generate", model_id)
+            .await
+    }
+
+    async fn route_inference_generate_path(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &InferenceGenerateRequest,
+        path: &str,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(headers, body, path, model_id)
             .await
     }
 
@@ -5643,6 +5670,112 @@ mod tests {
             WorkerType::Regular,
         )));
         router
+    }
+
+    #[tokio::test]
+    async fn regular_sticky_binds_body_user_only_for_inference_generate() {
+        use crate::config::PolicyConfig;
+        use crate::policies::StickyLeastLoadedPolicy;
+        use serde_json::json;
+
+        let (address, server) = spawn_header_echo_backend().await;
+        let mut router = router_pointing_at(address);
+        router.policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::StickyLeastLoaded));
+        let policy = router.policy_for_model(None);
+        let sticky = policy
+            .as_any()
+            .downcast_ref::<StickyLeastLoadedPolicy>()
+            .unwrap();
+
+        let user = "body-user";
+        let chat = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hello"}], "user": user
+        }))
+        .unwrap();
+        let response = router.route_chat(None, &chat, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            sticky.active_session_count(),
+            0,
+            "chat user is not a session"
+        );
+
+        let completion = serde_json::from_value(json!({"prompt": "hello", "user": user})).unwrap();
+        let response = router.route_completion(None, &completion, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            sticky.active_session_count(),
+            0,
+            "completion user is not a session"
+        );
+
+        let generate = serde_json::from_value(json!({"token_ids": [42], "user": user})).unwrap();
+        for path in [None, Some("/custom/v1/generate")] {
+            let response = match path {
+                None => router.route_inference_generate(None, &generate, None).await,
+                Some(path) => {
+                    router
+                        .route_inference_generate_path(None, &generate, path, None)
+                        .await
+                }
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(sticky.active_session_count(), 1);
+            sticky.finish_session(user);
+            assert_eq!(sticky.active_session_count(), 0);
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn inference_generate_paths_preserve_effective_cache_tokens() {
+        use crate::config::PolicyConfig;
+        use crate::policies::{CacheAwareCandidate, CacheAwarePolicy};
+        use crate::protocols::spec::InferenceGenerateRequest;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(|| async { StatusCode::OK });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        for path in ["/inference/v1/generate", "/custom/v1/generate"] {
+            let mut router = router_pointing_at(address);
+            router.policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.0001,
+                eviction_interval_secs: 0,
+                max_tree_size: 10_000,
+            }));
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.worker_registry.register(Arc::new(
+                BasicWorker::new(format!("http://{address}"), WorkerType::Regular)
+                    .with_labels(HashMap::from([("model_id".into(), "model-a".into())])),
+            ));
+            let body: InferenceGenerateRequest = serde_json::from_value(serde_json::json!({
+                "model": "model-a", "token_ids": [123, 456],
+                "sampling_params": {"max_tokens": 1}, "prompt": "extension"
+            }))
+            .unwrap();
+            let response = router
+                .route_inference_generate_path(None, &body, path, Some("model-a"))
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let policy = router.policy_for_model(None);
+            let cache = policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap();
+            let placement = cache
+                .evaluate_initial_placement(
+                    "model-a",
+                    &body.extract_cache_routing_key(),
+                    &[CacheAwareCandidate {
+                        target_id: &format!("http://{address}"),
+                        kv_pressure: 0.0,
+                    }],
+                )
+                .unwrap();
+            assert_eq!(placement.match_rate, 1.0, "{path}");
+        }
+        server.abort();
     }
 
     /// The transparent path with EPD enabled has to apply the same header policy
