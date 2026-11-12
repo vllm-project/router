@@ -2542,6 +2542,12 @@ impl Router {
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            if strip_usage {
+                // Filtering the injected usage changes the body length. Let
+                // the HTTP server frame the stream instead of forwarding the
+                // upstream length for a body we no longer send verbatim.
+                response_headers.remove(CONTENT_LENGTH);
+            }
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
             if stages_on {
@@ -8093,5 +8099,251 @@ mod tests {
         assert!(registry.revision() > revision_before_recovery);
 
         health_checker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn usage_filter_preserves_stream_framing_across_token_modes() {
+        use crate::program_scheduling::TokenCountMode;
+        for mode in [
+            None,
+            Some(TokenCountMode::Estimated),
+            Some(TokenCountMode::Shadow),
+            Some(TokenCountMode::ExactWhenVerified),
+        ] {
+            for (identified, client_usage) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+                let capture = captured.clone();
+                let app = axum::Router::new().route(
+                    "/v1/chat/completions",
+                    axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                        let capture = capture.clone();
+                        async move {
+                            let include = body.pointer("/stream_options/include_usage")
+                                .and_then(serde_json::Value::as_bool) == Some(true);
+                            *capture.lock() = Some(body);
+                            let mut sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n".to_string();
+                            if include {
+                                sse.push_str("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\n");
+                            }
+                            sse.push_str("data: [DONE]\n\n");
+                            Response::builder()
+                                .header(CONTENT_TYPE, "text/event-stream")
+                                .header(CONTENT_LENGTH, sse.len())
+                                .body(Body::from(sse)).unwrap()
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let mut router = router_pointing_at(address);
+                router.frontend.pin_test_token_ids(vec![1; 10]);
+                router.program_scheduler = mode.map(|token_count_mode| {
+                    Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                        token_count_mode,
+                        token_count_verification_settlements: 0,
+                        exact_text_endpoints: vec!["/v1/chat/completions".into()],
+                        ..Default::default()
+                    }))
+                });
+                let mut body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hello"}],"stream":true});
+                if identified {
+                    body["vllm_xargs"] = serde_json::json!({"agentic_context":{"program_id":"p","expected_resume":false}});
+                }
+                if client_usage {
+                    body["stream_options"] = serde_json::json!({"include_usage":true});
+                }
+                let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+                let response = router
+                    .route_typed_request(None, &request, "/v1/chat/completions", None)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let declared = response
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .map(|value| value.to_str().unwrap().parse::<usize>().unwrap());
+                let bytes = to_bytes(response.into_body(), 10000).await.unwrap();
+                let inject = identified
+                    && !client_usage
+                    && mode.is_some_and(|mode| mode.uses_prepared_facts());
+                assert_eq!(
+                    captured
+                        .lock()
+                        .as_ref()
+                        .unwrap()
+                        .pointer("/stream_options/include_usage")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true),
+                    client_usage || inject
+                );
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("hello"));
+                assert!(text.ends_with("data: [DONE]\n\n"));
+                assert_eq!(text.contains("\"usage\""), client_usage);
+                // A changed body must not advertise the upstream byte count;
+                // ordinary streams and explicitly requested usage stay intact.
+                assert_eq!(
+                    declared,
+                    if inject { None } else { Some(bytes.len()) },
+                    "mode={mode:?}, identity={identified}, client_usage={client_usage}"
+                );
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_token_verification_uses_only_engine_prompt_info() {
+        use crate::program_scheduling::{
+            ArrivalTokenFacts, TokenCountMode, TokenFacts, TokenizerFingerprint,
+        };
+        for prompt_info in [None, Some(10), Some(12)] {
+            let scheduler = Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                token_count_mode: TokenCountMode::ExactWhenVerified,
+                ..Default::default()
+            }));
+            let fp = TokenizerFingerprint::from_parts(&["prompt-info"]);
+            let arrival = ArrivalTokenFacts::new(100, Some(TokenFacts::prepared_token_ids(10, fp)));
+            let context = scheduler.resolve_arrival_tokens("model-a", arrival);
+            let identity = ProgramIdentity::from_request(
+                None,
+                Some(&serde_json::json!({"vllm_xargs":{"agentic_context":{
+                    "program_id":"p","expected_resume":true
+                }}})),
+                Some("model-a"),
+            )
+            .unwrap()
+            .unwrap();
+            let target = crate::program_scheduling::ProgramTarget {
+                id: "rank-0".into(),
+                base_url: "grpc://worker".into(),
+                dp_rank: None,
+            };
+            let dispatch = scheduler
+                .acquire(identity, context, &[target], None)
+                .await
+                .unwrap();
+            let completion = program_completion(&scheduler, dispatch);
+            completion.engine_observer().record_usage(prompt_info, 1);
+            // The gRPC producer fills wire usage with prepared IDs when the
+            // Engine omitted prompt_info. That fallback is client-visible but
+            // must never become independent verification evidence.
+            let wire = format!("data: {{\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":1}}}}\n\ndata: [DONE]\n\n",prompt_info.unwrap_or(10));
+            let response = Response::new(Body::from(wire.clone()));
+            let response = settle_program_completion_on_response(response, true, completion).await;
+            let bytes = to_bytes(response.into_body(), 10000).await.unwrap();
+            assert_eq!(bytes.as_ref(), wire.as_bytes());
+            let diagnostic = scheduler.diagnostics();
+            assert_eq!(
+                diagnostic.verified_token_fingerprints,
+                usize::from(prompt_info == Some(10))
+            );
+            assert_eq!(
+                diagnostic.revoked_token_fingerprints,
+                usize::from(prompt_info == Some(12))
+            );
+            assert_eq!(
+                scheduler
+                    .resolve_arrival_tokens("model-a", arrival)
+                    .source()
+                    .is_prepared(),
+                prompt_info == Some(10)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_counts_leave_http_kv_inputs_on_engine_preparation() {
+        use crate::program_scheduling::TokenCountMode;
+        for mode in [
+            TokenCountMode::Estimated,
+            TokenCountMode::Shadow,
+            TokenCountMode::ExactWhenVerified,
+        ] {
+            for identified in [false, true] {
+                let ids = vec![1, 2, 3, 4, 5, 6];
+                let mut fixture = http_kv_fixture([vec![ids.clone()], vec![ids]], 0, true).await;
+                fixture.router.frontend.pin_test_token_ids(vec![9; 100]);
+                fixture.router.program_scheduler =
+                    Some(Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                        token_count_mode: mode,
+                        token_count_verification_settlements: 0,
+                        exact_text_endpoints: vec!["/v1/chat/completions".into()],
+                        ..Default::default()
+                    })));
+                let mut body =
+                    serde_json::json!({"model":"m","messages":[{"role":"user","content":"hello"}]});
+                if identified {
+                    body["vllm_xargs"] = serde_json::json!({"agentic_context":{"program_id":"p","expected_resume":false}});
+                }
+                let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+                let response = fixture
+                    .router
+                    .route_typed_request(None, &request, "/v1/chat/completions", None)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                to_bytes(response.into_body(), 10000).await.unwrap();
+                assert!(
+                    fixture
+                        .calls
+                        .lock()
+                        .iter()
+                        .any(|(_, path, _)| path.ends_with("/render")),
+                    "{mode:?}: skipped Engine input preparation"
+                );
+                let loads = fixture.loads.lock();
+                assert_eq!(loads.len(), 1);
+                assert!(
+                    loads[0].1.active_prefill_tokens <= 6,
+                    "{mode:?}: Router-only 100 IDs leaked into KV routing: {:?}",
+                    loads[0]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_counting_preserves_dp_and_public_headers() {
+        use crate::program_scheduling::TokenCountMode;
+        for mode in [
+            None,
+            Some(TokenCountMode::Estimated),
+            Some(TokenCountMode::Shadow),
+            Some(TokenCountMode::ExactWhenVerified),
+        ] {
+            let (address, server) = spawn_header_echo_backend().await;
+            let mut router = create_test_regular_router();
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.worker_registry.register(Arc::new(BasicWorker::new(
+                format!("http://{address}@1"),
+                WorkerType::Regular,
+            )));
+            router.intra_node_data_parallel_size = 2;
+            router.frontend.pin_test_token_ids(vec![1; 10]);
+            router.program_scheduler = mode.map(|token_count_mode| {
+                Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                    token_count_mode,
+                    token_count_verification_settlements: 0,
+                    exact_text_endpoints: vec!["/v1/chat/completions".into()],
+                    ..Default::default()
+                }))
+            });
+            let request:ChatCompletionRequest=serde_json::from_value(serde_json::json!({"model":"m","messages":[{"role":"user","content":"hello"}],"vllm_xargs":{"agentic_context":{"program_id":"p","expected_resume":false}}})).unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", "Bearer test-token".parse().unwrap());
+            headers.insert("x-public", "keep".parse().unwrap());
+            let response = router
+                .route_typed_request(Some(&headers), &request, "/v1/chat/completions", None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 10000).await.unwrap();
+            let echoed: HashMap<String, Vec<String>> = serde_json::from_slice(&body).unwrap();
+            assert_eq!(echoed["x-data-parallel-rank"], vec!["1"]);
+            assert_eq!(echoed["authorization"], vec!["Bearer test-token"]);
+            assert_eq!(echoed["x-public"], vec!["keep"]);
+            server.abort();
+        }
     }
 }
