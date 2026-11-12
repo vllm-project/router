@@ -377,6 +377,19 @@ impl ProgramRuntime {
         self.request_pool.front_context_tokens(program_ref)
     }
 
+    pub(crate) fn update_retained_contexts(
+        &mut self,
+        update: impl FnMut(&ProgramRef, ContextTokens) -> ContextTokens,
+    ) -> Vec<(ProgramRef, ContextTokens)> {
+        let changes = self.request_pool.update_contexts(update);
+        for (reference, context) in &changes {
+            if let Some(program) = self.programs.get_mut(&RuntimeKey::from(reference)) {
+                program.context = program.context.max_with(*context);
+            }
+        }
+        changes
+    }
+
     /// Immutable lifecycle view used by scheduling decisions under one lock.
     pub(crate) fn view(&self, program_ref: &ProgramRef) -> Option<RuntimeProgramView> {
         self.programs

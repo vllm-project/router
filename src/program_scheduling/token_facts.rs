@@ -280,6 +280,8 @@ impl fmt::Display for TokenCountMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextTokens {
     pub(crate) tokens: usize,
+    /// Original byte estimate, retained so queued exact facts can be revoked.
+    pub(crate) estimated_tokens: usize,
     pub(crate) source: TokenFactSource,
     pub(crate) fingerprint: Option<TokenizerFingerprint>,
     pub(crate) shadow: Option<TokenFacts>,
@@ -302,6 +304,7 @@ impl ContextTokens {
     pub fn estimated(tokens: usize) -> Self {
         Self {
             tokens: tokens.max(1),
+            estimated_tokens: tokens.max(1),
             source: TokenFactSource::Estimated,
             fingerprint: None,
             shadow: None,
@@ -309,9 +312,10 @@ impl ContextTokens {
         }
     }
 
-    pub fn from_prepared(facts: TokenFacts) -> Self {
+    pub fn from_prepared(facts: TokenFacts, estimated_tokens: usize) -> Self {
         Self {
             tokens: facts.tokens().max(1),
+            estimated_tokens: estimated_tokens.max(1),
             source: facts.source(),
             fingerprint: facts.fingerprint(),
             shadow: None,
@@ -359,6 +363,15 @@ impl ContextTokens {
         self.fallback
     }
 
+    pub(crate) fn fallback_if_revoked(self, revoked: bool) -> Self {
+        if revoked && self.source.is_prepared() {
+            Self::estimated(self.estimated_tokens)
+                .with_fallback(TokenFactFallback::FingerprintRevoked)
+        } else {
+            self
+        }
+    }
+
     /// Keep the larger demand while preserving the strongest provenance.
     ///
     /// A Program's ledger entry is the largest unfinished context demand across
@@ -383,6 +396,11 @@ impl ContextTokens {
         };
         Self {
             tokens,
+            estimated_tokens: if other_wins {
+                other.estimated_tokens
+            } else {
+                self.estimated_tokens
+            },
             source,
             fingerprint,
             // Both counters describe what the *same* prepared fact would have
@@ -453,7 +471,7 @@ pub fn resolve_context_tokens(
                     .with_shadow(Some(prepared))
                     .with_fallback(TokenFactFallback::FingerprintUnverified);
             }
-            ContextTokens::from_prepared(prepared)
+            ContextTokens::from_prepared(prepared, arrival.estimated_tokens())
         }
     }
 }
@@ -615,7 +633,7 @@ mod tests {
         let estimated = ContextTokens::estimated(100)
             .with_shadow(Some(TokenFacts::prepared_token_ids(900, fingerprint())));
         let prepared =
-            ContextTokens::from_prepared(TokenFacts::client_token_ids(100, fingerprint()));
+            ContextTokens::from_prepared(TokenFacts::client_token_ids(100, fingerprint()), 100);
         let merged = estimated.max_with(prepared);
         assert_eq!(merged.tokens(), 100);
         assert_eq!(merged.source(), TokenFactSource::ClientTokenIds);

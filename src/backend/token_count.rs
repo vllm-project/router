@@ -67,6 +67,8 @@ pub(crate) fn prepared_chat_fingerprint(
         "chat_template_kwargs": request.chat_template_kwargs,
         "add_generation_prompt": request.add_generation_prompt,
         "continue_final_message": request.continue_final_message,
+        "reasoning_effort": request.reasoning_effort,
+        "response_format": request.response_format,
         "add_special_tokens": request.other.get("add_special_tokens"),
         "chat_template": request.other.get("chat_template"),
         "tools": request.tools,
@@ -134,4 +136,42 @@ pub(crate) fn exact_prompt_tokens_from_json(request: Option<&serde_json::Value>)
         Some(limit) if limit > 0 && tokens > limit => limit,
         _ => tokens,
     })
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_format_must_have_its_own_verification_class() {
+        let request = |format: serde_json::Value| -> ChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "model", "messages": [{"role": "user", "content": "hello"}],
+                "response_format": format
+            }))
+            .unwrap()
+        };
+        assert_ne!(
+            prepared_chat_fingerprint(&request(serde_json::Value::Null), "vllm-tokenizer"),
+            prepared_chat_fingerprint(
+                &request(serde_json::json!({"type":"json_object"})),
+                "vllm-tokenizer"
+            )
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_must_have_its_own_verification_class() {
+        let request = |effort: &str| -> ChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({
+                "model":"model", "messages":[{"role":"user","content":"hello"}],
+                "reasoning_effort":effort
+            }))
+            .unwrap()
+        };
+        assert_ne!(
+            prepared_chat_fingerprint(&request("none"), "vllm-tokenizer"),
+            prepared_chat_fingerprint(&request("high"), "vllm-tokenizer")
+        );
+    }
 }

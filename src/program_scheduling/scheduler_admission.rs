@@ -107,6 +107,9 @@ impl ProgramScheduler {
         let expected_resume = identity.expected_resume();
         let (handle, pending_output_prediction) = {
             let mut state = self.state.lock();
+            // Resolution happens before acquiring this lock; a settlement may
+            // have revoked the fingerprint in the meantime.
+            let context = self.revalidate_context(&state, identity.model_pool(), context);
             let handle = state.runtime.retain_request(
                 &identity,
                 context,
