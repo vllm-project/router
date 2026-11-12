@@ -661,6 +661,7 @@ impl ProgramScheduler {
                     let current_tokens = decision.context_tokens;
                     let merged = ContextTokens {
                         tokens: decision.context_tokens,
+                        estimated_tokens: decision.context_tokens,
                         source: decision.context_token_source,
                         fingerprint: decision.context_token_fingerprint,
                         shadow: decision.shadow_context_facts,

@@ -6,7 +6,7 @@
 //! additional encoding. Prepared counts arrive with the request.
 
 use super::scheduler::ProgramScheduler;
-use super::scheduler_state::ProgramSchedulerState;
+use super::scheduler_state::{ProgramPauseReason, ProgramSchedulerState};
 use super::{ArrivalTokenFacts, ContextTokens, ProgramRef, TokenCountMode, TokenizerFingerprint};
 use crate::metrics::RouterMetrics;
 use std::time::Instant;
@@ -52,6 +52,80 @@ impl ProgramScheduler {
     ) -> bool {
         fingerprint
             .is_some_and(|fingerprint| state.revoked_token_fingerprints.contains_key(&fingerprint))
+    }
+
+    pub(crate) fn revalidate_context(
+        &self,
+        state: &ProgramSchedulerState,
+        model_pool: &str,
+        context: ContextTokens,
+    ) -> ContextTokens {
+        context.fallback_if_revoked(
+            state.token_fingerprint_saturated_pools.contains(model_pool)
+                || self.fingerprint_revoked(state, context.fingerprint()),
+        )
+    }
+
+    /// Revocation and all retained-fact updates share the scheduler lock. Scan
+    /// only on a new revocation, including every fingerprint in a saturated pool.
+    fn refresh_retained_token_facts(&self, state: &mut ProgramSchedulerState) {
+        let revoked = &state.revoked_token_fingerprints;
+        let saturated = &state.token_fingerprint_saturated_pools;
+        let changes = state.runtime.update_retained_contexts(|program, context| {
+            context.fallback_if_revoked(
+                saturated.contains(program.model_pool())
+                    || context
+                        .fingerprint()
+                        .is_some_and(|fingerprint| revoked.contains_key(&fingerprint)),
+            )
+        });
+        let now = Instant::now();
+        for (program, context) in changes {
+            // An admission can have committed before its waiter was polled.
+            // Return that idle placement to the queue to check the new demand.
+            if !self.config.binding_only
+                && self.pause_idle(state, &program, ProgramPauseReason::CapacityRepair, now)
+            {
+                if let Some(target) = state
+                    .decisions
+                    .get(&program)
+                    .and_then(|decision| decision.last_target.clone())
+                {
+                    let queue = if self.config.global_queue {
+                        state
+                            .global_queues
+                            .entry(program.model_pool().to_string())
+                            .or_default()
+                    } else {
+                        state.rank_queues.entry(target.clone()).or_default()
+                    };
+                    if !queue.contains(&program) {
+                        queue.push_back(program.clone());
+                    }
+                    if let Some(decision) = state.decisions.get_mut(&program) {
+                        decision.queued_at.get_or_insert(now);
+                    }
+                    self.set_force_resume_deadline(state, &target, &program, now);
+                }
+            }
+            let placement = state.runtime.placement(&program).map(str::to_string);
+            if let Some(decision) = state.decisions.get_mut(&program) {
+                let before = decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+                // Preserve larger historical/in-flight demand, as on arrival.
+                if context.tokens() >= decision.context_tokens {
+                    decision.context_tokens = context.tokens();
+                    decision.context_token_source = context.source();
+                    decision.context_token_fingerprint = context.fingerprint();
+                    decision.shadow_context_facts = context.shadow_facts();
+                    decision.context_shrink_observations = 0;
+                }
+                let after = decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+                if let Some(target) = placement {
+                    Self::adjust_usage(state, &target, after - before);
+                }
+            }
+            state.runtime.notify_front(&program);
+        }
     }
 
     /// Resolve the applied context demand for one arrival.
@@ -241,11 +315,11 @@ impl ProgramScheduler {
             // Every prepared fact for this pool already falls back to estimation.
             return;
         }
-        if state
+        let newly_revoked = state
             .revoked_token_fingerprints
             .insert(fingerprint, Instant::now())
-            .is_none()
-        {
+            .is_none();
+        if newly_revoked {
             state.token_fingerprint_revocations =
                 state.token_fingerprint_revocations.saturating_add(1);
             RouterMetrics::record_agent_aware_context_token_revocation("usage_mismatch");
@@ -281,6 +355,9 @@ impl ProgramScheduler {
                 "revoked-fingerprint set reached its bound; prepared token counts now \
                  fall back to estimation for every fingerprint until restart"
             );
+        }
+        if newly_revoked {
+            self.refresh_retained_token_facts(state);
         }
     }
 
@@ -879,5 +956,231 @@ mod tests {
             context.fallback(),
             Some(super::super::TokenFactFallback::FingerprintRevoked)
         );
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod revocation_tests {
+    use super::*;
+    use crate::program_scheduling::*;
+    use std::time::Duration;
+    fn identity(name: &str) -> ProgramIdentity {
+        ProgramIdentity::from_request(
+            None,
+            Some(&serde_json::json!({
+                "vllm_xargs":{"agentic_context":{"program_id":name,"expected_resume":true}}
+            })),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn revocation_between_resolution_and_retention_uses_the_original_estimate() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
+            token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_verification_settlements: 0,
+            ..Default::default()
+        });
+        let fingerprint = TokenizerFingerprint::from_parts(&["race"]);
+        let context = scheduler.resolve_arrival_tokens(
+            "model",
+            ArrivalTokenFacts::new(1000, Some(TokenFacts::prepared_token_ids(10, fingerprint))),
+        );
+        {
+            let mut state = scheduler.state.lock();
+            scheduler.reconcile_observed_prompt_tokens(
+                &mut state,
+                "model",
+                TokenFactSource::PreparedTokenIds,
+                Some(fingerprint),
+                Some(10),
+                Some(1000),
+            );
+        }
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: None,
+        };
+        let dispatch = scheduler
+            .acquire(identity("race"), context, &[target], None)
+            .await
+            .unwrap();
+        assert_eq!(dispatch.context_tokens(), 1000);
+        assert_eq!(dispatch.context_token_source(), TokenFactSource::Estimated);
+        assert_eq!(
+            dispatch.context_facts().fallback(),
+            Some(TokenFactFallback::FingerprintRevoked)
+        );
+    }
+
+    #[test]
+    fn revoked_or_saturated_facts_recheck_admission_and_update_the_entire_fifo() {
+        for global_queue in [false, true] {
+            for saturate in [false, true] {
+                let mut config = ProgramSchedulerConfig {
+                    token_count_mode: TokenCountMode::ExactWhenVerified,
+                    token_count_verification_settlements: 0,
+                    global_queue,
+                    ..Default::default()
+                };
+                config.progress_ttl.token_capacity = Some(500);
+                config.progress_ttl.decode_buffer_tokens = 10;
+                let scheduler = ProgramScheduler::new(config);
+                let target = ProgramTarget {
+                    id: "rank-0".into(),
+                    base_url: "http://rank-0".into(),
+                    dp_rank: None,
+                };
+                scheduler.sync_targets("model", &[target]);
+                let fingerprint = TokenizerFingerprint::from_parts(&["queued"]);
+                let front = scheduler.resolve_arrival_tokens(
+                    "model",
+                    ArrivalTokenFacts::new(
+                        1000,
+                        Some(TokenFacts::prepared_token_ids(10, fingerprint)),
+                    ),
+                );
+                let tail = scheduler.resolve_arrival_tokens(
+                    "model",
+                    ArrivalTokenFacts::new(
+                        1200,
+                        Some(TokenFacts::prepared_token_ids(12, fingerprint)),
+                    ),
+                );
+                let now = Instant::now();
+                let mut state = scheduler.state.lock();
+                let handle = state
+                    .runtime
+                    .retain_request(&identity("queued"), front, None, now);
+                let reference = handle.program().clone();
+                scheduler.ensure_decision_state(
+                    &mut state,
+                    &identity("queued"),
+                    reference.clone(),
+                    front,
+                    now,
+                    None,
+                );
+                let plan = scheduler
+                    .rank_admission_plan(&state, &reference, "rank-0", now)
+                    .unwrap();
+                assert!(scheduler.commit_admission(&mut state, &reference, "rank-0", plan, now));
+                state
+                    .runtime
+                    .retain_request(&identity("queued"), tail, None, now);
+
+                // A different pool's retained fact must remain exact on saturation.
+                let other_identity = ProgramIdentity::from_request(
+                    None,
+                    Some(&serde_json::json!({
+                        "vllm_xargs":{"agentic_context":{"program_id":"other"}}
+                    })),
+                    Some("other-model"),
+                )
+                .unwrap()
+                .unwrap();
+                let other = state
+                    .runtime
+                    .retain_request(&other_identity, front, None, now);
+                let mismatch = if saturate {
+                    for index in 0..MAX_REVOKED_FINGERPRINTS {
+                        state.revoked_token_fingerprints.insert(
+                            TokenizerFingerprint::from_parts(&[&format!("bad-{index}")]),
+                            now,
+                        );
+                    }
+                    TokenizerFingerprint::from_parts(&["overflow"])
+                } else {
+                    fingerprint
+                };
+                scheduler.reconcile_observed_prompt_tokens(
+                    &mut state,
+                    "model",
+                    TokenFactSource::PreparedTokenIds,
+                    Some(mismatch),
+                    Some(10),
+                    Some(1000),
+                );
+                assert_eq!(state.runtime.front_request_context(&reference), Some(1000));
+                assert_eq!(
+                    state.runtime.view(&reference).unwrap().state,
+                    ProgramState::Paused
+                );
+                assert!(scheduler
+                    .rank_admission_plan(&state, &reference, "rank-0", now)
+                    .is_none());
+                assert_eq!(state.observations["rank-0"].active_program_token_delta, 0.0);
+                if saturate {
+                    assert!(state.token_fingerprint_saturated_pools.contains("model"));
+                    assert_eq!(
+                        state.runtime.front_request_context(other.program()),
+                        Some(10)
+                    );
+                }
+                drop(state);
+                scheduler.cancel_retained_request(&handle);
+                let state = scheduler.state.lock();
+                assert_eq!(state.runtime.front_request_context(&reference), Some(1200));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn queued_request_must_stop_using_a_revoked_fact() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
+            token_count_mode: TokenCountMode::ExactWhenVerified,
+            max_active_programs_per_target: 1,
+            ..Default::default()
+        });
+        let targets = [ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: None,
+        }];
+        let fp = TokenizerFingerprint::from_parts(&["review"]);
+        let arrival = ArrivalTokenFacts::new(1000, Some(TokenFacts::prepared_token_ids(10, fp)));
+        let probation = scheduler.resolve_arrival_tokens("model", arrival);
+        let warm = scheduler
+            .acquire(identity("warm"), probation, &targets, None)
+            .await
+            .unwrap();
+        scheduler.complete(&warm, true, true, Some(10), None);
+        let blocker = scheduler
+            .acquire(
+                identity("blocker"),
+                scheduler.resolve_arrival_tokens("model", arrival),
+                &targets,
+                None,
+            )
+            .await
+            .unwrap();
+        let exact = scheduler.resolve_arrival_tokens("model", arrival);
+        assert_eq!(exact.source(), TokenFactSource::PreparedTokenIds);
+        let waiting = scheduler.acquire(identity("waiting"), exact, &targets, None);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        // A real in-flight attempt reveals the mismatch before the queued request is admitted.
+        scheduler.complete(&blocker, true, true, Some(1000), None);
+        assert_eq!(
+            scheduler.resolve_arrival_tokens("model", arrival).source(),
+            TokenFactSource::Estimated
+        );
+        let dispatched = tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            dispatched.context_token_source(),
+            TokenFactSource::Estimated,
+            "known bad fact remained queued and was dispatched at {} tokens",
+            dispatched.context_tokens()
+        );
+        assert_eq!(dispatched.context_tokens(), 1000);
     }
 }

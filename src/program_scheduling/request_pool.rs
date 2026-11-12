@@ -164,6 +164,30 @@ impl RequestPool {
             .and_then(VecDeque::front)
             .map(|request| request.context.tokens())
     }
+
+    /// Replace retained facts atomically; report the largest changed demand per Program.
+    pub(crate) fn update_contexts(
+        &mut self,
+        mut update: impl FnMut(&ProgramRef, ContextTokens) -> ContextTokens,
+    ) -> Vec<(ProgramRef, ContextTokens)> {
+        let mut changes = Vec::new();
+        for (program, requests) in &mut self.requests {
+            let mut changed_context: Option<ContextTokens> = None;
+            for request in requests {
+                let context = update(program, request.context);
+                if context != request.context {
+                    request.context = context;
+                    changed_context = Some(
+                        changed_context.map_or(context, |previous| previous.max_with(context)),
+                    );
+                }
+            }
+            if let Some(context) = changed_context {
+                changes.push((program.clone(), context));
+            }
+        }
+        changes
+    }
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
