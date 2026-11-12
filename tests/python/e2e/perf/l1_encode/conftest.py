@@ -12,11 +12,11 @@ import pytest
 
 from tests.python.e2e.perf.l1_encode.check import hit_tag
 from tests.python.e2e.perf.l1_encode.stack_launcher import L1Stack
-from tests.python.e2e.perf.artifact_paths import perf_results_dir
+from tests.python.e2e.perf.path import get_perf_results_dir
 
 _DIR = Path(__file__).resolve().parent
 # Dashboard copies tests/python/e2e/results only.
-RESULTS_DIR = perf_results_dir("l1_encode")
+RESULTS_DIR = get_perf_results_dir("l1_encode")
 
 BENCH_SCRIPT = _DIR.parents[4] / "benches" / "backend" / "bench_prefix_kvhit.py"
 

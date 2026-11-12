@@ -25,7 +25,7 @@ from case_loader import (  # noqa: E402
     wave_case_id,
 )
 from stack_launcher import launch_stack  # noqa: E402
-from tests.python.e2e.perf.artifact_paths import perf_results_dir  # noqa: E402
+from tests.python.e2e.perf.path import get_perf_results_dir  # noqa: E402
 
 BENCH_SCRIPT = _PERF_DIR.parents[4] / "benches" / "backend" / "bench_prefix_kvhit.py"
 
@@ -109,7 +109,7 @@ def perf_output_dir(perf_case, bench_mod) -> str:
     path = bench_mod.default_output_dir(
         {"backend_label": perf_case.backend},
         # Dashboard copies tests/python/e2e/results only.
-        results_parent=perf_results_dir("grpc"),
+        results_parent=get_perf_results_dir("grpc"),
     )
     _progress(f"results directory: {Path(path).resolve()}")
     return path

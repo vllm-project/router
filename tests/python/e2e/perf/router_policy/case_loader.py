@@ -11,13 +11,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from tests.python.e2e.perf.artifact_paths import perf_results_dir, perf_run_dir
+from tests.python.e2e.perf.path import get_perf_results_dir, get_perf_run_dir
 
 RUN_SUFFIX_ENV = "AGENTX_RUN_SUFFIX"
 
 # Dashboard copies results/ only; run/ keeps replay rows and snapshots (see README).
-PERF_RESULTS_DIR = perf_results_dir("router_policy")
-PERF_RUN_DIR = perf_run_dir("router_policy")
+PERF_RESULTS_DIR = get_perf_results_dir("router_policy")
+PERF_RUN_DIR = get_perf_run_dir("router_policy")
 
 MODEL_ENV = "MODEL"
 PYTHON_ENV_KEYS = ("AGENTX_PYTHON", "PYTHON")
