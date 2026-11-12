@@ -104,6 +104,7 @@ class RouterArgs:
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
     kv_aware_completion_history: bool = False
+    kv_aware_prefill_history: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -244,6 +245,12 @@ class RouterArgs:
             default=RouterArgs.kv_aware_completion_history,
             help="Enable regular HTTP kv_aware prompt history observed at successful "
             "response headers (separate from KV events and session affinity)",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-aware-prefill-history",
+            action="store_true",
+            default=RouterArgs.kv_aware_prefill_history,
+            help="Enable advisory history after verified static sequential NIXL pull Prefill handoff",
         )
         parser.add_argument(
             f"--{prefix}kv-event-source",

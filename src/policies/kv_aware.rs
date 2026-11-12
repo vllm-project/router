@@ -19,7 +19,7 @@ use crate::request_identity::StableIdentity;
 
 mod history;
 use history::CompletionHistory;
-pub use history::{CompletionHistoryRequest, HistoryObservation};
+pub use history::{CompletionHistoryRequest, HistoryObservation, PrefillHistoryHint};
 
 /// Read-only placement port owned by its policy consumer.
 pub trait TieredMatchProvider: Send + Sync {
@@ -127,6 +127,33 @@ pub trait KvAwareOps: Send + Sync {
 
     /// Commit an observation at successful upstream headers, without owning load.
     fn observe_completion_headers(&self, _worker: &dyn Worker, _observation: HistoryObservation) {}
+
+    /// Capture independently addressed P registrations before preparation.
+    fn capture_prefill_history(
+        &self,
+        _workers: &[Arc<dyn Worker>],
+        _requested_model: &str,
+    ) -> Option<CompletionHistoryRequest> {
+        None
+    }
+
+    /// Perform the prefix scan outside the P/D admission critical section.
+    fn prepare_prefill_history(
+        &self,
+        _capture: &CompletionHistoryRequest,
+        _worker: &dyn Worker,
+        _ids: &[u32],
+    ) -> Option<PrefillHistoryHint> {
+        None
+    }
+
+    /// Revalidate a prepared match without rescanning token prefixes.
+    fn prefill_history_overlap(&self, _worker: &dyn Worker, _hint: &PrefillHistoryHint) -> usize {
+        0
+    }
+
+    /// The P adapter calls this only after a complete, fresh valid handoff.
+    fn commit_prefill_handoff(&self, _worker: &dyn Worker, _observation: HistoryObservation) {}
 
     /// Ordinary and history-assisted requests share selection and reservation.
     /// Implementers without history keep their existing qualification behavior.
@@ -1348,7 +1375,9 @@ impl KvAwarePolicy {
             .filter(|_| {
                 self.params.router_temperature == 0.0 && lora_name.is_none() && cache_salt.is_none()
             })
-            .filter(|request| request.belongs_to(self.completion_history.get()));
+            .filter(|request| {
+                !request.prefill && request.belongs_to(self.completion_history.get())
+            });
         let digest = affinity_key.map(|key| key.scoped_digest(lora_name, cache_salt));
         // Re-query at most three times under registration churn. The final
         // attempt snapshots current targets and reserves using live load only.
@@ -1989,10 +2018,36 @@ impl KvAwareOps for KvAwarePolicy {
         workers: &[Arc<dyn Worker>],
         requested_model: &str,
     ) -> Option<CompletionHistoryRequest> {
-        Some(self.capture_history_registrations(workers, requested_model))
+        Some(self.capture_history_registrations(workers, requested_model, false))
     }
 
     fn observe_completion_headers(&self, worker: &dyn Worker, observation: HistoryObservation) {
+        self.commit_history_observation(worker, observation);
+    }
+
+    fn capture_prefill_history(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        requested_model: &str,
+    ) -> Option<CompletionHistoryRequest> {
+        (self.params.router_temperature == 0.0)
+            .then(|| self.capture_history_registrations(workers, requested_model, true))
+    }
+
+    fn prepare_prefill_history(
+        &self,
+        capture: &CompletionHistoryRequest,
+        worker: &dyn Worker,
+        ids: &[u32],
+    ) -> Option<PrefillHistoryHint> {
+        self.prepare_prefill_history_hint(capture, worker, ids)
+    }
+
+    fn prefill_history_overlap(&self, worker: &dyn Worker, hint: &PrefillHistoryHint) -> usize {
+        self.prefill_hint_overlap(worker, hint)
+    }
+
+    fn commit_prefill_handoff(&self, worker: &dyn Worker, observation: HistoryObservation) {
         self.commit_history_observation(worker, observation);
     }
 

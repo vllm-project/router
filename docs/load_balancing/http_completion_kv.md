@@ -55,3 +55,24 @@ process memory limit). Replacement or removal fences the old registration.
 KV Remove/Clear changes placement evidence, not the fact that the request was
 routed. An unobserved same-address engine restart cannot be identified by this
 local history. This option does not enable P/D, gRPC, IGW or Program history.
+
+### Sequential Prefill history (P/D)
+
+`--kv-aware-prefill-history` is a separate, default-off option for static,
+independently addressed DP1 HTTP Prefill workers using `kv_aware` and sequential
+NIXL pull. It accepts plain, single-prompt Completions for an explicitly matched
+model. With zero **routing** temperature, no positive event credit, and equal
+work and occupancy, the longest unexpired exact prefix can break the Prefill
+tie. A hint does not reduce the reservation. Decode selection and affinity do
+not use this history.
+
+Prefill headers do not record a hint. The router consumes the bounded 2xx body
+and checks the single Completion and its current attempt's NIXL pull metadata
+(including request IDs, remote engine, endpoint, a nonempty block group, and
+`remote_num_tokens` matching the entire prepared input, not just its first 256 IDs).
+Only the selected, still-registered P can be observed. An invalid or unsupported
+handoff does not train history or change ordinary forwarding. A later D failure
+does not undo a valid P observation; a new attempt needs its own handoff.
+This first slice covers one block group and TP1, not push, multi-rank, discovery,
+EPD, Program, Chat or adapters. It shares the 60 s / 128 observations / first
+256 IDs limits above; it does not establish residency or actual KV transfer.

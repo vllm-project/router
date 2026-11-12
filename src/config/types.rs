@@ -85,6 +85,9 @@ pub struct RouterConfig {
     /// This heuristic is separate from worker-reported KV events and session affinity.
     #[serde(default)]
     pub kv_aware_completion_history: bool,
+    /// Advisory history for plain static sequential NIXL pull Prefill, after a valid handoff.
+    #[serde(default)]
+    pub kv_aware_prefill_history: bool,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
@@ -1332,6 +1335,7 @@ impl Default for RouterConfig {
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
             kv_aware_completion_history: false,
+            kv_aware_prefill_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -2138,6 +2142,7 @@ mod tests {
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
             kv_aware_completion_history: false,
+            kv_aware_prefill_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2209,6 +2214,7 @@ mod tests {
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
             kv_aware_completion_history: false,
+            kv_aware_prefill_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2276,6 +2282,7 @@ mod tests {
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
             kv_aware_completion_history: false,
+            kv_aware_prefill_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,

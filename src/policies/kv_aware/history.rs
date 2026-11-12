@@ -1,4 +1,4 @@
-//! Advisory Regular Completion observations. A generation belongs to exactly
+//! Advisory Completion observations. A generation belongs to exactly
 //! one registered target and CacheKey within this policy; it is not a Worker UUID.
 
 use std::collections::{HashSet, VecDeque};
@@ -18,6 +18,7 @@ const TTL: Duration = Duration::from_secs(60);
 /// another Worker object at the same URL, even on a retry of the same request.
 pub struct CompletionHistoryRequest {
     registrations: HashSet<u64>,
+    pub(super) prefill: bool,
     pub(super) origin: std::sync::Weak<CompletionHistory>,
 }
 
@@ -46,6 +47,23 @@ pub struct HistoryObservation {
     pub(super) origin: std::sync::Weak<CompletionHistory>,
 }
 
+/// A prefix lookup prepared before P/D admission. It owns no load or tokens;
+/// admission rechecks its expiry and registration before using its overlap.
+#[derive(Debug, Clone)]
+pub struct PrefillHistoryHint {
+    generation: u64,
+    origin: std::sync::Weak<CompletionHistory>,
+    hit: Option<HistoryHit>,
+}
+
+impl PrefillHistoryHint {
+    /// Mint the selected P's observation from the same prepared input used for
+    /// this lookup. Call only after admission, outside its load lock.
+    pub(crate) fn observation(&self, ids: &[u32]) -> HistoryObservation {
+        HistoryObservation::new(self.generation, ids, self.origin.clone())
+    }
+}
+
 impl HistoryObservation {
     pub(super) fn new(
         generation: u64,
@@ -60,6 +78,7 @@ impl HistoryObservation {
     }
 }
 
+#[derive(Debug, Clone)]
 pub(super) struct HistoryHit {
     length: usize,
     expires: Instant,
@@ -139,13 +158,18 @@ impl KvAwarePolicy {
         &self,
         workers: &[Arc<dyn Worker>],
         requested_model: &str,
+        prefill: bool,
     ) -> CompletionHistoryRequest {
         let registrations = workers
             .iter()
             .filter_map(|worker| {
                 let b = self.targets.get(worker.url())?;
-                (worker.worker_type() == WorkerType::Regular
-                    && worker.connection_mode() == ConnectionMode::Http
+                ((if prefill {
+                    matches!(worker.worker_type(), WorkerType::Prefill { .. })
+                        && worker.dp_size().is_none_or(|size| size == 1)
+                } else {
+                    worker.worker_type() == WorkerType::Regular
+                }) && worker.connection_mode() == ConnectionMode::Http
                     && worker.dp_rank().is_none()
                     && b.target.dp_rank == 0
                     && b.is_history_worker(worker.as_ref())
@@ -157,8 +181,55 @@ impl KvAwarePolicy {
             .collect();
         CompletionHistoryRequest {
             registrations,
+            prefill,
             origin: Arc::downgrade(self.completion_history.get_or_init(Default::default)),
         }
+    }
+
+    pub(super) fn prepare_prefill_history_hint(
+        &self,
+        capture: &CompletionHistoryRequest,
+        worker: &dyn Worker,
+        ids: &[u32],
+    ) -> Option<PrefillHistoryHint> {
+        if self.params.router_temperature != 0.0 || !capture.prefill || ids.is_empty() {
+            return None;
+        }
+        let store = self.completion_history.get()?;
+        if !capture.belongs_to(Some(store)) {
+            return None;
+        }
+        let generation = {
+            let binding = self.targets.get(worker.url())?;
+            capture.generation(worker, &binding)?
+        };
+        Some(PrefillHistoryHint {
+            generation,
+            origin: capture.origin.clone(),
+            hit: store.match_prefix(generation, ids, Instant::now()),
+        })
+    }
+
+    pub(super) fn prefill_hint_overlap(
+        &self,
+        worker: &dyn Worker,
+        hint: &PrefillHistoryHint,
+    ) -> usize {
+        let Some(store) = self.completion_history.get() else {
+            return 0;
+        };
+        if self.params.router_temperature != 0.0 || !hint.origin.ptr_eq(&Arc::downgrade(store)) {
+            return 0;
+        }
+        let Some(binding) = self.targets.get(worker.url()) else {
+            return 0;
+        };
+        if binding.generation != hint.generation || !binding.is_history_worker(worker) {
+            return 0;
+        }
+        hint.hit
+            .as_ref()
+            .map_or(0, |hit| hit.len_at(Instant::now()))
     }
 
     pub(super) fn commit_history_observation(

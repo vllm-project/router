@@ -822,6 +822,7 @@ mod test_pd_routing {
                 disable_circuit_breaker: false,
                 kv_aware_session_affinity_ttl_secs: None,
                 kv_aware_completion_history: false,
+                kv_aware_prefill_history: false,
                 health_check: vllm_router_rs::config::HealthCheckConfig::default(),
                 program_scheduling: None,
                 enable_igw: false,

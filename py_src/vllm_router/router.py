@@ -87,6 +87,8 @@ class Router:
         kv_aware_completion_history: Enable regular HTTP kv_aware prompt history
             observed at successful upstream response headers, not completed inference.
             Separate from KV events and session affinity. Default: False
+        kv_aware_prefill_history: Enable advisory history after a valid static DP1
+            sequential NIXL pull Prefill handoff. Default: False.
         pd_kv_events: Static prefill KV sources as URL=ENDPOINT[,ENDPOINT...],
             one entry per worker. Endpoints are ordered by DP rank; block size is 16.
             Requires PD mode and a kv_aware prefill policy. Default: []
