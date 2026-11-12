@@ -245,6 +245,10 @@ def popen_launch_vllm_rs_grpc_worker(
     kind, prefix = resolve_worker_serve_launch(prefer_vllm_serve=prefer_vllm_serve)
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(base_gpu_id)
+    # vLLM may have mirrored the parent's CUDA mask into HIP during import.
+    # Keep the worker's narrowed mask consistent on ROCm.
+    if "HIP_VISIBLE_DEVICES" in env:
+        env["HIP_VISIBLE_DEVICES"] = str(base_gpu_id)
     serve_tail = list(extra_argv or [])
     if kv_events_zmq_port is not None and "--kv-events-config" not in serve_tail:
         serve_tail = [
