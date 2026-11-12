@@ -261,6 +261,9 @@ steps:
   # Hosts restore the digest-pinned image before the job (#363). This is the
   # L3 matrix, not the old "every trusted PR" condition. The one-mode smoke
   # lives in test-merge.yml. nightly-test includes forks.
+  # Shared MI300X jobs acquire a host lease in the agent pre-command hook. The
+  # lease wait counts against timeout_in_minutes, so keep 450 minutes: 360 for
+  # the lease plus 90 for readiness and test execution.
   - group: ":large_purple_circle: ROCm MoRI XGMI P/D"
     key: "pd-disagg-moriio-tests"
     depends_on: "upload-nightly-pipeline"
@@ -275,16 +278,14 @@ steps:
     steps:
       - label: "ROCm MoRI XGMI (read_mode={{matrix.read_mode}}, 2 GPUs)"
         key: "pd-disagg-moriio-test"
-        timeout_in_minutes: 60
+        timeout_in_minutes: 450
         matrix:
           setup:
             read_mode:
               - "true"
               - "false"
         retry:
-          automatic:
-            - exit_status: "*"
-              limit: 1
+          automatic: false
           manual:
             allowed: true
             reason: "Retry transient GPU-agent failures after inspecting the logs"
@@ -319,16 +320,14 @@ steps:
       ) ||
       ((build.source == "ui" || build.source == "api") &&
        build.env("RUN_ROCM_RDMA") == "1")
-    timeout_in_minutes: 75
+    timeout_in_minutes: 450
     matrix:
       setup:
         read_mode:
           - "true"
           - "false"
     retry:
-      automatic:
-        - exit_status: "*"
-          limit: 1
+      automatic: false
       manual:
         allowed: true
         reason: "Retry transient two-node GPU or RDMA failures after inspecting both node logs"

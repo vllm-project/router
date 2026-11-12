@@ -206,7 +206,11 @@ Builds Docker image for the router.
 - `medium_cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
 - `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation; 4-GPU router_policy c16)
 - `mithril-h100-pool`: NVIDIA H100 SXM tests (2-GPU gRPC prefix-KV perf)
-- `router_rocm_mi300_2`: dedicated two-node MI300X MoRI tests (`spawn=1`)
+- `router_rocm_mi300_2`: MoRI tests on shared MI300X hosts (`spawn=1`). The
+  `pre-command` hook acquires the host lease for `mi300_2` and `mi300_rdma` jobs;
+  their 450-minute step timeout includes up to 360 minutes waiting for the lease
+  plus 90 minutes for readiness and execution. Automatic retries are disabled for
+  these MoRI smoke/nightly jobs; inspect failures before retrying manually.
 - `default`: General purpose queue
 
 ## Adding New Tests
