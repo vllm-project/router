@@ -2,8 +2,8 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdHeldKvMode, PdKvEventSources,
+    PolicyConfig, ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -421,6 +421,12 @@ struct CliArgs {
     /// KV connector type for PD disaggregation (nixl or mooncake)
     #[arg(long, value_enum, default_value_t = KvConnector::Nixl)]
     kv_connector: KvConnector,
+    /// Additional wait in milliseconds after an empty deferred Decode commitment.
+    #[arg(long, default_value_t = 0)]
+    pd_decode_commit_wait_ms: u64,
+    /// Explicit KV ownership after completed Prefill.
+    #[arg(long, value_enum, default_value_t = PdHeldKvMode::Unknown)]
+    pd_held_kv_mode: PdHeldKvMode,
 }
 
 impl CliArgs {
@@ -686,6 +692,8 @@ impl CliArgs {
             enable_profiling: self.profile,
             profile_timeout_secs: 10, // Default profiling timeout
             kv_connector: self.kv_connector,
+            pd_decode_commit_wait_ms: self.pd_decode_commit_wait_ms,
+            pd_held_kv_mode: self.pd_held_kv_mode,
             program_scheduling,
         })
     }
@@ -850,6 +858,28 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_pd_commit_mitigation_options() {
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--vllm-pd-disaggregation",
+            "--decode",
+            "http://decode:8000",
+            "--pd-decode-commit-wait-ms",
+            "75",
+            "--pd-held-kv-mode",
+            "prefill",
+        ])
+        .unwrap();
+        let config = args
+            .to_router_config(vec![("http://prefill:8000".into(), None)])
+            .unwrap();
+        assert_eq!(config.pd_decode_commit_wait_ms, 75);
+        assert_eq!(config.pd_held_kv_mode, PdHeldKvMode::Prefill);
+        assert!(CliArgs::try_parse_from(["vllm-router", "--pd-decode-commit-wait-ms=-1"]).is_err());
+        assert!(CliArgs::try_parse_from(["vllm-router", "--pd-held-kv-mode", "guessed"]).is_err());
+    }
 
     #[test]
     fn parses_pd_kv_aware_with_affinity_ttl() {

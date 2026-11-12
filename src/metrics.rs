@@ -19,6 +19,14 @@ impl Default for PrometheusConfig {
 }
 
 pub fn init_metrics() {
+    describe_counter!(
+        "vllm_router_pd_held_kv_total",
+        "Abandoned completed Prefill hold outcomes: released, unsupported, failed, or not_held"
+    );
+    describe_histogram!(
+        "vllm_router_pd_held_kv_wait_seconds",
+        "Time spent waiting after an empty deferred Decode commitment, including cancellation"
+    );
     // Request metrics
     describe_counter!(
         "vllm_router_requests_total",
@@ -595,6 +603,15 @@ impl RouterMetrics {
         counter!("vllm_router_pd_decode_commit_total",
             "result" => result.to_owned())
         .increment(1);
+    }
+
+    /// Outcome of an abandoned Prefill hold, not of Router load cleanup.
+    pub fn record_pd_held_kv(result: &'static str) {
+        counter!("vllm_router_pd_held_kv_total", "result" => result).increment(1);
+    }
+
+    pub fn record_pd_held_kv_wait(duration: Duration) {
+        histogram!("vllm_router_pd_held_kv_wait_seconds").record(duration.as_secs_f64());
     }
 
     // Request metrics

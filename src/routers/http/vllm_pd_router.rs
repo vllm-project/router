@@ -10,7 +10,7 @@ use super::router::{hold_request_load_until_body_done, prepare_error_status, Req
 use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::backend::preprocess::{ADAPTER_FIELDS, NAMED_LORA_FIELD};
-use crate::config::KvConnector;
+use crate::config::{KvConnector, PdHeldKvMode};
 use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
@@ -31,7 +31,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -102,12 +102,73 @@ pub struct VllmPDRouter {
     intra_node_data_parallel_size: usize,
     /// KV connector type
     kv_connector: KvConnector,
+    pd_decode_commit_wait: Duration,
+    pd_held_kv_mode: PdHeldKvMode,
     /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
     /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
     nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, Value>>>,
     /// Tokenizer and tonic clients for `grpc://` prefill and decode pools.
     grpc_frontend: crate::backend::EngineFrontend,
+}
+
+/// A refused selection can be retried; a closed attempt cannot.
+#[derive(Debug, PartialEq, Eq)]
+enum DecodeCommitError {
+    NoEligibleWorker,
+    AttemptClosed,
+    InvalidSelection,
+    InvalidDeadline,
+}
+
+impl DecodeCommitError {
+    fn response(self, attempt: &PdAttempt) -> Response {
+        let (status, reason, message) = match self {
+            Self::NoEligibleWorker => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                if attempt.has_unreclaimable_hold() {
+                    "held_kv_unreclaimable"
+                } else {
+                    "no_eligible_decode_worker"
+                },
+                "No eligible decode worker before the commitment deadline",
+            ),
+            Self::AttemptClosed => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "decode_attempt_closed",
+                "Decode attempt already closed",
+            ),
+            Self::InvalidSelection => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "decode_commit_inconsistent",
+                "Committed decode worker missing from selection",
+            ),
+            Self::InvalidDeadline => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "decode_commit_invalid_deadline",
+                "Decode commitment wait exceeds the supported clock range",
+            ),
+        };
+        attempt.release();
+        (
+            status,
+            axum::Json(json!({"error": {"message": message, "reason": reason}})),
+        )
+            .into_response()
+    }
+}
+
+struct DecodeCommitRefresh {
+    tokens: Option<WorkerTokenInputs>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+/// Includes cancellation while sleeping or preparing newly discovered workers.
+struct HeldKvWait(Instant);
+impl Drop for HeldKvWait {
+    fn drop(&mut self) {
+        RouterMetrics::record_pd_held_kv_wait(self.0.elapsed());
+    }
 }
 
 /// Everything the deferred decode commitment needs at dispatch time.
@@ -302,8 +363,10 @@ fn own_grpc_decode(response: Response, attempt: &PdAttempt) -> Response {
         .get::<crate::backend::grpc::GrpcStreamTask>()
         .is_some()
     {
+        attempt.expect_decode_outcome();
         hold_request_load_until_body_done(response, RequestLoadGuard::new(None, None))
     } else {
+        attempt.record_decode_outcome(response.status().is_success());
         attempt.finish_decode();
         response
     }
@@ -324,13 +387,17 @@ fn grpc_decode_outcome(
 fn record_grpc_decode_stream_failure(
     outcome: Option<impl std::future::Future<Output = bool> + Send + 'static>,
     decode_base_url: &str,
+    attempt: &PdAttempt,
 ) {
     let Some(outcome) = outcome else {
         return;
     };
     let decode_base_url = decode_base_url.to_string();
+    let attempt = attempt.clone();
     tokio::spawn(async move {
-        if outcome.await {
+        let failed = outcome.await;
+        attempt.record_decode_outcome(!failed);
+        if failed {
             RouterMetrics::record_pd_decode_error(&decode_base_url);
         }
     });
@@ -1282,7 +1349,74 @@ impl VllmPDRouter {
         request: &Value,
         headers: Option<&HeaderMap>,
         pin_to_provisional: bool,
-    ) -> Result<Arc<dyn Worker>, (StatusCode, String)> {
+    ) -> Result<Arc<dyn Worker>, DecodeCommitError> {
+        let mut refresh = DecodeCommitRefresh {
+            tokens: input.decode_tokens.clone(),
+            deadline: None,
+        };
+        match self
+            .try_commit_decode(
+                attempt,
+                input,
+                request,
+                headers,
+                pin_to_provisional,
+                &mut refresh,
+            )
+            .await
+        {
+            Err(DecodeCommitError::NoEligibleWorker) => {}
+            result => return result,
+        }
+        if !self.pd_decode_commit_wait.is_zero() {
+            let _wait = HeldKvWait(Instant::now());
+            let deadline = tokio::time::Instant::now()
+                .checked_add(self.pd_decode_commit_wait)
+                .ok_or(DecodeCommitError::InvalidDeadline)?;
+            refresh.deadline = Some(deadline);
+            loop {
+                tokio::time::sleep_until(
+                    (tokio::time::Instant::now() + Duration::from_millis(10)).min(deadline),
+                )
+                .await;
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                let result = tokio::time::timeout_at(
+                    deadline,
+                    self.try_commit_decode(
+                        attempt,
+                        input,
+                        request,
+                        headers,
+                        pin_to_provisional,
+                        &mut refresh,
+                    ),
+                )
+                .await;
+                match result {
+                    Ok(Err(DecodeCommitError::NoEligibleWorker)) => {}
+                    Ok(result) => return result,
+                    Err(_) => break,
+                }
+            }
+        }
+        RouterMetrics::record_pd_decode_commit("empty");
+        Err(DecodeCommitError::NoEligibleWorker)
+    }
+
+    async fn try_commit_decode(
+        &self,
+        attempt: &PdAttempt,
+        input: &DecodeCommitInput,
+        request: &Value,
+        headers: Option<&HeaderMap>,
+        pin_to_provisional: bool,
+        refresh: &mut DecodeCommitRefresh,
+    ) -> Result<Arc<dyn Worker>, DecodeCommitError> {
+        if !attempt.decode_pending_commit() {
+            return Err(DecodeCommitError::AttemptClosed);
+        }
         let decode_policy = self.policy_registry.get_decode_policy();
         // Rebuild the candidates: a worker removed while Prefill ran still
         // reports its last availability on the admission-time handle, and a
@@ -1299,8 +1433,7 @@ impl VllmPDRouter {
         // live candidate immediately before selecting against the current
         // loads. An unavailable or model-mismatched worker must not consume the
         // preparation budget while a healthy Decode is ready.
-        let mut tokens = input.decode_tokens.clone();
-        if let Some(tokens) = tokens.as_mut() {
+        if let Some(tokens) = refresh.tokens.as_mut() {
             let missing: Vec<_> = candidates
                 .iter()
                 .filter(|worker| {
@@ -1336,7 +1469,7 @@ impl VllmPDRouter {
                 }
             }
         }
-        let decode_cache = tokens.as_ref().and_then(|tokens| {
+        let decode_cache = refresh.tokens.as_ref().and_then(|tokens| {
             decode_policy.prepare_cache_selection(
                 &candidates,
                 tokens,
@@ -1358,36 +1491,54 @@ impl VllmPDRouter {
             route: &input.route,
         };
         let committed = self.pd_router.pd_load.commit_decode(attempt, |loads| {
-            super::pd_router::select_decode_stage(
+            if refresh
+                .deadline
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            {
+                return None;
+            }
+            let selected = super::pd_router::select_decode_stage(
                 loads,
                 &candidates,
                 decode_policy.as_ref(),
                 &context,
-            )
+            );
+            if refresh
+                .deadline
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            {
+                if let Some(binding) = selected
+                    .as_ref()
+                    .and_then(|decision| decision.affinity.as_ref())
+                {
+                    binding.release_ref();
+                }
+                None
+            } else {
+                selected
+            }
         });
         let Some(decision) = committed else {
-            RouterMetrics::record_pd_decode_commit("empty");
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No eligible decode worker at dispatch".to_owned(),
-            ));
+            return Err(if attempt.decode_pending_commit() {
+                DecodeCommitError::NoEligibleWorker
+            } else {
+                DecodeCommitError::AttemptClosed
+            });
         };
         let outcome = if decision.endpoint == input.provisional_endpoint {
             "same"
         } else {
             "changed"
         };
-        RouterMetrics::record_pd_decode_commit(outcome);
         if let Some(affinity) = decision.affinity_outcome {
             RouterMetrics::record_pd_affinity_decision("decode", affinity);
         }
-        let Some(worker) = candidates.get(decision.worker_index).cloned() else {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Committed decode worker left the pool".to_owned(),
-            ));
-        };
+        let worker = candidates
+            .get(decision.worker_index)
+            .cloned()
+            .ok_or(DecodeCommitError::InvalidSelection)?;
         attempt.attach_decode_worker(worker.clone());
+        RouterMetrics::record_pd_decode_commit(outcome);
         debug!(
             version = 1,
             decode = %worker.url(),
@@ -1515,6 +1666,7 @@ impl VllmPDRouter {
                         index,
                         &self.pd_router.pd_load,
                         decode_worker.clone(),
+                        self.pd_held_kv_mode,
                     )
                     .await
                     {
@@ -1850,6 +2002,10 @@ impl VllmPDRouter {
             let status = response.status();
             let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
             let bytes = read_prefill_body(response, base).await?;
+            if status.is_success() {
+                // Before profiling cleanup awaits: cancellation here may abandon a hold.
+                attempt.prefill_completed(self.pd_held_kv_mode);
+            }
             Ok((status, content_type, bytes))
         }
         .await;
@@ -1882,6 +2038,7 @@ impl VllmPDRouter {
         RouterMetrics::record_pd_prefill_request(prefill_http);
         RouterMetrics::record_pd_decode_request(decode_http);
         if !decode_response.status().is_success() {
+            attempt.record_decode_outcome(false);
             RouterMetrics::record_pd_decode_error(decode_http);
         }
         let is_streaming = request
@@ -1904,6 +2061,7 @@ impl VllmPDRouter {
                     format!("Failed to read response body from {decode_base_url}: {error}")
                 })? {
                 ResponseBody::Buffered(bytes) => {
+                    attempt.record_decode_outcome(status.is_success());
                     attempt.finish_decode();
                     finalize_decode_body(
                         status,
@@ -2322,11 +2480,11 @@ impl VllmPDRouter {
                 .await
             {
                 Ok(worker) => decode_worker = worker,
-                Err((status, message)) => {
+                Err(error) => {
                     RouterMetrics::record_pd_error("server_selection");
                     RouterMetrics::record_pd_request(path);
                     RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-                    return Ok((status, message).into_response());
+                    return Ok(error.response(&attempt));
                 }
             }
         }
@@ -2530,7 +2688,10 @@ impl VllmPDRouter {
             .await;
         attempt.finish_prefill();
         let prefill_kv = match prefill_result {
-            Ok(kv) => kv,
+            Ok(kv) => {
+                attempt.prefill_completed(self.pd_held_kv_mode);
+                kv
+            }
             Err(response) => {
                 attempt.release();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -2560,12 +2721,12 @@ impl VllmPDRouter {
                     .await
                 {
                     Ok(worker) => worker,
-                    Err((status, message)) => {
+                    Err(error) => {
                         attempt.release();
                         RouterMetrics::record_pd_error("server_selection");
                         RouterMetrics::record_pd_request(path);
                         RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-                        return (status, message).into_response();
+                        return error.response(attempt);
                     }
                 }
             }
@@ -2603,7 +2764,7 @@ impl VllmPDRouter {
         RouterMetrics::record_pd_prefill_request(&prefill_base_url);
         RouterMetrics::record_pd_decode_request(&decode_base_url);
         if response.status().is_success() {
-            record_grpc_decode_stream_failure(decode_outcome, &decode_base_url);
+            record_grpc_decode_stream_failure(decode_outcome, &decode_base_url, attempt);
         } else {
             RouterMetrics::record_pd_decode_error(&decode_base_url);
         }
@@ -2677,6 +2838,7 @@ impl VllmPDRouter {
                 attempt.finish_prefill();
                 match prefill_result {
                     Ok(kv) => {
+                        attempt.prefill_completed(self.pd_held_kv_mode);
                         let (response, _, decode_outcome) = decode.await;
                         (kv, response, decode_outcome)
                     }
@@ -2701,7 +2863,10 @@ impl VllmPDRouter {
                 };
                 attempt.finish_prefill();
                 match prefill_result {
-                    Ok(kv) => (kv, response, decode_outcome),
+                    Ok(kv) => {
+                        attempt.prefill_completed(self.pd_held_kv_mode);
+                        (kv, response, decode_outcome)
+                    },
                     Err(prefill_response) => return fail(prefill_response, true),
                 }
             }
@@ -2718,7 +2883,7 @@ impl VllmPDRouter {
         RouterMetrics::record_pd_prefill_request(&prefill_base_url);
         RouterMetrics::record_pd_decode_request(&decode_base_url);
         if response.status().is_success() {
-            record_grpc_decode_stream_failure(decode_outcome, &decode_base_url);
+            record_grpc_decode_stream_failure(decode_outcome, &decode_base_url, attempt);
         } else {
             RouterMetrics::record_pd_decode_error(&decode_base_url);
         }
@@ -2970,6 +3135,9 @@ impl VllmPDRouter {
         // reqwest::Client::new() would let a stalled encoder hold the
         // request and its concurrency permit indefinitely.
         let http_client = ctx.client.clone();
+        info!(wait_ms = ctx.router_config.pd_decode_commit_wait_ms,
+            held_kv_mode = ?ctx.router_config.pd_held_kv_mode,
+            "P/D held-KV mitigation configured; engine reclamation is unsupported");
 
         if let Some(ref addr) = discovery_address {
             // Discovery mode
@@ -3016,6 +3184,10 @@ impl VllmPDRouter {
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 kv_connector,
+                pd_decode_commit_wait: Duration::from_millis(
+                    ctx.router_config.pd_decode_commit_wait_ms,
+                ),
+                pd_held_kv_mode: ctx.router_config.pd_held_kv_mode,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 grpc_frontend: crate::backend::EngineFrontend::new(),
@@ -3136,6 +3308,10 @@ impl VllmPDRouter {
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 kv_connector,
+                pd_decode_commit_wait: Duration::from_millis(
+                    ctx.router_config.pd_decode_commit_wait_ms,
+                ),
+                pd_held_kv_mode: ctx.router_config.pd_held_kv_mode,
                 mooncake_prefill_info,
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 grpc_frontend,
@@ -3699,6 +3875,398 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         url
+    }
+
+    struct PendingCommitTest {
+        router: Arc<VllmPDRouter>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+        finish: Arc<tokio::sync::Semaphore>,
+        prefill_calls: Arc<std::sync::atomic::AtomicUsize>,
+        decode_calls: Arc<std::sync::atomic::AtomicUsize>,
+        response: tokio::task::JoinHandle<Response>,
+    }
+
+    impl PendingCommitTest {
+        async fn start(wait_ms: u64) -> Self {
+            use axum::routing::post;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use tokio::sync::Semaphore;
+            let entered = Arc::new(Semaphore::new(0));
+            let finish = Arc::new(Semaphore::new(0));
+            let prefill_calls = Arc::new(AtomicUsize::new(0));
+            let decode_calls = Arc::new(AtomicUsize::new(0));
+            let prefill_url = spawn_test_server(axum::Router::new().route(
+                "/v1/completions",
+                post({
+                    let entered = entered.clone();
+                    let finish = finish.clone();
+                    let calls = prefill_calls.clone();
+                    move || {
+                        let entered = entered.clone();
+                        let finish = finish.clone();
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::Relaxed);
+                            entered.add_permits(1);
+                            finish.acquire().await.unwrap().forget();
+                            axum::Json(json!({"kv_transfer_params": {"transfer_mode": "pull"}}))
+                        }
+                    }
+                }),
+            ))
+            .await;
+            let decode_url = spawn_test_server(axum::Router::new().route(
+                "/v1/completions",
+                post({
+                    let calls = decode_calls.clone();
+                    move || {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        async { axum::Json(json!({"choices": []})) }
+                    }
+                }),
+            ))
+            .await;
+            let mut router = test_vllm_pd_router().await;
+            router.pd_decode_commit_wait = Duration::from_millis(wait_ms);
+            router
+                .policy_registry
+                .set_decode_policy(Arc::new(crate::policies::KvAwarePolicy::default()));
+            router.pin_test_token_ids(vec![1, 2, 3]);
+            let router = Arc::new(router);
+            let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                prefill_url,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ));
+            let decode: Arc<dyn Worker> =
+                Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+            router.pd_router.worker_registry.register(prefill.clone());
+            router.pd_router.worker_registry.register(decode.clone());
+            let response = tokio::spawn({
+                let router = router.clone();
+                async move {
+                    router
+                        .route_transparent(
+                            None,
+                            "/v1/completions",
+                            &Method::POST,
+                            json!({"model": "test", "prompt": "hello"}),
+                        )
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+                .await
+                .unwrap()
+                .unwrap()
+                .forget();
+            router
+                .pd_router
+                .worker_registry
+                .remove_by_url(decode.url())
+                .unwrap();
+            Self {
+                router,
+                prefill,
+                decode,
+                finish,
+                prefill_calls,
+                decode_calls,
+                response,
+            }
+        }
+
+        async fn finish_prefill(&self) {
+            self.finish.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.prefill.load() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(self.decode.load(), 0);
+            assert!(self.router.pd_router.pd_load.snapshot().is_empty());
+        }
+    }
+
+    fn p2_counter(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+        name: &str,
+        result: &str,
+    ) -> usize {
+        let prefix = format!("{name}{{result=\"{result}\"}} ");
+        handle
+            .render()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(&prefix)
+                    .and_then(|value| value.parse().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn deferred_decode_refusal_reports_unreclaimable_hold() {
+        let test = PendingCommitTest::start(0).await;
+        test.finish.add_permits(1);
+        let response = tokio::time::timeout(Duration::from_secs(5), test.response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: Value = serde_json::from_slice(&bytes)
+            .expect("commit refusal must carry a machine-readable reason");
+        assert_eq!(error["error"]["reason"], "held_kv_unreclaimable");
+        assert_eq!(test.prefill.load(), 0);
+        assert_eq!(test.decode.load(), 0);
+        assert!(test.router.pd_router.pd_load.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deferred_decode_wait_recovers_without_repeating_prefill() {
+        use std::sync::atomic::Ordering;
+        for replacement in [false, true] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _local = metrics::set_default_local_recorder(&recorder);
+            let test = PendingCommitTest::start(1000).await;
+            test.finish_prefill().await;
+            assert!(!test.response.is_finished());
+            let worker = if replacement {
+                let calls = test.decode_calls.clone();
+                let url = spawn_test_server(axum::Router::new().route(
+                    "/v1/completions",
+                    axum::routing::post(move || {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        async { axum::Json(json!({"choices": []})) }
+                    }),
+                ))
+                .await;
+                Arc::new(BasicWorker::new(url, WorkerType::Decode)) as Arc<dyn Worker>
+            } else {
+                test.decode.clone()
+            };
+            test.router
+                .pd_router
+                .worker_registry
+                .register(worker.clone());
+            let response = tokio::time::timeout(Duration::from_secs(5), test.response)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(test.prefill_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(test.decode_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(worker.load(), 0);
+            assert!(test.router.pd_router.pd_load.snapshot().is_empty());
+            assert_eq!(
+                p2_counter(&handle, "vllm_router_pd_decode_commit_total", "empty"),
+                0
+            );
+            assert_eq!(
+                p2_counter(
+                    &handle,
+                    "vllm_router_pd_decode_commit_total",
+                    if replacement { "changed" } else { "same" }
+                ),
+                1
+            );
+            assert_eq!(
+                p2_counter(&handle, "vllm_router_pd_held_kv_total", "unsupported"),
+                0
+            );
+            assert!(handle
+                .render()
+                .contains("vllm_router_pd_held_kv_wait_seconds_count 1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_decode_wait_expiry_and_cancellation_report_once() {
+        use std::sync::atomic::Ordering;
+        for cancelled in [false, true] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _local = metrics::set_default_local_recorder(&recorder);
+            let test = PendingCommitTest::start(if cancelled { 1000 } else { 30 }).await;
+            let started = Instant::now();
+            test.finish_prefill().await;
+            if cancelled {
+                test.response.abort();
+                assert!(test.response.await.unwrap_err().is_cancelled());
+                // Returning capacity later must not revive the cancelled future.
+                test.router
+                    .pd_router
+                    .worker_registry
+                    .register(test.decode.clone());
+                tokio::task::yield_now().await;
+            } else {
+                let response = tokio::time::timeout(Duration::from_secs(5), test.response)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(started.elapsed() >= Duration::from_millis(30));
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            }
+            assert_eq!(test.prefill_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(test.decode_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(test.prefill.load(), 0);
+            assert_eq!(test.decode.load(), 0);
+            assert!(test.router.pd_router.pd_load.snapshot().is_empty());
+            assert_eq!(
+                p2_counter(&handle, "vllm_router_pd_held_kv_total", "unsupported"),
+                1
+            );
+            assert_eq!(
+                p2_counter(&handle, "vllm_router_pd_decode_commit_total", "empty"),
+                usize::from(!cancelled)
+            );
+            assert!(handle
+                .render()
+                .contains("vllm_router_pd_held_kv_wait_seconds_count 1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_decode_wait_rechecks_health_and_model() {
+        use std::sync::atomic::Ordering;
+        for wrong_model in [false, true] {
+            let test = PendingCommitTest::start(if wrong_model { 30 } else { 1000 }).await;
+            let worker: Arc<dyn Worker> = if wrong_model {
+                Arc::new(
+                    BasicWorker::new(test.decode.url().to_owned(), WorkerType::Decode)
+                        .with_labels(HashMap::from([("model_id".into(), "other-model".into())])),
+                )
+            } else {
+                test.decode.set_healthy(false);
+                test.decode.clone()
+            };
+            test.router
+                .pd_router
+                .worker_registry
+                .register(worker.clone());
+            test.finish_prefill().await;
+            if !wrong_model {
+                assert!(!test.response.is_finished());
+                worker.set_healthy(true);
+            }
+            let response = tokio::time::timeout(Duration::from_secs(5), test.response)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if wrong_model {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::OK
+                }
+            );
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                test.decode_calls.load(Ordering::Relaxed),
+                usize::from(!wrong_model)
+            );
+            assert_eq!(worker.load(), 0);
+            assert!(test.router.pd_router.pd_load.snapshot().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_decode_retry_preparation_obeys_deadline() {
+        use crate::config::PolicyConfig;
+        use crate::policies::PolicyFactory;
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let url = spawn_test_server(axum::Router::new().fallback({
+            let entered = entered.clone();
+            move || {
+                let entered = entered.clone();
+                async move {
+                    entered.add_permits(1);
+                    std::future::pending::<Response>().await
+                }
+            }
+        }))
+        .await;
+        let mut router = test_vllm_pd_router().await;
+        router.pd_decode_commit_wait = Duration::from_millis(100);
+        router
+            .policy_registry
+            .set_decode_policy(PolicyFactory::create_from_config(
+                &PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    eviction_interval_secs: 3600,
+                    max_tree_size: 10000,
+                },
+                None,
+            ));
+        let p: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://p".into(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let old_d: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://old-decode".into(),
+            WorkerType::Decode,
+        ));
+        let d: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, WorkerType::Decode));
+        let request = json!({"model": "test", "prompt": "hello"});
+        let prompts: Arc<[Vec<u32>]> = Arc::from([vec![1, 2, 3]]);
+        let admission = router
+            .admit_pair_with_tokens(
+                &[p],
+                std::slice::from_ref(&old_d),
+                &request,
+                "/v1/completions",
+                None,
+                true,
+                Some(&prompts),
+                true,
+            )
+            .await
+            .unwrap();
+        let input = DecodeCommitInput::for_request(
+            DecodePoolSource::Registry,
+            admission.selection.decode.endpoint,
+            admission.decode_tokens,
+            admission.affinity_key,
+            &request,
+            "/v1/completions",
+            None,
+        );
+        admission.attempt.finish_prefill();
+        admission.attempt.prefill_completed(PdHeldKvMode::Prefill);
+        let attempt = admission.attempt;
+        let committed = router.select_and_commit_decode(&attempt, &input, &request, None, false);
+        tokio::pin!(committed);
+        // Poll to the first retry sleep before introducing the new worker.
+        assert!(futures_util::poll!(committed.as_mut()).is_pending());
+        router.pd_router.worker_registry.register(d);
+        let result = tokio::time::timeout(Duration::from_millis(500), committed)
+            .await
+            .expect("input preparation must not extend the commitment budget");
+        assert!(matches!(result, Err(DecodeCommitError::NoEligibleWorker)));
+        assert!(
+            entered.try_acquire().is_ok(),
+            "the retry must prepare the new worker"
+        );
+        assert!(attempt.decode_pending_commit());
+        attempt.release();
+        assert!(router.pd_router.pd_load.snapshot().is_empty());
     }
 
     use super::*;
@@ -6644,6 +7212,9 @@ mod tests {
 
     #[tokio::test]
     async fn prefill_parse_error_releases_decode_reservation() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         let prefill_url = spawn_test_server(
             axum::Router::new().fallback(|| async { (StatusCode::OK, "not JSON") }),
         )
@@ -6669,10 +7240,17 @@ mod tests {
         .unwrap();
         assert!(response.status().is_server_error());
         assert_eq!(decode.load(), 0);
+        assert_eq!(
+            p2_counter(&handle, "vllm_router_pd_held_kv_total", "unsupported"),
+            1
+        );
     }
 
     #[tokio::test]
     async fn buffered_logprobs_cancellation_releases_decode_reservation() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         use axum::{http::header::CONTENT_TYPE, routing::post};
         use bytes::Bytes;
         use std::{convert::Infallible, task::Poll};
@@ -6732,6 +7310,10 @@ mod tests {
         let _ = task.await;
         assert_eq!(decode_load, 1);
         assert_eq!(decode.load(), 0);
+        assert_eq!(
+            p2_counter(&handle, "vllm_router_pd_held_kv_total", "unsupported"),
+            1
+        );
     }
     #[tokio::test]
     async fn ordinary_decode_dispatch_reuses_reservation() {
@@ -6848,6 +7430,10 @@ mod tests {
                 "decode_transport",
                 "decode_timeout",
             ] {
+                let recorder =
+                    metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+                let handle = recorder.handle();
+                let _local = metrics::set_default_local_recorder(&recorder);
                 let prefill_url = if mode == "prefill_transport" {
                     "http://127.0.0.1:1".to_string()
                 } else if mode == "prefill_http" {
@@ -6917,6 +7503,11 @@ mod tests {
                     decode.load(),
                     1,
                     "response drop must not release again: {path} {mode}"
+                );
+                assert_eq!(
+                    p2_counter(&handle, "vllm_router_pd_held_kv_total", "unsupported"),
+                    usize::from(mode.starts_with("decode_")),
+                    "{path} {mode}"
                 );
                 decode.decrement_load();
             }
