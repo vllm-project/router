@@ -1157,6 +1157,7 @@ impl std::str::FromStr for PolicyConfig {
             }),
             "consistent_hash" => Ok(Self::ConsistentHash { virtual_nodes: 160 }),
             "rendezvous_hash" => Ok(Self::RendezvousHash),
+            "sticky_least_loaded" => Ok(Self::StickyLeastLoaded),
             "cache_aware" => {
                 let c = crate::policies::CacheAwareConfig::default();
                 Ok(Self::CacheAware {
@@ -1572,6 +1573,7 @@ mod tests {
             "power_of_two",
             "consistent_hash",
             "rendezvous_hash",
+            "sticky_least_loaded",
             "cache_aware",
             "kv_aware",
         ] {

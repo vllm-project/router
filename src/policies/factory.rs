@@ -25,6 +25,7 @@ impl PolicyFactory {
             PolicyConfig::KvAware { .. } => KvAwarePolicy::validate_role(&role),
             PolicyConfig::ConsistentHash { .. } => ConsistentHashPolicy::validate_role(&role),
             PolicyConfig::RendezvousHash => RendezvousHashPolicy::validate_role(&role),
+            PolicyConfig::StickyLeastLoaded => StickyLeastLoadedPolicy::validate_role(&role),
         }
     }
     /// Create a policy from configuration
@@ -121,6 +122,7 @@ mod tests {
             "power_of_two",
             "consistent_hash",
             "rendezvous_hash",
+            "sticky_least_loaded",
             "cache_aware",
             "kv_aware",
         ] {

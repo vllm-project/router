@@ -58,6 +58,7 @@ with Encode may be replaced by a compatible CLI override.
 | `random` | One independent uniform choice per item. |
 | `power_of_two` | Compare two candidates using local in-flight HTTP batch load; no new encoder polling or item reservations. |
 | `consistent_hash`, `rendezvous_hash` | Request/session affinity within the independent Encode pool. |
+| `sticky_least_loaded` | Keep each session on one Encode worker and assign new sessions by tracked session count. `/finish_session` also releases the independent Encode session. |
 | `cache_aware` | Unsupported for Encode. An explicit Encode setting fails; an inherited main setting falls back to independent `round_robin`. |
 | `kv_aware` | Unsupported for Encode. An explicit Encode setting fails; an inherited main setting falls back to independent `round_robin`. |
 
@@ -231,8 +232,8 @@ through the router instead. Unranked DP=1 and address-map-free NIXL/Example inpu
 retain their existing behavior. PD responses,
 including SSE streams, use the existing transparent forwarding path.
 
-The native Rust configuration supports static HTTP encoders with DP=1; Python
-launcher, dynamic discovery, DP>1, IGW, gRPC encoder transport, full
+The native Rust configuration supports static HTTP encoders and data-parallel consumers; Python
+launcher, dynamic discovery, IGW, gRPC encoder transport, full
 cancellation, and real GPU performance are separate follow-up work or
 validation environments.
 

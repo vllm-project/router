@@ -784,6 +784,84 @@ mod tests {
     }
 
     #[test]
+    fn sticky_encode_sessions_use_prepared_body_ids_and_finish_independently() {
+        use crate::{config::PolicyConfig, policies::StickyLeastLoadedPolicy};
+        let stage = test_stage(EpdConfig {
+            encoder_urls: vec!["http://e0".into(), "http://e1".into()],
+            encode_policy: Some(PolicyConfig::StickyLeastLoaded),
+            consumer_zmq_addrs: Default::default(),
+        });
+        let policy = stage.policy_registry.get_encode_policy().unwrap();
+        let sticky = policy
+            .as_any()
+            .downcast_ref::<StickyLeastLoadedPolicy>()
+            .unwrap();
+        let consumer = crate::policies::PolicyFactory::create_from_config(
+            &PolicyConfig::StickyLeastLoaded,
+            None,
+        );
+        stage.policy_registry.set_prefill_policy(consumer.clone());
+        let consumer_pool = vec![Arc::new(crate::core::BasicWorker::new(
+            "http://p0".into(),
+            WorkerType::Regular,
+        )) as Arc<dyn Worker>];
+        let mut body = request();
+        body["session_params"] = json!({"session_id":"body-session"});
+        body["messages"][0]["content"][0]["image_url"]["url"] =
+            Value::String(format!("data:image/png;base64,{}", "a".repeat(1024 * 1024)));
+        consumer
+            .select_worker(&consumer_pool, Some(&body.to_string()))
+            .unwrap();
+        let before = hash_key::BODY_PREPARATIONS.with(|count| count.get());
+        let chosen = stage.select_encoders(32, &body, None).unwrap();
+        assert!(chosen.iter().all(|worker| worker.url() == chosen[0].url()));
+        assert_eq!(sticky.active_session_count(), 1);
+        assert_eq!(
+            hash_key::BODY_PREPARATIONS.with(|count| count.get()) - before,
+            1
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "header-session".parse().unwrap());
+        let before = hash_key::BODY_PREPARATIONS.with(|count| count.get());
+        let second = stage.select_encoders(32, &body, Some(&headers)).unwrap();
+        assert!(second.iter().all(|worker| worker.url() == second[0].url()));
+        assert_ne!(chosen[0].url(), second[0].url());
+        assert_eq!(sticky.active_session_count(), 2);
+        assert_eq!(
+            hash_key::BODY_PREPARATIONS.with(|count| count.get()),
+            before
+        );
+        assert_eq!(
+            consumer
+                .as_any()
+                .downcast_ref::<StickyLeastLoadedPolicy>()
+                .unwrap()
+                .active_session_count(),
+            1
+        );
+        stage.policy_registry.finish_session("body-session");
+        assert_eq!(sticky.active_session_count(), 1);
+        assert_eq!(
+            consumer
+                .as_any()
+                .downcast_ref::<StickyLeastLoadedPolicy>()
+                .unwrap()
+                .active_session_count(),
+            0
+        );
+        stage.policy_registry.finish_session("header-session");
+        assert_eq!(sticky.active_session_count(), 0);
+        body.as_object_mut().unwrap().remove("session_params");
+        stage.select_encoders(32, &body, None).unwrap();
+        assert_eq!(sticky.active_session_count(), 0);
+        assert!(stage
+            .worker_registry
+            .get_by_type(&WorkerType::Encode)
+            .iter()
+            .all(|worker| worker.load() == 0 && worker.processed_requests() == 0));
+    }
+
+    #[test]
     fn power_of_two_encode_selection_uses_batch_load_without_item_reservations() {
         let stage = test_stage(EpdConfig {
             encoder_urls: vec!["http://e0".into(), "http://e1".into()],

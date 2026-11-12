@@ -1801,16 +1801,46 @@ mod tests {
     #[tokio::test]
     async fn pd_views_and_selection_ignore_encode_and_regular() {
         let router = create_test_pd_router();
+        let select = |model_id| {
+            let prefill = router.worker_registry.get_prefill_workers();
+            let decode = router.worker_registry.get_decode_workers();
+            let context = PdRequestContext {
+                prefill_inputs: None,
+                model_id,
+                legacy_policy_input: None,
+                prefill_cache: None,
+                decode_cache: None,
+                headers: None,
+                affinity_key: None,
+                lora_name: None,
+                cache_salt: None,
+                route: "/v1/chat/completions",
+            };
+            router
+                .select_and_admit(&prefill, &decode, &context)
+                .map(|(selected, _attempt)| {
+                    (
+                        prefill[selected.prefill.worker_index].clone(),
+                        decode[selected.decode.worker_index].clone(),
+                    )
+                })
+        };
         for (url, role) in [
             ("http://encoder", WorkerType::Encode),
             ("http://regular", WorkerType::Regular),
         ] {
-            router
-                .worker_registry
-                .register(Arc::new(BasicWorker::new(url.into(), role)));
+            let model = if role == WorkerType::Encode {
+                "encode-only"
+            } else {
+                "regular-only"
+            };
+            router.worker_registry.register(Arc::new(
+                BasicWorker::new(url.into(), role)
+                    .with_labels(HashMap::from([("model_id".into(), model.into())])),
+            ));
         }
         assert_eq!(router.readiness().status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(router.select_pd_pair(None, None).await.is_err());
+        assert!(select(None).is_none());
         assert!(router.get_worker_urls().is_empty());
         for (url, role) in [
             (
@@ -1821,9 +1851,12 @@ mod tests {
             ),
             ("http://decode", WorkerType::Decode),
         ] {
-            router
-                .worker_registry
-                .register(Arc::new(BasicWorker::new(url.into(), role)));
+            router.worker_registry.register(Arc::new(
+                BasicWorker::new(url.into(), role).with_labels(HashMap::from([(
+                    "model_id".into(),
+                    "consumer-model".into(),
+                )])),
+            ));
         }
         router
             .worker_registry
@@ -1836,13 +1869,10 @@ mod tests {
             router.health(Request::new(Body::empty())).await.status(),
             StatusCode::OK
         );
-        let (prefill, decode) = router.select_pd_pair(None, None).await.unwrap();
+        let (prefill, decode) = select(None).unwrap();
         assert!(matches!(prefill.worker_type(), WorkerType::Prefill { .. }));
         assert_eq!(decode.worker_type(), WorkerType::Decode);
-        assert!(router
-            .select_pd_pair(None, Some("encode-only"))
-            .await
-            .is_err());
+        assert!(select(Some("encode-only")).is_none());
     }
 
     fn create_test_worker(url: String, worker_type: WorkerType, healthy: bool) -> Box<dyn Worker> {
@@ -2146,10 +2176,10 @@ mod tests {
                 };
                 router
                     .policy_registry
-                    .set_prefill_policy(PolicyFactory::create_from_config(prefill_config));
+                    .set_prefill_policy(PolicyFactory::create_from_config(prefill_config, None));
                 router
                     .policy_registry
-                    .set_decode_policy(PolicyFactory::create_from_config(decode_config));
+                    .set_decode_policy(PolicyFactory::create_from_config(decode_config, None));
                 let prefill_policy = router.policy_registry.get_prefill_policy();
                 let decode_policy = router.policy_registry.get_decode_policy();
                 let (routing_policy, opposite_policy, role, opposite_role) = if prefill {

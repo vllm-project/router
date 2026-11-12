@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},

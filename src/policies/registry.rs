@@ -357,6 +357,9 @@ impl PolicyRegistry {
         if let Some(policy) = self.decode_policy.read().unwrap().as_ref() {
             policy.finish_session(session_id);
         }
+        if let Some(policy) = self.get_encode_policy() {
+            policy.finish_session(session_id);
+        }
     }
 
     /// Clear all policies (useful for testing). Policy rebuilds also drop
@@ -373,7 +376,8 @@ impl PolicyRegistry {
     /// and item selection share the context-before-slot lock order.
     pub fn set_encode_policy(&self, config: &PolicyConfig) -> Result<(), super::PolicyRoleError> {
         super::PolicyFactory::validate_role(config, WorkerType::Encode)?;
-        let policy = super::PolicyFactory::create_from_config(config);
+        let policy =
+            super::PolicyFactory::create_from_config(config, Some(&self.kv_affinity_table));
         self.encode_selection_context.with_selection(|| {
             *self.encode_policy.write().unwrap() = Some(policy);
         });
@@ -440,6 +444,7 @@ mod tests {
             PolicyConfig::Random,
             PolicyConfig::RoundRobin,
             PolicyConfig::RendezvousHash,
+            PolicyConfig::StickyLeastLoaded,
             PolicyConfig::ConsistentHash { virtual_nodes: 317 },
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 73,

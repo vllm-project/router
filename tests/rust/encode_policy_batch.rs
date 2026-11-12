@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 //! Encode assignment must preserve batching without inflating consumer metrics.
 use metrics::{
     Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
@@ -35,6 +37,7 @@ fn supported_configs() -> Vec<PolicyConfig> {
         },
         PolicyConfig::ConsistentHash { virtual_nodes: 317 },
         PolicyConfig::RendezvousHash,
+        PolicyConfig::StickyLeastLoaded,
     ]
 }
 
@@ -92,7 +95,7 @@ fn round_robin_context_keeps_a_contiguous_sequence_per_concurrent_request() {
 #[test]
 fn batch_policies_exclude_unhealthy_and_open_circuit_workers() {
     for config in supported_configs() {
-        let policy = PolicyFactory::create_from_config(&config);
+        let policy = PolicyFactory::create_from_config(&config, None);
         let context = SelectionContext::default();
         let pool = workers();
         pool[0].set_healthy(false);
@@ -266,7 +269,7 @@ fn incompatible_roles_are_rejected_before_selection_side_effects() {
 fn consumer_selection_keeps_each_policies_existing_accounting() {
     for config in supported_configs() {
         for size in [1, 2] {
-            let policy = PolicyFactory::create_from_config(&config);
+            let policy = PolicyFactory::create_from_config(&config, None);
             let pool: Vec<Arc<dyn Worker>> = (0..size)
                 .map(|i| {
                     Arc::new(BasicWorker::new(

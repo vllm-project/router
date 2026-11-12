@@ -366,7 +366,8 @@ impl ConfigValidator {
             RoutingMode::VllmPrefillDecode { decode_urls, .. } => decode_urls.as_slice(),
             _ => &[],
         };
-        let mut endpoints = std::collections::HashMap::new();
+        let mut endpoints = std::collections::HashSet::new();
+        let mut base_roles = std::collections::HashMap::new();
         for (role, url) in epd.encoder_urls.iter().map(|url| ("Encode", url)).chain(
             worker_urls
                 .iter()
@@ -374,7 +375,15 @@ impl ConfigValidator {
                 .chain(decode_urls.iter())
                 .map(|url| ("consumer", url)),
         ) {
-            let parsed = url::Url::parse(url).map_err(|e| ConfigError::InvalidValue {
+            // Consumer URLs may pin a DP rank. Encoders remain unexpanded HTTP
+            // endpoints; validate the actual base separately from the suffix.
+            let (base_url, rank) = match url.rsplit_once('@') {
+                Some((base, rank)) if role == "consumer" && rank.parse::<usize>().is_ok() => {
+                    (base, Some(rank.parse::<usize>().unwrap()))
+                }
+                _ => (url.as_str(), None),
+            };
+            let parsed = url::Url::parse(base_url).map_err(|e| ConfigError::InvalidValue {
                 field: "epd.worker_url".into(),
                 value: url.clone(),
                 reason: format!("Invalid EPD HTTP URL: {e}"),
@@ -390,7 +399,7 @@ impl ConfigValidator {
                 });
             }
             if url.trim() != url
-                || url.contains('@')
+                || base_url.contains('@')
                 || !parsed.username().is_empty()
                 || parsed.password().is_some()
                 || parsed.query().is_some()
@@ -399,18 +408,22 @@ impl ConfigValidator {
                 return Err(ConfigError::InvalidValue {
                     field: "epd.worker_url".into(),
                     value: url.clone(),
-                    reason: "EPD URLs must be HTTP base URLs without credentials, DP rank, query, fragment, or surrounding whitespace".into(),
+                    reason: "EPD URLs must be HTTP base URLs without credentials, query, fragment, or surrounding whitespace; only consumer URLs may pin a DP rank".into(),
                 });
             }
             // Canonical parsing also catches host case and default-port aliases.
             let key = parsed.as_str().trim_end_matches('/').to_string();
-            if let Some(previous_role) = endpoints.insert(key, role) {
+            if base_roles
+                .insert(key.clone(), role)
+                .is_some_and(|previous| previous != role)
+            {
                 return Err(ConfigError::ValidationFailed {
-                    reason: if previous_role != role {
-                        "EPD Encode and consumer URLs must not conflict".into()
-                    } else {
-                        format!("EPD duplicate {role} URL")
-                    },
+                    reason: "EPD Encode and consumer URLs must not conflict".into(),
+                });
+            }
+            if !endpoints.insert((key, rank)) {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!("EPD duplicate {role} URL"),
                 });
             }
         }
@@ -1548,7 +1561,6 @@ mod tests {
         for invalid in [
             "grpc://decode:8000",
             "http://",
-            "http://decode:8000@0",
             "http://user:password@decode:8000",
             "http://decode:8000?q=1",
             "http://decode:8000#frag",
@@ -1585,12 +1597,25 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("duplicate Encode"));
-        for unsupported in 0..4 {
+        config = static_epd_config();
+        config.intra_node_data_parallel_size = 2;
+        if let RoutingMode::VllmPrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        } = &mut config.mode
+        {
+            prefill_urls[0].0.push_str("@0");
+            decode_urls[0].push_str("@1");
+        }
+        ConfigValidator::validate_epd(&config).unwrap();
+        config.epd.as_mut().unwrap().encoder_urls[0].push_str("@0");
+        assert!(ConfigValidator::validate_epd(&config).is_err());
+        for unsupported in 0..3 {
             let mut config = static_epd_config();
             match unsupported {
-                0 => config.intra_node_data_parallel_size = 2,
-                1 => config.enable_igw = true,
-                2 => {
+                0 => config.enable_igw = true,
+                1 => {
                     config.discovery = Some(DiscoveryConfig {
                         enabled: true,
                         ..Default::default()

@@ -351,3 +351,11 @@ codegen-units = 1
 [profile.dev-opt]
 inherits = "dev"
 opt-level = 1
+
+[[test]]
+name = "workers_api"
+path = "tests/rust/workers_api.rs"
+
+[[test]]
+name = "encode_policy_batch"
+path = "tests/rust/encode_policy_batch.rs"

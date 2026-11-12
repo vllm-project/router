@@ -835,6 +835,14 @@ impl VllmPDRouter {
             .then(|| cached.identity.clone())
     }
 
+    fn selected_nixl_push_identity(&self, worker: &Arc<dyn Worker>) -> Option<Value> {
+        if self.use_discovery {
+            self.get_discovered_nixl_push_identity(worker.base_url(), worker.dp_rank())
+        } else {
+            self.get_nixl_push_identity_for_worker(worker)
+        }
+    }
+
     fn ensure_nixl_push_identity(
         &self,
         prefill_url: &str,
@@ -1308,10 +1316,9 @@ impl VllmPDRouter {
             // discovery-backed Nixl pool keeps its admission pick.
             KvConnector::Nixl => {
                 !self.use_discovery
-                    && prefill_workers.iter().all(|worker| {
-                        self.get_nixl_push_identity(worker.base_url(), worker.dp_rank())
-                            .is_none()
-                    })
+                    && prefill_workers
+                        .iter()
+                        .all(|worker| self.get_nixl_push_identity_for_worker(worker).is_none())
             }
             KvConnector::Mooncake => true,
             KvConnector::MoriIO => false,
@@ -1328,14 +1335,13 @@ impl VllmPDRouter {
     /// commitment is free to move.
     fn prefill_pinned_to_provisional(
         &self,
-        prefill_worker: &dyn Worker,
+        prefill_worker: &Arc<dyn Worker>,
         prefill_response: Option<&Value>,
     ) -> bool {
         prefill_pins_commitment(
             self.kv_connector,
             prefill_response,
-            self.get_nixl_push_identity(prefill_worker.base_url(), prefill_worker.dp_rank())
-                .is_some(),
+            self.selected_nixl_push_identity(prefill_worker).is_some(),
         )
     }
 
@@ -2387,16 +2393,14 @@ impl VllmPDRouter {
             &prefill_base_url,
             prefill_dp_rank,
             &prefill_response_json,
-            Some(&prefill_worker),
+            (!self.use_discovery).then_some(&prefill_worker),
         );
         // The Prefill response is the first point where a deferred decode
         // target can be chosen against live state without delaying dispatch:
         // the decode request body is built from this same response.
         if let Some(commit) = commit {
-            let pinned = self.prefill_pinned_to_provisional(
-                prefill_worker.as_ref(),
-                Some(&prefill_response_json),
-            );
+            let pinned =
+                self.prefill_pinned_to_provisional(&prefill_worker, Some(&prefill_response_json));
             // Score the refresh against the client body, not the encoder
             // output; without EPD the two are the same value.
             let request = commit_scoring_body(client_request.as_ref(), &original_request);
@@ -2584,8 +2588,7 @@ impl VllmPDRouter {
         };
 
         if commit.is_none() && matches!(self.kv_connector, KvConnector::Nixl) {
-            if let Some(identity) = self.get_nixl_push_identity(&prefill_base_url, prefill_dp_rank)
-            {
+            if let Some(identity) = self.get_nixl_push_identity_for_worker(&prefill_worker) {
                 let decode_params = Self::build_nixl_push_decode_params(&identity, &request_id);
                 return self
                     .process_grpc_concurrent_chat(
@@ -2627,6 +2630,12 @@ impl VllmPDRouter {
             Some(kv) => json!({ "kv_transfer_params": kv }),
             None => json!({}),
         };
+        self.maybe_cache_nixl_push_identity(
+            &prefill_base_url,
+            prefill_dp_rank,
+            &prefill_response_json,
+            Some(&prefill_worker),
+        );
 
         // Prefill is done, so the decode pool can be read live. The committed
         // worker replaces the admission-time pick for dispatch and metrics;
@@ -2634,10 +2643,8 @@ impl VllmPDRouter {
         // with, exactly as on the HTTP path.
         let decode_worker = match commit {
             Some(input) => {
-                let pinned = self.prefill_pinned_to_provisional(
-                    prefill_worker.as_ref(),
-                    Some(&prefill_response_json),
-                );
+                let pinned = self
+                    .prefill_pinned_to_provisional(&prefill_worker, Some(&prefill_response_json));
                 match self
                     .select_and_commit_decode(attempt, input, request, headers, pinned)
                     .await
@@ -2794,6 +2801,7 @@ impl VllmPDRouter {
                 &prefill_base_url,
                 prefill_worker.dp_rank(),
                 &json!({ "kv_transfer_params": kv }),
+                Some(&prefill_worker),
             );
         }
         RouterMetrics::record_pd_request(path);
@@ -2815,11 +2823,12 @@ impl VllmPDRouter {
         decode_worker: &Arc<dyn Worker>,
         path: &str,
     ) -> Option<(Value, Value, String)> {
-        if !self
-            .pd_router
-            .worker_registry
-            .get_by_url(prefill_worker.url())
-            .is_some_and(|current| Arc::ptr_eq(&current, prefill_worker))
+        if !self.use_discovery
+            && !self
+                .pd_router
+                .worker_registry
+                .get_by_url(prefill_worker.url())
+                .is_some_and(|current| Arc::ptr_eq(&current, prefill_worker))
         {
             return None;
         }
@@ -2827,7 +2836,7 @@ impl VllmPDRouter {
         let prefill_base_url = prefill_worker.base_url().to_string();
         let prefill_dp_rank = prefill_worker.dp_rank();
         let identity = if matches!(self.kv_connector, KvConnector::Nixl) {
-            Some(self.get_nixl_push_identity_for_worker(prefill_worker)?)
+            Some(self.selected_nixl_push_identity(prefill_worker)?)
         } else {
             None
         };
@@ -3005,7 +3014,7 @@ impl VllmPDRouter {
                 &prefill_base_url,
                 prefill_dp_rank,
                 prefill_json,
-                Some(&prefill_worker),
+                (!self.use_discovery).then_some(&prefill_worker),
             );
         }
         // Prefill succeeded and consumed the embeddings; the pending EC
@@ -3769,6 +3778,7 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
     // One-shot, thread-local scheduling point: a deferred response can write
@@ -3853,8 +3863,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nixl_identity_generation_preserves_other_dp_ranks() {
+    #[tokio::test]
+    async fn nixl_identity_generation_preserves_other_dp_ranks() {
         let router = test_vllm_pd_router().await;
         let base = "http://prefill:8000";
         let rank_worker = |rank| -> Arc<dyn Worker> {
@@ -3958,8 +3968,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nixl_identity_cache_does_not_retain_retired_worker() {
+    #[tokio::test]
+    async fn nixl_identity_cache_does_not_retain_retired_worker() {
         let router = test_vllm_pd_router().await;
         let url = "http://prefill:8000";
         let previous: Arc<dyn Worker> = Arc::new(BasicWorker::new(
@@ -4652,8 +4662,6 @@ mod tests {
         url
     }
 
-    use super::*;
-
     #[tokio::test]
     async fn prefill_body_limit_rejects_oversized_responses() {
         let url = spawn_test_server(axum::Router::new().fallback(|| async {
@@ -5088,6 +5096,32 @@ mod tests {
                     .get_discovered_nixl_push_identity(&format!("http://{address}/p"), None)
                     .is_some(),
                 push
+            );
+            let prefills = router
+                .discovery_candidates(
+                    vec![(format!("{address}/p"), "P".into(), None)],
+                    ServiceType::Prefill,
+                )
+                .unwrap();
+            let decodes = router
+                .discovery_candidates(
+                    vec![(format!("{address}/d"), "D".into(), None)],
+                    ServiceType::Decode,
+                )
+                .unwrap();
+            assert!(router.worker_registry().get_all().is_empty());
+            assert_eq!(
+                router
+                    .try_build_concurrent_requests(
+                        &json!({"messages": []}),
+                        &prefills[0],
+                        &decodes[0],
+                        "/v1/chat/completions",
+                    )
+                    .await
+                    .is_some(),
+                push,
+                "discovered workers must reuse discovery identities without registry membership"
             );
             server.abort();
         }
@@ -6292,6 +6326,11 @@ mod tests {
                         "transfer_mode": "push", "remote_engine_id": "P",
                         "remote_host": "127.0.0.1", "remote_port": 1234,
                     }),
+                    router
+                        .worker_registry()
+                        .get_by_url(&p)
+                        .filter(|_| !discovered)
+                        .as_ref(),
                 );
             }
             let request_router = router.clone();
@@ -6819,6 +6858,7 @@ mod tests {
             },
             epd: Some(EpdConfig {
                 encoder_urls: vec![encoder],
+                encode_policy: None,
                 consumer_zmq_addrs: Default::default(),
             }),
             worker_startup_timeout_secs: 5,
@@ -7431,6 +7471,7 @@ mod tests {
                     Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
                 let unrelated = crate::core::WorkerLoadGuard::new(decode.as_ref());
                 let router = test_vllm_pd_router().await;
+                router.pd_router.worker_registry.register(prefill.clone());
                 if concurrent {
                     router.store_nixl_info(
                         prefill.base_url(),
@@ -7439,9 +7480,9 @@ mod tests {
                             "transfer_mode": "push", "remote_engine_id": "test-prefill",
                             "remote_host": "127.0.0.1", "remote_port": 1234,
                         }),
+                        Some(&prefill),
                     );
                 }
-                router.pd_router.worker_registry.register(prefill.clone());
                 router.pd_router.worker_registry.register(decode.clone());
                 let mut request = tokio::spawn(async move {
                     router

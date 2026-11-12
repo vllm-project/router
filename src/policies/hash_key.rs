@@ -12,6 +12,11 @@ use tracing::debug;
 // NUL cannot occur in an HTTP header name. This key exists only in policy data
 // and cannot be supplied by HeaderMap or forwarded to a backend.
 const PREPARED_KEY: &str = "\0router-prepared-hash-key";
+const PREPARED_SESSION: &str = "\0router-prepared-session-id";
+
+pub(crate) fn prepared_key(headers: Option<&RequestHeaders>) -> Option<&str> {
+    headers?.get(PREPARED_KEY).map(String::as_str)
+}
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 thread_local! {
@@ -24,11 +29,21 @@ pub(crate) fn prepare_headers(
     mut headers: RequestHeaders,
     body: impl FnOnce() -> String,
 ) -> RequestHeaders {
-    let key = extract_hash_key_from_headers(&headers).unwrap_or_else(|| {
-        #[cfg(all(test, feature = "cpu", feature = "ready"))]
-        BODY_PREPARATIONS.with(|count| count.set(count.get() + 1));
-        extract_hash_key(Some(&body()), None)
-    });
+    let (key, session_id) = match extract_hash_key_from_headers(&headers) {
+        Some(key) => (key, extract_session_id(None, Some(&headers))),
+        None => {
+            #[cfg(all(test, feature = "cpu", feature = "ready"))]
+            BODY_PREPARATIONS.with(|count| count.set(count.get() + 1));
+            let body = body();
+            (
+                extract_hash_key(Some(&body), None),
+                extract_session_id(Some(&body), None),
+            )
+        }
+    };
+    if let Some(session_id) = session_id {
+        headers.insert(PREPARED_SESSION.into(), session_id);
+    }
     headers.insert(PREPARED_KEY.into(), key);
     headers
 }
@@ -104,6 +119,9 @@ pub(crate) fn extract_session_id(
     request_text: Option<&str>,
     headers: Option<&RequestHeaders>,
 ) -> Option<String> {
+    if let Some(headers) = headers.filter(|headers| headers.contains_key(PREPARED_KEY)) {
+        return headers.get(PREPARED_SESSION).cloned();
+    }
     if let Some(hdrs) = headers {
         for header_name in SESSION_HEADER_NAMES {
             if let Some(value) = hdrs.get(*header_name) {

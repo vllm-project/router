@@ -209,8 +209,8 @@ async fn igw_replacement_cleans_previous_consumer_affinity_without_changing_coun
             };
             let workers = Arc::new(WorkerRegistry::new());
             let policies = Arc::new(PolicyRegistry::new(cache_config.clone()));
-            policies.set_prefill_policy(PolicyFactory::create_from_config(&cache_config));
-            policies.set_decode_policy(PolicyFactory::create_from_config(&cache_config));
+            policies.set_prefill_policy(PolicyFactory::create_from_config(&cache_config, None));
+            policies.set_decode_policy(PolicyFactory::create_from_config(&cache_config, None));
             let manager = RouterManager::new(
                 config,
                 reqwest::Client::new(),

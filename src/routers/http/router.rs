@@ -2398,12 +2398,10 @@ impl Router {
             // Find and remove all workers with matching prefix
             let all_workers = self.worker_registry.get_all();
             for w in all_workers.iter() {
-                if w.url().starts_with(&worker_url_prefix) {
+                if w.worker_type().is_consumer() && w.url().starts_with(&worker_url_prefix) {
                     let removed_url = w.url().to_string();
 
-                    if let Some(removed) = self.worker_registry.remove_by_url(&removed_url) {
-                        let model_id = removed.model_id().to_string();
-                        let is_consumer = removed.worker_type().is_consumer();
+                    if let Some(removed_worker) = self.worker_registry.remove_by_url(&removed_url) {
                         self.frontend.remove_worker(&removed_url);
                         info!("Removed worker: {}", removed_url);
                         removed_workers.push(removed_url);
@@ -2427,7 +2425,9 @@ impl Router {
                 self.policy_registry
                     .notify_consumer_removed(removed_worker.as_ref());
 
-                RouterMetrics::set_active_workers(self.worker_registry.get_regular_workers(None).len());
+                RouterMetrics::set_active_workers(
+                    self.worker_registry.get_regular_workers(None).len(),
+                );
                 self.remove_kv_worker(worker_url, &[worker_url.to_string()]);
             } else {
                 warn!("Worker {} not found, skipping removal", worker_url);
@@ -5432,13 +5432,36 @@ mod tests {
             .get_worker_urls_for_model(Some("encode-only"))
             .is_empty());
         assert!(router
-            .select_worker_for_model(Some("encode-only"), None, None)
+            .select_worker_for_model(
+                Some("encode-only"),
+                &router.available_workers(Some("encode-only")),
+                None,
+                None,
+                KvRequestTokens::Shared(None),
+                None,
+                None,
+                None,
+                None,
+                &[]
+            )
             .is_none());
         for _ in 0..8 {
             assert_eq!(
                 router
-                    .select_worker_for_model(None, None, None)
+                    .select_worker_for_model(
+                        None,
+                        &router.available_workers(None),
+                        None,
+                        None,
+                        KvRequestTokens::Shared(None),
+                        None,
+                        None,
+                        None,
+                        None,
+                        &[]
+                    )
                     .unwrap()
+                    .worker
                     .worker_type(),
                 WorkerType::Regular
             );
@@ -5929,8 +5952,11 @@ mod tests {
         router.epd = Some(super::super::epd::EncoderStage::new(
             crate::config::EpdConfig {
                 encoder_urls: vec!["http://unused".into()],
+                encode_policy: None,
                 consumer_zmq_addrs: Default::default(),
             },
+            router.worker_registry.clone(),
+            router.policy_registry.clone(),
         ));
         let mut headers = HeaderMap::new();
         headers.insert("keep-alive", "timeout=5".parse().unwrap());
