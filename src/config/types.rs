@@ -1179,11 +1179,12 @@ impl std::str::FromStr for PolicyConfig {
     }
 }
 
+/// Source of an explicit Encode policy. Inheritance is determined from an
+/// absent `EpdConfig::encode_policy` and cannot produce a role-compatibility error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodePolicySource {
     ExplicitCli,
     ExplicitJson,
-    InheritedMain,
 }
 
 fn default_kv_penalty_host() -> f64 {
@@ -1516,8 +1517,7 @@ mod tests {
                 let resolution = ConfigValidator::resolve_encode_policy(
                     &epd,
                     &main,
-                    EncodePolicySource::InheritedMain,
-                    "RouterConfig.policy",
+                    EncodePolicySource::ExplicitJson,
                 )
                 .unwrap();
                 assert_eq!(resolution.policy, main);

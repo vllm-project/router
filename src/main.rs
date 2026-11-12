@@ -647,12 +647,9 @@ impl CliArgs {
                 &policy,
                 if self.encode_policy.is_some() {
                     EncodePolicySource::ExplicitCli
-                } else if epd.encode_policy.is_some() {
-                    EncodePolicySource::ExplicitJson
                 } else {
-                    EncodePolicySource::InheritedMain
+                    EncodePolicySource::ExplicitJson
                 },
-                "--policy",
             )?;
         }
         // Build RouterConfig
@@ -941,7 +938,6 @@ mod tests {
                         assert!(message.contains(match source {
                             EncodePolicySource::ExplicitCli => "--encode-policy",
                             EncodePolicySource::ExplicitJson => "epd.encode_policy",
-                            EncodePolicySource::InheritedMain => unreachable!(),
                         }));
                     }
                     other => panic!("{other}"),

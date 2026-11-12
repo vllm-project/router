@@ -161,7 +161,6 @@ let resolution = ConfigValidator::resolve_encode_policy(
     &epd,
     &main,
     EncodePolicySource::ExplicitJson,
-    "RouterConfig.policy",
 )?;
 let effective: &PolicyConfig = &resolution.policy;
 ```

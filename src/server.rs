@@ -99,12 +99,7 @@ impl AppContext {
             let encode_resolution = crate::config::ConfigValidator::resolve_encode_policy(
                 epd,
                 &router_config.policy,
-                if epd.encode_policy.is_some() {
-                    crate::config::EncodePolicySource::ExplicitJson
-                } else {
-                    crate::config::EncodePolicySource::InheritedMain
-                },
-                "RouterConfig.policy",
+                crate::config::EncodePolicySource::ExplicitJson,
             )
             .map_err(|error| error.to_string())?;
             if let Some(fallback) = &encode_resolution.fallback {

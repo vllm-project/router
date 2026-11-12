@@ -24,12 +24,12 @@ impl ConfigValidator {
     /// Explicit Encode policies remain strict. An unset Encode policy inherits
     /// the main policy when it supports the Encode role; otherwise Encode uses
     /// an independent round-robin instance while the consumer policy remains
-    /// unchanged.
+    /// unchanged. `explicit_origin` describes the source only when
+    /// `epd.encode_policy` is set.
     pub fn resolve_encode_policy(
         epd: &EpdConfig,
         main: &PolicyConfig,
-        origin: EncodePolicySource,
-        main_source: &str,
+        explicit_origin: EncodePolicySource,
     ) -> ConfigResult<EncodePolicyResolution> {
         let candidate = epd.effective_encode_policy(main);
         Self::validate_policy(candidate)?;
@@ -46,7 +46,7 @@ impl ConfigValidator {
             Err(error) => error,
         };
 
-        if epd.encode_policy.is_none() && origin == EncodePolicySource::InheritedMain {
+        if epd.encode_policy.is_none() {
             return Ok(EncodePolicyResolution {
                 policy: PolicyConfig::RoundRobin,
                 fallback: Some(EncodePolicyFallback {
@@ -58,26 +58,17 @@ impl ConfigValidator {
 
         Err(Self::unsupported_encode_policy_error(
             error,
-            origin,
-            main_source,
+            explicit_origin,
         ))
     }
 
     fn unsupported_encode_policy_error(
         error: crate::policies::PolicyRoleError,
         origin: EncodePolicySource,
-        main_source: &str,
     ) -> ConfigError {
         let source = match origin {
-            EncodePolicySource::ExplicitCli => {
-                "explicitly configured by --encode-policy".to_string()
-            }
-            EncodePolicySource::ExplicitJson => {
-                "explicitly configured by epd.encode_policy".to_string()
-            }
-            EncodePolicySource::InheritedMain => {
-                format!("inherited from {main_source} because encode_policy is unset")
-            }
+            EncodePolicySource::ExplicitCli => "explicitly configured by --encode-policy",
+            EncodePolicySource::ExplicitJson => "explicitly configured by epd.encode_policy",
         };
         ConfigError::UnsupportedEncodePolicy {
             policy: error.policy,
@@ -340,16 +331,7 @@ impl ConfigValidator {
             return Ok(());
         };
         Self::validate_policy(&config.policy)?;
-        Self::resolve_encode_policy(
-            epd,
-            &config.policy,
-            if epd.encode_policy.is_some() {
-                EncodePolicySource::ExplicitJson
-            } else {
-                EncodePolicySource::InheritedMain
-            },
-            "RouterConfig.policy",
-        )?;
+        Self::resolve_encode_policy(epd, &config.policy, EncodePolicySource::ExplicitJson)?;
         let worker_urls: Vec<&String> = match &config.mode {
             RoutingMode::Regular { worker_urls } => worker_urls.iter().collect(),
             RoutingMode::VllmPrefillDecode {
@@ -1197,8 +1179,7 @@ mod tests {
             let resolution = ConfigValidator::resolve_encode_policy(
                 &epd,
                 &main,
-                EncodePolicySource::InheritedMain,
-                "RouterConfig.policy",
+                EncodePolicySource::ExplicitJson,
             )
             .unwrap();
             assert_eq!(resolution.policy, PolicyConfig::RoundRobin);
@@ -1221,8 +1202,7 @@ mod tests {
                 ConfigValidator::resolve_encode_policy(
                     &epd,
                     &main,
-                    EncodePolicySource::InheritedMain,
-                    "RouterConfig.policy",
+                    EncodePolicySource::ExplicitJson,
                 ),
                 Err(ConfigError::InvalidValue { .. })
             ));
