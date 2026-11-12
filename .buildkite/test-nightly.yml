@@ -285,9 +285,7 @@ steps:
               - "true"
               - "false"
         retry:
-          automatic:
-            - exit_status: "*"
-              limit: 1
+          automatic: false
           manual:
             allowed: true
             reason: "Retry transient GPU-agent failures after inspecting the logs"
@@ -329,9 +327,7 @@ steps:
           - "true"
           - "false"
     retry:
-      automatic:
-        - exit_status: "*"
-          limit: 1
+      automatic: false
       manual:
         allowed: true
         reason: "Retry transient two-node GPU or RDMA failures after inspecting both node logs"

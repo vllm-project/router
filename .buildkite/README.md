@@ -209,7 +209,8 @@ Builds Docker image for the router.
 - `router_rocm_mi300_2`: MoRI tests on shared MI300X hosts (`spawn=1`). The
   `pre-command` hook acquires the host lease for `mi300_2` and `mi300_rdma` jobs;
   their 450-minute step timeout includes up to 360 minutes waiting for the lease
-  plus 90 minutes for readiness and execution.
+  plus 90 minutes for readiness and execution. Automatic retries are disabled for
+  these MoRI smoke/nightly jobs; inspect failures before retrying manually.
 - `default`: General purpose queue
 
 ## Adding New Tests
