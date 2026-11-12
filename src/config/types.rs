@@ -919,7 +919,7 @@ pub struct PdKvEventSources {
     pub model: Option<String>,
     /// Router-managed cache layout for this prefill worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hybrid: Option<crate::kv_index::hybrid_capability::HybridCapabilities>,
+    pub hybrid: Option<crate::kv_index::hybrid::HybridCapabilities>,
     /// Decode base URLs explicitly verified for this hybrid prefill worker.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compatible_decode_urls: Vec<String>,
@@ -1094,7 +1094,7 @@ pub struct StaticKvEventSources {
     pub model: String,
     /// Router-managed hybrid layout and per-rank publisher identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hybrid: Option<crate::kv_index::hybrid_capability::HybridCapabilities>,
+    pub hybrid: Option<crate::kv_index::hybrid::HybridCapabilities>,
 }
 
 impl PolicyConfig {

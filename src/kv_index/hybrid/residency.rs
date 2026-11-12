@@ -1,514 +1,140 @@
-//! Atomic, fail-closed hybrid event state for one worker rank.
+//! What this rank currently holds: claims per chain and page evidence.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use parking_lot::RwLock;
+use crate::kv_hash::SequenceHash;
+use crate::kv_index::StorageTier;
 
-use super::hybrid::{align_down, common_reusable_tokens, HybridGroupKind, HybridGroupView};
-use super::wire::{BlockStored, ExternalBlockHash};
-use super::{KVEvent, KVEventBatch, Locality, RoutableTarget, StorageTier, TierMatch};
-use crate::kv_hash::{BlockKeyGenerator, SequenceHash};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HybridEventGroup {
-    pub group_idx: u32,
-    /// The verified cache block size in tokens, not the hash granularity.
-    pub block_size: u32,
-    pub kind: HybridGroupKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HybridEventError {
-    InvalidLayout,
-    Untrusted,
-    Sequence,
-    InvalidBatch,
-    Capacity,
-}
-
-struct State {
+pub(super) struct State {
     /// The next sequence in a continuous, source-bound event stream.
-    next_seq: Option<u64>,
+    pub(super) next_seq: Option<u64>,
     /// Partial replay must never be visible to routing.
-    visible: bool,
-    claims: HashSet<(u32, SequenceHash)>,
+    pub(super) visible: bool,
+    /// Claims per cache identity: `None` is the base model's chain, a name is
+    /// that adapter's chain. The engine seeds block hashes with the adapter
+    /// identity, so the two never share a chain and neither can credit the
+    /// other.
+    pub(super) claims: HashMap<Option<String>, HashMap<(u32, SequenceHash), TierSet>>,
+    /// Groups that have published at least one page hash, per identity. A group
+    /// that only publishes key-only stores reports no addressable page, so it
+    /// cannot bound the shared prefix.
+    pub(super) page_evidence: HashMap<Option<String>, HashSet<u32>>,
 }
 
-/// A bounded index for one verified identity, worker, rank and incarnation.
-/// Stores and removals across all groups share one lock and one sequence.
-pub struct HybridEventIndex {
-    target: RoutableTarget,
-    groups: Vec<HybridEventGroup>,
-    keys: BlockKeyGenerator,
-    /// Layout-declared restore-time recomputation window (vLLM
-    /// `prefix_replay_tokens`). It applies to the whole layout: a group that
-    /// publishes no events can still make this window mandatory.
-    replay_tokens: u32,
-    max_entries: usize,
-    state: RwLock<State>,
-}
+/// The tiers one page is resident on. A store adds a tier, a removal clears
+/// only the tier it names, and the best remaining tier is what the page is
+/// credited at.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct TierSet(u8);
 
-impl HybridEventIndex {
-    /// Test constructor keyed by a `PYTHONHASHSEED` instead of a root digest.
-    #[cfg(test)]
-    pub fn new(
-        target: RoutableTarget,
-        groups: Vec<HybridEventGroup>,
-        hash_block_size: u32,
-        hash_seed: u32,
-        max_entries: usize,
-    ) -> Result<Self, HybridEventError> {
-        if hash_block_size == 0 {
-            return Err(HybridEventError::InvalidLayout);
+impl TierSet {
+    const DEVICE: u8 = 1 << 0;
+    const HOST: u8 = 1 << 1;
+    const DISK: u8 = 1 << 2;
+    const EXTERNAL: u8 = 1 << 3;
+
+    fn bit(tier: StorageTier) -> u8 {
+        match tier {
+            StorageTier::Device => Self::DEVICE,
+            StorageTier::HostPinned => Self::HOST,
+            StorageTier::Disk => Self::DISK,
+            StorageTier::External => Self::EXTERNAL,
         }
-        Self::with_keys(
-            target,
-            groups,
-            max_entries,
-            BlockKeyGenerator::new(hash_block_size as usize, u64::from(hash_seed)),
-        )
     }
 
-    /// The root digest and group layout must come from the same verified engine.
-    pub fn new_with_root_hash(
-        target: RoutableTarget,
-        groups: Vec<HybridEventGroup>,
-        hash_block_size: u32,
-        root_hash: SequenceHash,
-        max_entries: usize,
-    ) -> Result<Self, HybridEventError> {
-        if hash_block_size == 0 {
-            return Err(HybridEventError::InvalidLayout);
-        }
-        Self::with_keys(
-            target,
-            groups,
-            max_entries,
-            BlockKeyGenerator::from_root_hash(hash_block_size as usize, root_hash),
-        )
+    pub(super) fn with(mut self, tier: StorageTier) -> Self {
+        self.0 |= Self::bit(tier);
+        self
     }
 
-    fn with_keys(
-        target: RoutableTarget,
-        groups: Vec<HybridEventGroup>,
-        max_entries: usize,
-        keys: BlockKeyGenerator,
-    ) -> Result<Self, HybridEventError> {
-        let mut ids = HashSet::new();
-        if groups.is_empty()
-            || groups.len() > 64
-            || max_entries == 0
-            || groups.iter().any(|group| {
-                group.block_size == 0
-                    || !(group.block_size as usize).is_multiple_of(keys.block_size())
-                    || !ids.insert(group.group_idx)
-                    // Compressed state covers `tokens_per_state` tokens, so the
-                    // group boundary has to be a multiple of that ratio.
-                    || match group.kind {
-                        HybridGroupKind::SlidingWindow { window_tokens } => window_tokens == 0,
-                        HybridGroupKind::CompressedFullAttention { tokens_per_state } => {
-                            tokens_per_state == 0
-                                || !group.block_size.is_multiple_of(tokens_per_state)
-                        }
-                        _ => false,
-                    }
-            })
-        {
-            return Err(HybridEventError::InvalidLayout);
-        }
-        Ok(Self {
-            target,
-            groups,
-            keys,
-            replay_tokens: 0,
-            max_entries,
-            state: RwLock::new(State {
-                next_seq: None,
-                visible: false,
-                claims: HashSet::new(),
-            }),
-        })
+    pub(super) fn without(mut self, tier: StorageTier) -> Self {
+        self.0 &= !Self::bit(tier);
+        self
     }
 
-    /// Declare the layout's restore-time recomputation window
-    /// (`prefix_replay_tokens`); it lowers the credit for the whole layout.
-    pub fn with_replay_tokens(mut self, replay_tokens: u32) -> Result<Self, HybridEventError> {
-        let hash_block_size = self.keys.block_size();
-        if replay_tokens > 0 && (hash_block_size == 0 || replay_tokens > u32::MAX / 2) {
-            return Err(HybridEventError::InvalidLayout);
-        }
-        self.replay_tokens = replay_tokens;
-        Ok(self)
+    pub(super) fn is_empty(self) -> bool {
+        self.0 == 0
     }
 
-    pub fn target(&self) -> &RoutableTarget {
-        &self.target
-    }
-
-    /// Begin tracking from an externally established empty-cache barrier.
-    /// This is not a snapshot or replay implementation. Never call it merely
-    /// because a subscription started or a gap occurred.
-    pub fn begin_empty(&self, next_seq: u64) {
-        let mut state = self.state.write();
-        state.claims.clear();
-        state.next_seq = Some(next_seq);
-        state.visible = true;
-    }
-
-    /// Start a full replay from an externally verified empty origin. Queries
-    /// remain cold until the caller verifies a continuous replay watermark.
-    pub fn begin_replay(&self, next_seq: u64) {
-        let mut state = self.state.write();
-        state.claims.clear();
-        state.next_seq = Some(next_seq);
-        state.visible = false;
-    }
-
-    /// Publish a complete replay atomically. The caller must obtain the
-    /// watermark from the source's replay/live handoff, not infer it locally.
-    pub fn finish_replay(&self, expected_next_seq: u64) -> Result<(), HybridEventError> {
-        let mut state = self.state.write();
-        if state.visible || state.next_seq != Some(expected_next_seq) {
-            return Self::fail(&mut state, HybridEventError::Sequence);
-        }
-        state.visible = true;
-        Ok(())
-    }
-
-    /// Discard all claims on a gap, restart, lease retirement or lost event.
-    pub fn invalidate(&self) {
-        let mut state = self.state.write();
-        state.claims.clear();
-        state.next_seq = None;
-        state.visible = false;
-    }
-
-    /// Decode a wire payload before applying it. Corrupt payloads invalidate
-    /// all groups, including claims from previously accepted batches.
-    ///
-    pub fn apply_payload(&self, seq: u64, payload: &[u8]) -> Result<(), HybridEventError> {
-        let batch = match crate::kv_index::decode_batch(payload) {
-            Ok(batch) => batch,
-            Err(error) => {
-                tracing::warn!(
-                    error,
-                    bytes = payload.len(),
-                    "hybrid payload did not decode"
-                );
-                self.invalidate();
-                return Err(HybridEventError::InvalidBatch);
-            }
-        };
-        self.apply_batch(seq, &batch)
-    }
-
-    /// Apply an ordered batch atomically. A sequence mismatch, including a
-    /// duplicate, invalidates the view: without an independently verified
-    /// publisher epoch, a repeated sequence can also mean a restart.
-    pub fn apply_batch(&self, seq: u64, batch: &KVEventBatch) -> Result<(), HybridEventError> {
-        let mut state = self.state.write();
-        let Some(next_seq) = state.next_seq else {
-            return Err(HybridEventError::Untrusted);
-        };
-        if seq != next_seq || seq == u64::MAX {
-            return Self::fail(&mut state, HybridEventError::Sequence);
-        }
-        if batch.data_parallel_rank != Some(self.target.dp_rank)
-            || !batch.ts.is_finite()
-            || batch.ts < 0.0
-        {
-            return Self::fail(&mut state, HybridEventError::InvalidBatch);
-        }
-        for event in &batch.events {
-            let result = match event {
-                KVEvent::BlockStored(store) => {
-                    // An engine may publish several page sizes for one group
-                    // index (V4-class compressors store 4-token pages next to
-                    // the group's own pages). Only the declared granularity is
-                    // addressable by the layout; the other pages cover the same
-                    // tokens and add no boundary information.
-                    let Some(group) = self
-                        .groups
-                        .iter()
-                        .find(|group| store.group_idx == Some(group.group_idx))
-                    else {
-                        return Self::fail(&mut state, HybridEventError::InvalidBatch);
-                    };
-                    if store.block_size != group.block_size {
-                        tracing::debug!(
-                            group_idx = group.group_idx,
-                            declared = group.block_size,
-                            published = store.block_size,
-                            "hybrid group published a secondary page size"
-                        );
-                        continue;
-                    }
-                    if store.medium.as_deref() != Some("GPU")
-                        || store.locality.as_deref().is_some_and(|s| s != "LOCAL")
-                        || store.ownership.is_some()
-                        || store.lora_id.is_some()
-                        || store.lora_name.is_some()
-                        || !event_kind_matches(group.kind, store)
-                        || !stored_shape_matches(group.kind, store)
-                        || store.extra_keys.as_ref().is_some_and(|keys| {
-                            keys.len() != store.block_hashes.len()
-                                || keys.iter().any(|key| !key.is_nil())
-                        })
-                        || store
-                            .parent_block_hash
-                            .as_ref()
-                            .is_some_and(|hash| sequence_hash(hash).is_none())
-                    {
-                        Err(HybridEventError::InvalidBatch)
-                    } else {
-                        let Ok(keys) = self.stored_keys(group, store) else {
-                            return Self::fail(&mut state, HybridEventError::InvalidBatch);
-                        };
-                        let group_idx = group.group_idx;
-                        for hash in keys {
-                            let key = (group_idx, hash);
-                            if !state.claims.contains(&key)
-                                && state.claims.len() >= self.max_entries
-                            {
-                                return Self::fail(&mut state, HybridEventError::Capacity);
-                            }
-                            state.claims.insert(key);
-                        }
-                        Ok(())
-                    }
-                }
-                KVEvent::BlockRemoved(remove) => {
-                    if remove.medium.as_deref() != Some("GPU")
-                        || remove.locality.as_deref().is_some_and(|s| s != "LOCAL")
-                        || remove.ownership.is_some()
-                        || !self
-                            .groups
-                            .iter()
-                            .any(|group| remove.group_idx == Some(group.group_idx))
-                        || remove.block_hashes.is_empty()
-                    {
-                        Err(HybridEventError::InvalidBatch)
-                    } else {
-                        let group_idx = remove.group_idx.expect("validated group");
-                        for hash in &remove.block_hashes {
-                            let Some(hash) = sequence_hash(hash) else {
-                                return Self::fail(&mut state, HybridEventError::InvalidBatch);
-                            };
-                            state.claims.remove(&(group_idx, hash));
-                        }
-                        Ok(())
-                    }
-                }
-                KVEvent::AllBlocksCleared(_) => {
-                    state.claims.clear();
-                    Ok(())
-                }
-            };
-            if let Err(error) = result {
-                return Self::fail(&mut state, error);
-            }
-        }
-        state.next_seq = Some(seq + 1);
-        Ok(())
-    }
-
-    /// Calculate one consistent local snapshot. Zero means a miss or an
-    /// untrusted source.
-    pub fn reusable_tokens(&self, tokens: &[u32], max_reusable_tokens: usize) -> u64 {
-        let hashes = self.keys.generate_block_keys(tokens);
-        let state = self.state.read();
-        if state.next_seq.is_none() || !state.visible {
-            return 0;
-        }
-        let matches: Vec<Vec<TierMatch>> = self
-            .groups
-            .iter()
-            .map(|group| {
-                let stride = group.block_size as usize / self.keys.block_size();
-                let mut segments: Vec<(u32, u32)> = Vec::new();
-                for (position, hash) in hashes.iter().skip(stride - 1).step_by(stride).enumerate() {
-                    let Ok(end) = u32::try_from(position.saturating_add(1)) else {
-                        break;
-                    };
-                    if !state.claims.contains(&(group.group_idx, *hash)) {
-                        continue;
-                    }
-                    let start = end - 1;
-                    if let Some(segment) = segments.last_mut().filter(|segment| segment.1 == start)
-                    {
-                        segment.1 = end;
-                    } else {
-                        segments.push((start, end));
-                    }
-                }
-                vec![TierMatch {
-                    target: self.target.clone(),
-                    tier: StorageTier::Device,
-                    locality: Locality::Local,
-                    segments,
-                }]
-            })
-            .collect();
-        let views: Vec<_> = self
-            .groups
-            .iter()
-            .zip(&matches)
-            .map(|(group, matches)| HybridGroupView {
-                group_idx: group.group_idx,
-                block_size: group.block_size,
-                kind: group.kind,
-                matches,
-            })
-            .collect();
-        let boundary = common_reusable_tokens(
-            &self.target,
-            &views,
-            tokens.len().saturating_sub(1).min(max_reusable_tokens) as u64,
-        );
-        // The engine replays the layout's trailing window before prefilling the
-        // rest, and rounds the remaining hit down to a block. Charging the same
-        // way keeps Router's estimate from exceeding the engine's own cache hit.
-        let credited = boundary.saturating_sub(u64::from(self.replay_tokens));
-        align_down(credited, self.keys.block_size() as u32)
-    }
-
-    /// Every block a store proves. A sliding group publishes only its tail;
-    /// the chain from the parent digest recovers the rest, and is used only
-    /// when its tail matches the published hashes.
-    fn stored_keys(
-        &self,
-        group: &HybridEventGroup,
-        store: &BlockStored,
-    ) -> Result<Vec<SequenceHash>, ()> {
-        let published = store
-            .block_hashes
-            .iter()
-            .map(|hash| sequence_hash(hash).ok_or(()))
-            .collect::<Result<Vec<_>, ()>>()?;
-        if !matches!(group.kind, HybridGroupKind::SlidingWindow { .. })
-            || store.token_ids.is_empty()
-            || !store
-                .token_ids
-                .len()
-                .is_multiple_of(group.block_size as usize)
-        {
-            return Ok(published);
-        }
-        let parent = match store.parent_block_hash.as_ref() {
-            None => self.keys.none_hash(),
-            Some(hash) => sequence_hash(hash).ok_or(())?,
-        };
-        let expanded = self.keys.keys_after(parent, &store.token_ids);
-        // Only the group's own page boundaries are addressable: `reusable_tokens`
-        // looks up nothing else and the engine's removals name nothing else, so
-        // claiming the intermediate chain steps would leave entries behind on
-        // every store/evict cycle until the capacity limit revoked the rank.
-        let stride = (group.block_size as usize / self.keys.block_size()).max(1);
-        let boundaries: Vec<SequenceHash> = expanded
-            .iter()
-            .skip(stride - 1)
-            .step_by(stride)
-            .copied()
-            .collect();
-        if published.is_empty() {
-            return Ok(boundaries);
-        }
-        if boundaries.ends_with(&published) {
-            Ok(boundaries)
+    /// The tier a hit is credited at: the fastest copy the page still has.
+    pub(super) fn best(self) -> Option<StorageTier> {
+        if self.0 & Self::DEVICE != 0 {
+            Some(StorageTier::Device)
+        } else if self.0 & Self::HOST != 0 {
+            Some(StorageTier::HostPinned)
+        } else if self.0 & Self::DISK != 0 {
+            Some(StorageTier::Disk)
+        } else if self.0 & Self::EXTERNAL != 0 {
+            Some(StorageTier::External)
         } else {
-            Ok(published)
-        }
-    }
-
-    fn fail<T>(state: &mut State, error: HybridEventError) -> Result<T, HybridEventError> {
-        state.claims.clear();
-        state.next_seq = None;
-        state.visible = false;
-        Err(error)
-    }
-}
-
-fn sequence_hash(hash: &ExternalBlockHash) -> Option<SequenceHash> {
-    match hash {
-        ExternalBlockHash::Bytes(bytes) => bytes.as_slice().try_into().ok(),
-        ExternalBlockHash::Int(_) => None,
-    }
-}
-
-/// A group accepts only the event shape its verified restore rule describes.
-/// The sliding-window size is part of the identity: the same model served with
-/// a different window is a different layout.
-fn event_kind_matches(kind: HybridGroupKind, store: &BlockStored) -> bool {
-    let spec = store.kv_cache_spec_kind.as_deref();
-    match kind {
-        HybridGroupKind::FullAttention => {
-            spec == Some("full_attention") && store.kv_cache_spec_sliding_window.is_none()
-        }
-        HybridGroupKind::CompressedFullAttention { .. } => {
-            spec == Some("mla_attention") && store.kv_cache_spec_sliding_window.is_none()
-        }
-        HybridGroupKind::Checkpoint => {
-            spec == Some("mamba") && store.kv_cache_spec_sliding_window.is_none()
-        }
-        HybridGroupKind::SlidingWindow { window_tokens } => {
-            matches!(spec, Some("sliding_window" | "sliding_window_mla"))
-                && store.kv_cache_spec_sliding_window.map(u64::from) == Some(window_tokens)
+            None
         }
     }
 }
 
-/// Checkpoint and sliding groups may publish fewer hashes than the blocks the
-/// token range spans; attention groups publish one per block.
-fn stored_shape_matches(kind: HybridGroupKind, store: &BlockStored) -> bool {
-    let block_size = store.block_size as usize;
-    if block_size == 0 || store.token_ids.is_empty() {
-        return false;
-    }
-    if !store.token_ids.len().is_multiple_of(block_size) {
-        return false;
-    }
-    let blocks = store.token_ids.len() / block_size;
-    match kind {
-        HybridGroupKind::Checkpoint | HybridGroupKind::SlidingWindow { .. } => {
-            store.block_hashes.len() <= blocks
-        }
-        _ => store.block_hashes.len() == blocks,
-    }
-}
-
-// Install this provider only when the engine contract verifies that recomputing
-// the last token is a sufficient bound (no unmodeled lookahead/replay rules).
-impl crate::policies::TieredMatchProvider for HybridEventIndex {
-    fn find_tiered_matches(&self, _query: &super::MatchQuery) -> Vec<TierMatch> {
-        // A single group's dense lookup is never sufficient for a hybrid hit.
-        Vec::new()
-    }
-
-    fn find_token_matches(
+impl State {
+    /// The claims of one identity. A rank carries a handful of identities, so
+    /// the scan is cheaper than allocating a key for every lookup.
+    pub(super) fn claims_in(
         &self,
-        tokens: &[u32],
-        block_size: u32,
-        lora_name: Option<&str>,
-        dp_rank: u32,
-    ) -> Option<Vec<TierMatch>> {
-        // Events, ownership and history are bound to one rank. A hit computed
-        // from another rank's stream is never evidence for this one.
-        if lora_name.is_some() || block_size == 0 || dp_rank != self.target.dp_rank {
-            return Some(Vec::new());
+        namespace: Option<&str>,
+    ) -> Option<&HashMap<(u32, SequenceHash), TierSet>> {
+        self.claims
+            .iter()
+            .find(|(identity, _)| identity.as_deref() == namespace)
+            .map(|(_, claims)| claims)
+    }
+
+    /// The groups one identity has page evidence for.
+    pub(super) fn page_evidence_in(&self, namespace: Option<&str>) -> Option<&HashSet<u32>> {
+        self.page_evidence
+            .iter()
+            .find(|(identity, _)| identity.as_deref() == namespace)
+            .map(|(_, evidence)| evidence)
+    }
+
+    /// Record one claim for `namespace`, refusing only when that identity is
+    /// full: one adapter must never evict the base model's evidence.
+    pub(super) fn insert_claim(
+        &mut self,
+        namespace: Option<&str>,
+        key: (u32, SequenceHash),
+        tier: StorageTier,
+        max_entries: usize,
+    ) -> bool {
+        let claims = self.claims.entry(namespace.map(str::to_owned)).or_default();
+        if let Some(resident) = claims.get_mut(&key) {
+            *resident = resident.with(tier);
+            return true;
         }
-        let tokens = self.reusable_tokens(tokens, usize::MAX);
-        if tokens == 0 || !tokens.is_multiple_of(u64::from(block_size)) {
-            return Some(Vec::new());
+        if claims.len() >= max_entries {
+            return false;
         }
-        let Ok(blocks) = u32::try_from(tokens / u64::from(block_size)) else {
-            return Some(Vec::new());
-        };
-        Some(vec![TierMatch {
-            target: self.target.clone(),
-            tier: StorageTier::Device,
-            locality: Locality::Local,
-            segments: vec![(0, blocks)],
-        }])
+        claims.insert(key, TierSet::default().with(tier));
+        true
+    }
+
+    /// A removal whose medium names no known tier drops every copy of the page:
+    /// keeping a stale claim would over-credit, dropping one costs at most a
+    /// re-prefill.
+    pub(super) fn remove_claim_all(&mut self, key: (u32, SequenceHash)) {
+        for claims in self.claims.values_mut() {
+            claims.remove(&key);
+        }
+    }
+
+    /// A removal names one tier and no identity: the engine evicted that copy
+    /// whichever chain produced it. A page that still has another copy stays
+    /// claimed at the better remaining tier.
+    pub(super) fn remove_claim(&mut self, key: (u32, SequenceHash), tier: StorageTier) {
+        for claims in self.claims.values_mut() {
+            if let Some(resident) = claims.get_mut(&key) {
+                *resident = resident.without(tier);
+                if resident.is_empty() {
+                    claims.remove(&key);
+                }
+            }
+        }
     }
 }
 
@@ -516,14 +142,98 @@ impl crate::policies::TieredMatchProvider for HybridEventIndex {
 pub(crate) mod tests {
     use std::sync::Arc;
 
-    use super::*;
+    use super::super::ingest::HybridEventError;
+    use super::super::layout::{event_kind_matches, HybridEventGroup, HybridGroupKind};
+    use super::super::HybridEventIndex;
+    use crate::kv_hash::{BlockKeyGenerator, SequenceHash};
+    use crate::kv_index::wire::ExternalBlockHash;
     use crate::kv_index::wire::{BlockRemoved, BlockStored};
+    use crate::kv_index::{KVEvent, KVEventBatch, RoutableTarget};
 
     fn target() -> RoutableTarget {
         RoutableTarget {
             instance_id: Arc::from("w"),
             dp_rank: 0,
         }
+    }
+
+    #[test]
+    fn partial_stores_restore_the_joint_boundary_and_survive_tier_removal() {
+        use crate::kv_index::StorageTier;
+        use crate::policies::TieredMatchProvider;
+
+        let tokens: Vec<u32> = (0..1201).collect();
+        let hashes = BlockKeyGenerator::new(16, 0).generate_block_keys(&tokens);
+        let groups = vec![
+            HybridEventGroup {
+                group_idx: 0,
+                block_size: 576,
+                kind: HybridGroupKind::FullAttention,
+            },
+            HybridEventGroup {
+                group_idx: 1,
+                block_size: 576,
+                kind: HybridGroupKind::Checkpoint,
+            },
+        ];
+        let mut previous = gpu_store(1, "mamba", 576, &tokens[..576], &hashes[35..36]);
+        previous.medium = Some("STORAGE".into());
+        let mut partial = gpu_store(1, "mamba", 16, &tokens[1120..1136], &hashes[70..71]);
+        partial.medium = Some("CPU".into());
+        let mut device_copy = partial.clone();
+        device_copy.medium = Some("GPU".into());
+        let batch = KVEventBatch {
+            ts: 1.0,
+            data_parallel_rank: Some(0),
+            events: vec![
+                KVEvent::BlockStored(gpu_store(
+                    0,
+                    "full_attention",
+                    576,
+                    &tokens[..576],
+                    &hashes[35..36],
+                )),
+                KVEvent::BlockStored(gpu_store(
+                    0,
+                    "full_attention",
+                    16,
+                    &tokens[1120..1136],
+                    &hashes[70..71],
+                )),
+                KVEvent::BlockStored(previous),
+                KVEvent::BlockStored(partial),
+                KVEvent::BlockStored(device_copy),
+            ],
+        };
+        let default_index = HybridEventIndex::new(target(), groups.clone(), 16, 0, 8).unwrap();
+        default_index.begin_empty(0);
+        assert_eq!(default_index.apply_batch(0, &batch), Ok(()));
+        assert_eq!(default_index.reusable_tokens(&tokens, usize::MAX), 576);
+
+        let index = HybridEventIndex::new(target(), groups, 16, 0, 8)
+            .unwrap()
+            .with_partial_hash_hits(true);
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &batch), Ok(()));
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 1136);
+        assert_eq!(index.reusable_tokens(&tokens, 1120), 576);
+        let matches = index.find_token_matches(&tokens, 16, None, 0).unwrap();
+        assert_eq!(matches[0].tier, StorageTier::Device);
+        let removal = KVEventBatch {
+            ts: 1.0,
+            data_parallel_rank: Some(0),
+            events: vec![KVEvent::BlockRemoved(BlockRemoved {
+                block_hashes: vec![ExternalBlockHash::Bytes(hashes[70].to_vec())],
+                medium: Some("GPU".into()),
+                group_idx: Some(1),
+                locality: None,
+                ownership: None,
+            })],
+        };
+        assert_eq!(index.apply_batch(1, &removal), Ok(()));
+        let matches = index.find_token_matches(&tokens, 16, None, 0).unwrap();
+        assert_eq!(matches[0].tier, StorageTier::HostPinned);
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 1136);
     }
 
     fn groups() -> Vec<HybridEventGroup> {
@@ -655,6 +365,272 @@ pub(crate) mod tests {
         assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
     }
 
+    fn host_store(
+        batch: &crate::kv_index::KVEventBatch,
+        medium: &str,
+    ) -> crate::kv_index::KVEventBatch {
+        let mut batch = batch.clone();
+        for event in &mut batch.events {
+            if let KVEvent::BlockStored(store) = event {
+                store.medium = Some(medium.to_string());
+            }
+        }
+        batch
+    }
+
+    #[test]
+    fn host_resident_pages_are_credited_at_their_tier() {
+        use crate::policies::TieredMatchProvider;
+
+        let index = index(16);
+        index.begin_empty(0);
+        assert_eq!(
+            index.apply_batch(0, &host_store(&qwen_batch(), "CPU")),
+            Ok(())
+        );
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+        let matches = index
+            .find_token_matches(&prompt(), 528, None, 0)
+            .expect("hybrid provider");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].tier, crate::kv_index::StorageTier::HostPinned);
+    }
+
+    #[test]
+    fn evicting_the_device_copy_keeps_the_host_credit() {
+        let index = index(16);
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &qwen_batch()), Ok(()));
+        assert_eq!(
+            index.apply_batch(1, &host_store(&qwen_batch(), "CPU")),
+            Ok(())
+        );
+
+        let mut removed = qwen_batch();
+        for event in &mut removed.events {
+            if let KVEvent::BlockStored(store) = event {
+                *event = KVEvent::BlockRemoved(BlockRemoved {
+                    block_hashes: store.block_hashes.clone(),
+                    medium: Some("GPU".into()),
+                    group_idx: store.group_idx,
+                    locality: None,
+                    ownership: None,
+                });
+            }
+        }
+        assert_eq!(index.apply_batch(2, &removed), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+    }
+
+    #[test]
+    fn a_foreign_owner_is_skipped_without_revoking_the_view() {
+        let index = index(16);
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &qwen_batch()), Ok(()));
+        let mut foreign = qwen_batch();
+        for event in &mut foreign.events {
+            if let KVEvent::BlockStored(store) = event {
+                store.ownership = Some("offload".into());
+            }
+        }
+        assert_eq!(index.apply_batch(1, &foreign), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+    }
+
+    /// A required group that never published a page caps reuse at zero: its
+    /// silence is not evidence that the page is unnecessary.
+    #[test]
+    fn a_required_group_without_page_evidence_caps_reuse_at_zero() {
+        let index = index(16);
+        index.begin_empty(0);
+        let mut batch = qwen_batch();
+        batch.events.retain(|event| match event {
+            KVEvent::BlockStored(store) => store.group_idx == Some(3),
+            _ => false,
+        });
+        assert_eq!(index.apply_batch(0, &batch), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
+    }
+
+    /// An adapter publishes under its own hash chain. Such a batch must leave
+    /// the base model's claims intact instead of revoking the whole view.
+    #[test]
+    fn adapter_stores_do_not_revoke_the_base_view() {
+        let index = index(16);
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &qwen_batch()), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+
+        let mut adapter_batch = qwen_batch();
+        for event in &mut adapter_batch.events {
+            if let KVEvent::BlockStored(store) = event {
+                store.lora_name = Some("lora1".to_string());
+            }
+        }
+        assert_eq!(index.apply_batch(1, &adapter_batch), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+        // The base chain keeps applying afterwards.
+        assert_eq!(index.apply_batch(2, &qwen_batch()), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+    }
+
+    /// The same pages stored under one adapter: the engine hashes them with
+    /// the adapter's `(name, path)` extra keys, so this is a different chain.
+    fn adapter_batch(name: &str, path: &str) -> KVEventBatch {
+        let tokens = prompt();
+        let hash =
+            BlockKeyGenerator::new(528, 0).generate_block_keys_for_adapter(&tokens, name, path)[0];
+        let events = groups()
+            .iter()
+            .map(|group| {
+                let spec = if group.group_idx == 3 {
+                    "full_attention"
+                } else {
+                    "mamba"
+                };
+                let mut store = gpu_store(group.group_idx, spec, 528, &tokens[..528], &[hash]);
+                store.lora_name = Some(name.to_string());
+                store.extra_keys = None;
+                KVEvent::BlockStored(store)
+            })
+            .collect();
+        KVEventBatch {
+            ts: 1.0,
+            events,
+            data_parallel_rank: Some(0),
+        }
+    }
+
+    /// An adapter's pages live under their own chain: they are indexed under
+    /// the declared adapter, never credited to the base model, and never to
+    /// another adapter.
+    #[test]
+    fn adapter_pages_are_indexed_under_their_own_chain() {
+        let index = index(16).with_adapters(vec![
+            ("lora1".to_string(), "/adapters/lora1".to_string()),
+            ("lora2".to_string(), "/adapters/lora2".to_string()),
+        ]);
+        index.begin_empty(0);
+        assert_eq!(
+            index.apply_batch(0, &adapter_batch("lora1", "/adapters/lora1")),
+            Ok(())
+        );
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
+        assert_eq!(
+            index.reusable_tokens_in(Some("lora1"), &prompt(), usize::MAX),
+            528
+        );
+        assert_eq!(
+            index.reusable_tokens_in(Some("lora2"), &prompt(), usize::MAX),
+            0
+        );
+
+        // The base model stores the same tokens under its own chain.
+        assert_eq!(index.apply_batch(1, &qwen_batch()), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+        assert_eq!(
+            index.reusable_tokens_in(Some("lora1"), &prompt(), usize::MAX),
+            528
+        );
+
+        // An eviction names hashes, not a chain: the engine removes the page
+        // from every group, and both views lose it.
+        let adapter_hash = BlockKeyGenerator::new(528, 0).generate_block_keys_for_adapter(
+            &prompt(),
+            "lora1",
+            "/adapters/lora1",
+        )[0]
+        .to_vec();
+        let base_hash = BlockKeyGenerator::new(528, 0).generate_block_keys(&prompt())[0].to_vec();
+        let removed = KVEventBatch {
+            ts: 2.0,
+            data_parallel_rank: Some(0),
+            events: groups()
+                .iter()
+                .map(|group| {
+                    KVEvent::BlockRemoved(BlockRemoved {
+                        block_hashes: vec![
+                            ExternalBlockHash::Bytes(adapter_hash.clone()),
+                            ExternalBlockHash::Bytes(base_hash.clone()),
+                        ],
+                        medium: Some("GPU".to_string()),
+                        group_idx: Some(group.group_idx),
+                        locality: Some("LOCAL".to_string()),
+                        ownership: None,
+                    })
+                })
+                .collect(),
+        };
+        assert_eq!(index.apply_batch(2, &removed), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
+        assert_eq!(
+            index.reusable_tokens_in(Some("lora1"), &prompt(), usize::MAX),
+            0
+        );
+    }
+
+    /// A page for an adapter this layout does not declare is skipped: it can
+    /// neither credit the base model nor revoke the claims the rank holds.
+    /// A real adapter store carries its identity as extra keys; that is not a
+    /// foreign identity, so the pages still count for the adapter's chain.
+    #[test]
+    fn adapter_stores_carrying_lora_extra_keys_are_credited() {
+        let index =
+            index(16).with_adapters(vec![("lora1".to_string(), "/adapters/lora1".to_string())]);
+        index.begin_empty(0);
+        let mut batch = adapter_batch("lora1", "/adapters/lora1");
+        for event in &mut batch.events {
+            if let KVEvent::BlockStored(store) = event {
+                store.extra_keys = Some(vec![rmpv::Value::String("lora1".into())]);
+            }
+        }
+        assert_eq!(index.apply_batch(0, &batch), Ok(()));
+        assert_eq!(
+            index.reusable_tokens_in(Some("lora1"), &prompt(), usize::MAX),
+            528
+        );
+    }
+
+    #[test]
+    fn undeclared_adapter_stores_are_skipped() {
+        use crate::policies::TieredMatchProvider;
+
+        let index = index(16);
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &qwen_batch()), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+
+        assert_eq!(
+            index.apply_batch(1, &adapter_batch("ghost", "/adapters/ghost")),
+            Ok(())
+        );
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+        assert_eq!(
+            index.reusable_tokens_in(Some("ghost"), &prompt(), usize::MAX),
+            0
+        );
+        assert!(index
+            .find_token_matches(&prompt(), 528, Some("ghost"), 0)
+            .is_some_and(|hits| hits.is_empty()));
+        assert!(index
+            .find_token_matches(&prompt(), 528, None, 0)
+            .is_some_and(|hits| hits.len() == 1));
+    }
+
+    /// DeepSeek V4 publishes MLA pages without a state ratio; those restore
+    /// from the root, so a full-attention group accepts them.
+    #[test]
+    fn mla_pages_are_full_attention_stores() {
+        let store = gpu_store(0, "mla_attention", 528, &prompt()[..528], &[[7u8; 32]]);
+        assert!(event_kind_matches(HybridGroupKind::FullAttention, &store));
+        let mut sliding = store;
+        sliding.kv_cache_spec_sliding_window = Some(128);
+        assert!(!event_kind_matches(
+            HybridGroupKind::FullAttention,
+            &sliding
+        ));
+    }
+
     #[test]
     fn gap_and_old_sequence_revoke_the_whole_view() {
         let index = index(8);
@@ -735,11 +711,13 @@ pub(crate) mod tests {
         let KVEvent::BlockStored(last) = &mut batch.events[3] else {
             panic!("expected store")
         };
+        // An integer hash is the engine's default event encoding, so it gets its
+        // own error rather than the generic shape mismatch.
         last.block_hashes = vec![ExternalBlockHash::Int(42)];
         index.begin_empty(0);
         assert_eq!(
             index.apply_batch(0, &batch),
-            Err(HybridEventError::InvalidBatch)
+            Err(HybridEventError::IntBlockHashes)
         );
         assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
         assert_eq!(
@@ -755,6 +733,21 @@ pub(crate) mod tests {
             Err(HybridEventError::InvalidBatch)
         );
         assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
+    }
+
+    #[test]
+    fn an_int_parent_hash_is_reported_as_int_block_hashes() {
+        let index = index(8);
+        let mut batch = qwen_batch();
+        let KVEvent::BlockStored(last) = &mut batch.events[3] else {
+            panic!("expected store")
+        };
+        last.parent_block_hash = Some(ExternalBlockHash::Int(7));
+        index.begin_empty(0);
+        assert_eq!(
+            index.apply_batch(0, &batch),
+            Err(HybridEventError::IntBlockHashes)
+        );
     }
 
     #[test]
@@ -1243,10 +1236,6 @@ pub(crate) mod tests {
                 .copied()
                 .collect()
         };
-        let tail = |block: usize, hold: usize| -> Vec<SequenceHash> {
-            let hashes = view(block);
-            hashes[hashes.len() - hold..].to_vec()
-        };
         let groups = vec![
             HybridEventGroup {
                 group_idx: 0,
@@ -1294,63 +1283,37 @@ pub(crate) mod tests {
         };
         let index = HybridEventIndex::new(target(), groups.clone(), 4, 0, 4096).unwrap();
         index.begin_empty(0);
+        // A V4-class layout publishes the sliding groups as key-only stores: the
+        // pages are named by the compressed group, and the sliding groups carry
+        // no addressable page of their own. They therefore cannot bound the
+        // shared prefix, and the compressed group's three restorable blocks do.
         let batch = KVEventBatch {
             ts: 1.0,
             data_parallel_rank: Some(0),
             events: vec![
-                store(
-                    groups[0],
-                    "sliding_window_mla",
-                    Some(128),
-                    tail(64, 2),
-                    64,
-                    1024,
-                ),
-                store(
-                    groups[1],
-                    "sliding_window_mla",
-                    Some(128),
-                    tail(64, 2),
-                    64,
-                    1024,
-                ),
+                store(groups[0], "sliding_window_mla", Some(128), vec![], 64, 1024),
+                store(groups[1], "sliding_window_mla", Some(128), vec![], 64, 1024),
                 store(groups[2], "mla_attention", None, view(256), 256, 1024),
                 // The same group also publishes compressor pages it stores on
                 // their own; they carry no boundary the group does not already
                 // report.
                 store(groups[2], "mla_attention", None, vec![keys[0]], 4, 4),
-                store(
-                    groups[3],
-                    "sliding_window_mla",
-                    Some(8),
-                    tail(4, 2),
-                    4,
-                    1024,
-                ),
-                store(
-                    groups[4],
-                    "sliding_window_mla",
-                    Some(128),
-                    tail(8, 16),
-                    8,
-                    1024,
-                ),
+                store(groups[3], "sliding_window_mla", Some(8), vec![], 4, 1024),
+                store(groups[4], "sliding_window_mla", Some(128), vec![], 8, 1024),
             ],
         };
         assert_eq!(index.apply_batch(0, &batch), Ok(()));
         // The compressed group restores three 256-token blocks below the
-        // last-token bound, and the engine keeps that smallest hit even though
-        // the sliding tails sit at the end of the prefix.
+        // last-token bound, and no other group has page evidence to lower it.
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 768);
     }
 
-    /// A sliding claim must stay inside what the engine can later remove. The
-    /// store spans 1,024 tokens at a 64-token group page, so the chain has 256
-    /// four-token steps but only 16 of them are page boundaries: querying and
-    /// removing address nothing else, and retaining the intermediates would
-    /// exhaust the capacity limit over repeated store/evict cycles.
+    /// A sliding store claims exactly the hashes it published. vLLM publishes
+    /// the page boundaries it actually holds and skips pages it never stored, so
+    /// rebuilding the chain from `token_ids` would claim pages the engine cannot
+    /// restore and would exhaust the capacity limit over store/evict cycles.
     #[test]
-    fn sliding_claims_only_the_page_boundaries_its_removals_name() {
+    fn sliding_claims_only_the_published_page_boundaries() {
         let tokens: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
         let keys = BlockKeyGenerator::new(4, 0).generate_block_keys(&tokens);
         let group = HybridEventGroup {
@@ -1359,7 +1322,8 @@ pub(crate) mod tests {
             kind: HybridGroupKind::SlidingWindow { window_tokens: 128 },
         };
         let tail: Vec<SequenceHash> = keys.iter().skip(15).step_by(16).copied().collect();
-        let tail = &tail[tail.len() - 2..];
+        // The three pages that hold the window ending at the last full block.
+        let tail = &tail[tail.len() - 3..];
         let mut store = gpu_store(0, "sliding_window_mla", 64, &tokens[..1024], tail);
         store.kv_cache_spec_sliding_window = Some(128);
         let batch = KVEventBatch {
@@ -1367,11 +1331,17 @@ pub(crate) mod tests {
             data_parallel_rank: Some(0),
             events: vec![KVEvent::BlockStored(store)],
         };
-        for (capacity, expected) in [(16, Ok(())), (15, Err(HybridEventError::Capacity))] {
+        // Three published pages are three claims, not sixteen chain steps.
+        for (capacity, expected) in [(3, Ok(())), (2, Err(HybridEventError::Capacity))] {
             let index = HybridEventIndex::new(target(), vec![group], 4, 0, capacity).unwrap();
             index.begin_empty(0);
             assert_eq!(index.apply_batch(0, &batch), expected);
         }
+        // The published tail still credits its own window.
+        let index = HybridEventIndex::new(target(), vec![group], 4, 0, 16).unwrap();
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &batch), Ok(()));
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 960);
     }
 
     /// The event shape a DeepSeek V4.1 layout publishes: one 128-token

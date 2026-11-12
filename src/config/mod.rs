@@ -285,7 +285,7 @@ mod static_kv_event_source_tests {
     /// publishers.
     #[test]
     fn hybrid_layout_without_endpoints_validates() {
-        let layout: crate::kv_index::hybrid_capability::HybridCapabilities =
+        let layout: crate::kv_index::hybrid::HybridCapabilities =
             serde_json::from_value(serde_json::json!({
                 "schema_version": 1,
                 "ranks": [{

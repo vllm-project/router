@@ -808,16 +808,34 @@ impl ConfigValidator {
                         // one event-source entry covers every rank of that
                         // base URL. Accept either the exact URL, the base of a
                         // rank-pinned key, or a rank-pinned entry of this base.
-                        let known = worker_urls.iter().any(|url| {
-                            url == worker
-                                || url
-                                    .strip_prefix(worker.as_str())
-                                    .is_some_and(|suffix| suffix.starts_with('@'))
-                                || worker
-                                    .strip_prefix(url.as_str())
-                                    .is_some_and(|suffix| suffix.starts_with('@'))
+                        let exact = worker_urls.iter().any(|url| url == worker);
+                        let covers_ranks = worker_urls.iter().any(|url| {
+                            url.strip_prefix(worker.as_str())
+                                .is_some_and(|suffix| suffix.starts_with('@'))
                         });
-                        if !known {
+                        let rank_pinned_under_base = !exact
+                            && worker_urls.iter().any(|url| {
+                                !url.contains('@')
+                                    && worker
+                                        .strip_prefix(url.as_str())
+                                        .is_some_and(|suffix| suffix.starts_with('@'))
+                            });
+                        if rank_pinned_under_base {
+                            // The KV index resolves static sources by exact
+                            // worker URL, so a rank-pinned declaration under a
+                            // plain base URL is accepted here and then never
+                            // applied. Ask for the rank-pinned URLs instead of
+                            // silently disabling the source.
+                            return Err(ConfigError::ValidationFailed {
+                                reason: format!(
+                                    "static KV event source '{worker}' is rank-pinned but \
+                                     --worker-urls configures only its base URL; declare the \
+                                     source under that base URL with one entry per rank, or \
+                                     enable discovery"
+                                ),
+                            });
+                        }
+                        if !exact && !covers_ranks {
                             return Err(ConfigError::ValidationFailed {
                                 reason: format!(
                                     "static KV event source worker '{worker}' is not in --worker-urls"

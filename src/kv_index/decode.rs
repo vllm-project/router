@@ -278,9 +278,17 @@ mod tests {
     fn device_admission_is_separate_and_conservative() {
         let batch = decode_batch(&encode(vec![stored()], Value::Nil)).unwrap();
         assert!(validate_device_batch(&batch, 2).is_ok());
+        // Accelerator backends name their device instead of "GPU"; the contract
+        // is about the tier, not the vendor.
+        for medium in ["NPU", "DEVICE", "XPU", "ASCEND"] {
+            let mut event = stored();
+            change(&mut event, "medium", medium.into());
+            let batch = decode_batch(&encode(vec![event], 0.into())).unwrap();
+            assert!(validate_device_batch(&batch, 2).is_ok(), "{medium}");
+        }
         for (key, value) in [
             ("medium", "CPU".into()),
-            ("medium", Value::Nil),
+            ("medium", "MOONCAKE".into()),
             ("ownership", "UNKNOWN".into()),
             ("locality", "UNKNOWN".into()),
             ("group_idx", 1.into()),

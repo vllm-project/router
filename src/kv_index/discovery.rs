@@ -14,9 +14,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::StaticKvEventSources;
-use crate::kv_index::hybrid_capability::HybridCapabilities;
-use crate::kv_index::hybrid_events::HybridEventIndex;
-use crate::kv_index::hybrid_stream::{HybridEventStream, HybridSubscriberHandle};
+use crate::kv_index::hybrid::HybridCapabilities;
+use crate::kv_index::hybrid::HybridEventIndex;
+use crate::kv_index::hybrid::{HybridEventStream, HybridSubscriberHandle};
 use crate::kv_index::indexer::KvBlockIndexer;
 use crate::kv_index::subscriber::{EventSource, SubscriberHandle};
 use crate::kv_index::{HashMode, IngestionSignal, SourceId};
@@ -296,6 +296,72 @@ impl KvIndexSupervisor {
         self
     }
 
+    /// Resolve a worker's declared sources, folding per-rank declarations
+    /// (`base@0`, `base@1`) into the base entry. Regular startup discovers the
+    /// base URL and fans it out to its DP ranks afterwards, so a declaration
+    /// keyed by rank has to be merged here or it is never applied.
+    fn resolved_static_source(&self, worker_url: &str) -> Option<StaticKvEventSources> {
+        let exact = self.static_sources.get(worker_url).cloned();
+        if worker_url.contains('@') {
+            return exact;
+        }
+        let prefix = format!("{worker_url}@");
+        let mut per_rank: Vec<(u32, &StaticKvEventSources)> = Vec::new();
+        for (key, source) in &self.static_sources {
+            if let Some(rank) = key
+                .strip_prefix(prefix.as_str())
+                .and_then(|suffix| suffix.parse::<u32>().ok())
+            {
+                per_rank.push((rank, source));
+            }
+        }
+        if per_rank.is_empty() {
+            return exact;
+        }
+        per_rank.sort_by_key(|(rank, _)| *rank);
+        let mut merged = exact
+            .or_else(|| per_rank.first().map(|(_, source)| (*source).clone()))
+            .expect("per-rank declarations are non-empty");
+        // Every rank publishes its own endpoints: collect them instead of
+        // keeping only the first non-empty list, or the second rank's publisher
+        // and replay channel are silently dropped.
+        let mut endpoints = merged.endpoints.clone();
+        let mut replay_endpoints = merged.replay_endpoints.clone().unwrap_or_default();
+        for (rank, source) in per_rank {
+            for endpoint in &source.endpoints {
+                if !endpoints.contains(endpoint) {
+                    endpoints.push(endpoint.clone());
+                }
+            }
+            if let Some(list) = &source.replay_endpoints {
+                for endpoint in list {
+                    if !replay_endpoints.contains(endpoint) {
+                        replay_endpoints.push(endpoint.clone());
+                    }
+                }
+            }
+            if merged.topic.is_empty() {
+                merged.topic = source.topic.clone();
+            }
+            if merged.model.is_empty() {
+                merged.model = source.model.clone();
+            }
+            match (&mut merged.hybrid, &source.hybrid) {
+                (Some(base), Some(overlay)) => merge_hybrid_layout(base, overlay),
+                (None, Some(overlay)) => merged.hybrid = Some(overlay.clone()),
+                _ => {}
+            }
+            tracing::debug!(
+                worker_url,
+                rank,
+                "merged a rank-pinned hybrid declaration into its base worker"
+            );
+        }
+        merged.endpoints = endpoints;
+        merged.replay_endpoints = (!replay_endpoints.is_empty()).then_some(replay_endpoints);
+        Some(merged)
+    }
+
     /// Query both endpoints for `worker_url`, spawn one subscriber per rank into
     /// this worker's identity's indexer. A missing source route is a soft skip.
     pub async fn on_worker_added(&self, worker_url: &str) -> Result<WorkerKvInfo, String> {
@@ -324,6 +390,7 @@ impl KvIndexSupervisor {
                             worker_url,
                             self.api_key.as_deref(),
                             &source,
+                            None,
                         )
                         .await
                         {
@@ -344,9 +411,9 @@ impl KvIndexSupervisor {
             };
         }
         let grpc = crate::backend::is_grpc_url(worker_url);
-        let static_source = self.static_sources.get(worker_url);
+        let static_source = self.resolved_static_source(worker_url);
         let full_attention_http = !grpc && self.full_attention_http;
-        match static_source {
+        match &static_source {
             // A layout entry without endpoints: the declaration carries the
             // identity and groups, the engine reports the publishers.
             Some(config) if layout_only(config) => {
@@ -389,6 +456,7 @@ impl KvIndexSupervisor {
                         worker_url,
                         self.api_key.as_deref(),
                         config,
+                        None,
                     )
                     .await
                     {
@@ -439,7 +507,7 @@ impl KvIndexSupervisor {
         let hybrid_capability = discovery.hybrid;
         let grpc = crate::backend::is_grpc_url(worker_url);
         let full_attention_http =
-            !grpc && self.full_attention_http && !self.static_sources.contains_key(worker_url);
+            !grpc && self.full_attention_http && self.resolved_static_source(worker_url).is_none();
         let full_attention = full_attention_http || (self.http_pd && !grpc);
         let server_info = discovery.server_info.unwrap_or_else(|e| {
             warn!(
@@ -521,6 +589,22 @@ impl KvIndexSupervisor {
                 cache_key: None,
             });
         };
+        // Policy intervals use this unit to translate hits back into tokens.
+        // A hybrid hash boundary can lie inside the physical attention page.
+        // Use a common divisor when ranks declare different granularities.
+        let block_size = hybrid_capability.as_ref().map_or(block_size, |capability| {
+            capability
+                .ranks
+                .iter()
+                .filter_map(|rank| rank.hash_block_size)
+                .filter(|size| *size > 0)
+                .fold(block_size, |mut a, mut b| {
+                    while b != 0 {
+                        (a, b) = (b, a % b);
+                    }
+                    a
+                })
+        });
         let key = CacheKey {
             model: Arc::from(model_id.as_str()),
             hash_mode: self.hash_mode,
@@ -711,9 +795,29 @@ impl KvIndexSupervisor {
             self.retire_worker(previous);
         }
         let indexer = self.acquire_identity(&key);
+        // Endpoints the subscribers are about to attach to, so the freshness
+        // task can notice a publisher that moves while keeping its identity.
+        let bound_sources: Arc<BoundSources> = Arc::new(
+            event_sources
+                .iter()
+                .map(|ev| {
+                    (
+                        ev.dp_rank,
+                        BoundSource {
+                            endpoint: ev.pub_endpoint.clone(),
+                            replay_endpoint: ev.replay_endpoint.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        );
         let mut ranks = Vec::with_capacity(event_sources.len());
         let mut handles = Vec::with_capacity(event_sources.len());
         let mut hybrid_handles = Vec::new();
+        let mut hybrid_targets: Vec<(
+            crate::kv_index::subscriber::EventSource,
+            Arc<HybridEventIndex>,
+        )> = Vec::new();
         for (ev, live) in event_sources.into_iter().zip(&live_sources) {
             let rank = ev.dp_rank;
             if let Some(indexes) = &hybrid_indexes {
@@ -721,8 +825,22 @@ impl KvIndexSupervisor {
                 // subscriber at all: the legacy single-group index must not
                 // credit an unmodeled hybrid layout.
                 if let Some(index) = indexes.get(&rank) {
+                    // Two ranks on one publisher and one topic cannot be told
+                    // apart when a batch omits its rank, and the hybrid
+                    // subscriber has no rank fence to apply: give the rank no
+                    // subscriber instead of crediting the other rank's cache.
+                    if *live.lease.strict_rank.lock() {
+                        tracing::warn!(
+                            "kv_index {}: rank{} shares a publisher and topic with another rank; no hybrid subscriber",
+                            worker_url,
+                            rank
+                        );
+                        ranks.push(rank);
+                        continue;
+                    }
+                    hybrid_targets.push((ev.clone(), index.clone()));
                     let stream = Arc::new(HybridEventStream::new(index.clone()));
-                    let handle = super::hybrid_stream::spawn_zmq(ev, stream, self.ctx.clone())
+                    let handle = super::hybrid::spawn_zmq(ev, stream, self.ctx.clone())
                         .expect("hybrid source was validated before registration");
                     hybrid_handles.push(Arc::new(handle));
                 }
@@ -757,52 +875,74 @@ impl KvIndexSupervisor {
         });
         if let Some(provider) = &hybrid {
             let provider = Arc::downgrade(provider);
-            let handles = hybrid_handles.clone();
+            let mut handles = hybrid_handles.clone();
+            let mut expired = false;
+            let targets = hybrid_targets.clone();
+            let probe_ctx = self.ctx.clone();
             let client = self.client.clone();
             let worker = worker_url.to_owned();
             let api_key = self.api_key.clone();
-            let static_config = self.static_sources.get(worker_url).cloned();
+            let static_config = self.resolved_static_source(worker_url);
+            let bound = bound_sources.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     let Some(provider) = provider.upgrade() else {
                         break;
                     };
-                    if !provider.active.load(Ordering::Acquire) {
+                    if !provider.active.load(Ordering::Acquire) && !expired {
+                        // Retired by the owner, not by this task's own expiry.
                         break;
                     }
-                    if provider.verified_at.lock().elapsed() > Duration::from_secs(5) {
+                    if provider.verified_at.lock().elapsed() > Duration::from_secs(5) && !expired {
+                        // Expire the view but keep probing: a recovered control
+                        // endpoint must be able to re-admit this worker instead
+                        // of staying dark until a restart.
                         provider.active.store(false, Ordering::Release);
                         for handle in &handles {
                             handle.shutdown();
                         }
-                        break;
+                        expired = true;
                     }
-                    let valid = if let Some(config) = &static_config {
-                        // An engine without the control endpoint cannot
-                        // contradict a declared layout; only a contradicting
-                        // answer retires the provider.
-                        matches!(
-                            static_hybrid_sources_match(
-                                &client,
-                                &worker,
-                                api_key.as_deref(),
-                                config
-                            )
-                            .await,
-                            StaticHybridMatch::Matches | StaticHybridMatch::Unavailable(_)
+                    let outcome = if let Some(config) = &static_config {
+                        static_hybrid_sources_match(
+                            &client,
+                            &worker,
+                            api_key.as_deref(),
+                            config,
+                            Some(&bound),
                         )
+                        .await
                     } else {
-                        false
+                        StaticHybridMatch::Differs
                     };
-                    if !valid || provider.verified_at.lock().elapsed() > Duration::from_secs(5) {
+                    if !probe_keeps_trust(&outcome)
+                        || provider.verified_at.lock().elapsed() > Duration::from_secs(5)
+                    {
                         provider.active.store(false, Ordering::Release);
                         for handle in &handles {
                             handle.shutdown();
                         }
                         break;
                     }
-                    *provider.verified_at.lock() = Instant::now();
+                    if probe_keeps_trust(&outcome) {
+                        if expired {
+                            handles.clear();
+                            for (ev, index) in &targets {
+                                let stream = Arc::new(HybridEventStream::new(index.clone()));
+                                if let Ok(handle) =
+                                    super::hybrid::spawn_zmq(ev.clone(), stream, probe_ctx.clone())
+                                {
+                                    handles.push(Arc::new(handle));
+                                }
+                            }
+                            expired = false;
+                            provider.active.store(true, Ordering::Release);
+                        }
+                        if probe_renews_trust(&outcome) {
+                            *provider.verified_at.lock() = Instant::now();
+                        }
+                    }
                 }
             });
         }
@@ -943,6 +1083,35 @@ impl KvIndexSupervisor {
     }
 }
 
+/// Overlay one declaration's ranks and adapters onto another. A rank-pinned
+/// declaration replaces the base entry of the same rank; other ranks are
+/// untouched.
+fn merge_hybrid_layout(
+    base: &mut crate::kv_index::hybrid::HybridCapabilities,
+    overlay: &crate::kv_index::hybrid::HybridCapabilities,
+) {
+    for rank in &overlay.ranks {
+        match base
+            .ranks
+            .iter_mut()
+            .find(|existing| existing.rank == rank.rank)
+        {
+            Some(existing) => *existing = rank.clone(),
+            None => base.ranks.push(rank.clone()),
+        }
+    }
+    base.ranks.sort_by_key(|rank| rank.rank);
+    for adapter in &overlay.adapters {
+        if !base
+            .adapters
+            .iter()
+            .any(|existing| existing.name == adapter.name)
+        {
+            base.adapters.push(adapter.clone());
+        }
+    }
+}
+
 fn failed_hybrid_discovery(error: String) -> WorkerDiscovery {
     WorkerDiscovery {
         server_info: Err(error.clone()),
@@ -1020,7 +1189,7 @@ async fn discover_worker(
                 "HTTP worker model and block-size metadata must be configured statically"
                     .to_string(),
             ),
-            sources: query_kv_event_sources(client, worker_url).await,
+            sources: query_kv_event_sources(client, worker_url, api_key).await,
             model_id: Ok(Some(worker_url.to_string())),
             hybrid: None,
         };
@@ -1169,11 +1338,43 @@ enum StaticHybridMatch {
     Unavailable(SourcesProbe),
 }
 
+#[derive(Clone, Debug)]
+struct BoundSource {
+    endpoint: String,
+    replay_endpoint: Option<String>,
+}
+
+/// The publisher endpoints a worker's hybrid subscribers are attached to, by
+/// rank. Used to notice a publisher that moved while keeping its identity.
+type BoundSources = HashMap<u32, BoundSource>;
+
+/// Whether a probe result keeps the provider alive. A transient failure is not
+/// a contradiction: the worker stays routable and only its credit expires.
+fn probe_keeps_trust(outcome: &StaticHybridMatch) -> bool {
+    matches!(
+        outcome,
+        StaticHybridMatch::Matches | StaticHybridMatch::Unavailable(_)
+    )
+}
+
+/// Whether a probe result may extend the freshness window. A confirming probe
+/// does, and so does an engine that has no control endpoint at all (the static
+/// declaration is authoritative there). A failing probe must let the window
+/// expire, otherwise a worker that restarts at the same URL while the endpoint
+/// returns 503 would keep crediting claims from before the restart.
+fn probe_renews_trust(outcome: &StaticHybridMatch) -> bool {
+    matches!(
+        outcome,
+        StaticHybridMatch::Matches | StaticHybridMatch::Unavailable(SourcesProbe::Unsupported)
+    )
+}
+
 async fn static_hybrid_sources_match(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
     config: &StaticKvEventSources,
+    bound: Option<&BoundSources>,
 ) -> StaticHybridMatch {
     // A rank-pinned worker URL (`base@1`) still queries the engine's HTTP
     // control plane on the base URL.
@@ -1226,6 +1427,19 @@ async fn static_hybrid_sources_match(
         }
         if layout_topic_mismatch(config, &observed).is_some() {
             return StaticHybridMatch::Differs;
+        }
+        // The subscribers stay attached to the endpoints captured when the
+        // layout was installed, so a publisher that moved or disabled events
+        // while keeping its rank and topic has to retire the provider.
+        if let Some(bound) = bound {
+            let moved = bound.iter().any(|(rank, installed)| {
+                observed
+                    .get(&rank.to_string())
+                    .is_none_or(|actual| bound_source_moved(&host, installed, actual))
+            });
+            if moved {
+                return StaticHybridMatch::Differs;
+            }
         }
         let missing_rank = config.hybrid.as_ref().is_some_and(|layout| {
             layout.ranks.iter().any(|rank| {
@@ -1283,10 +1497,7 @@ async fn discover_full_attention_http_worker(
         .map_err(Clone::clone);
     WorkerDiscovery {
         server_info,
-        // Native vLLM omits the fixed ZMQ wire declarations on each source, so
-        // normalize them the way the P/D path does or every source is dropped as
-        // an unsupported encoding.
-        sources: query_pd_kv_event_sources(client, worker_url, api_key).await,
+        sources: fetch_kv_event_sources(client, worker_url, api_key).await,
         model_id,
         hybrid: None,
     }
@@ -1415,8 +1626,9 @@ async fn fetch_kv_event_sources(
 async fn query_kv_event_sources(
     client: &reqwest::Client,
     worker_url: &str,
+    api_key: Option<&str>,
 ) -> Result<KvEventSourcesResponse, SourcesUnavailable> {
-    fetch_kv_event_sources(client, worker_url, None).await
+    fetch_kv_event_sources(client, worker_url, api_key).await
 }
 
 impl From<crate::backend::control::KvEventSourcesError> for SourcesUnavailable {
@@ -1507,6 +1719,30 @@ fn event_source_label(worker_url: &str) -> &'static str {
     } else {
         "/kv_event_sources"
     }
+}
+
+/// Whether the engine's current answer for one rank no longer matches the
+/// endpoints its subscribers are attached to. The engine reports the addresses
+/// it bound (`tcp://*:port`) while the installed source holds the resolved
+/// ones, so both sides are resolved against the worker host before comparing.
+fn bound_source_moved(host: &str, installed: &BoundSource, actual: &KvEventSourceEntry) -> bool {
+    let same_endpoint = |left: &str, right: &str| {
+        resolve_endpoint(left, host)
+            .ok()
+            .zip(resolve_endpoint(right, host).ok())
+            .is_some_and(|(left, right)| left == right)
+    };
+    let same_optional_endpoint = |left: Option<&str>, right: Option<&str>| match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => same_endpoint(left, right),
+        _ => false,
+    };
+    !events_enabled(actual)
+        || !same_endpoint(&actual.endpoint, &installed.endpoint)
+        || !same_optional_endpoint(
+            actual.replay_endpoint.as_deref(),
+            installed.replay_endpoint.as_deref(),
+        )
 }
 
 /// Worker cache metadata, tried in the order a deployment is likely to answer it:
@@ -1917,6 +2153,24 @@ vllm:cache_config_info{block_size="32",engine="1"} 1.0
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
+
+    #[test]
+    fn only_confirming_probes_renew_trust() {
+        assert!(probe_renews_trust(&StaticHybridMatch::Matches));
+        assert!(probe_renews_trust(&StaticHybridMatch::Unavailable(
+            SourcesProbe::Unsupported
+        )));
+        assert!(!probe_renews_trust(&StaticHybridMatch::Unavailable(
+            SourcesProbe::Failed
+        )));
+        assert!(!probe_renews_trust(&StaticHybridMatch::Differs));
+        // A failed probe keeps the worker routable; only the credit expires.
+        assert!(probe_keeps_trust(&StaticHybridMatch::Unavailable(
+            SourcesProbe::Failed
+        )));
+        assert!(!probe_keeps_trust(&StaticHybridMatch::Differs));
+    }
+
     use super::*;
     use crate::kv_index::{MatchQuery, StorageTier};
 
@@ -2008,6 +2262,45 @@ mod tests {
             "ipc:///tmp/x"
         );
         assert_eq!(resolve_endpoint("inproc://x", "h").unwrap(), "inproc://x");
+    }
+
+    #[test]
+    fn bound_source_accepts_the_engines_bind_endpoints() {
+        // The engine answers /kv_event_sources with the addresses it bound while
+        // the installed source keeps the resolved ones; that is not a move.
+        let installed = BoundSource {
+            endpoint: "tcp://127.0.0.1:26258".to_string(),
+            replay_endpoint: Some("tcp://127.0.0.1:27258".to_string()),
+        };
+        let actual = KvEventSourceEntry {
+            publisher: Some("zmq".to_string()),
+            endpoint: "tcp://*:26258".to_string(),
+            replay_endpoint: Some("tcp://*:27258".to_string()),
+            ..KvEventSourceEntry::default()
+        };
+        assert!(!bound_source_moved("127.0.0.1", &installed, &actual));
+
+        let moved_publisher = KvEventSourceEntry {
+            endpoint: "tcp://*:26259".to_string(),
+            ..actual.clone()
+        };
+        assert!(bound_source_moved(
+            "127.0.0.1",
+            &installed,
+            &moved_publisher
+        ));
+
+        let moved_replay = KvEventSourceEntry {
+            replay_endpoint: Some("tcp://*:27259".to_string()),
+            ..actual.clone()
+        };
+        assert!(bound_source_moved("127.0.0.1", &installed, &moved_replay));
+
+        let no_replay = KvEventSourceEntry {
+            replay_endpoint: None,
+            ..actual
+        };
+        assert!(bound_source_moved("127.0.0.1", &installed, &no_replay));
     }
 
     #[test]
@@ -2371,12 +2664,12 @@ mod tests {
         };
         let client = reqwest::Client::new();
         assert_eq!(
-            static_hybrid_sources_match(&client, &worker, None, &config).await,
+            static_hybrid_sources_match(&client, &worker, None, &config, None).await,
             StaticHybridMatch::Matches
         );
         sources.write().await["1"]["topic"] = serde_json::json!("boot-2-rank-1");
         assert_eq!(
-            static_hybrid_sources_match(&client, &worker, None, &config).await,
+            static_hybrid_sources_match(&client, &worker, None, &config, None).await,
             StaticHybridMatch::Differs
         );
         task.abort();
@@ -2424,19 +2717,19 @@ mod tests {
         };
         let client = reqwest::Client::new();
         assert_eq!(
-            static_hybrid_sources_match(&client, &worker, None, &config).await,
+            static_hybrid_sources_match(&client, &worker, None, &config, None).await,
             StaticHybridMatch::Matches
         );
         // A restarted engine that advertises a new topic belongs to another boot.
         sources.write().await["0"]["topic"] = serde_json::json!("kv-hybrid-boot-2");
         assert_eq!(
-            static_hybrid_sources_match(&client, &worker, None, &config).await,
+            static_hybrid_sources_match(&client, &worker, None, &config, None).await,
             StaticHybridMatch::Differs
         );
         // An engine that advertises nothing cannot keep the old binding alive.
         *sources.write().await = serde_json::json!({});
         assert_eq!(
-            static_hybrid_sources_match(&client, &worker, None, &config).await,
+            static_hybrid_sources_match(&client, &worker, None, &config, None).await,
             StaticHybridMatch::Differs
         );
         task.abort();
@@ -2474,7 +2767,7 @@ mod tests {
             server_info: Ok(ServerInfo {
                 instance_id: Some("worker".into()),
                 model_id: Some("qwen".into()),
-                kv_block_size: Some(16),
+                kv_block_size: Some(576),
                 ..Default::default()
             }),
             sources: Ok(sources),
@@ -2483,10 +2776,11 @@ mod tests {
         };
         let (supervisor, _signals) =
             KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
-        let mut ranks = supervisor
+        let info = supervisor
             .install_worker("http://127.0.0.1:8080", discovery)
-            .unwrap()
-            .ranks;
+            .unwrap();
+        assert_eq!(info.block_size, Some(16));
+        let mut ranks = info.ranks;
         ranks.sort_unstable();
         assert_eq!(ranks, [0, 1]);
     }
@@ -2586,7 +2880,7 @@ mod tests {
         let info = supervisor.on_worker_added(&worker_url).await.unwrap();
         let provider = supervisor.match_provider_for_worker(&worker_url).unwrap();
         boundary_subscription(&publisher, "hybrid/epoch-1", false).await;
-        let payload = crate::kv_index::hybrid_events::tests::qwen35_payload();
+        let payload = crate::kv_index::hybrid::residency::tests::qwen35_payload();
         publisher
             .send_multipart(
                 [
@@ -3920,7 +4214,7 @@ mod tests {
     /// DP ranks never share one index even when both declare one endpoint.
     #[tokio::test]
     async fn rank_pinned_static_source_binds_its_own_rank() {
-        let layout: crate::kv_index::hybrid_capability::HybridCapabilities =
+        let layout: crate::kv_index::hybrid::HybridCapabilities =
             serde_json::from_value(serde_json::json!({
                 "schema_version": 1,
                 "ranks": [{
@@ -4052,7 +4346,7 @@ mod tests {
         block_size: u32,
         model: &str,
     ) -> crate::config::types::StaticKvEventSources {
-        let layout: crate::kv_index::hybrid_capability::HybridCapabilities =
+        let layout: crate::kv_index::hybrid::HybridCapabilities =
             serde_json::from_value(serde_json::json!({
                 "schema_version": 1,
                 "ranks": [{
@@ -4257,5 +4551,62 @@ vllm:cache_config_info{block_size=\"16\",effective_attention_block_size=\"16\",e
         assert!(error.contains("server_info"), "{error}");
         assert!(error.contains("metrics"), "{error}");
         server.abort();
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod rank_merge_tests {
+    use super::*;
+
+    #[test]
+    fn rank_pinned_declarations_fold_into_their_base_worker() {
+        let base = "http://worker:8000";
+        let rank = |rank: u32, model: &str| {
+            serde_json::json!({
+                "rank": rank, "model": model, "weight_version": "default",
+                "weight_identity": null, "publisher_topic": format!("topic-{rank}"),
+                "instance_topic": true, "hash_algorithm": "sha256_cbor",
+                "root_hash": "9bd96a485ad84efdafb72ee48a1d7a69bcead0f8f0433173941b276b9581eef0",
+                "full_hashes": true, "hash_block_size": 16, "hash_lookahead_tokens": 0,
+                "speculative_tokens": 0, "prefix_caching": true, "groups": [],
+            })
+        };
+        let mut sources = serde_json::Map::new();
+        sources.insert(
+            base.to_string(),
+            serde_json::json!({
+                "endpoints": ["tcp://base:5557"], "topic": "topic-0", "block_size": 16, "model": "m0",
+                "hybrid": {"schema_version": 1, "ranks": [rank(0, "m0")]},
+            }),
+        );
+        sources.insert(
+            format!("{base}@1"),
+            serde_json::json!({
+                "endpoints": ["tcp://rank1:5557"], "topic": "topic-1", "block_size": 16, "model": "m1",
+                "hybrid": {"schema_version": 1, "ranks": [rank(1, "m1")]},
+            }),
+        );
+        let (mut supervisor, _signals) =
+            KvIndexSupervisor::new(reqwest::Client::new(), crate::kv_index::HashMode::Sha256);
+        supervisor.static_sources =
+            serde_json::from_value(serde_json::Value::Object(sources)).expect("sources");
+        let resolved = supervisor
+            .resolved_static_source(base)
+            .expect("base resolves with its rank declarations");
+        let hybrid = resolved.hybrid.expect("hybrid layout");
+        assert_eq!(hybrid.ranks.len(), 2);
+        assert_eq!(hybrid.ranks[0].rank, 0);
+        assert_eq!(hybrid.ranks[0].model, "m0");
+        assert_eq!(hybrid.ranks[1].rank, 1);
+        assert_eq!(hybrid.ranks[1].model, "m1");
+        // Both ranks keep their publisher: keeping only the first non-empty
+        // list silently drops the second rank's stream.
+        assert_eq!(
+            resolved.endpoints,
+            vec![
+                "tcp://base:5557".to_string(),
+                "tcp://rank1:5557".to_string()
+            ]
+        );
     }
 }

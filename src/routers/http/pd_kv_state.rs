@@ -603,8 +603,9 @@ mod kv_input_tests {
             replay_endpoints: Some(vec!["tcp://127.0.0.1:5558".into()]),
             block_size: 16,
             model: Some("model".into()),
-            hybrid: Some(crate::kv_index::hybrid_capability::HybridCapabilities {
+            hybrid: Some(crate::kv_index::hybrid::HybridCapabilities {
                 schema_version: 1,
+                adapters: vec![],
                 ranks: vec![],
             }),
             compatible_decode_urls: vec!["http://d0".into()],

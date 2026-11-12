@@ -58,6 +58,14 @@ format only:
 }
 ```
 
+For an engine verified to publish hash-granularity partial prefix entries,
+set `"partial_hash_hits": true` in its rank declaration and set
+`hash_block_size` to the engine's prefix match unit. This is opt-in because a
+hash-sized secondary page is otherwise indistinguishable from a partial entry.
+Only full-attention and Mamba partial entries are recognized; other secondary
+page types remain uncredited. Event-driven credit is a routing estimate and
+can differ from the engine's later lookup when concurrent requests evict pages.
+
 For P/D (experimental), pass `--pd-hybrid-config` a JSON file keyed by prefill
 URL. Each entry holds `endpoints`, `replay_endpoints`, `block_size`, `model`,
 `hybrid` (the layout above) and `compatible_decode_urls`, the decode workers

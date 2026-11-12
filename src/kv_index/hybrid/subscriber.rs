@@ -7,31 +7,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use tokio::sync::watch;
 
-use super::hybrid_events::{HybridEventError, HybridEventIndex};
-use super::subscriber::EventSource;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HybridSourceLease(u64);
+use super::super::subscriber::EventSource;
+use super::super::subscriber::{payload_fingerprint, ReplayWindow};
+use super::super::subscriber::{HybridSourceLease, Phase, SourceState};
+use super::{HybridEventError, HybridEventIndex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HybridStreamError {
     StaleLease,
     InvalidState,
     Index(HybridEventError),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    Retired,
-    Replaying,
-    Live,
-}
-
-struct SourceState {
-    generation: u64,
-    phase: Phase,
 }
 
 /// Serializes lease changes and index mutations, so a retired subscriber
@@ -49,6 +37,7 @@ impl HybridEventStream {
             source: Mutex::new(SourceState {
                 generation: 0,
                 phase: Phase::Retired,
+                reported_int_hashes: false,
             }),
         }
     }
@@ -62,6 +51,7 @@ impl HybridEventStream {
             .checked_add(1)
             .expect("source generation exhausted");
         source.phase = Phase::Replaying;
+        source.reported_int_hashes = false;
         self.index.begin_replay(0);
         HybridSourceLease(source.generation)
     }
@@ -103,7 +93,22 @@ impl HybridEventStream {
             // A rejected batch means the publisher's layout and the declared
             // one disagree; naming the reason is the only way to fix a layout
             // from a live system.
-            tracing::warn!(seq, error = ?error, "hybrid event batch rejected");
+            match error {
+                HybridEventError::IntBlockHashes => {
+                    // The engine's default event encoding, so the fix belongs to
+                    // the engine invocation and the operator has to be told once.
+                    if !source.reported_int_hashes {
+                        source.reported_int_hashes = true;
+                        tracing::error!(
+                            seq,
+                            "hybrid event source publishes integer block hashes, which the sha256 \
+                             index cannot address; no prefix will be credited for this engine. \
+                             Start it with VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0."
+                        );
+                    }
+                }
+                _ => tracing::warn!(seq, error = ?error, "hybrid event batch rejected"),
+            }
             source.phase = Phase::Replaying;
             return Err(HybridStreamError::Index(error));
         }
@@ -205,6 +210,10 @@ pub fn spawn_zmq(
                 rank = source.dp_rank,
                 "hybrid subscriber connecting"
             );
+            let mut window = ReplayWindow {
+                required_through: 0,
+                replayed: HashMap::new(),
+            };
             // A SUB socket can connect before its subscription reaches the
             // publisher. Do not expose a replay until a live event proves the
             // subscription is active and replay reaches at least that event.
@@ -240,11 +249,13 @@ pub fn spawn_zmq(
                 required_through,
                 "hybrid subscription barrier reached"
             );
+            let mut failures = 0u32;
             loop {
                 if stopped(&shutdown_rx) || !stream.is_active(lease) {
                     return Ok(());
                 }
                 stream.restart_replay(lease).map_err(|_| ())?;
+                window.required_through = required_through;
                 let next = replay_from_empty(
                     &ctx,
                     &replay_endpoint,
@@ -252,15 +263,17 @@ pub fn spawn_zmq(
                     &stream,
                     lease,
                     &shutdown_rx,
-                    required_through,
+                    &mut window,
                 )
                 .await;
                 let Some(mut next) = next else {
                     tracing::debug!("hybrid replay produced no usable history");
                     stream.invalidate_replay(lease).map_err(|_| ())?;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(replay_backoff(failures)).await;
+                    failures = failures.saturating_add(1);
                     continue;
                 };
+                failures = 0;
                 tracing::debug!(next, "hybrid replay complete");
                 let mut replaying = true;
                 loop {
@@ -286,11 +299,26 @@ pub fn spawn_zmq(
                             let seq = seq as u64;
                             if seq < next {
                                 // Frames queued during the replay/live overlap
-                                // are harmless duplicates. Once the replay is
-                                // published, a lower sequence can only come
-                                // from a restarted publisher reusing the topic,
-                                // so the whole view belongs to a dead epoch.
-                                if replaying {
+                                // are duplicates only when they carry the same
+                                // bytes the replay applied. A lower sequence with
+                                // different bytes (or one this replay never saw)
+                                // is a restarted publisher reusing the topic, so
+                                // the whole view belongs to a dead epoch and the
+                                // replay has to start over.
+                                // A publisher that restarts reuses the topic
+                                // and begins again at sequence zero. That is a
+                                // new epoch even when the bytes match an old
+                                // frame, so the old epoch's claims must not
+                                // survive it: start the replay over.
+                                if seq == 0 && next > 0 {
+                                    required_through = seq;
+                                    break;
+                                }
+                                let duplicate = replaying
+                                    && window.replayed.get(&seq).is_some_and(|known| {
+                                        *known == payload_fingerprint(&frames[2])
+                                    });
+                                if duplicate {
                                     continue;
                                 }
                                 required_through = seq;
@@ -336,10 +364,20 @@ pub fn spawn_zmq(
     })
 }
 
+/// Backoff for a replay that cannot recover its origin. A publisher that
+/// evicted sequence 0 cannot answer a request from zero, so retrying at a fixed
+/// interval only spins; double the wait up to five seconds and reset it once a
+/// replay lands.
+fn replay_backoff(failures: u32) -> Duration {
+    Duration::from_millis((100u64 << failures.min(6)).min(5_000))
+}
+
 fn stopped(rx: &watch::Receiver<bool>) -> bool {
     *rx.borrow() || rx.has_changed().is_err()
 }
 
+/// The replay's progress and the payloads it applied, so a frame that
+/// overlaps it can be told apart from a restarted publisher reusing the topic.
 async fn replay_from_empty(
     ctx: &zmq::Context,
     endpoint: &str,
@@ -347,7 +385,7 @@ async fn replay_from_empty(
     stream: &HybridEventStream,
     lease: HybridSourceLease,
     shutdown: &watch::Receiver<bool>,
-    required_through: u64,
+    window: &mut ReplayWindow,
 ) -> Option<u64> {
     let dealer = ctx.socket(zmq::DEALER).ok()?;
     dealer.set_linger(0).ok()?;
@@ -362,7 +400,7 @@ async fn replay_from_empty(
             Ok(frames) if frames.len() == 4 && frames[0].is_empty() && frames[2].len() == 8 => {
                 let seq = i64::from_be_bytes(frames[2].as_slice().try_into().ok()?);
                 if seq == -1 && frames[1].is_empty() && frames[3].is_empty() {
-                    if next <= required_through {
+                    if next <= window.required_through {
                         return None;
                     }
                     return Some(next);
@@ -371,6 +409,15 @@ async fn replay_from_empty(
                     return None;
                 }
                 stream.apply_payload(lease, next, &frames[3]).ok()?;
+                window
+                    .replayed
+                    .insert(next, payload_fingerprint(&frames[3]));
+                // Keep the overlap window bounded; older frames fall back to
+                // the conservative restart path.
+                if window.replayed.len() > 4096 {
+                    let floor = next.saturating_sub(2048);
+                    window.replayed.retain(|seq, _| *seq >= floor);
+                }
                 next = next.checked_add(1)?;
             }
             Ok(_) => return None,
@@ -381,12 +428,23 @@ async fn replay_from_empty(
     None
 }
 
+/// Cheap content fingerprint used to tell a replayed frame apart from a
+/// different publisher's frame that happens to reuse the same sequence number.
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use crate::kv_index::hybrid::layout::HybridEventGroup;
     use crate::kv_index::hybrid::HybridGroupKind;
-    use crate::kv_index::hybrid_events::HybridEventGroup;
     use crate::kv_index::RoutableTarget;
+
+    #[test]
+    fn replay_backoff_doubles_and_caps() {
+        assert_eq!(replay_backoff(0), Duration::from_millis(100));
+        assert_eq!(replay_backoff(1), Duration::from_millis(200));
+        assert_eq!(replay_backoff(5), Duration::from_millis(3_200));
+        assert_eq!(replay_backoff(6), Duration::from_millis(5_000));
+        assert_eq!(replay_backoff(30), Duration::from_millis(5_000));
+    }
 
     #[test]
     fn retired_subscriber_cannot_change_replacement_replay() {
@@ -417,7 +475,7 @@ mod tests {
         let stream = HybridEventStream::new(index.clone());
         let first = stream.begin_replay();
         let current = stream.begin_replay();
-        let payload = &crate::kv_index::hybrid_events::tests::qwen35_payload();
+        let payload = &crate::kv_index::hybrid::residency::tests::qwen35_payload();
         let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
         assert_eq!(
             stream.apply_payload(first, 0, payload),
@@ -503,7 +561,7 @@ mod tests {
             replay.recv_multipart(zmq::DONTWAIT),
             Err(zmq::Error::EAGAIN)
         );
-        let payload = &crate::kv_index::hybrid_events::tests::qwen35_payload();
+        let payload = &crate::kv_index::hybrid::residency::tests::qwen35_payload();
         let seq0 = 0_i64.to_be_bytes();
         let end = (-1_i64).to_be_bytes();
         publisher
@@ -580,8 +638,8 @@ mod tests {
             .send_multipart([b"epoch-1".as_slice(), &1_i64.to_be_bytes(), &clear], 0)
             .unwrap();
         wait_for(&index, &prompt, 0).await;
-        // The credit is gone (asserted above); which worker wins is the
-        // tie-break's decision, not the cache's.
+        // After a clear both workers tie; the credit is gone, the tie-break
+        // winner is not part of this assertion.
         assert!(policy
             .select_worker_with_token_ids(&workers, Some(&prompt))
             .is_some());

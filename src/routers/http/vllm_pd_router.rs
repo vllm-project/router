@@ -637,17 +637,23 @@ impl VllmPDRouter {
                 }
             }
             KvConnector::Nixl => {
-                // Push mode hands the decode engine a remote engine identity;
-                // pull mode hands it the prefill's block ids. Neither may be
-                // empty when the response claims a handoff.
-                if decode_params
-                    .get("remote_engine_id")
-                    .is_some_and(Value::is_null)
-                    && decode_params
-                        .get("remote_block_ids")
-                        .is_some_and(Value::is_null)
-                    && decode_params.get("remote_host").is_none()
-                {
+                // A handoff has to carry something. An empty object, or one
+                // whose fields are all null or empty, is not connector
+                // evidence: dispatching decode with it starts a cold prefill
+                // that the router would still report as P/D. Fields the
+                // connector may or may not fill (`remote_engine_id`,
+                // `remote_block_ids`, a transfer id) are not required
+                // individually, because push and pull fill different ones.
+                let empty = |value: &Value| match value {
+                    Value::Null => true,
+                    Value::String(text) => text.is_empty(),
+                    Value::Array(items) => items.is_empty(),
+                    _ => false,
+                };
+                let all_empty = decode_params
+                    .as_object()
+                    .is_none_or(|fields| fields.values().all(empty));
+                if all_empty {
                     return Err("empty_remote_identity");
                 }
             }
@@ -1524,7 +1530,7 @@ impl VllmPDRouter {
             .await
         {
             Ok(response) => attempt.track_response(response),
-            Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+            Err(error) => (error.status_code(), error.to_string()).into_response(),
         }
     }
 
@@ -3224,7 +3230,7 @@ impl RouterTrait for VllmPDRouter {
                         e
                     );
                     (
-                        StatusCode::INTERNAL_SERVER_ERROR,
+                        e.status_code(),
                         format!("Transparent proxy request failed: {}", e),
                     )
                         .into_response()
@@ -5119,10 +5125,16 @@ mod tests {
             for shape in ["streaming", "buffered", "oversized"] {
                 let body_started = Arc::new(tokio::sync::Notify::new());
                 let started = body_started.clone();
-                let prefill_url = spawn_test_server(
-                    axum::Router::new()
-                        .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
-                )
+                let prefill_url = spawn_test_server(axum::Router::new().fallback(|| async {
+                    // A handoff needs a real identity: the router rejects an
+                    // empty object before decode runs.
+                    axum::Json(json!({"kv_transfer_params": {
+                        "remote_engine_id": "test-prefill",
+                        "remote_block_ids": [1],
+                        "remote_host": "127.0.0.1",
+                        "remote_port": 1234
+                    }}))
+                }))
                 .await;
                 let decode_url = spawn_test_server(axum::Router::new().route(
                     "/v1/chat/completions",
@@ -5354,10 +5366,11 @@ mod tests {
         use std::{convert::Infallible, task::Poll};
         let entered = Arc::new(tokio::sync::Notify::new());
         let signal = entered.clone();
-        let prefill_url = spawn_test_server(
-            axum::Router::new()
-                .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
-        )
+        let prefill_url = spawn_test_server(axum::Router::new().fallback(|| async {
+            axum::Json(
+                json!({"kv_transfer_params": {"remote_engine_id": "P", "remote_block_ids": [1]}}),
+            )
+        }))
         .await;
         let decode_url = spawn_test_server(axum::Router::new().route(
             "/v1/chat/completions",
@@ -5415,10 +5428,11 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let signal = entered.clone();
         let resume = release.clone();
-        let prefill_url = spawn_test_server(
-            axum::Router::new()
-                .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
-        )
+        let prefill_url = spawn_test_server(axum::Router::new().fallback(|| async {
+            axum::Json(
+                json!({"kv_transfer_params": {"remote_engine_id": "P", "remote_block_ids": [1]}}),
+            )
+        }))
         .await;
         let decode_url = spawn_test_server(axum::Router::new().fallback(move || {
             let signal = signal.clone();
@@ -5535,7 +5549,7 @@ mod tests {
                 } else {
                     spawn_test_server(
                         axum::Router::new()
-                            .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
+                            .fallback(|| async { axum::Json(json!({"kv_transfer_params": {"remote_engine_id": "P", "remote_block_ids": [1]}})) }),
                     )
                     .await
                 };

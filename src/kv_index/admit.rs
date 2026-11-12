@@ -1,4 +1,6 @@
 //! Event-shape admission, separate from structural decoding and transport.
+use crate::kv_index::types::StorageTier;
+use crate::kv_index::wire::extra_keys_match;
 use crate::kv_index::wire::{BlockStored, ExternalBlockHash, KVEvent, KVEventBatch};
 
 /// Validate the narrow full-attention GPU event shape, preserving the batch rank.
@@ -44,7 +46,7 @@ pub fn validate_device_batch(
                 )
             }
         };
-        if medium.as_deref() != Some("GPU")
+        if StorageTier::from_medium(medium.as_deref()) != Some(StorageTier::Device)
             || group.is_some_and(|group| group != 0)
             || locality
                 .as_deref()
@@ -73,9 +75,7 @@ fn no_unsupported_extensions(event: &BlockStored) -> bool {
         && event.lora_name.is_none()
         // vLLM v0.29.0 block_pool.py builds one extra-key entry per emitted
         // block; a present nonempty all-None list is normal publisher output.
-        && event.extra_keys.as_ref().is_none_or(|keys| {
-            keys.len() == event.block_hashes.len() && keys.iter().all(|key| key.is_nil())
-        })
+        && extra_keys_match(event.extra_keys.as_ref(), event.block_hashes.len(), None)
         && event
             .kv_cache_spec_kind
             .as_deref()
@@ -123,17 +123,11 @@ pub(super) fn validate_full_attention_batch(
                 // Keep unmodeled salt/MM/layout identities out of this token-only
                 // query space. Named LoRA is already isolated by the hash seed.
                 // session_id annotates the request, not the block's cache identity.
-                if s.extra_keys.as_ref().is_some_and(|keys| {
-                    keys.len() != s.block_hashes.len()
-                        || keys.iter().any(|key| {
-                            !key.is_nil()
-                                && !s.lora_name.as_ref().is_some_and(|name| {
-                                    key.as_array().is_some_and(|parts| {
-                                        parts.len() == 1 && parts[0].as_str() == Some(name.as_str())
-                                    })
-                                })
-                        })
-                }) {
+                if !extra_keys_match(
+                    s.extra_keys.as_ref(),
+                    s.block_hashes.len(),
+                    s.lora_name.as_deref(),
+                ) {
                     Some(FullAttentionRejectionReason::ExtraKeys)
                 } else if s
                     .kv_cache_spec_kind
@@ -206,12 +200,7 @@ fn is_supported_residency(
 ) -> bool {
     let pool = ownership.is_some_and(|owner| !owner.is_empty());
     locality.is_none_or(|locality| locality == if pool { "REMOTE" } else { "LOCAL" })
-        && medium.is_none_or(|medium| {
-            matches!(
-                medium.to_ascii_uppercase().as_str(),
-                "GPU" | "DEVICE" | "CPU" | "HOST" | "HOST_PINNED" | "STORAGE" | "DISK"
-            )
-        })
+        && medium.is_none_or(|medium| StorageTier::from_medium(Some(medium)).is_some())
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
