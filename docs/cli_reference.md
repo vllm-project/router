@@ -105,6 +105,8 @@ and the Rust OpenAI backend use different configuration paths. See
 | `--kv-penalty-external` | `f64` | `0.6` | `float` | `0.6` | External-tier KV transfer credit for kv_aware. |
 | `--kv-penalty-disk` | `f64` | `0.3` | `float` | `0.3` | Disk-tier KV transfer credit for kv_aware. |
 | `--kv-aware-session-affinity-ttl-secs` | `u64` | `unset` | `integer` | `unset` | Idle affinity TTL in seconds (1–31536000); unset disables affinity. In PD mode, applies only to decode. |
+| `--kv-aware-completion-history` | `flag` | `false` | `flag` | `false` | Opt in to regular HTTP kv_aware prompt history observed at successful upstream response headers, not completed inference. Does not enable history for PD or gRPC. |
+| `--kv-aware-prefill-history` | `flag` | `false` | `flag` | `false` | Prefer a previously observed Prefill in a work/occupancy tie for static DP1 sequential NIXL pull Completion; never discounts input work. |
 | `--cache-threshold` | `f32` | `0.3` | `float` | `0.3` | Cache-match threshold from 0.0 to 1.0 for cache-aware routing. |
 | `--balance-abs-threshold` | `usize` | `64` | `integer` | `64` | Cache-aware load balancing absolute threshold; used together with the relative threshold. |
 | `--balance-rel-threshold` | `f32` | `1.5` | `float` | `1.5` | Cache-aware load balancing relative threshold; used together with the absolute threshold. |
@@ -123,6 +125,14 @@ consistent-hash virtual-node count, which is `160`. In the regular router,
 
 Without service discovery, `power_of_two` requires at least two workers. A
 PD stage using an explicit power-of-two policy needs two workers for that stage.
+
+Completion history is disabled by default and is independent of session affinity
+and worker-reported KV events. It applies only to plain single-prompt requests
+for a verified registered model in regular HTTP `kv_aware` routing. When no
+usable session binding or positive KV credit applies, it breaks ties within the
+minimum shared score; requests still carry their full token cost. An observation
+at successful upstream response headers does not establish completed inference
+or current KV residency. Other policies, PD and gRPC retain their existing behavior.
 
 ## Prefill/decode disaggregation
 

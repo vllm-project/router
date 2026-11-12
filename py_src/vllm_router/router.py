@@ -84,6 +84,11 @@ class Router:
         kv_penalty_disk: Disk-tier transfer credit for kv_aware. Default: 0.3
         kv_aware_session_affinity_ttl_secs: Idle TTL in seconds for kv_aware session
             affinity (1-31536000). None disables affinity. Default: None
+        kv_aware_completion_history: Enable regular HTTP kv_aware prompt history
+            observed at successful upstream response headers, not completed inference.
+            Separate from KV events and session affinity. Default: False
+        kv_aware_prefill_history: Enable advisory history after a valid static DP1
+            sequential NIXL pull Prefill handoff. Default: False.
         pd_kv_events: Static prefill KV sources as URL=ENDPOINT[,ENDPOINT...],
             one entry per worker. Endpoints are ordered by DP rank; block size is 16.
             Requires PD mode and a kv_aware prefill policy. Default: []

@@ -203,6 +203,12 @@ struct CliArgs {
     /// Omit to disable session affinity while keeping KV-aware routing enabled.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=31_536_000))]
     kv_aware_session_affinity_ttl_secs: Option<u64>,
+    /// Enable regular HTTP kv_aware prompt history observed at successful response headers.
+    #[arg(long, default_value_t = false)]
+    kv_aware_completion_history: bool,
+    /// Enable advisory Prefill history for static DP1 sequential NIXL pull Completion.
+    #[arg(long, default_value_t = false)]
+    kv_aware_prefill_history: bool,
     /// Static KV event publishers for regular kv_aware workers.
     #[arg(long = "kv-event-source", action = ArgAction::Append, value_name = "WORKER_URL=ENDPOINT[,ENDPOINT...]")]
     kv_event_source: Vec<String>,
@@ -670,6 +676,8 @@ impl CliArgs {
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
             kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
+            kv_aware_completion_history: self.kv_aware_completion_history,
+            kv_aware_prefill_history: self.kv_aware_prefill_history,
             health_check: HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
@@ -850,6 +858,29 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_history_is_opt_in_and_reaches_router_config() {
+        for (regular, prefill) in [(false, false), (true, false), (false, true)] {
+            let mut argv = vec![
+                "vllm-router",
+                "--policy",
+                "kv_aware",
+                "--worker-urls",
+                "http://127.0.0.1:8000",
+            ];
+            if regular {
+                argv.push("--kv-aware-completion-history");
+            }
+            if prefill {
+                argv.push("--kv-aware-prefill-history");
+            }
+            let args = CliArgs::try_parse_from(argv).unwrap();
+            let config = args.to_router_config(vec![]).unwrap();
+            assert_eq!(config.kv_aware_completion_history, regular);
+            assert_eq!(config.kv_aware_prefill_history, prefill);
+        }
+    }
 
     #[test]
     fn parses_pd_kv_aware_with_affinity_ttl() {

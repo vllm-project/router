@@ -90,12 +90,18 @@ fn probe_outcome(existing: Option<&Binding>, signature: Option<&str>) -> ProbeOu
     }
 }
 
+struct RegisteredTarget {
+    signature: String,
+    history_worker: Option<std::sync::Weak<dyn Worker>>,
+}
+
 pub(super) struct PdKvState {
     client: reqwest::Client,
     api_key: Option<String>,
     supervisor: KvIndexSupervisor,
     bindings: Mutex<HashMap<String, Binding>>,
-    targets: Mutex<HashMap<String, String>>,
+    targets: Mutex<HashMap<String, RegisteredTarget>>,
+    pub(super) history_enabled: bool,
     // Serializes bind() runs. Discovery and subscriber handshakes run outside
     // the map locks, so a slow P engine can only delay its own refresh —
     // never the request path's short binding reads.
@@ -120,9 +126,11 @@ impl PdKvState {
         sources: HashMap<String, crate::config::types::PdKvEventSources>,
         workers: Vec<Arc<dyn Worker>>,
         policy: Arc<dyn LoadBalancingPolicy>,
+        history_enabled: bool,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
         state.api_key = api_key;
+        state.history_enabled = history_enabled;
         state.supervisor.set_api_key(state.api_key.clone());
         state.refresh_inputs = Mutex::new(RefreshInputs {
             workers: workers.iter().cloned().collect(),
@@ -164,6 +172,7 @@ impl PdKvState {
             api_key: None,
             bindings: Mutex::new(HashMap::new()),
             targets: Mutex::new(HashMap::new()),
+            history_enabled: false,
             bind_lock: Mutex::new(()),
             refresh_inputs: Mutex::new(RefreshInputs::default()),
             // Subscribers enforce trust by suspending/clearing affected sources.
@@ -337,7 +346,13 @@ impl PdKvState {
             let signature = binding
                 .map(|binding| format!("{}:{:?}", binding.signature, binding.info))
                 .unwrap_or_default();
-            if targets.get(worker.url()) == Some(&signature) {
+            if targets.get(worker.url()).is_some_and(|previous| {
+                previous.signature == signature
+                    && (!self.history_enabled
+                        || previous.history_worker.as_ref().is_some_and(|witness| {
+                            std::ptr::addr_eq(witness.as_ptr(), worker.as_ref())
+                        }))
+            }) {
                 continue;
             }
             policy.unregister_worker(worker.url());
@@ -353,8 +368,18 @@ impl PdKvState {
                     .then(|| self.supervisor.match_provider_for_worker(worker.base_url()))
                     .flatten()
             });
-            policy.register_worker(worker.as_ref(), info, matches);
-            targets.insert(worker.url().to_owned(), signature);
+            if self.history_enabled {
+                policy.register_http_worker(worker, info, matches, true);
+            } else {
+                policy.register_worker(worker.as_ref(), info, matches);
+            }
+            targets.insert(
+                worker.url().to_owned(),
+                RegisteredTarget {
+                    signature,
+                    history_worker: self.history_enabled.then(|| Arc::downgrade(worker)),
+                },
+            );
         }
     }
 
