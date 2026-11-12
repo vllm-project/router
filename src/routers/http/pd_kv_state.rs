@@ -1,7 +1,9 @@
 //! P/D prefill KV discovery, refresh, and request-input preparation.
 
 use super::pd_types::{PdEndpoint, PdPrefillInput};
-use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs};
+use crate::backend::preprocess::{
+    http_cache_read_fallback, prepare_http_token_inputs, router_token_inputs,
+};
 use crate::core::Worker;
 use crate::kv_index::discovery::{worker_get, WorkerDiscovery};
 use crate::kv_index::{HashMode, KvIndexSupervisor, WorkerKvInfo};
@@ -526,10 +528,12 @@ impl PdKvState {
         };
         let mut prepared = HashMap::new();
         for (base, result) in results {
-            let fallback = KvAwarePolicy::credit_fallback(
-                request.get("cache_salt").and_then(Value::as_str),
-                allow_credit.get(&base).copied().unwrap_or(false),
-            );
+            let fallback = http_cache_read_fallback(request).or_else(|| {
+                KvAwarePolicy::credit_fallback(
+                    request.get("cache_salt").and_then(Value::as_str),
+                    allow_credit.get(&base).copied().unwrap_or(false),
+                )
+            });
             let (prompts, fallback_reason, source) = match result {
                 Ok(input) => (Some(input.prompts), fallback, input.source),
                 Err(reason) => (None, Some(reason), reason),
@@ -595,6 +599,48 @@ mod kv_input_tests {
     use axum::response::IntoResponse;
     use reqwest::Client;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn prompt_scoring_keeps_prefill_tokens_but_disables_pd_credit() {
+        let state = PdKvState::new(Client::new());
+        let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://worker".into(),
+            WorkerType::Regular,
+        ));
+        let prompt: Vec<u32> = (0..65).collect();
+        for (field, expected) in [
+            (
+                json!({"skip_reading_prefix_cache":true}),
+                "skip_prefix_cache",
+            ),
+            (json!({"prompt_logprobs":0}), "unsupported_prompt_scoring"),
+            (
+                json!({"skip_reading_prefix_cache":false,"prompt_logprob_start":32}),
+                "unsupported_prompt_scoring",
+            ),
+        ] {
+            let mut body = json!({"model":"m","prompt":prompt});
+            body.as_object_mut()
+                .unwrap()
+                .extend(field.as_object().unwrap().clone());
+            let result = state
+                .prepare(
+                    std::slice::from_ref(&worker),
+                    &policy,
+                    &body,
+                    "/v1/completions",
+                    None,
+                    None,
+                )
+                .await;
+            let input = &result[worker.base_url()];
+            assert_eq!(input.fallback_reason, Some(expected));
+            assert!(!input.allow_credit);
+            assert_eq!(input.prompts.as_ref().unwrap()[0].len(), 65);
+            assert_eq!(input.work_by_rank[&worker.dp_rank()].new_prefill_tokens, 65);
+        }
+    }
 
     #[tokio::test]
     async fn configured_hybrid_pairs_exclude_unlisted_workers() {

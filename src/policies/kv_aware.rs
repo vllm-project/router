@@ -2275,6 +2275,84 @@ mod tests {
     }
 
     #[test]
+    fn request_qualification_applies_to_dense_and_hybrid_placement() {
+        struct Matches {
+            target: RoutableTarget,
+            hybrid: bool,
+            queries: AtomicUsize,
+        }
+        impl TieredMatchProvider for Matches {
+            fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
+                self.queries.fetch_add(1, Ordering::Relaxed);
+                vec![tier_match(&self.target, StorageTier::Device, &[(0, 4)])]
+            }
+            fn find_token_matches(
+                &self,
+                _: &[u32],
+                _: u32,
+                _: Option<&str>,
+                _: u32,
+            ) -> Option<Vec<TierMatch>> {
+                self.hybrid.then(|| {
+                    self.queries.fetch_add(1, Ordering::Relaxed);
+                    vec![tier_match(&self.target, StorageTier::Device, &[(0, 4)])]
+                })
+            }
+        }
+        for hybrid in [false, true] {
+            let policy = KvAwarePolicy::default();
+            let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+                "http://qualified".into(),
+                WorkerType::Regular,
+            ))];
+            let provider = Arc::new(Matches {
+                target: target(workers[0].url(), 0),
+                hybrid,
+                queries: AtomicUsize::new(0),
+            });
+            policy.register_target_with_cache_identity(
+                workers[0].url(),
+                provider.target.clone(),
+                CacheKey {
+                    model: Arc::from("model"),
+                    hash_mode: crate::kv_index::HashMode::Sha256,
+                    block_size: 16,
+                },
+                provider.clone(),
+            );
+            let ids: Vec<u32> = (0..65).collect();
+            for (allowed, prefill) in [(true, 1), (false, 65)] {
+                let receipt = policy
+                    .select_worker_with_qualified_inputs(
+                        &workers,
+                        QualifiedKvInput {
+                            tokens: KvRequestTokens::Shared(Some(&ids)),
+                            eligibility: Some(&[allowed]),
+                        },
+                        None,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap();
+                assert_eq!(receipt.new_prefill_tokens, prefill, "hybrid={hybrid}");
+                release_receipt(&workers, &receipt);
+                let pd = policy.estimate_prefill_work(&[(
+                    workers[0].as_ref(),
+                    std::slice::from_ref(&ids),
+                    allowed,
+                )]);
+                assert_eq!(pd[0].new_prefill_tokens, prefill, "hybrid={hybrid}");
+            }
+            assert_eq!(
+                provider.queries.load(Ordering::Relaxed),
+                2,
+                "hybrid={hybrid}"
+            );
+        }
+    }
+
+    #[test]
     fn placement_eligibility_keeps_unknown_targets_selectable_without_shared_identity_credit() {
         struct Matches {
             queries: AtomicUsize,

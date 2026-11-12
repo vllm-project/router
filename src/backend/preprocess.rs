@@ -99,6 +99,72 @@ fn http_cache_identity(
     Ok(())
 }
 
+/// Requests whose cache-read semantics have not been verified must not earn
+/// placement credit. Keep their token ids for load accounting and affinity.
+/// B300 vLLM 0.33 skips prompt scoring reads by default but has no start cap;
+/// local vLLM b147663 additionally has a cap. Without an engine capability
+/// contract, neither behaviour can be assumed for a routed worker.
+pub(crate) fn http_cache_read_fallback(body: &serde_json::Value) -> Option<&'static str> {
+    fn inspect(
+        value: &serde_json::Value,
+        echo: &mut bool,
+        logprobs: &mut bool,
+    ) -> Option<&'static str> {
+        let fields = value.as_object()?;
+        match fields.get("skip_reading_prefix_cache") {
+            None | Some(serde_json::Value::Null | serde_json::Value::Bool(false)) => {}
+            Some(serde_json::Value::Bool(true)) => return Some("skip_prefix_cache"),
+            Some(_) => return Some("unsupported_cache_read"),
+        }
+        match fields.get("skip_reading_external_kv") {
+            None | Some(serde_json::Value::Null | serde_json::Value::Bool(false)) => {}
+            Some(serde_json::Value::Bool(true)) => return Some("skip_external_kv"),
+            Some(_) => return Some("unsupported_cache_read"),
+        }
+        if [
+            "prompt_logprobs",
+            "prompt_logprob_token_ids",
+            "prompt_logprob_start",
+        ]
+        .iter()
+        .any(|name| fields.get(*name).is_some_and(|value| !value.is_null()))
+        {
+            return Some("unsupported_prompt_scoring");
+        }
+        match fields.get("echo") {
+            None | Some(serde_json::Value::Null | serde_json::Value::Bool(false)) => {}
+            Some(serde_json::Value::Bool(true)) => *echo = true,
+            Some(_) => return Some("unsupported_cache_read"),
+        }
+        *logprobs |= ["logprobs", "top_logprobs"]
+            .iter()
+            .any(|name| fields.get(*name).is_some_and(|value| !value.is_null()));
+        match fields.get("cache_salt") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(salt)) if salt.is_empty() => {}
+            Some(serde_json::Value::String(_)) => return Some("cache_salt"),
+            Some(_) => return Some("unsupported_cache_identity"),
+        }
+        for name in ["extra_body", "sampling_params", "sampling_parameters"] {
+            if let Some(value) = fields.get(name).filter(|value| !value.is_null()) {
+                if !value.is_object() {
+                    return Some("unsupported_cache_read");
+                }
+                if let Some(reason) = inspect(value, echo, logprobs) {
+                    return Some(reason);
+                }
+            }
+        }
+        None
+    }
+    if !body.is_object() {
+        return Some("unsupported_cache_read");
+    }
+    let (mut echo, mut logprobs) = (false, false);
+    inspect(body, &mut echo, &mut logprobs)
+        .or_else(|| (echo && logprobs).then_some("unsupported_prompt_scoring"))
+}
+
 fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &'static str> {
     if let Some(fields) = body.as_object() {
         http_cache_identity(fields)?;
@@ -1024,6 +1090,70 @@ mod tests {
         );
         assert!(results[&bad].is_err());
         server.abort();
+    }
+
+    #[test]
+    fn http_cache_read_qualification_is_conservative_across_protocol_versions() {
+        use super::http_cache_read_fallback;
+        use serde_json::json;
+
+        for (body, expected) in [
+            (json!({"prompt":[1,2]}), None),
+            (json!({"lora_name":"adapter"}), None),
+            (json!({"skip_reading_prefix_cache":false}), None),
+            (
+                json!({"skip_reading_prefix_cache":true}),
+                Some("skip_prefix_cache"),
+            ),
+            (
+                json!({"skip_reading_prefix_cache":"false"}),
+                Some("unsupported_cache_read"),
+            ),
+            (
+                json!({"skip_reading_external_kv":true}),
+                Some("skip_external_kv"),
+            ),
+            (
+                json!({"prompt_logprobs":0}),
+                Some("unsupported_prompt_scoring"),
+            ),
+            (
+                json!({"prompt_logprob_token_ids":[[1]]}),
+                Some("unsupported_prompt_scoring"),
+            ),
+            (
+                json!({"prompt_logprob_start":32,"skip_reading_prefix_cache":false}),
+                Some("unsupported_prompt_scoring"),
+            ),
+            (
+                json!({"extra_body":{"skip_reading_prefix_cache":true}}),
+                Some("skip_prefix_cache"),
+            ),
+            (
+                json!({"skip_reading_prefix_cache":false,"extra_body":{"skip_reading_prefix_cache":true}}),
+                Some("skip_prefix_cache"),
+            ),
+            (
+                json!({"sampling_params":{"prompt_logprobs":0}}),
+                Some("unsupported_prompt_scoring"),
+            ),
+            (
+                json!({"echo":true,"extra_body":{"logprobs":0}}),
+                Some("unsupported_prompt_scoring"),
+            ),
+            (json!({"echo":false,"logprobs":0}), None),
+            (
+                json!({"echo":1,"logprobs":0}),
+                Some("unsupported_cache_read"),
+            ),
+            (json!({"cache_salt":12}), Some("unsupported_cache_identity")),
+            (
+                json!({"extra_body":{"cache_salt":"tenant"}}),
+                Some("cache_salt"),
+            ),
+        ] {
+            assert_eq!(http_cache_read_fallback(&body), expected, "{body}");
+        }
     }
 
     #[test]

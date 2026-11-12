@@ -1,6 +1,8 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
 use super::program_adapter::ProgramCompletion;
-use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
+use crate::backend::preprocess::{
+    http_cache_read_fallback, prepare_completion_direct_inputs, prepare_http_kv_inputs,
+};
 use crate::backend::{
     stream_output::{output_frame_tracking, OutputFrameConsumer, OutputFrameProducer},
     PrepareError,
@@ -1513,6 +1515,15 @@ impl Router {
         // its blocks under that identity: the base model's chain is no evidence
         // for it, so it carries the adapter identity into placement credit.
         let (declared_lora, cache_salt) = typed_req.cache_identity();
+        let cache_read_fallback =
+            kv_aware_ops(self.policy_for_model(model_id).as_ref()).and_then(|_| {
+                serde_json::to_value(typed_req)
+                    .map(|body| http_cache_read_fallback(&body))
+                    .unwrap_or(Some("unsupported_cache_read"))
+            });
+        if let Some(reason) = cache_read_fallback {
+            RouterMetrics::record_kv_placement_lookup(reason);
+        }
         let lora_name = declared_lora.or_else(|| {
             let requested = typed_req.get_model()?;
             let workers = self.worker_registry.get_all();
@@ -1621,13 +1632,16 @@ impl Router {
                         .map(KvRequestTokens::PerWorker)
                         .unwrap_or(KvRequestTokens::Shared(None))
                 };
-                let eligibility = completion
+                let mut eligibility = completion
                     .and_then(|completion| {
                         placement_eligibility(
                             completion,
                             &workers,
                         )
                     });
+                if cache_read_fallback.is_some() {
+                    eligibility = Some(vec![false; workers.len()]);
+                }
                 let selected_worker = if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
@@ -1641,13 +1655,16 @@ impl Router {
                     }) {
                         return Self::program_target_unavailable_response(route);
                     }
-                    let eligibility = completion
+                    let mut eligibility = completion
                         .and_then(|completion| {
                             placement_eligibility(
                                 completion,
                                 std::slice::from_ref(&worker),
                             )
                         });
+                    if cache_read_fallback.is_some() {
+                        eligibility = Some(vec![false]);
+                    }
                     let kv_receipt = kv_aware_ops(policy.as_ref()).and_then(|kv_aware| {
                         kv_aware.select_worker_with_qualified_inputs(
                             std::slice::from_ref(&worker),
@@ -3149,6 +3166,10 @@ impl RouterTrait for Router {
             .as_ref()
             .map(KvRequestTokens::PerWorker)
             .unwrap_or(KvRequestTokens::Shared(None));
+        let cache_read_fallback = kv_ops.and_then(|_| http_cache_read_fallback(&body));
+        if let Some(reason) = cache_read_fallback {
+            RouterMetrics::record_kv_placement_lookup(reason);
+        }
         let program_completion = if *method == Method::POST {
             match self
                 .acquire_program_completion_from_payload(
@@ -3175,25 +3196,28 @@ impl RouterTrait for Router {
                 .filter(|worker| worker.is_available())
                 .map(|worker| {
                     let kv_receipt = kv_ops.and_then(|ops| {
-                        ops.select_worker_with_inputs(
+                        ops.select_worker_with_qualified_inputs(
                             std::slice::from_ref(&worker),
                             request_tokens,
                             lora_name,
                             cache_salt,
                             affinity_key.as_ref(),
                             &[],
+                            cache_read_fallback.map(|_| &[false][..]),
                         )
                     });
                     SelectedWorker { worker, kv_receipt }
                 })
         } else if let Some(ops) = kv_ops {
-            ops.select_worker_with_inputs(
+            let eligibility = cache_read_fallback.map(|_| vec![false; workers.len()]);
+            ops.select_worker_with_qualified_inputs(
                 &workers,
                 request_tokens,
                 lora_name,
                 cache_salt,
                 affinity_key.as_ref(),
                 &[],
+                eligibility.as_deref(),
             )
             .map(|receipt| SelectedWorker {
                 worker: workers[receipt.worker_index].clone(),
