@@ -1,16 +1,16 @@
 """Start real vLLM worker processes from the test process.
 
-The command builder stays in ``tests.python.helpers.e2e.process`` and is
-imported only when a worker is launched. Mock workers use ``MockWorkerManager``.
+Workers are started through ``tests.python.helpers.process``. That module
+loads the vLLM command builder only when a worker is launched. Mock workers
+use ``MockWorkerManager``.
 """
 
 from __future__ import annotations
 
-import subprocess
 from types import SimpleNamespace
 
-from tests.python.helpers.e2e.process import _popen_launch_worker, _terminate
 from tests.python.helpers.ports import find_free_port
+from tests.python.helpers.process import RunningProc, launch_vllm_http_worker
 
 
 class VllmWorkerManager:
@@ -22,7 +22,7 @@ class VllmWorkerManager:
 
     def __init__(self, shared: VllmWorkerManager | None = None):
         self._shared = shared
-        self._procs: list[subprocess.Popen] = []
+        self._running: list[RunningProc] = []
         self._cache: dict = {}
 
     def start(
@@ -58,10 +58,9 @@ class VllmWorkerManager:
         return self._cached(("dp2-pair", model), launch)
 
     def stop_all(self) -> None:
-        for proc in self._procs:
-            if proc.poll() is None:
-                _terminate(proc)
-        self._procs.clear()
+        for running in self._running:
+            running.stop()
+        self._running.clear()
         self._cache.clear()
 
     def _cached(self, key: tuple, factory):
@@ -79,12 +78,12 @@ class VllmWorkerManager:
     ) -> SimpleNamespace:
         port = find_free_port()
         url = f"http://127.0.0.1:{port}"
-        proc = _popen_launch_worker(
+        running = launch_vllm_http_worker(
             model,
             url,
             dp_size=dp_size,
             api_key=api_key,
             base_gpu_id=base_gpu_id,
         )
-        self._procs.append(proc)
-        return SimpleNamespace(proc=proc, url=url)
+        self._running.append(running)
+        return SimpleNamespace(proc=running.proc, url=url)

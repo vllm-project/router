@@ -2,8 +2,7 @@
 
 The HTTP server itself stays in ``mock_worker.py`` and runs in a child process.
 This manager starts regular workers, or the prefill and decode workers used by
-PD disaggregation and PD response merge. The test starts the router itself
-through ``RouterManager``.
+PD disaggregation. The test starts the router itself through ``RouterManager``.
 """
 
 from __future__ import annotations
@@ -61,21 +60,12 @@ class MockWorkerManager:
         n: int = 1,
         args: list[str] | None = None,
         bootstrap_port: int | None = None,
-        *,
-        merge: bool = False,
-        nixl_push: bool = False,
     ) -> tuple[list[str], list[str]]:
         """Start ``n`` prefill workers.
 
-        ``merge`` makes each worker return the prefill half of a PD response.
-        ``nixl_push`` marks that half as a NIXL push transfer and requires
-        ``merge``. The bootstrap port stays unset unless given.
+        The bootstrap port stays unset unless given.
         """
-        if nixl_push and not merge:
-            raise ValueError("nixl_push requires merge=True")
-        _, urls, worker_ids = self.start_workers(
-            n, _role_args("prefill" if merge else None, nixl_push, args)
-        )
+        _, urls, worker_ids = self.start_workers(n, args)
         self.prefill_urls.extend((url, bootstrap_port) for url in urls)
         self.prefill_ids.update(worker_ids)
         return urls, worker_ids
@@ -84,17 +74,12 @@ class MockWorkerManager:
         self,
         n: int = 1,
         args: list[str] | None = None,
-        *,
-        merge: bool = False,
     ) -> tuple[list[str], list[str]]:
         """Start ``n`` decode workers.
 
-        ``merge`` makes each worker return the decode half of a PD response.
         Call again for a group that needs different ``args``.
         """
-        _, urls, worker_ids = self.start_workers(
-            n, _role_args("decode" if merge else None, False, args)
-        )
+        _, urls, worker_ids = self.start_workers(n, args)
         self.decode_urls.extend(urls)
         self.decode_ids.update(worker_ids)
         return urls, worker_ids
@@ -141,15 +126,6 @@ class MockWorkerManager:
         url = f"http://127.0.0.1:{port}"
         _wait_health(url)
         return process, url, worker_id
-
-
-def _role_args(role: str | None, nixl_push: bool, args: list[str] | None) -> list[str]:
-    extra = list(args or [])
-    if role is not None:
-        extra = ["--pd-role", role, *extra]
-    if nixl_push:
-        extra.append("--nixl-push")
-    return extra
 
 
 def _wait_health(url: str, timeout: float = 10.0) -> None:

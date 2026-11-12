@@ -12,15 +12,23 @@ from pathlib import Path
 
 import pytest
 
-from tests.python.helpers.e2e.monitor import (
+from tests.python.helpers.monitor import (
     _gpu_monitor_should_run,
     _launch_gpu_monitor,
     _log_and_assert_gpu_thresholds,
     _read_gpu_monitor_result,
 )
-from tests.python.helpers.e2e.process import _graceful_stop_any, _which
+from tests.python.helpers.process import stop_any
 
 logger = logging.getLogger(__name__)
+
+
+def _which(cmd: str) -> str | None:
+    try:
+        return shutil.which(cmd)
+    except Exception as exc:
+        logger.warning("shutil.which(%r) failed: %s", cmd, exc)
+        return None
 
 
 def run_genai_bench(
@@ -198,7 +206,7 @@ def run_genai_bench(
                 except Exception:
                     pass
             for proc_to_stop in kill_procs:
-                _graceful_stop_any(proc_to_stop)
+                stop_any(proc_to_stop)
             try:
                 time.sleep(2)
             except Exception:

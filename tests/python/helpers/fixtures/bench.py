@@ -1,4 +1,4 @@
-"""Benchmark fixture. The genai-bench runner lives in ``tests.python.helpers.e2e.bench``."""
+"""Benchmark fixture. The genai-bench runner lives in ``tests.python.helpers.bench``."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from typing import Callable
 
 import pytest
 
-from tests.python.helpers.e2e.bench import run_genai_bench
+from tests.python.helpers.bench import run_genai_bench
 
 
 @pytest.fixture(scope="session")

@@ -8,8 +8,6 @@ Implements minimal endpoints used by the router:
 - GET /get_server_info, /get_model_info, /v1/models
 
 Behavior knobs are controlled via CLI flags to simulate failures, latency, and load.
-``--pd-role prefill|decode`` returns the usage and logprobs fixtures used by
-the PD response-merge tests. ``--nixl-push`` marks a prefill response as NIXL push.
 """
 
 import argparse
@@ -52,114 +50,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--dp-size", type=int, default=1)
     p.add_argument("--crash-on-request", action="store_true")
     p.add_argument("--health-fail-after-ms", type=int, default=0)
-    # PD response-merge fixtures. Prefill owns input usage; decode owns output usage.
-    p.add_argument("--pd-role", choices=["prefill", "decode"], default=None)
-    p.add_argument("--nixl-push", action="store_true")
     return p.parse_args()
-
-
-def _pd_usage(path: str, role: str) -> dict:
-    """Usage blocks from the in-process PD merge fixture in test_pd_routing.rs."""
-    responses = path.endswith("/responses")
-    if role == "prefill":
-        if responses:
-            return {
-                "input_tokens": 70,
-                "output_tokens": 1,
-                "total_tokens": 71,
-                "input_tokens_details": {"cached_tokens": 4},
-            }
-        return {
-            "prompt_tokens": 70,
-            "completion_tokens": 1,
-            "total_tokens": 71,
-            "prompt_tokens_details": {"cached_tokens": 4},
-        }
-    if responses:
-        return {
-            "input_tokens": 999,
-            "output_tokens": 8,
-            "total_tokens": 1007,
-            "output_tokens_details": {"reasoning_tokens": 2},
-        }
-    return {
-        "prompt_tokens": 999,
-        "completion_tokens": 8,
-        "total_tokens": 1007,
-        "prompt_tokens_details": {"cached_tokens": 99, "audio_tokens": 2},
-    }
-
-
-def _wants_logprobs(data: dict) -> bool:
-    return "logprobs" in data or data.get("echo") is True
-
-
-def _pd_json(args: argparse.Namespace, path: str, data: dict, worker_id: str) -> dict:
-    """Prefill or decode JSON whose usage and logprobs the router must merge."""
-    usage = _pd_usage(path, args.pd_role)
-    body: dict = {"choices": [{"text": "answer", "index": 0}], "usage": usage}
-    if args.pd_role == "prefill":
-        params = {
-            "remote_engine_id": "P",
-            "do_remote_prefill": True,
-        }
-        if args.nixl_push:
-            params["remote_host"] = "127.0.0.1"
-            params["remote_port"] = 9100
-            params["transfer_mode"] = "push"
-        body["kv_transfer_params"] = params
-    if _wants_logprobs(data) and path.endswith("/chat/completions"):
-        if args.pd_role == "prefill":
-            # Chat Completions keeps prompt_logprobs at the top level.
-            body["prompt_logprobs"] = [None, -0.5, -1.2]
-    elif (
-        _wants_logprobs(data)
-        and not path.endswith("/responses")
-        and args.pd_role == "prefill"
-    ):
-        body["choices"] = [
-            {
-                "text": "prefill",
-                "index": 0,
-                "prompt_logprobs": [None, -0.5, -1.2],
-                "logprobs": {
-                    "token_logprobs": [None, -0.5, -1.2, -2.1],
-                    "tokens": ["Hello", " world", " test", " extra"],
-                    "text_offset": [0, 5, 11, 16],
-                    "top_logprobs": [
-                        None,
-                        {" world": -0.5},
-                        {" test": -1.2},
-                        {" extra": -2.1},
-                    ],
-                },
-            }
-        ]
-    elif (
-        _wants_logprobs(data)
-        and not path.endswith("/responses")
-        and not path.endswith("/chat/completions")
-    ):
-        body["choices"][0]["logprobs"] = {
-            "token_logprobs": [-3.5, -4.2],
-            "tokens": [" output", " token"],
-            "text_offset": [0, 7],
-            "top_logprobs": [{" output": -3.5}, {" token": -4.2}],
-        }
-    body["worker_id"] = worker_id
-    return body
-
-
-def _pd_sse(path: str, role: str) -> str:
-    """Two SSE frames then [DONE], matching the Rust PD usage fixture."""
-    usage = _pd_usage(path, role)
-    if path.endswith("/responses"):
-        delta = {"type": "response.output_text.delta", "delta": "answer"}
-        final = {"type": "response.completed", "response": {"usage": usage}}
-    else:
-        delta = {"choices": [{"index": 0, "text": "answer"}], "usage": None}
-        final = {"choices": [], "usage": usage}
-    return f"data: {json.dumps(delta)}\n\ndata: {json.dumps(final)}\n\ndata: [DONE]\n\n"
 
 
 def _extract_worker_id(args: argparse.Namespace) -> str:
@@ -344,44 +235,6 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         }
         return make_json_response(ret, status_code=200)
 
-    async def handle_pd_request(request: Request):
-        # Same failure knobs as the generic handler. The body is a PD fixture
-        # instead of an echo, so the router can merge prefill and decode.
-        check_api_key(request)
-        raw = await request.body()
-        if len(raw) > args.max_payload_bytes:
-            return make_json_response({"error": "payload too large"}, status_code=413)
-        if args.crash_on_request and not crashed["done"]:
-            crashed["done"] = True
-            os._exit(1)
-        if args.timeout:
-            await asyncio.sleep(3600)
-        await maybe_hold()
-        await maybe_delay()
-        fail_code = should_fail()
-        if fail_code is not None and fail_code != 200:
-            return make_json_response(
-                {"error": f"mock failure {fail_code}"}, status_code=fail_code
-            )
-        try:
-            data = json.loads(raw) if raw else {}
-        except (json.JSONDecodeError, ValueError):
-            data = {}
-        if not isinstance(data, dict):
-            data = {}
-        path = request.url.path
-        # Prefill is always one buffered JSON response. Decode follows the client.
-        if args.pd_role == "decode" and data.get("stream") is True:
-            headers = {"X-Worker-Id": worker_id}
-
-            async def gen():
-                yield _pd_sse(path, args.pd_role)
-
-            return StreamingResponse(
-                gen(), media_type="text/event-stream", headers=headers
-            )
-        return make_json_response(_pd_json(args, path, data, worker_id))
-
     async def handle_stream_request(request: Request):
         check_api_key(request)
 
@@ -400,8 +253,6 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
     async def dispatch(request: Request):
-        if args.pd_role:
-            return await handle_pd_request(request)
         if args.stream:
             return await handle_stream_request(request)
         return await handle_text_request(request)

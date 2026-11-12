@@ -1,14 +1,17 @@
-"""Worker argv and process start/stop for the perf suites.
+"""Start and stop worker and router processes.
 
-``vllm_rs_serve_cmd``, ``vllm_serve_cmd``, and ``router_cmd`` build argv.
-``launch_worker`` and ``launch_router`` start the processes. Callers decide
-when to start them.
+``vllm_rs_serve_cmd``, ``vllm_serve_cmd``, and ``router_cmd`` build argv for
+the perf suites. ``launch_worker`` and ``launch_router`` start those processes.
+``launch_vllm_http_worker`` starts a real vLLM HTTP worker for GPU tests.
+``graceful_stop`` is the only teardown. Importing this module does not import
+vLLM; the worker command builder loads only when a worker is launched.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -17,6 +20,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -103,8 +107,9 @@ def _wait_http(
     raise TimeoutError(f"{label} not ready at {url} within {timeout}s")
 
 
-def graceful_stop(proc: subprocess.Popen, timeout: float = 120.0) -> None:
-    if proc.poll() is not None:
+def graceful_stop(proc: subprocess.Popen | None, timeout: float = 120.0) -> None:
+    """Terminate a process, then kill it if it is still alive after ``timeout``."""
+    if proc is None or proc.poll() is not None:
         return
     proc.terminate()
     start = time.monotonic()
@@ -112,6 +117,31 @@ def graceful_stop(proc: subprocess.Popen, timeout: float = 120.0) -> None:
         time.sleep(1)
     if proc.poll() is None:
         proc.kill()
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _stop_pid(pid: int, timeout: float) -> None:
+    if not _pid_alive(pid):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    start = time.monotonic()
+    while _pid_alive(pid) and time.monotonic() - start < timeout:
+        time.sleep(1)
+    if _pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def _stop_proc(
@@ -153,6 +183,25 @@ class RunningProc:
             self.label,
             prefix=self.log_prefix,
         )
+
+
+def stop_any(obj: object, timeout: float = 120.0) -> None:
+    """Stop a ``RunningProc``, a ``Popen``, a pid, or an object with ``.proc``."""
+    try:
+        if isinstance(obj, RunningProc):
+            obj.stop(timeout)
+            return
+        if isinstance(obj, subprocess.Popen):
+            graceful_stop(obj, timeout)
+            return
+        if isinstance(obj, int):
+            _stop_pid(obj, timeout)
+            return
+        proc = getattr(obj, "proc", None)
+        if isinstance(proc, subprocess.Popen):
+            graceful_stop(proc, timeout)
+    except Exception as exc:
+        logger.warning("failed to stop %r: %s", obj, exc)
 
 
 def vllm_rs_serve_cmd(
@@ -300,3 +349,38 @@ def launch_router(
         lines=lines,
         lock=lock,
     )
+
+
+def _parse_http_url(base_url: str) -> tuple[str, str]:
+    parsed = urlparse(base_url)
+    return parsed.hostname or "127.0.0.1", (
+        str(parsed.port) if parsed.port is not None else ""
+    )
+
+
+def launch_vllm_http_worker(
+    model: str,
+    base_url: str,
+    *,
+    dp_size: int | None = None,
+    api_key: str | None = None,
+    base_gpu_id: int | None = 0,
+    label: str = "vllm",
+) -> RunningProc:
+    """Start one real vLLM HTTP worker. Callers wait for readiness themselves."""
+    from tools.e2e.vllm_test_compat import (
+        vllm_worker_command,
+        vllm_worker_popen_env,
+    )
+
+    host, port = _parse_http_url(base_url)
+    cmd = vllm_worker_command(
+        model,
+        host,
+        port,
+        dp_size=dp_size,
+        api_key=api_key,
+        base_gpu_id=base_gpu_id,
+    )
+    env = vllm_worker_popen_env(base_gpu_id=base_gpu_id, dp_size=dp_size)
+    return launch_worker(cmd, env=env, label=label, log_prefix="e2e")
