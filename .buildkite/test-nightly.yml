@@ -135,7 +135,8 @@ steps:
       - "/tmp/vllm-router-grpc-pd/*.log"
 
   # ============================================================================
-  # L3 gRPC prefix-KV perf — rust_grpc + python_http (c16-r32), H100×2.
+  # L3 gRPC prefix-KV perf — rust_grpc + python_http, H100×2.
+  # c16-r32 (hit 0 and 0.99) plus hit 0.99 at c4-r8 and c64-r128.
   # Pulls the router CI image from image-build (vLLM + vllm-router on PATH).
   # ============================================================================
   - label: ":python: grpc perf test case"
@@ -163,18 +164,63 @@ steps:
       export PERF_STACK_TIMEOUT=1800
       export PERF_WORKER_STARTUP_TIMEOUT=1800
 
-      python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=rust_grpc
-      python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=python_http
+      python -m pytest -sv tests/python/e2e/perf/grpc -k "c16-r32 or hit99-c4 or hit99-c64" --perf-case=rust_grpc
+      python -m pytest -sv tests/python/e2e/perf/grpc -k "c16-r32 or hit99-c4 or hit99-c64" --perf-case=python_http
 
       BASH
     artifact_paths:
       - "tests/python/e2e/perf/grpc/results/**/*.json"
 
   # ============================================================================
-  # L3 L1 prefix-encoding perf — full matrix (24 waves), 1× L4.
+  # L3 router_policy TraceLab replay — cache_aware / kv_aware / kv_aware_aff @ c16.
+  # 4× vllm-rs + router per cell (12GiB GPU KV/worker, no CPU offload) → L4×4.
+  # Optional: TRACELAB_JSONL_URL to replace data/tracelab-ci-uniform-28.jsonl.
+  # ============================================================================
+  - label: ":python: router policy perf (c16 × 3 policies)"
+    key: "router-policy-perf-e2e"
+    if: build.env("ROCM_ONLY") != "1"
+    timeout_in_minutes: 240
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 1
+      manual:
+        allowed: true
+        reason: "GPU perf cold starts / long replay — retry after checking logs"
+    mirror_hardwares: l4_4
+    depends_on:
+      - "upload-nightly-pipeline"
+      - "image-build"
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+
+      python -m pip install --no-cache-dir 'agentinfer==0.2.0'
+
+      export AGENTX_RUN_SUFFIX="${AGENTX_RUN_SUFFIX:-$(date -u +%Y%m%d%H%M%S)}"
+      export AGENTX_CELL_GAP_SEC="${AGENTX_CELL_GAP_SEC:-15}"
+      export AGENTX_PORT_SETTLE_SEC="${AGENTX_PORT_SETTLE_SEC:-5}"
+
+      trace="tests/python/e2e/perf/router_policy/data/tracelab-ci-uniform-28.jsonl"
+      if [[ -n "${TRACELAB_JSONL_URL:-}" ]]; then
+        mkdir -p "$$(dirname "$${trace}")"
+        curl -fsSL "${TRACELAB_JSONL_URL}" -o "$${trace}"
+      fi
+      test -f "$${trace}"
+
+      python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'cache_aware/c16 or kv_aware/c16 or kv_aware_aff/c16'
+
+      BASH
+    artifact_paths:
+      - "test-results/router_policy/runs/**/*"
+      - "test-results/router_policy/results/*.json"
+
+  # ============================================================================
+  # L3 L1 prefix-encoding perf — hit 0.30 and 0.99999 at c4 and c16, 1× L4.
   # Same router CI image as the other NVIDIA jobs (vLLM + vllm-router on PATH).
   # Case default is Qwen/Qwen3-0.6B, TP1, GPU 0. One pytest session: worker
   # stays up through L1 on, then worker and router cold-start before L1 off.
+  # Both L1 on and L1 off; 8 waves (2 hit rates × c4/c16 × 2 arms).
   # ============================================================================
   - label: ":python: l1 encode perf test case"
     key: "l1-encode-perf-e2e"
@@ -203,7 +249,7 @@ steps:
       export PERF_STACK_TIMEOUT=1800
       export PERF_WORKER_STARTUP_TIMEOUT=1800
 
-      python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py
+      python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py -k "(hit0.30 or hit0.99999) and (c4 or c16)"
 
       BASH
     artifact_paths:

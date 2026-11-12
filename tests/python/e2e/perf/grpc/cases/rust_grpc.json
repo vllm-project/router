@@ -32,7 +32,8 @@
       {"concurrency": 4, "requests": 8},
       {"concurrency": 8, "requests": 16},
       {"concurrency": 12, "requests": 24},
-      {"concurrency": 16, "requests": 32}
+      {"concurrency": 16, "requests": 32},
+      {"concurrency": 64, "requests": 128}
     ]
   }
 }

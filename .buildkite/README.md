@@ -20,7 +20,7 @@ on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 | --- | --- | --- | --- |
 | `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, one NVIDIA P/D completion, and kv_aware e2e on 2× L4 (`ROCM_ONLY != 1` on the GPU jobs) |
 | `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), its merge queue, or any other branch labeled `merge-test` | one-mode xGMI smoke and RDMA `SMOKE_ONLY` |
-| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA |
+| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), router_policy TraceLab c16 on 4× L4 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA |
 | `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
 
 A pull request labeled `ready` uploads `test-ready.yml`, including forks.
@@ -35,7 +35,7 @@ shell. A build-level `HF_TOKEN` would override a pod env entry of the same name.
 | Name | Machine |
 | --- | --- |
 | `l4_2` | EKS `l4-k8s`, same `l4x4` pool, pod requests 2× L4, same CI image |
-| `l4_4` | EKS `l4-k8s`, 4× L4, image `public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT` |
+| `l4_4` | EKS `l4-k8s`, 4× L4, image `public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT` (router_policy perf) |
 | `l4_1` | Same L4 pool and image, 1× L4 |
 | `h100_2` | `mithril-h100-pool`, 2× H100 SXM, us-west-2 pull-through cache of the router CI image, GPU limit 2 |
 | `mi300_2` | `router_rocm_mi300_2`, same-host xGMI Docker devices |
@@ -75,6 +75,48 @@ The test script:
 - Starts the router with `--pd-disaggregation` flag
 - Runs accuracy validation tests
 - Cleans up containers on exit
+
+### CI Configuration
+
+A `ready` label runs one completion from `test-ready.yml`
+(`SKIP_LM_EVAL=true`, `NUM_SANITY_REQUESTS=1`) when `ROCM_ONLY != 1`.
+Full GSM8K stays in `test-nightly.yml`. Both include forks.
+
+**Key features:**
+- Requires 4 GPUs (runs on `l4-k8s`)
+- 60 minute timeout
+- Automatic retry (up to 2 attempts) for flaky failures
+- Manual retry option available
+
+### ROCm MoRI coverage
+
+The dedicated `router_rocm_mi300_2` queue covers two MoRI lanes:
+
+- `run_moriio_accuracy_test.sh` uses two GPUs on one host with the xGMI backend.
+- `run_moriio_rdma_accuracy_test.sh` uses one GPU on each of two hosts with the
+  RDMA backend.
+
+The hosts restore the digest-pinned ROCm image before each job
+(https://github.com/vllm-project/router/issues/363). L2 xGMI is one
+`read_mode` plus `LM_EVAL_LIMIT=20`, and runs for a default-branch push, the
+default-branch merge queue, or any pull request labeled `merge-test`. L3
+xGMI is the read+write matrix. It runs for `NIGHTLY=1`, any pull request
+labeled `nightly-test`, or a manual/API build with `RUN_ROCM_XGMI=1`. These
+are the L2/L3 triggers, not the old "every trusted PR" condition.
+
+L2 RDMA (`test-merge.yml`) sets `SMOKE_ONLY=true` and `read_mode=true`. Both
+L2 jobs run whenever that file is uploaded. L3 RDMA runs both directions for
+scheduled `NIGHTLY=1`, a pull request labeled `nightly-test`, or a manual/API
+build with `RUN_ROCM_RDMA=1`.
+
+ROCm-only scheduled builds should set both `NIGHTLY=1` and `ROCM_ONLY=1`.
+`ROCM_ONLY=1` skips the NVIDIA four-GPU step, the H100 gRPC perf job, and the
+L4 router_policy perf job while retaining the CPU build that supplies the router
+artifact to the ROCm jobs.
+
+The L3 matrices use a digest-pinned ROCm vLLM image and run health, sanity,
+and 500-example GSM8K accuracy checks. The RDMA job is coordinator-owned and
+controls the second host through the strict `vllm-router-rocm-worker` SSH alias.
 
 ### Environment Variables
 
@@ -137,6 +179,12 @@ The `build` group in `pipeline.yml` creates release artifacts:
 - Rust binary (`target/release/vllm-router`)
 - Python wheels and source distribution
 
+Each step has a premerge variant and a nightly variant. Premerge builds
+skip thin LTO and raise `codegen-units` to 16 for faster CI turnaround.
+Nightly builds (triggered by `NIGHTLY=1` or the `nightly-test` label)
+keep the repository release profile so that perf baselines match the
+published binary. Only one variant of each pair runs per build.
+
 L1, L2, and L3 uploads depend on this group. L2 and L3 do not depend on the L1 upload.
 
 ### Tests
@@ -156,7 +204,7 @@ Builds Docker image for the router.
 ## Agent Queues
 
 - `medium_cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
-- `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation)
+- `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation; 4-GPU router_policy c16)
 - `mithril-h100-pool`: NVIDIA H100 SXM tests (2-GPU gRPC prefix-KV perf)
 - `router_rocm_mi300_2`: dedicated two-node MI300X MoRI tests (`spawn=1`)
 - `default`: General purpose queue
@@ -199,3 +247,25 @@ Buildkite provides these built-in variables:
 - [vLLM Documentation](https://docs.vllm.ai/)
 - [Project README](../README.md)
 - [Example P/D Setup Scripts](../scripts/llama3.1/)
+
+## Docker Hub release credentials
+
+Docker publishing and nightly cleanup use the Buildkite secret
+`ROUTER_DOCKERHUB_TOKEN`, mapped to `RELEASE_DOCKERHUB_TOKEN` only on Docker jobs.
+Agents must support step-level secrets (Buildkite agent 3.106.0 or newer).
+Configure an organization access token for `vllm/vllm-router` and use `vllm`
+as the Docker Hub username. Image Push grants image pull/push; Tag Admin
+grants tag listing/deletion for nightly cleanup. Do not grant access to
+other repositories or organization management.
+
+Restrict the secret's access policy to the immutable `router-release` pipeline
+ID, main or an approved version ref, and the CPU and ARM release queues. A job's `secrets` entry
+controls injection; the access policy controls whether other jobs may
+retrieve the secret. Protect release refs and pipeline settings as well.
+
+The cleanup script uses Docker Hub's `/v2/auth/token` exchange and
+namespace-scoped tag API. Shell tracing stays disabled to avoid exposing
+credentials or bearer tokens. The legacy S3 `DOCKERHUB_TOKEN` variable is
+not used by these Docker jobs. After validating the replacement, remove
+obsolete S3 copies and revoke shared tokens only after all consumers have
+migrated. Never commit token values to this repository.
