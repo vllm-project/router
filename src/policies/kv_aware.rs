@@ -1720,6 +1720,11 @@ impl LoadBalancingPolicy for KvAwarePolicy {
         true
     }
 
+    /// Occupancy, KV events and affinity are all read live.
+    fn can_redecide_at_dispatch(&self, _decode_cache_ready: bool) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "kv_aware"
     }
