@@ -211,9 +211,16 @@ steps:
       python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'cache_aware/c16 or kv_aware/c16 or kv_aware_aff/c16'
 
       BASH
-    # Dashboard copies tests/python/e2e/results only. The run dir stays on the agent.
+    # Performance JSON for the dashboard, plus the cell files used to diagnose a run.
     artifact_paths:
       - "tests/python/e2e/results/perf/router_policy/**/*.json"
+      - "tests/python/e2e/run/perf/router_policy/*/result/summary.json"
+      - "tests/python/e2e/run/perf/router_policy/*/result/manifest.json"
+      - "tests/python/e2e/run/perf/router_policy/*/router.log"
+      - "tests/python/e2e/run/perf/router_policy/*/engine*.log"
+      - "tests/python/e2e/run/perf/router_policy/*/replay.log"
+      - "tests/python/e2e/run/perf/router_policy/*/runtime-replay.yaml"
+      - "tests/python/e2e/run/perf/router_policy/*/*.command.json"
 
   # ============================================================================
   # L3 L1 prefix-encoding perf — hit 0.30 and 0.99999 at c4 and c16, 1× L4.

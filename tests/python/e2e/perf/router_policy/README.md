@@ -33,7 +33,7 @@ pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -sv -
 Performance JSON and the run directory are separate. The nightly dashboard copies `tests/python/e2e/results` only.
 
 - `tests/python/e2e/results/perf/router_policy/<policy>_<run_suffix>/c<concurrency>_t<task_num>.json` — copy of `calibration.json` when the cell is ok. One directory per policy and session; one file per concurrency. The `concurrency` / `task_num` fields match the file name.
-- `tests/python/e2e/run/perf/router_policy/<case_id>-<run_suffix>/` — `result/`, `before/`, `after/`, `calibration.json`, `ports.json`, and `runtime-replay.yaml`. Nightly does not upload this directory. The replay launcher is a temp file outside it, and model caches stay in the default cache directories. Worker, router, and replay stdout go to stderr only (`[engineN]`, `[vllm-router]`, `[replay]`).
+- `tests/python/e2e/run/perf/router_policy/<case_id>-<run_suffix>/` — cell files. Nightly uploads `result/summary.json`, `result/manifest.json`, `router.log`, `engineN.log`, `replay.log`, `runtime-replay.yaml`, and `*.command.json`. Prometheus snapshots, `requests.jsonl`, `ports.json`, and `calibration.json` stay on the agent. The replay launcher is a temp file, and model caches stay in the default cache directories. The same stdout is also printed (`[engineN]`, `[vllm-router]`, `[replay]`).
 
 `<run_suffix>` is local time `YYYYMMDD_HHMMSS` (same format as grpc and l1_encode) unless you set **`AGENTX_RUN_SUFFIX`** (same suffix for all cells in one matrix, e.g. `export AGENTX_RUN_SUFFIX=20251029_171300`). Override the run dir with **`AGENTX_OUT`**.
 

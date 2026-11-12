@@ -139,20 +139,28 @@ def open_cell(case: RouterPolicyCase, *, out_dir: Path | None) -> RouterPolicySt
     )
 
 
-def _stream_replay(proc: subprocess.Popen[Any]) -> None:
+def _stream_replay(proc: subprocess.Popen[Any], log: Path) -> None:
     stream = proc.stdout
     if stream is None:
         return
-    for line in stream:
-        print(f"[replay] {line}", end="", file=sys.stderr, flush=True)
+    with log.open("w", encoding="utf-8") as handle:
+        for line in stream:
+            handle.write(line)
+            handle.flush()
+            print(f"[replay] {line}", end="", file=sys.stderr, flush=True)
 
 
-def _start_replay(run: RouterPolicyStack, command: list[str]) -> subprocess.Popen[Any]:
+def _start_replay(
+    run: RouterPolicyStack, command: list[str], log: Path
+) -> subprocess.Popen[Any]:
     """Agentinfer replay. Its own session so a stall can stop the whole group.
 
-    Stdout goes to stderr with the other component streams. No replay.log.
+    Stdout is copied to ``replay.log`` and also printed on stderr.
     """
 
+    Path(str(log) + ".command.json").write_text(
+        json.dumps(command, indent=2), encoding="utf-8"
+    )
     proc = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -164,7 +172,7 @@ def _start_replay(run: RouterPolicyStack, command: list[str]) -> subprocess.Pope
     )
     threading.Thread(
         target=_stream_replay,
-        args=(proc,),
+        args=(proc, log),
         name="router-policy-replay",
         daemon=True,
     ).start()
@@ -643,6 +651,10 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                 release_worker_port_holders(run.port_holders, i, case.worker_count)
                 _release_kv_port_holders(run, i)
                 worker_cmd = engine_command(run, i)
+                worker_log = run.out / f"engine{i}.log"
+                Path(str(worker_log) + ".command.json").write_text(
+                    json.dumps(worker_cmd, indent=2), encoding="utf-8"
+                )
                 run.stack.append(
                     launch_worker(
                         worker_cmd,
@@ -651,12 +663,17 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                         ready_url=f"http://127.0.0.1:{ports['http'][i]}/health",
                         timeout=1800,
                         log_prefix="router_policy",
+                        log_path=worker_log,
                     )
                 )
             _require_resolved_kv_events(run)
             print(f"ENGINES_READY {time.monotonic() - started:.0f}s", flush=True)
             release_router_port_holders(run.port_holders, case.worker_count)
             router_argv = router_command(run)
+            router_log = run.out / "router.log"
+            Path(str(router_log) + ".command.json").write_text(
+                json.dumps(router_argv, indent=2), encoding="utf-8"
+            )
             run.stack.append(
                 launch_router(
                     router_argv,
@@ -664,6 +681,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                     env=run.env,
                     timeout=180,
                     log_prefix="router_policy",
+                    log_path=router_log,
                 )
             )
             print(f"ROUTER_READY {time.monotonic() - started:.0f}s", flush=True)
@@ -692,6 +710,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                 "--result-dir",
                 str(result),
             ],
+            run.out / "replay.log",
         )
         replay = run.replay_proc
 
