@@ -44,9 +44,8 @@ pub struct HybridGroupView<'a> {
     /// publishes key-only stores reports no addressable page, so it cannot
     /// constrain the boundary; the layout's other groups do.
     pub page_evidence: bool,
-    /// Token end of a prefix that stops inside a page, when the engine published
-    /// a partial prefix entry for it (`cache_partial_block`).
-    pub partial_end: u64,
+    /// Hash-aligned partial page boundaries present in this group.
+    pub partial_ends: &'a [u64],
 }
 
 /// Round `tokens` down to `block_size`.
@@ -226,22 +225,25 @@ fn longest_supported(group: &HybridGroupView<'_>, target: &RoutableTarget, cap: 
             best = best.max(candidate);
         }
     }
-    // A partial prefix entry proves a boundary inside a page the page-level
-    // hashes have not covered yet. A checkpoint needs only itself; a dense run
-    // must already hold every page before that one.
-    let page = u64::from(group.block_size).max(1);
-    if group.partial_end > best {
-        let page_start = (group.partial_end / page) * page;
-        let dense_ready = best >= page_start;
-        if dense_ready
-            && matches!(
-                group.kind,
-                HybridGroupKind::FullAttention
-                    | HybridGroupKind::CompressedFullAttention { .. }
-                    | HybridGroupKind::Checkpoint
-            )
-        {
-            best = group.partial_end;
+    // Checkpoints are not downward closed: an entry above `cap` cannot
+    // establish an earlier checkpoint. Dense groups need the preceding pages.
+    for &end in group.partial_ends {
+        if end > cap || end <= best || end % size == 0 {
+            continue;
+        }
+        let page_start = (end / size) * size;
+        let restorable = match group.kind {
+            HybridGroupKind::Checkpoint => true,
+            HybridGroupKind::FullAttention => best >= page_start,
+            HybridGroupKind::CompressedFullAttention { tokens_per_state } => {
+                tokens_per_state != 0
+                    && end % u64::from(tokens_per_state) == 0
+                    && best >= page_start
+            }
+            HybridGroupKind::SlidingWindow { .. } => false,
+        };
+        if restorable {
+            best = end;
         }
     }
     best
@@ -312,6 +314,10 @@ pub struct HybridRankCapability {
     pub root_hash: Option<String>,
     pub full_hashes: bool,
     pub hash_block_size: Option<u32>,
+    /// Source publishes hash-granularity stores as partial prefix entries.
+    /// Enable only for a verified engine event contract.
+    #[serde(default)]
+    pub partial_hash_hits: bool,
     pub hash_lookahead_tokens: u32,
     pub speculative_tokens: u32,
     pub prefix_caching: bool,
@@ -520,7 +526,11 @@ impl HybridCapabilities {
             .map_err(|_| "invalid group layout")?
             .with_replay_tokens(replay_tokens)
             .map_err(|_| "invalid group layout")
-            .map(|index| index.with_adapters(adapters))
+            .map(|index| {
+                index
+                    .with_adapters(adapters)
+                    .with_partial_hash_hits(rank.partial_hash_hits)
+            })
     }
 
     /// Bind one event source to its rank's verified layout.
@@ -589,7 +599,7 @@ mod tests {
             kind,
             matches,
             page_evidence: true,
-            partial_end: 0,
+            partial_ends: &[],
         }
     }
 
@@ -600,7 +610,7 @@ mod tests {
         let worker = target("w", 0);
         // Page 576, a partial entry at 560: no page-level hash exists yet.
         let mut full_group = group(0, 576, HybridGroupKind::FullAttention, &[]);
-        full_group.partial_end = 560;
+        full_group.partial_ends = &[560];
         assert_eq!(common_reusable_tokens(&worker, &[full_group], 1024), 560);
     }
 
@@ -609,8 +619,34 @@ mod tests {
     fn a_partial_checkpoint_is_restorable_on_its_own() {
         let worker = target("w", 0);
         let mut checkpoint = group(0, 576, HybridGroupKind::Checkpoint, &[]);
-        checkpoint.partial_end = 560;
+        checkpoint.partial_ends = &[560];
         assert_eq!(common_reusable_tokens(&worker, &[checkpoint], 1024), 560);
+    }
+
+    #[test]
+    fn partial_checkpoint_respects_cap_and_does_not_need_earlier_pages() {
+        let worker = target("w", 0);
+        let mut checkpoint = group(0, 576, HybridGroupKind::Checkpoint, &[]);
+        checkpoint.partial_ends = &[560, 1136];
+        assert_eq!(common_reusable_tokens(&worker, &[checkpoint], 544), 0);
+        let mut checkpoint = group(0, 576, HybridGroupKind::Checkpoint, &[]);
+        checkpoint.partial_ends = &[560, 1136];
+        assert_eq!(common_reusable_tokens(&worker, &[checkpoint], 1100), 560);
+        let mut checkpoint = group(0, 576, HybridGroupKind::Checkpoint, &[]);
+        checkpoint.partial_ends = &[560, 1136];
+        assert_eq!(common_reusable_tokens(&worker, &[checkpoint], 1152), 1136);
+    }
+
+    #[test]
+    fn dense_partial_requires_earlier_full_pages() {
+        let worker = target("w", 0);
+        let mut full = group(0, 576, HybridGroupKind::FullAttention, &[]);
+        full.partial_ends = &[1136];
+        assert_eq!(common_reusable_tokens(&worker, &[full], 1152), 0);
+        let hits = [hit(&worker, &[(0, 1)])];
+        let mut full = group(0, 576, HybridGroupKind::FullAttention, &hits);
+        full.partial_ends = &[1136];
+        assert_eq!(common_reusable_tokens(&worker, &[full], 1152), 1136);
     }
 
     #[test]

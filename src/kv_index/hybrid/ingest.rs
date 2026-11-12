@@ -144,7 +144,19 @@ impl HybridEventIndex {
                         }
                         return Self::fail(&mut state, HybridEventError::InvalidBatch);
                     }
-                    if store.block_size != group.block_size {
+                    // vLLM publishes partial full-attention and Mamba entries
+                    // as one hash-granularity store. Other secondary page sizes
+                    // (notably compressed groups) are not partial evidence.
+                    let partial = self.partial_hash_hits
+                        && matches!(
+                            group.kind,
+                            HybridGroupKind::FullAttention | HybridGroupKind::Checkpoint
+                        )
+                        && store.block_size < group.block_size
+                        && store.block_size as usize == self.keys.block_size()
+                        && store.block_hashes.len() == 1
+                        && store.token_ids.len() == self.keys.block_size();
+                    if store.block_size != group.block_size && !partial {
                         tracing::debug!(
                             group_idx = group.group_idx,
                             declared = group.block_size,
@@ -185,7 +197,6 @@ impl HybridEventIndex {
                             namespace.as_deref(),
                             (group_idx, hash),
                             tier,
-                            store.block_size,
                             self.max_entries,
                         ) {
                             // An adapter that fills its own budget must not

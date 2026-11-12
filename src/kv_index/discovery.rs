@@ -589,6 +589,22 @@ impl KvIndexSupervisor {
                 cache_key: None,
             });
         };
+        // Policy intervals use this unit to translate hits back into tokens.
+        // A hybrid hash boundary can lie inside the physical attention page.
+        // Use a common divisor when ranks declare different granularities.
+        let block_size = hybrid_capability.as_ref().map_or(block_size, |capability| {
+            capability
+                .ranks
+                .iter()
+                .filter_map(|rank| rank.hash_block_size)
+                .filter(|size| *size > 0)
+                .fold(block_size, |mut a, mut b| {
+                    while b != 0 {
+                        (a, b) = (b, a % b);
+                    }
+                    a
+                })
+        });
         let key = CacheKey {
             model: Arc::from(model_id.as_str()),
             hash_mode: self.hash_mode,
@@ -2751,7 +2767,7 @@ mod tests {
             server_info: Ok(ServerInfo {
                 instance_id: Some("worker".into()),
                 model_id: Some("qwen".into()),
-                kv_block_size: Some(16),
+                kv_block_size: Some(576),
                 ..Default::default()
             }),
             sources: Ok(sources),
@@ -2760,10 +2776,11 @@ mod tests {
         };
         let (supervisor, _signals) =
             KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
-        let mut ranks = supervisor
+        let info = supervisor
             .install_worker("http://127.0.0.1:8080", discovery)
-            .unwrap()
-            .ranks;
+            .unwrap();
+        assert_eq!(info.block_size, Some(16));
+        let mut ranks = info.ranks;
         ranks.sort_unstable();
         assert_eq!(ranks, [0, 1]);
     }

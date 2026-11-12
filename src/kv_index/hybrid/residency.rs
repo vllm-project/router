@@ -19,9 +19,6 @@ pub(super) struct State {
     /// that only publishes key-only stores reports no addressable page, so it
     /// cannot bound the shared prefix.
     pub(super) page_evidence: HashMap<Option<String>, HashSet<u32>>,
-    /// Tokens one claim covers. A store of a full page records the page size;
-    /// vLLM's partial prefix entry records the shorter length it represents.
-    pub(super) claim_tokens: HashMap<Option<String>, HashMap<(u32, SequenceHash), u32>>,
 }
 
 /// The tiers one page is resident on. A store adds a tier, a removal clears
@@ -88,17 +85,6 @@ impl State {
             .map(|(_, claims)| claims)
     }
 
-    /// Tokens one claim covers, for the partial-boundary check.
-    pub(super) fn claim_tokens_in(
-        &self,
-        namespace: Option<&str>,
-    ) -> Option<&HashMap<(u32, SequenceHash), u32>> {
-        self.claim_tokens
-            .iter()
-            .find(|(identity, _)| identity.as_deref() == namespace)
-            .map(|(_, widths)| widths)
-    }
-
     /// The groups one identity has page evidence for.
     pub(super) fn page_evidence_in(&self, namespace: Option<&str>) -> Option<&HashSet<u32>> {
         self.page_evidence
@@ -114,7 +100,6 @@ impl State {
         namespace: Option<&str>,
         key: (u32, SequenceHash),
         tier: StorageTier,
-        tokens: u32,
         max_entries: usize,
     ) -> bool {
         let claims = self.claims.entry(namespace.map(str::to_owned)).or_default();
@@ -126,10 +111,6 @@ impl State {
             return false;
         }
         claims.insert(key, TierSet::default().with(tier));
-        self.claim_tokens
-            .entry(namespace.map(str::to_owned))
-            .or_default()
-            .insert(key, tokens);
         true
     }
 
@@ -137,9 +118,6 @@ impl State {
     /// keeping a stale claim would over-credit, dropping one costs at most a
     /// re-prefill.
     pub(super) fn remove_claim_all(&mut self, key: (u32, SequenceHash)) {
-        for widths in self.claim_tokens.values_mut() {
-            widths.remove(&key);
-        }
         for claims in self.claims.values_mut() {
             claims.remove(&key);
         }
@@ -149,9 +127,6 @@ impl State {
     /// whichever chain produced it. A page that still has another copy stays
     /// claimed at the better remaining tier.
     pub(super) fn remove_claim(&mut self, key: (u32, SequenceHash), tier: StorageTier) {
-        for widths in self.claim_tokens.values_mut() {
-            widths.remove(&key);
-        }
         for claims in self.claims.values_mut() {
             if let Some(resident) = claims.get_mut(&key) {
                 *resident = resident.without(tier);
@@ -180,6 +155,85 @@ pub(crate) mod tests {
             instance_id: Arc::from("w"),
             dp_rank: 0,
         }
+    }
+
+    #[test]
+    fn partial_stores_restore_the_joint_boundary_and_survive_tier_removal() {
+        use crate::kv_index::StorageTier;
+        use crate::policies::TieredMatchProvider;
+
+        let tokens: Vec<u32> = (0..1201).collect();
+        let hashes = BlockKeyGenerator::new(16, 0).generate_block_keys(&tokens);
+        let groups = vec![
+            HybridEventGroup {
+                group_idx: 0,
+                block_size: 576,
+                kind: HybridGroupKind::FullAttention,
+            },
+            HybridEventGroup {
+                group_idx: 1,
+                block_size: 576,
+                kind: HybridGroupKind::Checkpoint,
+            },
+        ];
+        let mut previous = gpu_store(1, "mamba", 576, &tokens[..576], &hashes[35..36]);
+        previous.medium = Some("STORAGE".into());
+        let mut partial = gpu_store(1, "mamba", 16, &tokens[1120..1136], &hashes[70..71]);
+        partial.medium = Some("CPU".into());
+        let mut device_copy = partial.clone();
+        device_copy.medium = Some("GPU".into());
+        let batch = KVEventBatch {
+            ts: 1.0,
+            data_parallel_rank: Some(0),
+            events: vec![
+                KVEvent::BlockStored(gpu_store(
+                    0,
+                    "full_attention",
+                    576,
+                    &tokens[..576],
+                    &hashes[35..36],
+                )),
+                KVEvent::BlockStored(gpu_store(
+                    0,
+                    "full_attention",
+                    16,
+                    &tokens[1120..1136],
+                    &hashes[70..71],
+                )),
+                KVEvent::BlockStored(previous),
+                KVEvent::BlockStored(partial),
+                KVEvent::BlockStored(device_copy),
+            ],
+        };
+        let default_index = HybridEventIndex::new(target(), groups.clone(), 16, 0, 8).unwrap();
+        default_index.begin_empty(0);
+        assert_eq!(default_index.apply_batch(0, &batch), Ok(()));
+        assert_eq!(default_index.reusable_tokens(&tokens, usize::MAX), 576);
+
+        let index = HybridEventIndex::new(target(), groups, 16, 0, 8)
+            .unwrap()
+            .with_partial_hash_hits(true);
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &batch), Ok(()));
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 1136);
+        assert_eq!(index.reusable_tokens(&tokens, 1120), 576);
+        let matches = index.find_token_matches(&tokens, 16, None, 0).unwrap();
+        assert_eq!(matches[0].tier, StorageTier::Device);
+        let removal = KVEventBatch {
+            ts: 1.0,
+            data_parallel_rank: Some(0),
+            events: vec![KVEvent::BlockRemoved(BlockRemoved {
+                block_hashes: vec![ExternalBlockHash::Bytes(hashes[70].to_vec())],
+                medium: Some("GPU".into()),
+                group_idx: Some(1),
+                locality: None,
+                ownership: None,
+            })],
+        };
+        assert_eq!(index.apply_batch(1, &removal), Ok(()));
+        let matches = index.find_token_matches(&tokens, 16, None, 0).unwrap();
+        assert_eq!(matches[0].tier, StorageTier::HostPinned);
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 1136);
     }
 
     fn groups() -> Vec<HybridEventGroup> {

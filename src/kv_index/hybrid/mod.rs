@@ -46,6 +46,7 @@ pub struct HybridEventIndex {
     /// cannot credit it, and one that declares the wrong path credits nothing.
     pub(super) adapters: Vec<(String, String)>,
     pub(super) max_entries: usize,
+    pub(super) partial_hash_hits: bool,
     state: RwLock<State>,
 }
 
@@ -124,8 +125,8 @@ impl HybridEventIndex {
             replay_tokens: 0,
             adapters: Vec::new(),
             max_entries,
+            partial_hash_hits: false,
             state: RwLock::new(State {
-                claim_tokens: HashMap::new(),
                 next_seq: None,
                 visible: false,
                 claims: HashMap::new(),
@@ -143,6 +144,13 @@ impl HybridEventIndex {
         }
         self.replay_tokens = replay_tokens;
         Ok(self)
+    }
+
+    /// Enable only when the source contract identifies hash-sized stores as
+    /// fine-grained prefix entries, rather than secondary pages.
+    pub fn with_partial_hash_hits(mut self, enabled: bool) -> Self {
+        self.partial_hash_hits = enabled;
+        self
     }
 
     pub fn target(&self) -> &RoutableTarget {
@@ -241,27 +249,25 @@ impl HybridEventIndex {
             return (0, None);
         };
         let page_evidence = state.page_evidence_in(namespace);
-        let claim_tokens = state.claim_tokens_in(namespace);
-        // vLLM also caches a prefix that ends inside a page (`cache_partial_block`
-        // at a mamba checkpoint or a shared prefix boundary). Those stores carry
-        // the shorter length and their own hash, so the boundary they prove is
-        // that hash position -- find it in the query chain.
-        let hash_positions: std::collections::HashMap<SequenceHash, usize> =
-            hashes.iter().enumerate().map(|(i, h)| (*h, i)).collect();
-        let partial_end = |group_idx: u32, page: u64| -> u64 {
-            let Some(widths) = claim_tokens else {
-                return 0;
-            };
-            let granule = u64::from(self.keys.block_size() as u32);
-            widths
-                .iter()
-                .filter(|((idx, _), width)| *idx == group_idx && u64::from(**width) < page)
-                .filter_map(|((_, hash), _)| hash_positions.get(hash))
-                .map(|position| (u64::try_from(*position).unwrap_or(u64::MAX) + 1) * granule)
-                .filter(|end| end % page != 0)
-                .max()
-                .unwrap_or(0)
-        };
+        // Every published hash proves only its own boundary. A group page
+        // ends at a multiple of its stride; other resident hashes are partial
+        // entries. Keep all of them for fixed-point queries at smaller caps.
+        let partial_ends: Vec<Vec<u64>> = self
+            .groups
+            .iter()
+            .map(|group| {
+                let stride = group.block_size as usize / self.keys.block_size();
+                hashes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, hash)| {
+                        let end = position + 1;
+                        (end % stride != 0 && claims.contains_key(&(group.group_idx, *hash)))
+                            .then_some(end as u64 * self.keys.block_size() as u64)
+                    })
+                    .collect()
+            })
+            .collect();
         let matches: Vec<Vec<TierMatch>> = self
             .groups
             .iter()
@@ -295,14 +301,15 @@ impl HybridEventIndex {
             .groups
             .iter()
             .zip(&matches)
-            .map(|(group, matches)| HybridGroupView {
+            .zip(&partial_ends)
+            .map(|((group, matches), partial_ends)| HybridGroupView {
                 group_idx: group.group_idx,
                 block_size: group.block_size,
                 kind: group.kind,
                 matches,
                 page_evidence: page_evidence
                     .is_some_and(|evidence| evidence.contains(&group.group_idx)),
-                partial_end: partial_end(group.group_idx, u64::from(group.block_size)),
+                partial_ends,
             })
             .collect();
         let boundary = common_reusable_tokens(
@@ -318,7 +325,7 @@ impl HybridEventIndex {
         // Report the slowest tier any group needs at the credited boundary: the
         // nearest resident page at or below it is the one that completes it.
         let mut worst = StorageTier::Device;
-        for group in &self.groups {
+        for (group, partials) in self.groups.iter().zip(&partial_ends) {
             let stride = group.block_size as usize / self.keys.block_size();
             let blocks = (credited / u64::from(group.block_size)) as usize;
             // Every page the group needs to complete the boundary counts: a
@@ -335,6 +342,23 @@ impl HybridEventIndex {
                 }
             };
             let floor = blocks.saturating_sub(required);
+            if partials.contains(&credited) {
+                let index = (credited as usize / self.keys.block_size()).saturating_sub(1);
+                if let Some(tier) = hashes
+                    .get(index)
+                    .and_then(|hash| claims.get(&(group.group_idx, *hash)))
+                    .and_then(|resident| resident.best())
+                {
+                    if tier_rank(tier) > tier_rank(worst) {
+                        worst = tier;
+                    }
+                }
+                // A checkpoint needs only the page at this boundary, not an
+                // older checkpoint which might reside on a slower tier.
+                if matches!(group.kind, HybridGroupKind::Checkpoint) {
+                    continue;
+                }
+            }
             for position in (floor..blocks.max(1)).rev() {
                 let Some(hash) = hashes.get(stride * (position + 1) - 1) else {
                     break;
