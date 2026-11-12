@@ -67,6 +67,9 @@ def rust_options():
     body = source.split("struct CliArgs {", 1)[1].split("\n}", 1)[0]
     enums = {
         "Backend": rust_enum(source, "Backend"),
+        "PdHeldKvMode": rust_enum(
+            (ROOT / "src/config/types.rs").read_text(encoding="utf-8"), "PdHeldKvMode"
+        ),
         "KvConnector": rust_enum(
             (ROOT / "src/config/types.rs").read_text(encoding="utf-8"), "KvConnector"
         ),
