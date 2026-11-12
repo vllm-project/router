@@ -266,6 +266,10 @@ name = "streaming_tests"
 path = "tests/rust/streaming_tests.rs"
 
 [[test]]
+name = "test_admission_fallback"
+path = "tests/rust/test_admission_fallback.rs"
+
+[[test]]
 name = "test_chat_template"
 path = "tests/rust/test_chat_template.rs"
 

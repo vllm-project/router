@@ -344,20 +344,24 @@ async fn cache_aware_prefix_overrides_load() {
 
 #[tokio::test]
 async fn kv_aware_prefers_the_less_loaded_worker() {
+    // Equal-cost cold requests are no longer pinned to one worker, so a run
+    // of them may use either worker.
     let servers = workers(2, Duration::ZERO).await;
     let router = start_router(&servers, kv_aware()).await;
-    let mut first = None;
-    for i in 0..8 {
-        let index = complete(&router, &servers, prompt(&[i], json!({}))).await;
-        first.get_or_insert(index);
-        assert_eq!(index, first.unwrap());
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..32 {
+        seen.insert(complete(&router, &servers, prompt(&[i], json!({}))).await);
     }
+    assert_eq!(
+        seen.len(),
+        2,
+        "cold equal-cost requests should reach both workers"
+    );
 
+    // A worker that is still serving a request must not receive the next cold request.
     let delayed = workers(2, Duration::from_millis(800)).await;
-    let router = start_router(&delayed, kv_aware()).await;
-    let cached = complete(&router, &delayed, prompt(&[1, 2, 3], json!({}))).await;
+    let router = Arc::new(start_router(&delayed, kv_aware()).await);
     let before = hits(&delayed);
-    let router = Arc::new(router);
     let holder = {
         let router = Arc::clone(&router);
         tokio::spawn(async move {
@@ -371,10 +375,10 @@ async fn kv_aware_prefers_the_less_loaded_worker() {
         })
     };
     wait_for_hit(&delayed, &before).await;
-    assert_eq!(grew(&before, &hits(&delayed)), cached);
+    let busy = grew(&before, &hits(&delayed));
     let diverted = complete(&router, &delayed, prompt(&[4, 5, 6], json!({}))).await;
     holder.await.unwrap();
-    assert_ne!(diverted, cached);
+    assert_ne!(diverted, busy, "cold request should avoid the busy worker");
 }
 
 #[tokio::test]
@@ -397,8 +401,12 @@ async fn kv_aware_affinity_sticks_to_session() {
     let holder = {
         let router = Arc::clone(&router);
         tokio::spawn(async move {
-            let request: CompletionRequest =
-                serde_json::from_value(prompt(&[7, 7, 7], json!({}))).unwrap();
+            // Stay on alpha's worker so beta has a busy worker to avoid.
+            let request: CompletionRequest = serde_json::from_value(prompt(
+                &[7, 7, 7],
+                json!({"session_params": {"session_id": "alpha"}}),
+            ))
+            .unwrap();
             let response = router.route_completion(None, &request, None).await;
             assert!(response.status().is_success());
             axum::body::to_bytes(response.into_body(), usize::MAX)

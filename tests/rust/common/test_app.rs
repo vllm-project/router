@@ -4,7 +4,7 @@ use std::sync::Arc;
 use vllm_router_rs::{
     config::RouterConfig,
     otel_trace,
-    routers::RouterTrait,
+    routers::{RouterFactory, RouterTrait},
     server::{build_app_with_wasm_middleware, AppContext, AppState},
     wasm_middleware::WasmMiddlewareRuntime,
 };
@@ -17,6 +17,21 @@ pub fn create_test_app(
     router_config: &RouterConfig,
 ) -> Router {
     create_test_app_with_tracing(router, client, router_config, otel_trace::is_otel_enabled())
+}
+
+/// Build the router from `router_config` and wrap it in the full app.
+///
+/// The app gets a fresh context, not the router's. Use
+/// `create_test_app_with_context` when the two must share one.
+#[allow(dead_code)]
+pub async fn create_test_app_from_config(router_config: &RouterConfig) -> Router {
+    let context = super::create_test_context(router_config.clone());
+    let router: Arc<dyn RouterTrait> = Arc::from(
+        RouterFactory::create_router(&context)
+            .await
+            .expect("router"),
+    );
+    create_test_app(router, Client::new(), router_config)
 }
 
 /// Create a test Axum application with an explicit request-tracing toggle.
