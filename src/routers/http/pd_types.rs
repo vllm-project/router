@@ -68,6 +68,13 @@ pub(super) enum Stage {
 pub struct PdLoadSample {
     pub prefill_requests: usize,
     pub active_prefill_tokens: u64,
+    /// Router-local prefill tokens charged by this router.
+    pub local_prefill_tokens: u64,
+    /// Worker-reported work at the current anchor.
+    /// Router-local ledger at the moment the anchor's poll was sent.
+    /// When the anchor's poll was sent; drives decay between samples.
+    /// Observed drain rate, in thousandths of a token per second.
+    /// Worker sample counter reflected in active_prefill_tokens.
     pub unknown_prefill_requests: usize,
     pub pending_decode_requests: usize,
     pub active_decode_requests: usize,
@@ -182,6 +189,44 @@ pub struct PdSelection {
     pub decode: StageDecision,
 }
 
+/// What one request currently contributes to the prefill ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefillCharge {
+    /// Admitted without a token estimate; nothing charged yet.
+    Unknown,
+    /// This many tokens are charged and released when the request ends.
+    Charged(u64),
+    /// The request released its charge; further calls change nothing.
+    Released,
+}
+
+impl PrefillCharge {
+    /// Ledger delta when the engine reports `remaining` tokens left.
+    ///
+    /// The first report after an unknown admission charges what it reports and
+    /// converts the request from unknown to known; later reports move the
+    /// charge by the difference, in either direction.
+    fn on_report(self, remaining: u64) -> (i64, Self, bool) {
+        match self {
+            Self::Released => (0, self, false),
+            Self::Unknown => (remaining as i64, Self::Charged(remaining), true),
+            Self::Charged(charged) => (
+                remaining as i64 - charged as i64,
+                Self::Charged(remaining),
+                false,
+            ),
+        }
+    }
+
+    /// Tokens to release when the request ends, and whether it was unknown.
+    fn on_finish(self) -> (u64, bool, Self) {
+        match self {
+            Self::Released | Self::Unknown => (0, matches!(self, Self::Unknown), Self::Released),
+            Self::Charged(charged) => (charged, false, Self::Released),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct PdLoadManager {
     loads: Arc<Mutex<Loads>>,
@@ -234,11 +279,12 @@ impl PdLoadManager {
         p.prefill_requests += 1;
         if let Some(tokens) = prefill.new_prefill_tokens {
             p.active_prefill_tokens += tokens;
+            p.local_prefill_tokens += tokens;
         } else {
             p.unknown_prefill_requests += 1;
         }
         p.publish(Stage::Prefill, &prefill.endpoint);
-        let now = std::time::Instant::now();
+        let now = tokio::time::Instant::now();
         let (decode_endpoint, affinity, decode_state, pending_since) = if defer_decode {
             (None, None, DecodeState::Unbound, None)
         } else {
@@ -260,7 +306,10 @@ impl PdLoadManager {
             prefill: selection.prefill.endpoint.clone(),
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
-            prefill_tokens: selection.prefill.new_prefill_tokens,
+            prefill_charge: Mutex::new(match selection.prefill.new_prefill_tokens {
+                Some(tokens) => PrefillCharge::Charged(tokens),
+                None => PrefillCharge::Unknown,
+            }),
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: decode_state,
@@ -298,7 +347,7 @@ impl PdLoadManager {
         d.publish(Stage::Decode, &decision.endpoint);
         state.decode_endpoint = Some(decision.endpoint.clone());
         state.affinity = decision.affinity.clone();
-        state.pending_since = Some(std::time::Instant::now());
+        state.pending_since = Some(tokio::time::Instant::now());
         state.decode = DecodeState::Pending;
         metrics::histogram!("vllm_router_pd_decode_selection_gap_seconds")
             .record(inner.admitted_at.elapsed().as_secs_f64());
@@ -329,18 +378,18 @@ impl PdLoadManager {
             d.publish(Stage::Decode, &decode);
         }
         let attempt = PdAttempt(Arc::new(AttemptInner {
-            admitted_at: std::time::Instant::now(),
+            admitted_at: tokio::time::Instant::now(),
             loads: self.loads.clone(),
             prefill,
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
-            prefill_tokens: None,
+            prefill_charge: Mutex::new(PrefillCharge::Unknown),
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: DecodeState::Pending,
                 decode_endpoint: Some(decode),
                 affinity: None,
-                pending_since: Some(std::time::Instant::now()),
+                pending_since: Some(tokio::time::Instant::now()),
             }),
         }));
         attempt.attach_workers(prefill_worker, decode_worker);
@@ -366,19 +415,64 @@ struct AttemptState {
     /// Decode binding held alive until this attempt finishes.
     affinity: Option<Arc<AffinityRecord>>,
     /// When the decode slot was charged, for the pending histogram.
-    pending_since: Option<std::time::Instant>,
+    pending_since: Option<tokio::time::Instant>,
 }
 
 struct AttemptInner {
-    admitted_at: std::time::Instant,
+    admitted_at: tokio::time::Instant,
     loads: Arc<Mutex<Loads>>,
     prefill: PdEndpoint,
     prefill_worker: Mutex<Option<Arc<dyn Worker>>>,
     decode_worker: Mutex<Option<Arc<dyn Worker>>>,
-    prefill_tokens: Option<u64>,
+    /// What this attempt currently has charged to the prefill ledger.
+    prefill_charge: Mutex<PrefillCharge>,
     /// Guards every stage transition and the decode fields below, so a commit
     /// and a release cannot interleave halfway through.
     state: Mutex<AttemptState>,
+}
+
+/// Experiment switch: set VLLM_ROUTER_PREFILL_PROGRESS=0 to stream progress
+/// without consuming it.
+fn prefill_progress_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VLLM_ROUTER_PREFILL_PROGRESS")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
+impl PdAttempt {
+    /// Replace this attempt's estimated prefill work with the engine's report.
+    pub(super) fn apply_prefill_progress(&self, remaining: u64) {
+        if !prefill_progress_enabled() {
+            return;
+        }
+        // Held through the ledger update so a release cannot slip in between.
+        let mut charge = self.0.prefill_charge.lock();
+        let (delta, next, converted) = charge.on_report(remaining);
+        *charge = next;
+        if delta == 0 && !converted {
+            return;
+        }
+        tracing::debug!(remaining, delta, converted, "prefill progress applied");
+        let mut loads = self.0.loads.lock();
+        if let Some(load) = loads.get_mut(&(Stage::Prefill, self.0.prefill.clone())) {
+            if converted {
+                load.unknown_prefill_requests = load.unknown_prefill_requests.saturating_sub(1);
+            }
+            if delta >= 0 {
+                load.active_prefill_tokens =
+                    load.active_prefill_tokens.saturating_add(delta as u64);
+                load.local_prefill_tokens = load.local_prefill_tokens.saturating_add(delta as u64);
+            } else {
+                let drop = delta.unsigned_abs();
+                load.active_prefill_tokens = load.active_prefill_tokens.saturating_sub(drop);
+                load.local_prefill_tokens = load.local_prefill_tokens.saturating_sub(drop);
+            }
+            load.publish(Stage::Prefill, &self.0.prefill);
+        }
+    }
 }
 
 impl AttemptInner {
@@ -387,14 +481,19 @@ impl AttemptInner {
         if !state.prefill {
             return;
         }
+        // Same hold as `apply_prefill_progress`.
+        let mut charge = self.prefill_charge.lock();
+        let (released, was_unknown, next) = charge.on_finish();
+        *charge = next;
         let mut loads = self.loads.lock();
         let key = (Stage::Prefill, self.prefill.clone());
         if let Some(load) = loads.get_mut(&key) {
             load.prefill_requests -= 1;
-            if let Some(tokens) = self.prefill_tokens {
-                load.active_prefill_tokens -= tokens;
+            if was_unknown {
+                load.unknown_prefill_requests = load.unknown_prefill_requests.saturating_sub(1);
             } else {
-                load.unknown_prefill_requests -= 1;
+                load.active_prefill_tokens = load.active_prefill_tokens.saturating_sub(released);
+                load.local_prefill_tokens = load.local_prefill_tokens.saturating_sub(released);
             }
             load.publish(Stage::Prefill, &self.prefill);
             if load.idle() {

@@ -2563,11 +2563,12 @@ impl VllmPDRouter {
 
         let prefill_result = self
             .grpc_frontend
-            .prefill(
+            .prefill_streaming(
                 prefill_worker.url(),
                 &prepared,
                 request_id.clone(),
                 &prefill_params,
+                |remaining| attempt.apply_prefill_progress(remaining),
             )
             .await;
         attempt.finish_prefill();
@@ -2683,11 +2684,12 @@ impl VllmPDRouter {
         };
 
         attempt.begin_decode();
-        let prefill = self.grpc_frontend.prefill(
+        let prefill = self.grpc_frontend.prefill_streaming(
             prefill_worker.url(),
             &prepared,
             request_id.clone(),
             &prefill_params,
+            |remaining| attempt.apply_prefill_progress(remaining),
         );
         // Dropping a held response, e.g. when P fails after D's stream opened,
         // aborts D's stream.
