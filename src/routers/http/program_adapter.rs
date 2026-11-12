@@ -112,13 +112,16 @@ impl ProgramCompletionInner {
         // did not ask for a wire `usage` chunk; prefer them over missing SSE.
         if let Some((prompt_tokens, completion_tokens)) = self.observer.usage() {
             usage.merge(ProgramUsageObservation {
-                // `None` means the Engine did not report `prompt_info`; the
-                // wire usage (if any) and the arrival fact remain the only
-                // evidence, and reconciliation must not invent a match.
                 prompt_tokens,
                 completion_tokens: Some(completion_tokens),
                 cached_prompt_tokens: None,
             });
+            // gRPC wire usage falls back to the Router's prepared count when
+            // Engine prompt_info is absent. The producer's observation is
+            // authoritative, including None: never verify a prepared count
+            // against its own synthetic wire copy. HTTP has no producer usage
+            // observation, so its independently reported wire count is kept.
+            usage.prompt_tokens = prompt_tokens;
         }
         if self.observer.failed() {
             // A producer error frame (timeout, tonic error, premature EOF) is
@@ -455,7 +458,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_engine_prompt_info_does_not_fabricate_a_prompt_count() {
+    async fn http_wire_usage_remains_authoritative_without_a_producer_observation() {
+        let (scheduler, dispatch) = settlement_fixture().await;
+        let estimator = Arc::new(MomentumTokenEstimator::default());
+        let (_, calibration) = estimator.estimate(
+            TokenEstimateScope::new("model", "/v1/chat/completions"),
+            "HTTP usage",
+        );
+        let completion =
+            ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
+        completion.observe_sse_chunk(
+            b"data: {\"usage\":{\"prompt_tokens\":155,\"completion_tokens\":7}}\n",
+        );
+        completion.finish(true);
+        assert!(completion.finished_success());
+        assert_eq!(
+            scheduler.diagnostics().ranks[0].programs[0].context_tokens,
+            155
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_engine_prompt_info_discards_synthetic_wire_prompt_count() {
         let (scheduler, dispatch) = settlement_fixture().await;
         let estimator = Arc::new(MomentumTokenEstimator::default());
         let (_, calibration) = estimator.estimate(
@@ -465,7 +489,7 @@ mod tests {
         let completion =
             ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
         // The producer saw completion tokens but the Engine never reported
-        // `prompt_info`; only wire usage may supply prompt tokens.
+        // `prompt_info`; gRPC wire usage contains a synthetic fallback count.
         completion.engine_observer().record_usage(None, 7);
         completion.observe_sse_chunk(
             b"data: {\"usage\":{\"prompt_tokens\":155,\"completion_tokens\":7}}\n",
@@ -473,7 +497,7 @@ mod tests {
         completion.finish(true);
         assert!(completion.finished_success());
         let snapshot = scheduler.diagnostics();
-        assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 155);
+        assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 100);
     }
 
     #[tokio::test]
