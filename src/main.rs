@@ -124,12 +124,13 @@ struct CliArgs {
     policy: String,
 
     /// Enable Program-level scheduling independently of the request-level
-    /// load-balancing policy.
+    /// load-balancing policy. Uses estimated input-token counts by default.
     #[arg(long, default_value_t = false)]
     enable_program_scheduling: bool,
 
     /// Optional JSON object overriding Program-level scheduling defaults.
-    /// Requires --enable-program-scheduling.
+    /// Requires --enable-program-scheduling. To opt into verified exact input
+    /// counts, use {"token_count_mode":"exact_when_verified"}.
     #[arg(long)]
     program_scheduling_config_json: Option<String>,
 

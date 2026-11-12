@@ -159,12 +159,25 @@ in clap's option list in `--help`.
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--enable-program-scheduling` | `flag` | `false` | `flag` | `false` | Enable Program-level scheduling independently of the request-level routing policy. |
+| `--enable-program-scheduling` | `flag` | `false` | `flag` | `false` | Enable Program-level scheduling independently of the request-level routing policy, using estimated input-token counts by default. |
 | `--program-scheduling-config-json` | `string` | `unset` | `string` | `unset` | JSON object overriding Program scheduling defaults; requires `--enable-program-scheduling`. |
 
 For JSON fields, defaults and request opt-in behavior, see
 [Program scheduling](program_scheduling/program-scheduling.md). The JSON option configures the
 feature; it does not enable it on its own.
+
+No JSON override is needed for the compatible estimated-count default. To opt
+into verified exact input counts, both CLIs accept the same minimal override:
+
+```bash
+--enable-program-scheduling \
+--program-scheduling-config-json '{"token_count_mode":"exact_when_verified"}'
+```
+
+This mode verifies available prepared counts automatically and falls back to
+estimation; HTTP chat tokenization remains a separate explicit opt-in. See
+[input-token configuration](program_scheduling/program-scheduling.md#input-token-facts)
+for that opt-in and the advanced `shadow` diagnostic option.
 
 ## Kubernetes service discovery
 

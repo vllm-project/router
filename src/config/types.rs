@@ -399,6 +399,9 @@ pub struct ProgramSchedulingConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_capacity_per_dp_rank: Option<usize>,
     /// Input-token fact source used for admission, growth, and TTL cost.
+    /// Omit for compatible estimated counts; opt into `exact_when_verified`
+    /// for automatic verification and fallback. `shadow` is an advanced
+    /// diagnostic option that never applies prepared counts to decisions.
     #[serde(default)]
     pub token_count_mode: TokenCountMode,
     /// Model pools allowed to apply prepared exact counts. Empty means all.
@@ -415,7 +418,9 @@ pub struct ProgramSchedulingConfig {
     /// so an unverified count is never used to admit work.
     #[serde(default = "default_token_count_verification_settlements")]
     pub token_count_verification_settlements: usize,
-    /// Text endpoints allowed to apply Router-tokenized exact counts.
+    /// Optional text endpoints allowed to use Router-tokenized facts.
+    /// Empty by default, including in `exact_when_verified` mode, to avoid
+    /// adding HTTP text tokenization unless the deployment explicitly opts in.
     ///
     /// Exactness for HTTP text requires verified tokenizer/template
     /// equivalence; deployments opt in per endpoint (for example

@@ -243,14 +243,18 @@ impl fmt::Display for TokenFactFallback {
 
 /// Token-count source selection mode.
 ///
-/// Default is `Estimated`, which preserves pre-RFC behavior exactly.
+/// `Estimated` is the compatibility default. `ExactWhenVerified` is the
+/// standard opt-in for exact counts: it estimates during probation and falls
+/// back when prepared facts cannot be trusted. `Shadow` is an advanced rollout
+/// diagnostic; deployments do not need to pass through it before opting in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenCountMode {
     /// Byte estimator only; no shadow accounting.
     #[default]
     Estimated,
-    /// Apply the estimator, but record what the prepared count would decide.
+    /// Advanced diagnostic: keep estimating even after verification, and
+    /// record what the prepared count would decide. Preparation still costs work.
     Shadow,
     /// Apply the prepared count once its fingerprint is allowed and verified.
     ExactWhenVerified,
