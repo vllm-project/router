@@ -10,8 +10,8 @@ from typing import Iterable, List, Optional, Tuple
 import pytest
 import requests
 
-from ..fixtures.ports import find_free_port
-from ..fixtures.router_manager import RouterManager
+from tests.python.helpers.ports import find_free_port
+from tests.python.helpers.router_manager import RouterManager
 
 
 def pytest_configure(config):
@@ -28,8 +28,7 @@ def router_manager() -> Iterable[RouterManager]:
 
 
 def _spawn_mock_worker(args: List[str]) -> Tuple[subprocess.Popen, str, str]:
-    repo_root = Path(__file__).resolve().parents[3]
-    script = repo_root / "tests" / "python" / "fixtures" / "mock_worker.py"
+    script = Path(__file__).resolve().parents[1] / "helpers" / "mock_worker.py"
     port = find_free_port()
     worker_id = f"worker-{port}"
     base_cmd = [
@@ -201,7 +200,7 @@ def kv_st_runtime(tmp_path_factory):
 
 @pytest.fixture
 def kv_workers(kv_st_runtime):
-    from ..fixtures.mock_worker import GrpcKvWorker
+    from tests.python.helpers.mock_worker import GrpcKvWorker
 
     workers = []
 

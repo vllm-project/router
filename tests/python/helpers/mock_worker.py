@@ -653,26 +653,30 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         headers = {"X-Worker-Id": worker_id}
         return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
+    async def dispatch(request: Request):
+        if args.stream:
+            return await handle_stream_request(request)
+        return await handle_text_request(request)
+
     @app.post("/generate")
     async def generate(request: Request):
         async with track_inflight():
-            if args.stream:
-                return await handle_stream_request(request)
-            return await handle_text_request(request)
+            return await dispatch(request)
 
     @app.post("/v1/completions")
     async def completions(request: Request):
         async with track_inflight():
-            if args.stream:
-                return await handle_stream_request(request)
-            return await handle_text_request(request)
+            return await dispatch(request)
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
         async with track_inflight():
-            if args.stream:
-                return await handle_stream_request(request)
-            return await handle_text_request(request)
+            return await dispatch(request)
+
+    @app.post("/v1/responses")
+    async def responses(request: Request):
+        async with track_inflight():
+            return await dispatch(request)
 
     return app
 

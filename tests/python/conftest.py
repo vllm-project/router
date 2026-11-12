@@ -1,25 +1,19 @@
+"""Path setup for the router Python suite.
+
+Plugin registration lives in the repository-root ``conftest.py``. Pytest only
+allows ``pytest_plugins`` in that top-level file. Importable utilities live
+under ``tests/python/helpers/``. Fixtures live under
+``tests/python/helpers/fixtures/``.
+"""
+
+from __future__ import annotations
+
 import sys
 from pathlib import Path
 
-import pytest
-
-from .helpers.mark import HARDWARE_MARK_NORMALIZATION_FIXTURE
-
-# Ensure local sources in py_src are importable ahead of any installed package
 _ROOT = Path(__file__).resolve().parents[2]
 _SRC = _ROOT / "py_src"
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
-
-
-@pytest.fixture(name=HARDWARE_MARK_NORMALIZATION_FIXTURE)
-def _normalized_hardware_marks(request):
-    """Platform name for one mixed-count ``hardware_test`` variant.
-
-    The variant's SKU and ``cards_{n}`` marks are already on the item.
-    This fixture only consumes the indirect parameter so the test function
-    does not need a new argument.
-    """
-    return request.param

@@ -7,9 +7,11 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
 @pytest.mark.integration
-def test_circuit_breaker_opens_and_recovers(router_manager, mock_workers):
+def test_circuit_breaker_opens_and_recovers(router_manager, mock_worker_manager):
     # A single worker that fails first 3 requests, then succeeds
-    _, [wurl], _ = mock_workers(n=1, args=["--fail-first-n", "3"])  # fails first 3
+    _, [wurl], _ = mock_worker_manager.start_workers(
+        n=1, args=["--fail-first-n", "3"]
+    )  # fails first 3
     rh = router_manager.start_router(
         worker_urls=[wurl],
         policy="round_robin",
@@ -49,8 +51,10 @@ def test_circuit_breaker_opens_and_recovers(router_manager, mock_workers):
 
 
 @pytest.mark.integration
-def test_circuit_breaker_half_open_failure_reopens(router_manager, mock_workers):
-    _, [wurl], _ = mock_workers(n=1, args=["--status-code", "500"])  # always fail
+def test_circuit_breaker_half_open_failure_reopens(router_manager, mock_worker_manager):
+    _, [wurl], _ = mock_worker_manager.start_workers(
+        n=1, args=["--status-code", "500"]
+    )  # always fail
     rh = router_manager.start_router(
         worker_urls=[wurl],
         policy="round_robin",
@@ -91,8 +95,10 @@ def test_circuit_breaker_half_open_failure_reopens(router_manager, mock_workers)
 
 
 @pytest.mark.integration
-def test_circuit_breaker_disable_flag(router_manager, mock_workers):
-    _, [wurl], _ = mock_workers(n=1, args=["--status-code", "500"])  # always fail
+def test_circuit_breaker_disable_flag(router_manager, mock_worker_manager):
+    _, [wurl], _ = mock_worker_manager.start_workers(
+        n=1, args=["--status-code", "500"]
+    )  # always fail
     rh = router_manager.start_router(
         worker_urls=[wurl],
         policy="round_robin",
@@ -115,9 +121,11 @@ def test_circuit_breaker_disable_flag(router_manager, mock_workers):
 
 
 @pytest.mark.integration
-def test_circuit_breaker_per_worker_isolation(router_manager, mock_workers):
-    _, [fail_url], _ = mock_workers(n=1, args=["--status-code", "500"])  # always fail
-    _, [ok_url], _ = mock_workers(n=1)
+def test_circuit_breaker_per_worker_isolation(router_manager, mock_worker_manager):
+    _, [fail_url], _ = mock_worker_manager.start_workers(
+        n=1, args=["--status-code", "500"]
+    )  # always fail
+    _, [ok_url], _ = mock_worker_manager.start_workers(n=1)
     rh = router_manager.start_router(
         worker_urls=[fail_url, ok_url],
         policy="round_robin",
@@ -163,9 +171,11 @@ def test_circuit_breaker_per_worker_isolation(router_manager, mock_workers):
 
 
 @pytest.mark.integration
-def test_circuit_breaker_with_retries(router_manager, mock_workers):
-    _, [fail_url], _ = mock_workers(n=1, args=["--status-code", "500"])  # always fail
-    _, [ok_url], _ = mock_workers(n=1)
+def test_circuit_breaker_with_retries(router_manager, mock_worker_manager):
+    _, [fail_url], _ = mock_worker_manager.start_workers(
+        n=1, args=["--status-code", "500"]
+    )  # always fail
+    _, [ok_url], _ = mock_worker_manager.start_workers(n=1)
     rh = router_manager.start_router(
         worker_urls=[fail_url, ok_url],
         policy="round_robin",
@@ -194,7 +204,7 @@ def test_circuit_breaker_with_retries(router_manager, mock_workers):
 
 
 @pytest.mark.integration
-def test_circuit_breaker_ignores_4xx_client_errors(router_manager, mock_workers):
+def test_circuit_breaker_ignores_4xx_client_errors(router_manager, mock_worker_manager):
     """
     4xx client errors (e.g., 400 Bad Request) should NOT count as circuit breaker
     failures. Only 5xx server errors indicate worker health issues.
@@ -203,7 +213,9 @@ def test_circuit_breaker_ignores_4xx_client_errors(router_manager, mock_workers)
     while 500 responses still do.
     """
     # Worker that returns 400 Bad Request for all requests
-    _, [client_error_url], _ = mock_workers(n=1, args=["--status-code", "400"])
+    _, [client_error_url], _ = mock_worker_manager.start_workers(
+        n=1, args=["--status-code", "400"]
+    )
     rh = router_manager.start_router(
         worker_urls=[client_error_url],
         policy="round_robin",

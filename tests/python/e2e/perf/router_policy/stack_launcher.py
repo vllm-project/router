@@ -48,7 +48,7 @@ from log_summary import (  # noqa: E402
     print_failure_diagnostics,
     write_calibration,
 )
-from tests.python.e2e.perf.process import (  # noqa: E402
+from tests.python.helpers.process import (  # noqa: E402
     RunningProc,
     launch_router,
     launch_worker,
