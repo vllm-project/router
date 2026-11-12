@@ -26,7 +26,6 @@ import socket
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,6 +58,7 @@ from tests.python.e2e.perf.process import (  # noqa: E402
     release_worker_port_holders,
     reserve_port,
     router_cmd,
+    stream_process,
     vllm_rs_serve_cmd,
 )
 
@@ -75,6 +75,7 @@ class RouterPolicyStack:
     ports: dict[str, Any] = field(default_factory=dict)
     stack: list[RunningProc] = field(default_factory=list)
     replay_proc: subprocess.Popen[Any] | None = None
+    replay_stream: RunningProc | None = None
     replay_entry: Path | None = None
     port_holders: list[socket.socket | None] = field(default_factory=list)
     kv_port_holders: list[socket.socket | None] = field(default_factory=list)
@@ -105,6 +106,10 @@ def open_cell(case: RouterPolicyCase, *, out_dir: Path | None) -> RouterPolicySt
     path_parts = [p for p in (py_prefix, env.get("PATH", "")) if p]
     env_updates: dict[str, str] = {
         "PATH": os.pathsep.join(path_parts),
+        "XDG_CACHE_HOME": str(case.perf_work_root / "cache"),
+        "HF_HOME": str(case.perf_work_root / "cache/huggingface"),
+        "VLLM_CACHE_ROOT": str(case.perf_work_root / "cache/vllm"),
+        "TRITON_CACHE_DIR": str(case.perf_work_root / "cache/triton"),
         "VLLM_ROUTER_MODEL": case.model,
         "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "8"),
         "TOKENIZERS_PARALLELISM": "false",
@@ -137,17 +142,6 @@ def open_cell(case: RouterPolicyCase, *, out_dir: Path | None) -> RouterPolicySt
     )
 
 
-def _stream_replay(proc: subprocess.Popen[Any], log: Path) -> None:
-    stream = proc.stdout
-    if stream is None:
-        return
-    with log.open("w", encoding="utf-8") as handle:
-        for line in stream:
-            handle.write(line)
-            handle.flush()
-            print(f"[replay] {line}", end="", file=sys.stderr, flush=True)
-
-
 def _start_replay(
     run: RouterPolicyStack, command: list[str], log: Path
 ) -> subprocess.Popen[Any]:
@@ -168,12 +162,9 @@ def _start_replay(
         text=True,
         bufsize=1,
     )
-    threading.Thread(
-        target=_stream_replay,
-        args=(proc, log),
-        name="router-policy-replay",
-        daemon=True,
-    ).start()
+    run.replay_stream = stream_process(
+        proc, label="replay", log_path=log, log_prefix="router_policy"
+    )
     return proc
 
 
@@ -184,6 +175,9 @@ def cleanup(run: RouterPolicyStack) -> None:
     if run.replay_proc is not None:
         graceful_stop(run.replay_proc, 45.0, process_group=True, kill_grace=15)
         run.replay_proc = None
+    if run.replay_stream is not None:
+        run.replay_stream.stop()
+        run.replay_stream = None
     for proc in reversed(run.stack):
         proc.stop()
     run.stack.clear()
@@ -760,6 +754,10 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                     graceful_stop(replay, 60, process_group=True, kill_grace=15)
                     break
             if tick % 6 == 0:
+                try:
+                    snapshot(run, run.out / "metrics" / f"{tick * 10:05}")
+                except Exception as exc:
+                    print(f"SNAPSHOT_FAIL {exc}", flush=True)
                 replay_lines = 0
                 if progress_file.is_file():
                     replay_lines = sum(

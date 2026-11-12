@@ -393,6 +393,21 @@ def _open_log(log_path: Path | None):
     return open(log_path, "w", encoding="utf-8")
 
 
+def stream_process(
+    proc: subprocess.Popen,
+    *,
+    label: str,
+    log_path: Path,
+    log_prefix: str = "perf",
+) -> RunningProc:
+    """Attach the shared stdout tee to an existing process; stop() drains its log."""
+    log_fp = _open_log(log_path)
+    thread = _pipe(proc, label, None, threading.Lock(), log_fp)
+    return RunningProc(
+        proc=proc, thread=thread, label=label, log_prefix=log_prefix, log_fp=log_fp
+    )
+
+
 def launch_worker(
     cmd: list[str],
     *,

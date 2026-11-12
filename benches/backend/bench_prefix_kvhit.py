@@ -433,7 +433,7 @@ def read_perf_settings(
         "timeout": float(os.environ.get("PERF_TIMEOUT", str(default_timeout))),
         "warmup": os.environ.get("PERF_WARMUP", "1").lower() in ("1", "true", "yes"),
         "backend_label": label,
-        "output_dir": os.environ.get("PERF_OUTPUT_DIR", "").strip(),
+        "output_dir": "",
     }
 
 

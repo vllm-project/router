@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from case_loader import router_policy_result_path
+from tests.python.e2e.perf.result_metadata import add_missing_metadata
 
 if TYPE_CHECKING:
     from stack_launcher import RouterPolicyStack
@@ -293,10 +294,7 @@ def write_calibration(
     output_tokens = sum(r.get("output_tokens") or 0 for r in ok)
     makespan = _makespan_seconds(ok)
     stats = {
-        "router_policy": case.policy,
         "arm": case.policy,
-        "concurrency": case.concurrency,
-        "task_num": case.task_num,
         "returncode": replay_rc,
         "wall_seconds": wall_seconds,
         "makespan_seconds": makespan,
@@ -348,6 +346,14 @@ def write_calibration(
             ),
         ),
     }
+    stats = add_missing_metadata(
+        stats,
+        {
+            "router_policy": case.policy,
+            "concurrency": case.concurrency,
+            "task_num": case.task_num,
+        },
+    )
     (run.out / "calibration.json").write_text(json.dumps(stats, indent=2))
     emit_run_summary(
         run,

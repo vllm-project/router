@@ -33,9 +33,11 @@ pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -sv -
 Performance JSON and the run directory are separate. The nightly dashboard copies `tests/python/e2e/results` only.
 
 - `tests/python/e2e/results/perf/router_policy/<policy>_<run_suffix>/c<concurrency>_t<task_num>.json` — copy of `calibration.json` when the cell is ok. One directory per policy and session; one file per concurrency. The `concurrency` / `task_num` fields match the file name.
-- `tests/python/e2e/run/perf/router_policy/<case_id>-<run_suffix>/` — cell files. Nightly uploads `result/summary.json`, `result/manifest.json`, `router.log`, `engineN.log`, `replay.log`, `runtime-replay.yaml`, and `*.command.json`. Prometheus snapshots, `requests.jsonl`, `ports.json`, and `calibration.json` stay on the agent. The replay launcher is a temp file, and model caches stay in the default cache directories. The same stdout is also printed (`[engineN]`, `[vllm-router]`, `[replay]`).
+- `tests/python/e2e/run/perf/router_policy/<case_id>-<run_suffix>/` — cell files. Nightly uploads `result/summary.json`, `result/manifest.json`, `router.log`, `engineN.log`, `replay.log`, `runtime-replay.yaml`, and `*.command.json`. Prometheus snapshots, `requests.jsonl`, `ports.json`, and `calibration.json` stay on the agent. The replay launcher is a temp file, and model caches stay under `tests/python/e2e/run/perf/router_policy/cache/` (shared across cells in this work root, excluded from nightly uploads). The same stdout is also printed (`[engineN]`, `[vllm-router]`, `[replay]`).
 
 `<run_suffix>` is local time `YYYYMMDD_HHMMSS` (same format as grpc and l1_encode) unless you set **`AGENTX_RUN_SUFFIX`** (same suffix for all cells in one matrix, e.g. `export AGENTX_RUN_SUFFIX=20251029_171300`). The run directory is generated automatically from the case ID and run suffix.
+
+Prometheus snapshots are saved under `before/`, `after/`, and `metrics/<elapsed_seconds>/` (approximately every 60 seconds during replay). They remain in the run directory for local diagnosis and are not uploaded. Replay logging uses the shared process stdout tee; cleanup joins the reader thread before closing the log.
 
 Before replay, the cell runner **removes `result/`** if it already exists. The cell **fails if replay exit code ≠ 0**.
 

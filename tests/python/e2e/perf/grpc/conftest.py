@@ -25,6 +25,7 @@ from case_loader import (  # noqa: E402
     wave_case_id,
 )
 from stack_launcher import launch_stack  # noqa: E402
+from tests.python.e2e.perf.artifact_paths import perf_results_dir  # noqa: E402
 
 BENCH_SCRIPT = _PERF_DIR.parents[4] / "benches" / "backend" / "bench_prefix_kvhit.py"
 
@@ -72,16 +73,6 @@ def _perf_ready() -> bool:
     return perf_model_ready() and perf_case_selected()
 
 
-def _perf_save_results_enabled() -> bool:
-    """Default on; set PERF_SAVE_RESULTS=0 to skip writing results/*.json."""
-    raw = os.environ.get("PERF_SAVE_RESULTS", "").strip().lower()
-    if raw in ("0", "false", "no"):
-        return False
-    if raw in ("1", "true", "yes"):
-        return True
-    return True
-
-
 def _perf_case_for_collection():
     """Resolve the case at collection time (does not require MODEL).
 
@@ -114,18 +105,12 @@ def perf_case():
 
 @pytest.fixture(scope="session")
 def perf_output_dir(perf_case, bench_mod) -> str:
-    """One results directory per pytest session (default: always save)."""
-    existing = os.environ.get("PERF_OUTPUT_DIR", "").strip()
-    if existing:
-        return existing
-    if not _perf_save_results_enabled():
-        return ""
+    """Always save results in one directory per pytest session."""
     path = bench_mod.default_output_dir(
         {"backend_label": perf_case.backend},
         # Dashboard copies tests/python/e2e/results only.
-        results_parent=_PERF_DIR.parents[1] / "results" / "perf" / "grpc",
+        results_parent=perf_results_dir("grpc"),
     )
-    os.environ["PERF_OUTPUT_DIR"] = path
     _progress(f"results directory: {Path(path).resolve()}")
     return path
 
@@ -167,8 +152,7 @@ def perf_settings(perf_case, perf_stack, bench_mod, perf_output_dir):
         bench_max_tokens=perf_case.bench_max_tokens,
         bench_timeout=perf_case.bench_timeout,
     )
-    if not settings["output_dir"] and perf_output_dir:
-        settings["output_dir"] = perf_output_dir
+    settings["output_dir"] = perf_output_dir
     return settings
 
 

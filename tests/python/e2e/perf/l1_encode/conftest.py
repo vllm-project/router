@@ -12,21 +12,17 @@ import pytest
 
 from tests.python.e2e.perf.l1_encode.check import hit_tag
 from tests.python.e2e.perf.l1_encode.stack_launcher import L1Stack
+from tests.python.e2e.perf.artifact_paths import perf_results_dir
 
 _DIR = Path(__file__).resolve().parent
 # Dashboard copies tests/python/e2e/results only.
-RESULTS_DIR = _DIR.parents[1] / "results" / "perf" / "l1_encode"
+RESULTS_DIR = perf_results_dir("l1_encode")
 
 BENCH_SCRIPT = _DIR.parents[4] / "benches" / "backend" / "bench_prefix_kvhit.py"
 
 
 def _progress(msg: str) -> None:
     print(f"[perf] {msg}", file=sys.stderr, flush=True)
-
-
-def _save_results() -> bool:
-    raw = os.environ.get("PERF_SAVE_RESULTS", "").strip().lower()
-    return raw not in ("0", "false", "no")
 
 
 def load_bench_module():
@@ -79,11 +75,8 @@ def l1_case(request):
 @pytest.fixture(scope="class")
 def l1_output_dir(l1_case):
     """One directory per L1 arm and session: ``l1on_<stamp>`` or ``l1off_<stamp>``."""
-    if not _save_results():
-        yield None
-        return
-    arm = "l1on" if l1_case.l1_on else "l1off"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    arm = "l1on" if l1_case.l1_on else "l1off"
     path = RESULTS_DIR / f"{arm}_{stamp}"
     path.mkdir(parents=True, exist_ok=True)
     _progress(f"results directory: {path.resolve()}")
