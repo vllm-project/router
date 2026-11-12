@@ -1095,8 +1095,10 @@ impl Router {
         headers: Option<&HeaderMap>,
         typed_req: &T,
         model_id: Option<&str>,
-    ) -> Option<ProgramIdentity> {
-        let scheduler = self.program_scheduler.as_ref()?;
+    ) -> Result<Option<ProgramIdentity>, ScheduleError> {
+        let Some(scheduler) = self.program_scheduler.as_ref() else {
+            return Ok(None);
+        };
         let model_pool = self.resolved_program_model_pool(model_id);
         let request = typed_req.extract_program_identity_payload();
         ProgramIdentity::from_request_with_enable_key(
@@ -1105,8 +1107,6 @@ impl Router {
             Some(&model_pool.scheduler_key),
             scheduler.enable_key(),
         )
-        .ok()
-        .flatten()
     }
 
     /// Whether settlement can verify a prepared count against Engine usage.
@@ -1802,9 +1802,14 @@ impl Router {
                         &self.resolved_program_model_pool(model_id).scheduler_key,
                     )
             });
-        let resolved_identity = identity_config_applies
-            .then(|| self.resolved_program_identity(headers, typed_req, model_id))
-            .flatten();
+        let resolved_identity = if identity_config_applies {
+            match self.resolved_program_identity(headers, typed_req, model_id) {
+                Ok(identity) => identity,
+                Err(error) => return Self::schedule_error_response(error),
+            }
+        } else {
+            None
+        };
         let inject_include_usage = matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
             && typed_req.is_stream()
             && !typed_req.settlement_reports_usage()
@@ -7357,6 +7362,39 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_identity_is_not_forwarded_on_the_exact_text_path() {
+        let mut router = create_test_regular_router();
+        let config = ProgramSchedulerConfig {
+            token_count_mode: crate::program_scheduling::TokenCountMode::Shadow,
+            exact_text_endpoints: vec!["/v1/chat/completions".to_string()],
+            ..ProgramSchedulerConfig::default()
+        };
+        router.program_scheduler = Some(Arc::new(ProgramScheduler::new(config)));
+
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "hello"}],
+            "vllm_xargs": {
+                "agentic_context": {
+                    "program_id": "p",
+                    "parent_program_id": "p"
+                }
+            }
+        }))
+        .unwrap();
+        let response = router
+            .route_typed_request(None, &request, "/v1/chat/completions", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("parent_program_id must differ from program_id"),
+            "unexpected body: {body}"
+        );
     }
 
     #[tokio::test]
