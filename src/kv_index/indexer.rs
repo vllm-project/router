@@ -197,6 +197,13 @@ fn unique_alias_position(node: &NodeRef, target: &RoutableTarget, seq: &Arc<str>
     positions.next().is_none().then_some(position)
 }
 
+/// Derived position of a source-scoped alias in the compressed tree.
+#[derive(Clone)]
+struct Anchor {
+    node: NodeRef,
+    offset: usize,
+}
+
 /// One `group_idx`'s compressed radix tree + owner/tier claims for a single
 /// kv-cache-spec group. Blocks from different groups never share a node because
 /// they live in separate shards — the engine's sequence hash doesn't fold
@@ -207,14 +214,14 @@ struct GroupShard {
     topology: RwLock<()>,
     /// Tree root (sentinel: empty edge, no claims, only children).
     root: NodeRef,
-    /// Engine seq hash → tree node, so a store jumps to its parent and a
+    /// Engine seq hash → tree node and edge offset, so a store jumps to its parent and a
     /// `BlockRemoved` (carrying only seq hashes) finds the node to drop.
     // ponytail: never trimmed — topology outlives residency; unique-prefix churn
     // grows topology and historical alias sets without limit. Revisit with an
     // epoch leaf sweep if growth shows.
     // The same opaque integer may refer to different paths at two publishers.
     // Keep parent anchors scoped by the publishing target, not by hash alone.
-    scoped_anchors: DashMap<Arc<str>, HashMap<RoutableTarget, NodeRef>>,
+    scoped_anchors: DashMap<Arc<str>, HashMap<RoutableTarget, Anchor>>,
     /// Reverse lookup: (owner, tier) → seq hashes claimed.
     reverse: DashMap<OwnerTier, HashSet<Arc<str>>>,
 }
@@ -276,35 +283,42 @@ impl GroupShard {
                 .entry(target.clone())
                 .or_default()
                 .insert(seq.clone());
-            self.scoped_anchors
-                .entry(seq.clone())
-                .or_default()
-                .insert(target.clone(), node.clone());
+            self.scoped_anchors.entry(seq.clone()).or_default().insert(
+                target.clone(),
+                Anchor {
+                    node: node.clone(),
+                    offset: *offset,
+                },
+            );
         }
         let mut cursor = parent_seq;
         let mut bi = 0;
         while bi < blocks.len() {
-            let node = match &cursor {
-                Some(seq) => self
-                    .anchor(&target, seq)
-                    .expect("known cursor must remain anchored; anchors are insert-only"),
-                None => self.root.clone(),
+            let (node, offset) = match &cursor {
+                Some(seq) => {
+                    let anchor = self
+                        .positioned_anchor(&target, seq)
+                        .expect("known cursor must remain anchored; anchors are insert-only");
+                    (anchor.node, Some(anchor.offset))
+                }
+                None => (self.root.clone(), None),
             };
             #[cfg(all(test, feature = "cpu", feature = "ready"))]
             after_anchor_clone();
             let mut parent = node.write();
             if let Some(seq) = &cursor {
-                let Some(pos) = parent
+                let pos = offset.expect("a cursor has an anchor offset");
+                if !parent
                     .edge
-                    .iter()
-                    .position(|(aliases, _)| aliases.has(&target, seq))
-                else {
+                    .get(pos)
+                    .is_some_and(|(aliases, _)| aliases.has(&target, seq))
+                {
                     // The same split-only progress argument as remove_claim
                     // applies to this fixed cursor; resolve its moved anchor.
                     drop(parent);
                     std::thread::yield_now();
                     continue;
-                };
+                }
                 if pos + 1 < parent.edge.len() {
                     self.split_locked(&mut parent, &node, pos + 1);
                 }
@@ -399,9 +413,17 @@ impl GroupShard {
         target: &RoutableTarget,
         seq: &Arc<str>,
     ) -> Result<Option<(NodeRef, usize, bool)>, ()> {
-        if let Some(node) = self.anchor(target, seq) {
-            let position = unique_alias_position(&node, target, seq).ok_or(())?;
-            return Ok(Some((node, position, false)));
+        if let Some(anchor) = self.positioned_anchor(target, seq) {
+            let valid = anchor
+                .node
+                .read()
+                .edge
+                .get(anchor.offset)
+                .is_some_and(|(aliases, _)| aliases.has(target, seq));
+            if !valid {
+                return Err(());
+            }
+            return Ok(Some((anchor.node, anchor.offset, false)));
         }
         if seq.starts_with("i:") {
             return Ok(None);
@@ -416,7 +438,7 @@ impl GroupShard {
         };
         let candidates: Vec<_> = anchors
             .iter()
-            .map(|(scope, node)| (scope.clone(), node.clone()))
+            .map(|(scope, anchor)| (scope.clone(), anchor.node.clone()))
             .collect();
         drop(anchors);
         let mut found: Option<(NodeRef, usize)> = None;
@@ -478,10 +500,13 @@ impl GroupShard {
                 .entry(key.0.target())
                 .or_default()
                 .insert(seq.clone());
-            self.scoped_anchors
-                .entry(seq.clone())
-                .or_default()
-                .insert(key.0.target(), node.clone());
+            self.scoped_anchors.entry(seq.clone()).or_default().insert(
+                key.0.target(),
+                Anchor {
+                    node: node.clone(),
+                    offset: i,
+                },
+            );
             self.reverse
                 .entry(key.clone())
                 .or_default()
@@ -510,13 +535,16 @@ impl GroupShard {
         // An anchor exposes the remainder to other writers. Keep it locked
         // through all re-anchoring and publication so a split cannot race us.
         let r = rem_node.write();
-        for (aliases, _) in &r.edge {
+        for (offset, (aliases, _)) in r.edge.iter().enumerate() {
             for (target, seqs) in &aliases.scoped {
                 for seq in seqs {
                     if let Some(mut anchors) = self.scoped_anchors.get_mut(seq) {
                         if let Some(anchor) = anchors.get_mut(target) {
-                            if Arc::ptr_eq(anchor, original) {
-                                *anchor = rem_node.clone();
+                            if Arc::ptr_eq(&anchor.node, original) {
+                                *anchor = Anchor {
+                                    node: rem_node.clone(),
+                                    offset,
+                                };
                             }
                         }
                     }
@@ -642,6 +670,11 @@ impl GroupShard {
     }
 
     fn anchor(&self, target: &RoutableTarget, seq: &Arc<str>) -> Option<NodeRef> {
+        self.positioned_anchor(target, seq)
+            .map(|anchor| anchor.node)
+    }
+
+    fn positioned_anchor(&self, target: &RoutableTarget, seq: &Arc<str>) -> Option<Anchor> {
         self.scoped_anchors
             .get(seq)
             .and_then(|entries| entries.get(target).cloned())
@@ -657,23 +690,24 @@ impl GroupShard {
         // that Clear cannot enumerate.
         loop {
             // Never hold an anchors map guard while taking the node lock.
-            let Some(node) = self.anchor(&key.0.target(), seq) else {
+            let Some(anchor) = self.positioned_anchor(&key.0.target(), seq) else {
                 return;
             };
             #[cfg(all(test, feature = "cpu", feature = "ready"))]
             after_anchor_clone();
-            let mut n = node.write();
+            let mut n = anchor.node.write();
             let target = key.0.target();
-            let Some(idx) = n
+            let idx = anchor.offset;
+            if !n
                 .edge
-                .iter()
-                .position(|(aliases, _)| aliases.has(&target, seq))
-            else {
+                .get(idx)
+                .is_some_and(|(aliases, _)| aliases.has(&target, seq))
+            {
                 // A concurrent split moved this alias; resolve it again.
                 drop(n);
                 std::thread::yield_now();
                 continue;
-            };
+            }
             let active = self.reverse.get(key).is_some_and(|seqs| {
                 n.edge[idx]
                     .0
@@ -2672,6 +2706,9 @@ mod tests {
             let node = anchor_for(shard, &key.0, seq);
             let pos = unique_alias_position(&node, &key.0.target(), seq)
                 .expect("source-scoped anchor contains alias");
+            let anchor = shard.positioned_anchor(&key.0.target(), seq).unwrap();
+            assert!(Arc::ptr_eq(&anchor.node, &node));
+            assert_eq!(anchor.offset, pos, "anchor offset for {seq}");
             let node = node.read();
             assert!(node.claims[pos].contains(key));
         }
