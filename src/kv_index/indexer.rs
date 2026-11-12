@@ -854,6 +854,9 @@ impl KvBlockIndexer {
     }
 
     fn source_lock(&self, target: &RoutableTarget) -> Arc<SourceLock> {
+        if let Some(source) = self.source_locks.get(target) {
+            return source.clone();
+        }
         self.source_locks
             .entry(target.clone())
             .or_insert_with(|| Arc::new(SourceLock::new()))
@@ -1051,20 +1054,10 @@ impl KvBlockIndexer {
             .collect();
         let shard = self.shard(query.group_idx);
         let topology = shard.topology.read();
-        let mut node_claims = shard.collect_claims(query);
-        let eligible: HashSet<_> = sources
-            .iter()
-            .filter_map(|(target, source)| {
-                (source.generation.load(Ordering::Acquire) == snapshots[target].generation
-                    && !self
-                        .suspended_sources
-                        .contains_key(&(target.instance_id.clone(), target.dp_rank)))
-                .then_some(target.clone())
-            })
-            .collect();
-        for claims in &mut node_claims {
-            claims.retain(|(owner, _)| eligible.contains(&owner.target()));
-        }
+        // A target absent from this source snapshot, suspended, or invalidated
+        // before the result is returned is filtered below. Doing the same
+        // lookup for every page adds O(pages * owners) duplicate checks.
+        let node_claims = shard.collect_claims(query);
         drop(topology);
         drop(_guards);
         drop(_domain);
