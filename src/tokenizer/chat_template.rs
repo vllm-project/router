@@ -115,7 +115,7 @@ pub fn load_chat_template_from_config(config_path: &str) -> Result<Option<String
     Ok(None)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

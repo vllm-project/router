@@ -372,7 +372,7 @@ DEBUG 10-17 09:29:39 [plugins/__init__.py:36] Available plugins for group vllm.g
 DEBUG 10-17 09:29:39 [plugins/__init__.py:38] - lora_filesystem_resolver -> vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver
 DEBUG 10-17 09:29:39 [plugins/__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
 DEBUG 10-17 09:29:39 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.deepseek_v2.DeepseekV2Model'>: ['input_ids', 'positions', 'intermediate_tensors', 'inputs_embeds']
-W1017 09:29:39.408000 1496 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+W1017 09:29:39.408000 1496 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation.
 W1017 09:29:39.408000 1496 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
 DEBUG 10-17 09:29:39 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama.LlamaModel'>: ['input_ids', 'positions', 'intermediate_tensors', 'inputs_embeds']
 DEBUG 10-17 09:29:39 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama_eagle3.LlamaModel'>: ['input_ids', 'positions', 'hidden_states']
@@ -380,7 +380,7 @@ DEBUG 10-17 09:29:39 [plugins/__init__.py:36] Available plugins for group vllm.g
 DEBUG 10-17 09:29:39 [plugins/__init__.py:38] - lora_filesystem_resolver -> vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver
 DEBUG 10-17 09:29:39 [plugins/__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
 DEBUG 10-17 09:29:40 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.deepseek_v2.DeepseekV2Model'>: ['input_ids', 'positions', 'intermediate_tensors', 'inputs_embeds']
-W1017 09:29:40.065000 1488 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+W1017 09:29:40.065000 1488 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation.
 W1017 09:29:40.065000 1488 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
 DEBUG 10-17 09:29:40 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama.LlamaModel'>: ['input_ids', 'positions', 'intermediate_tensors', 'inputs_embeds']
 DEBUG 10-17 09:29:40 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama_eagle3.LlamaModel'>: ['input_ids', 'positions', 'hidden_states']
@@ -392,7 +392,7 @@ DEBUG 10-17 09:29:40 [utils/__init__.py:3188] Methods determine_num_available_bl
 DEBUG 10-17 09:29:40 [distributed/device_communicators/shm_broadcast.py:313] Connecting to ipc:///tmp/12f4fc21-fea0-47f1-aea6-1bfc9d19cfdb
 DEBUG 10-17 09:29:40 [distributed/device_communicators/shm_broadcast.py:243] Binding to ipc:///tmp/ed0c1e61-2e27-4527-ba7e-c81296f448b5
 INFO 10-17 09:29:40 [distributed/device_communicators/shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_9d31528f'), local_subscribe_addr='ipc:///tmp/ed0c1e61-2e27-4527-ba7e-c81296f448b5', remote_subscribe_addr=None, remote_addr_ipv6=False)
-W1017 09:29:40.726000 1489 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+W1017 09:29:40.726000 1489 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation.
 W1017 09:29:40.726000 1489 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
 DEBUG 10-17 09:29:40 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama.LlamaModel'>: ['input_ids', 'positions', 'intermediate_tensors', 'inputs_embeds']
 DEBUG 10-17 09:29:40 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama_eagle3.LlamaModel'>: ['input_ids', 'positions', 'hidden_states']
@@ -412,7 +412,7 @@ DEBUG 10-17 09:29:41 [plugins/__init__.py:36] Available plugins for group vllm.g
 DEBUG 10-17 09:29:41 [plugins/__init__.py:38] - lora_filesystem_resolver -> vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver
 DEBUG 10-17 09:29:41 [plugins/__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
 DEBUG 10-17 09:29:41 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.deepseek_v2.DeepseekV2Model'>: ['input_ids', 'positions', 'intermediate_tensors', 'inputs_embeds']
-W1017 09:29:41.599000 1507 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+W1017 09:29:41.599000 1507 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation.
 W1017 09:29:41.599000 1507 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
 DEBUG 10-17 09:29:41 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama.LlamaModel'>: ['input_ids', 'positions', 'intermediate_tensors', 'inputs_embeds']
 DEBUG 10-17 09:29:41 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama_eagle3.LlamaModel'>: ['input_ids', 'positions', 'hidden_states']
@@ -425,7 +425,7 @@ DEBUG 10-17 09:29:41 [distributed/device_communicators/shm_broadcast.py:313] Con
 DEBUG 10-17 09:29:41 [distributed/device_communicators/shm_broadcast.py:243] Binding to ipc:///tmp/f888dd2d-71ad-4cdd-8176-2387dcf3b55a
 INFO 10-17 09:29:41 [distributed/device_communicators/shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_64eed7ba'), local_subscribe_addr='ipc:///tmp/f888dd2d-71ad-4cdd-8176-2387dcf3b55a', remote_subscribe_addr=None, remote_addr_ipv6=False)
 [1;36m(APIServer pid=1)[0;0m DEBUG 10-17 09:29:42 [v1/engine/utils.py:776] Waiting for 8 local, 0 remote core engine proc(s) to start.
-W1017 09:29:42.450000 1504 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+W1017 09:29:42.450000 1504 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation.
 W1017 09:29:42.450000 1504 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
 DEBUG 10-17 09:29:42 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama.LlamaModel'>: ['input_ids', 'positions', 'intermediate_tensors', 'inputs_embeds']
 DEBUG 10-17 09:29:42 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama_eagle3.LlamaModel'>: ['input_ids', 'positions', 'hidden_states']
@@ -433,7 +433,7 @@ DEBUG 10-17 09:29:42 [utils/__init__.py:3188] Methods determine_num_available_bl
 DEBUG 10-17 09:29:42 [distributed/device_communicators/shm_broadcast.py:313] Connecting to ipc:///tmp/007d2bf0-7593-4e31-8603-0285177e08e7
 DEBUG 10-17 09:29:42 [distributed/device_communicators/shm_broadcast.py:243] Binding to ipc:///tmp/d1993e9d-5612-4011-ac17-fd2819f6900a
 INFO 10-17 09:29:42 [distributed/device_communicators/shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_012feb24'), local_subscribe_addr='ipc:///tmp/d1993e9d-5612-4011-ac17-fd2819f6900a', remote_subscribe_addr=None, remote_addr_ipv6=False)
-W1017 09:29:43.104000 1497 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+W1017 09:29:43.104000 1497 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation.
 W1017 09:29:43.104000 1497 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
 DEBUG 10-17 09:29:43 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama.LlamaModel'>: ['input_ids', 'positions', 'intermediate_tensors', 'inputs_embeds']
 DEBUG 10-17 09:29:43 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama_eagle3.LlamaModel'>: ['input_ids', 'positions', 'hidden_states']
@@ -441,7 +441,7 @@ DEBUG 10-17 09:29:43 [utils/__init__.py:3188] Methods determine_num_available_bl
 DEBUG 10-17 09:29:43 [distributed/device_communicators/shm_broadcast.py:313] Connecting to ipc:///tmp/5a0303da-8f15-446b-8063-9e335df95ad3
 DEBUG 10-17 09:29:43 [distributed/device_communicators/shm_broadcast.py:243] Binding to ipc:///tmp/92752e52-a156-4e4d-88d8-4782d49dc120
 INFO 10-17 09:29:43 [distributed/device_communicators/shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_fee90b14'), local_subscribe_addr='ipc:///tmp/92752e52-a156-4e4d-88d8-4782d49dc120', remote_subscribe_addr=None, remote_addr_ipv6=False)
-W1017 09:29:43.931000 1503 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+W1017 09:29:43.931000 1503 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation.
 W1017 09:29:43.931000 1503 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
 DEBUG 10-17 09:29:44 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama.LlamaModel'>: ['input_ids', 'positions', 'intermediate_tensors', 'inputs_embeds']
 DEBUG 10-17 09:29:44 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama_eagle3.LlamaModel'>: ['input_ids', 'positions', 'hidden_states']
@@ -449,7 +449,7 @@ DEBUG 10-17 09:29:44 [utils/__init__.py:3188] Methods determine_num_available_bl
 DEBUG 10-17 09:29:44 [distributed/device_communicators/shm_broadcast.py:313] Connecting to ipc:///tmp/47cb6e96-349e-4ea8-b6bf-4f69845f4808
 DEBUG 10-17 09:29:44 [distributed/device_communicators/shm_broadcast.py:243] Binding to ipc:///tmp/6fd662e0-cddf-407b-a62d-072b8ee3ce92
 INFO 10-17 09:29:44 [distributed/device_communicators/shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_b863392f'), local_subscribe_addr='ipc:///tmp/6fd662e0-cddf-407b-a62d-072b8ee3ce92', remote_subscribe_addr=None, remote_addr_ipv6=False)
-W1017 09:29:44.668000 1498 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+W1017 09:29:44.668000 1498 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation.
 W1017 09:29:44.668000 1498 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
 DEBUG 10-17 09:29:44 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama.LlamaModel'>: ['input_ids', 'positions', 'intermediate_tensors', 'inputs_embeds']
 DEBUG 10-17 09:29:44 [compilation/decorators.py:155] Inferred dynamic dimensions for forward method of <class 'vllm.model_executor.models.llama_eagle3.LlamaModel'>: ['input_ids', 'positions', 'hidden_states']
@@ -1356,7 +1356,7 @@ DEBUG 10-17 09:31:02 [v1/sample/logits_processor/__init__.py:57] No logitsprocs 
 [1;36m(EngineCore_DP4 pid=276)[0;0m   File "<string>", line 1, in <lambda>
 [1;36m(EngineCore_DP4 pid=276)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py", line 679, in signal_handler
 [1;36m(EngineCore_DP4 pid=276)[0;0m     raise SystemExit()
-[1;36m(EngineCore_DP4 pid=276)[0;0m SystemExit: 
+[1;36m(EngineCore_DP4 pid=276)[0;0m SystemExit:
 [1;36m(EngineCore_DP7 pid=279)[0;0m DEBUG 10-17 09:31:07 [v1/engine/core.py:704] EngineCore exiting.
 [1;36m(APIServer pid=1)[0;0m Traceback (most recent call last):
 [1;36m(APIServer pid=1)[0;0m   File "/usr/local/bin/vllm", line 10, in <module>

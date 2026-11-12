@@ -1,13 +1,21 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
 use super::dp_utils;
-use super::pd_types::PDRouterError;
-use crate::core::{
-    BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig, Worker, WorkerFactory,
-    WorkerRegistry, WorkerType,
+use super::pd_kv_state::PdKvState;
+use super::pd_types::{
+    Loads, PDRouterError, PdAttempt, PdEndpoint, PdLoadManager, PdPrefillInput, PdRequestContext,
+    PdSelection, Stage, StageDecision,
 };
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs, HttpTokenInput};
+use crate::core::worker::WorkerMetadata;
+use crate::core::{
+    BasicWorker, CircuitBreaker, CircuitBreakerConfig, ConnectionMode, DPAwareWorker, HealthConfig,
+    Worker, WorkerRegistry, WorkerResult, WorkerType,
+};
+use crate::policies::WorkerTokenInputs;
+use crate::policies::{kv_aware_ops, LoadBalancingPolicy, PolicyRegistry};
 use crate::routers::header_utils;
+use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
@@ -17,26 +25,742 @@ use axum::{
 };
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+/// Whether a decode policy can be re-run at dispatch and still produce a
+/// meaningful answer.
+///
+/// The policy owns the answer — kv_aware reads live occupancy, KV events and
+/// affinity; cache_aware re-runs from the prepared prefix selection the caller
+/// carries into the commitment — so this router-side helper only forwards the
+/// one input the policy cannot see.
+fn decode_policy_can_defer(
+    policy: &dyn LoadBalancingPolicy,
+    context: &PdRequestContext<'_>,
+) -> bool {
+    policy.can_redecide_at_dispatch(context.decode_cache.is_some())
+}
+
+/// Stage eligibility shared by admission and the deferred commitment.
+///
+/// Admission must not switch an endpoint between aggregate and per-rank
+/// accounting while requests are live, so existing granularities are indexed
+/// once instead of rescanning every load key for every candidate. Both entry
+/// points filter through this type, so the two cannot drift apart.
+struct Eligibility<'a, 'b> {
+    active_granularities: HashSet<(Stage, &'a str, bool)>,
+    context: &'a PdRequestContext<'b>,
+}
+
+impl<'a, 'b> Eligibility<'a, 'b> {
+    fn new(loads: &'a Loads, context: &'a PdRequestContext<'b>) -> Self {
+        let active_granularities = loads
+            .keys()
+            .map(|(stage, endpoint)| {
+                (
+                    *stage,
+                    endpoint.http_url.as_str(),
+                    endpoint.dp_rank.is_some(),
+                )
+            })
+            .collect();
+        Self {
+            active_granularities,
+            context,
+        }
+    }
+
+    fn is_eligible(&self, stage: Stage, worker: &dyn Worker, endpoint: &PdEndpoint) -> bool {
+        let granularity_matches = !self.active_granularities.contains(&(
+            stage,
+            endpoint.http_url.as_str(),
+            endpoint.dp_rank.is_none(),
+        ));
+        worker.is_available()
+            && granularity_matches
+            && self
+                .context
+                .model_id
+                .is_none_or(|model| worker.model_id() == "unknown" || worker.model_id() == model)
+    }
+
+    /// Eligible worker indices for `stage`, with their endpoints in pool order.
+    fn pool(&self, stage: Stage, workers: &[Arc<dyn Worker>]) -> (Vec<PdEndpoint>, Vec<usize>) {
+        let endpoints: Vec<_> = workers
+            .iter()
+            .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
+            .collect();
+        let indices = workers
+            .iter()
+            .zip(&endpoints)
+            .enumerate()
+            .filter(|(_, (worker, endpoint))| self.is_eligible(stage, worker.as_ref(), endpoint))
+            .map(|(index, _)| index)
+            .collect();
+        (endpoints, indices)
+    }
+}
+
+/// Admission decision over the supplied load snapshot. Legacy policies
+/// retain their own selection semantics and text/header inputs.
+pub(super) fn select_pd_pair(
+    loads: &Loads,
+    prefill_workers: &[Arc<dyn Worker>],
+    decode_workers: &[Arc<dyn Worker>],
+    prefill_policy: &dyn LoadBalancingPolicy,
+    decode_policy: &dyn LoadBalancingPolicy,
+    context: &PdRequestContext<'_>,
+    bind_decode: bool,
+) -> Option<PdSelection> {
+    let eligibility = Eligibility::new(loads, context);
+    let (prefill_endpoints, prefill_indices) = eligibility.pool(Stage::Prefill, prefill_workers);
+    let (decode_endpoints, decode_indices) = eligibility.pool(Stage::Decode, decode_workers);
+    if prefill_indices.is_empty() || decode_indices.is_empty() {
+        return None;
+    }
+    let prefill = select_stage(
+        loads,
+        Stage::Prefill,
+        prefill_workers,
+        &prefill_endpoints,
+        &prefill_indices,
+        prefill_policy,
+        context,
+    )?;
+    let decode = if bind_decode {
+        select_stage(
+            loads,
+            Stage::Decode,
+            decode_workers,
+            &decode_endpoints,
+            &decode_indices,
+            decode_policy,
+            context,
+        )?
+    } else {
+        // The deferred pickup is provisional: it only seeds the request identity
+        // and the Prefill KV parameters. Scoring it through the policy would
+        // consume the decode tie cursor, so the commitment - which advances the
+        // cursor itself - would start one tick late and break the tie rotation.
+        provisional_decode(loads, &decode_endpoints, &decode_indices)?
+    };
+
+    Some(PdSelection { prefill, decode })
+}
+
+/// Deterministic stand-in for a decode decision that will be taken later.
+///
+/// Uses the lowest projected occupancy, first index on a tie, and consults no
+/// policy state, so a pick that may be discarded cannot bias later decisions.
+fn provisional_decode(
+    loads: &Loads,
+    endpoints: &[PdEndpoint],
+    indices: &[usize],
+) -> Option<StageDecision> {
+    let (worker_index, endpoint) = indices
+        .iter()
+        .map(|&index| (index, endpoints[index].clone()))
+        .min_by_key(|(_, endpoint)| {
+            loads
+                .get(&(Stage::Decode, endpoint.clone()))
+                .copied()
+                .unwrap_or_default()
+                .occupancy(Stage::Decode)
+        })?;
+    Some(StageDecision {
+        fallback_reason: None,
+        credited_prefix_tokens: None,
+        worker_index,
+        endpoint,
+        score: None,
+        new_prefill_tokens: None,
+        affinity_outcome: None,
+        affinity: None,
+    })
+}
+
+/// Re-select the decode stage against a live load snapshot.
+///
+/// Used by the deferred commitment: the request has already been admitted for
+/// Prefill, and the decode target is chosen when the decode request is about to
+/// be sent.
+pub(super) fn select_decode_stage(
+    loads: &Loads,
+    decode_workers: &[Arc<dyn Worker>],
+    decode_policy: &dyn LoadBalancingPolicy,
+    context: &PdRequestContext<'_>,
+) -> Option<StageDecision> {
+    let (endpoints, indices) = Eligibility::new(loads, context).pool(Stage::Decode, decode_workers);
+    if indices.is_empty() {
+        return None;
+    }
+    select_stage(
+        loads,
+        Stage::Decode,
+        decode_workers,
+        &endpoints,
+        &indices,
+        decode_policy,
+        context,
+    )
+}
+
+fn select_stage(
+    loads: &Loads,
+    stage: Stage,
+    workers: &[Arc<dyn Worker>],
+    endpoints: &[PdEndpoint],
+    indices: &[usize],
+    policy: &dyn LoadBalancingPolicy,
+    context: &PdRequestContext<'_>,
+) -> Option<StageDecision> {
+    let policy_input = context.legacy_policy_input;
+    let kv_aware = kv_aware_ops(policy).is_some();
+    // Keep the caller slice order. Static pools pass registry registration
+    // order, which is the --prefill / --decode order. Sorting by endpoint URL
+    // made round-robin follow port text instead of that order.
+    let selected_indices = indices.to_vec();
+    let projected: Vec<Arc<dyn Worker>> = selected_indices
+        .iter()
+        .map(|&index| {
+            let inner = workers[index].clone();
+            let endpoint = endpoints[index].clone();
+            let load = loads
+                .get(&(stage, endpoint))
+                .copied()
+                .unwrap_or_default()
+                .occupancy(stage);
+            Arc::new(PolicyWorker { inner, load }) as Arc<dyn Worker>
+        })
+        .collect();
+    let unknown_backlog = stage == Stage::Prefill
+        && selected_indices.iter().any(|&index| {
+            loads
+                .get(&(stage, endpoints[index].clone()))
+                .is_some_and(|load| load.unknown_prefill_requests > 0)
+        });
+    if let (Stage::Prefill, Some(kv), false) = (stage, kv_aware_ops(policy), unknown_backlog) {
+        let inputs: Option<Vec<_>> = projected
+            .iter()
+            .map(|worker| {
+                let input = context.prefill_inputs?.get(worker.base_url())?;
+                Some((
+                    input,
+                    input.prompts.as_deref()?,
+                    *input.work_by_rank.get(&worker.dp_rank())?,
+                ))
+            })
+            .collect();
+        // Token costs and request counts have different units. If any
+        // eligible P has unknown work, compare the whole pool by occupancy.
+        if let Some(inputs) = inputs {
+            let work: Vec<_> = inputs.iter().map(|(_, _, work)| *work).collect();
+            let costs: Vec<_> = selected_indices
+                .iter()
+                .zip(&work)
+                .map(|(&index, work)| {
+                    loads
+                        .get(&(stage, endpoints[index].clone()))
+                        .copied()
+                        .unwrap_or_default()
+                        .active_prefill_tokens
+                        .saturating_add(work.new_prefill_tokens) as f64
+                })
+                .collect();
+            let occupancy: Vec<_> = projected.iter().map(|worker| worker.load()).collect();
+            debug!(version = 1, stage = "prefill", endpoints = ?selected_indices.iter()
+                .map(|&index| &endpoints[index]).collect::<Vec<_>>(), ?costs, ?occupancy,
+                remaining_work = ?work, "P/D token-cost candidates");
+            // P follows actual token work across the full eligible pool;
+            // decode session affinity must never filter or pin prefill.
+            if let Some(picked) = kv.pick_prefill(&costs, &occupancy) {
+                let (input, tokens, _) = inputs[picked];
+                let estimate = work[picked];
+                let new_tokens = estimate.new_prefill_tokens;
+                let outcome = if !estimate.placement_verified {
+                    "unverified_identity"
+                } else {
+                    "prefix_cost"
+                };
+                crate::metrics::RouterMetrics::record_prefix_routing_decision(
+                    "kv_aware", "prefill", outcome,
+                );
+                return Some(StageDecision {
+                    worker_index: selected_indices[picked],
+                    endpoint: endpoints[selected_indices[picked]].clone(),
+                    score: Some(costs[picked]),
+                    new_prefill_tokens: Some(new_tokens),
+                    credited_prefix_tokens: Some(
+                        tokens
+                            .iter()
+                            .map(|ids| ids.len() as u64)
+                            .sum::<u64>()
+                            .saturating_sub(new_tokens),
+                    ),
+                    fallback_reason: input
+                        .fallback_reason
+                        .or((!estimate.placement_verified).then_some("unverified_placement")),
+                    affinity_outcome: None,
+                    affinity: None,
+                });
+            }
+            // pick_prefill refused the candidates (non-finite or misaligned
+            // costs): degrade to policy selection, never fail the request.
+            debug!(
+                stage = "prefill",
+                "pick_prefill refused candidates; using policy selection"
+            );
+        }
+    }
+    let (picked, affinity_outcome, affinity_binding) = if stage == Stage::Decode && kv_aware {
+        // Decode never queries placement or applies the P temperature:
+        // deterministic minimum occupancy with rotating equal-load ties, and
+        // the optional decode session binding on top.
+        let kv = kv_aware_ops(policy)?;
+        let pick = kv.select_decode(
+            &projected,
+            context.affinity_key.as_ref(),
+            context.lora_name,
+            context.cache_salt,
+        )?;
+        (
+            pick.index,
+            context.affinity_key.is_some().then_some(pick.outcome),
+            pick.binding,
+        )
+    } else if stage == Stage::Prefill && kv_aware {
+        // Unknown token work or refused costs use projected occupancy,
+        // without session binding or a request-count affinity limit on P.
+        // PD admission owns the candidate lifecycle and load snapshot here;
+        // the colocated selector's registration filter can otherwise discard
+        // fresh discovery workers before their background KV binding exists.
+        let picked = projected
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, worker)| worker.load())
+            .map(|(index, _)| index)?;
+        (picked, None, None)
+    } else if let Some(cache) = policy
+        .as_any()
+        .downcast_ref::<crate::policies::CacheAwarePolicy>()
+    {
+        let prepared = if stage == Stage::Prefill {
+            context.prefill_cache
+        } else {
+            context.decode_cache
+        };
+        let picked = cache.select_prepared(
+            &projected,
+            prepared,
+            if stage == Stage::Prefill {
+                "prefill"
+            } else {
+                "decode"
+            },
+        )?;
+        (picked, None, None)
+    } else {
+        let picked =
+            policy.select_worker_with_headers(&projected, policy_input, context.headers)?;
+        (picked, None, None)
+    };
+    if kv_aware {
+        let phase = if stage == Stage::Prefill {
+            "prefill"
+        } else {
+            "decode"
+        };
+        let outcome = if affinity_outcome == Some("sticky_hit") {
+            "sticky_hit"
+        } else if stage == Stage::Prefill {
+            "load_fallback"
+        } else {
+            "occupancy"
+        };
+        crate::metrics::RouterMetrics::record_prefix_routing_decision("kv_aware", phase, outcome);
+    }
+    // A held binding reference must never leak on a late selection failure:
+    // release it before any bail-out below.
+    let Some((&worker_index, worker)) = selected_indices.get(picked).zip(projected.get(picked))
+    else {
+        if let Some(record) = &affinity_binding {
+            record.release_ref();
+        }
+        return None;
+    };
+    let selected_tokens = (stage == Stage::Prefill)
+        .then(|| {
+            context
+                .prefill_inputs
+                .and_then(|inputs| inputs.get(worker.base_url()))
+                .and_then(|input| input.prompts.as_ref())
+                .map(|prompts| prompts.iter().map(|ids| ids.len() as u64).sum())
+        })
+        .flatten();
+    Some(StageDecision {
+        fallback_reason: if stage == Stage::Prefill && kv_aware {
+            Some(if unknown_backlog {
+                "unknown_prefill_backlog"
+            } else {
+                projected
+                    .iter()
+                    .find_map(|worker| {
+                        context
+                            .prefill_inputs
+                            .and_then(|inputs| inputs.get(worker.base_url()))
+                            .and_then(|input| input.fallback_reason)
+                    })
+                    .unwrap_or("unverified_effective_tokens")
+            })
+        } else {
+            None
+        },
+        credited_prefix_tokens: selected_tokens.map(|_| 0),
+        worker_index,
+        endpoint: endpoints[worker_index].clone(),
+        // Unknown P token work falls back to occupancy; D includes the
+        // incoming request, which does not change candidate ranking.
+        score: kv_aware.then_some(match stage {
+            Stage::Prefill => worker.load() as f64,
+            Stage::Decode => (worker.load() + 1) as f64,
+        }),
+        new_prefill_tokens: selected_tokens,
+        affinity_outcome,
+        affinity: affinity_binding,
+    })
+}
+
+/// Selection-only view: load is an immutable sample from the admission lock.
+/// Worker identity, availability, metadata and policy inputs are preserved.
+#[derive(Debug)]
+struct PolicyWorker {
+    inner: Arc<dyn Worker>,
+    load: usize,
+}
+
+#[async_trait]
+impl Worker for PolicyWorker {
+    fn url(&self) -> &str {
+        self.inner.url()
+    }
+    fn worker_type(&self) -> WorkerType {
+        self.inner.worker_type()
+    }
+    fn connection_mode(&self) -> ConnectionMode {
+        self.inner.connection_mode()
+    }
+    fn is_healthy(&self) -> bool {
+        self.inner.is_healthy()
+    }
+    fn set_healthy(&self, healthy: bool) {
+        self.inner.set_healthy(healthy);
+    }
+    async fn check_health_async(&self) -> WorkerResult<()> {
+        self.inner.check_health_async().await
+    }
+    fn load(&self) -> usize {
+        self.load
+    }
+    fn increment_load(&self) {
+        self.inner.increment_load();
+    }
+    fn decrement_load(&self) {
+        self.inner.decrement_load();
+    }
+    fn processed_requests(&self) -> usize {
+        self.inner.processed_requests()
+    }
+    fn increment_processed(&self) {
+        self.inner.increment_processed();
+    }
+    fn metadata(&self) -> &WorkerMetadata {
+        self.inner.metadata()
+    }
+    fn circuit_breaker(&self) -> &CircuitBreaker {
+        self.inner.circuit_breaker()
+    }
+    fn base_url(&self) -> &str {
+        self.inner.base_url()
+    }
+    fn dp_rank(&self) -> Option<usize> {
+        self.inner.dp_rank()
+    }
+    fn dp_size(&self) -> Option<usize> {
+        self.inner.dp_size()
+    }
+    fn is_dp_aware(&self) -> bool {
+        self.inner.is_dp_aware()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PdRouterBase {
+    pub(super) kv_state: Option<Arc<PdKvState>>,
     pub worker_registry: Arc<WorkerRegistry>,
+    pub(super) pd_load: Arc<PdLoadManager>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub worker_startup_timeout_secs: u64,
     pub worker_startup_check_interval_secs: u64,
     pub worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub client: Client,
+    api_key: Option<String>,
     pub circuit_breaker_config: CircuitBreakerConfig,
-    // Intra-node data parallel size for creating DPAwareWorker in add_*_server()
+    // Fallback DP size for servers that report no engine metrics
     pub dp_size: usize,
 }
 
+/// Build the workers backing one server URL, one per engine the server fronts.
+fn build_dp_workers(
+    url: &str,
+    dp_size: usize,
+    worker_type: WorkerType,
+    circuit_breaker_config: &CircuitBreakerConfig,
+    health_config: Option<&HealthConfig>,
+) -> Result<Vec<Arc<dyn Worker>>, String> {
+    let (base_url, _) = dp_utils::parse_worker_url(url);
+
+    // DPAwareWorker strips the @rank suffix in endpoint_url(), preventing
+    // IPv6+DP URL corruption where HTTP clients read @N as userinfo (RFC 3986).
+    let dp_worker = |rank: usize| -> Arc<dyn Worker> {
+        let worker = DPAwareWorker::new(base_url.clone(), rank, dp_size, worker_type.clone())
+            .with_circuit_breaker_config(circuit_breaker_config.clone());
+        let worker = match health_config {
+            Some(config) => worker.with_health_config(config.clone()),
+            None => worker,
+        };
+        Arc::new(worker)
+    };
+
+    Ok(dp_utils::expand_dp_ranks(url, dp_size)?
+        .into_iter()
+        .map(|rank| match rank {
+            Some(rank) => dp_worker(rank),
+            None => {
+                let worker = BasicWorker::new(url.to_string(), worker_type.clone())
+                    .with_dp_size(dp_size)
+                    .with_circuit_breaker_config(circuit_breaker_config.clone());
+                let worker = match health_config {
+                    Some(config) => worker.with_health_config(config.clone()),
+                    None => worker,
+                };
+                Arc::new(worker) as Arc<dyn Worker>
+            }
+        })
+        .collect())
+}
+
 impl PdRouterBase {
+    /// `router_prompts` are the router's token ids for `grpc://` pools. HTTP
+    /// pools pass `None` and each backend renders the request itself.
+    pub(super) async fn prepare_prefill_inputs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
+    ) -> Option<HashMap<String, super::pd_types::PdPrefillInput>> {
+        let policy = self.policy_registry.get_prefill_policy();
+        if kv_aware_ops(policy.as_ref()).is_some() {
+            return Some(
+                self.kv_state
+                    .as_ref()?
+                    .prepare(workers, &policy, request, route, headers, router_prompts)
+                    .await,
+            );
+        }
+        if policy.name() != "cache_aware" {
+            return None;
+        }
+        let results = self
+            .token_inputs(workers, request, route, headers, router_prompts)
+            .await;
+        Some(
+            results
+                .into_iter()
+                .map(|(base, result)| {
+                    let (prompts, reason) = match result {
+                        Ok(input) => (Some(input.prompts), None),
+                        Err(reason) => (None, Some(reason)),
+                    };
+                    (
+                        base,
+                        PdPrefillInput {
+                            prompts,
+                            work_by_rank: HashMap::new(),
+                            allow_credit: false,
+                            fallback_reason: reason,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    pub(super) async fn prepare_decode_inputs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
+    ) -> Option<WorkerTokenInputs> {
+        if self.policy_registry.get_decode_policy().name() != "cache_aware" {
+            return None;
+        }
+        let results = self
+            .token_inputs(workers, request, route, headers, router_prompts)
+            .await;
+        Some(
+            results
+                .into_iter()
+                .filter_map(|(base, result)| match result {
+                    Ok(input) => Some((base, input.prompts)),
+                    Err(reason) => {
+                        crate::metrics::RouterMetrics::record_kv_routing_input("pd_decode", reason);
+                        None
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    async fn token_inputs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
+    ) -> HashMap<String, Result<HttpTokenInput, &'static str>> {
+        let bases = workers
+            .iter()
+            .map(|worker| worker.base_url().to_owned())
+            .collect::<Vec<_>>();
+        match router_prompts {
+            Some(prompts) => router_token_inputs(bases, request, prompts),
+            None => {
+                prepare_http_token_inputs(
+                    &self.client,
+                    bases,
+                    request,
+                    route,
+                    headers,
+                    self.api_key.as_deref(),
+                    Duration::from_secs(1),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Shared entry point for static and discovered P/D pools. Selection and
+    /// reservation are synchronous; no network work runs under admission.
+    pub(super) fn select_and_admit(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+        context: &PdRequestContext<'_>,
+    ) -> Option<(PdSelection, PdAttempt)> {
+        self.select_and_admit_with(prefill_workers, decode_workers, context, false)
+    }
+
+    /// Admission with a deferred decode commitment.
+    ///
+    /// `defer_decode` says the deployment can defer (see
+    /// `VllmPDRouter::decode_commit_can_defer`); the policy then decides whether
+    /// a dispatch-time re-selection is still meaningful. kv_aware reads live
+    /// occupancy and affinity, and cache_aware re-runs from the prepared prefix
+    /// selection, so both can decide at dispatch without re-rendering token
+    /// inputs. Policies that need the admission-time request text keep the
+    /// commitment they made.
+    pub(super) fn select_and_admit_with(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+        context: &PdRequestContext<'_>,
+        defer_decode: bool,
+    ) -> Option<(PdSelection, PdAttempt)> {
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+        let defer = defer_decode && decode_policy_can_defer(decode_policy.as_ref(), context);
+        let select = |loads: &Loads| {
+            if let Some(kv) =
+                kv_aware_ops(decode_policy.as_ref()).filter(|kv| kv.session_affinity_enabled())
+            {
+                kv.reconcile_decode_workers(decode_workers);
+            }
+            select_pd_pair(
+                loads,
+                prefill_workers,
+                decode_workers,
+                prefill_policy.as_ref(),
+                decode_policy.as_ref(),
+                context,
+                !defer,
+            )
+        };
+        let admitted = if defer {
+            self.pd_load.admit_deferred(select)
+        } else {
+            self.pd_load.admit(select)
+        };
+        if let Some((selection, attempt)) = &admitted {
+            let deferred = attempt.decode_pending_commit();
+            if kv_aware_ops(prefill_policy.as_ref()).is_some() {
+                crate::metrics::RouterMetrics::record_pd_kv_decision(
+                    selection.prefill.new_prefill_tokens,
+                    selection.prefill.credited_prefix_tokens,
+                    selection.prefill.fallback_reason,
+                );
+            }
+            // A deferred decode decision is provisional, so its affinity
+            // outcome is recorded by the commit, not here.
+            if !deferred {
+                if let Some(outcome) = selection.decode.affinity_outcome {
+                    crate::metrics::RouterMetrics::record_pd_affinity_decision("decode", outcome);
+                }
+            }
+            // Selection indices come from these same slices, so the lookups
+            // cannot fail today. If future filtering ever makes them fail,
+            // still return the admitted attempt: bailing out here would
+            // silently 503 a request whose occupancy was already reserved.
+            // The per-worker counters are best-effort (pd_load is the
+            // accounting of record); discovery pools rebuild their workers
+            // per request, so for them the counters are write-only until
+            // those workers are persisted.
+            if let Some(prefill_worker) = prefill_workers.get(selection.prefill.worker_index) {
+                if deferred {
+                    attempt.attach_prefill_worker(prefill_worker.clone());
+                } else if let Some(decode_worker) =
+                    decode_workers.get(selection.decode.worker_index)
+                {
+                    attempt.attach_workers(prefill_worker.clone(), decode_worker.clone());
+                }
+            }
+            debug!(
+                version = 1,
+                route = context.route,
+                prefill_policy = prefill_policy.name(),
+                decode_policy = decode_policy.name(),
+                decode_deferred = deferred,
+                fallback = ?selection.prefill.fallback_reason,
+                new_prefill_tokens = ?selection.prefill.new_prefill_tokens,
+                credited_prefix_tokens = ?selection.prefill.credited_prefix_tokens,
+                prefill_score = ?selection.prefill.score,
+                decode_score = ?selection.decode.score,
+                decode_sticky = ?selection.decode.fallback_reason,
+                ?selection,
+                "P/D admission"
+            );
+        }
+        admitted
+    }
+
     // Private helper method to perform health check on a new server
     async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
         crate::routers::http::router::Router::wait_for_healthy_workers(
@@ -235,125 +959,51 @@ impl PdRouterBase {
         url: String,
         bootstrap_port: Option<u16>,
     ) -> Result<String, PDRouterError> {
-        // Wait for the new server to be healthy
-        self.wait_for_server_health(&url).await?;
-
-        let worker_type = WorkerType::Prefill { bootstrap_port };
-
-        if self.dp_size > 1 {
-            let (_base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-            if dp_rank.is_some() {
-                // URL already has @rank suffix (e.g., from direct URL mode).
-                // Create a single DPAwareWorker. DPAwareWorker strips the @rank
-                // suffix in endpoint_url(), preventing IPv6+DP URL corruption
-                // where HTTP clients interpret @N as a userinfo separator per RFC 3986.
-                if self.worker_registry.get_by_url(&url).is_some() {
-                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
-                }
-                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-                let worker_arc: Arc<dyn Worker> = Arc::new(
-                    DPAwareWorker::new(base_url, dp_rank.unwrap_or(0), self.dp_size, worker_type)
-                        .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
-                );
-                self.register_and_notify(worker_arc);
-                info!("Added prefill server: {}", url);
-            } else {
-                // Bare URL without @rank (e.g., from K8s service discovery).
-                // Expand into dp_size workers, one per DP rank, matching the
-                // expansion logic in router.rs::add_worker() and PdRouterBase::new().
-                // Without this, all traffic pins to rank 0 via unwrap_or(0),
-                // bypassing vLLM's hybrid load balancer.
-                let first_dp_url = format!("{}@0", url);
-                if self.worker_registry.get_by_url(&first_dp_url).is_some() {
-                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
-                }
-                for rank in 0..self.dp_size {
-                    let dp_url = format!("{}@{}", url, rank);
-                    let worker_arc: Arc<dyn Worker> = Arc::new(
-                        DPAwareWorker::new(url.clone(), rank, self.dp_size, worker_type.clone())
-                            .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
-                    );
-                    self.register_and_notify(worker_arc);
-                    info!("Added prefill server: {} (rank {})", dp_url, rank);
-                }
-                info!(
-                    "Expanded prefill server {} into {} DP-aware workers",
-                    url, self.dp_size
-                );
-            }
-        } else {
-            // dp_size == 1: no DP-aware routing, use BasicWorker
-            if self.worker_registry.get_by_url(&url).is_some() {
-                return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
-            }
-            let worker_arc: Arc<dyn Worker> = Arc::from(WorkerFactory::create_prefill_with_config(
-                url.clone(),
-                bootstrap_port,
-                self.circuit_breaker_config.clone(),
-            ));
-            self.register_and_notify(worker_arc);
-            info!("Added prefill server: {}", url);
-        }
-
-        Ok(format!("Successfully added prefill server: {}", url))
+        self.add_server(url, "prefill", WorkerType::Prefill { bootstrap_port })
+            .await
     }
 
     pub async fn add_decode_server(&self, url: String) -> Result<String, PDRouterError> {
+        self.add_server(url, "decode", WorkerType::Decode).await
+    }
+
+    async fn add_server(
+        &self,
+        url: String,
+        role: &str,
+        worker_type: WorkerType,
+    ) -> Result<String, PDRouterError> {
         // Wait for the new server to be healthy
         self.wait_for_server_health(&url).await?;
 
-        if self.dp_size > 1 {
-            let (_base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-            if dp_rank.is_some() {
-                // URL already has @rank suffix — single DPAwareWorker
-                if self.worker_registry.get_by_url(&url).is_some() {
-                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
-                }
-                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-                let worker_arc: Arc<dyn Worker> = Arc::new(
-                    DPAwareWorker::new(
-                        base_url,
-                        dp_rank.unwrap_or(0),
-                        self.dp_size,
-                        WorkerType::Decode,
-                    )
-                    .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
-                );
-                self.register_and_notify(worker_arc);
-                info!("Added decode server: {}", url);
-            } else {
-                // Bare URL — expand into dp_size workers (same as add_prefill_server)
-                let first_dp_url = format!("{}@0", url);
-                if self.worker_registry.get_by_url(&first_dp_url).is_some() {
-                    return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
-                }
-                for rank in 0..self.dp_size {
-                    let dp_url = format!("{}@{}", url, rank);
-                    let worker_arc: Arc<dyn Worker> = Arc::new(
-                        DPAwareWorker::new(url.clone(), rank, self.dp_size, WorkerType::Decode)
-                            .with_circuit_breaker_config(self.circuit_breaker_config.clone()),
-                    );
-                    self.register_and_notify(worker_arc);
-                    info!("Added decode server: {} (rank {})", dp_url, rank);
-                }
-                info!(
-                    "Expanded decode server {} into {} DP-aware workers",
-                    url, self.dp_size
-                );
-            }
-        } else {
-            if self.worker_registry.get_by_url(&url).is_some() {
-                return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
-            }
-            let worker_arc: Arc<dyn Worker> = Arc::from(WorkerFactory::create_decode_with_config(
-                url.clone(),
-                self.circuit_breaker_config.clone(),
-            ));
-            self.register_and_notify(worker_arc);
-            info!("Added decode server: {}", url);
+        let dp_size = dp_utils::discover_dp_size(&self.client, &url, self.dp_size).await;
+        let workers = build_dp_workers(
+            &url,
+            dp_size,
+            worker_type,
+            &self.circuit_breaker_config,
+            None,
+        )
+        .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
+
+        if workers
+            .iter()
+            .any(|worker| self.worker_registry.get_by_url(worker.url()).is_some())
+        {
+            return Err(PDRouterError::WorkerAlreadyExists { url });
         }
 
-        Ok(format!("Successfully added decode server: {}", url))
+        info!(
+            "Added {} server {} as {} worker(s)",
+            role,
+            url,
+            workers.len()
+        );
+        for worker in workers {
+            self.register_and_notify(worker);
+        }
+
+        Ok(format!("Successfully added {} server: {}", role, url))
     }
 
     /// Register a worker and notify the policy registry.
@@ -373,10 +1023,8 @@ impl PdRouterBase {
     }
 
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
-        if self.dp_size > 1 && !url.contains('@') {
-            // Bare URL: remove all DP-expanded workers by prefix match,
-            // mirroring the expansion in add_prefill_server and the
-            // prefix-match removal in router.rs::remove_worker().
+        // A bare URL that is not registered as-is was expanded per DP rank.
+        if !url.contains('@') && self.worker_registry.get_by_url(url).is_none() {
             return self.remove_dp_expanded_workers(url, "prefill");
         }
 
@@ -417,7 +1065,7 @@ impl PdRouterBase {
     }
 
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
-        if self.dp_size > 1 && !url.contains('@') {
+        if !url.contains('@') && self.worker_registry.get_by_url(url).is_none() {
             return self.remove_dp_expanded_workers(url, "decode");
         }
 
@@ -433,6 +1081,9 @@ impl PdRouterBase {
         let removed = self.worker_registry.remove_by_url(url);
 
         if removed.is_some() {
+            if let Some(kv) = kv_aware_ops(self.policy_registry.get_decode_policy().as_ref()) {
+                kv.unregister_worker(url);
+            }
             // Notify PolicyRegistry about the removed worker
             self.policy_registry.on_worker_removed(&model_id);
 
@@ -470,6 +1121,13 @@ impl PdRouterBase {
             if w.url().starts_with(&prefix) {
                 let model_id = w.model_id().to_string();
                 if self.worker_registry.remove_by_url(w.url()).is_some() {
+                    if role == "decode" {
+                        if let Some(kv) =
+                            kv_aware_ops(self.policy_registry.get_decode_policy().as_ref())
+                        {
+                            kv.unregister_worker(w.url());
+                        }
+                    }
                     self.policy_registry.on_worker_removed(&model_id);
                     if let Some(policy) = self.policy_registry.get_policy(&model_id) {
                         if policy.name() == "cache_aware" {
@@ -501,7 +1159,6 @@ impl PdRouterBase {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
@@ -516,68 +1173,21 @@ impl PdRouterBase {
             window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
-        // Automatically expand to DP-aware format when intra_node_data_parallel_size > 1
-        // This creates multiple worker URLs with @rank suffixes (e.g., "http://host:8000@0", "@1", etc.)
-        // without querying the workers. The router will add X-data-parallel-rank headers to route to specific ranks.
-        let (expanded_prefill_urls, expanded_decode_urls) =
-            if ctx.router_config.intra_node_data_parallel_size > 1 {
-                info!(
-                "DP-aware mode enabled (intra_node_data_parallel_size={}), expanding worker URLs",
-                ctx.router_config.intra_node_data_parallel_size
-            );
-
-                // Extract base URLs from prefill_urls (url, port) tuples
-                let prefill_base_urls: Vec<String> =
-                    prefill_urls.iter().map(|(url, _)| url.clone()).collect();
-
-                // Expand prefill URLs with DP ranks (0..intra_node_data_parallel_size-1)
-                let expanded_prefill = super::dp_utils::get_dp_aware_workers(
-                    &prefill_base_urls,
-                    &ctx.router_config.api_key,
-                    ctx.router_config.intra_node_data_parallel_size,
+        // Workers must be up before they can report their engine count.
+        let prefill_base_urls: Vec<String> =
+            prefill_urls.iter().map(|(url, _)| url.clone()).collect();
+        for urls in [&prefill_base_urls, &decode_urls] {
+            if !urls.is_empty() {
+                crate::routers::http::router::Router::wait_for_healthy_workers(
+                    urls,
+                    ctx.router_config.worker_startup_timeout_secs,
+                    ctx.router_config.worker_startup_check_interval_secs,
                 )
-                .await
-                .map_err(|e| format!("Failed to expand prefill workers: {}", e))?;
+                .await?;
+            }
+        }
 
-                // Expand decode URLs with DP ranks (0..intra_node_data_parallel_size-1)
-                let expanded_decode = super::dp_utils::get_dp_aware_workers(
-                    &decode_urls,
-                    &ctx.router_config.api_key,
-                    ctx.router_config.intra_node_data_parallel_size,
-                )
-                .await
-                .map_err(|e| format!("Failed to expand decode workers: {}", e))?;
-
-                info!(
-                    "Expanded {} prefill URLs to {} DP-aware URLs",
-                    prefill_base_urls.len(),
-                    expanded_prefill.len()
-                );
-                info!(
-                    "Expanded {} decode URLs to {} DP-aware URLs",
-                    decode_urls.len(),
-                    expanded_decode.len()
-                );
-
-                // Keep the bootstrap_port from the original URLs, apply to all expanded URLs
-                let prefill_with_ports: Vec<(String, Option<u16>)> = expanded_prefill
-                    .into_iter()
-                    .map(|url| {
-                        // Use the port from the first original URL (all DP replicas share the same port config)
-                        let port = prefill_urls.first().and_then(|(_, p)| *p);
-                        (url, port)
-                    })
-                    .collect();
-
-                (prefill_with_ports, expanded_decode)
-            } else {
-                info!("DP-aware mode disabled, using original worker URLs");
-                (prefill_urls, decode_urls)
-            };
-
-        let mut prefill_workers_urls = vec![];
-        let mut decode_workers_urls = vec![];
-        let dp_size = ctx.router_config.intra_node_data_parallel_size;
+        let fallback_dp_size = ctx.router_config.intra_node_data_parallel_size.max(1);
         let health_config = HealthConfig {
             timeout_secs: ctx.router_config.health_check.timeout_secs,
             check_interval_secs: ctx.router_config.health_check.check_interval_secs,
@@ -586,73 +1196,44 @@ impl PdRouterBase {
             success_threshold: ctx.router_config.health_check.success_threshold,
         };
 
-        // Register prefill workers in the registry
-        for (url, port) in expanded_prefill_urls {
-            prefill_workers_urls.push(url.clone());
-            let worker_type = WorkerType::Prefill {
-                bootstrap_port: port,
-            };
-            let worker: Arc<dyn Worker> = if dp_size > 1 {
-                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-                Arc::new(
-                    DPAwareWorker::new(base_url, dp_rank.unwrap_or(0), dp_size, worker_type)
-                        .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(health_config.clone()),
-                )
-            } else {
-                Arc::new(
-                    BasicWorker::new(url, worker_type)
-                        .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(health_config.clone()),
-                )
-            };
-            ctx.worker_registry.register(worker);
+        let prefill_workers = prefill_urls.iter().map(|(url, bootstrap_port)| {
+            (
+                url,
+                WorkerType::Prefill {
+                    bootstrap_port: *bootstrap_port,
+                },
+            )
+        });
+        let decode_workers = decode_urls.iter().map(|url| (url, WorkerType::Decode));
+        for (url, worker_type) in prefill_workers.chain(decode_workers) {
+            let dp_size = dp_utils::discover_dp_size(&ctx.client, url, fallback_dp_size).await;
+            for worker in build_dp_workers(
+                url,
+                dp_size,
+                worker_type,
+                &core_cb_config,
+                Some(&health_config),
+            )? {
+                ctx.worker_registry.register(worker);
+            }
         }
 
-        // Register decode workers in the registry
-        for url in expanded_decode_urls {
-            decode_workers_urls.push(url.clone());
-            let worker: Arc<dyn Worker> = if dp_size > 1 {
-                let (base_url, dp_rank) = dp_utils::parse_worker_url(&url);
-                Arc::new(
-                    DPAwareWorker::new(base_url, dp_rank.unwrap_or(0), dp_size, WorkerType::Decode)
-                        .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(health_config.clone()),
-                )
-            } else {
-                Arc::new(
-                    BasicWorker::new(url, WorkerType::Decode)
-                        .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(health_config.clone()),
-                )
-            };
-            ctx.worker_registry.register(worker);
+        if let Some(config) = &ctx.router_config.epd {
+            super::epd::EncoderStage::validate_consumers(
+                config,
+                ctx.worker_registry
+                    .get_prefill_workers()
+                    .iter()
+                    .map(|worker| worker.url()),
+            )?;
         }
 
-        // Get all workers from registry for health check
+        // Get all workers from registry for load monitoring
         let all_workers = ctx.worker_registry.get_all();
         let all_urls: Vec<String> = all_workers
             .iter()
             .map(|worker| worker.url().to_string())
             .collect();
-        // At least one prefill and one decode are up
-        if !prefill_workers_urls.is_empty() {
-            crate::routers::http::router::Router::wait_for_healthy_workers(
-                &prefill_workers_urls,
-                ctx.router_config.worker_startup_timeout_secs,
-                ctx.router_config.worker_startup_check_interval_secs,
-            )
-            .await?;
-        }
-
-        if !decode_workers_urls.is_empty() {
-            crate::routers::http::router::Router::wait_for_healthy_workers(
-                &decode_workers_urls,
-                ctx.router_config.worker_startup_timeout_secs,
-                ctx.router_config.worker_startup_check_interval_secs,
-            )
-            .await?;
-        }
 
         // Initialize cache-aware policies with workers from registry
         // Note: We need to get workers by type and convert to Box<dyn Worker> for CacheAwarePolicy
@@ -669,7 +1250,13 @@ impl PdRouterBase {
 
         let load_monitor_handle =
             if prefill_policy.name() == "power_of_two" || decode_policy.name() == "power_of_two" {
-                let monitor_urls = all_urls.clone();
+                // grpc:// workers serve no HTTP /get_load. A failed probe would
+                // cache load 0 and hide their local in-flight count.
+                let monitor_urls: Vec<String> = all_urls
+                    .iter()
+                    .filter(|url| !crate::backend::is_grpc_url(url))
+                    .cloned()
+                    .collect();
                 let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
                 let monitor_client = ctx.client.clone();
                 let prefill_policy_clone = Arc::clone(&prefill_policy);
@@ -693,7 +1280,23 @@ impl PdRouterBase {
         // Note: Health checking is now handled centrally by RouterManager
         // Individual routers no longer need to manage health checkers
 
+        let kv_state = if kv_aware_ops(prefill_policy.as_ref()).is_some() {
+            Some(
+                PdKvState::start(
+                    ctx.client.clone(),
+                    ctx.router_config.api_key.clone(),
+                    ctx.router_config.pd_kv_event_sources.clone(),
+                    ctx.worker_registry.get_prefill_workers(),
+                    prefill_policy.clone(),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
         Ok(PdRouterBase {
+            kv_state,
+            pd_load: Arc::new(PdLoadManager::default()),
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
             worker_startup_timeout_secs: ctx.router_config.worker_startup_timeout_secs,
@@ -703,104 +1306,10 @@ impl PdRouterBase {
             worker_loads,
             load_monitor_handle,
             client: ctx.client.clone(),
+            api_key: ctx.router_config.api_key.clone(),
             circuit_breaker_config: core_cb_config,
-            dp_size,
+            dp_size: fallback_dp_size,
         })
-    }
-
-    // Select a pair of prefill and decode servers considering circuit breaker state
-    async fn select_pd_pair(
-        &self,
-        request_text: Option<&str>,
-        model_id: Option<&str>,
-    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
-        // Get workers from registry - filter by model if provided
-        let prefill_workers = if let Some(model) = model_id {
-            // Get model-specific workers and filter for prefill type
-            self.worker_registry
-                .get_by_model_fast(model)
-                .into_iter()
-                .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
-                .collect()
-        } else {
-            self.worker_registry.get_prefill_workers()
-        };
-
-        let decode_workers = if let Some(model) = model_id {
-            // Get model-specific workers and filter for decode type
-            self.worker_registry
-                .get_by_model_fast(model)
-                .into_iter()
-                .filter(|w| matches!(w.worker_type(), WorkerType::Decode))
-                .collect()
-        } else {
-            self.worker_registry.get_decode_workers()
-        };
-
-        // Select workers using helper function
-        // Use separate policies for prefill and decode to avoid counter conflicts
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
-
-        let prefill = Self::pick_worker_by_policy_arc(
-            &prefill_workers,
-            &*prefill_policy,
-            request_text,
-            "prefill",
-        )?;
-
-        let decode = Self::pick_worker_by_policy_arc(
-            &decode_workers,
-            &*decode_policy,
-            request_text,
-            "decode",
-        )?;
-
-        Ok((prefill, decode))
-    }
-
-    // Helper function to select a worker using the policy (Arc version)
-    fn pick_worker_by_policy_arc(
-        workers: &[Arc<dyn Worker>],
-        policy: &dyn LoadBalancingPolicy,
-        request_text: Option<&str>,
-        worker_type: &str,
-    ) -> Result<Arc<dyn Worker>, String> {
-        // Check if we have any workers
-        if workers.is_empty() {
-            return Err(format!(
-                "No {} workers available. Please check if {} servers are configured and healthy.",
-                worker_type, worker_type
-            ));
-        }
-
-        // Filter available workers (healthy + circuit breaker not open)
-        let available_workers: Vec<Arc<dyn Worker>> = workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-
-        if available_workers.is_empty() {
-            return Err(format!(
-                "No available {} workers (all circuits open or unhealthy)",
-                worker_type
-            ));
-        }
-
-        // Let policy select from available workers (no conversion needed now!)
-        let selected_idx = policy
-            .select_worker(&available_workers, request_text)
-            .ok_or_else(|| {
-                format!(
-                    "Policy {} failed to select a {} worker",
-                    policy.name(),
-                    worker_type
-                )
-            })?;
-
-        // Return the selected Arc worker
-        Ok(available_workers[selected_idx].clone())
     }
 
     // Background task to monitor worker loads with shared client
@@ -947,21 +1456,62 @@ impl PdRouterBase {
         }
     }
 
+    /// First prefill worker of an all-gRPC pool; validation rejects mixed pools.
+    fn first_grpc_prefill_url(&self) -> Option<String> {
+        let workers = self.worker_registry.get_prefill_workers();
+        let url = workers.first()?.url();
+        crate::backend::is_grpc_url(url).then(|| url.to_string())
+    }
+
     pub async fn health_generate(&self, _req: Request<Body>) -> Response {
+        if self.first_grpc_prefill_url().is_some() {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "/health_generate is not implemented for gRPC workers; use /health for gRPC readiness",
+            )
+                .into_response();
+        }
         // Test model generation capability by selecting a random pair and testing them
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
+        let prefill_workers = self.worker_registry.get_prefill_workers();
+        let decode_workers = self.worker_registry.get_decode_workers();
+        self.health_generate_for_workers(&prefill_workers, &decode_workers)
+            .await
+    }
 
-        // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("No healthy worker pair available: {}", e),
-                )
-                    .into_response();
-            }
+    /// Probe one P/D pair selected through the same admission path as real
+    /// traffic, so health checks and requests cannot drift apart. The
+    /// attempt is dropped (releasing its reservations) when the probe ends.
+    pub(super) async fn health_generate_for_workers(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+    ) -> Response {
+        let context = PdRequestContext {
+            prefill_inputs: None,
+            model_id: None,
+            legacy_policy_input: None,
+            prefill_cache: None,
+            decode_cache: None,
+            headers: None,
+            affinity_key: None,
+            lora_name: None,
+            cache_salt: None,
+            route: "/health_generate",
         };
+        let (selection, _attempt) =
+            match self.select_and_admit(prefill_workers, decode_workers, &context) {
+                Some(admitted) => admitted,
+                None => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "No healthy worker pair available".to_string(),
+                    )
+                        .into_response();
+                }
+            };
+        let prefill = &prefill_workers[selection.prefill.worker_index];
+        let decode = &decode_workers[selection.decode.worker_index];
 
         // Test prefill server's health_generate
         // Extract base URLs if DP-aware format (e.g., http://127.0.0.1:8081@0 → http://127.0.0.1:8081)
@@ -1034,13 +1584,45 @@ impl PdRouterBase {
     }
 
     pub async fn get_server_info(&self, _req: Request<Body>) -> Response {
+        if let Some(worker_url) = self.first_grpc_prefill_url() {
+            return match crate::backend::get_grpc_server_info(&worker_url, Duration::from_secs(2))
+                .await
+            {
+                Ok(info) => (
+                    StatusCode::OK,
+                    Json(crate::backend::server_info_json(&info)),
+                )
+                    .into_response(),
+                Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+            };
+        }
         // Get info from the first decode server to match vllm's server info format
         // Note: We use decode workers for server info to match expected format
         self.proxy_to_first_prefill_worker("get_server_info", None)
             .await
     }
 
+    /// `GetModelInfo` from the first gRPC prefill worker, rendered by `render`.
+    async fn grpc_model_info(
+        &self,
+        render: fn(&crate::backend::pb::ModelInfo) -> Value,
+    ) -> Option<Response> {
+        let worker_url = self.first_grpc_prefill_url()?;
+        Some(
+            match crate::backend::get_grpc_model_info(&worker_url, Duration::from_secs(2)).await {
+                Ok(info) => (StatusCode::OK, Json(render(&info))).into_response(),
+                Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+            },
+        )
+    }
+
     pub async fn get_models(&self, req: Request<Body>) -> Response {
+        if let Some(response) = self
+            .grpc_model_info(crate::backend::openai_models_json)
+            .await
+        {
+            return response;
+        }
         // Extract headers first to avoid Send issues
         let headers = header_utils::copy_request_headers(&req);
 
@@ -1050,6 +1632,9 @@ impl PdRouterBase {
     }
 
     pub async fn get_model_info(&self, req: Request<Body>) -> Response {
+        if let Some(response) = self.grpc_model_info(crate::backend::model_info_json).await {
+            return response;
+        }
         // Extract headers first to avoid Send issues
         let headers = header_utils::copy_request_headers(&req);
 
@@ -1092,6 +1677,13 @@ impl PdRouterBase {
     }
 
     pub async fn flush_cache(&self) -> Response {
+        if self.first_grpc_prefill_url().is_some() {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "/flush_cache is not implemented for gRPC workers: vLLM's gRPC Control service has no cache reset",
+            )
+                .into_response();
+        }
         // Process both prefill and decode workers
         let (prefill_results, prefill_errors) = self
             .process_workers(
@@ -1222,10 +1814,10 @@ impl PdRouterBase {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
+    use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerFactory, WorkerType};
 
     fn create_test_pd_router() -> PdRouterBase {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1233,6 +1825,8 @@ mod tests {
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
 
         PdRouterBase {
+            kv_state: None,
+            pd_load: Arc::new(PdLoadManager::default()),
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -1240,6 +1834,7 @@ mod tests {
             worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
             load_monitor_handle: None,
             client: Client::new(),
+            api_key: None,
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size: 1,
         }
@@ -1251,6 +1846,8 @@ mod tests {
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
 
         PdRouterBase {
+            kv_state: None,
+            pd_load: Arc::new(PdLoadManager::default()),
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -1258,6 +1855,7 @@ mod tests {
             worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
             load_monitor_handle: None,
             client: Client::new(),
+            api_key: None,
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size,
         }
@@ -1415,24 +2013,53 @@ mod tests {
         router.worker_registry.register(Arc::from(healthy_worker));
         router.worker_registry.register(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, None).await;
-
-        assert!(result.is_ok());
-        let (prefill, _decode) = result.unwrap();
+        // Health-style selection goes through the same admission path as
+        // real traffic; availability filtering is part of that path.
+        let prefill_workers = router.worker_registry.get_prefill_workers();
+        let decode_workers = router.worker_registry.get_decode_workers();
+        let context = PdRequestContext {
+            prefill_inputs: None,
+            model_id: None,
+            legacy_policy_input: None,
+            prefill_cache: None,
+            decode_cache: None,
+            headers: None,
+            affinity_key: None,
+            lora_name: None,
+            cache_salt: None,
+            route: "/health_generate",
+        };
+        let (selection, attempt) = router
+            .select_and_admit(&prefill_workers, &decode_workers, &context)
+            .unwrap();
+        let prefill = &prefill_workers[selection.prefill.worker_index];
 
         // Should select the healthy worker
         assert_eq!(prefill.url(), "http://healthy");
         assert!(prefill.is_healthy());
+        drop(attempt);
+        assert!(router.pd_load.snapshot().is_empty());
     }
 
     #[tokio::test]
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, None).await;
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("No prefill workers available"));
+        let empty: Vec<Arc<dyn Worker>> = Vec::new();
+        let context = PdRequestContext {
+            prefill_inputs: None,
+            model_id: None,
+            legacy_policy_input: None,
+            prefill_cache: None,
+            decode_cache: None,
+            headers: None,
+            affinity_key: None,
+            lora_name: None,
+            cache_salt: None,
+            route: "/health_generate",
+        };
+        assert!(router.select_and_admit(&empty, &empty, &context).is_none());
+        assert!(router.pd_load.snapshot().is_empty());
     }
 
     // ============= Health Endpoints Tests =============
@@ -1973,5 +2600,1113 @@ mod tests {
             4,
             "Only host 2's workers should remain"
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::super::pd_types::PdLoadSample;
+    use super::*;
+    use crate::core::{BasicWorker, DPAwareWorker};
+    use crate::policies::{
+        AffinityKey, CostParams, KvAwarePolicy, RequestHeaders, RoundRobinPolicy,
+    };
+
+    fn prefix_policy_with_blocks(
+        p: &[Arc<dyn Worker>],
+        tokens: &[u32],
+        stored_blocks: usize,
+        params: CostParams,
+    ) -> KvAwarePolicy {
+        use crate::kv_index::{
+            CacheKey, HashMode, KvBlockIndexer, ResidencyOwner, RoutableTarget, StorageTier,
+        };
+        let policy = KvAwarePolicy::new(params);
+        let index = Arc::new(KvBlockIndexer::new());
+        let hashes = KvAwarePolicy::local_hashes(tokens, 16);
+        let blocks: Vec<_> = hashes
+            .into_iter()
+            .enumerate()
+            .take(stored_blocks)
+            .map(|(i, hash)| (Arc::<str>::from(format!("block-{i}")), hash))
+            .collect();
+        index.store(
+            0,
+            ResidencyOwner::Worker {
+                source: Arc::from(p[1].base_url()),
+                dp_rank: 0,
+                incarnation: 0,
+            },
+            StorageTier::Device,
+            None,
+            &blocks,
+        );
+        for worker in p {
+            policy.register_target_with_cache_identity(
+                worker.url(),
+                RoutableTarget {
+                    instance_id: Arc::from(worker.base_url()),
+                    dp_rank: 0,
+                },
+                CacheKey {
+                    model: Arc::from("model"),
+                    hash_mode: HashMode::Sha256,
+                    block_size: 16,
+                },
+                index.clone(),
+            );
+        }
+        policy
+    }
+
+    fn resident_prefix_policy(p: &[Arc<dyn Worker>], tokens: &[u32]) -> KvAwarePolicy {
+        prefix_policy_with_blocks(p, tokens, usize::MAX, CostParams::default())
+    }
+
+    fn token_inputs(
+        p: &[Arc<dyn Worker>],
+        tokens: &[u32],
+        policy: &KvAwarePolicy,
+    ) -> HashMap<String, super::super::pd_types::PdPrefillInput> {
+        p.iter()
+            .map(|worker| {
+                (
+                    worker.base_url().to_owned(),
+                    super::super::pd_types::PdPrefillInput {
+                        prompts: Some(Arc::from(vec![tokens.to_vec()])),
+                        work_by_rank: HashMap::from([(
+                            worker.dp_rank(),
+                            kv_aware_ops(policy).unwrap().estimate_prefill_work(&[(
+                                worker.as_ref(),
+                                &[tokens.to_vec()],
+                                true,
+                            )])[0],
+                        )]),
+                        allow_credit: true,
+                        fallback_reason: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pd_prefix_credit_changes_placement_and_charges_exact_attempt_work() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 2);
+        let d = pool("d", 2);
+        let tokens: Vec<u32> = (0..33).collect();
+        let policy = resident_prefix_policy(&p, &tokens);
+        let colocated = policy
+            .select_worker_with_receipt(&p, Some(&tokens), None, None, None, &[])
+            .unwrap();
+        assert_eq!(colocated.worker_index, 1);
+        assert_eq!(colocated.new_prefill_tokens, 1);
+        let inputs = token_inputs(&p, &tokens, &policy);
+        let mut context = context();
+        context.prefill_inputs = Some(&inputs);
+        let (first, a) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
+            .unwrap();
+        assert_eq!(first.prefill.worker_index, 1); // Warm P wins over the first idle P.
+        assert_eq!(first.prefill.new_prefill_tokens, Some(1));
+        assert_eq!(first.prefill.credited_prefix_tokens, Some(32));
+        assert_eq!(first.prefill.fallback_reason, None);
+        let (second, b) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
+            .unwrap();
+        assert_eq!(second.prefill.worker_index, 1);
+        assert_eq!(second.prefill.score, Some(2.0));
+        assert_ne!(first.decode.endpoint, second.decode.endpoint);
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &first.prefill.endpoint).active_prefill_tokens,
+            2
+        );
+        a.finish_prefill();
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &first.prefill.endpoint).active_prefill_tokens,
+            1
+        );
+        drop((a, b));
+        assert!(manager.snapshot().is_empty());
+
+        let mut loads = Loads::new();
+        loads.insert(
+            (Stage::Prefill, first.prefill.endpoint),
+            PdLoadSample {
+                prefill_requests: 1,
+                active_prefill_tokens: 40,
+                ..Default::default()
+            },
+        );
+        let selection = select_pd_pair(&loads, &p, &d, &policy, &policy, &context, true).unwrap();
+        assert_eq!(selection.prefill.worker_index, 0); // Token backlog outweighs warm residency.
+        assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
+    }
+
+    #[test]
+    fn prefill_backlog_shifts_to_idle_worker() {
+        let p = pool("p", 2);
+        let d = pool("d", 1);
+        // 400 tokens; p1 holds the first 12 blocks (192), so new_p1 = 208
+        // and new_p0 = 400. Placement is the only term favoring the holder:
+        // once its admitted backlog outweighs the recompute gap, the request
+        // shifts to the idle worker based on actual admitted token work.
+        let tokens: Vec<u32> = (0..400).collect();
+        let mut context = context();
+
+        let policy = prefix_policy_with_blocks(&p, &tokens, 12, CostParams::default());
+        let inputs = token_inputs(&p, &tokens, &policy);
+        context.prefill_inputs = Some(&inputs);
+        let manager = Arc::new(PdLoadManager::default());
+        let (first, a) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
+            .unwrap();
+        assert_eq!(first.prefill.worker_index, 1);
+        let (second, b) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
+            .unwrap();
+        assert_eq!(
+            second.prefill.worker_index, 0,
+            "the idle worker's backlog advantage beats the recompute gap"
+        );
+        drop((a, b));
+    }
+
+    #[test]
+    fn unknown_inflight_work_forces_one_unit_consistent_pool_fallback() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 2);
+        let d = pool("d", 2);
+        let tokens: Vec<u32> = (0..33).collect();
+        let policy = resident_prefix_policy(&p, &tokens);
+        let (_, unknown) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context(), true))
+            .unwrap();
+        let inputs = token_inputs(&p, &tokens, &policy);
+        let mut context = context();
+        context.prefill_inputs = Some(&inputs);
+        let (selection, known) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
+            .unwrap();
+        assert_eq!(
+            selection.prefill.fallback_reason,
+            Some("unknown_prefill_backlog")
+        );
+        assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
+        assert_eq!(selection.prefill.credited_prefix_tokens, Some(0));
+        drop((unknown, known));
+        assert!(manager.snapshot().is_empty());
+    }
+
+    fn pool(prefix: &str, count: usize) -> Vec<Arc<dyn Worker>> {
+        (0..count)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://{prefix}{i}"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    fn context() -> PdRequestContext<'static> {
+        PdRequestContext {
+            prefill_inputs: None,
+            model_id: None,
+            legacy_policy_input: Some("original request"),
+            prefill_cache: None,
+            decode_cache: None,
+            headers: None,
+            affinity_key: None,
+            lora_name: None,
+            cache_salt: None,
+            route: "/v1/completions",
+        }
+    }
+
+    fn admit(
+        manager: &Arc<PdLoadManager>,
+        p: &[Arc<dyn Worker>],
+        d: &[Arc<dyn Worker>],
+    ) -> (PdSelection, PdAttempt) {
+        let policy = KvAwarePolicy::default();
+        manager
+            .admit(|loads| select_pd_pair(loads, p, d, &policy, &policy, &context(), true))
+            .unwrap()
+    }
+
+    /// Deferral is a claim about the policy, not a user switch: only a policy
+    /// that can re-decide from live state gets to commit at dispatch.
+    #[test]
+    fn deferral_requires_a_policy_that_can_redecide_at_dispatch() {
+        use crate::policies::{CacheAwarePolicy, KvRequestTokens, WorkerTokenInputs};
+
+        let decode_pool = pool("d", 2);
+        let kv = KvAwarePolicy::default();
+        assert!(decode_policy_can_defer(&kv, &context()));
+
+        let cache = CacheAwarePolicy::new();
+        // Without the prepared prefix selection a dispatch-time cache_aware
+        // decision would silently degrade to load, so admission keeps its pick.
+        assert!(!decode_policy_can_defer(&cache, &context()));
+        let tokens: WorkerTokenInputs = [(
+            decode_pool[0].base_url().to_string(),
+            Arc::from([vec![1u32, 2, 3, 4]]),
+        )]
+        .into_iter()
+        .collect();
+        let prepared = cache
+            .prepare_selection(
+                &decode_pool,
+                KvRequestTokens::PerWorker(&tokens),
+                None,
+                None,
+                None,
+            )
+            .expect("prefix selection");
+        let prepared_context = PdRequestContext {
+            decode_cache: Some(&prepared),
+            ..context()
+        };
+        assert!(decode_policy_can_defer(&cache, &prepared_context));
+
+        let round_robin = RoundRobinPolicy::default();
+        assert!(!decode_policy_can_defer(&round_robin, &context()));
+    }
+
+    fn context_with_session(session: &str) -> PdRequestContext<'static> {
+        PdRequestContext {
+            prefill_inputs: None,
+            model_id: None,
+            legacy_policy_input: Some("original request"),
+            prefill_cache: None,
+            decode_cache: None,
+            headers: None,
+            affinity_key: Some(affinity_key(session)),
+            lora_name: None,
+            cache_salt: None,
+            route: "/v1/completions",
+        }
+    }
+
+    fn affinity_key(session: &str) -> AffinityKey {
+        let body = serde_json::json!({ "session_id": session });
+        let identity = crate::request_identity::resolve_affinity_identity(
+            None,
+            crate::request_identity::IdentityFields::from_body(&body),
+        )
+        .unwrap()
+        .unwrap();
+        AffinityKey::from_identity(identity, "default")
+    }
+
+    fn admit_with(
+        manager: &Arc<PdLoadManager>,
+        p: &[Arc<dyn Worker>],
+        d: &[Arc<dyn Worker>],
+        policy: &KvAwarePolicy,
+        context: &PdRequestContext<'_>,
+    ) -> (PdSelection, PdAttempt) {
+        manager
+            .admit(|loads| select_pd_pair(loads, p, d, policy, policy, context, true))
+            .unwrap()
+    }
+
+    fn sample(manager: &PdLoadManager, stage: Stage, endpoint: &PdEndpoint) -> PdLoadSample {
+        manager
+            .snapshot()
+            .get(&(stage, endpoint.clone()))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn deferred_admission_leaves_decode_uncommitted_until_dispatch() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d = pool("d", 2);
+        let policy = KvAwarePolicy::default();
+        let (_, attempt) = manager
+            .admit_deferred(|loads| {
+                select_pd_pair(loads, &p, &d, &policy, &policy, &context(), false)
+            })
+            .unwrap();
+
+        // Nothing is charged for the provisional decode pick.
+        assert!(attempt.decode_pending_commit());
+        assert!(attempt.decode_endpoint().is_none());
+        assert!(manager
+            .snapshot()
+            .keys()
+            .all(|(stage, _)| *stage == Stage::Prefill));
+
+        // The commitment sees the live snapshot and charges exactly once.
+        let decision = manager
+            .commit_decode(&attempt, |loads| {
+                select_decode_stage(loads, &d, &policy, &context())
+            })
+            .unwrap();
+        assert!(!attempt.decode_pending_commit());
+        assert_eq!(attempt.decode_endpoint(), Some(decision.endpoint.clone()));
+        assert_eq!(
+            sample(&manager, Stage::Decode, &decision.endpoint).pending_decode_requests,
+            1
+        );
+        // A second commit is a no-op on the books.
+        assert!(manager
+            .commit_decode(&attempt, |loads| {
+                select_decode_stage(loads, &d, &policy, &context())
+            })
+            .is_none());
+        assert_eq!(
+            sample(&manager, Stage::Decode, &decision.endpoint).pending_decode_requests,
+            1
+        );
+
+        attempt.begin_decode();
+        assert_eq!(
+            sample(&manager, Stage::Decode, &decision.endpoint).active_decode_requests,
+            1
+        );
+        attempt.finish_prefill();
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn abandoned_deferred_attempt_cannot_commit_a_decode() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d = pool("d", 1);
+        let policy = KvAwarePolicy::default();
+        let (_, attempt) = manager
+            .admit_deferred(|loads| {
+                select_pd_pair(loads, &p, &d, &policy, &policy, &context(), false)
+            })
+            .unwrap();
+        attempt.finish_prefill();
+        // A cancelled request closes the unbound state before dispatch.
+        attempt.finish_decode();
+        assert!(manager
+            .commit_decode(&attempt, |loads| {
+                select_decode_stage(loads, &d, &policy, &context())
+            })
+            .is_none());
+        assert!(manager.snapshot().is_empty());
+
+        // A refused commit keeps the attempt open, so a retry can still land.
+        let (_, retry) = manager
+            .admit_deferred(|loads| {
+                select_pd_pair(loads, &p, &d, &policy, &policy, &context(), false)
+            })
+            .unwrap();
+        assert!(manager.commit_decode(&retry, |_| None).is_none());
+        assert!(retry.decode_pending_commit());
+        assert!(manager
+            .commit_decode(&retry, |loads| {
+                select_decode_stage(loads, &d, &policy, &context())
+            })
+            .is_some());
+        drop(retry);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn provisional_decode_pick_does_not_consume_the_tie_cursor() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d = pool("d", 2);
+        let policy = KvAwarePolicy::default();
+
+        // A pickup that may be discarded must leave the policy untouched, or the
+        // commitment starts one tie step late and the rotation degrades.
+        let provisional: Vec<_> = (0..3)
+            .map(|_| {
+                let (selection, attempt) = manager
+                    .admit_deferred(|loads| {
+                        select_pd_pair(loads, &p, &d, &policy, &policy, &context(), false)
+                    })
+                    .unwrap();
+                drop(attempt);
+                selection.decode.endpoint.http_url
+            })
+            .collect();
+        assert!(
+            provisional.windows(2).all(|pair| pair[0] == pair[1]),
+            "provisional pick moved: {provisional:?}"
+        );
+
+        // The commitment advances the cursor once per request, so idle ties rotate.
+        let committed: Vec<_> = (0..2)
+            .map(|_| {
+                let (_, attempt) = manager
+                    .admit_deferred(|loads| {
+                        select_pd_pair(loads, &p, &d, &policy, &policy, &context(), false)
+                    })
+                    .unwrap();
+                manager
+                    .commit_decode(&attempt, |loads| {
+                        select_decode_stage(loads, &d, &policy, &context())
+                    })
+                    .expect("the commitment should land")
+                    .endpoint
+                    .http_url
+            })
+            .collect();
+        assert_ne!(committed[0], committed[1]);
+    }
+
+    #[test]
+    fn decode_soft_affinity_rebinds_pending_and_active_requests_then_stays_idle() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d = pool("d", 2);
+        let policy = affinity_policy();
+        let ctx = context_with_session("session-a");
+        let (first, attempt) = admit_with(&manager, &p, &d, &policy, &ctx);
+        assert_eq!(first.decode.affinity_outcome, Some("bind"));
+        // Pending reservations already count, so another request spills.
+        let (second, second_attempt) = admit_with(&manager, &p, &d, &policy, &ctx);
+        assert_ne!(first.decode.worker_index, second.decode.worker_index);
+        assert_eq!(second.decode.affinity_outcome, Some("rebind"));
+        second_attempt.begin_decode();
+        drop(attempt);
+        // Active D work also counts. The old decoder is now idle.
+        let (third, third_attempt) = admit_with(&manager, &p, &d, &policy, &ctx);
+        assert_eq!(third.decode.worker_index, first.decode.worker_index);
+        assert_eq!(third.decode.affinity_outcome, Some("rebind"));
+        drop((second_attempt, third_attempt));
+        // With no overlap, subsequent turns keep their cached decoder.
+        let (next, attempt) = admit_with(&manager, &p, &d, &policy, &ctx);
+        assert_eq!(next.decode.worker_index, third.decode.worker_index);
+        assert_eq!(next.decode.affinity_outcome, Some("sticky_hit"));
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    /// DP ranks on one HTTP server share a base URL; the binding target must
+    /// stay rank-qualified or every lookup would resolve to the first rank
+    /// and strand session KV there.
+    #[test]
+    fn decode_session_binds_by_rank_qualified_target() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|rank| {
+                Arc::new(DPAwareWorker::new(
+                    "http://d".to_owned(),
+                    rank,
+                    2,
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let policy = affinity_policy();
+
+        // A live request on rank 0 makes session a choose rank 1.
+        let ctx_b = context_with_session("session-b");
+        let mut attempts = Vec::new();
+        let (pick, attempt) = admit_with(&manager, &p, &d, &policy, &ctx_b);
+        assert_eq!(pick.decode.worker_index, 0);
+        attempts.push(attempt);
+        // Session a must bind to the idle rank 1...
+        let ctx_a = context_with_session("session-a");
+        let (first, attempt) = admit_with(&manager, &p, &d, &policy, &ctx_a);
+        assert_eq!(first.decode.worker_index, 1);
+        assert_eq!(first.decode.affinity_outcome, Some("bind"));
+        attempts.push(attempt);
+        // Finish both requests. The next turn must retain rank 1 even
+        // though rank 0 is equally idle and sorts first.
+        drop(attempts);
+        let (next, attempt) = admit_with(&manager, &p, &d, &policy, &ctx_a);
+        assert_eq!(next.decode.worker_index, 1);
+        assert_eq!(next.decode.affinity_outcome, Some("sticky_hit"));
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    fn affinity_policy() -> KvAwarePolicy {
+        KvAwarePolicy::default().with_shared_affinity(Arc::new(
+            crate::policies::KvAffinityTable::with_ttl(Some(Duration::from_secs(1800))),
+        ))
+    }
+
+    #[test]
+    fn decode_affinity_does_not_filter_prefill_token_cost_candidates() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 2);
+        let d = pool("d", 1);
+        let tokens: Vec<u32> = (0..33).collect();
+        let policy = resident_prefix_policy(&p, &tokens).with_shared_affinity(Arc::new(
+            crate::policies::KvAffinityTable::with_ttl(Some(Duration::from_secs(1800))),
+        ));
+        let inputs = token_inputs(&p, &tokens, &policy);
+        let mut ctx = context_with_session("session-a");
+        ctx.prefill_inputs = Some(&inputs);
+        let (first, a) = admit_with(&manager, &p, &d, &policy, &ctx);
+        assert_eq!(first.prefill.worker_index, 1);
+        assert_eq!(first.prefill.new_prefill_tokens, Some(1));
+        assert_eq!(first.prefill.affinity_outcome, None);
+        assert!(first.prefill.affinity.is_none());
+        assert_eq!(first.decode.affinity_outcome, Some("bind"));
+        // Warm P1 still wins on token cost (2 vs 33), even though its
+        // projected request count exceeds the old affinity limit (2 vs 1).
+        let (second, b) = admit_with(&manager, &p, &d, &policy, &ctx);
+        assert_eq!(second.prefill.worker_index, 1);
+        assert_eq!(second.prefill.new_prefill_tokens, Some(1));
+        assert_eq!(second.prefill.score, Some(2.0));
+        assert_eq!(second.prefill.affinity_outcome, None);
+        assert!(second.prefill.affinity.is_none());
+        assert_eq!(second.decode.affinity_outcome, Some("sticky_hit"));
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &first.prefill.endpoint).prefill_requests,
+            2
+        );
+        // A real token backlog still outweighs P1's prefix credit for this
+        // same session: decode affinity must never pin P to its last choice.
+        let mut loads = manager.snapshot();
+        loads
+            .get_mut(&(Stage::Prefill, first.prefill.endpoint.clone()))
+            .unwrap()
+            .active_prefill_tokens = 40;
+        let unbound_decode = KvAwarePolicy::default();
+        let next = select_pd_pair(&loads, &p, &d, &policy, &unbound_decode, &ctx, true).unwrap();
+        assert_eq!(next.prefill.worker_index, 0);
+        assert_eq!(next.prefill.new_prefill_tokens, Some(33));
+        assert_eq!(next.prefill.affinity_outcome, None);
+        assert!(next.prefill.affinity.is_none());
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &second.prefill.endpoint).prefill_requests,
+            2
+        );
+        drop((a, b));
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn concurrent_session_admissions_balance_occupancy_with_decode_only_binding() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 4);
+        let d = pool("d", 4);
+        let policy = affinity_policy();
+        let attempts: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        admit_with(
+                            &manager,
+                            &p,
+                            &d,
+                            &policy,
+                            &context_with_session("same-session"),
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    let (selection, attempt) = handle.join().unwrap();
+                    // These requests have no prepared token work, so this
+                    // also covers the occupancy fallback with TTL enabled.
+                    assert_eq!(selection.prefill.affinity_outcome, None);
+                    assert!(selection.prefill.affinity.is_none());
+                    attempt
+                })
+                .collect()
+        });
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.len(), 8);
+        for ((stage, _), load) in snapshot {
+            assert_eq!(load.occupancy(stage), 4);
+        }
+        drop(attempts);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn pending_handoffs_balance_even_with_fresh_discovery_workers() {
+        let manager = Arc::new(PdLoadManager::default());
+        let (first, a) = admit(&manager, &pool("p", 1), &pool("d", 2));
+        a.finish_prefill();
+        let (second, b) = admit(&manager, &pool("p", 1), &pool("d", 2));
+        assert_ne!(first.decode.endpoint, second.decode.endpoint);
+        assert_eq!(
+            sample(&manager, Stage::Decode, &first.decode.endpoint).pending_decode_requests,
+            1
+        );
+        assert_eq!(first.prefill.new_prefill_tokens, None);
+        drop((a, b));
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn stages_finish_independently_and_transitions_are_idempotent() {
+        let manager = Arc::new(PdLoadManager::default());
+        let (selection, attempt) = admit(&manager, &pool("same", 1), &pool("same", 1));
+        attempt.begin_decode();
+        attempt.begin_decode();
+        let d = sample(&manager, Stage::Decode, &selection.decode.endpoint);
+        assert_eq!(
+            (d.pending_decode_requests, d.active_decode_requests),
+            (0, 1)
+        );
+        attempt.finish_decode();
+        attempt.finish_decode();
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &selection.prefill.endpoint).prefill_requests,
+            1
+        );
+        attempt.finish_prefill();
+        attempt.finish_prefill();
+        attempt.release();
+        attempt.begin_decode();
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn finishing_prefill_retains_decode_and_drop_releases_pending() {
+        let manager = Arc::new(PdLoadManager::default());
+        let (selection, attempt) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        attempt.finish_prefill();
+        assert_eq!(
+            sample(&manager, Stage::Decode, &selection.decode.endpoint).pending_decode_requests,
+            1
+        );
+        let clone = attempt.clone();
+        drop(attempt);
+        assert_eq!(manager.snapshot().len(), 1);
+        drop(clone);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn decode_policy_failure_after_prefill_selection_leaves_no_reservations() {
+        #[derive(Debug)]
+        struct RejectDecode;
+        impl LoadBalancingPolicy for RejectDecode {
+            fn select_worker_with_headers(
+                &self,
+                _: &[Arc<dyn Worker>],
+                _: Option<&str>,
+                _: Option<&RequestHeaders>,
+            ) -> Option<usize> {
+                None
+            }
+            fn name(&self) -> &'static str {
+                "reject-decode"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d = pool("d", 1);
+        let policy = KvAwarePolicy::default();
+        assert!(manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &RejectDecode, &context(), true))
+            .is_none());
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn cold_prefill_ties_use_every_worker_in_an_idle_pool() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 3);
+        let d = pool("d", 1);
+        let policy = KvAwarePolicy::default();
+        let tokens: Vec<u32> = (0..33).collect();
+        let inputs = token_inputs(&p, &tokens, &policy);
+        let mut ctx = context();
+        ctx.prefill_inputs = Some(&inputs);
+
+        // Every admission starts from an idle pool again, so the same
+        // equal-cost tie is met on each turn.
+        let mut seen = [false; 3];
+        for _ in 0..32 {
+            let (selection, attempt) = admit_with(&manager, &p, &d, &policy, &ctx);
+            assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
+            seen[selection.prefill.worker_index] = true;
+            drop(attempt);
+        }
+        assert_eq!(seen, [true, true, true], "equal costs must use every P");
+    }
+
+    #[test]
+    fn equal_load_follows_caller_order() {
+        let manager = Arc::new(PdLoadManager::default());
+        let mut p = pool("p", 2);
+        let mut d = pool("d", 2);
+        p.reverse();
+        d.reverse();
+        let (selection, _) = admit(&manager, &p, &d);
+        // Tie-break is the slice order. Static callers pass registration
+        // order, so a reversed slice stays reversed instead of being
+        // rewritten into URL order.
+        assert_eq!(selection.prefill.worker_index, 0);
+        assert_eq!(selection.decode.worker_index, 0);
+        assert_eq!(selection.prefill.endpoint.http_url, "http://p1");
+        assert_eq!(selection.decode.endpoint.http_url, "http://d1");
+    }
+
+    #[test]
+    fn dp_ranks_have_independent_occupancy_and_granularity_is_pinned() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|rank| {
+                Arc::new(DPAwareWorker::new(
+                    "http://d0".into(),
+                    rank,
+                    2,
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let (first, a) = admit(&manager, &p, &d);
+        let (second, b) = admit(&manager, &p, &d);
+        assert_eq!(first.decode.endpoint.dp_rank, Some(0));
+        assert_eq!(second.decode.endpoint.dp_rank, Some(1));
+        let policy = KvAwarePolicy::default();
+        assert!(manager
+            .admit(|loads| select_pd_pair(
+                loads,
+                &p,
+                &pool("d", 1),
+                &policy,
+                &policy,
+                &context(),
+                true,
+            ))
+            .is_none());
+        drop((a, b));
+        let (_, attempt) = admit(&manager, &p, &pool("d", 1));
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn concurrent_admission_samples_and_reserves_atomically() {
+        let manager = Arc::new(PdLoadManager::default());
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                let manager = manager.clone();
+                std::thread::spawn(move || admit(&manager, &pool("p", 2), &pool("d", 2)))
+            })
+            .collect();
+        let admitted: Vec<_> = handles
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        for load in manager.snapshot().values() {
+            assert_eq!(load.prefill_requests + load.pending_decode_requests, 16);
+        }
+        drop(admitted);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn racing_cleanup_never_releases_another_attempt() {
+        let manager = Arc::new(PdLoadManager::default());
+        let (_, a) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        let (selection, b) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let a = a.clone();
+                std::thread::spawn(move || {
+                    if i % 2 == 0 {
+                        a.begin_decode();
+                    }
+                    a.release();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &selection.prefill.endpoint).prefill_requests,
+            1
+        );
+        assert_eq!(
+            sample(&manager, Stage::Decode, &selection.decode.endpoint).pending_decode_requests,
+            1
+        );
+        drop((a, b));
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn cleanup_uses_each_attempts_immutable_admitted_token_amount() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d = pool("d", 1);
+        let policy = KvAwarePolicy::default();
+        let known = |tokens| {
+            manager
+                .admit(|loads| {
+                    let mut selection =
+                        select_pd_pair(loads, &p, &d, &policy, &policy, &context(), true)?;
+                    selection.prefill.new_prefill_tokens = Some(tokens);
+                    Some(selection)
+                })
+                .unwrap()
+        };
+        let (selection, a) = known(17);
+        let (_, b) = known(31);
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &selection.prefill.endpoint).active_prefill_tokens,
+            48
+        );
+        a.finish_prefill();
+        a.finish_prefill();
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &selection.prefill.endpoint).active_prefill_tokens,
+            31
+        );
+        drop((a, b));
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[derive(Debug)]
+    struct LegacyPolicy;
+    impl LoadBalancingPolicy for LegacyPolicy {
+        fn select_worker_with_headers(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            text: Option<&str>,
+            headers: Option<&RequestHeaders>,
+        ) -> Option<usize> {
+            assert_eq!(text, Some("original request"));
+            assert_eq!(
+                headers.unwrap().get("x-session-id").map(String::as_str),
+                Some("session")
+            );
+            workers
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, w)| w.load())
+                .map(|(i, _)| i)
+        }
+        fn name(&self) -> &'static str {
+            "legacy-test"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn mixed_legacy_policies_keep_inputs_and_read_shared_occupancy() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 2);
+        let d = pool("d", 2);
+        let (first, a) = admit(&manager, &p, &d);
+        let headers = HashMap::from([("x-session-id".into(), "session".into())]);
+        let mut context = context();
+        context.headers = Some(&headers);
+        let policy = LegacyPolicy;
+        let (second, b) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
+            .unwrap();
+        assert_ne!(first.prefill.endpoint, second.prefill.endpoint);
+        assert_ne!(first.decode.endpoint, second.decode.endpoint);
+        assert_eq!(second.prefill.score, None);
+        drop((a, b));
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn round_robin_follows_registration_order_not_url_order() {
+        let manager = Arc::new(PdLoadManager::default());
+        let prefill = pool("p", 1);
+        let decode = |url: &str| {
+            Arc::new(BasicWorker::new(url.to_string(), WorkerType::Decode)) as Arc<dyn Worker>
+        };
+        // Port text sorts as 35151, 60629, 60773. Registration order is the reverse.
+        let decode_workers = vec![
+            decode("http://127.0.0.1:60773"),
+            decode("http://127.0.0.1:35151"),
+            decode("http://127.0.0.1:60629"),
+        ];
+        let prefill_policy = RoundRobinPolicy::new();
+        let decode_policy = RoundRobinPolicy::new();
+        let cycle = [
+            "http://127.0.0.1:60773",
+            "http://127.0.0.1:35151",
+            "http://127.0.0.1:60629",
+        ];
+        let seen: Vec<String> = (0..6)
+            .map(|_| {
+                let (selection, attempt) = manager
+                    .admit(|loads| {
+                        select_pd_pair(
+                            loads,
+                            &prefill,
+                            &decode_workers,
+                            &prefill_policy,
+                            &decode_policy,
+                            &context(),
+                            true,
+                        )
+                    })
+                    .unwrap();
+                drop(attempt);
+                selection.decode.endpoint.http_url
+            })
+            .collect();
+        assert_eq!(seen, [cycle.as_slice(), cycle.as_slice()].concat());
+    }
+
+    #[test]
+    fn stage_override_is_preserved() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 2);
+        let d = pool("d", 1);
+        let rr = RoundRobinPolicy::new();
+        let kv = KvAwarePolicy::default();
+        let (_, a) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &rr, &kv, &context(), true))
+            .unwrap();
+        let (second, b) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &rr, &kv, &context(), true))
+            .unwrap();
+        assert_eq!(second.prefill.score, None);
+        assert_eq!(second.decode.score, Some(2.0));
+        drop((a, b));
+    }
+
+    #[test]
+    fn model_labels_filter_eligible_pools() {
+        // PD workers register without labels today, so model filtering is
+        // inert until something populates model_id. Pin the behavior for the
+        // labeled future: a matching label or an unlabeled ("unknown")
+        // worker stays eligible, mismatched labels are excluded, and a model
+        // served by no labeled worker fails admission once every worker
+        // carries a label.
+        let manager = Arc::new(PdLoadManager::default());
+        let policy = KvAwarePolicy::default();
+        let d = pool("d", 1);
+        let labeled = |url: &str, model: &str| {
+            Arc::new(
+                BasicWorker::new(url.to_string(), WorkerType::Regular)
+                    .with_labels(HashMap::from([("model_id".to_string(), model.to_string())])),
+            ) as Arc<dyn Worker>
+        };
+        let unlabeled = |url: &str| {
+            Arc::new(BasicWorker::new(url.to_string(), WorkerType::Regular)) as Arc<dyn Worker>
+        };
+        fn ctx(model: &str) -> PdRequestContext<'_> {
+            PdRequestContext {
+                prefill_inputs: None,
+                model_id: Some(model),
+                legacy_policy_input: Some("original request"),
+                prefill_cache: None,
+                decode_cache: None,
+                headers: None,
+                affinity_key: None,
+                lora_name: None,
+                cache_salt: None,
+                route: "/v1/completions",
+            }
+        }
+
+        // Request for model-b: p1 matches, p2 is unknown, p0 mismatches.
+        let p = vec![
+            labeled("http://p0", "model-a"),
+            labeled("http://p1", "model-b"),
+            unlabeled("http://p2"),
+        ];
+        let (selection, attempt) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &ctx("model-b"), true))
+            .unwrap();
+        assert_eq!(selection.prefill.endpoint.http_url, "http://p1");
+        drop(attempt);
+
+        // Request for model-c: only the unlabeled worker keeps it routable.
+        let (selection, attempt) = manager
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &ctx("model-c"), true))
+            .unwrap();
+        assert_eq!(selection.prefill.endpoint.http_url, "http://p2");
+        drop(attempt);
+
+        // Once every worker carries a label, an unserved model has no pair.
+        let only_labeled = vec![
+            labeled("http://p0", "model-a"),
+            labeled("http://p1", "model-b"),
+        ];
+        assert!(manager
+            .admit(|loads| {
+                select_pd_pair(
+                    loads,
+                    &only_labeled,
+                    &d,
+                    &policy,
+                    &policy,
+                    &ctx("model-c"),
+                    true,
+                )
+            })
+            .is_none());
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn body_guard_holds_until_eof_and_handles_unpolled_drop() {
+        let manager = Arc::new(PdLoadManager::default());
+        let (_, attempt) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        attempt.finish_prefill();
+        attempt.begin_decode();
+        let body = attempt.track_body(Body::from("chunk"));
+        assert_eq!(manager.snapshot().len(), 1);
+        let bytes = axum::body::to_bytes(body, 100).await.unwrap();
+        assert_eq!(&bytes[..], b"chunk");
+        assert!(manager.snapshot().is_empty());
+        let (_, attempt) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        attempt.finish_prefill();
+        attempt.begin_decode();
+        let retained_producer_handle = attempt.clone();
+        let body = attempt.track_body(Body::from("never polled"));
+        drop(body);
+        assert!(manager.snapshot().is_empty());
+        drop(retained_producer_handle);
+    }
+
+    #[tokio::test]
+    async fn body_error_and_cancellation_release_occupancy() {
+        let manager = Arc::new(PdLoadManager::default());
+        let (_, attempt) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        attempt.finish_prefill();
+        attempt.begin_decode();
+        let body = Body::from_stream(futures_util::stream::once(async {
+            Err::<bytes::Bytes, _>(std::io::Error::other("injected read failure"))
+        }));
+        assert!(axum::body::to_bytes(attempt.track_body(body), 100)
+            .await
+            .is_err());
+        assert!(manager.snapshot().is_empty());
+
+        let (_, attempt) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        attempt.begin_decode();
+        let body = Body::from_stream(futures_util::stream::pending::<
+            Result<bytes::Bytes, std::io::Error>,
+        >());
+        let task =
+            tokio::spawn(async move { axum::body::to_bytes(attempt.track_body(body), 100).await });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn early_error_response_releases_both_stages_without_waiting_for_client() {
+        let manager = Arc::new(PdLoadManager::default());
+        let (_, attempt) = admit(&manager, &pool("p", 1), &pool("d", 1));
+        let response =
+            attempt.track_response(axum::response::Response::new(Body::from("prefill error")));
+        assert!(manager.snapshot().is_empty());
+        drop(response);
     }
 }

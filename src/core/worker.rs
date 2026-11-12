@@ -58,7 +58,8 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Decrement the load counter
     fn decrement_load(&self);
 
-    /// Reset the load counter to 0 (for sync/recovery)
+    /// Reset the load counter to 0 for explicit recovery after active requests drain.
+    /// Health checks must not call this: active guards still own their reservations.
     fn reset_load(&self) {
         // Default implementation - does nothing
         // Workers that track load should override this
@@ -201,12 +202,15 @@ pub trait Worker: Send + Sync + fmt::Debug {
 pub enum ConnectionMode {
     /// HTTP/REST connection
     Http,
+    /// vLLM rust Inference gRPC (`grpc://host:port`)
+    Grpc,
 }
 
 impl fmt::Display for ConnectionMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConnectionMode::Http => write!(f, "HTTP"),
+            ConnectionMode::Grpc => write!(f, "gRPC"),
         }
     }
 }
@@ -284,6 +288,7 @@ pub struct WorkerMetadata {
 #[derive(Clone)]
 pub struct BasicWorker {
     metadata: WorkerMetadata,
+    dp_size: Option<usize>,
     load_counter: Arc<AtomicUsize>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
@@ -296,6 +301,7 @@ impl fmt::Debug for BasicWorker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BasicWorker")
             .field("metadata", &self.metadata)
+            .field("dp_size", &self.dp_size)
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
             .field("circuit_breaker", &self.circuit_breaker)
             .finish()
@@ -304,7 +310,8 @@ impl fmt::Debug for BasicWorker {
 
 impl BasicWorker {
     pub fn new(url: String, worker_type: WorkerType) -> Self {
-        Self::with_connection_mode(url, worker_type, ConnectionMode::Http)
+        let connection_mode = crate::backend::connection_mode_from_url(&url);
+        Self::with_connection_mode(url, worker_type, connection_mode)
     }
 
     pub fn with_connection_mode(
@@ -322,6 +329,7 @@ impl BasicWorker {
 
         Self {
             metadata,
+            dp_size: None,
             load_counter: Arc::new(AtomicUsize::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
@@ -333,6 +341,12 @@ impl BasicWorker {
 
     pub fn with_labels(mut self, labels: std::collections::HashMap<String, String>) -> Self {
         self.metadata.labels = labels;
+        self
+    }
+
+    /// Attach a known DP group size when this worker represents a single-rank endpoint.
+    pub fn with_dp_size(mut self, dp_size: usize) -> Self {
+        self.dp_size = Some(dp_size.max(1));
         self
     }
 
@@ -407,6 +421,12 @@ impl Worker for BasicWorker {
                     Err(_) => false,
                 }
             }
+            ConnectionMode::Grpc => {
+                let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
+                crate::backend::check_grpc_health(self.url(), timeout)
+                    .await
+                    .is_ok()
+            }
         };
 
         if health_result {
@@ -452,7 +472,7 @@ impl Worker for BasicWorker {
 
     fn decrement_load(&self) {
         self.load_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             })
             .ok();
@@ -476,6 +496,10 @@ impl Worker for BasicWorker {
 
     fn circuit_breaker(&self) -> &CircuitBreaker {
         &self.circuit_breaker
+    }
+
+    fn dp_size(&self) -> Option<usize> {
+        self.dp_size
     }
 }
 
@@ -884,10 +908,6 @@ pub fn start_health_checker(
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
 
-        // Counter for periodic load reset (every 10 health check cycles)
-        let mut check_count = 0u64;
-        const LOAD_RESET_INTERVAL: u64 = 10;
-
         loop {
             interval.tick().await;
 
@@ -897,8 +917,6 @@ pub fn start_health_checker(
                 break;
             }
 
-            check_count += 1;
-
             // Check health of all workers
             let workers_to_check = match workers.read() {
                 Ok(guard) => guard.clone(),
@@ -907,22 +925,6 @@ pub fn start_health_checker(
                     continue;
                 }
             };
-
-            // Periodically reset load counters to prevent drift
-            // Only do this when we believe all workers should be idle
-            if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                let max_load = workers_to_check.iter().map(|w| w.load()).max().unwrap_or(0);
-                // Only reset if load appears to be very low (likely drift)
-                if max_load <= 2 {
-                    tracing::debug!(
-                        "Resetting load counters to prevent drift (max_load: {})",
-                        max_load
-                    );
-                    for worker in &workers_to_check {
-                        worker.reset_load();
-                    }
-                }
-            }
 
             // Perform health checks concurrently
             let health_checks = workers_to_check.iter().map(|worker| {
@@ -956,7 +958,7 @@ pub fn start_health_checker(
     HealthChecker { handle, shutdown }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use std::thread;

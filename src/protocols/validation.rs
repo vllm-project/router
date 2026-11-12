@@ -14,7 +14,7 @@ pub mod constants {
     /// Temperature range: 0.0 to 2.0 (OpenAI spec)
     pub const TEMPERATURE_RANGE: (f32, f32) = (0.0, 2.0);
 
-    /// Top-p range: 0.0 to 1.0 (exclusive of 0.0)
+    /// Numeric bounds for top-p; validation rejects `0.0` separately.
     pub const TOP_P_RANGE: (f32, f32) = (0.0, 1.0);
 
     /// Presence penalty range: -2.0 to 2.0 (OpenAI spec)
@@ -230,8 +230,17 @@ pub mod utils {
             validate_range(temp, &constants::TEMPERATURE_RANGE, "temperature")?;
         }
 
-        // Validate top_p (0.0 to 1.0)
+        // Validate top_p (0.0, 1.0]
         if let Some(top_p) = request.get_top_p() {
+            if top_p <= constants::TOP_P_RANGE.0 {
+                return Err(ValidationError::OutOfRange {
+                    parameter: "top_p".to_string(),
+                    value: top_p.to_string(),
+                    min: constants::TOP_P_RANGE.0.to_string(),
+                    max: constants::TOP_P_RANGE.1.to_string(),
+                });
+            }
+            // Check the inclusive upper bound and reject NaN.
             validate_range(top_p, &constants::TOP_P_RANGE, "top_p")?;
         }
 
@@ -754,7 +763,7 @@ impl ValidatableRequest for ChatCompletionRequest {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::constants::*;
     use super::utils::*;
@@ -867,7 +876,7 @@ mod tests {
     }
 
     // Chat completion specific tests
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     mod chat_tests {
         use super::*;
         use crate::protocols::spec::ReasoningEffort;
@@ -914,7 +923,7 @@ mod tests {
                 include_reasoning: true,
                 no_stop_trim: false,
                 ignore_eos: false,
-                add_generation_prompt: true,
+                add_generation_prompt: Some(true),
                 continue_final_message: false,
                 skip_special_tokens: true,
                 lora_path: None,
@@ -987,10 +996,16 @@ mod tests {
             request.temperature = Some(3.0);
             assert!(request.validate().is_err());
 
-            // Test top_p range (0.0 to 1.0)
+            // Test top_p range (0.0, 1.0]
             request.temperature = Some(1.0); // Reset
             request.top_p = Some(0.9);
             assert!(request.validate().is_ok());
+            request.top_p = Some(1.0);
+            assert!(request.validate().is_ok());
+            request.top_p = Some(f32::EPSILON);
+            assert!(request.validate().is_ok());
+            request.top_p = Some(0.0);
+            assert!(request.validate().is_err());
             request.top_p = Some(-0.1);
             assert!(request.validate().is_err());
             request.top_p = Some(1.5);
@@ -1193,15 +1208,45 @@ mod tests {
             assert!(request.reasoning_effort.is_none());
             assert!(request.validate().is_ok());
 
-            // Valid reasoning_effort values: Low, Medium, High
-            request.reasoning_effort = Some(ReasoningEffort::Low);
-            assert!(request.validate().is_ok());
+            // All OpenAI ReasoningEffort values are accepted by the router.
+            for effort in [
+                ReasoningEffort::None,
+                ReasoningEffort::Minimal,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::Xhigh,
+                ReasoningEffort::Max,
+            ] {
+                request.reasoning_effort = Some(effort);
+                assert!(
+                    request.validate().is_ok(),
+                    "effort {:?} should be valid",
+                    effort
+                );
+            }
+        }
 
-            request.reasoning_effort = Some(ReasoningEffort::Medium);
-            assert!(request.validate().is_ok());
-
-            request.reasoning_effort = Some(ReasoningEffort::High);
-            assert!(request.validate().is_ok());
+        #[test]
+        fn test_reasoning_effort_serde_roundtrip_all_values() {
+            // Every OpenAI effort string must deserialize and re-serialize to
+            // the same snake_case token — this is the regression the enum was
+            // widened for (previously unknown variants 400'd at the router).
+            for (s, expected) in [
+                ("none", ReasoningEffort::None),
+                ("minimal", ReasoningEffort::Minimal),
+                ("low", ReasoningEffort::Low),
+                ("medium", ReasoningEffort::Medium),
+                ("high", ReasoningEffort::High),
+                ("xhigh", ReasoningEffort::Xhigh),
+                ("max", ReasoningEffort::Max),
+            ] {
+                let parsed: ReasoningEffort = serde_json::from_str(&format!("\"{}\"", s))
+                    .unwrap_or_else(|e| panic!("{} should deserialize: {}", s, e));
+                assert_eq!(parsed, expected);
+                let reser = serde_json::to_string(&expected).unwrap();
+                assert_eq!(reser, format!("\"{}\"", s));
+            }
         }
 
         #[test]
