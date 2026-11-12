@@ -49,6 +49,9 @@ def _write_results_summary_from_calibration(out: Path) -> list[tuple[str, Path]]
         return []
     if not isinstance(stats, dict) or stats.get("ok") is not True:
         return []
+    required = ("router_policy", "concurrency", "task_num")
+    if any(key not in stats for key in required):
+        return []
     dest = router_policy_result_path(
         stats["router_policy"],
         stats["concurrency"],

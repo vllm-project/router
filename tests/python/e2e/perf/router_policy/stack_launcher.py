@@ -90,8 +90,6 @@ def open_cell(case: RouterPolicyCase, *, out_dir: Path | None) -> RouterPolicySt
 
     if out_dir is not None:
         out = out_dir
-    elif raw_out := os.environ.get("AGENTX_OUT", "").strip():
-        out = Path(raw_out)
     else:
         suffix = cell_run_suffix()
         out = case.perf_work_root / f"{case.id}-{suffix}"
@@ -577,8 +575,6 @@ def run_router_policy_cell(
     if run_suffix is None:
         run_suffix = cell_run_suffix()
     os.environ["AGENTX_RUN_SUFFIX"] = run_suffix
-    if out_dir is not None:
-        os.environ["AGENTX_OUT"] = str(out_dir)
     case = load_router_policy_case(case_path, concurrency=concurrency)
     run = open_cell(case, out_dir=out_dir)
     _active = run

@@ -82,10 +82,9 @@ def l1_output_dir(l1_case):
     if not _save_results():
         yield None
         return
-    raw = os.environ.get("PERF_OUTPUT_DIR", "").strip()
     arm = "l1on" if l1_case.l1_on else "l1off"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = Path(raw) if raw else RESULTS_DIR / f"{arm}_{stamp}"
+    path = RESULTS_DIR / f"{arm}_{stamp}"
     path.mkdir(parents=True, exist_ok=True)
     _progress(f"results directory: {path.resolve()}")
     yield path

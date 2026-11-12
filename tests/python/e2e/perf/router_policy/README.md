@@ -35,9 +35,9 @@ Performance JSON and the run directory are separate. The nightly dashboard copie
 - `tests/python/e2e/results/perf/router_policy/<policy>_<run_suffix>/c<concurrency>_t<task_num>.json` — copy of `calibration.json` when the cell is ok. One directory per policy and session; one file per concurrency. The `concurrency` / `task_num` fields match the file name.
 - `tests/python/e2e/run/perf/router_policy/<case_id>-<run_suffix>/` — cell files. Nightly uploads `result/summary.json`, `result/manifest.json`, `router.log`, `engineN.log`, `replay.log`, `runtime-replay.yaml`, and `*.command.json`. Prometheus snapshots, `requests.jsonl`, `ports.json`, and `calibration.json` stay on the agent. The replay launcher is a temp file, and model caches stay in the default cache directories. The same stdout is also printed (`[engineN]`, `[vllm-router]`, `[replay]`).
 
-`<run_suffix>` is local time `YYYYMMDD_HHMMSS` (same format as grpc and l1_encode) unless you set **`AGENTX_RUN_SUFFIX`** (same suffix for all cells in one matrix, e.g. `export AGENTX_RUN_SUFFIX=20251029_171300`). Override the run dir with **`AGENTX_OUT`**.
+`<run_suffix>` is local time `YYYYMMDD_HHMMSS` (same format as grpc and l1_encode) unless you set **`AGENTX_RUN_SUFFIX`** (same suffix for all cells in one matrix, e.g. `export AGENTX_RUN_SUFFIX=20251029_171300`). The run directory is generated automatically from the case ID and run suffix.
 
-Before replay, the cell runner **removes `result/`** if reusing the same `AGENTX_OUT`. The cell **fails if replay exit code ≠ 0**.
+Before replay, the cell runner **removes `result/`** if it already exists. The cell **fails if replay exit code ≠ 0**.
 
 **Ports**: HTTP, gRPC, and the router use OS-assigned ports held until that process starts. KV event PUB/replay use a free port in **25100–25299**, also held until that worker starts. This vLLM reports the configured endpoint unchanged, so `tcp://*:0` comes back as port 0 and the router rejects it. After each worker is healthy, the runner calls gRPC `Control.GetKvEventSources` and fails the cell if an advertised endpoint still uses port 0. Between pytest cells, default **`AGENTX_CELL_GAP_SEC=5`**; before allocate, **`AGENTX_PORT_SETTLE_SEC=2`**. Do not run multiple matrix jobs on one host in parallel.
 
