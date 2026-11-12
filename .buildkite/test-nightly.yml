@@ -283,12 +283,15 @@ steps:
               - "false"
         retry:
           automatic:
-            - exit_status: "*"
+            - exit_status: -1
+              signal_reason: none
               limit: 1
           manual:
             allowed: true
             reason: "Retry transient GPU-agent failures after inspecting the logs"
         mirror_hardwares: mi300_2
+        concurrency: 1
+        concurrency_group: "vllm/router-rocm-mi300x-pair"
         command: |
           bash -euo pipefail <<'BASH'
           export MORIIO_READ_MODE="{{matrix.read_mode}}"
@@ -327,11 +330,14 @@ steps:
           - "false"
     retry:
       automatic:
-        - exit_status: "*"
+        - exit_status: -1
+          signal_reason: none
           limit: 1
       manual:
         allowed: true
         reason: "Retry transient two-node GPU or RDMA failures after inspecting both node logs"
+    concurrency: 1
+    concurrency_group: "vllm/router-rocm-mi300x-pair"
     command: |
       set -euo pipefail
 

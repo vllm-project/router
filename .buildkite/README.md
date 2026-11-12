@@ -114,6 +114,13 @@ ROCm-only scheduled builds should set both `NIGHTLY=1` and `ROCM_ONLY=1`.
 L4 router_policy perf job while retaining the CPU build that supplies the router
 artifact to the ROCm jobs.
 
+The four MoRI job definitions in L2/L3 share the Buildkite concurrency group
+`vllm/router-rocm-mi300x-pair` with a limit of one. This serializes jobs using
+that group across builds; host leases still exclude other projects. Exit `-1` is
+retried once only when no signal reason is reported. Timeouts can also return
+`-1`, but carry the `cancel` reason and must not be retried automatically.
+Test, GPU, and transport failures require an inspected manual retry.
+
 The L3 matrices use a digest-pinned ROCm vLLM image and run health, sanity,
 and 500-example GSM8K accuracy checks. The RDMA job is coordinator-owned and
 controls the second host through the strict `vllm-router-rocm-worker` SSH alias.
