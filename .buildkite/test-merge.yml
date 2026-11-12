@@ -31,6 +31,7 @@ steps:
         retry:
           automatic:
             - exit_status: -1
+              signal_reason: none
               limit: 1
           manual:
             allowed: true
@@ -64,6 +65,7 @@ steps:
     retry:
       automatic:
         - exit_status: -1
+          signal_reason: none
           limit: 1
       manual:
         allowed: true
