@@ -1,7 +1,7 @@
 //! Hybrid attention prefix index.
 //!
-//! `HybridIndex` owns the residency lock and is the only type callers see.
 //! Event interpretation lives in `ingest`, cache-group rules in `layout`.
+//! Residency is shared with full attention through `KvBlockIndexer`.
 
 mod ingest;
 mod layout;
@@ -9,6 +9,7 @@ pub(crate) mod residency;
 mod subscriber;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 
@@ -27,9 +28,16 @@ pub use crate::kv_index::subscriber::HybridSourceLease;
 
 #[allow(unused_imports)]
 use self::ingest::HybridEventError as _;
+use super::indexer::IndexBatch;
 use super::wire::BlockStored;
-use super::{Locality, RoutableTarget, StorageTier, TierMatch};
+use super::{KvBlockIndexer, Locality, ResidencyOwner, RoutableTarget, StorageTier, TierMatch};
 use crate::kv_hash::{BlockKeyGenerator, SequenceHash};
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+std::thread_local! {
+    static AFTER_HYBRID_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
 
 /// A bounded index for one verified identity, worker, rank and incarnation.
 /// Stores and removals across all groups share one lock and one sequence.
@@ -47,6 +55,11 @@ pub struct HybridEventIndex {
     pub(super) adapters: Vec<(String, String)>,
     pub(super) max_entries: usize,
     pub(super) partial_hash_hits: bool,
+    /// The same domain index used by full-attention workers. Layout and stream
+    /// state live here; cache residency lives only in this shared index.
+    pub(super) index: Arc<KvBlockIndexer>,
+    pub(super) owner: ResidencyOwner,
+    binding: Option<super::binding::SourceLease>,
     state: RwLock<State>,
 }
 
@@ -118,6 +131,12 @@ impl HybridEventIndex {
         {
             return Err(HybridEventError::InvalidLayout);
         }
+        let incarnation = super::next_owner_incarnation();
+        let owner = ResidencyOwner::Worker {
+            source: target.instance_id.clone(),
+            dp_rank: target.dp_rank,
+            incarnation,
+        };
         Ok(Self {
             target,
             groups,
@@ -126,13 +145,34 @@ impl HybridEventIndex {
             adapters: Vec::new(),
             max_entries,
             partial_hash_hits: false,
+            index: Arc::new(KvBlockIndexer::new()),
+            owner,
+            binding: None,
             state: RwLock::new(State {
                 next_seq: None,
                 visible: false,
-                claims: HashMap::new(),
                 page_evidence: HashMap::new(),
             }),
         })
+    }
+
+    /// Bind an admitted layout to its supervisor's cache domain before replay.
+    pub(crate) fn with_shared_index(mut self, index: Arc<KvBlockIndexer>) -> Self {
+        debug_assert!(self.state.get_mut().next_seq.is_none());
+        self.index = index;
+        self
+    }
+
+    pub(super) fn with_source_binding(mut self, binding: super::binding::SourceLease) -> Self {
+        self.binding = Some(binding);
+        self
+    }
+
+    fn with_active_binding<R>(&self, operation: impl FnOnce() -> R) -> Option<R> {
+        match &self.binding {
+            Some(binding) => binding.with_active(|_| operation()),
+            None => Some(operation()),
+        }
     }
 
     /// Declare the layout's restore-time recomputation window
@@ -176,38 +216,58 @@ impl HybridEventIndex {
     /// This is not a snapshot or replay implementation. Never call it merely
     /// because a subscription started or a gap occurred.
     pub fn begin_empty(&self, next_seq: u64) {
-        let mut state = self.state.write();
-        state.claims.clear();
-        state.next_seq = Some(next_seq);
-        state.visible = true;
+        self.with_active_binding(|| {
+            let mut state = self.state.write();
+            self.index.with_source_batch(&self.target, |tx| {
+                tx.clear_owner_exact(&self.owner);
+                state.page_evidence.clear();
+                tx.resume_source(&self.target.instance_id, self.target.dp_rank);
+                state.next_seq = Some(next_seq);
+                state.visible = true;
+            });
+        });
     }
 
     /// Start a full replay from an externally verified empty origin. Queries
     /// remain cold until the caller verifies a continuous replay watermark.
     pub fn begin_replay(&self, next_seq: u64) {
-        let mut state = self.state.write();
-        state.claims.clear();
-        state.next_seq = Some(next_seq);
-        state.visible = false;
+        self.with_active_binding(|| {
+            let mut state = self.state.write();
+            self.index.with_source_batch(&self.target, |tx| {
+                tx.clear_owner_exact(&self.owner);
+                state.page_evidence.clear();
+                state.next_seq = Some(next_seq);
+                state.visible = false;
+            });
+        });
     }
 
     /// Publish a complete replay atomically. The caller must obtain the
     /// watermark from the source's replay/live handoff, not infer it locally.
     pub fn finish_replay(&self, expected_next_seq: u64) -> Result<(), HybridEventError> {
-        let mut state = self.state.write();
-        if state.visible || state.next_seq != Some(expected_next_seq) {
-            return Self::fail(&mut state, HybridEventError::Sequence);
-        }
-        state.visible = true;
-        Ok(())
+        self.with_active_binding(|| {
+            let mut state = self.state.write();
+            self.index.with_source_batch(&self.target, |tx| {
+                if state.visible || state.next_seq != Some(expected_next_seq) {
+                    return Self::fail(&mut state, tx, &self.owner, HybridEventError::Sequence);
+                }
+                tx.resume_source(&self.target.instance_id, self.target.dp_rank);
+                state.visible = true;
+                Ok(())
+            })
+        })
+        .unwrap_or(Err(HybridEventError::Untrusted))
     }
 
     /// Discard all claims on a gap, restart, lease retirement or lost event.
     pub fn invalidate(&self) {
         let mut state = self.state.write();
-        state.claims.clear();
-        state.next_seq = None;
-        state.visible = false;
+        self.index.with_source_batch(&self.target, |tx| {
+            tx.clear_owner_exact(&self.owner);
+            state.page_evidence.clear();
+            state.next_seq = None;
+            state.visible = false;
+        });
     }
 
     /// Calculate one consistent local snapshot. Zero means a miss or an
@@ -226,6 +286,13 @@ impl HybridEventIndex {
         tokens: &[u32],
         max_reusable_tokens: usize,
     ) -> (u64, Option<TierMatch>) {
+        if self
+            .binding
+            .as_ref()
+            .is_some_and(|binding| !binding.is_active())
+        {
+            return (0, None);
+        }
         {
             let state = self.state.read();
             if state.next_seq.is_none() || !state.visible {
@@ -241,13 +308,26 @@ impl HybridEventIndex {
                 None => return (0, None),
             },
         };
+        let prepared = super::indexer::prepare_sparse_keys(namespace, &hashes);
         let state = self.state.read();
         if state.next_seq.is_none() || !state.visible {
             return (0, None);
         }
-        let Some(claims) = state.claims_in(namespace) else {
-            return (0, None);
-        };
+        // Copy only the required tier evidence under one source view.
+        // Boundary calculation uses these owned values and does not block
+        // writers for other workers while it scans the request.
+        let (claims, version) = self.index.with_source_snapshot(&self.target, |view| {
+            let claims: Vec<_> = self
+                .groups
+                .iter()
+                .map(|group| view.sparse_tiers(&self.owner, group.group_idx, &prepared))
+                .collect();
+            (claims, view.source_version(&self.target))
+        });
+        #[cfg(all(test, feature = "cpu", feature = "ready"))]
+        if let Some(hook) = AFTER_HYBRID_SNAPSHOT.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
         let page_evidence = state.page_evidence_in(namespace);
         // Every published hash proves only its own boundary. A group page
         // ends at a multiple of its stride; other resident hashes are partial
@@ -255,14 +335,15 @@ impl HybridEventIndex {
         let partial_ends: Vec<Vec<u64>> = self
             .groups
             .iter()
-            .map(|group| {
+            .enumerate()
+            .map(|(group_pos, group)| {
                 let stride = group.block_size as usize / self.keys.block_size();
-                hashes
+                claims[group_pos]
                     .iter()
                     .enumerate()
                     .filter_map(|(position, hash)| {
                         let end = position + 1;
-                        (end % stride != 0 && claims.contains_key(&(group.group_idx, *hash)))
+                        (end % stride != 0 && hash.is_some())
                             .then_some(end as u64 * self.keys.block_size() as u64)
                     })
                     .collect()
@@ -271,14 +352,20 @@ impl HybridEventIndex {
         let matches: Vec<Vec<TierMatch>> = self
             .groups
             .iter()
-            .map(|group| {
+            .enumerate()
+            .map(|(group_pos, group)| {
                 let stride = group.block_size as usize / self.keys.block_size();
                 let mut segments: Vec<(u32, u32)> = Vec::new();
-                for (position, hash) in hashes.iter().skip(stride - 1).step_by(stride).enumerate() {
+                for (position, hash) in claims[group_pos]
+                    .iter()
+                    .skip(stride - 1)
+                    .step_by(stride)
+                    .enumerate()
+                {
                     let Ok(end) = u32::try_from(position.saturating_add(1)) else {
                         break;
                     };
-                    if !claims.contains_key(&(group.group_idx, *hash)) {
+                    if hash.is_none() {
                         continue;
                     }
                     let start = end - 1;
@@ -325,7 +412,7 @@ impl HybridEventIndex {
         // Report the slowest tier any group needs at the credited boundary: the
         // nearest resident page at or below it is the one that completes it.
         let mut worst = StorageTier::Device;
-        for (group, partials) in self.groups.iter().zip(&partial_ends) {
+        for (group_pos, (group, partials)) in self.groups.iter().zip(&partial_ends).enumerate() {
             let stride = group.block_size as usize / self.keys.block_size();
             let blocks = (credited / u64::from(group.block_size)) as usize;
             // Every page the group needs to complete the boundary counts: a
@@ -344,11 +431,7 @@ impl HybridEventIndex {
             let floor = blocks.saturating_sub(required);
             if partials.contains(&credited) {
                 let index = (credited as usize / self.keys.block_size()).saturating_sub(1);
-                if let Some(tier) = hashes
-                    .get(index)
-                    .and_then(|hash| claims.get(&(group.group_idx, *hash)))
-                    .and_then(|resident| resident.best())
-                {
+                if let Some(tier) = claims[group_pos].get(index).copied().flatten() {
                     if tier_rank(tier) > tier_rank(worst) {
                         worst = tier;
                     }
@@ -360,13 +443,10 @@ impl HybridEventIndex {
                 }
             }
             for position in (floor..blocks.max(1)).rev() {
-                let Some(hash) = hashes.get(stride * (position + 1) - 1) else {
+                let Some(tier) = claims[group_pos].get(stride * (position + 1) - 1).copied() else {
                     break;
                 };
-                if let Some(tier) = claims
-                    .get(&(group.group_idx, *hash))
-                    .and_then(|resident| resident.best())
-                {
+                if let Some(tier) = tier {
                     if tier_rank(tier) > tier_rank(worst) {
                         worst = tier;
                     }
@@ -379,6 +459,14 @@ impl HybridEventIndex {
         let Ok(blocks) = u32::try_from(credited / u64::from(self.keys.block_size() as u32)) else {
             return (0, None);
         };
+        if !self.index.source_version_is_current(&version)
+            || self
+                .binding
+                .as_ref()
+                .is_some_and(|binding| !binding.is_active())
+        {
+            return (0, None);
+        }
         (
             credited,
             Some(TierMatch {

@@ -60,8 +60,8 @@ pub fn align_down(tokens: u64, block_size: u32) -> u64 {
 }
 
 /// Return the latest jointly restorable boundary, or zero when none is proven.
-/// `max_reusable_tokens` is the engine's upper bound; only local GPU claims on
-/// `target` count.
+/// `max_reusable_tokens` is the engine's upper bound; only local, addressable
+/// device, host, or disk claims on `target` count.
 pub fn common_reusable_tokens(
     target: &RoutableTarget,
     groups: &[HybridGroupView<'_>],
@@ -100,14 +100,24 @@ pub fn common_reusable_tokens(
     // boundary it can restore under the current cap, the smallest one wins, and
     // the loop repeats because that smaller cap can invalidate a sliding
     // group's window.
+    let mut cursors: Vec<_> = constraining
+        .iter()
+        .map(|group| BoundaryCursor::new(group, target))
+        .collect();
     let mut boundary = max_reusable_tokens;
     loop {
         let mut next = boundary;
-        for group in &constraining {
+        for (group, cursor) in constraining.iter().zip(&mut cursors) {
             // The group already reports a boundary it can restore; snapping it
             // to the page would discard a partial-page entry the engine
             // published. The caller aligns to the hash granule at the end.
-            next = next.min(supported_at(group, target, boundary));
+            let supported = match cursor {
+                Some(cursor) => cursor.predecessor(boundary),
+                // Public callers can construct unsupported compressed layouts.
+                // Preserve their previous semantics instead of assuming a ratio.
+                None => supported_at(group, target, boundary),
+            };
+            next = next.min(supported);
         }
         if next == 0 {
             return 0;
@@ -116,6 +126,121 @@ pub fn common_reusable_tokens(
             return boundary;
         }
         boundary = next;
+    }
+}
+
+/// Temporary, query-local predecessor cursor. Block ranges are inclusive;
+/// partial boundaries are exact token offsets and are never interpolated.
+struct BoundaryCursor {
+    size: u64,
+    ranges: Vec<(u64, u64)>,
+    range_end: usize,
+    partials: Vec<u64>,
+    partial_end: usize,
+}
+
+impl BoundaryCursor {
+    fn new(group: &HybridGroupView<'_>, target: &RoutableTarget) -> Option<Self> {
+        let size = u64::from(group.block_size);
+        if let HybridGroupKind::CompressedFullAttention { tokens_per_state } = group.kind {
+            if tokens_per_state == 0 || !group.block_size.is_multiple_of(tokens_per_state) {
+                return None;
+            }
+        }
+        let mut ranges = Vec::new();
+        for hit in group.matches.iter().filter(|hit| eligible(hit, target)) {
+            for &(start, end) in &hit.segments {
+                let (start, end) = (u64::from(start), u64::from(end));
+                if start >= end {
+                    continue;
+                }
+                let first = match group.kind {
+                    HybridGroupKind::FullAttention
+                    | HybridGroupKind::CompressedFullAttention { .. } => {
+                        if start != 0 {
+                            continue;
+                        }
+                        1
+                    }
+                    HybridGroupKind::Checkpoint => start + 1,
+                    HybridGroupKind::SlidingWindow { window_tokens } => {
+                        if start == 0 {
+                            1
+                        } else {
+                            let needed = window_tokens.saturating_sub(1).div_ceil(size).max(1);
+                            start.saturating_add(needed)
+                        }
+                    }
+                };
+                if first <= end {
+                    ranges.push((first, end));
+                }
+            }
+        }
+        ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut() {
+                if start <= last.1.saturating_add(1) {
+                    last.1 = last.1.max(end);
+                    continue;
+                }
+            }
+            merged.push((start, end));
+        }
+
+        let root_end = merged
+            .first()
+            .filter(|(start, _)| *start == 1)
+            .map_or(0, |(_, end)| end * size);
+        let mut partials: Vec<u64> = group
+            .partial_ends
+            .iter()
+            .copied()
+            .filter(|end| {
+                if *end == 0 || *end % size == 0 {
+                    return false;
+                }
+                let page_start = (*end / size) * size;
+                match group.kind {
+                    HybridGroupKind::Checkpoint => true,
+                    HybridGroupKind::FullAttention => root_end >= page_start,
+                    HybridGroupKind::CompressedFullAttention { tokens_per_state } => {
+                        *end % u64::from(tokens_per_state) == 0 && root_end >= page_start
+                    }
+                    HybridGroupKind::SlidingWindow { .. } => false,
+                }
+            })
+            .collect();
+        partials.sort_unstable();
+        partials.dedup();
+        Some(Self {
+            size,
+            range_end: merged.len(),
+            ranges: merged,
+            partial_end: partials.len(),
+            partials,
+        })
+    }
+
+    fn predecessor(&mut self, cap: u64) -> u64 {
+        let cap_blocks = cap / self.size;
+        while self.range_end > 0 && self.ranges[self.range_end - 1].0 > cap_blocks {
+            self.range_end -= 1;
+        }
+        let full = if self.range_end == 0 {
+            0
+        } else {
+            self.ranges[self.range_end - 1].1.min(cap_blocks) * self.size
+        };
+        while self.partial_end > 0 && self.partials[self.partial_end - 1] > cap {
+            self.partial_end -= 1;
+        }
+        full.max(if self.partial_end == 0 {
+            0
+        } else {
+            self.partials[self.partial_end - 1]
+        })
     }
 }
 
@@ -601,6 +726,129 @@ mod tests {
             page_evidence: true,
             partial_ends: &[],
         }
+    }
+
+    /// Original repeated full-scan algorithm, kept as a differential oracle.
+    fn original_common(target: &RoutableTarget, groups: &[HybridGroupView<'_>], cap: u64) -> u64 {
+        let groups: Vec<_> = groups
+            .iter()
+            .filter(|group| {
+                group.page_evidence || !matches!(group.kind, HybridGroupKind::SlidingWindow { .. })
+            })
+            .collect();
+        if groups.is_empty() {
+            return 0;
+        }
+        let mut boundary = cap;
+        loop {
+            let next = groups.iter().fold(boundary, |next, group| {
+                next.min(supported_at(group, target, boundary))
+            });
+            if next == 0 || next == boundary {
+                return next;
+            }
+            boundary = next;
+        }
+    }
+
+    fn masked_hit(target: &RoutableTarget, mask: u8) -> TierMatch {
+        let mut segments = Vec::new();
+        for page in 0..4 {
+            if mask & (1 << page) == 0 {
+                continue;
+            }
+            if let Some((_, end)) = segments.last_mut() {
+                if *end == page {
+                    *end += 1;
+                    continue;
+                }
+            }
+            segments.push((page, page + 1));
+        }
+        hit(target, &segments)
+    }
+
+    #[test]
+    fn cursors_match_original_scans_for_small_page_and_partial_states() {
+        let worker = target("w", 0);
+        for a in 0..16 {
+            for b in 0..16 {
+                let dense = [masked_hit(&worker, a)];
+                let checkpoint = [masked_hit(&worker, b)];
+                let partials: Vec<u64> = (0..4)
+                    .filter(|i| b & (1 << i) != 0)
+                    .map(|i| 2 * i as u64 + 1)
+                    .collect();
+                for kind in [
+                    HybridGroupKind::FullAttention,
+                    HybridGroupKind::CompressedFullAttention {
+                        tokens_per_state: 1,
+                    },
+                    HybridGroupKind::SlidingWindow { window_tokens: 3 },
+                ] {
+                    let mut first = group(0, 2, kind, &dense);
+                    let mut second = group(1, 2, HybridGroupKind::Checkpoint, &checkpoint);
+                    first.partial_ends = &partials;
+                    second.partial_ends = &partials;
+                    for cap in 0..=10 {
+                        let groups = [
+                            HybridGroupView {
+                                group_idx: first.group_idx,
+                                block_size: first.block_size,
+                                kind: first.kind,
+                                matches: first.matches,
+                                page_evidence: first.page_evidence,
+                                partial_ends: first.partial_ends,
+                            },
+                            HybridGroupView {
+                                group_idx: second.group_idx,
+                                block_size: second.block_size,
+                                kind: second.kind,
+                                matches: second.matches,
+                                page_evidence: second.page_evidence,
+                                partial_ends: second.partial_ends,
+                            },
+                        ];
+                        assert_eq!(
+                            common_reusable_tokens(&worker, &groups, cap),
+                            original_common(&worker, &groups, cap),
+                            "a={a} b={b} kind={kind:?} cap={cap}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn interleaved_checkpoints_descend_to_zero() {
+        let worker = target("w", 0);
+        let odd: Vec<_> = (0..64).step_by(2).map(|i| (i, i + 1)).collect();
+        let even: Vec<_> = (1..64).step_by(2).map(|i| (i, i + 1)).collect();
+        let a = [hit(&worker, &odd)];
+        let b = [hit(&worker, &even)];
+        let groups = [
+            group(0, 1, HybridGroupKind::Checkpoint, &a),
+            group(1, 1, HybridGroupKind::Checkpoint, &b),
+        ];
+        assert_eq!(common_reusable_tokens(&worker, &groups, 64), 0);
+    }
+
+    #[test]
+    fn sliding_window_is_rechecked_after_checkpoint_rewinds() {
+        let worker = target("w", 0);
+        let checkpoints = [hit(&worker, &[(3, 4)])];
+        let tail = [hit(&worker, &[(4, 6)])];
+        let groups = [
+            group(0, 16, HybridGroupKind::Checkpoint, &checkpoints),
+            group(
+                1,
+                16,
+                HybridGroupKind::SlidingWindow { window_tokens: 32 },
+                &tail,
+            ),
+        ];
+        assert_eq!(common_reusable_tokens(&worker, &groups, 96), 0);
     }
 
     /// vLLM also caches a prefix ending inside a page (`cache_partial_block`).

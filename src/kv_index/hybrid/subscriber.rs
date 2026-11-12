@@ -137,6 +137,9 @@ impl HybridEventStream {
     pub fn retire(&self, lease: HybridSourceLease) -> Result<(), HybridStreamError> {
         let mut source = self.source.lock();
         Self::check(&source, lease)?;
+        if source.phase == Phase::Retired {
+            return Ok(());
+        }
         self.index.invalidate();
         source.phase = Phase::Retired;
         Ok(())
@@ -444,6 +447,48 @@ mod tests {
         assert_eq!(replay_backoff(5), Duration::from_millis(3_200));
         assert_eq!(replay_backoff(6), Duration::from_millis(5_000));
         assert_eq!(replay_backoff(30), Duration::from_millis(5_000));
+    }
+
+    #[test]
+    fn repeated_retire_does_not_clear_a_replacement_stream() {
+        let groups = (0..4)
+            .map(|group_idx| HybridEventGroup {
+                group_idx,
+                block_size: 528,
+                kind: if group_idx == 3 {
+                    HybridGroupKind::FullAttention
+                } else {
+                    HybridGroupKind::Checkpoint
+                },
+            })
+            .collect();
+        let index = Arc::new(
+            HybridEventIndex::new(
+                RoutableTarget {
+                    instance_id: Arc::from("worker"),
+                    dp_rank: 0,
+                },
+                groups,
+                528,
+                0,
+                8,
+            )
+            .unwrap(),
+        );
+        let old = HybridEventStream::new(index.clone());
+        let old_lease = old.begin_replay();
+        old.retire(old_lease).unwrap();
+        let replacement = HybridEventStream::new(index.clone());
+        let replacement_lease = replacement.begin_replay();
+        let payload = &crate::kv_index::hybrid::residency::tests::qwen35_payload();
+        replacement
+            .apply_payload(replacement_lease, 0, payload)
+            .unwrap();
+        replacement.finish_replay(replacement_lease, 1).unwrap();
+        let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
+        assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 528);
+        old.retire(old_lease).unwrap();
+        assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 528);
     }
 
     #[test]

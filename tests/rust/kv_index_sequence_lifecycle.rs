@@ -279,12 +279,21 @@ fn historical_alias_parents_follow_splits_and_interior_continuations() {
         3
     );
     index.remove(0, &b, StorageTier::Device, &[Arc::from("i:202")]);
-    // Removed aliases still locate topology after a split.
+    // Keep z resident under a second source-local alias, then remove i:102.
+    // A historical alias still locates its own source's topology after a split.
     index.store(
         0,
         a.clone(),
         StorageTier::Device,
-        Some(Arc::from("i:202")),
+        Some(Arc::from("i:101")),
+        &blocks(&[("i:104", "z")]),
+    );
+    index.remove(0, &a, StorageTier::Device, &[Arc::from("i:102")]);
+    index.store(
+        0,
+        a.clone(),
+        StorageTier::Device,
+        Some(Arc::from("i:102")),
         &blocks(&[("i:103", "tail")]),
     );
     assert_eq!(
@@ -306,6 +315,45 @@ fn historical_alias_parents_follow_splits_and_interior_continuations() {
     assert_eq!(
         depth(&index, 0, &b, StorageTier::Device, &["x", "y", "branch"]),
         3
+    );
+}
+
+#[test]
+fn an_unknown_integer_parent_cannot_borrow_another_sources_path() {
+    let index = KvBlockIndexer::new();
+    let a = worker("a", 3);
+    let b = worker("b", 3);
+    index.store(
+        0,
+        a.clone(),
+        StorageTier::Device,
+        None,
+        &blocks(&[("i:100", "x"), ("i:101", "y"), ("i:102", "z")]),
+    );
+    index.store(
+        0,
+        b.clone(),
+        StorageTier::Device,
+        None,
+        &blocks(&[("i:200", "x"), ("i:201", "y"), ("i:202", "z")]),
+    );
+    index.remove(0, &b, StorageTier::Device, &[Arc::from("i:202")]);
+    index.store(
+        0,
+        a.clone(),
+        StorageTier::Device,
+        Some(Arc::from("i:202")),
+        &blocks(&[("i:103", "tail")]),
+    );
+    // The equal local path does not prove that a's unknown integer i:202
+    // denotes b's prefix. Crediting the suffix would fabricate that evidence.
+    assert_eq!(
+        depth(&index, 0, &a, StorageTier::Device, &["x", "y", "z", "tail"]),
+        3
+    );
+    assert_eq!(
+        depth(&index, 0, &b, StorageTier::Device, &["x", "y", "z", "tail"]),
+        2
     );
 }
 

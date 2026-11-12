@@ -7,6 +7,7 @@ use std::sync::Arc;
 use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::RwLock;
 
+use crate::kv_hash::SequenceHash;
 use crate::kv_index::types::{
     ClearScope, Locality, ResidencyOwner, RoutableTarget, SourceId, StorageTier,
 };
@@ -38,13 +39,64 @@ pub struct TierMatch {
 type OwnerTier = (ResidencyOwner, StorageTier);
 type NodeRef = Arc<RwLock<TreeNode>>;
 type IncomingBlock = (Arc<str>, Arc<str>); // (seq_hash, local_hash)
-type EdgeBlock = (HashSet<Arc<str>>, Arc<str>); // (historical seq hashes, local_hash)
+
+fn same_clear_owner(owner: &ResidencyOwner, other: &ResidencyOwner) -> bool {
+    match (owner, other) {
+        (
+            ResidencyOwner::Worker {
+                source: s1,
+                dp_rank: r1,
+                ..
+            },
+            ResidencyOwner::Worker {
+                source: s2,
+                dp_rank: r2,
+                ..
+            },
+        ) => s1 == s2 && r1 == r2,
+        (
+            ResidencyOwner::CacheOwner { pool_id: p1, .. },
+            ResidencyOwner::CacheOwner { pool_id: p2, .. },
+        ) => p1 == p2,
+        _ => false,
+    }
+}
+/// Historical sequence aliases are publisher-scoped: identical opaque hashes
+/// at different sources need not describe the same path.
+#[derive(Default)]
+struct Aliases {
+    scoped: HashMap<RoutableTarget, HashSet<Arc<str>>>,
+}
+
+impl Aliases {
+    fn has(&self, target: &RoutableTarget, seq: &Arc<str>) -> bool {
+        self.scoped
+            .get(target)
+            .is_some_and(|hashes| hashes.contains(seq))
+    }
+
+    #[cfg(test)]
+    fn contains(&self, seq: &str) -> bool {
+        self.scoped.values().any(|hashes| hashes.contains(seq))
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.scoped.values().map(HashSet::len).sum()
+    }
+}
+
+type EdgeBlock = (Aliases, Arc<str>); // (historical scoped aliases, local_hash)
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 std::thread_local! {
     static AFTER_ANCHOR_CLONE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     static AFTER_QUERY_EDGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_QUERY_UNLOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_QUERY_SOURCE_LOOKUP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -59,6 +111,22 @@ fn after_anchor_clone() {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 fn after_query_edge() {
     let hook = AFTER_QUERY_EDGE.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+fn after_query_unlock() {
+    let hook = AFTER_QUERY_UNLOCK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+fn after_query_source_lookup() {
+    let hook = AFTER_QUERY_SOURCE_LOOKUP.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
@@ -98,17 +166,35 @@ impl TreeNode {
             children: HashMap::new(),
         }
     }
-    fn with_edge(blocks: &[IncomingBlock]) -> Self {
+    fn with_edge(blocks: &[IncomingBlock], target: &RoutableTarget) -> Self {
         let claims = (0..blocks.len()).map(|_| Vec::new()).collect();
         TreeNode {
             edge: blocks
                 .iter()
-                .map(|(seq, local)| (HashSet::from([seq.clone()]), local.clone()))
+                .map(|(seq, local)| {
+                    (
+                        Aliases {
+                            scoped: HashMap::from([(target.clone(), HashSet::from([seq.clone()]))]),
+                        },
+                        local.clone(),
+                    )
+                })
                 .collect(),
             claims,
             children: HashMap::new(),
         }
     }
+}
+
+fn unique_alias_position(node: &NodeRef, target: &RoutableTarget, seq: &Arc<str>) -> Option<usize> {
+    let node = node.read();
+    let mut positions = node
+        .edge
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (aliases, _))| aliases.has(target, seq).then_some(i));
+    let position = positions.next()?;
+    positions.next().is_none().then_some(position)
 }
 
 /// One `group_idx`'s compressed radix tree + owner/tier claims for a single
@@ -117,6 +203,8 @@ impl TreeNode {
 /// `group_idx`, so the same tokens under two groups yield the same seq hash and
 /// would clobber a shared anchor map; sharding keeps them apart.
 struct GroupShard {
+    /// Serializes topology-changing operations across different sources.
+    topology: RwLock<()>,
     /// Tree root (sentinel: empty edge, no claims, only children).
     root: NodeRef,
     /// Engine seq hash → tree node, so a store jumps to its parent and a
@@ -124,21 +212,20 @@ struct GroupShard {
     // ponytail: never trimmed — topology outlives residency; unique-prefix churn
     // grows topology and historical alias sets without limit. Revisit with an
     // epoch leaf sweep if growth shows.
-    anchors: DashMap<Arc<str>, NodeRef>,
+    // The same opaque integer may refer to different paths at two publishers.
+    // Keep parent anchors scoped by the publishing target, not by hash alone.
+    scoped_anchors: DashMap<Arc<str>, HashMap<RoutableTarget, NodeRef>>,
     /// Reverse lookup: (owner, tier) → seq hashes claimed.
     reverse: DashMap<OwnerTier, HashSet<Arc<str>>>,
-    /// Per-(owner, tier) count of distinct active engine sequence observations.
-    /// Multiple aliases of one logical block remain distinct observations.
-    counts: DashMap<OwnerTier, usize>,
 }
 
 impl GroupShard {
     fn new() -> Self {
         GroupShard {
+            topology: RwLock::new(()),
             root: Arc::new(RwLock::new(TreeNode::root())),
-            anchors: DashMap::new(),
+            scoped_anchors: DashMap::new(),
             reverse: DashMap::new(),
-            counts: DashMap::new(),
         }
     }
 
@@ -158,24 +245,48 @@ impl GroupShard {
         tier: StorageTier,
         parent_seq: Option<Arc<str>>,
         blocks: &[IncomingBlock],
-    ) {
+    ) -> bool {
         let key = (owner, tier);
-        // An unknown ancestor cannot be replaced by root: block-local hashes
-        // do not prove that this suffix is a stand-alone request prefix.
-        if let Some(seq) = &parent_seq {
-            if !self.anchors.contains_key(seq) {
-                tracing::debug!(parent_seq = %seq, "kv_index: unknown parent; skipping unanchored store");
-                return;
+        let target = key.0.target();
+        if blocks.is_empty() {
+            return true;
+        }
+        // A parent may borrow only a uniquely established foreign content
+        // position; this is topology evidence, never a residency claim.
+        let parent = if let Some(seq) = &parent_seq {
+            match self.resolve_parent(&target, seq) {
+                Ok(Some(parent)) => Some(parent),
+                Ok(None) => {
+                    tracing::debug!(parent_seq = %seq, "kv_index: unknown or ambiguous parent; skipping unanchored store");
+                    return true;
+                }
+                Err(()) => return false,
             }
+        } else {
+            None
+        };
+        if !self.store_path_is_consistent(&target, parent.as_ref(), parent_seq.as_ref(), blocks) {
+            return false;
+        }
+        if let (Some(seq), Some((node, offset, true))) = (&parent_seq, &parent) {
+            let mut node_guard = node.write();
+            node_guard.edge[*offset]
+                .0
+                .scoped
+                .entry(target.clone())
+                .or_default()
+                .insert(seq.clone());
+            self.scoped_anchors
+                .entry(seq.clone())
+                .or_default()
+                .insert(target.clone(), node.clone());
         }
         let mut cursor = parent_seq;
         let mut bi = 0;
         while bi < blocks.len() {
             let node = match &cursor {
                 Some(seq) => self
-                    .anchors
-                    .get(seq)
-                    .map(|node| node.clone())
+                    .anchor(&target, seq)
                     .expect("known cursor must remain anchored; anchors are insert-only"),
                 None => self.root.clone(),
             };
@@ -186,7 +297,7 @@ impl GroupShard {
                 let Some(pos) = parent
                     .edge
                     .iter()
-                    .position(|(aliases, _)| aliases.contains(seq))
+                    .position(|(aliases, _)| aliases.has(&target, seq))
                 else {
                     // The same split-only progress argument as remove_claim
                     // applies to this fixed cursor; resolve its moved anchor.
@@ -195,20 +306,20 @@ impl GroupShard {
                     continue;
                 };
                 if pos + 1 < parent.edge.len() {
-                    self.split_locked(&mut parent, pos + 1);
+                    self.split_locked(&mut parent, &node, pos + 1);
                 }
             }
             let child = parent.children.get(&blocks[bi].1).cloned();
             let Some(child) = child else {
                 // Keep the parent locked from lookup through publication so
                 // another writer cannot replace a newly installed child.
-                let new_node = Arc::new(RwLock::new(TreeNode::with_edge(&blocks[bi..])));
+                let new_node = Arc::new(RwLock::new(TreeNode::with_edge(&blocks[bi..], &target)));
                 let mut new = new_node.write();
                 self.record_locked(&mut new, &new_node, &key, &blocks[bi..]);
                 parent
                     .children
                     .insert(blocks[bi].1.clone(), new_node.clone());
-                return;
+                return true;
             };
             drop(parent);
             // Match, split, and claim under one write lock: a concurrent split
@@ -217,7 +328,7 @@ impl GroupShard {
             let matched = edge_common_prefix(&c.edge, &blocks[bi..]);
             debug_assert!(matched >= 1, "child key matches its first edge block");
             if matched < c.edge.len() {
-                self.split_locked(&mut c, matched);
+                self.split_locked(&mut c, &child, matched);
             }
             self.record_locked(&mut c, &child, &key, &blocks[bi..bi + matched]);
             bi += matched;
@@ -225,9 +336,132 @@ impl GroupShard {
             // anchor remains a valid cursor even if a later split moves it.
             cursor = Some(blocks[bi - 1].0.clone());
         }
+        true
     }
 
-    /// Record incoming identities into anchors, reverse, counts, and
+    /// Verify every previously seen source hash resolves to the exact same
+    /// logical path and edge offset before mutating any part of this store.
+    /// Production callers hold the domain write lock throughout the check and
+    /// store; independent source hashes may legitimately have the same bytes.
+    fn store_path_is_consistent(
+        &self,
+        target: &RoutableTarget,
+        parent: Option<&(NodeRef, usize, bool)>,
+        parent_seq: Option<&Arc<str>>,
+        blocks: &[IncomingBlock],
+    ) -> bool {
+        let mut path = Some(match parent {
+            None => (self.root.clone(), 0),
+            Some((node, position, _)) => (node.clone(), position + 1),
+        });
+        let mut incoming = HashSet::with_capacity(blocks.len());
+        if let Some(parent) = parent_seq {
+            incoming.insert(parent.clone());
+        }
+        for (seq, local) in blocks {
+            // Each entry is a different prefix position, even if local tokens
+            // repeat; an identical sequence hash cannot name both safely.
+            if !incoming.insert(seq.clone()) {
+                return false;
+            }
+            let expected = path.take().and_then(|(node, offset)| {
+                let current = node.read();
+                if offset < current.edge.len() {
+                    (current.edge[offset].1 == *local).then(|| (node.clone(), offset))
+                } else {
+                    current.children.get(local).cloned().map(|child| (child, 0))
+                }
+            });
+            if let Some(anchor) = self.anchor(target, seq) {
+                let Some((node, offset)) = &expected else {
+                    return false;
+                };
+                if !Arc::ptr_eq(&anchor, node)
+                    || !node
+                        .read()
+                        .edge
+                        .get(*offset)
+                        .is_some_and(|(aliases, _)| aliases.has(target, seq))
+                {
+                    return false;
+                }
+            }
+            path = expected.map(|(node, offset)| (node, offset + 1));
+        }
+        true
+    }
+
+    /// Return the exact source-scoped parent, or borrow one unambiguous global
+    /// topology anchor for a full byte digest / legacy opaque identifier.
+    /// A foreign integer or short byte hash is never adequate identity proof.
+    fn resolve_parent(
+        &self,
+        target: &RoutableTarget,
+        seq: &Arc<str>,
+    ) -> Result<Option<(NodeRef, usize, bool)>, ()> {
+        if let Some(node) = self.anchor(target, seq) {
+            let position = unique_alias_position(&node, target, seq).ok_or(())?;
+            return Ok(Some((node, position, false)));
+        }
+        if seq.starts_with("i:") {
+            return Ok(None);
+        }
+        if let Some(digest) = seq.strip_prefix("b:") {
+            if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Ok(None);
+            }
+        }
+        let Some(anchors) = self.scoped_anchors.get(seq) else {
+            return Ok(None);
+        };
+        let candidates: Vec<_> = anchors
+            .iter()
+            .map(|(scope, node)| (scope.clone(), node.clone()))
+            .collect();
+        drop(anchors);
+        let mut found: Option<(NodeRef, usize)> = None;
+        for (scope, node) in candidates {
+            let Some(position) = unique_alias_position(&node, &scope, seq) else {
+                return Ok(None);
+            };
+            if let Some((known, known_position)) = &found {
+                if !Arc::ptr_eq(known, &node) || *known_position != position {
+                    return Ok(None);
+                }
+            } else {
+                found = Some((node, position));
+            }
+        }
+        Ok(found.map(|(node, position)| (node, position, true)))
+    }
+
+    /// Attach a sparse fact only when an existing source-scoped anchor proves
+    /// one exact tree position; an unanchored sparse fact remains detached.
+    fn attach_existing(&self, owner: &ResidencyOwner, tier: StorageTier, seq: &Arc<str>) {
+        let target = owner.target();
+        let Some(node) = self.anchor(&target, seq) else {
+            return;
+        };
+        let mut node = node.write();
+        let mut positions = node
+            .edge
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (aliases, _))| aliases.has(&target, seq).then_some(i));
+        let Some(position) = positions.next() else {
+            return;
+        };
+        if positions.next().is_some() {
+            return;
+        }
+        drop(positions);
+        let claim = (owner.clone(), tier);
+        if !node.claims[position].contains(&claim) {
+            node.claims[position].push(claim);
+        }
+    }
+
+    /// Record incoming identities into anchors and reverse, and
     /// attach `(owner, tier)` as a per-block claim. Idempotent per
     /// (owner, tier, block). Caller holds `node`'s write lock.
     fn record_locked(
@@ -238,16 +472,20 @@ impl GroupShard {
         incoming: &[IncomingBlock],
     ) {
         for (i, (seq, _)) in incoming.iter().enumerate() {
-            n.edge[i].0.insert(seq.clone());
-            self.anchors.insert(seq.clone(), node.clone());
-            if self
-                .reverse
+            n.edge[i]
+                .0
+                .scoped
+                .entry(key.0.target())
+                .or_default()
+                .insert(seq.clone());
+            self.scoped_anchors
+                .entry(seq.clone())
+                .or_default()
+                .insert(key.0.target(), node.clone());
+            self.reverse
                 .entry(key.clone())
                 .or_default()
-                .insert(seq.clone())
-            {
-                *self.counts.entry(key.clone()).or_insert(0) += 1;
-            }
+                .insert(seq.clone());
             if !n.claims[i].contains(key) {
                 n.claims[i].push(key.clone());
             }
@@ -259,7 +497,7 @@ impl GroupShard {
     /// the remainder's claims and the old children. The remainder's seq hashes
     /// are re-anchored to the new node so `remove`/`clear` still find them.
     /// Called under the caller's write lock on `child`.
-    fn split_locked(&self, c: &mut TreeNode, pos: usize) {
+    fn split_locked(&self, c: &mut TreeNode, original: &NodeRef, pos: usize) {
         let remainder: Vec<EdgeBlock> = c.edge.split_off(pos);
         let rem_claims: Vec<Vec<OwnerTier>> = c.claims.split_off(pos);
         let old_children = std::mem::take(&mut c.children);
@@ -273,8 +511,16 @@ impl GroupShard {
         // through all re-anchoring and publication so a split cannot race us.
         let r = rem_node.write();
         for (aliases, _) in &r.edge {
-            for seq in aliases {
-                self.anchors.insert(seq.clone(), rem_node.clone());
+            for (target, seqs) in &aliases.scoped {
+                for seq in seqs {
+                    if let Some(mut anchors) = self.scoped_anchors.get_mut(seq) {
+                        if let Some(anchor) = anchors.get_mut(target) {
+                            if Arc::ptr_eq(anchor, original) {
+                                *anchor = rem_node.clone();
+                            }
+                        }
+                    }
+                }
             }
         }
         c.children.insert(rem_first, rem_node.clone());
@@ -287,22 +533,10 @@ impl GroupShard {
     pub fn remove(&self, owner: &ResidencyOwner, tier: StorageTier, seq_hashes: &[Arc<str>]) {
         let key = (owner.clone(), tier);
         for seq in seq_hashes {
-            let mut removed = false;
             if let Some(mut claims) = self.reverse.get_mut(&key) {
-                if claims.remove(seq) {
-                    removed = true;
-                }
+                claims.remove(seq);
             }
             self.remove_claim(seq, &key);
-            if removed {
-                if let Some(mut c) = self.counts.get_mut(&key) {
-                    if *c > 0 {
-                        *c -= 1;
-                    }
-                }
-                // Atomic: a concurrent store bumping back above zero wins.
-                self.counts.remove_if(&key, |_, c| *c == 0);
-            }
         }
     }
 
@@ -344,7 +578,6 @@ impl GroupShard {
                 .unwrap_or_default();
             self.remove(&key.0, key.1, &seqs);
             self.reverse.remove_if(&key, |_, seqs| seqs.is_empty());
-            self.counts.remove_if(&key, |_, count| *count == 0);
         }
     }
 
@@ -369,6 +602,49 @@ impl GroupShard {
             self.remove(&key.0, key.1, &seqs);
             self.reverse.remove_if(&key, |_, seqs| seqs.is_empty());
         }
+        let target = RoutableTarget {
+            instance_id: source.clone(),
+            dp_rank,
+        };
+        self.scoped_anchors.retain(|_, anchors| {
+            anchors.remove(&target);
+            !anchors.is_empty()
+        });
+        self.prune_source_paths(&target);
+    }
+
+    /// After all facts and anchors for a source are gone, remove its historical
+    /// aliases and empty leaves. Retain every node with a live alias, claim, or
+    /// descendant: another source may still use it as a parent anchor.
+    fn prune_source_paths(&self, target: &RoutableTarget) {
+        let mut stack = vec![(self.root.clone(), false)];
+        while let Some((node, visited)) = stack.pop() {
+            if !visited {
+                stack.push((node.clone(), true));
+                let children: Vec<_> = node.read().children.values().cloned().collect();
+                stack.extend(children.into_iter().map(|child| (child, false)));
+                continue;
+            }
+            let mut current = node.write();
+            for (aliases, _) in &mut current.edge {
+                aliases.scoped.remove(target);
+            }
+            current.children.retain(|_, child| {
+                let child = child.read();
+                !child.children.is_empty()
+                    || child
+                        .edge
+                        .iter()
+                        .any(|(aliases, _)| !aliases.scoped.is_empty())
+                    || child.claims.iter().any(|claims| !claims.is_empty())
+            });
+        }
+    }
+
+    fn anchor(&self, target: &RoutableTarget, seq: &Arc<str>) -> Option<NodeRef> {
+        self.scoped_anchors
+            .get(seq)
+            .and_then(|entries| entries.get(target).cloned())
     }
     /// Drop the logical block claim only after its last active alias is gone.
     fn remove_claim(&self, seq: &Arc<str>, key: &OwnerTier) {
@@ -381,22 +657,30 @@ impl GroupShard {
         // that Clear cannot enumerate.
         loop {
             // Never hold an anchors map guard while taking the node lock.
-            let Some(node) = self.anchors.get(seq).map(|n| n.clone()) else {
+            let Some(node) = self.anchor(&key.0.target(), seq) else {
                 return;
             };
             #[cfg(all(test, feature = "cpu", feature = "ready"))]
             after_anchor_clone();
             let mut n = node.write();
-            let Some(idx) = n.edge.iter().position(|(aliases, _)| aliases.contains(seq)) else {
+            let target = key.0.target();
+            let Some(idx) = n
+                .edge
+                .iter()
+                .position(|(aliases, _)| aliases.has(&target, seq))
+            else {
                 // A concurrent split moved this alias; resolve it again.
                 drop(n);
                 std::thread::yield_now();
                 continue;
             };
-            let active = self
-                .reverse
-                .get(key)
-                .is_some_and(|seqs| n.edge[idx].0.iter().any(|alias| seqs.contains(alias)));
+            let active = self.reverse.get(key).is_some_and(|seqs| {
+                n.edge[idx]
+                    .0
+                    .scoped
+                    .get(&target)
+                    .is_some_and(|aliases| aliases.iter().any(|alias| seqs.contains(alias)))
+            });
             if !active {
                 n.claims[idx].retain(|claim| claim != key);
             }
@@ -408,7 +692,7 @@ impl GroupShard {
     /// per-position `(owner, tier)` claims along the matched prefix; the
     /// collapse below builds maximal `[start, end)` segments from them. Each
     /// edge element's claims are the claims of the node that edge belongs to.
-    pub fn find_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
+    fn collect_claims(&self, query: &MatchQuery) -> Vec<Vec<OwnerTier>> {
         let mut node_claims: Vec<Vec<OwnerTier>> = Vec::with_capacity(query.local_hashes.len());
         let mut qi = 0; // index into query.local_hashes
         let mut next = query
@@ -425,7 +709,8 @@ impl GroupShard {
                 && qi + advanced < query.local_hashes.len()
                 && c.edge[advanced].1 == query.local_hashes[qi + advanced]
             {
-                // Copy only matched claims, never historical alias sets.
+                // Derived references are maintained in the same source or
+                // global transaction as `reverse`, the authoritative facts.
                 node_claims.push(c.claims[advanced].clone());
                 advanced += 1;
             }
@@ -444,6 +729,10 @@ impl GroupShard {
             after_query_edge();
         }
 
+        node_claims
+    }
+
+    fn aggregate_claims(query: &MatchQuery, node_claims: &[Vec<OwnerTier>]) -> Vec<TierMatch> {
         // Per (target, tier), run-length collect the maximal contiguous
         // [start, end) block intervals the target holds at that tier. The index
         // stores by owner but answers by target; locality is derived from the
@@ -486,18 +775,56 @@ impl GroupShard {
             .filter(|m| !m.segments.is_empty())
             .collect()
     }
+
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    fn find_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
+        Self::aggregate_claims(query, &self.collect_claims(query))
+    }
 }
 
-/// One radix-tree index per cache identity, sharded by `group_idx`. Implements
-/// `TieredMatchProvider` directly.
+/// Serializes one worker/rank across its cache groups.
+struct SourceLock {
+    access: RwLock<()>,
+    generation: AtomicU64,
+}
+
+/// Identity and trust generation of one source at snapshot time.
+pub(crate) struct SourceVersion {
+    target: RoutableTarget,
+    source: Arc<SourceLock>,
+    generation: u64,
+}
+
+impl SourceLock {
+    fn new() -> Self {
+        Self {
+            access: RwLock::new(()),
+            generation: AtomicU64::new(0),
+        }
+    }
+}
+
+/// One shared fact index per cache identity, sharded by cache group.
+/// Implements `TieredMatchProvider` directly for full attention.
 pub struct KvBlockIndexer {
     /// One shard per `group_idx` (kv-cache-spec group).
     // ponytail: group_idx is None on the wire → 0; single-spec models have one
     // group and multi-spec always emits group_idx, so 0 is a safe default.
     shards: DashMap<u32, Arc<GroupShard>>,
     suspended_sources: DashMap<(SourceId, u32), ()>,
-    /// Reject query snapshots crossing an invalidation/resume boundary.
+    /// Retained for lifecycle tests; production uses per-source generations.
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     source_generation: AtomicU64,
+    /// Gates may be removed only by `retire_source` under the global barrier.
+    source_locks: DashMap<RoutableTarget, Arc<SourceLock>>,
+    /// Namespace directory for remove events, which carry no identity. This
+    /// contains names only; `GroupShard::reverse` remains the sole fact table.
+    sparse_namespaces: DashMap<ResidencyOwner, HashSet<String>>,
+    /// Recomputable per-owner/identity cardinalities; never residency facts.
+    /// Domain writes maintain the counters or invalidate them for dense edits.
+    sparse_counts: DashMap<(ResidencyOwner, Option<String>), usize>,
+    /// Ordinary access shares the barrier; pool clear and retirement exclude it.
+    domain: RwLock<()>,
 }
 
 impl KvBlockIndexer {
@@ -505,7 +832,12 @@ impl KvBlockIndexer {
         KvBlockIndexer {
             shards: DashMap::new(),
             suspended_sources: DashMap::new(),
+            #[cfg(all(test, feature = "cpu", feature = "ready"))]
             source_generation: AtomicU64::new(0),
+            source_locks: DashMap::new(),
+            sparse_namespaces: DashMap::new(),
+            sparse_counts: DashMap::new(),
+            domain: RwLock::new(()),
         }
     }
 
@@ -521,6 +853,31 @@ impl KvBlockIndexer {
             .clone()
     }
 
+    fn source_lock(&self, target: &RoutableTarget) -> Arc<SourceLock> {
+        self.source_locks
+            .entry(target.clone())
+            .or_insert_with(|| Arc::new(SourceLock::new()))
+            .clone()
+    }
+
+    /// Check a snapshot after dropping its locks. Ordinary store/remove is a
+    /// valid snapshot transition; suspension, resume, or retirement invalidates
+    /// the result. This does not reserve engine blocks.
+    pub(crate) fn source_version_is_current(&self, version: &SourceVersion) -> bool {
+        let current = self
+            .source_locks
+            .get(&version.target)
+            .is_some_and(|entry| Arc::ptr_eq(entry.value(), &version.source));
+        #[cfg(all(test, feature = "cpu", feature = "ready"))]
+        after_query_source_lookup();
+        current
+            && version.source.generation.load(Ordering::Acquire) == version.generation
+            && !self
+                .suspended_sources
+                .contains_key(&(version.target.instance_id.clone(), version.target.dp_rank))
+            && version.source.generation.load(Ordering::Acquire) == version.generation
+    }
+
     pub fn store(
         &self,
         group_idx: u32,
@@ -529,7 +886,10 @@ impl KvBlockIndexer {
         parent_seq: Option<Arc<str>>,
         blocks: &[(Arc<str>, Arc<str>)],
     ) {
-        self.shard(group_idx).store(owner, tier, parent_seq, blocks);
+        let target = owner.target();
+        self.with_source_batch(&target, |batch| {
+            batch.store(group_idx, owner, tier, parent_seq, blocks)
+        });
     }
 
     pub fn remove(
@@ -539,41 +899,118 @@ impl KvBlockIndexer {
         tier: StorageTier,
         seq_hashes: &[Arc<str>],
     ) {
-        self.shard(group_idx).remove(owner, tier, seq_hashes);
+        let target = owner.target();
+        self.with_source_batch(&target, |batch| {
+            batch.remove(group_idx, owner, tier, seq_hashes)
+        });
     }
 
     /// Clear one owner's residency across every group. A worker reset /
     /// `AllBlocksCleared` spans all kv-cache-spec groups the worker holds.
     pub fn clear(&self, owner: &ResidencyOwner, scope: ClearScope) {
-        let shards: Vec<Arc<GroupShard>> = self.shards.iter().map(|e| e.value().clone()).collect();
-        for s in shards {
-            s.clear(owner, scope);
+        if matches!(owner, ResidencyOwner::Worker { .. }) && scope == ClearScope::Worker {
+            self.with_source_batch(&owner.target(), |batch| batch.clear(owner, scope));
+        } else {
+            self.with_batch(|batch| batch.clear(owner, scope));
         }
     }
 
     /// Hide a source's observations while contiguous replay repairs its state.
     /// Correctness does not depend on delivery of advisory ingestion signals.
     pub fn suspend_source(&self, source: &SourceId, dp_rank: u32) {
+        let target = RoutableTarget {
+            instance_id: source.clone(),
+            dp_rank,
+        };
+        let _domain = self.domain.read();
+        let source_lock = self.source_lock(&target);
+        let _guard = source_lock.access.write();
+        self.suspend_source_unlocked(source, dp_rank);
+    }
+
+    fn suspend_source_unlocked(&self, source: &SourceId, dp_rank: u32) {
         self.suspended_sources.insert((source.clone(), dp_rank), ());
+        #[cfg(all(test, feature = "cpu", feature = "ready"))]
         self.source_generation.fetch_add(1, Ordering::AcqRel);
+        let target = RoutableTarget {
+            instance_id: source.clone(),
+            dp_rank,
+        };
+        self.source_lock(&target)
+            .generation
+            .fetch_add(1, Ordering::AcqRel);
     }
 
     /// Stop crediting a lossy source and discard all its old observations.
     pub fn invalidate_source(&self, source: &SourceId, dp_rank: u32) {
-        self.suspend_source(source, dp_rank);
+        let target = RoutableTarget {
+            instance_id: source.clone(),
+            dp_rank,
+        };
+        let _domain = self.domain.read();
+        let source_lock = self.source_lock(&target);
+        let _guard = source_lock.access.write();
+        self.invalidate_source_unlocked(source, dp_rank);
+    }
+
+    /// Permanently retire a fenced source. The global barrier drains all
+    /// transactions before removing its gate; in-flight owned snapshots retain
+    /// the old gate and observe its incremented generation.
+    pub(crate) fn retire_source(&self, source: &SourceId, dp_rank: u32) {
+        let _domain = self.domain.write();
+        self.invalidate_source_unlocked(source, dp_rank);
+        let target = RoutableTarget {
+            instance_id: source.clone(),
+            dp_rank,
+        };
+        self.source_locks.remove(&target);
+        self.suspended_sources.remove(&(source.clone(), dp_rank));
+    }
+
+    fn invalidate_source_unlocked(&self, source: &SourceId, dp_rank: u32) {
+        self.suspend_source_unlocked(source, dp_rank);
         let shards: Vec<Arc<GroupShard>> = self.shards.iter().map(|e| e.value().clone()).collect();
         for shard in shards {
+            let _topology = shard.topology.write();
             shard.clear_source(source, dp_rank);
         }
+        self.sparse_namespaces.retain(|owner, _| {
+            let target = owner.target();
+            target.instance_id != *source || target.dp_rank != dp_rank
+        });
+        self.sparse_counts.retain(|(owner, _), _| {
+            let target = owner.target();
+            target.instance_id != *source || target.dp_rank != dp_rank
+        });
     }
 
     /// Enable fresh observations after complete replay, or after discarding
     /// incomplete replay and applying a new valid live batch to a clean source.
     /// Already-active sources must not invalidate concurrent query snapshots.
     pub fn resume_source(&self, source: &SourceId, dp_rank: u32) {
+        let target = RoutableTarget {
+            instance_id: source.clone(),
+            dp_rank,
+        };
+        let _domain = self.domain.read();
+        let source_lock = self.source_lock(&target);
+        let _guard = source_lock.access.write();
+        self.resume_source_unlocked(source, dp_rank);
+    }
+
+    fn resume_source_unlocked(&self, source: &SourceId, dp_rank: u32) {
+        let target = RoutableTarget {
+            instance_id: source.clone(),
+            dp_rank,
+        };
+        // Never hold a suspended-sources map entry while acquiring a
+        // source-lock map entry: final query checks access both maps.
+        let gate = self.source_lock(&target);
         if let Entry::Occupied(entry) = self.suspended_sources.entry((source.clone(), dp_rank)) {
             // Fence the visibility transition before removing its hidden state.
+            #[cfg(all(test, feature = "cpu", feature = "ready"))]
             self.source_generation.fetch_add(1, Ordering::AcqRel);
+            gate.generation.fetch_add(1, Ordering::AcqRel);
             entry.remove();
         }
     }
@@ -584,20 +1021,540 @@ impl KvBlockIndexer {
     }
 
     pub fn find_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
-        let generation = self.source_generation.load(Ordering::Acquire);
-        let matches = self.shard(query.group_idx).find_matches(query);
-        let matches = matches
-            .into_iter()
-            .filter(|hit| {
-                !self
-                    .suspended_sources
-                    .contains_key(&(hit.target.instance_id.clone(), hit.target.dp_rank))
+        let _domain = self.domain.read();
+        let mut sources: Vec<_> = self
+            .source_locks
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        sources.sort_unstable_by(|a, b| {
+            a.0.instance_id
+                .cmp(&b.0.instance_id)
+                .then(a.0.dp_rank.cmp(&b.0.dp_rank))
+        });
+        let _guards: Vec<_> = sources
+            .iter()
+            .map(|(_, source)| source.access.read())
+            .collect();
+        let snapshots: HashMap<_, _> = sources
+            .iter()
+            .map(|(target, source)| {
+                (
+                    target.clone(),
+                    SourceVersion {
+                        target: target.clone(),
+                        source: source.clone(),
+                        generation: source.generation.load(Ordering::Acquire),
+                    },
+                )
             })
             .collect();
-        if self.source_generation.load(Ordering::Acquire) != generation {
-            return Vec::new();
+        let shard = self.shard(query.group_idx);
+        let topology = shard.topology.read();
+        let mut node_claims = shard.collect_claims(query);
+        let eligible: HashSet<_> = sources
+            .iter()
+            .filter_map(|(target, source)| {
+                (source.generation.load(Ordering::Acquire) == snapshots[target].generation
+                    && !self
+                        .suspended_sources
+                        .contains_key(&(target.instance_id.clone(), target.dp_rank)))
+                .then_some(target.clone())
+            })
+            .collect();
+        for claims in &mut node_claims {
+            claims.retain(|(owner, _)| eligible.contains(&owner.target()));
         }
-        matches
+        drop(topology);
+        drop(_guards);
+        drop(_domain);
+        #[cfg(all(test, feature = "cpu", feature = "ready"))]
+        after_query_unlock();
+        GroupShard::aggregate_claims(query, &node_claims)
+            .into_iter()
+            .filter(|hit| {
+                snapshots
+                    .get(&hit.target)
+                    .is_some_and(|version| self.source_version_is_current(version))
+            })
+            .collect()
+    }
+
+    /// Run a whole publisher batch under one domain write lock.
+    pub(crate) fn with_batch<R>(&self, f: impl FnOnce(&IndexBatch<'_>) -> R) -> R {
+        let _guard = self.domain.write();
+        f(&IndexBatch {
+            index: self,
+            scope: None,
+        })
+    }
+
+    /// Test-only global snapshot for cases covering multiple owners.
+    #[cfg(test)]
+    pub(crate) fn with_snapshot<R>(&self, f: impl FnOnce(&IndexSnapshot<'_>) -> R) -> R {
+        let _guard = self.domain.write();
+        f(&IndexSnapshot {
+            index: self,
+            scope: None,
+        })
+    }
+
+    /// A source batch is atomic for this target without blocking other targets.
+    pub(crate) fn with_source_batch<R>(
+        &self,
+        target: &RoutableTarget,
+        f: impl FnOnce(&IndexBatch<'_>) -> R,
+    ) -> R {
+        let _domain = self.domain.read();
+        let source = self.source_lock(target);
+        let _guard = source.access.write();
+        f(&IndexBatch {
+            index: self,
+            scope: Some(target.clone()),
+        })
+    }
+
+    /// Read all groups for one target from the same source transaction.
+    pub(crate) fn with_source_snapshot<R>(
+        &self,
+        target: &RoutableTarget,
+        f: impl FnOnce(&IndexSnapshot<'_>) -> R,
+    ) -> R {
+        let _domain = self.domain.read();
+        let source = self.source_lock(target);
+        let _guard = source.access.read();
+        f(&IndexSnapshot {
+            index: self,
+            scope: Some(target.clone()),
+        })
+    }
+}
+
+/// A batch holds either the global barrier exclusively, or the barrier for
+/// reading together with its scoped source write lock. Its closure must not
+/// re-enter any locking `KvBlockIndexer` method.
+pub(crate) struct IndexBatch<'a> {
+    index: &'a KvBlockIndexer,
+    scope: Option<RoutableTarget>,
+}
+
+/// A consistent view held under either the global barrier or a source lock.
+pub(crate) struct IndexSnapshot<'a> {
+    index: &'a KvBlockIndexer,
+    scope: Option<RoutableTarget>,
+}
+
+fn sparse_digest(hash: &SequenceHash) -> [u8; 66] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut key = [0; 66];
+    key[0] = b'b';
+    key[1] = b':';
+    for (i, byte) in hash.iter().copied().enumerate() {
+        key[2 + 2 * i] = HEX[usize::from(byte >> 4)];
+        key[3 + 2 * i] = HEX[usize::from(byte & 0x0f)];
+    }
+    key
+}
+
+fn sparse_key(namespace: Option<&str>, hash: &SequenceHash) -> Arc<str> {
+    let key = sparse_digest(hash);
+    let digest = std::str::from_utf8(&key).expect("digest uses ASCII hex");
+    match namespace {
+        None => Arc::from(digest),
+        Some(name) => Arc::from(format!("n:{}:{}:{}", name.len(), name, digest)),
+    }
+}
+
+/// Borrowed lookups do not need an allocation per base-model hash.
+pub(crate) enum PreparedKey {
+    Inline([u8; 66]),
+    Owned(Arc<str>),
+}
+
+impl PreparedKey {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Inline(key) => std::str::from_utf8(key).expect("digest uses ASCII hex"),
+            Self::Owned(key) => key.as_ref(),
+        }
+    }
+}
+
+/// Encode a request's hashes once outside the domain lock and reuse the result
+/// for every group. Namespace is part of the key, never a query fallback.
+pub(crate) fn prepare_sparse_keys(
+    namespace: Option<&str>,
+    hashes: &[SequenceHash],
+) -> Vec<PreparedKey> {
+    match namespace {
+        None => hashes
+            .iter()
+            .map(|hash| PreparedKey::Inline(sparse_digest(hash)))
+            .collect(),
+        Some(name) => hashes
+            .iter()
+            .map(|hash| PreparedKey::Owned(sparse_key(Some(name), hash)))
+            .collect(),
+    }
+}
+
+fn in_namespace(key: &str, namespace: Option<&str>) -> bool {
+    match namespace {
+        None => !key.starts_with("n:"),
+        Some(name) => key.starts_with(&format!("n:{}:{}:", name.len(), name)),
+    }
+}
+
+const TIERS: [StorageTier; 4] = [
+    StorageTier::Device,
+    StorageTier::HostPinned,
+    StorageTier::Disk,
+    StorageTier::External,
+];
+
+impl IndexBatch<'_> {
+    fn check_target(&self, target: &RoutableTarget) {
+        if let Some(scope) = &self.scope {
+            assert_eq!(scope, target, "source transaction crossed targets");
+        } else {
+            self.index.source_lock(target);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn suspend_source(&self, source: &SourceId, rank: u32) {
+        self.check_target(&RoutableTarget {
+            instance_id: source.clone(),
+            dp_rank: rank,
+        });
+        self.index.suspend_source_unlocked(source, rank);
+    }
+
+    pub(crate) fn resume_source(&self, source: &SourceId, rank: u32) {
+        self.check_target(&RoutableTarget {
+            instance_id: source.clone(),
+            dp_rank: rank,
+        });
+        self.index.resume_source_unlocked(source, rank);
+    }
+
+    pub(crate) fn store(
+        &self,
+        group: u32,
+        owner: ResidencyOwner,
+        tier: StorageTier,
+        parent: Option<Arc<str>>,
+        blocks: &[(Arc<str>, Arc<str>)],
+    ) -> bool {
+        let target = owner.target();
+        self.check_target(&target);
+        self.index
+            .sparse_counts
+            .retain(|(candidate, _), _| candidate != &owner);
+        let shard = self.index.shard(group);
+        let topology = shard.topology.write();
+        let accepted = shard.store(owner, tier, parent, blocks);
+        drop(topology);
+        if !accepted {
+            // Hide and discard every observation from the ambiguous source
+            // while the domain write lock still protects all readers.
+            self.index
+                .invalidate_source_unlocked(&target.instance_id, target.dp_rank);
+        }
+        accepted
+    }
+
+    pub(crate) fn remove(
+        &self,
+        group: u32,
+        owner: &ResidencyOwner,
+        tier: StorageTier,
+        hashes: &[Arc<str>],
+    ) {
+        self.check_target(&owner.target());
+        let shard = self.index.shard(group);
+        let _topology = shard.topology.read();
+        shard.remove(owner, tier, hashes);
+        self.index
+            .sparse_counts
+            .retain(|(candidate, _), _| candidate != owner);
+    }
+
+    pub(crate) fn clear(&self, owner: &ResidencyOwner, scope: ClearScope) {
+        if self.scope.is_some() {
+            assert!(
+                matches!(owner, ResidencyOwner::Worker { .. }) && scope == ClearScope::Worker,
+                "cross-source clear requires a global transaction"
+            );
+        }
+        self.check_target(&owner.target());
+        let shards: Vec<_> = self
+            .index
+            .shards
+            .iter()
+            .map(|e| e.value().clone())
+            .collect();
+        for shard in shards {
+            let _topology = shard.topology.read();
+            shard.clear(owner, scope);
+        }
+        self.index.sparse_namespaces.retain(|candidate, _| {
+            if !matches!(scope, ClearScope::All) && scope != candidate.domain() {
+                return true;
+            }
+            !same_clear_owner(owner, candidate)
+        });
+        self.index.sparse_counts.retain(|(candidate, _), _| {
+            (!matches!(scope, ClearScope::All) && scope != candidate.domain())
+                || !same_clear_owner(owner, candidate)
+        });
+    }
+
+    /// Remove only this precise owner, including its incarnation.
+    pub(crate) fn clear_owner_exact(&self, owner: &ResidencyOwner) {
+        self.check_target(&owner.target());
+        let shards: Vec<_> = self
+            .index
+            .shards
+            .iter()
+            .map(|e| e.value().clone())
+            .collect();
+        for shard in shards {
+            let _topology = shard.topology.read();
+            for tier in TIERS {
+                let key = (owner.clone(), tier);
+                let hashes: Vec<_> = shard
+                    .reverse
+                    .get(&key)
+                    .map(|v| v.iter().cloned().collect())
+                    .unwrap_or_default();
+                shard.remove(owner, tier, &hashes);
+                shard.reverse.remove_if(&key, |_, hashes| hashes.is_empty());
+            }
+        }
+        self.index.sparse_namespaces.remove(owner);
+        self.index
+            .sparse_counts
+            .retain(|(candidate, _), _| candidate != owner);
+    }
+
+    fn count(&self, owner: &ResidencyOwner, namespace: Option<&str>) -> usize {
+        let key = (owner.clone(), namespace.map(str::to_owned));
+        if let Some(count) = self.index.sparse_counts.get(&key) {
+            return *count;
+        }
+        let mut entries = HashSet::new();
+        for entry in self.index.shards.iter() {
+            let group = *entry.key();
+            for tier in TIERS {
+                if let Some(hashes) = entry.value().reverse.get(&(owner.clone(), tier)) {
+                    for hash in hashes.iter().filter(|h| in_namespace(h, namespace)) {
+                        entries.insert((group, hash.clone()));
+                    }
+                }
+            }
+        }
+        let count = entries.len();
+        self.index.sparse_counts.insert(key, count);
+        count
+    }
+
+    /// Sparse events and radix-backed events update the same fact table.
+    pub(crate) fn store_sparse(
+        &self,
+        owner: &ResidencyOwner,
+        namespace: Option<&str>,
+        group: u32,
+        hash: &SequenceHash,
+        tier: StorageTier,
+        max_entries: usize,
+    ) -> bool {
+        self.check_target(&owner.target());
+        let shard = self.index.shard(group);
+        let hash = sparse_key(namespace, hash);
+        let existed = TIERS.into_iter().any(|t| {
+            shard
+                .reverse
+                .get(&(owner.clone(), t))
+                .is_some_and(|set| set.contains(&hash))
+        });
+        if !existed && self.count(owner, namespace) >= max_entries {
+            return false;
+        }
+        let key = (owner.clone(), tier);
+        shard.reverse.entry(key).or_default().insert(hash.clone());
+        if namespace.is_none() && !shard.scoped_anchors.is_empty() {
+            let _topology = shard.topology.read();
+            shard.attach_existing(owner, tier, &hash);
+        }
+        if let Some(name) = namespace {
+            self.index
+                .sparse_namespaces
+                .entry(owner.clone())
+                .or_default()
+                .insert(name.to_owned());
+        }
+        if !existed {
+            let key = (owner.clone(), namespace.map(str::to_owned));
+            if let Some(mut count) = self.index.sparse_counts.get_mut(&key) {
+                *count += 1;
+            }
+        }
+        true
+    }
+
+    /// Removal events do not identify the namespace, so invalidate every
+    /// matching namespace of this owner and group, but no other owner.
+    pub(crate) fn remove_sparse(
+        &self,
+        owner: &ResidencyOwner,
+        group: u32,
+        hash: &SequenceHash,
+        tier: Option<StorageTier>,
+    ) {
+        self.check_target(&owner.target());
+        let shard = self.index.shard(group);
+        let _topology = shard.topology.read();
+        let mut candidates = vec![(None, sparse_key(None, hash))];
+        if let Some(names) = self.index.sparse_namespaces.get(owner) {
+            candidates.extend(
+                names
+                    .iter()
+                    .map(|name| (Some(name.clone()), sparse_key(Some(name), hash))),
+            );
+        }
+        let mut removed = HashSet::new();
+        for t in TIERS
+            .into_iter()
+            .filter(|t| tier.is_none_or(|wanted| wanted == *t))
+        {
+            let key = (owner.clone(), t);
+            let hits: Vec<_> = shard
+                .reverse
+                .get(&key)
+                .map(|hashes| {
+                    candidates
+                        .iter()
+                        .filter(|(_, candidate)| hashes.contains(candidate))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let hashes: Vec<_> = hits.iter().map(|(_, hash)| hash.clone()).collect();
+            removed.extend(hits);
+            shard.remove(owner, t, &hashes);
+        }
+        // Capacity counts are an optimization, not residency facts.
+        // Decrement only when this page has disappeared from every tier.
+        for (namespace, hash) in removed {
+            if TIERS.into_iter().any(|t| {
+                shard
+                    .reverse
+                    .get(&(owner.clone(), t))
+                    .is_some_and(|set| set.contains(&hash))
+            }) {
+                continue;
+            }
+            if let Some(mut count) = self
+                .index
+                .sparse_counts
+                .get_mut(&(owner.clone(), namespace))
+            {
+                *count = count.saturating_sub(1);
+            }
+        }
+    }
+}
+
+impl IndexSnapshot<'_> {
+    fn check_target(&self, target: &RoutableTarget) {
+        if let Some(scope) = &self.scope {
+            assert_eq!(scope, target, "source snapshot crossed targets");
+        }
+    }
+
+    pub(crate) fn source_version(&self, target: &RoutableTarget) -> SourceVersion {
+        self.check_target(target);
+        let source = self
+            .index
+            .source_locks
+            .get(target)
+            .map(|entry| entry.value().clone())
+            .expect("source snapshot must have a registered gate");
+        let generation = source.generation.load(Ordering::Acquire);
+        SourceVersion {
+            target: target.clone(),
+            source,
+            generation,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn best_sparse_tier(
+        &self,
+        owner: &ResidencyOwner,
+        namespace: Option<&str>,
+        group: u32,
+        hash: &SequenceHash,
+    ) -> Option<StorageTier> {
+        let hash = sparse_key(namespace, hash);
+        self.best_sparse_prepared(owner, group, &hash)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn best_sparse_prepared(
+        &self,
+        owner: &ResidencyOwner,
+        group: u32,
+        hash: &Arc<str>,
+    ) -> Option<StorageTier> {
+        let target = owner.target();
+        self.check_target(&target);
+        if self
+            .index
+            .suspended_sources
+            .contains_key(&(target.instance_id, target.dp_rank))
+        {
+            return None;
+        }
+        let shard = self.index.shards.get(&group)?;
+        TIERS.into_iter().find(|tier| {
+            shard
+                .reverse
+                .get(&(owner.clone(), *tier))
+                .is_some_and(|set| set.contains(hash))
+        })
+    }
+
+    /// Resolve a group in tier order, acquiring each fact-table guard once.
+    pub(crate) fn sparse_tiers(
+        &self,
+        owner: &ResidencyOwner,
+        group: u32,
+        keys: &[PreparedKey],
+    ) -> Vec<Option<StorageTier>> {
+        let mut result = vec![None; keys.len()];
+        let target = owner.target();
+        self.check_target(&target);
+        if self
+            .index
+            .suspended_sources
+            .contains_key(&(target.instance_id, target.dp_rank))
+        {
+            return result;
+        }
+        let Some(shard) = self.index.shards.get(&group) else {
+            return result;
+        };
+        for tier in TIERS {
+            if let Some(hashes) = shard.reverse.get(&(owner.clone(), tier)) {
+                for (key, hit) in keys.iter().zip(&mut result) {
+                    if hit.is_none() && hashes.contains(key.as_str()) {
+                        *hit = Some(tier);
+                    }
+                }
+            }
+        }
+        result
     }
 }
 
@@ -662,6 +1619,647 @@ mod tests {
 
     fn h(s: &str) -> Arc<str> {
         Arc::<str>::from(s)
+    }
+
+    fn anchor_for(shard: &GroupShard, owner: &ResidencyOwner, seq: &str) -> NodeRef {
+        let target = owner.target();
+        let hash = h(seq);
+        let node = shard.anchor(&target, &hash).expect("source-scoped anchor");
+        assert!(unique_alias_position(&node, &target, &hash).is_some());
+        node
+    }
+
+    #[test]
+    fn prepared_sparse_keys_match_canonical_base_and_adapter_keys() {
+        let hash: SequenceHash = std::array::from_fn(|i| (i * 7) as u8);
+        let base = prepare_sparse_keys(None, &[hash]);
+        assert!(matches!(base[0], PreparedKey::Inline(_)));
+        assert_eq!(base[0].as_str(), sparse_key(None, &hash).as_ref());
+        let expected = format!(
+            "b:{}",
+            hash.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join("")
+        );
+        assert_eq!(base[0].as_str(), expected);
+        assert_eq!(base[0].as_str().len(), 66);
+        assert!(base[0].as_str().starts_with("b:00070e"));
+        let adapter = prepare_sparse_keys(Some("适配:a"), &[hash]);
+        assert!(matches!(adapter[0], PreparedKey::Owned(_)));
+        assert_eq!(
+            adapter[0].as_str(),
+            sparse_key(Some("适配:a"), &hash).as_ref()
+        );
+        assert_eq!(
+            adapter[0].as_str(),
+            format!("n:{}:适配:a:{}", "适配:a".len(), expected)
+        );
+        assert_ne!(base[0].as_str(), adapter[0].as_str());
+    }
+
+    fn assert_tree_references_have_facts(index: &KvBlockIndexer) {
+        for shard in index.shards.iter() {
+            let shard = shard.value();
+            let mut stack = vec![shard.root.clone()];
+            while let Some(node) = stack.pop() {
+                let node = node.read();
+                for (edge, claims) in node.edge.iter().zip(&node.claims) {
+                    for key in claims {
+                        let aliases = edge
+                            .0
+                            .scoped
+                            .get(&key.0.target())
+                            .expect("claim source alias");
+                        let facts = shard.reverse.get(key).expect("claim owner facts");
+                        assert!(
+                            aliases.iter().any(|hash| facts.contains(hash)),
+                            "stale tree reference"
+                        );
+                    }
+                }
+                stack.extend(node.children.values().cloned());
+            }
+        }
+    }
+
+    #[test]
+    fn derived_tree_references_track_facts_across_mutations() {
+        let index = KvBlockIndexer::new();
+        let a = worker("a");
+        let b = worker("b");
+        let sparse_hash = [11; 32];
+        let sparse_seq = sparse_key(None, &sparse_hash);
+        index.store(
+            0,
+            a.clone(),
+            StorageTier::Device,
+            None,
+            &[(sparse_seq.clone(), h("x")), (h("a2"), h("y"))],
+        );
+        index.store(
+            0,
+            b.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("b1"), h("x")), (h("b2"), h("z"))],
+        );
+        index.store(
+            0,
+            b.clone(),
+            StorageTier::HostPinned,
+            None,
+            &[(h("b1"), h("x"))],
+        );
+        assert_tree_references_have_facts(&index);
+        index.remove(0, &a, StorageTier::Device, &[sparse_seq]);
+        assert_tree_references_have_facts(&index);
+        index.with_batch(|batch| {
+            assert!(batch.store_sparse(&a, None, 0, &sparse_hash, StorageTier::Device, 8));
+        });
+        assert_tree_references_have_facts(&index);
+        index.with_batch(|batch| batch.clear_owner_exact(&b));
+        assert_tree_references_have_facts(&index);
+        index.invalidate_source(&SourceId::from("a"), 0);
+        assert_tree_references_have_facts(&index);
+    }
+
+    #[test]
+    fn sparse_records_are_scoped_by_group_identity_and_incarnation() {
+        let index = KvBlockIndexer::new();
+        let first = worker("a");
+        let second = ResidencyOwner::Worker {
+            source: SourceId::from("a"),
+            dp_rank: 0,
+            incarnation: 1,
+        };
+        let hash = [7; 32];
+        index.with_batch(|batch| {
+            assert!(batch.store_sparse(&first, None, 0, &hash, StorageTier::Device, 4));
+            assert!(batch.store_sparse(
+                &first,
+                Some("adapter"),
+                0,
+                &hash,
+                StorageTier::HostPinned,
+                4
+            ));
+            assert!(batch.store_sparse(&first, None, 1, &hash, StorageTier::Disk, 4));
+            assert!(batch.store_sparse(&second, None, 0, &hash, StorageTier::Device, 4));
+        });
+        index.with_snapshot(|view| {
+            assert_eq!(
+                view.best_sparse_tier(&first, None, 0, &hash),
+                Some(StorageTier::Device)
+            );
+            let prepared = prepare_sparse_keys(None, &[hash, [8; 32]]);
+            assert_eq!(
+                view.sparse_tiers(&first, 0, &prepared),
+                vec![Some(StorageTier::Device), None]
+            );
+            assert_eq!(
+                view.best_sparse_tier(&first, Some("adapter"), 0, &hash),
+                Some(StorageTier::HostPinned)
+            );
+            let adapter_keys = prepare_sparse_keys(Some("adapter"), &[hash]);
+            assert_eq!(
+                view.sparse_tiers(&first, 0, &adapter_keys),
+                vec![Some(StorageTier::HostPinned)]
+            );
+            assert_eq!(
+                view.best_sparse_tier(&first, None, 1, &hash),
+                Some(StorageTier::Disk)
+            );
+        });
+        index.with_batch(|batch| batch.clear_owner_exact(&first));
+        index.with_snapshot(|view| {
+            assert_eq!(view.best_sparse_tier(&first, None, 0, &hash), None);
+            assert_eq!(
+                view.best_sparse_tier(&second, None, 0, &hash),
+                Some(StorageTier::Device)
+            );
+        });
+    }
+
+    #[test]
+    fn sparse_and_dense_use_same_residency_facts() {
+        let index = KvBlockIndexer::new();
+        let owner = worker("a");
+        let hash = [9; 32];
+        let seq = sparse_key(None, &hash);
+        index.store(
+            0,
+            owner.clone(),
+            StorageTier::Device,
+            None,
+            &[(seq, h("x"))],
+        );
+        assert_eq!(
+            index.with_snapshot(|v| v.best_sparse_tier(&owner, None, 0, &hash)),
+            Some(StorageTier::Device)
+        );
+        index.with_batch(|batch| batch.remove_sparse(&owner, 0, &hash, Some(StorageTier::Device)));
+        assert!(index
+            .find_matches(&query(&["x"], &[StorageTier::Device]))
+            .is_empty());
+        // Reinsert through the sparse API: the source-scoped anchor proves
+        // the existing dense path, so its lookup reference must be restored.
+        index.with_batch(|batch| {
+            assert!(batch.store_sparse(&owner, None, 0, &hash, StorageTier::Device, 4));
+        });
+        assert_eq!(
+            depth_of(
+                &index.find_matches(&query(&["x"], &[StorageTier::Device])),
+                "a",
+                StorageTier::Device
+            ),
+            1
+        );
+        index.with_batch(|batch| batch.remove_sparse(&owner, 0, &hash, Some(StorageTier::Device)));
+        assert!(index
+            .find_matches(&query(&["x"], &[StorageTier::Device]))
+            .is_empty());
+    }
+
+    #[test]
+    fn sparse_fact_without_anchor_does_not_create_a_dense_path() {
+        let index = KvBlockIndexer::new();
+        let owner = worker("a");
+        let hash = [12; 32];
+        index.with_batch(|batch| {
+            assert!(batch.store_sparse(&owner, None, 0, &hash, StorageTier::Device, 4));
+        });
+        assert_eq!(
+            index.with_snapshot(|view| view.best_sparse_tier(&owner, None, 0, &hash)),
+            Some(StorageTier::Device)
+        );
+        assert!(index
+            .find_matches(&query(&["x"], &[StorageTier::Device]))
+            .is_empty());
+    }
+
+    #[test]
+    fn conflicting_source_hash_is_rejected_before_any_false_hit() {
+        let index = KvBlockIndexer::new();
+        let a = worker("a");
+        let b = worker("b");
+        index.store(
+            0,
+            a.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("i:7"), h("x"))],
+        );
+        index.store(0, b, StorageTier::Device, None, &[(h("i:9"), h("x"))]);
+        index.store(0, a, StorageTier::Device, None, &[(h("i:7"), h("y"))]);
+        let x = index.find_matches(&query(&["x"], &[StorageTier::Device]));
+        assert_eq!(depth_of(&x, "a", StorageTier::Device), 0);
+        assert_eq!(depth_of(&x, "b", StorageTier::Device), 1);
+        assert!(index
+            .find_matches(&query(&["y"], &[StorageTier::Device]))
+            .is_empty());
+    }
+
+    #[test]
+    fn foreign_parent_shares_only_topology_for_opaque_or_full_digest() {
+        for parent in ["s2".to_owned(), format!("b:{}", "ab".repeat(32))] {
+            let index = KvBlockIndexer::new();
+            let w1 = worker("w1");
+            let w2 = worker("w2");
+            let parent = h(&parent);
+            index.store(
+                0,
+                w1,
+                StorageTier::Device,
+                None,
+                &[(h("s1"), h("x")), (parent.clone(), h("y"))],
+            );
+            index.store(
+                0,
+                w2.clone(),
+                StorageTier::Device,
+                None,
+                &[(h("w2x"), h("x"))],
+            );
+            index.store(
+                0,
+                w2.clone(),
+                StorageTier::Device,
+                Some(parent.clone()),
+                &[(h("w2z"), h("z"))],
+            );
+            let hits = index.find_matches(&query(&["x", "y", "z"], &[StorageTier::Device]));
+            assert_eq!(
+                segments_of(&hits, "w2", StorageTier::Device),
+                [(0, 1), (2, 3)]
+            );
+            let shard = index.shard(0);
+            assert!(shard.anchor(&w2.target(), &parent).is_some());
+            assert!(!shard
+                .reverse
+                .get(&(w2, StorageTier::Device))
+                .is_some_and(|facts| facts.contains(&parent)));
+        }
+    }
+
+    #[test]
+    fn foreign_integer_and_short_or_invalid_byte_parents_are_not_borrowed() {
+        for parent in [
+            "i:42".to_owned(),
+            "b:aabb".to_owned(),
+            format!("b:{}gg", "ab".repeat(31)),
+            format!("b:{}", "ab".repeat(31)),
+        ] {
+            let index = KvBlockIndexer::new();
+            let w1 = worker("w1");
+            let w2 = worker("w2");
+            let parent = h(&parent);
+            index.store(
+                0,
+                w1,
+                StorageTier::Device,
+                None,
+                &[(parent.clone(), h("x"))],
+            );
+            index.store(
+                0,
+                w2.clone(),
+                StorageTier::Device,
+                Some(parent.clone()),
+                &[(h("w2y"), h("y"))],
+            );
+            assert!(index.shard(0).anchor(&w2.target(), &parent).is_none());
+            assert_eq!(
+                segments_of(
+                    &index.find_matches(&query(&["x", "y"], &[StorageTier::Device])),
+                    "w2",
+                    StorageTier::Device
+                ),
+                Vec::<(u32, u32)>::new()
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_parent_rejects_conflicting_nodes_and_offsets() {
+        for same_node in [false, true] {
+            let index = KvBlockIndexer::new();
+            let parent = h("s-parent");
+            index.store(
+                0,
+                worker("w1"),
+                StorageTier::Device,
+                None,
+                &[(parent.clone(), h("x")), (h("w1y"), h("y"))],
+            );
+            let second = if same_node {
+                vec![(h("w2x"), h("x")), (parent.clone(), h("y"))]
+            } else {
+                vec![(parent.clone(), h("other"))]
+            };
+            index.store(0, worker("w2"), StorageTier::Device, None, &second);
+            let w3 = worker("w3");
+            index.store(
+                0,
+                w3.clone(),
+                StorageTier::Device,
+                Some(parent.clone()),
+                &[(h("w3z"), h("z"))],
+            );
+            assert!(index.shard(0).anchor(&w3.target(), &parent).is_none());
+            assert!(index
+                .find_matches(&query(&["x", "y", "z"], &[StorageTier::Device]))
+                .iter()
+                .all(|hit| hit.target != w3.target()));
+        }
+    }
+
+    #[test]
+    fn rejected_store_does_not_bind_a_borrowed_parent() {
+        let index = KvBlockIndexer::new();
+        let parent = h("parent");
+        let w2 = worker("w2");
+        index.store(
+            0,
+            worker("w1"),
+            StorageTier::Device,
+            None,
+            &[(parent.clone(), h("x"))],
+        );
+        index.store(
+            0,
+            w2.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("used"), h("other"))],
+        );
+        let shard = index.shard(0);
+        assert!(!shard.store(
+            w2.clone(),
+            StorageTier::Device,
+            Some(parent.clone()),
+            &[(h("used"), h("z"))]
+        ));
+        assert!(shard.anchor(&w2.target(), &parent).is_none());
+        assert_eq!(
+            depth_of(
+                &index.find_matches(&query(&["other"], &[StorageTier::Device])),
+                "w2",
+                StorageTier::Device
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn conflicting_hash_at_another_offset_or_in_one_store_is_rejected() {
+        let index = KvBlockIndexer::new();
+        let a = worker("a");
+        index.store(
+            0,
+            a.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("i:1"), h("x")), (h("i:2"), h("y"))],
+        );
+        index.store(
+            0,
+            a.clone(),
+            StorageTier::Device,
+            Some(h("i:1")),
+            &[(h("i:1"), h("y"))],
+        );
+        assert!(index
+            .find_matches(&query(&["x", "y"], &[StorageTier::Device]))
+            .is_empty());
+        let b = worker("b");
+        index.store(
+            0,
+            b,
+            StorageTier::Device,
+            None,
+            &[(h("i:3"), h("x")), (h("i:3"), h("y"))],
+        );
+        assert!(index
+            .find_matches(&query(&["x", "y"], &[StorageTier::Device]))
+            .is_empty());
+    }
+
+    #[test]
+    fn sparse_capacity_counts_pages_not_tiers_or_repeated_stores() {
+        let index = KvBlockIndexer::new();
+        let owner = worker("a");
+        index.with_batch(|batch| {
+            assert!(batch.store_sparse(&owner, None, 0, &[1; 32], StorageTier::Device, 1));
+            assert!(batch.store_sparse(&owner, None, 0, &[1; 32], StorageTier::HostPinned, 1));
+            assert!(!batch.store_sparse(&owner, None, 1, &[2; 32], StorageTier::Device, 1));
+            batch.remove_sparse(&owner, 0, &[1; 32], None);
+            assert!(batch.store_sparse(&owner, None, 1, &[2; 32], StorageTier::Device, 1));
+        });
+    }
+
+    #[test]
+    fn persistent_sparse_capacity_tracks_tier_removal_across_batches() {
+        let index = KvBlockIndexer::new();
+        let owner = worker("a");
+        index.with_batch(|tx| {
+            assert!(tx.store_sparse(&owner, None, 0, &[1; 32], StorageTier::Device, 1))
+        });
+        index.with_batch(|tx| {
+            assert!(tx.store_sparse(&owner, None, 0, &[1; 32], StorageTier::HostPinned, 1))
+        });
+        index.with_batch(|tx| tx.remove_sparse(&owner, 0, &[1; 32], Some(StorageTier::Device)));
+        index.with_batch(|tx| {
+            assert!(!tx.store_sparse(&owner, None, 1, &[2; 32], StorageTier::Device, 1))
+        });
+        index.with_batch(|tx| tx.remove_sparse(&owner, 0, &[1; 32], Some(StorageTier::HostPinned)));
+        index.with_batch(|tx| {
+            assert!(tx.store_sparse(&owner, None, 1, &[2; 32], StorageTier::Device, 1))
+        });
+        index.with_batch(|tx| tx.clear_owner_exact(&owner));
+        index.with_batch(|tx| {
+            assert!(tx.store_sparse(&owner, None, 0, &[1; 32], StorageTier::Device, 1))
+        });
+    }
+
+    #[test]
+    fn dense_edits_invalidate_the_owner_sparse_capacity_cache() {
+        let index = KvBlockIndexer::new();
+        let owner = worker("a");
+        index.with_batch(|tx| {
+            assert!(tx.store_sparse(&owner, None, 0, &[1; 32], StorageTier::Device, 2))
+        });
+        let dense = sparse_key(None, &[2; 32]);
+        index.store(
+            0,
+            owner.clone(),
+            StorageTier::Device,
+            None,
+            &[(dense.clone(), h("x"))],
+        );
+        index.with_batch(|tx| {
+            assert!(!tx.store_sparse(&owner, None, 0, &[3; 32], StorageTier::Device, 2))
+        });
+        index.remove(0, &owner, StorageTier::Device, &[dense]);
+        index.with_batch(|tx| {
+            assert!(tx.store_sparse(&owner, None, 0, &[3; 32], StorageTier::Device, 2))
+        });
+    }
+
+    #[test]
+    fn opaque_hash_anchors_are_scoped_to_each_source() {
+        let index = KvBlockIndexer::new();
+        let a = worker("a");
+        let b = worker("b");
+        index.store(
+            0,
+            a.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("i:1"), h("x"))],
+        );
+        index.store(
+            0,
+            b.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("i:1"), h("y"))],
+        );
+        index.store(
+            0,
+            a.clone(),
+            StorageTier::Device,
+            Some(h("i:1")),
+            &[(h("i:2"), h("z"))],
+        );
+        index.store(
+            0,
+            b.clone(),
+            StorageTier::Device,
+            Some(h("i:1")),
+            &[(h("i:3"), h("q"))],
+        );
+        assert_eq!(
+            depth_of(
+                &index.find_matches(&query(&["x", "z"], &[StorageTier::Device])),
+                "a",
+                StorageTier::Device
+            ),
+            2
+        );
+        assert_eq!(
+            depth_of(
+                &index.find_matches(&query(&["y", "q"], &[StorageTier::Device])),
+                "b",
+                StorageTier::Device
+            ),
+            2
+        );
+        index.remove(0, &a, StorageTier::Device, &[h("i:1")]);
+        assert_eq!(
+            depth_of(
+                &index.find_matches(&query(&["y", "q"], &[StorageTier::Device])),
+                "b",
+                StorageTier::Device
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn foreign_alias_cannot_keep_a_removed_source_claim_alive() {
+        let index = KvBlockIndexer::new();
+        let w1 = worker("w1");
+        let w2 = worker("w2");
+        index.store(
+            0,
+            w1.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("i:1"), h("a"))],
+        );
+        index.store(
+            0,
+            w2.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("i:7"), h("a"))],
+        );
+        index.store(
+            0,
+            w1.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("i:7"), h("x"))],
+        );
+        index.remove(0, &w1, StorageTier::Device, &[h("i:1")]);
+        let a = index.find_matches(&query(&["a"], &[StorageTier::Device]));
+        assert_eq!(depth_of(&a, "w1", StorageTier::Device), 0);
+        assert_eq!(depth_of(&a, "w2", StorageTier::Device), 1);
+        let x = index.find_matches(&query(&["x"], &[StorageTier::Device]));
+        assert_eq!(depth_of(&x, "w1", StorageTier::Device), 1);
+    }
+
+    #[test]
+    fn source_suspension_hides_sparse_records_until_resumed() {
+        let index = KvBlockIndexer::new();
+        let owner = worker("a");
+        let hash = [3; 32];
+        index.with_batch(|tx| {
+            assert!(tx.store_sparse(&owner, None, 0, &hash, StorageTier::Device, 10));
+            tx.suspend_source(&SourceId::from("a"), 0);
+        });
+        assert_eq!(
+            index.with_snapshot(|v| v.best_sparse_tier(&owner, None, 0, &hash)),
+            None
+        );
+        index.with_batch(|tx| tx.resume_source(&SourceId::from("a"), 0));
+        assert_eq!(
+            index.with_snapshot(|v| v.best_sparse_tier(&owner, None, 0, &hash)),
+            Some(StorageTier::Device)
+        );
+    }
+
+    #[test]
+    fn source_invalidation_prunes_only_unreferenced_paths_and_aliases() {
+        let index = KvBlockIndexer::new();
+        let a = worker("a");
+        let b = worker("b");
+        index.store(
+            0,
+            a.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("a1"), h("x")), (h("a2"), h("y"))],
+        );
+        index.store(0, a, StorageTier::Device, None, &[(h("aq"), h("q"))]);
+        index.store(
+            0,
+            b.clone(),
+            StorageTier::Device,
+            None,
+            &[(h("b1"), h("x")), (h("b2"), h("z"))],
+        );
+        index.invalidate_source(&SourceId::from("a"), 0);
+        let shard = index.shard(0);
+        assert!(!shard.root.read().children.contains_key("q"));
+        assert!(shard.anchor(&worker("a").target(), &h("a1")).is_none());
+        assert!(shard.anchor(&b.target(), &h("b2")).is_some());
+        index.store(
+            0,
+            b,
+            StorageTier::Device,
+            Some(h("b2")),
+            &[(h("b3"), h("w"))],
+        );
+        assert_eq!(
+            depth_of(
+                &index.find_matches(&query(&["x", "z", "w"], &[StorageTier::Device])),
+                "b",
+                StorageTier::Device
+            ),
+            3
+        );
     }
 
     #[test]
@@ -731,6 +2329,105 @@ mod tests {
     }
 
     #[test]
+    fn four_source_readers_do_not_block_an_unrelated_source_writer() {
+        use std::sync::{mpsc, Barrier};
+        use std::time::Duration;
+
+        let index = Arc::new(KvBlockIndexer::new());
+        let entered = Arc::new(Barrier::new(5));
+        let release = Arc::new(Barrier::new(5));
+        let mut readers = Vec::new();
+        for id in 0..4 {
+            let index = index.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            readers.push(std::thread::spawn(move || {
+                let target = worker(&format!("reader-{id}")).target();
+                index.with_source_snapshot(&target, |_| {
+                    entered.wait();
+                    release.wait();
+                });
+            }));
+        }
+        entered.wait();
+        let writer_index = index.clone();
+        let (done, received) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let owner = worker("writer");
+            writer_index.with_source_batch(&owner.target(), |batch| {
+                assert!(batch.store_sparse(&owner, None, 0, &[1; 32], StorageTier::Device, 8));
+            });
+            done.send(()).unwrap();
+        });
+        let completed = received.recv_timeout(Duration::from_secs(5)).is_ok();
+        release.wait();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        writer.join().unwrap();
+        assert!(
+            completed,
+            "unrelated writer waited for other source snapshots"
+        );
+    }
+
+    #[test]
+    fn same_source_snapshot_waits_for_complete_multi_group_batch() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let index = Arc::new(KvBlockIndexer::new());
+        let owner = worker("a");
+        let target = owner.target();
+        let (entered, ready) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let writer_index = index.clone();
+        let writer_owner = owner.clone();
+        let writer_target = target.clone();
+        let writer = std::thread::spawn(move || {
+            writer_index.with_source_batch(&writer_target, |batch| {
+                assert!(batch.store_sparse(
+                    &writer_owner,
+                    None,
+                    0,
+                    &[1; 32],
+                    StorageTier::Device,
+                    8
+                ));
+                entered.send(()).unwrap();
+                resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(batch.store_sparse(
+                    &writer_owner,
+                    None,
+                    1,
+                    &[1; 32],
+                    StorageTier::Device,
+                    8
+                ));
+            });
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        {
+            let _domain = index.domain.read();
+            let gate = index.source_lock(&target);
+            assert!(gate.access.try_read().is_none());
+        }
+        release.send(()).unwrap();
+        writer.join().unwrap();
+        let keys = prepare_sparse_keys(None, &[[1; 32]]);
+        index.with_source_snapshot(&target, |view| {
+            assert_eq!(
+                view.sparse_tiers(&owner, 0, &keys),
+                [Some(StorageTier::Device)]
+            );
+            assert_eq!(
+                view.sparse_tiers(&owner, 1, &keys),
+                [Some(StorageTier::Device)]
+            );
+        });
+    }
+
+    #[test]
     fn query_keeps_snapshot_when_active_source_is_resumed() {
         let idx = Arc::new(KvBlockIndexer::new());
         idx.store(
@@ -743,7 +2440,7 @@ mod tests {
         let resuming = idx.clone();
         AFTER_QUERY_EDGE.with(|slot| {
             *slot.borrow_mut() = Some(Box::new(move || {
-                resuming.resume_source(&SourceId::from("a"), 0);
+                resuming.resume_source_unlocked(&SourceId::from("a"), 0);
             }));
         });
         let hits = idx.find_matches(&query(&["x"], &[StorageTier::Device]));
@@ -765,13 +2462,195 @@ mod tests {
         AFTER_QUERY_EDGE.with(|slot| {
             *slot.borrow_mut() = Some(Box::new(move || {
                 let source = SourceId::from("a");
-                invalidating.invalidate_source(&source, 0);
-                invalidating.resume_source(&source, 0);
+                // Simulate a visibility transition at this hook without
+                // recursively taking the query's topology read lock.
+                invalidating.suspend_source_unlocked(&source, 0);
+                invalidating.resume_source_unlocked(&source, 0);
             }));
         });
         assert!(idx
             .find_matches(&query(&["x"], &[StorageTier::Device]))
             .is_empty());
+    }
+
+    #[test]
+    fn source_transition_does_not_discard_other_targets() {
+        let index = Arc::new(KvBlockIndexer::new());
+        index.store(
+            0,
+            worker("a"),
+            StorageTier::Device,
+            None,
+            &[(h("a-hash"), h("x"))],
+        );
+        index.store(
+            0,
+            worker("b"),
+            StorageTier::Device,
+            None,
+            &[(h("b-hash"), h("x"))],
+        );
+        let changing = index.clone();
+        AFTER_QUERY_EDGE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                changing.suspend_source_unlocked(&SourceId::from("b"), 0);
+            }));
+        });
+        let matches = index.find_matches(&query(&["x"], &[StorageTier::Device]));
+        assert_eq!(depth_of(&matches, "a", StorageTier::Device), 1);
+        assert_eq!(depth_of(&matches, "b", StorageTier::Device), 0);
+    }
+
+    #[test]
+    fn query_final_check_drops_source_map_guard_before_suspended_lookup() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let index = Arc::new(KvBlockIndexer::new());
+        index.store(
+            0,
+            worker("a"),
+            StorageTier::Device,
+            None,
+            &[(h("hash"), h("x"))],
+        );
+        let (unlocked, unlocked_rx) = mpsc::channel();
+        let (held, held_rx) = mpsc::channel();
+        let (looked, looked_rx) = mpsc::channel();
+        let (finished, finished_rx) = mpsc::channel();
+        let query_index = index.clone();
+        let query_thread = std::thread::spawn(move || {
+            AFTER_QUERY_UNLOCK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    unlocked.send(()).unwrap();
+                    held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }));
+            });
+            AFTER_QUERY_SOURCE_LOOKUP.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    looked.send(()).unwrap();
+                }));
+            });
+            let matches = query_index.find_matches(&query(&["x"], &[StorageTier::Device]));
+            finished.send(matches.len()).unwrap();
+        });
+        let contender_index = index.clone();
+        let contender = std::thread::spawn(move || {
+            unlocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let _domain = contender_index.domain.read();
+            let target = worker("a").target();
+            let entry = contender_index
+                .suspended_sources
+                .entry((target.instance_id.clone(), target.dp_rank));
+            held.send(()).unwrap();
+            looked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // This deliberately takes the opposite map order. It can finish
+            // only if the query already released its source-map guard.
+            let _gate = contender_index.source_lock(&target);
+            drop(entry);
+        });
+        let result = finished_rx.recv_timeout(Duration::from_secs(10));
+        if result.is_ok() {
+            query_thread.join().unwrap();
+            contender.join().unwrap();
+        }
+        assert_eq!(result.expect("source/suspended map lock inversion"), 1);
+    }
+
+    #[test]
+    fn source_invalidated_after_snapshot_is_filtered_without_losing_other_targets() {
+        let index = Arc::new(KvBlockIndexer::new());
+        index.store(
+            0,
+            worker("a"),
+            StorageTier::Device,
+            None,
+            &[(h("a-hash"), h("x"))],
+        );
+        index.store(
+            0,
+            worker("b"),
+            StorageTier::Device,
+            None,
+            &[(h("b-hash"), h("x"))],
+        );
+        let changing = index.clone();
+        AFTER_QUERY_UNLOCK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let source = SourceId::from("a");
+                changing.invalidate_source(&source, 0);
+                changing.resume_source(&source, 0);
+            }));
+        });
+        let matches = index.find_matches(&query(&["x"], &[StorageTier::Device]));
+        assert_eq!(depth_of(&matches, "a", StorageTier::Device), 0);
+        assert_eq!(depth_of(&matches, "b", StorageTier::Device), 1);
+    }
+
+    #[test]
+    fn retired_and_reregistered_source_does_not_pass_old_snapshot_generation() {
+        let index = Arc::new(KvBlockIndexer::new());
+        index.store(
+            0,
+            worker("a"),
+            StorageTier::Device,
+            None,
+            &[(h("old"), h("x"))],
+        );
+        index.store(
+            0,
+            worker("b"),
+            StorageTier::Device,
+            None,
+            &[(h("b-hash"), h("x"))],
+        );
+        let changing = index.clone();
+        AFTER_QUERY_UNLOCK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                changing.retire_source(&SourceId::from("a"), 0);
+                changing.store(
+                    0,
+                    worker("a"),
+                    StorageTier::Device,
+                    None,
+                    &[(h("new"), h("x"))],
+                );
+            }));
+        });
+        let old_snapshot = index.find_matches(&query(&["x"], &[StorageTier::Device]));
+        assert_eq!(depth_of(&old_snapshot, "a", StorageTier::Device), 0);
+        assert_eq!(depth_of(&old_snapshot, "b", StorageTier::Device), 1);
+        let fresh = index.find_matches(&query(&["x"], &[StorageTier::Device]));
+        assert_eq!(depth_of(&fresh, "a", StorageTier::Device), 1);
+        assert_eq!(depth_of(&fresh, "b", StorageTier::Device), 1);
+    }
+
+    #[test]
+    fn retiring_many_sources_reclaims_gates_without_erasing_other_owners() {
+        let index = KvBlockIndexer::new();
+        index.store(
+            0,
+            worker("keep"),
+            StorageTier::Device,
+            None,
+            &[(h("keep-hash"), h("x"))],
+        );
+        for id in 0..1000 {
+            let name = format!("retired-{id}");
+            let owner = worker(&name);
+            index.store(
+                0,
+                owner,
+                StorageTier::Device,
+                None,
+                &[(h("source-hash"), h("x"))],
+            );
+            index.retire_source(&SourceId::from(name), 0);
+        }
+        assert_eq!(index.source_locks.len(), 1);
+        assert!(index.suspended_sources.is_empty());
+        let matches = index.find_matches(&query(&["x"], &[StorageTier::Device]));
+        assert_eq!(depth_of(&matches, "keep", StorageTier::Device), 1);
     }
 
     fn segments_of(res: &[TierMatch], target_id: &str, tier: StorageTier) -> Vec<(u32, u32)> {
@@ -795,22 +2674,12 @@ mod tests {
             .map(|seqs| seqs.clone())
             .unwrap_or_default();
         assert_eq!(actual, expected.iter().map(|seq| h(seq)).collect());
-        assert_eq!(
-            shard.counts.get(key).map_or(0, |count| *count),
-            expected.len()
-        );
+        assert_eq!(actual.len(), expected.len());
         for seq in &actual {
-            let node = shard
-                .anchors
-                .get(seq)
-                .expect("active alias has an anchor")
-                .clone();
+            let node = anchor_for(shard, &key.0, seq);
+            let pos = unique_alias_position(&node, &key.0.target(), seq)
+                .expect("source-scoped anchor contains alias");
             let node = node.read();
-            let pos = node
-                .edge
-                .iter()
-                .position(|(aliases, _)| aliases.contains(seq))
-                .expect("anchor contains alias");
             assert!(node.claims[pos].contains(key));
         }
     }
@@ -831,7 +2700,7 @@ mod tests {
         }
         let shard = idx.shard(0);
         assert_observations(&shard, &key, &["i:900", "i:42"]);
-        let node = shard.anchors.get("i:900").unwrap().clone();
+        let node = anchor_for(&shard, &owner, "i:900");
         assert!(node.read().edge[0].0.contains("i:900"));
         assert!(node.read().edge[0].0.contains("i:42"));
 
@@ -847,7 +2716,7 @@ mod tests {
         assert_observations(&shard, &key, &[]);
         assert!(node.read().claims[0].is_empty());
         assert_eq!(node.read().edge[0].0.len(), 2);
-        assert!(shard.counts.get(&key).is_none());
+        assert_eq!(shard.reverse.get(&key).map_or(0, |seqs| seqs.len()), 0);
     }
 
     #[test]
@@ -893,9 +2762,8 @@ mod tests {
         assert_observations(&shard, &ka, &["i:100", "i:101", "i:102"]);
         assert_observations(&shard, &kb, &[]);
         assert!(shard.reverse.get(&kb).is_none());
-        assert!(shard.counts.get(&kb).is_none());
         for seq in ["i:200", "i:201", "i:202", "b:0200", "i:203"] {
-            let node = shard.anchors.get(seq).unwrap().clone();
+            let node = anchor_for(&shard, &b, seq);
             let node = node.read();
             let pos = node
                 .edge
@@ -936,7 +2804,7 @@ mod tests {
             );
         }
         let shard = idx.shard(0);
-        let old_anchor = shard.anchors.get("i:202").unwrap().clone();
+        let old_anchor = anchor_for(&shard, &b, "i:202");
         let split_index = idx.clone();
         let retried = Rc::new(Cell::new(false));
         let retry_observed = retried.clone();
@@ -944,14 +2812,13 @@ mod tests {
             *slot.borrow_mut() = Some(Box::new(move || {
                 // Legal interleaving: another owner splits after remove has
                 // cloned its anchor, but before it takes that node's lock.
-                split_index.store(
-                    0,
+                split_index.shard(0).store(
                     worker("a"),
                     StorageTier::Device,
                     None,
                     &[(h("i:100"), h("x"))],
                 );
-                let moved = split_index.shard(0).anchors.get("i:202").unwrap().clone();
+                let moved = anchor_for(&split_index.shard(0), &worker("b"), "i:202");
                 assert!(!Arc::ptr_eq(&old_anchor, &moved));
                 assert!(!old_anchor
                     .read()
@@ -969,7 +2836,7 @@ mod tests {
         let kb = (b, StorageTier::Device);
         assert_observations(&shard, &ka, &["i:100", "i:101", "i:102"]);
         assert_observations(&shard, &kb, &["i:200", "i:201"]);
-        let moved = shard.anchors.get("i:202").unwrap().clone();
+        let moved = anchor_for(&shard, &kb.0, "i:202");
         let node = moved.read();
         let pos = node
             .edge
@@ -1006,20 +2873,19 @@ mod tests {
             );
         }
         let shard = idx.shard(0);
-        let old_anchor = shard.anchors.get("i:201").unwrap().clone();
+        let old_anchor = anchor_for(&shard, &b, "i:201");
         let split_index = idx.clone();
         let retried = Rc::new(Cell::new(false));
         let retry_observed = retried.clone();
         AFTER_ANCHOR_CLONE.with(|slot| {
             *slot.borrow_mut() = Some(Box::new(move || {
-                split_index.store(
-                    0,
+                split_index.shard(0).store(
                     worker("a"),
                     StorageTier::Device,
                     None,
                     &[(h("i:100"), h("x"))],
                 );
-                let moved = split_index.shard(0).anchors.get("i:201").unwrap().clone();
+                let moved = anchor_for(&split_index.shard(0), &worker("b"), "i:201");
                 assert!(!Arc::ptr_eq(&old_anchor, &moved));
                 assert!(!old_anchor
                     .read()
@@ -1043,7 +2909,7 @@ mod tests {
         let kb = (b, StorageTier::Device);
         assert_observations(&shard, &ka, &["i:100", "i:101", "i:102"]);
         assert_observations(&shard, &kb, &["i:200", "i:201", "i:202", "i:203"]);
-        let branch = shard.anchors.get("i:203").unwrap().clone();
+        let branch = anchor_for(&shard, &kb.0, "i:203");
         assert_eq!(branch.read().claims[0], vec![kb]);
         let original = idx.find_matches(&query(&["x", "y", "z"], &[StorageTier::Device]));
         assert_eq!(depth_of(&original, "a", StorageTier::Device), 3);
@@ -1162,7 +3028,7 @@ mod tests {
         let count = idx
             .shards
             .get(&0)
-            .and_then(|s| s.counts.get(&key).map(|c| *c))
+            .and_then(|s| s.reverse.get(&key).map(|seqs| seqs.len()))
             .unwrap_or(0);
         assert_eq!(count, 1);
     }
@@ -1383,7 +3249,7 @@ mod tests {
     #[test]
     fn clear_cache_owner_by_pool_id() {
         // Two pools pushed by the same worker share one (target, tier) entry,
-        // so find_matches can't tell them apart — verify via counts instead.
+        // so find_matches can't tell them apart — verify their records instead.
         let idx = KvBlockIndexer::new();
         idx.store(
             0,
@@ -1412,21 +3278,23 @@ mod tests {
         let shard = idx.shards.get(&0).expect("group 0 shard exists");
         // poolA cleared; poolB intact; Worker untouched.
         assert!(shard
-            .counts
+            .reverse
             .get(&(pool("poolA", "w0"), StorageTier::External))
             .is_none());
         assert_eq!(
-            *shard
-                .counts
+            shard
+                .reverse
                 .get(&(pool("poolB", "w0"), StorageTier::External))
-                .unwrap(),
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
-            *shard
-                .counts
+            shard
+                .reverse
                 .get(&(worker("w0"), StorageTier::Device))
-                .unwrap(),
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -1630,14 +3498,15 @@ mod tests {
                 ),
                 vec![(0, original.len() as u32)]
             );
-            assert!(shard.anchors.contains_key("incoming-x"));
-            assert!(shard.anchors.contains_key("incoming-y"));
+            anchor_for(&shard, &key.0, "incoming-x");
+            anchor_for(&shard, &key.0, "incoming-y");
             assert!(!shard.root.read().children.contains_key("w"));
             assert_eq!(
-                *shard
-                    .counts
+                shard
+                    .reverse
                     .get(&(worker("w0"), StorageTier::Device))
-                    .unwrap(),
+                    .unwrap()
+                    .len(),
                 original.len() + 3
             );
             // Matching local hashes registers incoming observations alongside
@@ -1652,7 +3521,7 @@ mod tests {
             shard.remove(&key.0, key.1, &[h("incoming-y")]);
             expected.retain(|seq| *seq != "incoming-y");
             assert_observations(&shard, &key, &expected);
-            let y = shard.anchors.get("sy").unwrap().clone();
+            let y = anchor_for(&shard, &key.0, "sy");
             let y_pos = y
                 .read()
                 .edge
@@ -1725,14 +3594,14 @@ mod tests {
                             &key,
                             &["sx", "sy", "sz", "incoming-x", "incoming-y"],
                         );
-                        let old_anchor = split_shard.anchors.get("incoming-y").unwrap().clone();
+                        let old_anchor = anchor_for(&split_shard, &key.0, "incoming-y");
                         split_shard.store(
                             worker("splitter"),
                             StorageTier::Device,
                             None,
                             &[(h("split-x"), h("x"))],
                         );
-                        let moved = split_shard.anchors.get("incoming-y").unwrap().clone();
+                        let moved = anchor_for(&split_shard, &key.0, "incoming-y");
                         assert!(!Arc::ptr_eq(&old_anchor, &moved));
                         assert!(!old_anchor
                             .read()
@@ -1804,7 +3673,7 @@ mod tests {
             None,
             &[(h("sx"), h("x")), (h("sy"), h("y")), (h("sz"), h("z"))],
         );
-        let old_anchor = shard.anchors.get("sy").unwrap().clone();
+        let old_anchor = anchor_for(&shard, &worker("w0"), "sy");
         let timeout = Duration::from_secs(10);
         let (resolved_tx, resolved_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
@@ -1841,7 +3710,7 @@ mod tests {
             split_tx.send(()).unwrap();
         });
         split_rx.recv_timeout(timeout).unwrap();
-        let moved_anchor = shard.anchors.get("sy").unwrap().clone();
+        let moved_anchor = anchor_for(&shard, &worker("w0"), "sy");
         assert!(!Arc::ptr_eq(&old_anchor, &moved_anchor));
         assert!(!old_anchor
             .read()
@@ -2046,8 +3915,7 @@ mod tests {
             *slot.borrow_mut() = Some(Box::new(move || {
                 // Another owner's store splits the edge after query matched it.
                 // Neither the local path nor A's residency changes.
-                splitting.store(
-                    0,
+                splitting.shard(0).store(
                     worker("b"),
                     StorageTier::Device,
                     None,

@@ -4,7 +4,21 @@ mod admit;
 mod binding;
 mod decode;
 
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[allow(unexpected_cfgs)]
+mod benchmarks;
+
 use std::sync::Arc;
+
+/// Local observation ownership only; this is not an authenticated engine epoch.
+/// Both ingestion paths use one allocator so delayed cleanup cannot cross modes.
+pub(crate) fn next_owner_incarnation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let value = NEXT.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(value, u64::MAX, "KV owner generation exhausted");
+    value
+}
 
 use sha2::{Digest, Sha256};
 pub mod discovery;

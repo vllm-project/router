@@ -100,6 +100,7 @@ pub(super) enum FullAttentionRejectionReason {
     ZeroBlockSize,
     BlockSizeMismatch,
     TokenCountMismatch,
+    ConflictingHash,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

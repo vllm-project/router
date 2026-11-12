@@ -7,10 +7,12 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
-use crate::kv_index::admit::{validate_full_attention_batch, FullAttentionBatchRejection};
+use crate::kv_index::admit::{
+    validate_full_attention_batch, FullAttentionBatchRejection, FullAttentionRejectionReason,
+};
 use crate::kv_index::binding::SourceLease;
 use crate::kv_index::indexer::KvBlockIndexer;
-use crate::kv_index::types::{ClearScope, ResidencyOwner, SourceId, StorageTier};
+use crate::kv_index::types::{ClearScope, ResidencyOwner, RoutableTarget, SourceId, StorageTier};
 use crate::kv_index::wire::{ExternalBlockHash, KVEvent, KVEventBatch};
 use crate::kv_index::{decode_batch, IngestionSignal};
 
@@ -162,7 +164,7 @@ fn spawn_inner(
         );
 
         let mut last_seq: i64 = -1;
-        let mut incarnation: u64 = 0;
+        let mut incarnation = super::next_owner_incarnation();
         let mut suspended = false;
         let mut full_attention_rejection_reported = false;
 
@@ -202,7 +204,7 @@ fn spawn_inner(
                         continue;
                     }
                     if last_seq != -1 && seq < last_seq {
-                        incarnation += 1;
+                        incarnation = super::next_owner_incarnation();
                         warn!(
                             "kv_index {}: restart seq {} < {} → incarnation {}",
                             source_id, seq, last_seq, incarnation
@@ -510,37 +512,79 @@ fn apply_batch(
     }
     // Batch rank if the 3-element array carries it; else the discovery rank.
     let rank = batch.data_parallel_rank.unwrap_or(dp_rank);
-    for ev in &batch.events {
-        match ev {
+    // Hashing prompt tokens can be expensive; prepare every mutation before
+    // entering the domain's short commit critical section.
+    enum Mutation {
+        Store(
+            u32,
+            ResidencyOwner,
+            StorageTier,
+            Option<Arc<str>>,
+            Vec<(Arc<str>, Arc<str>)>,
+        ),
+        Remove(u32, ResidencyOwner, StorageTier, Vec<Arc<str>>),
+        Clear(ResidencyOwner),
+    }
+    let prepared: Vec<_> = batch
+        .events
+        .iter()
+        .map(|ev| match ev {
             KVEvent::BlockStored(s) => {
                 let group = s.group_idx.unwrap_or(0);
                 let owner = event_owner(source_id, rank, incarnation, s.ownership.as_deref());
                 let tier = event_tier(&owner, s.medium.as_deref());
-                let locals: Vec<Arc<str>> =
-                    local_hashes(&s.token_ids, s.block_size, s.lora_name.as_deref())
-                        .iter()
-                        .map(|b| Arc::from(hex(b)))
-                        .collect();
-                // vLLM emits one BlockStored per contiguous chain (block[i]'s parent
-                // is block[i-1]); zipping seqs with local hashes yields one edge.
-                let seqs: Vec<Arc<str>> = s.block_hashes.iter().map(hash_str).collect();
-                let blocks: Vec<(Arc<str>, Arc<str>)> = seqs.into_iter().zip(locals).collect();
-                let parent_seq = s.parent_block_hash.as_ref().map(hash_str);
-                indexer.store(group, owner, tier, parent_seq, &blocks);
+                let locals = crate::kv_index::local_block_hash_strings(
+                    &s.token_ids,
+                    s.block_size,
+                    s.lora_name.as_deref(),
+                );
+                let blocks = s.block_hashes.iter().map(hash_str).zip(locals).collect();
+                Mutation::Store(
+                    group,
+                    owner,
+                    tier,
+                    s.parent_block_hash.as_ref().map(hash_str),
+                    blocks,
+                )
             }
             KVEvent::BlockRemoved(r) => {
-                let group = r.group_idx.unwrap_or(0);
                 let owner = event_owner(source_id, rank, incarnation, r.ownership.as_deref());
                 let tier = event_tier(&owner, r.medium.as_deref());
-                let hashes: Vec<Arc<str>> = r.block_hashes.iter().map(hash_str).collect();
-                indexer.remove(group, &owner, tier, &hashes);
+                Mutation::Remove(
+                    r.group_idx.unwrap_or(0),
+                    owner,
+                    tier,
+                    r.block_hashes.iter().map(hash_str).collect(),
+                )
             }
             KVEvent::AllBlocksCleared(_) => {
-                indexer.clear(&owner_for(source_id, rank, incarnation), ClearScope::Worker);
+                Mutation::Clear(owner_for(source_id, rank, incarnation))
+            }
+        })
+        .collect();
+    let target = RoutableTarget {
+        instance_id: source_id.clone(),
+        dp_rank: rank,
+    };
+    indexer.with_source_batch(&target, |tx| {
+        for (event_index, mutation) in prepared.into_iter().enumerate() {
+            match mutation {
+                Mutation::Store(group, owner, tier, parent, blocks) => {
+                    if !tx.store(group, owner, tier, parent, &blocks) {
+                        return Err(FullAttentionBatchRejection {
+                            reason: FullAttentionRejectionReason::ConflictingHash,
+                            event_index,
+                        });
+                    }
+                }
+                Mutation::Remove(group, owner, tier, hashes) => {
+                    tx.remove(group, &owner, tier, &hashes)
+                }
+                Mutation::Clear(owner) => tx.clear(&owner, ClearScope::Worker),
             }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Backfill `(last_seq, ∞)` from the replay ROUTER via a DEALER socket.

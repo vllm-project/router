@@ -1,140 +1,21 @@
-//! What this rank currently holds: claims per chain and page evidence.
+//! Stream progress and layout evidence. Residency is held by the shared index.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::kv_hash::SequenceHash;
-use crate::kv_index::StorageTier;
-
 pub(super) struct State {
-    /// The next sequence in a continuous, source-bound event stream.
     pub(super) next_seq: Option<u64>,
-    /// Partial replay must never be visible to routing.
     pub(super) visible: bool,
-    /// Claims per cache identity: `None` is the base model's chain, a name is
-    /// that adapter's chain. The engine seeds block hashes with the adapter
-    /// identity, so the two never share a chain and neither can credit the
-    /// other.
-    pub(super) claims: HashMap<Option<String>, HashMap<(u32, SequenceHash), TierSet>>,
-    /// Groups that have published at least one page hash, per identity. A group
-    /// that only publishes key-only stores reports no addressable page, so it
-    /// cannot bound the shared prefix.
+    /// Whether this identity/group publishes addressable pages. This metadata
+    /// constrains restore rules but is never an independent residency claim.
     pub(super) page_evidence: HashMap<Option<String>, HashSet<u32>>,
 }
 
-/// The tiers one page is resident on. A store adds a tier, a removal clears
-/// only the tier it names, and the best remaining tier is what the page is
-/// credited at.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct TierSet(u8);
-
-impl TierSet {
-    const DEVICE: u8 = 1 << 0;
-    const HOST: u8 = 1 << 1;
-    const DISK: u8 = 1 << 2;
-    const EXTERNAL: u8 = 1 << 3;
-
-    fn bit(tier: StorageTier) -> u8 {
-        match tier {
-            StorageTier::Device => Self::DEVICE,
-            StorageTier::HostPinned => Self::HOST,
-            StorageTier::Disk => Self::DISK,
-            StorageTier::External => Self::EXTERNAL,
-        }
-    }
-
-    pub(super) fn with(mut self, tier: StorageTier) -> Self {
-        self.0 |= Self::bit(tier);
-        self
-    }
-
-    pub(super) fn without(mut self, tier: StorageTier) -> Self {
-        self.0 &= !Self::bit(tier);
-        self
-    }
-
-    pub(super) fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
-    /// The tier a hit is credited at: the fastest copy the page still has.
-    pub(super) fn best(self) -> Option<StorageTier> {
-        if self.0 & Self::DEVICE != 0 {
-            Some(StorageTier::Device)
-        } else if self.0 & Self::HOST != 0 {
-            Some(StorageTier::HostPinned)
-        } else if self.0 & Self::DISK != 0 {
-            Some(StorageTier::Disk)
-        } else if self.0 & Self::EXTERNAL != 0 {
-            Some(StorageTier::External)
-        } else {
-            None
-        }
-    }
-}
-
 impl State {
-    /// The claims of one identity. A rank carries a handful of identities, so
-    /// the scan is cheaper than allocating a key for every lookup.
-    pub(super) fn claims_in(
-        &self,
-        namespace: Option<&str>,
-    ) -> Option<&HashMap<(u32, SequenceHash), TierSet>> {
-        self.claims
-            .iter()
-            .find(|(identity, _)| identity.as_deref() == namespace)
-            .map(|(_, claims)| claims)
-    }
-
-    /// The groups one identity has page evidence for.
     pub(super) fn page_evidence_in(&self, namespace: Option<&str>) -> Option<&HashSet<u32>> {
         self.page_evidence
             .iter()
             .find(|(identity, _)| identity.as_deref() == namespace)
             .map(|(_, evidence)| evidence)
-    }
-
-    /// Record one claim for `namespace`, refusing only when that identity is
-    /// full: one adapter must never evict the base model's evidence.
-    pub(super) fn insert_claim(
-        &mut self,
-        namespace: Option<&str>,
-        key: (u32, SequenceHash),
-        tier: StorageTier,
-        max_entries: usize,
-    ) -> bool {
-        let claims = self.claims.entry(namespace.map(str::to_owned)).or_default();
-        if let Some(resident) = claims.get_mut(&key) {
-            *resident = resident.with(tier);
-            return true;
-        }
-        if claims.len() >= max_entries {
-            return false;
-        }
-        claims.insert(key, TierSet::default().with(tier));
-        true
-    }
-
-    /// A removal whose medium names no known tier drops every copy of the page:
-    /// keeping a stale claim would over-credit, dropping one costs at most a
-    /// re-prefill.
-    pub(super) fn remove_claim_all(&mut self, key: (u32, SequenceHash)) {
-        for claims in self.claims.values_mut() {
-            claims.remove(&key);
-        }
-    }
-
-    /// A removal names one tier and no identity: the engine evicted that copy
-    /// whichever chain produced it. A page that still has another copy stays
-    /// claimed at the better remaining tier.
-    pub(super) fn remove_claim(&mut self, key: (u32, SequenceHash), tier: StorageTier) {
-        for claims in self.claims.values_mut() {
-            if let Some(resident) = claims.get_mut(&key) {
-                *resident = resident.without(tier);
-                if resident.is_empty() {
-                    claims.remove(&key);
-                }
-            }
-        }
     }
 }
 
@@ -320,6 +201,171 @@ pub(crate) mod tests {
 
     fn index(limit: usize) -> HybridEventIndex {
         HybridEventIndex::new(target(), groups(), 528, 0, limit).unwrap()
+    }
+
+    #[test]
+    fn shared_domain_keeps_workers_and_handle_generations_independent() {
+        use crate::kv_index::KvBlockIndexer;
+
+        let shared = Arc::new(KvBlockIndexer::new());
+        let old = index(8).with_shared_index(shared.clone());
+        let replacement = index(8).with_shared_index(shared.clone());
+        let other = HybridEventIndex::new(
+            RoutableTarget {
+                instance_id: Arc::from("w2"),
+                dp_rank: 0,
+            },
+            groups(),
+            528,
+            0,
+            8,
+        )
+        .unwrap()
+        .with_shared_index(shared);
+        for index in [&old, &replacement, &other] {
+            index.begin_empty(0);
+            index.apply_batch(0, &qwen_batch()).unwrap();
+            assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+        }
+        old.invalidate();
+        assert_eq!(old.reusable_tokens(&prompt(), usize::MAX), 0);
+        assert_eq!(replacement.reusable_tokens(&prompt(), usize::MAX), 528);
+        assert_eq!(other.reusable_tokens(&prompt(), usize::MAX), 528);
+
+        // Rejecting a batch only revokes that exact handle's observations.
+        assert_eq!(
+            replacement.apply_batch(9, &qwen_batch()),
+            Err(HybridEventError::Sequence)
+        );
+        assert_eq!(replacement.reusable_tokens(&prompt(), usize::MAX), 0);
+        assert_eq!(other.reusable_tokens(&prompt(), usize::MAX), 528);
+    }
+
+    #[test]
+    fn shared_source_invalidation_removes_every_group_without_hiding_other_workers() {
+        use crate::kv_index::KvBlockIndexer;
+
+        let shared = Arc::new(KvBlockIndexer::new());
+        let first = index(8).with_shared_index(shared.clone());
+        let other = HybridEventIndex::new(
+            RoutableTarget {
+                instance_id: Arc::from("w2"),
+                dp_rank: 0,
+            },
+            groups(),
+            528,
+            0,
+            8,
+        )
+        .unwrap()
+        .with_shared_index(shared.clone());
+        for index in [&first, &other] {
+            index.begin_empty(0);
+            index.apply_batch(0, &qwen_batch()).unwrap();
+        }
+        shared.invalidate_source(&Arc::from("w"), 0);
+        assert_eq!(first.reusable_tokens(&prompt(), usize::MAX), 0);
+        assert_eq!(other.reusable_tokens(&prompt(), usize::MAX), 528);
+        first.begin_replay(0);
+        first.apply_batch(0, &qwen_batch()).unwrap();
+        assert_eq!(first.reusable_tokens(&prompt(), usize::MAX), 0);
+        first.finish_replay(1).unwrap();
+        assert_eq!(first.reusable_tokens(&prompt(), usize::MAX), 528);
+    }
+
+    #[test]
+    fn source_revoked_after_snapshot_cannot_publish_credit_for_that_rank() {
+        use crate::kv_index::KvBlockIndexer;
+
+        let shared = Arc::new(KvBlockIndexer::new());
+        let first = index(8).with_shared_index(shared.clone());
+        let second = HybridEventIndex::new(
+            RoutableTarget {
+                instance_id: target().instance_id,
+                dp_rank: 1,
+            },
+            groups(),
+            528,
+            0,
+            8,
+        )
+        .unwrap()
+        .with_shared_index(shared.clone());
+        let mut rank1_batch = qwen_batch();
+        rank1_batch.data_parallel_rank = Some(1);
+        first.begin_empty(0);
+        first.apply_batch(0, &qwen_batch()).unwrap();
+        second.begin_empty(0);
+        second.apply_batch(0, &rank1_batch).unwrap();
+        assert_eq!(first.reusable_tokens(&prompt(), usize::MAX), 528);
+        super::super::AFTER_HYBRID_SNAPSHOT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::thread::spawn(move || shared.invalidate_source(&target().instance_id, 0))
+                    .join()
+                    .unwrap();
+            }));
+        });
+        assert_eq!(first.reusable_tokens(&prompt(), usize::MAX), 0);
+        assert_eq!(second.reusable_tokens(&prompt(), usize::MAX), 528);
+    }
+
+    #[test]
+    fn retired_source_cannot_reactivate_a_shared_domain() {
+        use crate::kv_index::{binding::SourceLease, KvBlockIndexer};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let shared = Arc::new(KvBlockIndexer::new());
+        let active = Arc::new(AtomicBool::new(true));
+        let old = index(8)
+            .with_shared_index(shared.clone())
+            .with_source_binding(SourceLease {
+                active: active.clone(),
+                strict_rank: Arc::new(parking_lot::Mutex::new(false)),
+            });
+        old.begin_replay(0);
+        old.apply_batch(0, &qwen_batch()).unwrap();
+        active.store(false, Ordering::Release);
+        let replacement = index(8).with_shared_index(shared.clone());
+        replacement.begin_empty(0);
+        replacement.apply_batch(0, &qwen_batch()).unwrap();
+        shared.suspend_source(&Arc::from("w"), 0);
+        assert_eq!(old.finish_replay(1), Err(HybridEventError::Untrusted));
+        old.begin_empty(1);
+        assert_eq!(replacement.reusable_tokens(&prompt(), usize::MAX), 0);
+        shared.resume_source(&Arc::from("w"), 0);
+        assert_eq!(replacement.reusable_tokens(&prompt(), usize::MAX), 528);
+        old.invalidate();
+        assert_eq!(replacement.reusable_tokens(&prompt(), usize::MAX), 528);
+    }
+
+    #[test]
+    fn old_hybrid_cleanup_preserves_a_new_full_attention_owner() {
+        use crate::kv_index::{KvBlockIndexer, MatchQuery, ResidencyOwner, StorageTier};
+        let shared = Arc::new(KvBlockIndexer::new());
+        let old = index(8).with_shared_index(shared.clone());
+        old.begin_empty(0);
+        old.apply_batch(0, &qwen_batch()).unwrap();
+        let next = ResidencyOwner::Worker {
+            source: target().instance_id,
+            dp_rank: 0,
+            incarnation: crate::kv_index::next_owner_incarnation(),
+        };
+        assert_ne!(old.owner, next);
+        shared.store(
+            3,
+            next,
+            StorageTier::Device,
+            None,
+            &[(Arc::from("full-hash"), Arc::from("local-content"))],
+        );
+        old.invalidate();
+        let hits = shared.find_matches(&MatchQuery {
+            group_idx: 3,
+            local_hashes: vec![Arc::from("local-content")],
+            tiers_of_interest: vec![StorageTier::Device],
+        });
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].segments, vec![(0, 1)]);
     }
 
     #[test]

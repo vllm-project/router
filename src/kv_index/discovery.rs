@@ -127,8 +127,51 @@ struct HybridWorkerProvider {
     /// lookup for one rank must never see another rank's claims.
     indexes: HashMap<u32, Arc<HybridEventIndex>>,
     active: Arc<AtomicBool>,
+    /// Freshness is independent of the supervisor's permanent retirement flag.
+    trusted: AtomicBool,
     verified_at: Mutex<Instant>,
     capability: HybridCapabilities,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HybridRefreshAction {
+    Keep,
+    Expire,
+    Recover,
+    Stop,
+}
+
+impl HybridWorkerProvider {
+    fn is_trusted(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+            && self.trusted.load(Ordering::Acquire)
+            && self.verified_at.lock().elapsed() <= Duration::from_secs(5)
+    }
+
+    fn expire_if_needed(&self) -> bool {
+        self.verified_at.lock().elapsed() > Duration::from_secs(5)
+            && self.trusted.swap(false, Ordering::AcqRel)
+    }
+
+    /// Called after each probe; a retired registration is never reactivated.
+    fn refresh_action(&self, outcome: &StaticHybridMatch) -> HybridRefreshAction {
+        if !self.active.load(Ordering::Acquire) {
+            return HybridRefreshAction::Stop;
+        }
+        if !probe_keeps_trust(outcome) {
+            self.trusted.store(false, Ordering::Release);
+            return HybridRefreshAction::Stop;
+        }
+        if probe_renews_trust(outcome) {
+            *self.verified_at.lock() = Instant::now();
+            if !self.trusted.load(Ordering::Acquire) {
+                return HybridRefreshAction::Recover;
+            }
+        } else if self.expire_if_needed() {
+            return HybridRefreshAction::Expire;
+        }
+        HybridRefreshAction::Keep
+    }
 }
 
 impl crate::policies::TieredMatchProvider for HybridWorkerProvider {
@@ -143,9 +186,7 @@ impl crate::policies::TieredMatchProvider for HybridWorkerProvider {
         lora: Option<&str>,
         dp_rank: u32,
     ) -> Option<Vec<super::TierMatch>> {
-        if !self.active.load(Ordering::Acquire)
-            || self.verified_at.lock().elapsed() > Duration::from_secs(5)
-        {
+        if !self.is_trusted() {
             return Some(Vec::new());
         }
         // An unadmitted rank is a miss for that rank, never a fallback to a
@@ -163,9 +204,7 @@ impl crate::policies::TieredMatchProvider for HybridWorkerProvider {
                 )
             })
             .unwrap_or_default();
-        if !self.active.load(Ordering::Acquire)
-            || self.verified_at.lock().elapsed() > Duration::from_secs(5)
-        {
+        if !self.is_trusted() {
             return Some(Vec::new());
         }
         Some(hits)
@@ -648,7 +687,7 @@ impl KvIndexSupervisor {
             }
             // Admit each rank on its own evidence; one rank's miss does not
             // revoke its siblings.
-            let mut indexes: HashMap<u32, Arc<HybridEventIndex>> = HashMap::new();
+            let mut indexes: HashMap<u32, HybridEventIndex> = HashMap::new();
             for source in &event_sources {
                 let Some(rank_capability) = capability.rank_capability(source.dp_rank) else {
                     warn!(
@@ -670,7 +709,7 @@ impl KvIndexSupervisor {
                 };
                 match capability.index_for_rank(source.dp_rank, source, target, 1_000_000) {
                     Ok(index) => {
-                        indexes.insert(source.dp_rank, Arc::new(index));
+                        indexes.insert(source.dp_rank, index);
                     }
                     Err(reason) => warn!(
                         "kv_index {}: hybrid rank {} not admitted: {reason}; rank will receive no cache credit",
@@ -795,6 +834,27 @@ impl KvIndexSupervisor {
             self.retire_worker(previous);
         }
         let indexer = self.acquire_identity(&key);
+        let hybrid_indexes = hybrid_indexes.map(|indexes| {
+            indexes
+                .into_iter()
+                .map(|(rank, index)| {
+                    let binding = live_sources
+                        .iter()
+                        .find(|live| live.rank == rank)
+                        .expect("admitted rank has a live source")
+                        .lease
+                        .clone();
+                    (
+                        rank,
+                        Arc::new(
+                            index
+                                .with_shared_index(indexer.clone())
+                                .with_source_binding(binding),
+                        ),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        });
         // Endpoints the subscribers are about to attach to, so the freshness
         // task can notice a publisher that moves while keeping its identity.
         let bound_sources: Arc<BoundSources> = Arc::new(
@@ -866,6 +926,7 @@ impl KvIndexSupervisor {
             Arc::new(HybridWorkerProvider {
                 indexes,
                 active: active.clone(),
+                trusted: AtomicBool::new(true),
                 verified_at: Mutex::new(Instant::now()),
                 capability: hybrid_capability
                     .as_ref()
@@ -876,7 +937,6 @@ impl KvIndexSupervisor {
         if let Some(provider) = &hybrid {
             let provider = Arc::downgrade(provider);
             let mut handles = hybrid_handles.clone();
-            let mut expired = false;
             let targets = hybrid_targets.clone();
             let probe_ctx = self.ctx.clone();
             let client = self.client.clone();
@@ -890,19 +950,13 @@ impl KvIndexSupervisor {
                     let Some(provider) = provider.upgrade() else {
                         break;
                     };
-                    if !provider.active.load(Ordering::Acquire) && !expired {
-                        // Retired by the owner, not by this task's own expiry.
+                    if !provider.active.load(Ordering::Acquire) {
                         break;
                     }
-                    if provider.verified_at.lock().elapsed() > Duration::from_secs(5) && !expired {
-                        // Expire the view but keep probing: a recovered control
-                        // endpoint must be able to re-admit this worker instead
-                        // of staying dark until a restart.
-                        provider.active.store(false, Ordering::Release);
+                    if provider.expire_if_needed() {
                         for handle in &handles {
                             handle.shutdown();
                         }
-                        expired = true;
                     }
                     let outcome = if let Some(config) = &static_config {
                         static_hybrid_sources_match(
@@ -916,32 +970,58 @@ impl KvIndexSupervisor {
                     } else {
                         StaticHybridMatch::Differs
                     };
-                    if !probe_keeps_trust(&outcome)
-                        || provider.verified_at.lock().elapsed() > Duration::from_secs(5)
-                    {
-                        provider.active.store(false, Ordering::Release);
+                    if !provider.active.load(Ordering::Acquire) {
                         for handle in &handles {
                             handle.shutdown();
                         }
                         break;
                     }
-                    if probe_keeps_trust(&outcome) {
-                        if expired {
+                    // A probe may cross the deadline while it is in flight.
+                    if provider.expire_if_needed() {
+                        for handle in &handles {
+                            handle.shutdown();
+                        }
+                    }
+                    match provider.refresh_action(&outcome) {
+                        HybridRefreshAction::Stop => {
+                            for handle in &handles {
+                                handle.shutdown();
+                            }
+                            break;
+                        }
+                        HybridRefreshAction::Expire => {
+                            for handle in &handles {
+                                handle.shutdown();
+                            }
+                        }
+                        HybridRefreshAction::Recover => {
                             handles.clear();
+                            let mut recovered = true;
                             for (ev, index) in &targets {
                                 let stream = Arc::new(HybridEventStream::new(index.clone()));
-                                if let Ok(handle) =
-                                    super::hybrid::spawn_zmq(ev.clone(), stream, probe_ctx.clone())
-                                {
-                                    handles.push(Arc::new(handle));
+                                match super::hybrid::spawn_zmq(
+                                    ev.clone(),
+                                    stream,
+                                    probe_ctx.clone(),
+                                ) {
+                                    Ok(handle) => handles.push(Arc::new(handle)),
+                                    Err(_) => recovered = false,
                                 }
                             }
-                            expired = false;
-                            provider.active.store(true, Ordering::Release);
+                            // Retirement can race the awaited probe and the new
+                            // subscriptions. Never make it active again.
+                            if !provider.active.load(Ordering::Acquire) || !recovered {
+                                for handle in &handles {
+                                    handle.shutdown();
+                                }
+                                if !provider.active.load(Ordering::Acquire) {
+                                    break;
+                                }
+                            } else {
+                                provider.trusted.store(true, Ordering::Release);
+                            }
                         }
-                        if probe_renews_trust(&outcome) {
-                            *provider.verified_at.lock() = Instant::now();
-                        }
+                        HybridRefreshAction::Keep => {}
                     }
                 }
             });
@@ -992,7 +1072,7 @@ impl KvIndexSupervisor {
         }
         for live in &subs.live_sources {
             let _guard = live.lease.strict_rank.lock();
-            subs.indexer.invalidate_source(&subs.source_id, live.rank);
+            subs.indexer.retire_source(&subs.source_id, live.rank);
         }
         self.release_identity(&subs.key);
     }
@@ -1031,9 +1111,7 @@ impl KvIndexSupervisor {
     pub(crate) fn trusted_hybrid_capability(&self, worker_url: &str) -> Option<HybridCapabilities> {
         let workers = self.workers.lock();
         let provider = workers.get(worker_url)?.hybrid.as_ref()?;
-        if !provider.active.load(Ordering::Acquire)
-            || provider.verified_at.lock().elapsed() > Duration::from_secs(5)
-        {
+        if !provider.is_trusted() {
             return None;
         }
         Some(provider.capability.clone())
@@ -2171,6 +2249,50 @@ mod tests {
         assert!(!probe_keeps_trust(&StaticHybridMatch::Differs));
     }
 
+    #[test]
+    fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
+        let active = Arc::new(AtomicBool::new(true));
+        let provider = HybridWorkerProvider {
+            indexes: HashMap::new(),
+            active: active.clone(),
+            trusted: AtomicBool::new(true),
+            verified_at: Mutex::new(Instant::now() - Duration::from_secs(6)),
+            capability: HybridCapabilities {
+                schema_version: 1,
+                adapters: vec![],
+                ranks: vec![],
+            },
+        };
+        assert!(!provider.is_trusted());
+        assert!(provider.expire_if_needed());
+        assert!(active.load(Ordering::Acquire));
+        assert_eq!(
+            provider.refresh_action(&StaticHybridMatch::Unavailable(SourcesProbe::Failed)),
+            HybridRefreshAction::Keep
+        );
+        assert!(!provider.is_trusted());
+        assert_eq!(
+            provider.refresh_action(&StaticHybridMatch::Matches),
+            HybridRefreshAction::Recover
+        );
+        assert!(!provider.is_trusted()); // Replay must be started before publication.
+        provider.trusted.store(true, Ordering::Release);
+        assert!(provider.is_trusted());
+        *provider.verified_at.lock() = Instant::now() - Duration::from_secs(6);
+        assert!(provider.expire_if_needed());
+        assert_eq!(
+            provider.refresh_action(&StaticHybridMatch::Unavailable(SourcesProbe::Unsupported)),
+            HybridRefreshAction::Recover
+        );
+        active.store(false, Ordering::Release);
+        assert_eq!(
+            provider.refresh_action(&StaticHybridMatch::Matches),
+            HybridRefreshAction::Stop
+        );
+        assert!(!active.load(Ordering::Acquire));
+        assert!(!provider.is_trusted());
+    }
+
     use super::*;
     use crate::kv_index::{MatchQuery, StorageTier};
 
@@ -2826,13 +2948,27 @@ mod tests {
             "endpoint":"inproc://hybrid-discovery-pub", "replay_endpoint":"inproc://hybrid-discovery-replay",
             "topic":"hybrid/epoch-1", "publisher":"zmq", "enable_kv_cache_events":true
         }})));
+        let fail_probe = Arc::new(AtomicBool::new(false));
+        let failed_probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let app = Router::new().route(
             "/kv_event_sources",
             get({
                 let sources = sources.clone();
+                let fail_probe = fail_probe.clone();
+                let failed_probes = failed_probes.clone();
                 move || {
                     let sources = sources.clone();
-                    async move { Json(sources.read().await.clone()) }
+                    let fail_probe = fail_probe.clone();
+                    let failed_probes = failed_probes.clone();
+                    async move {
+                        let status = if fail_probe.load(Ordering::Acquire) {
+                            failed_probes.fetch_add(1, Ordering::AcqRel);
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            axum::http::StatusCode::OK
+                        };
+                        (status, Json(sources.read().await.clone()))
+                    }
                 }
             }),
         );
@@ -2947,6 +3083,125 @@ mod tests {
         let estimate =
             policy.estimate_prefill_work(&[(worker.as_ref(), std::slice::from_ref(&prompt), true)]);
         assert_eq!(estimate[0].new_prefill_tokens, 496);
+        if !pd {
+            let hybrid = supervisor
+                .workers
+                .lock()
+                .get(&worker_url)
+                .unwrap()
+                .hybrid
+                .clone()
+                .unwrap();
+            fail_probe.store(true, Ordering::Release);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while failed_probes.load(Ordering::Acquire) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            *hybrid.verified_at.lock() = Instant::now() - Duration::from_secs(6);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while hybrid.trusted.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(hybrid.active.load(Ordering::Acquire));
+            assert!(provider
+                .find_token_matches(&prompt, 528, None, 0)
+                .unwrap()
+                .is_empty());
+            // XPUB coalesces duplicate subscriptions for a topic. Wait for
+            // the old SUB to disconnect before admitting the replacement.
+            let unsubscribed = [b"\x00".as_slice(), b"hybrid/epoch-1"].concat();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    match publisher.recv_bytes(zmq::DONTWAIT) {
+                        Ok(frame) if frame == unsubscribed => break,
+                        Ok(_) => continue,
+                        Err(zmq::Error::EAGAIN) => {
+                            tokio::time::sleep(Duration::from_millis(1)).await
+                        }
+                        Err(error) => panic!("unsubscribe: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            fail_probe.store(false, Ordering::Release);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !hybrid.trusted.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            boundary_subscription(&publisher, "hybrid/epoch-1", true).await;
+            assert!(provider
+                .find_token_matches(&prompt, 528, None, 0)
+                .unwrap()
+                .is_empty());
+            publisher
+                .send_multipart(
+                    [
+                        b"hybrid/epoch-1".as_slice(),
+                        &0_i64.to_be_bytes(),
+                        payload.as_slice(),
+                    ],
+                    0,
+                )
+                .unwrap();
+            let request = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    match replay.recv_multipart(zmq::DONTWAIT) {
+                        Ok(frames) => break frames,
+                        Err(zmq::Error::EAGAIN) => {
+                            tokio::time::sleep(Duration::from_millis(1)).await
+                        }
+                        Err(error) => panic!("replay: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            replay
+                .send_multipart(
+                    [
+                        request[0].as_slice(),
+                        &[],
+                        b"hybrid/epoch-1",
+                        &0_i64.to_be_bytes(),
+                        payload.as_slice(),
+                    ],
+                    0,
+                )
+                .unwrap();
+            replay
+                .send_multipart(
+                    [
+                        request[0].as_slice(),
+                        &[],
+                        &[],
+                        &(-1_i64).to_be_bytes(),
+                        &[],
+                    ],
+                    0,
+                )
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while provider
+                    .find_token_matches(&prompt, 528, None, 0)
+                    .unwrap()
+                    .is_empty()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
         sources.write().await["0"]["topic"] = serde_json::json!("hybrid/epoch-2");
         tokio::time::timeout(Duration::from_secs(5), async {
             while !provider
