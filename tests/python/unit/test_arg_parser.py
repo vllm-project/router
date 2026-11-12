@@ -20,6 +20,7 @@ class TestKvLauncherArgs:
     def test_defaults(self):
         args = parse_router_args([])
         assert args.kv_aware_session_affinity_ttl_secs is None
+        assert args.kv_aware_completion_history is False
         assert args.pd_kv_events == []
         args.pd_kv_events.append("http://p:8000=tcp://p:5557")
         assert RouterArgs().pd_kv_events == []
@@ -39,6 +40,7 @@ class TestKvLauncherArgs:
                 "kv_aware",
                 f"--{prefix}kv-aware-session-affinity-ttl-secs",
                 "1800",
+                f"--{prefix}kv-aware-completion-history",
                 f"--{prefix}pd-kv-events",
                 sources[0],
                 f"--{prefix}pd-kv-events",
@@ -47,6 +49,7 @@ class TestKvLauncherArgs:
         )
         args = RouterArgs.from_cli_args(namespace, use_router_prefix=use_prefix)
         assert args.kv_aware_session_affinity_ttl_secs == 1800
+        assert args.kv_aware_completion_history is True
         assert args.pd_kv_events == sources
 
     def test_native_constructor_forwarding(self):
@@ -544,6 +547,7 @@ class TestParseRouterArgs:
                 "1800",
                 "--router-temperature",
                 "0.25",
+                "--kv-aware-completion-history",
                 "--kv-penalty-host",
                 "0.7",
                 "--kv-penalty-external",
@@ -563,6 +567,7 @@ class TestParseRouterArgs:
 
         assert captured["policy"] == PolicyType.KvAware
         assert captured["kv_aware_session_affinity_ttl_secs"] == 1800
+        assert captured["kv_aware_completion_history"] is True
         assert captured["router_temperature"] == 0.25
         assert captured["kv_penalty_host"] == 0.7
         assert captured["kv_penalty_external"] == 0.5

@@ -80,6 +80,11 @@ pub struct RouterConfig {
     /// `None` disables affinity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_aware_session_affinity_ttl_secs: Option<u64>,
+    /// Opt in to prompt history observed at successful upstream response headers
+    /// for regular HTTP `kv_aware` routing, not proof of completed inference.
+    /// This heuristic is separate from worker-reported KV events and session affinity.
+    #[serde(default)]
+    pub kv_aware_completion_history: bool,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
@@ -1326,6 +1331,7 @@ impl Default for RouterConfig {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            kv_aware_completion_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -1421,6 +1427,25 @@ mod tests {
         assert!(config.metrics.is_none());
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
+        assert!(!config.kv_aware_completion_history);
+    }
+
+    #[test]
+    fn test_completion_history_serde_opt_in() {
+        let mut value = serde_json::to_value(RouterConfig::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("kv_aware_completion_history");
+        let omitted: RouterConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(!omitted.kv_aware_completion_history);
+        value["kv_aware_completion_history"] = serde_json::json!(true);
+        let enabled: RouterConfig = serde_json::from_value(value).unwrap();
+        assert!(enabled.kv_aware_completion_history);
+        assert_eq!(
+            serde_json::to_value(enabled).unwrap()["kv_aware_completion_history"],
+            true
+        );
     }
 
     #[test]
@@ -2112,6 +2137,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            kv_aware_completion_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2182,6 +2208,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            kv_aware_completion_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2248,6 +2275,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            kv_aware_completion_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
