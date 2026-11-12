@@ -50,6 +50,12 @@ vllm-router \
 
 The enable flag selects `ProgramSchedulingConfig` with every field defaulted; omitting the flag disables Program scheduling. The JSON option is configuration only: pass it together with the enable flag for overrides, and the Router reports a configuration error if JSON is supplied without explicit enablement. The defaults use the Program-count guard because token capacity is unset and emit a calibration warning because the built-in performance coefficients are reference values. For a production deployment, save the calibrated configuration above as `program-scheduling.json`, compact it into one CLI argument, and start the Router with the backend API endpoints. One Worker URL may expose multiple internal DP Ranks; `--intra-node-data-parallel-size` is the number of internal Ranks behind each Worker URL.
 
+Input-token counting also keeps its compatible `estimated` default. To enable
+verified exact counts, add `"token_count_mode": "exact_when_verified"` to the
+deployment JSON. All other token-count fields can keep their defaults; HTTP
+chat tokenization is a separate opt-in. See [Input-token facts](#input-token-facts)
+for the minimal overrides and advanced diagnostics.
+
 ```bash
 export PROGRAM_CONFIG_JSON="$(python -c \
   'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), separators=(",", ":")))' \
@@ -94,7 +100,7 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 | `binding_strategy` | `consistent_hash` | Selects the initial home Rank for each new Program generation. Supported values are `consistent_hash`, `program_round_robin`, `least_program_count`, `reasoning_token_balance`, and `cache_aware`; it does not replace admission or resume decisions. |
 | `hash_virtual_nodes` | `160` | Sets the number of virtual nodes used by `consistent_hash` initial binding. It has no effect on the other binding strategies. |
 | `token_capacity_per_dp_rank` | `null` | Supplies the logical KV-token capacity of each concrete DP Rank. A value enables token-based admission, growth reserve, capacity repair, and cross-Rank headroom checks; `null` falls back to the Program-count guard. `reasoning_token_balance` requires this value. The deprecated input alias `token_capacity_per_target` is accepted but is never emitted when the configuration is serialized. |
-| `token_count_mode` | `estimated` | Selects the input-token fact source. `estimated` keeps the byte estimator and changes nothing. `shadow` keeps the estimator for decisions but records what a prepared count would decide. `exact_when_verified` applies a prepared count once its fingerprint is allowlisted, not revoked, and has accumulated `token_count_verification_settlements` matching Engine settlements. |
+| `token_count_mode` | `estimated` | Omit for compatible byte-estimated counts. The standard exact-count opt-in is `exact_when_verified`: apply prepared counts after matching Engine settlements, otherwise estimate. `shadow` is an advanced diagnostic that keeps estimated decisions and records prepared counterfactuals even after verification. See [Input-token facts](#input-token-facts). |
 | `token_count_model_pools` | `[]` | Model pools allowed to apply prepared exact counts. Empty allows every pool; entries may be plain model names (`model-a`) or internal pool keys (`program:model:model-a`, `program:all`, `program:fallback:unlabeled`). Unknown-looking entries are not validated against live pools, so check `vllm_router_agent_aware_context_token_fallbacks_total{reason="pool_not_allowed"}` after enabling. |
 | `token_count_verification_settlements` | `1` | Matching Engine settlements a fingerprint needs before `exact_when_verified` applies it (probation). The first settlement of a new class uses the estimate and only counts as verification; a mismatch revokes the class and restarts probation. `0` restores legacy trust-on-first-use. |
 | `metrics_base_urls` | `{}` | Maps a Program target base URL to the HTTP `/metrics` endpoint of the same Engine/DP rank. Required for `grpc://` targets: without a mapping the target keeps reporting a missing observation, and a stale sample is never promoted to live capacity. Keys are matched literally against the configured target base URL, including any trailing slash; values must be `http(s)://` URLs (config validation rejects anything else). |
@@ -161,13 +167,35 @@ On a `grpc://` pool the canonical `vllm_xargs.agentic_context` payload is accept
 
 Program admission, context-growth accounting, and Progress-TTL cost all consume one number: how many input tokens a request adds to a Program's context. Historically that number came from a byte estimator whose only input is the request text.
 
-`token_count_mode` makes the source explicit:
+### Default and standard opt-in
 
-| Mode | Applied count | Operator visibility |
-|---|---|---|
-| `estimated` | Byte estimator with usage feedback | `context_token_source="estimated"` |
-| `shadow` | Byte estimator (identical decisions) | Prepared counterfactual for queued front admissions, evaluated by the same rank admission plan (count, low watermark, growth reserve, batch-gain); `vllm_router_agent_aware_context_token_shadow_total` counts agreement |
-| `exact_when_verified` | Prepared count after probation | `context_token_source` records `client_token_ids` or `prepared_token_ids`; `fingerprint_unverified` marks a class still in probation |
+Leave token-count fields out of the deployment JSON to keep `estimated`, the
+compatible byte estimator with usage feedback. Program scheduling itself stays
+disabled unless explicitly enabled. To return an exact-count deployment to the
+estimator, set `"token_count_mode": "estimated"`.
+
+To enable exact input-token facts, use this minimal override with the existing
+Program scheduling enable flag (or merge it into the deployment JSON):
+
+```json
+{
+  "token_count_mode": "exact_when_verified"
+}
+```
+
+This is the standard configuration for adopting exact counts. It automatically
+uses the estimate while a fingerprint is unverified, applies prepared counts
+after verification, and falls back when no usable fact is available or the
+fingerprint is revoked. There is no required `estimated` → `shadow` → exact
+rollout sequence. The defaults require one matching Engine settlement, allow
+all eligible model pools, and leave additional HTTP text tokenization disabled.
+These are input-token overrides; capacity and performance calibration remain
+part of the deployment configuration described above.
+
+`context_token_source` reports `estimated`, `client_token_ids`, or
+`prepared_token_ids`; the `fingerprint_unverified` fallback marks probation.
+
+### Available facts and optional HTTP chat tokenization
 
 A prepared count exists for three request shapes:
 
@@ -177,6 +205,40 @@ A prepared count exists for three request shapes:
 
 Before enabling `exact_text_endpoints`, verify that the Router's rendering and tokenization equal the Engine's for the deployed model, template and chat options. `examples/render_count.rs` performs that check on CPU against a fixture of conversations with Engine-side counts (no GPU required); a mismatch is also visible at runtime as a non-zero `vllm_router_agent_aware_context_token_observation_delta_ratio` and as fingerprint revocations (`vllm_router_agent_aware_context_token_revocations_total`).
 
+After that check, HTTP chat deployments can opt into the additional work with:
+
+```json
+{
+  "token_count_mode": "exact_when_verified",
+  "exact_text_endpoints": ["/v1/chat/completions"]
+}
+```
+
+Selecting exact mode alone does not enable this second tokenization. Ordinary
+HTTP text requests without an enabled preparation path continue to estimate;
+eligible token-ID and gRPC requests can reuse IDs that already exist.
+
+### Advanced diagnostics and scope controls
+
+Use `"token_count_mode": "shadow"` only when an optional observation period is
+useful. It keeps estimated scheduling decisions indefinitely, even after a
+fingerprint verifies, and records how prepared counts would change queued
+front admissions. Counterfactuals use the same rank admission plan (count, low
+watermark, growth reserve, and batch-gain); the results appear in
+`vllm_router_agent_aware_context_token_shadow_total`. Shadow still prepares
+facts and collects Engine usage, including the streaming usage handling below;
+enabling HTTP text preparation in shadow has the same second-tokenization cost.
+
+Other token-count fields are advanced overrides, not prerequisites for exact
+mode. Use `token_count_model_pools` to limit rollout scope, increase
+`token_count_verification_settlements` to require more matching observations,
+and enable `exact_text_endpoints` only for the intended HTTP text path. Keep the
+default verification threshold of `1` unless there is a deployment-specific
+reason to change it; `0` bypasses probation. `metrics_base_urls` independently
+maps gRPC targets to their Engine HTTP metrics endpoints for capacity accounting.
+
+### Verification and settlement
+
 Every prepared count carries a fingerprint of the token-equivalence inputs (request model, Router frontend asset overrides, template options, encode backend). Per-request identity, sampling knobs and credentials are excluded. At completion the Router compares the prepared count with Engine `prompt_tokens`:
 
 - equal counts advance that fingerprint's probation; once `token_count_verification_settlements` matches have accumulated, exact mode applies its count to later requests;
@@ -185,9 +247,9 @@ Every prepared count carries a fingerprint of the token-equivalence inputs (requ
 
 The fingerprint includes `reasoning_effort` and `response_format`, which can change the rendered prompt. Revocation also replaces affected retained requests with their original byte estimates, including FIFO successors and all prepared fingerprints in a saturated pool. An admitted request that has not started dispatch is returned to admission for a capacity recheck; a second check under the retention lock covers revocation between arrival-time resolution and enqueueing.
 
-On an HTTP pool the Router can only verify a prepared count when settlement sees Engine usage. For exact-mode streaming requests whose client did not request `stream_options.include_usage`, the Router injects `include_usage: true` into the upstream request and strips only the final usage-only chunk (never an ordinary delta, even one that carries `usage: null`) for that client, so the fact can still be verified. If the injected usage is still absent, settlement records `vllm_router_agent_aware_context_token_unobserved_total` and `exact_when_verified` keeps the estimator for that request (`unobservable_stream` fallback). gRPC paths are unaffected because the producer records usage internally.
+On an HTTP pool the Router can only verify a prepared count when settlement sees Engine usage. For eligible streaming requests in exact or shadow mode whose client did not request `stream_options.include_usage`, the Router injects `include_usage: true` into the upstream request and strips only the final usage-only chunk (never an ordinary delta, even one that carries `usage: null`) for that client, so the fact can still be verified. If the injected usage is still absent, settlement records `vllm_router_agent_aware_context_token_unobserved_total` and the missing observation does not advance verification. Requests known to be unobservable use the estimator (`unobservable_stream` fallback). gRPC paths are unaffected because the producer records usage internally.
 
-Operational note: `shadow` is a measurement mode, not a safe fallback. The tight-capacity E2E run showed estimated token facts plus Program scheduling can be **slower than no Program scheduling at all** (762.5 s vs 340.0 s wall) because false denials and forced resumes thrash; exact facts were faster than both (240.0 s). Do not enable Program-level scheduling under a tight token budget with `estimated` mode without measuring first, and use `shadow` to quantify the counterfactual before switching.
+Operational note: the estimated default preserves compatibility, rather than guaranteeing optimal scheduling performance. The tight-capacity E2E run showed estimated token facts plus Program scheduling can be **slower than no Program scheduling at all** (762.5 s vs 340.0 s wall) because false denials and forced resumes thrash; exact facts were faster than both (240.0 s). Measure under the deployment's token budget. Shadow can optionally quantify counterfactual decisions while retaining the estimator, but it is not a performance fallback or a required step before exact mode.
 
 Scope: the exact facts are an input to the Program scheduling algorithm only. They feed Program admission, context growth/occupancy accounting, Progress-TTL cost, Program binding/migration inputs, and the diagnostics above; they do not change KV-aware routing, DP routing, or the PD-disaggregated router, and the PD-disaggregated Program adapter (`pd_program_adapter`) still admits with the byte estimator. This PR therefore targets the colocated Program path (the regular router).
 
