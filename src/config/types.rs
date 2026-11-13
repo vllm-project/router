@@ -80,6 +80,11 @@ pub struct RouterConfig {
     /// `None` disables affinity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_aware_session_affinity_ttl_secs: Option<u64>,
+    /// Opt in to prompt history observed at successful upstream response headers
+    /// for regular HTTP `kv_aware` routing, not proof of completed inference.
+    /// This heuristic is separate from worker-reported KV events and session affinity.
+    #[serde(default)]
+    pub kv_aware_completion_history: bool,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
@@ -1326,6 +1331,7 @@ impl Default for RouterConfig {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            kv_aware_completion_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -1340,6 +1346,40 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    /// Configuration-only gates. An enabled flag does not qualify a request or registration.
+    pub(crate) fn history_policy_support(&self, policy: &PolicyConfig) -> Result<(), &'static str> {
+        if self.enable_igw {
+            return Err("inference_gateway");
+        }
+        if self.program_scheduling.is_some() {
+            return Err("program_scheduling");
+        }
+        if self.intra_node_data_parallel_size != 1 {
+            return Err("multi_rank");
+        }
+        match policy {
+            PolicyConfig::KvAware {
+                router_temperature, ..
+            } if *router_temperature == 0.0 => Ok(()),
+            PolicyConfig::KvAware { .. } => Err("nonzero_router_temperature"),
+            _ => Err("not_kv_aware"),
+        }
+    }
+
+    pub(crate) fn regular_history_support(&self) -> Result<(), &'static str> {
+        let RoutingMode::Regular { worker_urls } = &self.mode else {
+            return Err("not_regular");
+        };
+        self.history_policy_support(&self.policy)?;
+        if worker_urls
+            .iter()
+            .any(|url| crate::backend::is_grpc_url(url))
+        {
+            return Err("grpc_worker_pool");
+        }
+        Ok(())
+    }
+
     /// Create a new configuration with mode and policy
     pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
         Self {
@@ -1421,6 +1461,25 @@ mod tests {
         assert!(config.metrics.is_none());
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
+        assert!(!config.kv_aware_completion_history);
+    }
+
+    #[test]
+    fn test_completion_history_serde_opt_in() {
+        let mut value = serde_json::to_value(RouterConfig::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("kv_aware_completion_history");
+        let omitted: RouterConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(!omitted.kv_aware_completion_history);
+        value["kv_aware_completion_history"] = serde_json::json!(true);
+        let enabled: RouterConfig = serde_json::from_value(value).unwrap();
+        assert!(enabled.kv_aware_completion_history);
+        assert_eq!(
+            serde_json::to_value(enabled).unwrap()["kv_aware_completion_history"],
+            true
+        );
     }
 
     #[test]
@@ -2112,6 +2171,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            kv_aware_completion_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2182,6 +2242,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            kv_aware_completion_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2248,6 +2309,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            kv_aware_completion_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,

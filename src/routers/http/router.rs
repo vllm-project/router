@@ -12,13 +12,12 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-#[cfg(all(test, feature = "cpu", feature = "ready"))]
-use crate::policies::kv_aware_policy;
 use crate::policies::KvRequestTokens;
 use crate::policies::{
     kv_aware_ops, AffinityKey, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy,
     PolicyRegistry,
 };
+use crate::policies::{HistoryObservation, KvAwareOps, QualifiedKvInput};
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
@@ -269,6 +268,7 @@ struct TypedDispatch<'a> {
     completion: Option<&'a CompletionRoute>,
     load: RequestLoadGuard,
     prepared: Option<crate::backend::PreparedRequest>,
+    history: Option<(&'a dyn KvAwareOps, HistoryObservation)>,
 }
 
 struct SelectedWorker {
@@ -290,6 +290,7 @@ pub struct Router {
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
     kv_aware_session_affinity_ttl_secs: Option<u64>,
+    kv_aware_completion_history: bool,
     health_config: HealthConfig,
     frontend: crate::backend::EngineFrontend,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
@@ -332,6 +333,9 @@ impl Router {
         // All-http or all-grpc. Mixed schemes fail here (not a silent fallback).
         let pool_kind = crate::backend::classify_worker_urls(&worker_urls)?;
         let default_policy = ctx.policy_registry.get_default_policy();
+        let kv_aware_completion_history = ctx.router_config.kv_aware_completion_history
+            && ctx.router_config.regular_history_support().is_ok()
+            && pool_kind != Some(crate::backend::WorkerPoolKind::Grpc);
         let pending_kv_supervisor = if kv_aware_ops(default_policy.as_ref()).is_some() {
             let (mut supervisor, signals) =
                 crate::kv_index::KvIndexSupervisor::new_http_full_attention(
@@ -455,11 +459,19 @@ impl Router {
                 let provider = kv_index_supervisor.as_ref().and_then(|supervisor| {
                     supervisor.match_provider_for_worker(worker_arc.base_url())
                 });
-                kv_aware.register_worker(
-                    worker_arc.as_ref(),
-                    kv_worker_info.get(worker_arc.base_url()),
-                    provider,
-                );
+                if kv_aware_completion_history {
+                    kv_aware.register_history_worker(
+                        &worker_arc,
+                        kv_worker_info.get(worker_arc.base_url()),
+                        provider,
+                    );
+                } else {
+                    kv_aware.register_worker(
+                        worker_arc.as_ref(),
+                        kv_worker_info.get(worker_arc.base_url()),
+                        provider,
+                    );
+                }
             }
 
             // Notify PolicyRegistry about the new worker
@@ -625,6 +637,7 @@ impl Router {
             kv_aware_session_affinity_ttl_secs: ctx
                 .router_config
                 .kv_aware_session_affinity_ttl_secs,
+            kv_aware_completion_history,
             health_config,
             frontend,
             _worker_loads: worker_loads,
@@ -662,7 +675,7 @@ impl Router {
 
     fn register_kv_target(
         &self,
-        worker: &dyn Worker,
+        worker: &Arc<dyn Worker>,
         info: Option<&crate::kv_index::WorkerKvInfo>,
     ) {
         let policy = self.policy_registry.get_default_policy();
@@ -673,7 +686,11 @@ impl Router {
             .kv_index_supervisor
             .as_ref()
             .and_then(|supervisor| supervisor.match_provider_for_worker(worker.base_url()));
-        kv_aware.register_worker(worker, info, provider);
+        if self.kv_aware_completion_history {
+            kv_aware.register_history_worker(worker, info, provider);
+        } else {
+            kv_aware.register_worker(worker.as_ref(), info, provider);
+        }
     }
 
     fn remove_kv_worker(&self, worker_url: &str, target_urls: &[String]) {
@@ -1329,43 +1346,39 @@ impl Router {
     /// Select worker for a specific model considering circuit breaker state
     #[allow(clippy::too_many_arguments)]
     fn select_worker_for_model(
-        &self,
+        policy: &dyn LoadBalancingPolicy,
         model_id: Option<&str>,
         available: &[Arc<dyn Worker>],
         text: Option<&str>,
         headers: Option<&HeaderMap>,
-        token_ids: KvRequestTokens<'_>,
-        eligibility: Option<&[bool]>,
+        input: QualifiedKvInput<'_>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
-    ) -> Option<SelectedWorker> {
+    ) -> Option<(SelectedWorker, Option<HistoryObservation>)> {
         if available.is_empty() {
             return None;
         }
 
-        let policy = self.policy_for_model(model_id);
-
-        // Convert headers for policies that need them (e.g., consistent_hash)
-        let request_headers = Self::headers_to_request_headers(headers);
-
-        if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
+        if let Some(kv_aware) = kv_aware_ops(policy) {
             // The policy sees the full list: a retry exclusion must not
             // rewrite a still-valid binding.
-            let receipt = kv_aware.select_worker_with_qualified_inputs(
+            let (receipt, observation) = kv_aware.select_with_context(
                 available,
-                token_ids,
+                input,
                 lora_name,
                 cache_salt,
                 affinity_key,
                 excluded_workers,
-                eligibility,
             )?;
-            return Some(SelectedWorker {
-                worker: available.get(receipt.worker_index)?.clone(),
-                kv_receipt: Some(receipt),
-            });
+            return Some((
+                SelectedWorker {
+                    worker: available.get(receipt.worker_index)?.clone(),
+                    kv_receipt: Some(receipt),
+                },
+                observation,
+            ));
         }
 
         let idx = if let Some(cache) = policy
@@ -1373,15 +1386,27 @@ impl Router {
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
             cache.select_worker_with_inputs(
-                available, token_ids, model_id, lora_name, cache_salt, "regular",
+                available,
+                input.tokens,
+                model_id,
+                lora_name,
+                cache_salt,
+                "regular",
             )?
         } else {
-            policy.select_worker_with_headers(available, text, request_headers.as_ref())?
+            policy.select_worker_with_headers(
+                available,
+                text,
+                Self::headers_to_request_headers(headers).as_ref(),
+            )?
         };
-        Some(SelectedWorker {
-            worker: available.get(idx)?.clone(),
-            kv_receipt: None,
-        })
+        Some((
+            SelectedWorker {
+                worker: available.get(idx)?.clone(),
+                kv_receipt: None,
+            },
+            None,
+        ))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -1508,6 +1533,26 @@ impl Router {
         let cache_key = &cache_key;
 
         let http_inputs = tokio::sync::OnceCell::new();
+        let history_registrations = std::sync::OnceLock::new();
+        // Skip registration capture for ineligible input; policy selection still
+        // checks the per-worker credit mask before accepting a history hint.
+        let history_model = if self.kv_aware_completion_history
+            && completion.is_some_and(|c| c.worker_credit)
+        {
+            use crate::protocols::spec::PromptInput;
+            match typed_req.grpc_request() {
+                Some(GrpcRequestRef::Completion(r))
+                    if matches!(r.prompt, PromptInput::String(_) | PromptInput::IntArray(_)) =>
+                {
+                    r.model
+                        .as_deref()
+                        .filter(|m| !m.is_empty() && model_id.is_none_or(|id| id == *m))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         // KV-aware retries may bypass a target without rewriting its binding.
         let failed_workers = Mutex::new(Vec::new());
@@ -1530,6 +1575,7 @@ impl Router {
             });
 
         let http_inputs = &http_inputs;
+        let history_registrations = &history_registrations;
         let failed_workers = &failed_workers;
         let affinity_key = &affinity_key;
         let response = RetryExecutor::execute_response_with_retry(
@@ -1552,6 +1598,11 @@ impl Router {
                 let policy = self.policy_for_model(model_id);
                 let kv_ops = kv_aware_ops(policy.as_ref());
                 let workers = self.available_workers(model_id);
+                let history = history_model.and_then(|model| {
+                    // Tag per-Worker tokens before any preparation RPC. A retry may
+                    // reuse the tokens but may not assign them to a replacement.
+                    history_registrations.get_or_init(|| kv_ops.and_then(|ops| ops.capture_completion_history(&workers, model))).as_ref()
+                });
                 let excluded_workers = failed_workers.lock().clone();
                 let needs_http_input = prepared.is_none()
                     && (kv_ops.is_some() || policy.needs_cache_routing_key());
@@ -1635,7 +1686,7 @@ impl Router {
                                 std::slice::from_ref(&worker),
                             )
                         });
-                    let kv_receipt = kv_aware_ops(policy.as_ref()).and_then(|kv_aware| {
+                    let kv_receipt = kv_ops.and_then(|kv_aware| {
                         kv_aware.select_worker_with_qualified_inputs(
                             std::slice::from_ref(&worker),
                             request_tokens,
@@ -1646,9 +1697,10 @@ impl Router {
                             eligibility.as_deref(),
                         )
                     });
-                    Some(SelectedWorker { worker, kv_receipt })
+                    Some((SelectedWorker { worker, kv_receipt }, None))
                 } else {
-                    self.select_worker_for_model(
+                    Self::select_worker_for_model(
+                        policy.as_ref(),
                         model_id,
                         &workers,
                         Some(if policy.needs_cache_routing_key() {
@@ -1657,15 +1709,14 @@ impl Router {
                             text
                         }),
                         headers,
-                        request_tokens,
-                        eligibility.as_deref(),
+                        QualifiedKvInput { tokens: request_tokens, eligibility: eligibility.as_deref(), history },
                         lora_name,
                         cache_salt,
                         affinity_key.as_ref(),
                         &excluded_workers,
                     )
                 };
-                let SelectedWorker { worker, kv_receipt } = match selected_worker {
+                let (SelectedWorker { worker, kv_receipt }, observation) = match selected_worker {
                     Some(selection) => selection,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -1701,6 +1752,7 @@ impl Router {
                             completion,
                             load,
                             prepared: (*prepared).clone(),
+                            history: kv_ops.zip(observation),
                         },
                         program_completion.clone(),
                     )
@@ -1884,6 +1936,7 @@ impl Router {
             completion,
             load,
             prepared,
+            history,
         } = dispatch;
         let completion_echo = completion.map(|input| input.echo);
         let load_incremented = load.tracks_worker();
@@ -2028,6 +2081,13 @@ impl Router {
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if status.is_success() {
+            if let Some((policy, observation)) = history {
+                if let Some(current) = self.worker_registry.get_by_url(worker_url) {
+                    policy.observe_completion_headers(current.as_ref(), observation);
+                }
+            }
+        }
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
         if !is_stream {
@@ -2300,7 +2360,7 @@ impl Router {
 
                             let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                             self.worker_registry.register(worker_arc.clone());
-                            self.register_kv_target(worker_arc.as_ref(), kv_info.as_ref());
+                            self.register_kv_target(&worker_arc, kv_info.as_ref());
 
                             // Notify PolicyRegistry about the new worker
                             let model_id = worker_arc.model_id();
@@ -2336,9 +2396,9 @@ impl Router {
                                 .with_circuit_breaker_config(self.circuit_breaker_config.clone())
                                 .with_health_config(self.health_config.clone());
 
-                        let worker_arc = Arc::new(new_worker);
+                        let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                         self.worker_registry.register(worker_arc.clone());
-                        self.register_kv_target(worker_arc.as_ref(), kv_info.as_ref());
+                        self.register_kv_target(&worker_arc, kv_info.as_ref());
 
                         // Notify PolicyRegistry about the new worker
                         let model_id = worker_arc.model_id();
@@ -3419,7 +3479,14 @@ impl RouterTrait for Router {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use crate::policies::{kv_aware_policy, KvAwarePolicy};
     use std::collections::HashMap;
+
+    const NO_KV_INPUT: QualifiedKvInput<'static> = QualifiedKvInput {
+        tokens: KvRequestTokens::Shared(None),
+        eligibility: None,
+        history: None,
+    };
 
     struct CompletionResponseFixture {
         router: Arc<Router>,
@@ -3548,6 +3615,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn regular_history_startup_respects_policy_temperature_and_opt_in() {
+        use crate::config::RouterConfig;
+        for (policy, requested, enabled) in [
+            (serde_json::json!({"type": "random"}), true, false),
+            (
+                serde_json::json!({"type": "kv_aware", "router_temperature": 1.0}),
+                true,
+                false,
+            ),
+            (
+                serde_json::json!({"type": "kv_aware", "router_temperature": 0.0}),
+                false,
+                false,
+            ),
+            (
+                serde_json::json!({"type": "kv_aware", "router_temperature": 0.0}),
+                true,
+                true,
+            ),
+        ] {
+            let config = RouterConfig {
+                policy: serde_json::from_value(policy).unwrap(),
+                kv_aware_completion_history: requested,
+                ..Default::default()
+            };
+            let ctx = Arc::new(
+                crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
+            );
+            let router = Router::new(vec![], &ctx).await.unwrap();
+            assert_eq!(router.kv_aware_completion_history, enabled);
+        }
+    }
+
+    #[tokio::test]
     async fn app_context_rejects_invalid_static_source_config() {
         use crate::config::RouterConfig;
         let config = RouterConfig {
@@ -3583,7 +3684,12 @@ mod tests {
         let worker = format!("http://{}", listener.local_addr().unwrap());
         // Discovery endpoints deliberately do not exist: the saved mapping must
         // supply the source for this later, independently addressed worker.
-        let app = axum::Router::new().route("/health", get(|| async { "ok" }));
+        let app = axum::Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/v1/completions",
+                axum::routing::post(|| async { Json(json!({"choices": []})) }),
+            );
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let config = RouterConfig {
             policy: PolicyConfig::KvAware {
@@ -3599,6 +3705,7 @@ mod tests {
                     .unwrap(),
                 ),
             },
+            kv_aware_completion_history: true,
             worker_startup_timeout_secs: 5,
             ..Default::default()
         };
@@ -3607,6 +3714,23 @@ mod tests {
         );
         let router = Router::new(vec![], &ctx).await.unwrap();
         router.add_worker(&worker).await.unwrap();
+        let req: CompletionRequest =
+            serde_json::from_value(json!({"model":"future-model","prompt":vec![77;8]})).unwrap();
+        assert_eq!(
+            router
+                .route_typed_request(None, &req, "/v1/completions", None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let policy = router.policy_registry.get_default_policy();
+        let registered = router.worker_registry.get_by_url(&worker).unwrap();
+        assert_eq!(
+            kv_aware_policy(policy.as_ref())
+                .unwrap()
+                .observed_completion_prefix(registered.as_ref(), &[77; 8]),
+            8
+        );
         let supervisor = router.kv_index_supervisor.as_ref().unwrap();
         let provider = supervisor.match_provider_for_worker(&worker).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -4073,6 +4197,7 @@ mod tests {
     #[tokio::test]
     async fn completion_retry_reselects_another_worker_and_preserves_active_request() {
         let mut router = create_test_kv_router();
+        router.kv_aware_completion_history = true;
         router.retry_config = RetryConfig {
             max_retries: 2,
             initial_backoff_ms: 0,
@@ -4118,6 +4243,9 @@ mod tests {
         let manager = kv.slot_manager().unwrap();
         let first_target = kv.target_for_worker(first.as_ref());
         let second_target = kv.target_for_worker(second.as_ref());
+        for (worker, target) in [(&first, &first_target), (&second, &second_target)] {
+            register_history_target(kv, worker, target.clone(), "qwen3", 2);
+        }
         let router = Arc::new(router);
         let dispatch = |raw: bytes::Bytes| {
             let router = router.clone();
@@ -4214,6 +4342,13 @@ mod tests {
             "prepare each target once across retries"
         );
         assert_eq!((first.load(), second.load()), (1, 0));
+        // A returned 500 and the outstanding request has not seen headers.
+        // Only the successful attempt on B learned a complete two-token block.
+        assert_eq!(kv.observed_completion_prefix(first.as_ref(), &[1, 3, 4]), 0);
+        assert_eq!(
+            kv.observed_completion_prefix(second.as_ref(), &[1, 3, 4]),
+            2
+        );
         assert_eq!(
             manager.sample(&first_target),
             crate::policies::LoadSample {
@@ -4632,6 +4767,7 @@ mod tests {
                     // false` expressed before the field became a guard.
                     load: RequestLoadGuard::new(None, None),
                     prepared: None,
+                    history: None,
                 },
                 None,
             )
@@ -4738,15 +4874,19 @@ mod tests {
                 instance_id: Arc::from(format!("worker-{worker_index}")),
                 dp_rank: 0,
             };
-            policy.register_target_with_cache_identity(
-                worker.url(),
-                target.clone(),
-                CacheKey {
-                    model: Arc::from("model"),
-                    hash_mode: HashMode::Sha256,
-                    block_size: 2,
-                },
-                index.clone(),
+            policy.register_history_worker(
+                &worker,
+                Some(&crate::kv_index::WorkerKvInfo {
+                    instance_id: target.instance_id.to_string(),
+                    ranks: vec![0],
+                    cache_key: Some(CacheKey {
+                        model: Arc::from("model"),
+                        hash_mode: HashMode::Sha256,
+                        block_size: 2,
+                    }),
+                    ..Default::default()
+                }),
+                Some(index.clone()),
             );
             if worker_index == warm {
                 worker.increment_load();
@@ -4789,6 +4929,180 @@ mod tests {
         serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["worker"]
             .as_u64()
             .unwrap() as usize
+    }
+
+    fn register_history_target(
+        kv: &KvAwarePolicy,
+        worker: &Arc<dyn Worker>,
+        target: crate::kv_index::RoutableTarget,
+        model: &str,
+        block_size: u32,
+    ) {
+        use crate::kv_index::{CacheKey, HashMode, KvBlockIndexer};
+        kv.register_history_worker(
+            worker,
+            Some(&crate::kv_index::WorkerKvInfo {
+                instance_id: target.instance_id.to_string(),
+                ranks: vec![0],
+                cache_key: Some(CacheKey {
+                    model: Arc::from(model),
+                    hash_mode: HashMode::Sha256,
+                    block_size,
+                }),
+                ..Default::default()
+            }),
+            Some(Arc::new(KvBlockIndexer::new())),
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_history_http_tie_preserves_full_cost() {
+        // The existing seed on worker 0 is unrelated to the actual Direct IDs.
+        let mut f =
+            http_kv_fixture([vec![vec![1, 2, 3, 4]], vec![vec![5, 6, 7, 8]]], 0, true).await;
+        f.workers[0].decrement_load();
+        f.workers[0].set_healthy(false);
+        let ids = vec![42u32; 33];
+        let req: CompletionRequest =
+            serde_json::from_value(serde_json::json!({"model":"model","prompt":ids})).unwrap();
+        let policy = f.router.policy_registry.get_default_policy();
+        let kv = kv_aware_policy(policy.as_ref()).unwrap();
+        // Same source, successful response and request with the option off/on.
+        for (enabled, prefix) in [(false, 0), (true, 32)] {
+            f.router.kv_aware_completion_history = enabled;
+            assert_eq!(
+                selected_http_worker(
+                    f.router
+                        .route_typed_request(None, &req, "/v1/completions", None)
+                        .await
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                kv.observed_completion_prefix(f.workers[1].as_ref(), &ids),
+                prefix
+            );
+        }
+        f.workers[0].set_healthy(true);
+        assert_eq!(
+            selected_http_worker(
+                f.router
+                    .route_typed_request(None, &req, "/v1/completions", None)
+                    .await
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            f.loads.lock().as_slice(),
+            &[(
+                1,
+                crate::policies::LoadSample {
+                    active_prefill_tokens: 33,
+                    active_requests: 1,
+                }
+            ); 3]
+        );
+        assert!(f.workers.iter().all(|w| w.load() == 0));
+        assert!(f
+            .calls
+            .lock()
+            .iter()
+            .all(|(_, path, _)| path == "/v1/completions"));
+    }
+
+    #[tokio::test]
+    async fn completion_history_observes_successful_headers_before_body_not_before_cancel() {
+        use bytes::Bytes;
+        let mut f = completion_response_fixture().await;
+        Arc::get_mut(&mut f.router)
+            .unwrap()
+            .kv_aware_completion_history = true;
+        let policy = f.router.policy_registry.get_default_policy();
+        let kv = kv_aware_policy(policy.as_ref()).unwrap();
+        let target = kv.target_for_worker(f.worker.as_ref());
+        register_history_target(kv, &f.worker, target.clone(), "model", 16);
+        let manager = kv.slot_manager().unwrap();
+        let dispatch = |id: u32| {
+            let router = f.router.clone();
+            tokio::spawn(async move {
+                let req: CompletionRequest = serde_json::from_value(
+                    serde_json::json!({"model":"model","prompt":vec![id;16]}),
+                )
+                .unwrap();
+                router
+                    .route_typed_request(None, &req, "/v1/completions", None)
+                    .await
+            })
+        };
+        let timeout = Duration::from_secs(5);
+        let held = dispatch(7);
+        tokio::time::timeout(timeout, f.requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kv.observed_completion_prefix(f.worker.as_ref(), &[7; 16]),
+            0
+        );
+        let (send, chunks) =
+            tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+        f.responses
+            .send(Response::new(Body::from_stream(
+                UnboundedReceiverStream::new(chunks),
+            )))
+            .unwrap();
+        send.send(Ok(Bytes::from_static(b"partial"))).unwrap();
+        // The nonstream request is still reading its body. Waiting on the
+        // actual observation (not a delay) distinguishes headers from return.
+        tokio::time::timeout(timeout, async {
+            while kv.observed_completion_prefix(f.worker.as_ref(), &[7; 16]) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!held.is_finished());
+        let cancel = dispatch(9);
+        tokio::time::timeout(timeout, f.requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(manager.sample(&target).active_prefill_tokens, 32);
+        cancel.abort();
+        assert!(cancel.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            kv.observed_completion_prefix(f.worker.as_ref(), &[9; 16]),
+            0
+        );
+        assert_eq!(
+            manager.sample(&target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 16,
+                active_requests: 1
+            }
+        );
+        assert_eq!(f.worker.load(), 1);
+        send.send(Err(std::io::Error::other("truncated test response")))
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(timeout, held)
+                .await
+                .unwrap()
+                .unwrap()
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            kv.observed_completion_prefix(f.worker.as_ref(), &[7; 16]),
+            16
+        );
+        assert_eq!(
+            manager.sample(&target),
+            crate::policies::LoadSample::default()
+        );
+        assert_eq!(f.worker.load(), 0);
     }
 
     #[tokio::test]
@@ -5390,6 +5704,7 @@ mod tests {
             kv_index_supervisor: None,
             _kv_signal_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
+            kv_aware_completion_history: false,
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -5425,6 +5740,7 @@ mod tests {
             kv_index_supervisor: None,
             _kv_signal_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
+            kv_aware_completion_history: false,
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -6032,6 +6348,7 @@ mod tests {
                     completion: Some(&completion),
                     load,
                     prepared: None,
+                    history: None,
                 },
                 None,
             )
@@ -6215,6 +6532,7 @@ mod tests {
                         completion: Some(&completion),
                         load,
                         prepared: None,
+                        history: None,
                     },
                     None,
                 )
@@ -6865,6 +7183,7 @@ mod tests {
             kv_index_supervisor: None,
             _kv_signal_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
+            kv_aware_completion_history: false,
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -6926,20 +7245,19 @@ mod tests {
         // Make multiple selections with the same headers - should all pick the same worker
         let mut selected_urls: Vec<String> = Vec::new();
         for _ in 0..10 {
-            let worker = router
-                .select_worker_for_model(
-                    None,
-                    &router.available_workers(None),
-                    Some(r#"{"prompt": "test"}"#),
-                    Some(&header_map),
-                    KvRequestTokens::Shared(None),
-                    None,
-                    None,
-                    None,
-                    None,
-                    &[],
-                )
-                .expect("Should select a worker");
+            let (worker, _) = Router::select_worker_for_model(
+                router.policy_for_model(None).as_ref(),
+                None,
+                &router.available_workers(None),
+                Some(r#"{"prompt": "test"}"#),
+                Some(&header_map),
+                NO_KV_INPUT,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .expect("Should select a worker");
             selected_urls.push(worker.worker.url().to_string());
         }
 
@@ -6967,20 +7285,19 @@ mod tests {
             }
         }
 
-        let worker = router
-            .select_worker_for_model(
-                None,
-                &router.available_workers(None),
-                Some(r#"{"prompt": "test"}"#),
-                None,
-                KvRequestTokens::Shared(None),
-                None,
-                None,
-                None,
-                None,
-                &[],
-            )
-            .expect("Should select the remaining healthy worker");
+        let (worker, _) = Router::select_worker_for_model(
+            router.policy_for_model(None).as_ref(),
+            None,
+            &router.available_workers(None),
+            Some(r#"{"prompt": "test"}"#),
+            None,
+            NO_KV_INPUT,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("Should select the remaining healthy worker");
 
         assert_eq!(
             worker.worker.url(),
@@ -7000,13 +7317,13 @@ mod tests {
             w.set_healthy(false);
         }
 
-        let result = router.select_worker_for_model(
+        let result = Router::select_worker_for_model(
+            router.policy_for_model(None).as_ref(),
             None,
             &router.available_workers(None),
             Some(r#"{"prompt": "test"}"#),
             None,
-            KvRequestTokens::Shared(None),
-            None,
+            NO_KV_INPUT,
             None,
             None,
             None,
@@ -7022,23 +7339,23 @@ mod tests {
     fn test_retry_exclusion_does_not_change_other_policies() {
         let router = create_test_consistent_hash_router();
         let select = |excluded: &[String]| {
-            router
-                .select_worker_for_model(
-                    None,
-                    &router.available_workers(None),
-                    Some(r#"{"prompt": "test"}"#),
-                    None,
-                    KvRequestTokens::Shared(None),
-                    None,
-                    None,
-                    None,
-                    None,
-                    excluded,
-                )
-                .expect("Should select a worker")
-                .worker
-                .url()
-                .to_string()
+            Router::select_worker_for_model(
+                router.policy_for_model(None).as_ref(),
+                None,
+                &router.available_workers(None),
+                Some(r#"{"prompt": "test"}"#),
+                None,
+                NO_KV_INPUT,
+                None,
+                None,
+                None,
+                excluded,
+            )
+            .expect("Should select a worker")
+            .0
+            .worker
+            .url()
+            .to_string()
         };
         let first = select(&[]);
         assert_eq!(select(std::slice::from_ref(&first)), first);
@@ -7055,13 +7372,13 @@ mod tests {
             let session_id = format!("session-{}", i);
             header_map.insert("x-session-id", HeaderValue::from_str(&session_id).unwrap());
 
-            if let Some(worker) = router.select_worker_for_model(
+            if let Some((worker, _)) = Router::select_worker_for_model(
+                router.policy_for_model(None).as_ref(),
                 None,
                 &router.available_workers(None),
                 Some(r#"{"prompt": "test"}"#),
                 Some(&header_map),
-                KvRequestTokens::Shared(None),
-                None,
+                NO_KV_INPUT,
                 None,
                 None,
                 None,
