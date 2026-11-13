@@ -2623,8 +2623,8 @@ mod tests {
             .map(|(seq, token_ids)| batch_payload(&[store_event(100 + seq as u64, token_ids)], 0))
             .collect();
 
-        for seq in 0..=1 {
-            let events = [store_event(100 + seq as u64, &tokens[seq])];
+        for (seq, token_ids) in tokens.iter().take(2).enumerate() {
+            let events = [store_event(100 + seq as u64, token_ids)];
             publish_until_advanced(
                 &fixture.publisher,
                 &mut fixture.signals,

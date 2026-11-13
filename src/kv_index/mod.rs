@@ -28,7 +28,7 @@ pub use types::{
     CacheOwnerId, ClearScope, HashMode, Locality, ResidencyOwner, RoutableTarget, SourceId,
     StorageTier,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 pub(crate) use types::{SourceRecoveryState, SourceRecoveryStatus};
 pub use wire::{AllBlocksCleared, BlockRemoved, BlockStored, KVEvent, KVEventBatch};
 
