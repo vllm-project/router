@@ -286,6 +286,7 @@ impl HybridEventIndex {
                             // The clear is about claims: a group that has published
                             // pages still cannot bound a prefix, so its evidence stays.
                             tx.clear_owner_exact(&self.owner);
+                            state.reset_generation = state.reset_generation.wrapping_add(1);
                             Ok(())
                         }
                     };
@@ -307,9 +308,7 @@ impl HybridEventIndex {
         error: HybridEventError,
     ) -> Result<T, HybridEventError> {
         tx.clear_owner_exact(owner);
-        state.page_evidence.clear();
-        state.next_seq = None;
-        state.visible = false;
+        state.reset(None, false);
         Err(error)
     }
 }

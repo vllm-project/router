@@ -3,6 +3,9 @@
 use std::collections::{HashMap, HashSet};
 
 pub(super) struct State {
+    /// Fences owned query snapshots across reset/replay, including a reset
+    /// which returns to the same sequence number and visibility.
+    pub(super) reset_generation: u64,
     pub(super) next_seq: Option<u64>,
     pub(super) visible: bool,
     /// Whether this identity/group publishes addressable pages. This metadata
@@ -11,6 +14,13 @@ pub(super) struct State {
 }
 
 impl State {
+    pub(super) fn reset(&mut self, next_seq: Option<u64>, visible: bool) {
+        self.reset_generation = self.reset_generation.wrapping_add(1);
+        self.page_evidence.clear();
+        self.next_seq = next_seq;
+        self.visible = visible;
+    }
+
     pub(super) fn page_evidence_in(&self, namespace: Option<&str>) -> Option<&HashSet<u32>> {
         self.page_evidence
             .iter()
@@ -271,6 +281,73 @@ pub(crate) mod tests {
         assert_eq!(first.reusable_tokens(&prompt(), usize::MAX), 0);
         first.finish_replay(1).unwrap();
         assert_eq!(first.reusable_tokens(&prompt(), usize::MAX), 528);
+    }
+
+    #[test]
+    fn snapshot_calculation_does_not_block_same_source_writes_or_survive_reset() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Rebuild to the same sequence and visibility: checking those fields
+        // alone cannot distinguish the old snapshot from the new cache view.
+        for reset in 0..4 {
+            let first = Arc::new(index(8));
+            first.begin_empty(0);
+            first.apply_batch(0, &qwen_batch()).unwrap();
+            let writer = first.clone();
+            super::super::AFTER_HYBRID_SNAPSHOT.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let (sent, received) = mpsc::channel();
+                    let handle = std::thread::spawn(move || {
+                        match reset {
+                            0 => writer.invalidate(),
+                            1 => writer.begin_replay(0),
+                            2 => assert_eq!(
+                                writer.apply_batch(2, &qwen_batch()),
+                                Err(HybridEventError::Sequence)
+                            ),
+                            _ => writer.begin_empty(0),
+                        }
+                        writer.begin_empty(0);
+                        writer.apply_batch(0, &qwen_batch()).unwrap();
+                        sent.send(()).unwrap();
+                    });
+                    received
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("boundary calculation must not hold the stream read lock");
+                    handle.join().unwrap();
+                }));
+            });
+            assert_eq!(first.reusable_tokens(&prompt(), usize::MAX), 0);
+            assert_eq!(first.reusable_tokens(&prompt(), usize::MAX), 528);
+        }
+    }
+
+    #[test]
+    fn clear_after_snapshot_revokes_inflight_credit() {
+        let first = Arc::new(index(8));
+        first.begin_empty(0);
+        first.apply_batch(0, &qwen_batch()).unwrap();
+        let writer = first.clone();
+        super::super::AFTER_HYBRID_SNAPSHOT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::thread::spawn(move || {
+                    writer
+                        .apply_batch(
+                            1,
+                            &KVEventBatch {
+                                ts: 1.0,
+                                data_parallel_rank: Some(0),
+                                events: vec![KVEvent::AllBlocksCleared(Default::default())],
+                            },
+                        )
+                        .unwrap();
+                })
+                .join()
+                .unwrap();
+            }));
+        });
+        assert_eq!(first.reusable_tokens(&prompt(), usize::MAX), 0);
     }
 
     #[test]

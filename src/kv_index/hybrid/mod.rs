@@ -149,6 +149,7 @@ impl HybridEventIndex {
             owner,
             binding: None,
             state: RwLock::new(State {
+                reset_generation: 0,
                 next_seq: None,
                 visible: false,
                 page_evidence: HashMap::new(),
@@ -220,10 +221,8 @@ impl HybridEventIndex {
             let mut state = self.state.write();
             self.index.with_source_batch(&self.target, |tx| {
                 tx.clear_owner_exact(&self.owner);
-                state.page_evidence.clear();
+                state.reset(Some(next_seq), true);
                 tx.resume_source(&self.target.instance_id, self.target.dp_rank);
-                state.next_seq = Some(next_seq);
-                state.visible = true;
             });
         });
     }
@@ -235,9 +234,7 @@ impl HybridEventIndex {
             let mut state = self.state.write();
             self.index.with_source_batch(&self.target, |tx| {
                 tx.clear_owner_exact(&self.owner);
-                state.page_evidence.clear();
-                state.next_seq = Some(next_seq);
-                state.visible = false;
+                state.reset(Some(next_seq), false);
             });
         });
     }
@@ -264,9 +261,7 @@ impl HybridEventIndex {
         let mut state = self.state.write();
         self.index.with_source_batch(&self.target, |tx| {
             tx.clear_owner_exact(&self.owner);
-            state.page_evidence.clear();
-            state.next_seq = None;
-            state.visible = false;
+            state.reset(None, false);
         });
     }
 
@@ -324,11 +319,13 @@ impl HybridEventIndex {
                 .collect();
             (claims, view.source_version(&self.target))
         });
+        let page_evidence = state.page_evidence_in(namespace).cloned();
+        let reset_generation = state.reset_generation;
+        drop(state);
         #[cfg(all(test, feature = "cpu", feature = "ready"))]
         if let Some(hook) = AFTER_HYBRID_SNAPSHOT.with(|slot| slot.borrow_mut().take()) {
             hook();
         }
-        let page_evidence = state.page_evidence_in(namespace);
         // Every published hash proves only its own boundary. A group page
         // ends at a multiple of its stride; other resident hashes are partial
         // entries. Keep all of them for fixed-point queries at smaller caps.
@@ -395,6 +392,7 @@ impl HybridEventIndex {
                 kind: group.kind,
                 matches,
                 page_evidence: page_evidence
+                    .as_ref()
                     .is_some_and(|evidence| evidence.contains(&group.group_idx)),
                 partial_ends,
             })
@@ -459,7 +457,11 @@ impl HybridEventIndex {
         let Ok(blocks) = u32::try_from(credited / u64::from(self.keys.block_size() as u32)) else {
             return (0, None);
         };
-        if !self.index.source_version_is_current(&version)
+        let state = self.state.read();
+        if state.reset_generation != reset_generation
+            || !state.visible
+            || state.next_seq.is_none()
+            || !self.index.source_version_is_current(&version)
             || self
                 .binding
                 .as_ref()
