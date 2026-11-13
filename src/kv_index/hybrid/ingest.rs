@@ -251,9 +251,13 @@ impl HybridEventIndex {
                             Ok(())
                         }
                         KVEvent::BlockRemoved(remove) => {
+                            // External ownership is not indexed for this rank,
+                            // just as for the corresponding store.
+                            if remove.ownership.is_some() {
+                                continue;
+                            }
                             if StorageTier::from_medium(remove.medium.as_deref()).is_none()
                                 || remove.locality.as_deref().is_some_and(|s| s != "LOCAL")
-                                || remove.ownership.is_some()
                                 || !self
                                     .groups
                                     .iter()
@@ -262,13 +266,7 @@ impl HybridEventIndex {
                             {
                                 Err(HybridEventError::InvalidBatch)
                             } else {
-                                if remove.ownership.is_some() {
-                                    return Ok(());
-                                }
                                 let group_idx = remove.group_idx.expect("validated group");
-                                // An unknown medium names no tier, so the removal
-                                // applies to every copy of the page: dropping more
-                                // evidence is safe, keeping stale claims is not.
                                 let tier = StorageTier::from_medium(remove.medium.as_deref());
                                 for hash in &remove.block_hashes {
                                     let Some(hash) = sequence_hash(hash) else {
@@ -330,13 +328,18 @@ fn publishes_int_hash(event: &KVEvent) -> bool {
             .any(|hash| matches!(hash, ExternalBlockHash::Int(_)))
     }
     match event {
-        KVEvent::BlockStored(store) => any_int(
-            store
-                .block_hashes
-                .iter()
-                .chain(store.parent_block_hash.iter()),
-        ),
-        KVEvent::BlockRemoved(remove) => any_int(remove.block_hashes.iter()),
+        KVEvent::BlockStored(store) => {
+            store.ownership.is_none()
+                && any_int(
+                    store
+                        .block_hashes
+                        .iter()
+                        .chain(store.parent_block_hash.iter()),
+                )
+        }
+        KVEvent::BlockRemoved(remove) => {
+            remove.ownership.is_none() && any_int(remove.block_hashes.iter())
+        }
         KVEvent::AllBlocksCleared(_) => false,
     }
 }

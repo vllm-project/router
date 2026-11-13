@@ -477,10 +477,39 @@ pub(crate) mod tests {
         for event in &mut foreign.events {
             if let KVEvent::BlockStored(store) = event {
                 store.ownership = Some("offload".into());
+                store.block_hashes = vec![ExternalBlockHash::Int(42)];
+                store.parent_block_hash = Some(ExternalBlockHash::Int(41));
             }
         }
+        let local = qwen_batch();
+        let KVEvent::BlockStored(store) = &local.events[2] else {
+            panic!("expected store")
+        };
+        let mut removal = BlockRemoved {
+            block_hashes: vec![ExternalBlockHash::Int(42)],
+            medium: Some("GPU".into()),
+            group_idx: store.group_idx,
+            locality: Some("REMOTE".into()),
+            ownership: Some("offload".into()),
+        };
+        foreign.events.push(KVEvent::BlockRemoved(removal.clone()));
         assert_eq!(index.apply_batch(1, &foreign), Ok(()));
         assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+
+        let foreign_removal = removal.clone();
+        removal.locality = Some("LOCAL".into());
+        removal.ownership = None;
+        removal.block_hashes = store.block_hashes.clone();
+        let local_removal = KVEventBatch {
+            ts: 2.0,
+            data_parallel_rank: Some(0),
+            events: vec![
+                KVEvent::BlockRemoved(foreign_removal),
+                KVEvent::BlockRemoved(removal),
+            ],
+        };
+        assert_eq!(index.apply_batch(2, &local_removal), Ok(()));
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
     }
 
     /// A required group that never published a page caps reuse at zero: its
