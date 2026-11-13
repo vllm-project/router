@@ -223,16 +223,27 @@ fn select_stage(
     // order, which is the --prefill / --decode order. Sorting by endpoint URL
     // made round-robin follow port text instead of that order.
     let selected_indices = indices.to_vec();
+    // Decode ranks by the logical context it would hold, when every eligible
+    // candidate can supply it: one unknown prompt length mixes units across the
+    // pool, so the whole stage falls back to request counts instead.
+    let decode_tokens_known = stage == Stage::Decode
+        && kv_aware
+        && selected_indices.iter().all(|&index| {
+            loads
+                .get(&(stage, endpoints[index].clone()))
+                .is_none_or(|load| load.decode_tokens().is_some())
+        });
     let projected: Vec<Arc<dyn Worker>> = selected_indices
         .iter()
         .map(|&index| {
             let inner = workers[index].clone();
             let endpoint = endpoints[index].clone();
-            let load = loads
-                .get(&(stage, endpoint))
-                .copied()
-                .unwrap_or_default()
-                .occupancy(stage);
+            let load = loads.get(&(stage, endpoint)).copied().unwrap_or_default();
+            let load = if decode_tokens_known {
+                load.decode_tokens().unwrap_or(0) as usize
+            } else {
+                load.occupancy(stage)
+            };
             Arc::new(PolicyWorker { inner, load }) as Arc<dyn Worker>
         })
         .collect();
@@ -325,6 +336,7 @@ fn select_stage(
             context.affinity_key.as_ref(),
             context.lora_name,
             context.cache_salt,
+            context.decode_context,
         )?;
         (
             pick.index,
@@ -373,12 +385,18 @@ fn select_stage(
         } else {
             "decode"
         };
+        // Recorded once, here, for every KV-aware decision: what a Decode
+        // decision ranked by is part of the answer, not a debugging detail.
         let outcome = if affinity_outcome == Some("sticky_hit") {
             "sticky_hit"
         } else if stage == Stage::Prefill {
             "load_fallback"
         } else {
-            "occupancy"
+            match (decode_tokens_known, context.decode_context.is_some()) {
+                (true, true) => "context_tokens_marginal",
+                (true, false) => "context_tokens",
+                (false, _) => "occupancy_unknown_tokens",
+            }
         };
         crate::metrics::RouterMetrics::record_prefix_routing_decision("kv_aware", phase, outcome);
     }
@@ -658,6 +676,16 @@ impl PdRouterBase {
         }
     }
 
+    /// Whether the shared KV state is needed at all: it exists for whichever
+    /// stage ranks by KV, and a mixed policy needs it as much as a KV-aware
+    /// prefill does.
+    pub(super) fn needs_kv_state(
+        prefill_policy: &dyn LoadBalancingPolicy,
+        decode_policy: &dyn LoadBalancingPolicy,
+    ) -> bool {
+        kv_aware_ops(prefill_policy).is_some() || kv_aware_ops(decode_policy).is_some()
+    }
+
     /// Shared entry point for static and discovered P/D pools. Selection and
     /// reservation are synchronous; no network work runs under admission.
     pub(super) fn select_and_admit(
@@ -704,10 +732,12 @@ impl PdRouterBase {
                 !defer,
             )
         };
+        let reserve_decode = context.route != super::pd_types::HEALTH_PROBE_ROUTE;
         let admitted = if defer {
             self.pd_load.admit_deferred(select)
         } else {
-            self.pd_load.admit(select)
+            self.pd_load
+                .admit_sequences(select, context.decode_sequences, reserve_decode)
         };
         if let Some((selection, attempt)) = &admitted {
             let deferred = attempt.decode_pending_commit();
@@ -1280,14 +1310,34 @@ impl PdRouterBase {
         // Note: Health checking is now handled centrally by RouterManager
         // Individual routers no longer need to manage health checkers
 
-        let kv_state = if kv_aware_ops(prefill_policy.as_ref()).is_some() {
+        // Either stage may be the KV-aware one, and both pools are registered
+        // at construction: a pool recorded lazily has no binding for one refresh
+        // tick, and a burst admitted inside that tick would be priced without
+        // the credit the configuration asked for.
+        let kv_state = if Self::needs_kv_state(prefill_policy.as_ref(), decode_policy.as_ref()) {
+            let prefill_kv = kv_aware_ops(prefill_policy.as_ref()).is_some();
+            let decode_kv = kv_aware_ops(decode_policy.as_ref()).is_some();
             Some(
                 PdKvState::start(
                     ctx.client.clone(),
                     ctx.router_config.api_key.clone(),
                     ctx.router_config.pd_kv_event_sources.clone(),
-                    ctx.worker_registry.get_prefill_workers(),
-                    prefill_policy.clone(),
+                    (
+                        if prefill_kv {
+                            ctx.worker_registry.get_prefill_workers()
+                        } else {
+                            Vec::new()
+                        },
+                        prefill_kv.then(|| prefill_policy.clone()),
+                    ),
+                    (
+                        if decode_kv {
+                            ctx.worker_registry.get_decode_workers()
+                        } else {
+                            Vec::new()
+                        },
+                        decode_kv.then(|| decode_policy.clone()),
+                    ),
                 )
                 .await,
             )
@@ -1497,6 +1547,8 @@ impl PdRouterBase {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
+            decode_sequences: 1,
+            decode_context: None,
             route: "/health_generate",
         };
         let (selection, _attempt) =
@@ -2027,6 +2079,8 @@ mod tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
+            decode_sequences: 1,
+            decode_context: None,
             route: "/health_generate",
         };
         let (selection, attempt) = router
@@ -2056,6 +2110,8 @@ mod tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
+            decode_sequences: 1,
+            decode_context: None,
             route: "/health_generate",
         };
         assert!(router.select_and_admit(&empty, &empty, &context).is_none());
@@ -2676,11 +2732,10 @@ mod admission_tests {
                         prompts: Some(Arc::from(vec![tokens.to_vec()])),
                         work_by_rank: HashMap::from([(
                             worker.dp_rank(),
-                            kv_aware_ops(policy).unwrap().estimate_prefill_work(&[(
-                                worker.as_ref(),
-                                &[tokens.to_vec()],
-                                true,
-                            )])[0],
+                            kv_aware_ops(policy).unwrap().estimate_prefill_work(
+                                &[(worker.as_ref(), &[tokens.to_vec()], true)],
+                                &mut crate::policies::PromptHashes::new(),
+                            )[0],
                         )]),
                         allow_credit: true,
                         fallback_reason: None,
@@ -2821,6 +2876,8 @@ mod admission_tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
+            decode_sequences: 1,
+            decode_context: None,
             route: "/v1/completions",
         }
     }
@@ -2886,6 +2943,8 @@ mod admission_tests {
             affinity_key: Some(affinity_key(session)),
             lora_name: None,
             cache_salt: None,
+            decode_sequences: 1,
+            decode_context: None,
             route: "/v1/completions",
         }
     }
@@ -2943,7 +3002,7 @@ mod admission_tests {
 
         // The commitment sees the live snapshot and charges exactly once.
         let decision = manager
-            .commit_decode(&attempt, |loads| {
+            .commit_decode(&attempt, 1, |loads| {
                 select_decode_stage(loads, &d, &policy, &context())
             })
             .unwrap();
@@ -2955,7 +3014,7 @@ mod admission_tests {
         );
         // A second commit is a no-op on the books.
         assert!(manager
-            .commit_decode(&attempt, |loads| {
+            .commit_decode(&attempt, 1, |loads| {
                 select_decode_stage(loads, &d, &policy, &context())
             })
             .is_none());
@@ -2989,7 +3048,7 @@ mod admission_tests {
         // A cancelled request closes the unbound state before dispatch.
         attempt.finish_decode();
         assert!(manager
-            .commit_decode(&attempt, |loads| {
+            .commit_decode(&attempt, 1, |loads| {
                 select_decode_stage(loads, &d, &policy, &context())
             })
             .is_none());
@@ -3001,10 +3060,10 @@ mod admission_tests {
                 select_pd_pair(loads, &p, &d, &policy, &policy, &context(), false)
             })
             .unwrap();
-        assert!(manager.commit_decode(&retry, |_| None).is_none());
+        assert!(manager.commit_decode(&retry, 1, |_| None).is_none());
         assert!(retry.decode_pending_commit());
         assert!(manager
-            .commit_decode(&retry, |loads| {
+            .commit_decode(&retry, 1, |loads| {
                 select_decode_stage(loads, &d, &policy, &context())
             })
             .is_some());
@@ -3046,7 +3105,7 @@ mod admission_tests {
                     })
                     .unwrap();
                 manager
-                    .commit_decode(&attempt, |loads| {
+                    .commit_decode(&attempt, 1, |loads| {
                         select_decode_stage(loads, &d, &policy, &context())
                     })
                     .expect("the commitment should land")
@@ -3609,6 +3668,8 @@ mod admission_tests {
                 affinity_key: None,
                 lora_name: None,
                 cache_salt: None,
+                decode_sequences: 1,
+                decode_context: None,
                 route: "/v1/completions",
             }
         }

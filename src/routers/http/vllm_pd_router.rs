@@ -5,7 +5,9 @@ use super::logprobs_merge;
 use super::pd_cached_tokens;
 use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_router::PdRouterBase;
-use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext};
+use super::pd_types::{
+    error_chain, requested_sequences, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext,
+};
 use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
@@ -1140,22 +1142,79 @@ impl VllmPDRouter {
         let needs_headers = forward_policy_headers
             && (prefill_policy.needs_headers() || decode_policy.needs_headers());
         let policy_headers = header_utils::to_policy_headers(headers.filter(|_| needs_headers));
-        let (prefill_inputs, decode_inputs) = tokio::join!(
-            self.pd_router.prepare_prefill_inputs(
-                prefill_workers,
-                request,
-                path,
-                headers,
-                router_prompts
-            ),
-            self.pd_router.prepare_decode_inputs(
-                decode_workers,
-                request,
-                path,
-                headers,
-                router_prompts
-            ),
-        );
+        let sequences = requested_sequences(request);
+        // Decode context pricing runs before admission: it queries the KV index
+        // and tokenizes, neither of which may happen under the selection lock.
+        // The D pool is recorded here too, so the refresh loop subscribes to a
+        // Decode engine's own KV events when that engine publishes them.
+        //
+        // When both stages are KV-aware the two estimates are computed together,
+        // because they walk the same prompt: `prepare_pair` hashes it once and
+        // prices the Prefill and Decode pools from that one walk.
+        let (prefill_inputs, decode_inputs, decode_context) = match self.pd_router.kv_state.as_ref()
+        {
+            Some(state)
+                if state.publishes_for(decode_workers)
+                    && crate::policies::kv_aware_ops(prefill_policy.as_ref()).is_some() =>
+            {
+                state
+                    .record_decode_pool(decode_workers, &decode_policy)
+                    .await;
+                let (prepared, context) = state
+                    .prepare_pair(
+                        prefill_workers,
+                        &prefill_policy,
+                        decode_workers,
+                        &decode_policy,
+                        request,
+                        path,
+                        headers,
+                        router_prompts,
+                        sequences,
+                    )
+                    .await;
+                (Some(prepared), None, context)
+            }
+            _ => {
+                let state = self.pd_router.kv_state.as_ref();
+                tokio::join!(
+                    self.pd_router.prepare_prefill_inputs(
+                        prefill_workers,
+                        request,
+                        path,
+                        headers,
+                        router_prompts
+                    ),
+                    self.pd_router.prepare_decode_inputs(
+                        decode_workers,
+                        request,
+                        path,
+                        headers,
+                        router_prompts
+                    ),
+                    async {
+                        let state = state?;
+                        if !state.publishes_for(decode_workers) {
+                            return None;
+                        }
+                        state
+                            .record_decode_pool(decode_workers, &decode_policy)
+                            .await;
+                        state
+                            .prepare_decode_context(
+                                decode_workers,
+                                &decode_policy,
+                                request,
+                                path,
+                                headers,
+                                router_prompts,
+                                sequences,
+                            )
+                            .await
+                    },
+                )
+            }
+        };
         let model_id = request.get("model").and_then(Value::as_str);
         let cache_salt = request
             .get("cache_salt")
@@ -1194,6 +1253,8 @@ impl VllmPDRouter {
             affinity_key: affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
             cache_salt,
+            decode_sequences: sequences,
+            decode_context: decode_context.as_ref(),
             route: path,
         };
         // Existing deployments configure a common connector. Discovery parses
@@ -1345,6 +1406,30 @@ impl VllmPDRouter {
                 input.cache_salt.as_deref(),
             )
         });
+        let sequences = requested_sequences(request);
+        // Price the marginal Decode context here, not at admission: #500 defers
+        // Decode selection until Prefill completes, and the cheap placeholder
+        // figure taken then is stale by the time a candidate is actually picked.
+        // This runs before the commit so the closure below is pure selection.
+        let decode_context = async {
+            let state = self.pd_router.kv_state.as_ref()?;
+            if !state.publishes_for(&candidates) {
+                return None;
+            }
+            state.record_decode_pool(&candidates, &decode_policy).await;
+            state
+                .prepare_decode_context(
+                    &candidates,
+                    &decode_policy,
+                    request,
+                    &input.route,
+                    headers,
+                    input.router_prompts.as_ref(),
+                    sequences,
+                )
+                .await
+        }
+        .await;
         let context = PdRequestContext {
             prefill_inputs: None,
             model_id: input.model_id.as_deref(),
@@ -1355,16 +1440,21 @@ impl VllmPDRouter {
             affinity_key: input.affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
             cache_salt: input.cache_salt.as_deref(),
+            decode_sequences: sequences,
+            decode_context: decode_context.as_ref(),
             route: &input.route,
         };
-        let committed = self.pd_router.pd_load.commit_decode(attempt, |loads| {
-            super::pd_router::select_decode_stage(
-                loads,
-                &candidates,
-                decode_policy.as_ref(),
-                &context,
-            )
-        });
+        let committed = self
+            .pd_router
+            .pd_load
+            .commit_decode(attempt, sequences, |loads| {
+                super::pd_router::select_decode_stage(
+                    loads,
+                    &candidates,
+                    decode_policy.as_ref(),
+                    &context,
+                )
+            });
         let Some(decision) = committed else {
             RouterMetrics::record_pd_decode_commit("empty");
             return Err((
