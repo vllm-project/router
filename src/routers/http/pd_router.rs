@@ -106,6 +106,12 @@ impl<'a, 'b> Eligibility<'a, 'b> {
 
 /// Admission decision over the supplied load snapshot. Legacy policies
 /// retain their own selection semantics and text/header inputs.
+/// Share of an engine's ceilings a request may still be admitted into.
+///
+/// Below 100 so the engine keeps room to finish what it already holds; the measured
+/// failure mode was an engine that filled and stopped completing requests behind it.
+const KV_CAPACITY_WATERMARK_PERCENT: u64 = 95;
+
 pub(super) fn select_pd_pair(
     loads: &Loads,
     prefill_workers: &[Arc<dyn Worker>],
@@ -331,15 +337,72 @@ fn select_stage(
         // deterministic minimum occupancy with rotating equal-load ties, and
         // the optional decode session binding on top.
         let kv = kv_aware_ops(policy)?;
+        // Admission ceilings: a candidate that would hold more tokens than its KV
+        // capacity, or run more sequences than its slot limit, is not eligible.
+        // When every candidate is over, the request still goes to the least
+        // projected one - refusing would turn a full pool into 503s - and the
+        // decision metric records that the ceiling was exceeded.
+        let additional_tokens = |worker: &Arc<dyn Worker>| -> u64 {
+            context
+                .decode_context
+                .and_then(|context| context.get(worker.url()))
+                .copied()
+                .unwrap_or(0)
+        };
+        let fits = |index: usize| -> bool {
+            let worker = &projected[index];
+            let limits = kv.decode_limits(worker.as_ref());
+            let tokens_ok = limits.tokens.is_none_or(|capacity| {
+                (worker.load() as u64)
+                    .saturating_add(additional_tokens(worker))
+                    .saturating_mul(100)
+                    <= capacity.saturating_mul(KV_CAPACITY_WATERMARK_PERCENT)
+            });
+            // Slots are counted in requests, which live on the stage sample rather
+            // than in the projected token load.
+            let running = loads
+                .get(&(Stage::Decode, endpoints[index].clone()))
+                .map(|sample| {
+                    (sample.pending_decode_requests + sample.active_decode_requests) as u64
+                })
+                .unwrap_or(0);
+            let sequences_ok = limits.sequences.is_none_or(|slots| {
+                running.saturating_add(1).saturating_mul(100)
+                    <= slots.saturating_mul(KV_CAPACITY_WATERMARK_PERCENT)
+            });
+            tokens_ok && sequences_ok
+        };
+        let eligible: Vec<usize> = (0..projected.len()).filter(|&index| fits(index)).collect();
+        let over_capacity = eligible.is_empty();
+        let candidates: Vec<Arc<dyn Worker>> = if over_capacity {
+            projected.clone()
+        } else {
+            eligible
+                .iter()
+                .map(|&index| projected[index].clone())
+                .collect()
+        };
         let pick = kv.select_decode(
-            &projected,
+            &candidates,
             context.affinity_key.as_ref(),
             context.lora_name,
             context.cache_salt,
             context.decode_context,
         )?;
+        let index = if over_capacity {
+            pick.index
+        } else {
+            eligible[pick.index]
+        };
+        if over_capacity {
+            crate::metrics::RouterMetrics::record_prefix_routing_decision(
+                "kv_aware",
+                "decode",
+                "over_capacity_fallback",
+            );
+        }
         (
-            pick.index,
+            index,
             context.affinity_key.is_some().then_some(pick.outcome),
             pick.binding,
         )

@@ -164,4 +164,6 @@ pub struct ServerInfo {
     pub effective_attention_block_size: Option<u32>,
     /// KV capacity in tokens, when the engine publishes it.
     pub kv_capacity_tokens: Option<u64>,
+    /// Slot limit the engine advertises, when it publishes one.
+    pub max_num_seqs: Option<u64>,
 }

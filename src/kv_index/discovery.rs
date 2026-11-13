@@ -65,6 +65,9 @@ pub struct WorkerKvInfo {
     pub block_size: Option<u32>,
     /// KV capacity of this worker in tokens, when the engine published it.
     pub capacity_tokens: Option<u64>,
+    /// Slot limit this worker advertises, when it publishes one. KV capacity and
+    /// slots bind independently, so admission needs both.
+    pub max_num_seqs: Option<u64>,
     pub ranks: Vec<u32>,
     /// Cache identity shared by every worker feeding the same placement index.
     /// Absent when discovery cannot create an index for this worker.
@@ -303,6 +306,7 @@ impl KvIndexSupervisor {
             .unwrap_or_else(|| worker_url.to_string());
         let block_size = discovered_block_size(&server_info);
         let capacity_tokens = server_info.kv_capacity_tokens;
+        let max_num_seqs = server_info.max_num_seqs;
         let model_id = match discovery.model_id {
             Ok(Some(model_id)) if !model_id.trim().is_empty() => Some(model_id),
             Ok(_) => {
@@ -334,6 +338,7 @@ impl KvIndexSupervisor {
                     instance_id,
                     block_size,
                     capacity_tokens,
+                    max_num_seqs,
                     ranks: vec![],
                     cache_key: None,
                 });
@@ -350,6 +355,7 @@ impl KvIndexSupervisor {
                 instance_id,
                 block_size: None,
                 capacity_tokens,
+                max_num_seqs,
                 ranks: vec![],
                 cache_key: None,
             });
@@ -359,6 +365,7 @@ impl KvIndexSupervisor {
                 instance_id,
                 block_size: Some(block_size),
                 capacity_tokens,
+                max_num_seqs,
                 ranks: vec![],
                 cache_key: None,
             });
@@ -548,6 +555,7 @@ impl KvIndexSupervisor {
             instance_id,
             block_size: Some(block_size),
             capacity_tokens,
+            max_num_seqs,
             ranks,
             cache_key: Some(key),
         })
@@ -1054,6 +1062,10 @@ async fn query_metrics_metadata(
         kv_block_size: first.block_size,
         effective_attention_block_size: first.effective_attention_block_size,
         kv_capacity_tokens: metrics_meta::shared_capacity(&engines),
+        max_num_seqs: engines
+            .values()
+            .filter_map(|engine| engine.max_num_seqs)
+            .min(),
         ..Default::default()
     })
 }
@@ -1198,6 +1210,8 @@ mod metrics_meta {
         /// engine's capacity, which admission needs to tell whether a request
         /// would fit rather than only how full the engine already is.
         pub(crate) num_gpu_blocks: Option<u64>,
+        /// Slot limit the engine advertises, when it publishes one.
+        pub(crate) max_num_seqs: Option<u64>,
     }
 
     impl EngineCacheConfig {
@@ -1267,6 +1281,10 @@ mod metrics_meta {
                 .get("num_gpu_blocks")
                 .and_then(|value| value.parse::<u64>().ok())
                 .filter(|blocks| *blocks > 0);
+            entry.max_num_seqs = labels
+                .get("max_num_seqs")
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|seqs| *seqs > 0);
             entry.kv_cache_layout = labels
                 .get("kv_cache_layout")
                 .filter(|layout| !is_unset(layout))

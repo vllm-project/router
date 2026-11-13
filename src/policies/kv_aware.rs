@@ -162,6 +162,11 @@ pub trait KvAwareOps: Send + Sync {
         matches: Option<Arc<dyn TieredMatchProvider>>,
     );
     fn unregister_worker(&self, worker_url: &str);
+    /// Admission ceilings of a registered worker. `None` on a ceiling leaves it
+    /// disabled for that candidate.
+    fn decode_limits(&self, _worker: &dyn Worker) -> EngineLimits {
+        EngineLimits::default()
+    }
     /// Preparation hint only; selection revalidates the binding before reserving.
     fn has_affinity(
         &self,
@@ -1002,6 +1007,17 @@ pub struct KvAwarePolicy {
     selection_lock: Mutex<()>,
     /// Every registration gets a new generation, including load-only targets.
     next_generation: AtomicU64,
+    /// Admission ceilings per worker URL. Kept beside the bindings so registration
+    /// does not have to thread them through `register_target*`.
+    limits: Mutex<HashMap<String, EngineLimits>>,
+}
+
+/// The two ceilings that can bind a Decode engine: KV capacity in tokens, and the
+/// slot limit the engine runs at once. Either can bind, so admission checks both.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EngineLimits {
+    pub tokens: Option<u64>,
+    pub sequences: Option<u64>,
 }
 
 impl std::fmt::Debug for KvAwarePolicy {
@@ -1054,6 +1070,7 @@ impl KvAwarePolicy {
             affinity: Arc::new(KvAffinityTable::new()),
             selection_lock: Mutex::new(()),
             next_generation: AtomicU64::new(1),
+            limits: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2123,6 +2140,13 @@ impl KvAwareOps for KvAwarePolicy {
         info: Option<&WorkerKvInfo>,
         matches: Option<Arc<dyn TieredMatchProvider>>,
     ) {
+        let limits = EngineLimits {
+            tokens: info.and_then(|info| info.capacity_tokens),
+            sequences: info.and_then(|info| info.max_num_seqs),
+        };
+        if limits != EngineLimits::default() {
+            self.limits.lock().insert(worker.url().to_owned(), limits);
+        }
         let target = RoutableTarget {
             instance_id: Arc::from(
                 info.map(|info| info.instance_id.as_str())
@@ -2141,6 +2165,15 @@ impl KvAwareOps for KvAwarePolicy {
 
     fn unregister_worker(&self, worker_url: &str) {
         self.unregister_target(worker_url);
+        self.limits.lock().remove(worker_url);
+    }
+
+    fn decode_limits(&self, worker: &dyn Worker) -> EngineLimits {
+        self.limits
+            .lock()
+            .get(worker.url())
+            .copied()
+            .unwrap_or_default()
     }
 
     fn select_worker_with_qualified_inputs(
