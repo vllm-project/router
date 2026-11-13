@@ -77,7 +77,7 @@ After the prompt is rendered, read `prompt_tokens` in the summary. If the worker
 
 `-sv` prints `[vllm-rs]` and `[vllm-router]` lines as they arrive. When a scenario finishes it prints that wave's `ttft_ms`, `e2e_ms`, `encode_ms`, and `frontend_ms` (`min`, `p50`, `avg`, `max`) and the JSON path. Warmup is not printed. There is no cross-scenario summary. L1 Prometheus text is not printed. A `vllm_tokenizer_l1_bypasses_total` value above 0 fails the on arm.
 
-JSON is written under `tests/python/e2e/perf/l1_encode/results/<timestamp>/` (one object per wave, not the bench CLI's two-document stdout). `PERF_SAVE_RESULTS=0` skips the files. `PERF_OUTPUT_DIR` overrides the directory.
+JSON is written under `tests/python/e2e/results/perf/l1_encode/l1on_<timestamp>/hit<rate>_c<concurrency>_r<requests>.json` (or `l1off_<timestamp>/`), for example `l1on_20251029_171300/hit0.30_c4_r8.json` (one object per wave, not the bench CLI's two-document stdout). The timestamp is `YYYYMMDD_HHMMSS`. Result JSON is always saved. The nightly dashboard copies `tests/python/e2e/results` only.
 
 `PERF_TOKENS`, `PERF_MAX_TOKENS`, and `PERF_TIMEOUT` override the case JSON for both the worker preflight and the wave. The worker flags still have to cover `tokens + max_tokens + template`.
 

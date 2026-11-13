@@ -22,7 +22,7 @@ export MODEL=Qwen/Qwen3-4B-Instruct-2507   # or local model dir
 pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -v
 ```
 
-One concurrency / policy. `-sv` shows worker and router logs on stderr as they are written; replay stays in `replay.log`:
+One concurrency / policy. `-sv` shows worker, router, and replay lines on stderr:
 
 ```bash
 pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -sv -k 'kv_aware/c16'
@@ -30,20 +30,22 @@ pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -sv -
 
 ## Artifacts layout
 
-Each run writes a **new** cell directory:
+Performance JSON and the run directory are separate. The nightly dashboard copies `tests/python/e2e/results` only.
 
-- `test-results/router_policy/runs/<case_id>-<run_suffix>/` — logs, metrics snapshots, `result/requests.jsonl`, `calibration.json`
-- `test-results/router_policy/results/<case_id>-<run_suffix>.json` — copy of `calibration.json` for pytest
+- `tests/python/e2e/results/perf/router_policy/<policy>_<run_suffix>/c<concurrency>_t<task_num>.json` — copy of `calibration.json` when the cell is ok. One directory per policy and session; one file per concurrency. The `concurrency` / `task_num` fields match the file name.
+- `tests/python/e2e/run/perf/router_policy/<case_id>-<run_suffix>/` — cell files. Nightly uploads `result/summary.json`, `result/manifest.json`, `router.log`, `engineN.log`, `replay.log`, `runtime-replay.yaml`, and `*.command.json`. Prometheus snapshots, `requests.jsonl`, `ports.json`, and `calibration.json` stay on the agent. The replay launcher is a temp file, and model caches stay under `tests/python/e2e/run/perf/router_policy/cache/` (shared across cells in this work root, excluded from nightly uploads). The same stdout is also printed (`[engineN]`, `[vllm-router]`, `[replay]`).
 
-`<run_suffix>` is local time `YYYYMMDDhhmmss` unless you set **`AGENTX_RUN_SUFFIX`** (same suffix for all cells in one matrix, e.g. `export AGENTX_RUN_SUFFIX=202510291713`). Override the run dir with **`AGENTX_OUT`**.
+`<run_suffix>` is local time `YYYYMMDD_HHMMSS` (same format as grpc and l1_encode) unless you set **`AGENTX_RUN_SUFFIX`** (same suffix for all cells in one matrix, e.g. `export AGENTX_RUN_SUFFIX=20251029_171300`). The run directory is generated automatically from the case ID and run suffix.
 
-Before replay, the cell runner **removes `result/`** if reusing the same `AGENTX_OUT`. The cell **fails if replay exit code ≠ 0**.
+Prometheus snapshots are saved under `before/`, `after/`, and `metrics/<elapsed_seconds>/` (approximately every 60 seconds during replay). They remain in the run directory for local diagnosis and are not uploaded. Replay logging uses the shared process stdout tee; cleanup joins the reader thread before closing the log.
+
+Before replay, the cell runner **removes `result/`** if it already exists. The cell **fails if replay exit code ≠ 0**.
 
 **Ports**: HTTP, gRPC, and the router use OS-assigned ports held until that process starts. KV event PUB/replay use a free port in **25100–25299**, also held until that worker starts. This vLLM reports the configured endpoint unchanged, so `tcp://*:0` comes back as port 0 and the router rejects it. After each worker is healthy, the runner calls gRPC `Control.GetKvEventSources` and fails the cell if an advertised endpoint still uses port 0. Between pytest cells, default **`AGENTX_CELL_GAP_SEC=5`**; before allocate, **`AGENTX_PORT_SETTLE_SEC=2`**. Do not run multiple matrix jobs on one host in parallel.
 
-Worker and router processes are started with `perf/process.py` (`launch_worker` once per worker, then `launch_router`). The same output is streamed to stderr with prefixes `[engineN]` and `[vllm-router]`, and copied to `engineN.log` / `router.log` in the run directory. Replay stays in `replay.log`. Pytest hides the stderr stream unless the invocation uses **`-sv`**.
+Worker and router processes are started with `perf/process.py` (`launch_worker` once per worker, then `launch_router`). Pytest hides the stderr stream unless the invocation uses **`-sv`**.
 
-When replay exits, [`log_summary.py`](log_summary.py) writes **`calibration.json`** (TTFT, TPOT, JCT, and the other cell stats), then appends **`--- cell summary ---`**, **`STATS`**, and **`ARTIFACTS`** to **`replay.log`** immediately after agentinfer's `Replay result` line, and prints the same block on stdout. **`ARTIFACTS`** lists the run directory and **`results_summary.json`** when pytest sets `AGENTX_RESULTS_SUMMARY`. `calibration.json`, `requests.jsonl`, `ports.json`, `engineN.log`, `router.log`, and `replay.log` stay in the run directory and are not printed. Workers and the router are stopped after that. Worker and router lines already went to stderr while they were running.
+When replay exits, [`log_summary.py`](log_summary.py) writes **`calibration.json`** (TTFT, TPOT, JCT, concurrency, task count, and the other cell stats); when the cell is ok, the same JSON is copied to `tests/python/e2e/results/perf/router_policy/<policy>_<run_suffix>/c<concurrency>_t<task_num>.json` and prints **`--- cell summary ---`**, **`STATS`**, and **`ARTIFACTS`** on stdout. Quantile blocks (`ttft_s`, `tpot_ms`, `jct_s`) do not repeat the request count; that stays in `requests` and `success`. **`ARTIFACTS`** lists the run directory and the results JSON path (`results_json`). Workers and the router are stopped after that.
 
 Layout matches **`perf/grpc`**: case JSON + [`case_loader.py`](case_loader.py) + [`stack_launcher.py`](stack_launcher.py). [`log_summary.py`](log_summary.py) writes the stats and prints the cell summary.
 

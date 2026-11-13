@@ -142,8 +142,12 @@ def make_turn_messages(hit_rate: float, text: str, turns: int, tag: str) -> list
     step = max(1, len(shared) // turns)
     messages = []
     for idx in range(turns):
-        chunk = shared[idx * step : len(shared) if idx == turns - 1 else (idx + 1) * step]
-        messages.append({"role": "user" if idx % 2 == 0 else "assistant", "content": chunk})
+        chunk = shared[
+            idx * step : len(shared) if idx == turns - 1 else (idx + 1) * step
+        ]
+        messages.append(
+            {"role": "user" if idx % 2 == 0 else "assistant", "content": chunk}
+        )
     messages.append({"role": "user", "content": f"{tag} {tail}".rstrip()})
     return messages
 
@@ -262,9 +266,13 @@ def post_chat(
                     if delta:
                         text_parts.append(delta)
     except urllib.error.HTTPError as exc:
-        raise SystemExit(f"HTTP {exc.code}: {exc.read().decode(errors='replace')}") from exc
+        raise SystemExit(
+            f"HTTP {exc.code}: {exc.read().decode(errors='replace')}"
+        ) from exc
     except (OSError, RuntimeError) as exc:
-        raise SystemExit(f"stream failed after partial_chars={sum(map(len, text_parts))}: {exc}") from exc
+        raise SystemExit(
+            f"stream failed after partial_chars={sum(map(len, text_parts))}: {exc}"
+        ) from exc
     total_duration_ms = (time.perf_counter() - t0) * 1000.0
     if ttft_ms is None:
         raise SystemExit(
@@ -331,7 +339,9 @@ def summarize_rows(rows: list[dict]) -> dict:
     stages = [stage_fields(row) for row in rows]
 
     def values(key: str) -> list[float]:
-        vals = [float(row[key]) for row in rows if isinstance(row.get(key), (int, float))]
+        vals = [
+            float(row[key]) for row in rows if isinstance(row.get(key), (int, float))
+        ]
         return vals or [s[key] for s in stages if key in s]
 
     summary = {"count": len(rows)}
@@ -423,8 +433,7 @@ def read_perf_settings(
         "timeout": float(os.environ.get("PERF_TIMEOUT", str(default_timeout))),
         "warmup": os.environ.get("PERF_WARMUP", "1").lower() in ("1", "true", "yes"),
         "backend_label": label,
-        "output_dir": os.environ.get("PERF_OUTPUT_DIR", "").strip(),
-        "runs": max(1, int(os.environ.get("RUNS", "1"))),
+        "output_dir": "",
     }
 
 
@@ -559,7 +568,6 @@ def print_wave_summary(
     hit_rate: float | None = None,
     concurrency: int | None = None,
     requests: int | None = None,
-    run_idx: int | None = None,
 ) -> None:
     """Human-readable wave summary for pytest -sv / bench CLI (stderr)."""
     import sys
@@ -570,8 +578,6 @@ def print_wave_summary(
     tags: list[str] = []
     if backend:
         tags.append(backend)
-    if run_idx is not None:
-        tags.append(f"run{run_idx}")
     if hit_rate is not None:
         tags.append(f"hit={hit_rate:g}")
     if concurrency is not None:
@@ -600,7 +606,6 @@ def hit_rate_file_tag(hit_rate: float) -> str:
 def maybe_write_result(
     settings: dict[str, Any],
     *,
-    run_idx: int,
     hit_rate: float,
     concurrency: int,
     requests: int,
@@ -613,10 +618,7 @@ def maybe_write_result(
     if not out_dir.is_absolute():
         out_dir = Path.cwd() / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    name = (
-        f"run{run_idx}_hit{hit_rate_file_tag(hit_rate)}"
-        f"_c{concurrency}_r{requests}.json"
-    )
+    name = f"hit{hit_rate_file_tag(hit_rate)}_c{concurrency}_r{requests}.json"
     path = out_dir / name
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
@@ -630,10 +632,16 @@ def default_output_dir(settings: dict[str, Any], *, results_parent: Path) -> str
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--router-url", default=_env("ROUTER_URL", "http://127.0.0.1:30000"))
+    parser.add_argument(
+        "--router-url", default=_env("ROUTER_URL", "http://127.0.0.1:30000")
+    )
     parser.add_argument("--model", default=_default_cli_model())
-    parser.add_argument("--hit-rate", type=float, default=float(os.environ.get("HIT_RATE", "0.99")))
-    parser.add_argument("--chars", type=int, default=int(os.environ.get("KVHIT_CHARS", "8000")))
+    parser.add_argument(
+        "--hit-rate", type=float, default=float(os.environ.get("HIT_RATE", "0.99"))
+    )
+    parser.add_argument(
+        "--chars", type=int, default=int(os.environ.get("KVHIT_CHARS", "8000"))
+    )
     parser.add_argument(
         "--tokens",
         type=int,
@@ -700,14 +708,17 @@ def main() -> None:
         miss_body = make_turn_messages(args.hit_rate, user, args.turns, f"MISS-{stamp}")
         hit_body = make_turn_messages(args.hit_rate, user, args.turns, f"HIT-{stamp}")
         wave_bodies = [
-            make_turn_messages(args.hit_rate, user, args.turns, f"TAIL-WAVE-{stamp}-{idx}")
+            make_turn_messages(
+                args.hit_rate, user, args.turns, f"TAIL-WAVE-{stamp}-{idx}"
+            )
             for idx in range(wave_requests)
         ]
     else:
         miss_user, hit_user = make_bodies(args.hit_rate, user)
         miss_body, hit_body = user_messages(miss_user), user_messages(hit_user)
         wave_bodies = [
-            user_messages(body) for body in make_wave_bodies(args.hit_rate, user, wave_requests)
+            user_messages(body)
+            for body in make_wave_bodies(args.hit_rate, user, wave_requests)
         ]
 
     def chars(messages: list[dict]) -> int:
@@ -744,7 +755,9 @@ def main() -> None:
     )
     if args.once:
         body = miss_body if args.once == "miss" else hit_body
-        row = post_chat(args.router_url, args.model, body, args.max_tokens, args.timeout)
+        row = post_chat(
+            args.router_url, args.model, body, args.max_tokens, args.timeout
+        )
         print(json.dumps({"once": args.once, "req": row}, indent=2))
         return
     if args.concurrency < 1:
@@ -754,8 +767,12 @@ def main() -> None:
     result = {}
     if args.warmup:
         result["warmup"] = {
-            "miss": post_chat(args.router_url, args.model, miss_body, args.max_tokens, args.timeout),
-            "hit": post_chat(args.router_url, args.model, hit_body, args.max_tokens, args.timeout),
+            "miss": post_chat(
+                args.router_url, args.model, miss_body, args.max_tokens, args.timeout
+            ),
+            "hit": post_chat(
+                args.router_url, args.model, hit_body, args.max_tokens, args.timeout
+            ),
         }
     result["wave"] = post_hit_wave(
         args.router_url,

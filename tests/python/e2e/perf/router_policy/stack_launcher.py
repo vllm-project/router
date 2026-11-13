@@ -25,6 +25,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,7 +45,6 @@ from case_loader import (  # noqa: E402
 )
 from tests.python.e2e.perf.binaries import preflight_router_bin  # noqa: E402
 from log_summary import (  # noqa: E402
-    RESULTS_SUMMARY_ENV,
     print_failure_diagnostics,
     write_calibration,
 )
@@ -58,6 +58,7 @@ from tests.python.e2e.perf.process import (  # noqa: E402
     release_worker_port_holders,
     reserve_port,
     router_cmd,
+    stream_process,
     vllm_rs_serve_cmd,
 )
 
@@ -74,7 +75,8 @@ class RouterPolicyStack:
     ports: dict[str, Any] = field(default_factory=dict)
     stack: list[RunningProc] = field(default_factory=list)
     replay_proc: subprocess.Popen[Any] | None = None
-    replay_log_fp: Any = None
+    replay_stream: RunningProc | None = None
+    replay_entry: Path | None = None
     port_holders: list[socket.socket | None] = field(default_factory=list)
     kv_port_holders: list[socket.socket | None] = field(default_factory=list)
     did_cleanup: bool = False
@@ -89,14 +91,12 @@ def open_cell(case: RouterPolicyCase, *, out_dir: Path | None) -> RouterPolicySt
 
     if out_dir is not None:
         out = out_dir
-    elif raw_out := os.environ.get("AGENTX_OUT", "").strip():
-        out = Path(raw_out)
     else:
         suffix = cell_run_suffix()
-        out = case.perf_work_root / "runs" / f"{case.id}-{suffix}"
+        out = case.perf_work_root / f"{case.id}-{suffix}"
     out.mkdir(parents=True, exist_ok=True)
     print(
-        "STREAM_LOGS worker+router -> stderr (pytest -sv); replay stays in replay.log",
+        "STREAM_LOGS worker+router+replay -> stderr (pytest -sv)",
         flush=True,
     )
 
@@ -145,18 +145,27 @@ def open_cell(case: RouterPolicyCase, *, out_dir: Path | None) -> RouterPolicySt
 def _start_replay(
     run: RouterPolicyStack, command: list[str], log: Path
 ) -> subprocess.Popen[Any]:
-    """Agentinfer replay. Its own session so a stall can stop the whole group."""
+    """Agentinfer replay. Its own session so a stall can stop the whole group.
 
-    Path(str(log) + ".command.json").write_text(json.dumps(command, indent=2))
-    log.parent.mkdir(parents=True, exist_ok=True)
-    run.replay_log_fp = open(log, "w", encoding="utf-8")
-    return subprocess.Popen(
+    Stdout is copied to ``replay.log`` and also printed on stderr.
+    """
+
+    Path(str(log) + ".command.json").write_text(
+        json.dumps(command, indent=2), encoding="utf-8"
+    )
+    proc = subprocess.Popen(
         command,
-        stdout=run.replay_log_fp,
+        stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=run.env,
         start_new_session=True,
+        text=True,
+        bufsize=1,
     )
+    run.replay_stream = stream_process(
+        proc, label="replay", log_path=log, log_prefix="router_policy"
+    )
+    return proc
 
 
 def cleanup(run: RouterPolicyStack) -> None:
@@ -166,12 +175,15 @@ def cleanup(run: RouterPolicyStack) -> None:
     if run.replay_proc is not None:
         graceful_stop(run.replay_proc, 45.0, process_group=True, kill_grace=15)
         run.replay_proc = None
+    if run.replay_stream is not None:
+        run.replay_stream.stop()
+        run.replay_stream = None
     for proc in reversed(run.stack):
         proc.stop()
     run.stack.clear()
-    if run.replay_log_fp is not None:
-        run.replay_log_fp.close()
-        run.replay_log_fp = None
+    if run.replay_entry is not None:
+        run.replay_entry.unlink(missing_ok=True)
+        run.replay_entry = None
     release_all_port_holders(run.port_holders)
     release_all_port_holders(run.kv_port_holders)
 
@@ -548,19 +560,15 @@ def run_router_policy_cell(
     concurrency: int | None = None,
     out_dir: Path | None = None,
     run_suffix: str | None = None,
-    results_summary: Path | None = None,
 ) -> Path:
     """Start workers, router, and AgentX replay for one case JSON."""
 
     global _active
     case_path = case_file.resolve()
     os.environ["AGENTX_CASE_FILE"] = str(case_path)
-    if run_suffix is not None:
-        os.environ["AGENTX_RUN_SUFFIX"] = run_suffix
-    if out_dir is not None:
-        os.environ["AGENTX_OUT"] = str(out_dir)
-    if results_summary is not None:
-        os.environ[RESULTS_SUMMARY_ENV] = str(results_summary)
+    if run_suffix is None:
+        run_suffix = cell_run_suffix()
+    os.environ["AGENTX_RUN_SUFFIX"] = run_suffix
     case = load_router_policy_case(case_path, concurrency=concurrency)
     run = open_cell(case, out_dir=out_dir)
     _active = run
@@ -578,7 +586,10 @@ def _run_cell(run: RouterPolicyStack) -> None:
         time.sleep(settle)
     allocate_ports(run)
     ports = run.ports
-    entry = run.out / "agentx_entry.py"
+    fd, entry_name = tempfile.mkstemp(prefix="router-policy-replay-", suffix=".py")
+    os.close(fd)
+    entry = Path(entry_name)
+    run.replay_entry = entry
     entry.write_text(
         """import asyncio
 import os
@@ -632,7 +643,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                 worker_cmd = engine_command(run, i)
                 worker_log = run.out / f"engine{i}.log"
                 Path(str(worker_log) + ".command.json").write_text(
-                    json.dumps(worker_cmd, indent=2)
+                    json.dumps(worker_cmd, indent=2), encoding="utf-8"
                 )
                 run.stack.append(
                     launch_worker(
@@ -651,7 +662,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
             router_argv = router_command(run)
             router_log = run.out / "router.log"
             Path(str(router_log) + ".command.json").write_text(
-                json.dumps(router_argv, indent=2)
+                json.dumps(router_argv, indent=2), encoding="utf-8"
             )
             run.stack.append(
                 launch_router(

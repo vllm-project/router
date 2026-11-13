@@ -1,7 +1,7 @@
 # L3 nightly (https://github.com/vllm-project/router/issues/273).
 # pipeline.yml uploads this file for NIGHTLY=1 or nightly-test, including forks.
 # Jobs whose gate is narrower than that upload keep their own if.
-# NIGHTLY=1 on this test pipeline does not publish images.
+# NIGHTLY=1 on this test pipeline runs tests without publishing images.
 
 env:
   RUST_IMAGE: "rust:1.95.0-bookworm"
@@ -168,8 +168,9 @@ steps:
       python -m pytest -sv tests/python/e2e/perf/grpc -k "c16-r32 or hit99-c4 or hit99-c64" --perf-case=python_http
 
       BASH
+    # Dashboard copies tests/python/e2e/results only.
     artifact_paths:
-      - "tests/python/e2e/perf/grpc/results/**/*.json"
+      - "tests/python/e2e/results/perf/grpc/**/*.json"
 
   # ============================================================================
   # L3 router_policy TraceLab replay — cache_aware / kv_aware / kv_aware_aff @ c16.
@@ -197,7 +198,6 @@ steps:
 
       python -m pip install --no-cache-dir 'agentinfer==0.2.0'
 
-      export AGENTX_RUN_SUFFIX="${AGENTX_RUN_SUFFIX:-$(date -u +%Y%m%d%H%M%S)}"
       export AGENTX_CELL_GAP_SEC="${AGENTX_CELL_GAP_SEC:-15}"
       export AGENTX_PORT_SETTLE_SEC="${AGENTX_PORT_SETTLE_SEC:-5}"
 
@@ -211,9 +211,16 @@ steps:
       python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'cache_aware/c16 or kv_aware/c16 or kv_aware_aff/c16'
 
       BASH
+    # Performance JSON for the dashboard, plus the cell files used to diagnose a run.
     artifact_paths:
-      - "test-results/router_policy/runs/**/*"
-      - "test-results/router_policy/results/*.json"
+      - "tests/python/e2e/results/perf/router_policy/**/*.json"
+      - "tests/python/e2e/run/perf/router_policy/*/result/summary.json"
+      - "tests/python/e2e/run/perf/router_policy/*/result/manifest.json"
+      - "tests/python/e2e/run/perf/router_policy/*/router.log"
+      - "tests/python/e2e/run/perf/router_policy/*/engine*.log"
+      - "tests/python/e2e/run/perf/router_policy/*/replay.log"
+      - "tests/python/e2e/run/perf/router_policy/*/runtime-replay.yaml"
+      - "tests/python/e2e/run/perf/router_policy/*/*.command.json"
 
   # ============================================================================
   # L3 L1 prefix-encoding perf — hit 0.30 and 0.99999 at c4 and c16, 1× L4.
@@ -252,8 +259,9 @@ steps:
       python -m pytest -sv tests/python/e2e/perf/l1_encode/test_l1_encode.py -k "(hit0.30 or hit0.99999) and (c4 or c16)"
 
       BASH
+    # Dashboard copies tests/python/e2e/results only.
     artifact_paths:
-      - "tests/python/e2e/perf/l1_encode/results/**/*.json"
+      - "tests/python/e2e/results/perf/l1_encode/**/*.json"
 
   # This queue is intentionally separate from the shared amd_mi300_* queues.
   # Those agents run --no-plugins, while this lane needs the Docker plugin

@@ -207,7 +207,6 @@ class PrefixKvhitSseTests(unittest.TestCase):
             "warmup": True,
             "backend_label": "t",
             "output_dir": "",
-            "runs": 1,
         }
 
     def _capture_wave(self, **kwargs):
