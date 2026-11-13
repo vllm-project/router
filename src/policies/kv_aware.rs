@@ -1357,24 +1357,20 @@ impl KvAwarePolicy {
             let plan = if fallback_guard.is_some() {
                 let (healthy, bindings) = self.selection_targets(workers)?;
                 let count = healthy.len();
-                // History never grants cache credit, including the bounded
-                // churn fallback. Retain known work for its reservation.
-                let input_tokens: Vec<usize> = if history.is_some() {
-                    let sizes: Vec<Option<usize>> = healthy
-                        .iter()
-                        .map(|&index| {
-                            let prompts = input.tokens.prompts_for(workers[index].as_ref());
-                            (!prompts.is_empty()).then(|| prompts.iter().map(|ids| ids.len()).sum())
-                        })
-                        .collect();
-                    let known = sizes.iter().flatten().copied().max().unwrap_or(0);
-                    sizes
-                        .into_iter()
-                        .map(|size| size.unwrap_or(known))
-                        .collect()
-                } else {
-                    vec![0; count]
-                };
+                // Churn revokes placement evidence, not a target's prepared
+                // input. Unknown targets retain load-only accounting; another
+                // worker's rendered length is not evidence for their input.
+                let input_tokens: Vec<usize> = healthy
+                    .iter()
+                    .map(|&index| {
+                        input
+                            .tokens
+                            .prompts_for(workers[index].as_ref())
+                            .iter()
+                            .map(|ids| ids.len())
+                            .sum()
+                    })
+                    .collect();
                 let has_tokens = input_tokens.iter().any(|&size| size > 0);
                 SelectionPlan {
                     healthy,
@@ -4499,8 +4495,108 @@ mod tests {
         let queries_before = matches.2.load(Ordering::Relaxed);
         let receipt = select().unwrap();
         assert_eq!(matches.2.load(Ordering::Relaxed) - queries_before, 3);
-        assert_eq!(receipt.new_prefill_tokens, 0);
+        assert_eq!(receipt.new_prefill_tokens, 5);
         release_receipt(&workers, &receipt);
+    }
+
+    #[test]
+    fn churn_fallback_preserves_each_workers_known_input_without_history_credit() {
+        struct Churn {
+            calls: AtomicUsize,
+            callback: Mutex<Option<Box<dyn Fn() + Send>>>,
+        }
+        impl TieredMatchProvider for Churn {
+            fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.callback.lock().as_ref().unwrap()();
+                Vec::new()
+            }
+        }
+        for history_enabled in [false, true] {
+            let policy = Arc::new(KvAwarePolicy::default());
+            let workers = registered_worker_pair(&policy);
+            let matches = Arc::new(Churn {
+                calls: AtomicUsize::new(0),
+                callback: Mutex::new(None),
+            });
+            let info = WorkerKvInfo {
+                cache_key: Some(CacheKey {
+                    model: Arc::from("model"),
+                    hash_mode: crate::kv_index::HashMode::Sha256,
+                    block_size: 16,
+                }),
+                ..WorkerKvInfo::default()
+            };
+            for worker in &workers {
+                policy.register_worker(worker.as_ref(), Some(&info), Some(matches.clone()));
+            }
+            let weak_policy = Arc::downgrade(&policy);
+            let weak_matches = Arc::downgrade(&matches);
+            let registered = workers.clone();
+            *matches.callback.lock() = Some(Box::new(move || {
+                for worker in &registered {
+                    weak_policy.upgrade().unwrap().register_worker(
+                        worker.as_ref(),
+                        Some(&info),
+                        Some(weak_matches.upgrade().unwrap()),
+                    );
+                }
+            }));
+            let history =
+                history_enabled.then(|| policy.capture_history_registrations(&workers, "model"));
+            let mut inputs = WorkerTokenInputs::new();
+            for (worker, length) in workers.iter().zip([33, 17]) {
+                inputs.insert(
+                    worker.base_url().to_owned(),
+                    Arc::from(vec![vec![7; length]]),
+                );
+            }
+            // Force each known target, then a target without preparation
+            // evidence. Query callbacks invalidate all three initial plans.
+            for (chosen, expected, known) in [(0, 33, true), (1, 17, true), (1, 0, false)] {
+                if !known {
+                    inputs.remove(workers[1].base_url());
+                }
+                let before = matches.calls.load(Ordering::Relaxed);
+                let (receipt, observation) = policy
+                    .select_with_context(
+                        &workers,
+                        QualifiedKvInput {
+                            tokens: KvRequestTokens::PerWorker(&inputs),
+                            eligibility: None,
+                            history: history.as_ref(),
+                        },
+                        None,
+                        None,
+                        None,
+                        &[workers[1 - chosen].url().to_owned()],
+                    )
+                    .unwrap();
+                assert_eq!(
+                    matches.calls.load(Ordering::Relaxed) - before,
+                    if known { 6 } else { 3 }
+                );
+                assert_eq!(receipt.worker_index, chosen);
+                assert_eq!(
+                    receipt.new_prefill_tokens, expected,
+                    "history={history_enabled}"
+                );
+                assert_eq!(receipt.decision.components.ptoken, expected);
+                assert!(observation.is_none());
+                let target = &receipt.decision.target;
+                assert_eq!(
+                    policy.load.sample(target),
+                    LoadSample {
+                        active_prefill_tokens: expected,
+                        active_requests: 1
+                    }
+                );
+                assert_eq!(workers[chosen].load(), 1);
+                release_receipt(&workers, &receipt);
+                assert_eq!(policy.load.sample(target), LoadSample::default());
+                assert_eq!(workers[chosen].load(), 0);
+            }
+        }
     }
 
     #[test]
