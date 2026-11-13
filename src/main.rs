@@ -216,6 +216,7 @@ struct CliArgs {
     #[arg(long)]
     kv_event_model: Option<String>,
     /// Require complete KV event recovery before restoring placement credit.
+    /// External pool tiers stay uncredited until an independent pool baseline exists.
     #[arg(long, default_value_t = false)]
     kv_event_strict_recovery: bool,
     /// Transfer credit for host-resident KV blocks.

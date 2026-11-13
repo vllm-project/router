@@ -805,7 +805,12 @@ impl KvBlockIndexer {
         if self
             .source_states
             .get(&(source.clone(), dp_rank))
-            .is_some_and(|r| r.status.state == SourceRecoveryState::Exact)
+            .is_some_and(|r| {
+                matches!(
+                    r.status.state,
+                    SourceRecoveryState::Exact | SourceRecoveryState::WorkerExact
+                )
+            })
         {
             return;
         }
@@ -1121,6 +1126,8 @@ mod tests {
         let (start, attempt) = indexer.begin_replay(&source, 0, 22, true);
         assert_eq!(start, -1);
         assert!(indexer.finish_replay_if_current(&source, 0, attempt, None));
+        // Fresh observations must not widen worker-only trust to external pools.
+        indexer.resume_observed_source(&source, 0);
         assert_eq!(
             indexer.source_recovery_status(&source, 0).unwrap().state,
             SourceRecoveryState::WorkerExact
