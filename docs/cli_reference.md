@@ -250,6 +250,11 @@ has tracing support.
 | `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key used for requests to workers. |
 | `--api-key-validation-urls` | `string [0..] (repeatable)` | `[]` | — | — | Validation URLs; an empty list falls back to comma-separated `API_KEY_VALIDATION_URLS` from the environment or `.env`. |
 
+The regular router also sends `--api-key` as a bearer token on HTTP worker
+health checks: `/health` during the startup wait and `/add_worker`, and
+`--health-check-endpoint` for runtime checks. gRPC workers and P/D mode do not
+receive it on health checks.
+
 ## WASM middleware
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
