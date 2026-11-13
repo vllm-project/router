@@ -823,6 +823,7 @@ mod test_pd_routing {
                 kv_aware_session_affinity_ttl_secs: None,
                 health_check: vllm_router_rs::config::HealthCheckConfig::default(),
                 program_scheduling: None,
+                moriio_multi_pod: None,
                 enable_igw: false,
                 rate_limit_tokens_per_second: None,
                 connection_mode: ConnectionMode::Http,

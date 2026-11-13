@@ -100,6 +100,19 @@ pub struct RouterConfig {
     /// Optional Program-level admission and continuity scheduling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_scheduling: Option<ProgramSchedulingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moriio_multi_pod: Option<MoriIOMultiPodConfig>,
+}
+
+/// MoRI-IO Wide-EP where each role is one DP group spanning several pods. Only the DP master
+/// registers, so the router is told the other pods' hosts. WRITE mode only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MoriIOMultiPodConfig {
+    /// DP ranks per pod (rank r lives on pod r / dp_size_local).
+    pub dp_size_local: usize,
+    /// Pod hosts in DP-rank order, DP master first.
+    pub prefill_hosts: Vec<String>,
+    pub decode_hosts: Vec<String>,
 }
 
 fn default_profile_timeout_secs() -> u64 {
@@ -1335,6 +1348,7 @@ impl Default for RouterConfig {
             epd: None,
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            moriio_multi_pod: None,
         }
     }
 }
@@ -2124,6 +2138,7 @@ mod tests {
             epd: None,
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            moriio_multi_pod: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -2194,6 +2209,7 @@ mod tests {
             epd: None,
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            moriio_multi_pod: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -2260,6 +2276,7 @@ mod tests {
             epd: None,
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            moriio_multi_pod: None,
         };
 
         assert!(config.has_service_discovery());

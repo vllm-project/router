@@ -134,6 +134,9 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--decode` | `string (repeatable)` | `[]` | `string (repeatable)` | `unset` | Add one decode URL per occurrence: `--decode URL`. |
 | `--vllm-discovery-address` | `string` | `unset` | `string` | `unset` | ZMQ registration address for vLLM workers, e.g. `0.0.0.0:30001`. |
 | `--kv-connector` | `nixl, mooncake, moriio` | `nixl` | `nixl, mooncake, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. |
+| `--moriio-dp-size-local` | `usize` | `unset` | — | — | MoRI-IO multi-pod Wide-EP, WRITE mode only: DP ranks per pod. Requires `--moriio-prefill-hosts` and `--moriio-decode-hosts`; a role whose registered DP size exceeds this times its listed pods is rejected. |
+| `--moriio-prefill-hosts` | `string (repeatable)` | `[]` | — | — | MoRI-IO multi-pod Wide-EP: prefill pod hosts in DP-rank order, master first; each occurrence takes one or more hosts. |
+| `--moriio-decode-hosts` | `string (repeatable)` | `[]` | — | — | MoRI-IO multi-pod Wide-EP: decode pod hosts in DP-rank order, master first; each occurrence takes one or more hosts. |
 | `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill KV publishers as URL=ENDPOINT[,ENDPOINT...]; requires kv_aware prefill. Endpoints follow DP-rank order; block size is 16. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
