@@ -154,7 +154,44 @@ Three stacked PRs, each shippable on its own:
 3. **Batch and `n` fan-out** — the merge layer and router wiring.
 
 `#563` (token-id only) can merge first and unblocks the original replay/benchmark
-use case.
+use case. It must not close #562 — the issue carries the remaining work.
+
+## Remaining work
+
+The checklist lives on #562 so it can be assigned and closed per item; this RFC
+owns the design. Items, in rollout order:
+
+### Stage 1 — text prompts
+- [ ] Router-side encode-only path (`vllm-tokenizer`, `add_special_tokens`
+  default `true`), outside policy and retry.
+- [ ] Lowering for `str`, `list[str]`, `list[list[int]]`; one `GenerateRequest`
+  per sequence.
+- [ ] Unit tests per prompt form plus one end-to-end test.
+
+### Stage 2 — logprobs and echo
+- [ ] Per-sequence response accumulator (text, ids, logprobs, finish reason).
+- [ ] Map `logprobs` / `top_logprobs` / `prompt_logprobs` /
+  `logprob_token_ids` from the proto response options and candidate tokens.
+- [ ] `echo` prefix with `text_offset` shift; `echo` + `max_tokens: 0`.
+- [ ] Tests for offsets, top-k and `-9999` clamping.
+
+### Stage 3 — `n` and batched prompts
+- [ ] Fan-out and JSON merge (sequential `index`, usage accounting).
+- [ ] SSE merge (index rewrite, one `id`/`model`, one usage chunk, one
+  `[DONE]`).
+- [ ] P/D: one admission plus two-leg dispatch per sequence.
+- [ ] Tests for batched prompts and `n`.
+
+### Verification gaps
+- [ ] Real 1P+1D NIXL run of the completion route (the prototype was only
+  smoke-tested on a single gRPC worker).
+- [ ] `json_schema`, `logprob_token_ids`, `return_token_ids` and streaming
+  prompt logprobs on a real engine.
+- [ ] Decide whether to use `num_sequences` natively once the engine supports
+  it (today it rejects `num_sequences > 1`).
+
+### Docs
+- [ ] Update `docs/backend/grpc.md` when each stage lands.
 
 ## Open questions
 
