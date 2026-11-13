@@ -289,6 +289,8 @@ pub struct WorkerMetadata {
 pub struct BasicWorker {
     metadata: WorkerMetadata,
     dp_size: Option<usize>,
+    // Keep credentials out of metadata and Debug output.
+    api_key: Option<String>,
     load_counter: Arc<AtomicUsize>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
@@ -330,6 +332,7 @@ impl BasicWorker {
         Self {
             metadata,
             dp_size: None,
+            api_key: None,
             load_counter: Arc::new(AtomicUsize::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
@@ -337,6 +340,12 @@ impl BasicWorker {
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: CircuitBreaker::new(),
         }
+    }
+
+    /// Configure authentication for HTTP health checks.
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key;
+        self
     }
 
     pub fn with_labels(mut self, labels: std::collections::HashMap<String, String>) -> Self {
@@ -416,7 +425,11 @@ impl Worker for BasicWorker {
                 let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
 
                 // Use the shared client with a custom timeout for this request
-                match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
+                let mut request = WORKER_CLIENT.get(&health_url).timeout(timeout);
+                if let Some(key) = &self.api_key {
+                    request = request.bearer_auth(key);
+                }
+                match request.send().await {
                     Ok(response) => response.status().is_success(),
                     Err(_) => false,
                 }
@@ -534,6 +547,12 @@ impl DPAwareWorker {
     /// Configure the circuit breaker for this worker
     pub fn with_circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
         self.base_worker = self.base_worker.with_circuit_breaker_config(config);
+        self
+    }
+
+    /// Configure authentication for HTTP health checks.
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.base_worker = self.base_worker.with_api_key(api_key);
         self
     }
 
