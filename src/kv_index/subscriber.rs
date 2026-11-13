@@ -1,5 +1,7 @@
 //! ZMQ SUB + DEALER replay subscriber, one task per (worker, rank).
 
+use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -148,13 +150,16 @@ fn spawn_inner(
     let strict_recovery = source.strict_recovery;
 
     tokio::spawn(async move {
-        let sub = match ctx.socket(zmq::SUB) {
+        let mut sub = match ctx.socket(zmq::SUB) {
             Ok(s) => s,
             Err(e) => {
                 warn!("kv_index sub socket for {}: {}", source_id, e);
                 return;
             }
         };
+        if let Some(h) = hwm {
+            sub.set_rcvhwm(h).ok();
+        }
         if let Err(e) = sub.connect(&pub_endpoint) {
             warn!("kv_index connect {} to {}: {}", source_id, pub_endpoint, e);
             return;
@@ -170,9 +175,6 @@ fn spawn_inner(
         {
             return;
         }
-        if let Some(h) = hwm {
-            sub.set_rcvhwm(h).ok();
-        }
         // zmq recv is sync; DONTWAIT + sleep keeps the tokio worker free. No
         // rcvtimeo — it's a no-op under DONTWAIT.
         info!(
@@ -184,6 +186,7 @@ fn spawn_inner(
         let mut incarnation: u64 = 0;
         let mut full_attention_rejection_reported = false;
         let mut retries = ReplayRetryBudget::default();
+        let mut pending_live = VecDeque::new();
 
         loop {
             if is_shutdown(&mut shutdown_rx)
@@ -194,7 +197,10 @@ fn spawn_inner(
                 info!("kv_index subscriber {} shutting down", source_id);
                 break;
             }
-            match sub.recv_multipart(zmq::DONTWAIT) {
+            let received = pending_live
+                .pop_front()
+                .map_or_else(|| sub.recv_multipart(zmq::DONTWAIT), Ok);
+            match received {
                 Ok(frames) => {
                     // ZMQ SUB matches topic prefixes, not complete topics.
                     if frames
@@ -300,7 +306,7 @@ fn spawn_inner(
                         );
                         let replay_started = Instant::now();
                         let result = if let Some(ep) = replay_endpoint.as_deref() {
-                            replay(
+                            let recovery = replay(
                                 ep,
                                 replay_start,
                                 seq,
@@ -315,6 +321,13 @@ fn spawn_inner(
                                 &topic,
                                 &mut full_attention_rejection_reported,
                                 binding.as_ref(),
+                            );
+                            buffer_live_during_replay(
+                                recovery,
+                                &mut sub,
+                                &topic,
+                                &mut pending_live,
+                                MAX_PENDING_LIVE_BYTES,
                             )
                             .await
                         } else {
@@ -494,6 +507,59 @@ fn spawn_inner(
     });
 
     SubscriberHandle { shutdown_tx }
+}
+
+// Recovery keeps draining SUB into a bounded queue, without applying live
+// mutations over an in-progress rebuild. The original ingestion loop later
+// consumes this queue in order, deduplicating through the replay watermark.
+const MAX_PENDING_LIVE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PENDING_LIVE_FRAMES: usize = 1024;
+
+async fn buffer_live_during_replay(
+    recovery: impl Future<Output = Option<i64>>,
+    sub: &mut zmq::Socket,
+    topic: &str,
+    pending: &mut VecDeque<Vec<Vec<u8>>>,
+    byte_limit: usize,
+) -> Option<i64> {
+    tokio::pin!(recovery);
+    let mut bytes: usize = pending.iter().flatten().map(Vec::len).sum();
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut recovery => return result,
+            _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                // Bound work per poll so replay can progress under a busy publisher.
+                for _ in 0..64 {
+                    if pending.len() >= MAX_PENDING_LIVE_FRAMES || bytes >= byte_limit {
+                        warn!("kv_index live recovery buffer full; aborting replay before resuming ingestion");
+                        return None;
+                    }
+                    match sub.recv_multipart(zmq::DONTWAIT) {
+                        Ok(frames) => {
+                            if frames.first().is_some_and(|frame| frame.as_slice() != topic.as_bytes()) {
+                                continue;
+                            }
+                            bytes = bytes.saturating_add(frames.iter().map(Vec::len).sum::<usize>());
+                            // Keep even the frame crossing the budget: it has already
+                            // left ZMQ and must not be silently lost. Memory can exceed
+                            // the queue budget by this one transport frame.
+                            pending.push_back(frames);
+                            if bytes >= byte_limit {
+                                warn!("kv_index live recovery byte budget reached; aborting replay");
+                                return None;
+                            }
+                        }
+                        Err(zmq::Error::EAGAIN) => break,
+                        Err(error) => {
+                            warn!(%error, "kv_index live receive failed during replay");
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1391,11 +1457,30 @@ mod tests {
         binding: Option<SubscriberBinding>,
         strict_recovery: bool,
     ) -> Fixture {
+        fixture_with_receive_limit(
+            with_replay,
+            expected_block_size,
+            binding,
+            strict_recovery,
+            None,
+        )
+    }
+
+    fn fixture_with_receive_limit(
+        with_replay: bool,
+        expected_block_size: Option<u32>,
+        binding: Option<SubscriberBinding>,
+        strict_recovery: bool,
+        hwm: Option<i32>,
+    ) -> Fixture {
         use std::sync::atomic::{AtomicU32, Ordering};
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let tag = NEXT.fetch_add(1, Ordering::Relaxed);
         let ctx = Arc::new(zmq::Context::new());
         let publisher = ctx.socket(zmq::PUB).unwrap();
+        if let Some(hwm) = hwm {
+            publisher.set_sndhwm(hwm).unwrap();
+        }
         let pub_endpoint = format!("inproc://kv-loss-pub-{tag}");
         publisher.bind(&pub_endpoint).unwrap();
         let replay_endpoint = format!("inproc://kv-loss-replay-{tag}");
@@ -1412,7 +1497,7 @@ mod tests {
             pub_endpoint,
             replay_endpoint: with_replay.then_some(replay_endpoint),
             topic: "kv".into(),
-            hwm: None,
+            hwm,
             strict_recovery,
         };
         let handle = spawn_inner(
@@ -2781,6 +2866,133 @@ mod tests {
             .unwrap();
         let next = replay_request(fixture.replay_server.as_ref().unwrap()).await;
         assert_eq!(read_seq(next.last().unwrap()), 0);
+    }
+
+    #[tokio::test]
+    async fn slow_replay_drains_small_hwm_and_then_catches_up_live_events() {
+        let mut f = fixture_with_receive_limit(true, None, None, true, Some(2));
+        publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            0,
+            0.0,
+            &[store_event(100, &[1, 2, 3, 4])],
+            Some(0),
+        )
+        .await;
+        let server = f.replay_server.as_ref().unwrap();
+        let final_tokens = [90, 91, 92, 93];
+        let producer = async {
+            // A missing seq 1 starts replay through seq 2.
+            f.publisher
+                .send_multipart(
+                    [
+                        b"kv".as_slice(),
+                        &2i64.to_be_bytes(),
+                        &batch_payload(&[], 0),
+                    ],
+                    0,
+                )
+                .unwrap();
+            let request = replay_request(server).await;
+            assert_eq!(read_seq(request.last().unwrap()), 1);
+            // More than the combined PUB/SUB HWM arrives before replay replies.
+            for seq in 2i64..=42 {
+                let events = if seq == 42 {
+                    vec![store_event(200, &final_tokens)]
+                } else {
+                    vec![]
+                };
+                f.publisher
+                    .send_multipart(
+                        [
+                            b"kv".as_slice(),
+                            &seq.to_be_bytes(),
+                            &batch_payload(&events, 0),
+                        ],
+                        0,
+                    )
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(4)).await;
+            }
+            assert!(
+                hits(&f.indexer, &[1, 2, 3, 4]).is_empty(),
+                "pending live frames must not restore credit during replay"
+            );
+            send_replay_replies(
+                server,
+                &request,
+                &[
+                    (1, b"kv".as_slice(), batch_payload(&[], 0)),
+                    (2, b"kv".as_slice(), batch_payload(&[], 0)),
+                ],
+            );
+        };
+        let consumer = async {
+            let mut gaps = 0;
+            let mut replays = 0;
+            let mut second_advances = 0;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while let Some(signal) = f.signals.recv().await {
+                    match signal {
+                        IngestionSignal::Gap { .. } => gaps += 1,
+                        IngestionSignal::ReplayApplied { .. } => replays += 1,
+                        IngestionSignal::Advance { last_seq: 42, .. } => break,
+                        IngestionSignal::Advance { last_seq: 2, .. } => second_advances += 1,
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("live queue did not catch up after replay");
+            assert_eq!(gaps, 1, "replay itself must not induce a new live gap");
+            assert_eq!(replays, 1);
+            assert_eq!(
+                second_advances, 1,
+                "replayed live duplicate must be skipped"
+            );
+        };
+        tokio::join!(producer, consumer);
+        assert_eq!(hits(&f.indexer, &final_tokens).len(), 1);
+        assert_eq!(
+            f.indexer
+                .source_recovery_status(&SourceId::from("w0"), 0)
+                .unwrap()
+                .state,
+            crate::kv_index::SourceRecoveryState::WorkerExact
+        );
+    }
+
+    #[tokio::test]
+    async fn live_buffer_exhaustion_aborts_replay_without_losing_the_received_frame() {
+        let ctx = zmq::Context::new();
+        let sender = ctx.socket(zmq::PAIR).unwrap();
+        sender.bind("inproc://replay-live-budget").unwrap();
+        let mut receiver = ctx.socket(zmq::PAIR).unwrap();
+        receiver.connect("inproc://replay-live-budget").unwrap();
+        let frames = vec![
+            b"kv".to_vec(),
+            10i64.to_be_bytes().to_vec(),
+            vec![b'x'; 128],
+        ];
+        sender.send_multipart(&frames, 0).unwrap();
+        let mut pending = VecDeque::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            buffer_live_during_replay(
+                std::future::pending(),
+                &mut receiver,
+                "kv",
+                &mut pending,
+                64,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(pending.pop_front(), Some(frames));
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]
