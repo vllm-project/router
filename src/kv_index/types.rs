@@ -127,6 +127,79 @@ pub enum ClearScope {
     All,
 }
 
+/// Trust state for one independently addressed KV event source.
+///
+/// `Observed` is compatibility-mode credit for fresh observations, not a claim
+/// that the publisher's complete history has been reconstructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SourceRecoveryState {
+    Cold,
+    /// Worker history is complete; the external pool has no proven baseline.
+    WorkerExact,
+    Exact,
+    Observed,
+    Degraded,
+    Fallback,
+}
+
+impl SourceRecoveryState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::WorkerExact => "worker_exact",
+            Self::Exact => "exact",
+            Self::Observed => "observed",
+            Self::Degraded => "degraded",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+/// Stable, bounded reasons for source recovery state transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SourceRecoveryReason {
+    Registered,
+    InitialSequence,
+    SequenceGap,
+    ReplayApplied,
+    RetryExhausted,
+    ReplayUnavailable,
+    ReplayFailed,
+    InvalidFrame,
+    IncarnationReset,
+    RankScopeChanged,
+    ValidationFailed,
+    ClearBarrier,
+    FreshObservation,
+}
+
+impl SourceRecoveryReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Registered => "registered",
+            Self::InitialSequence => "initial_sequence",
+            Self::SequenceGap => "sequence_gap",
+            Self::ReplayApplied => "replay_applied",
+            Self::RetryExhausted => "retry_exhausted",
+            Self::ReplayUnavailable => "replay_unavailable",
+            Self::ReplayFailed => "replay_failed",
+            Self::InvalidFrame => "invalid_frame",
+            Self::IncarnationReset => "incarnation_reset",
+            Self::RankScopeChanged => "rank_scope_changed",
+            Self::ValidationFailed => "validation_failed",
+            Self::ClearBarrier => "clear_barrier",
+            Self::FreshObservation => "fresh_observation",
+        }
+    }
+}
+
+/// Current externally observable recovery status for one source/rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SourceRecoveryStatus {
+    pub(crate) state: SourceRecoveryState,
+    pub(crate) reason: SourceRecoveryReason,
+}
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;

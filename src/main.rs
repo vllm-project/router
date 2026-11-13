@@ -215,6 +215,13 @@ struct CliArgs {
     /// Shared model identity for workers using static event publishers.
     #[arg(long)]
     kv_event_model: Option<String>,
+    /// Require complete KV event recovery before restoring placement credit.
+    /// External pool tiers stay uncredited until an independent pool baseline exists.
+    /// Sources can remain in fallback; requests stay routable without cache credit.
+    /// After retry exhaustion, an operator-initiated worker KV clear restores worker-local credit.
+    /// Monitor vllm_router_kv_source_recovery_state and vllm_router_kv_source_recovery_transitions_total.
+    #[arg(long, default_value_t = false)]
+    kv_event_strict_recovery: bool,
     /// Transfer credit for host-resident KV blocks.
     #[arg(long, default_value_t = 0.8)]
     kv_penalty_host: f64,
@@ -630,6 +637,7 @@ impl CliArgs {
                 })?,
             mode,
             pd_kv_event_sources,
+            kv_event_strict_recovery: self.kv_event_strict_recovery,
             policy,
             connection_mode,
             host: self.host.clone(),

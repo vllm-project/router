@@ -120,10 +120,12 @@ impl PdKvState {
         sources: HashMap<String, crate::config::types::PdKvEventSources>,
         workers: Vec<Arc<dyn Worker>>,
         policy: Arc<dyn LoadBalancingPolicy>,
+        strict_recovery: bool,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
         state.api_key = api_key;
         state.supervisor.set_api_key(state.api_key.clone());
+        state.supervisor.set_strict_recovery(strict_recovery);
         state.refresh_inputs = Mutex::new(RefreshInputs {
             workers: workers.iter().cloned().collect(),
             policy: Some(policy.clone()),

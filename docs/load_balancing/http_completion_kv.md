@@ -32,3 +32,6 @@ Observed placement estimates are not actual APC hit counts or complete
 bootstrap/generation/recovery guarantees. See
 [the HTTP consumer RFC](https://github.com/vllm-project/router/issues/405) for the
 real-Worker acceptance requirements.
+
+For compatibility versus opt-in strict event recovery, retry limits, metrics,
+and operational alerts, see [KV event recovery](kv_event_recovery.md).

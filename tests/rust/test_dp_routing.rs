@@ -251,6 +251,7 @@ mod dp_e2e_tests {
         RouterConfig {
             mode: RoutingMode::Regular { worker_urls },
             pd_kv_event_sources: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::RoundRobin,
             host: "127.0.0.1".to_string(),
             port: 0,
@@ -303,6 +304,7 @@ mod dp_e2e_tests {
                 discovery_address: None,
             },
             pd_kv_event_sources: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::RoundRobin,
             host: "127.0.0.1".to_string(),
             port: 0,

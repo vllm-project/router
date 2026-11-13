@@ -83,6 +83,26 @@ pub fn init_metrics() {
         "vllm_router_kv_placement_lookups_total",
         "KV-aware placement lookups and reasons for skipping them"
     );
+    describe_gauge!(
+        "vllm_router_kv_source_recovery_state",
+        "Current number of registered KV event sources by recovery state and reason"
+    );
+    describe_counter!(
+        "vllm_router_kv_source_recovery_transitions_total",
+        "KV event source recovery transitions aggregated by state and reason"
+    );
+    describe_histogram!(
+        "vllm_router_kv_source_recovery_duration_seconds",
+        "Time from a detected KV event gap until exact recovery or source retirement"
+    );
+    describe_counter!(
+        "vllm_router_kv_replay_outcomes_total",
+        "KV event replay attempts aggregated by outcome"
+    );
+    describe_histogram!(
+        "vllm_router_kv_replay_duration_seconds",
+        "Duration of KV event replay operations aggregated by outcome"
+    );
     describe_counter!(
         "vllm_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
@@ -565,6 +585,76 @@ impl RouterMetrics {
     pub fn record_kv_placement_lookup(result: &'static str) {
         counter!("vllm_router_kv_placement_lookups_total", "result" => result).increment(1);
     }
+
+    pub fn record_kv_source_recovery_transition(
+        _source: &str,
+        _dp_rank: u32,
+        previous: Option<(&'static str, &'static str)>,
+        state: &'static str,
+        reason: &'static str,
+        recovery_duration: Option<Duration>,
+    ) {
+        if let Some((previous_state, previous_reason)) = previous {
+            gauge!("vllm_router_kv_source_recovery_state",
+                "state" => previous_state,
+                "reason" => previous_reason)
+            .decrement(1.0);
+        }
+        gauge!("vllm_router_kv_source_recovery_state",
+            "state" => state,
+            "reason" => reason)
+        .increment(1.0);
+        counter!("vllm_router_kv_source_recovery_transitions_total",
+            "from" => previous.map_or("unregistered", |(state, _)| state),
+            "to" => state,
+            "reason" => reason)
+        .increment(1);
+        if let Some(duration) = recovery_duration {
+            histogram!("vllm_router_kv_source_recovery_duration_seconds",
+                "outcome" => state)
+            .record(duration.as_secs_f64());
+        }
+    }
+
+    pub fn clear_kv_source_recovery_state(
+        _source: &str,
+        _dp_rank: u32,
+        state: &'static str,
+        reason: &'static str,
+        recovery_duration: Option<Duration>,
+    ) {
+        gauge!("vllm_router_kv_source_recovery_state",
+            "state" => state,
+            "reason" => reason)
+        .decrement(1.0);
+        counter!("vllm_router_kv_source_recovery_transitions_total",
+            "from" => state,
+            "to" => "forgotten",
+            "reason" => "source_retired")
+        .increment(1);
+        if let Some(duration) = recovery_duration {
+            histogram!("vllm_router_kv_source_recovery_duration_seconds",
+                "outcome" => "forgotten")
+            .record(duration.as_secs_f64());
+        }
+    }
+
+    pub fn record_kv_replay_outcome(
+        _source: &str,
+        _dp_rank: u32,
+        outcome: &'static str,
+        duration: Option<Duration>,
+    ) {
+        counter!("vllm_router_kv_replay_outcomes_total",
+            "outcome" => outcome)
+        .increment(1);
+        if let Some(duration) = duration {
+            histogram!("vllm_router_kv_replay_duration_seconds",
+                "outcome" => outcome)
+            .record(duration.as_secs_f64());
+        }
+    }
+
     pub fn record_kv_routing_input(transport: &'static str, result: &'static str) {
         counter!("vllm_router_kv_routing_inputs_total", "transport" => transport, "result" => result).increment(1);
     }

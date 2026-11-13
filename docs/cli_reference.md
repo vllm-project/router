@@ -86,6 +86,7 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | `--kv-event-replay-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Replay endpoint(s) for a static KV-event source, same `WORKER_URL=ENDPOINT[,ENDPOINT...]` form. |
 | `--kv-event-block-size` | `u32` | `16` | `integer` | `16` | KV cache block size in tokens for workers registered through `--kv-event-source`. |
 | `--kv-event-model` | `string` | `unset` | `string` | `unset` | Model id advertised to static KV-event sources; `unset` keeps the served model id. |
+| `--kv-event-strict-recovery` | `flag` | `false` | `flag` | `false` | Opt in to authoritative KV history recovery. External pool tiers stay uncredited until an independent pool baseline exists. Requests stay routable in fallback; after retry exhaustion, an operator-initiated worker KV clear restores worker-local credit. Without strict mode, fresh observations can restore credit after history loss; see [recovery trade-offs](load_balancing/kv_event_recovery.md). |
 
 The Rust CLI requires worker URLs in regular mode unless service discovery is
 enabled. The Python launcher permits an empty worker list without service

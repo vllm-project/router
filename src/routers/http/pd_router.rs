@@ -1288,6 +1288,7 @@ impl PdRouterBase {
                     ctx.router_config.pd_kv_event_sources.clone(),
                     ctx.worker_registry.get_prefill_workers(),
                     prefill_policy.clone(),
+                    ctx.router_config.kv_event_strict_recovery,
                 )
                 .await,
             )

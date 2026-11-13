@@ -91,12 +91,14 @@ impl PdProgramRuntime {
         let kv_interval = scheduler.metrics_interval().max(Duration::from_secs(1));
         let kv_warm_remote = warm_remote.clone();
         let kv_observer = if kv_config.kv_events {
+            let strict_recovery = ctx.router_config.kv_event_strict_recovery;
             Some(
                 tokio::spawn(async move {
-                    let (supervisor, mut signals) = KvIndexSupervisor::new(
+                    let (mut supervisor, mut signals) = KvIndexSupervisor::new(
                         kv_client,
                         HashMode::parse_config(&kv_config.kv_hash_mode),
                     );
+                    supervisor.set_strict_recovery(strict_recovery);
                     let mut previous = BTreeSet::new();
                     let mut subscribed = BTreeSet::new();
                     let mut loss_epoch = crate::kv_index::signal_loss_epoch();
