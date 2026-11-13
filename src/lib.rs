@@ -229,6 +229,8 @@ impl Router {
             epd: None,
             mode,
             pd_kv_event_sources: config::parse_pd_kv_events(&self.pd_kv_events)?,
+            // The library entry point has no CLI flag for this; the binary passes it.
+            kv_event_max_batch_events: config::types::default_kv_event_max_batch_events(),
             policy,
             host: self.host.clone(),
             port: self.port,

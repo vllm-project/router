@@ -9,6 +9,10 @@ use crate::program_scheduling::{
 };
 
 /// Main router configuration
+pub fn default_kv_event_max_batch_events() -> usize {
+    16384
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
     /// Optional encoder orchestration for E+PD or E/P/D routing.
@@ -20,6 +24,9 @@ pub struct RouterConfig {
     /// Workers listed here skip HTTP control-plane discovery and probing.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pd_kv_event_sources: HashMap<String, PdKvEventSources>,
+    /// KV events kept from one message; oversized batches keep the newest events.
+    #[serde(default = "default_kv_event_max_batch_events")]
+    pub kv_event_max_batch_events: usize,
     /// Worker connection mode
     #[serde(default)]
     pub connection_mode: ConnectionMode,
@@ -1301,6 +1308,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             pd_kv_event_sources: HashMap::new(),
+            kv_event_max_batch_events: default_kv_event_max_batch_events(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3001,
@@ -2081,6 +2089,7 @@ mod tests {
                 discovery_address: None,
             },
             pd_kv_event_sources: Default::default(),
+            kv_event_max_batch_events: default_kv_event_max_batch_events(),
             policy: PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 30,
             },
@@ -2147,6 +2156,7 @@ mod tests {
                 ],
             },
             pd_kv_event_sources: Default::default(),
+            kv_event_max_batch_events: default_kv_event_max_batch_events(),
             policy: PolicyConfig::CacheAware {
                 cache_threshold: 0.9,
                 balance_abs_threshold: 5,
@@ -2214,6 +2224,7 @@ mod tests {
                 worker_urls: vec!["http://worker1".to_string()],
             },
             pd_kv_event_sources: Default::default(),
+            kv_event_max_batch_events: default_kv_event_max_batch_events(),
             policy: PolicyConfig::RoundRobin,
             host: "::1".to_string(), // IPv6
             port: 8888,

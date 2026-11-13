@@ -797,6 +797,7 @@ mod test_pd_routing {
             let config = RouterConfig {
                 mode,
                 pd_kv_event_sources: Default::default(),
+                kv_event_max_batch_events: 16384,
                 policy,
                 host: "127.0.0.1".to_string(),
                 port: 3001,
