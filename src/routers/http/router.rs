@@ -4244,7 +4244,7 @@ mod tests {
         let first_target = kv.target_for_worker(first.as_ref());
         let second_target = kv.target_for_worker(second.as_ref());
         for (worker, target) in [(&first, &first_target), (&second, &second_target)] {
-            register_history_target(kv, worker, target.clone(), "qwen3");
+            register_history_target(kv, worker, target.clone(), "qwen3", 2);
         }
         let router = Arc::new(router);
         let dispatch = |raw: bytes::Bytes| {
@@ -4343,11 +4343,11 @@ mod tests {
         );
         assert_eq!((first.load(), second.load()), (1, 0));
         // A returned 500 and the outstanding request has not seen headers.
-        // Only the successful attempt on B learned its rendered tokens.
+        // Only the successful attempt on B learned a complete two-token block.
         assert_eq!(kv.observed_completion_prefix(first.as_ref(), &[1, 3, 4]), 0);
         assert_eq!(
             kv.observed_completion_prefix(second.as_ref(), &[1, 3, 4]),
-            3
+            2
         );
         assert_eq!(
             manager.sample(&first_target),
@@ -4936,6 +4936,7 @@ mod tests {
         worker: &Arc<dyn Worker>,
         target: crate::kv_index::RoutableTarget,
         model: &str,
+        block_size: u32,
     ) {
         use crate::kv_index::{CacheKey, HashMode, KvBlockIndexer};
         kv.register_history_worker(
@@ -4946,7 +4947,7 @@ mod tests {
                 cache_key: Some(CacheKey {
                     model: Arc::from(model),
                     hash_mode: HashMode::Sha256,
-                    block_size: 16,
+                    block_size,
                 }),
                 ..Default::default()
             }),
@@ -5021,7 +5022,7 @@ mod tests {
         let policy = f.router.policy_registry.get_default_policy();
         let kv = kv_aware_policy(policy.as_ref()).unwrap();
         let target = kv.target_for_worker(f.worker.as_ref());
-        register_history_target(kv, &f.worker, target.clone(), "model");
+        register_history_target(kv, &f.worker, target.clone(), "model", 16);
         let manager = kv.slot_manager().unwrap();
         let dispatch = |id: u32| {
             let router = f.router.clone();
