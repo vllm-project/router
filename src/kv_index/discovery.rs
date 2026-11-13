@@ -63,6 +63,8 @@ pub type KvEventSourcesResponse = HashMap<String, KvEventSourceEntry>;
 pub struct WorkerKvInfo {
     pub instance_id: String,
     pub block_size: Option<u32>,
+    /// KV capacity of this worker in tokens, when the engine published it.
+    pub capacity_tokens: Option<u64>,
     pub ranks: Vec<u32>,
     /// Cache identity shared by every worker feeding the same placement index.
     /// Absent when discovery cannot create an index for this worker.
@@ -300,6 +302,7 @@ impl KvIndexSupervisor {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| worker_url.to_string());
         let block_size = discovered_block_size(&server_info);
+        let capacity_tokens = server_info.kv_capacity_tokens;
         let model_id = match discovery.model_id {
             Ok(Some(model_id)) if !model_id.trim().is_empty() => Some(model_id),
             Ok(_) => {
@@ -330,6 +333,7 @@ impl KvIndexSupervisor {
                 return Ok(WorkerKvInfo {
                     instance_id,
                     block_size,
+                    capacity_tokens,
                     ranks: vec![],
                     cache_key: None,
                 });
@@ -345,6 +349,7 @@ impl KvIndexSupervisor {
             return Ok(WorkerKvInfo {
                 instance_id,
                 block_size: None,
+                capacity_tokens,
                 ranks: vec![],
                 cache_key: None,
             });
@@ -353,6 +358,7 @@ impl KvIndexSupervisor {
             return Ok(WorkerKvInfo {
                 instance_id,
                 block_size: Some(block_size),
+                capacity_tokens,
                 ranks: vec![],
                 cache_key: None,
             });
@@ -541,6 +547,7 @@ impl KvIndexSupervisor {
         Ok(WorkerKvInfo {
             instance_id,
             block_size: Some(block_size),
+            capacity_tokens,
             ranks,
             cache_key: Some(key),
         })
@@ -1046,6 +1053,7 @@ async fn query_metrics_metadata(
         model_id,
         kv_block_size: first.block_size,
         effective_attention_block_size: first.effective_attention_block_size,
+        kv_capacity_tokens: metrics_meta::shared_capacity(&engines),
         ..Default::default()
     })
 }
@@ -1186,6 +1194,10 @@ mod metrics_meta {
         pub(crate) hash_block_size: Option<u32>,
         /// Engine-declared cache layout, once vLLM populates it.
         pub(crate) kv_cache_layout: Option<String>,
+        /// Total KV blocks this rank reports; with the hash unit this is the
+        /// engine's capacity, which admission needs to tell whether a request
+        /// would fit rather than only how full the engine already is.
+        pub(crate) num_gpu_blocks: Option<u64>,
     }
 
     impl EngineCacheConfig {
@@ -1193,6 +1205,24 @@ mod metrics_meta {
         pub(crate) fn hash_unit(&self) -> Option<u32> {
             self.block_size.or(self.effective_attention_block_size)
         }
+
+        /// KV capacity of this engine in tokens.
+        pub(crate) fn capacity_tokens(&self) -> Option<u64> {
+            let blocks = self.num_gpu_blocks?;
+            let unit = u64::from(self.hash_unit()?);
+            (blocks > 0 && unit > 0).then(|| blocks.saturating_mul(unit))
+        }
+    }
+
+    /// Capacity every engine agrees on, or `None` when they differ or none
+    /// published it: admission must not compare a load against one ceiling and
+    /// reject against another.
+    pub(crate) fn shared_capacity(engines: &BTreeMap<u32, EngineCacheConfig>) -> Option<u64> {
+        let mut capacities = engines
+            .values()
+            .filter_map(EngineCacheConfig::capacity_tokens);
+        let first = capacities.next()?;
+        capacities.all(|value| value == first).then_some(first)
     }
 
     /// The hash unit every engine agrees on, or the sizes that conflict.
@@ -1233,6 +1263,10 @@ mod metrics_meta {
             entry.effective_attention_block_size =
                 positive(labels.get("effective_attention_block_size"));
             entry.hash_block_size = positive(labels.get("hash_block_size"));
+            entry.num_gpu_blocks = labels
+                .get("num_gpu_blocks")
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|blocks| *blocks > 0);
             entry.kv_cache_layout = labels
                 .get("kv_cache_layout")
                 .filter(|layout| !is_unset(layout))

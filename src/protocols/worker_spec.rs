@@ -162,4 +162,6 @@ pub struct ServerInfo {
     pub kv_block_size: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_attention_block_size: Option<u32>,
+    /// KV capacity in tokens, when the engine publishes it.
+    pub kv_capacity_tokens: Option<u64>,
 }
