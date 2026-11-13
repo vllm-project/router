@@ -1016,7 +1016,7 @@ mod tests {
             .as_ref()
             .and_then(|pending| pending.prediction.as_ref())
             .unwrap();
-        assert!(prediction.suggested_ttl_seconds > 0.0);
+        assert_eq!(prediction.suggested_ttl_seconds, 1.0);
         assert_eq!(decision.ttl_deadline, None);
         assert_eq!(
             decision.last_pause_reason,
@@ -1076,7 +1076,8 @@ mod tests {
             .as_ref()
             .and_then(|pending| pending.prediction.as_ref())
             .unwrap();
-        assert!(prediction.suggested_ttl_seconds > 0.0);
+        assert_eq!(prediction.suggested_ttl_seconds, 1.0);
+        assert_eq!(decision.last_applied_acting_ttl, Duration::from_secs(1));
         assert!(decision
             .ttl_deadline
             .is_some_and(|deadline| deadline > Instant::now()));
