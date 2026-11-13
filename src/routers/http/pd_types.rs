@@ -71,6 +71,16 @@ pub struct PdLoadSample {
     pub unknown_prefill_requests: usize,
     pub pending_decode_requests: usize,
     pub active_decode_requests: usize,
+    /// Logical context tokens of Decode requests admitted but not yet
+    /// dispatched. Their KV is not on the engine yet, so they are waiting work.
+    pub pending_decode_tokens: u64,
+    /// Logical context tokens of Decode requests already dispatched. Each
+    /// sequence contributes its full prompt length; shared physical prefix
+    /// blocks still count once per sequence.
+    pub active_decode_tokens: u64,
+    /// Admitted Decode requests whose prompt length the Router does not know.
+    /// Any candidate holding one is compared by request counts.
+    pub unknown_decode_requests: usize,
 }
 
 impl PdLoadSample {
@@ -106,6 +116,18 @@ impl PdLoadSample {
                     "vllm_router_pd_active_decode_requests",
                     self.active_decode_requests as f64,
                 );
+                record(
+                    "vllm_router_pd_pending_decode_tokens",
+                    self.pending_decode_tokens as f64,
+                );
+                record(
+                    "vllm_router_pd_active_decode_tokens",
+                    self.active_decode_tokens as f64,
+                );
+                record(
+                    "vllm_router_pd_unknown_decode_requests",
+                    self.unknown_decode_requests as f64,
+                );
             }
         }
     }
@@ -115,6 +137,19 @@ impl PdLoadSample {
             Stage::Prefill => self.prefill_requests,
             Stage::Decode => self.pending_decode_requests + self.active_decode_requests,
         }
+    }
+
+    /// The unit Decode ranks by, when it can be known.
+    ///
+    /// `None` as soon as one admitted request on this endpoint has an unknown
+    /// prompt length: mixing a known token figure with an unknown one would
+    /// compare different units across the pool, and request counts are the
+    /// documented fallback.
+    pub(super) fn decode_tokens(self) -> Option<u64> {
+        (self.unknown_decode_requests == 0).then(|| {
+            self.pending_decode_tokens
+                .saturating_add(self.active_decode_tokens)
+        })
     }
 
     fn idle(self) -> bool {
@@ -156,7 +191,66 @@ pub struct PdRequestContext<'a> {
     pub lora_name: Option<&'a str>,
     /// Request cache salt scoping the binding digest.
     pub cache_salt: Option<&'a str>,
+    /// Sampling sequences (`n`) the Decode endpoint will run for this request.
+    ///
+    /// Carried for identity and diagnostics; it does **not** scale the Decode
+    /// reservation, because the engine shares one copy of the prompt's blocks
+    /// across the `n` sequences.
+    pub decode_sequences: u32,
+    /// Marginal Decode context per candidate, keyed by worker URL, priced
+    /// immediately before Decode is selected. `None` keeps Decode on full
+    /// context tokens, or on request counts when those are unknown too.
+    pub decode_context: Option<&'a HashMap<String, u64>>,
     pub route: &'a str,
+}
+
+/// The route a probe uses. It takes a pair but starts no sequence, so it must
+/// not reserve Decode occupancy: an unknown reservation there would flip the
+/// whole pool to request counts for the length of every probe.
+pub(super) const HEALTH_PROBE_ROUTE: &str = "/health_generate";
+
+/// Sampling sequences a Decode endpoint runs for this request.
+///
+/// The engine forks `max(n, best_of)` sequences and each attends over the whole
+/// prompt, so the reservation charges the larger of the two. `best_of` defaults
+/// to `n` on the engine, hence `n` is the floor rather than the value. Values
+/// above `MAX_SEQUENCES` are clamped: the engine rejects them long before the
+/// reservation could overflow.
+const MAX_SEQUENCES: u32 = 1024;
+
+pub(super) fn requested_sequences(request: &serde_json::Value) -> u32 {
+    let read = |field: &str| {
+        request
+            .get(field)
+            .or_else(|| {
+                request
+                    .get("sampling_params")
+                    .and_then(|params| params.get(field))
+            })
+            .and_then(serde_json::Value::as_u64)
+    };
+    let sequences = read("n").unwrap_or(1).max(read("best_of").unwrap_or(1));
+    u32::try_from(sequences)
+        .unwrap_or(MAX_SEQUENCES)
+        .clamp(1, MAX_SEQUENCES)
+}
+
+/// Logical context a Decode request adds: the prompt it carries.
+///
+/// Deliberately **not** multiplied by the sampling-sequence count. The engine
+/// shares one copy of the prompt's blocks across `n` sequences, so the KV it
+/// occupies is the prompt, not `prompt * n`; the extra sequences cost decode
+/// work, which is a separate (unmodelled) term rather than more resident KV.
+/// `None` when the prompt length is unknown, which keeps the pool on counts.
+fn decode_context_tokens(prompt: Option<u64>) -> Option<u64> {
+    prompt
+}
+
+/// Prompt tokens a Prefill decision established, including credited prefix.
+fn prompt_tokens(prefill: &StageDecision) -> Option<u64> {
+    prefill
+        .new_prefill_tokens
+        .map(|new| new.saturating_add(prefill.credited_prefix_tokens.unwrap_or(0)))
 }
 
 #[derive(Debug, Clone)]
@@ -198,11 +292,25 @@ impl PdLoadManager {
     ///
     /// Both stages are charged here. Callers that dispatch Decode only after
     /// Prefill completes use [`Self::admit_deferred`] instead.
+    #[cfg(test)]
     pub(super) fn admit(
         &self,
         select: impl FnOnce(&Loads) -> Option<PdSelection>,
     ) -> Option<(PdSelection, PdAttempt)> {
-        self.admit_inner(select, false)
+        self.admit_inner(select, false, 1)
+    }
+
+    /// Same admission, for a request that asks for `sequences` sampling
+    /// sequences. `reserve_decode` is false for a probe: it takes a pair but
+    /// starts no sequence, so booking Decode occupancy for it would flip the
+    /// whole pool to request counts for the length of every probe.
+    pub(super) fn admit_sequences(
+        &self,
+        select: impl FnOnce(&Loads) -> Option<PdSelection>,
+        sequences: u32,
+        reserve_decode: bool,
+    ) -> Option<(PdSelection, PdAttempt)> {
+        self.admit_inner(select, !reserve_decode, sequences)
     }
 
     /// Admit the Prefill stage only and leave the Decode commitment open.
@@ -215,18 +323,23 @@ impl PdLoadManager {
         &self,
         select: impl FnOnce(&Loads) -> Option<PdSelection>,
     ) -> Option<(PdSelection, PdAttempt)> {
-        self.admit_inner(select, true)
+        self.admit_inner(select, true, 1)
     }
 
     fn admit_inner(
         &self,
         select: impl FnOnce(&Loads) -> Option<PdSelection>,
         defer_decode: bool,
+        // Parsed and carried, but deliberately not applied to the KV charge:
+        // `n` sequences share one copy of the prompt's blocks.
+        _sequences: u32,
     ) -> Option<(PdSelection, PdAttempt)> {
         let mut loads = self.loads.lock();
         let selection = select(&loads)?;
         let prefill = &selection.prefill;
         let decode = &selection.decode;
+        let prompt = prompt_tokens(prefill);
+        let charged = decode_context_tokens(prompt);
         // Neither stage is charged until both selections have succeeded.
         let p = loads
             .entry((Stage::Prefill, prefill.endpoint.clone()))
@@ -246,6 +359,10 @@ impl PdLoadManager {
                 .entry((Stage::Decode, decode.endpoint.clone()))
                 .or_default();
             d.pending_decode_requests += 1;
+            match charged {
+                Some(tokens) => d.pending_decode_tokens += tokens,
+                None => d.unknown_decode_requests += 1,
+            }
             d.publish(Stage::Decode, &decode.endpoint);
             (
                 Some(decode.endpoint.clone()),
@@ -261,6 +378,8 @@ impl PdLoadManager {
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_tokens: selection.prefill.new_prefill_tokens,
+            decode_context: prompt,
+            decode_tokens: std::sync::atomic::AtomicU64::new(charged.unwrap_or(0)),
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: decode_state,
@@ -282,6 +401,8 @@ impl PdLoadManager {
     pub(super) fn commit_decode(
         &self,
         attempt: &PdAttempt,
+        // See `admit_inner`: the count does not scale the resident KV.
+        _sequences: u32,
         select: impl FnOnce(&Loads) -> Option<StageDecision>,
     ) -> Option<StageDecision> {
         let inner = &attempt.0;
@@ -295,6 +416,17 @@ impl PdLoadManager {
             .entry((Stage::Decode, decision.endpoint.clone()))
             .or_default();
         d.pending_decode_requests += 1;
+        // The request's logical context is the prompt it carries: shared prefix
+        // blocks are counted once per sequence, never once per block.
+        match decode_context_tokens(inner.decode_context) {
+            Some(tokens) => {
+                d.pending_decode_tokens += tokens;
+                inner
+                    .decode_tokens
+                    .store(tokens, std::sync::atomic::Ordering::Relaxed);
+            }
+            None => d.unknown_decode_requests += 1,
+        }
         d.publish(Stage::Decode, &decision.endpoint);
         state.decode_endpoint = Some(decision.endpoint.clone());
         state.affinity = decision.affinity.clone();
@@ -326,6 +458,7 @@ impl PdLoadManager {
             p.publish(Stage::Prefill, &prefill);
             let d = loads.entry((Stage::Decode, decode.clone())).or_default();
             d.pending_decode_requests += 1;
+            d.unknown_decode_requests += 1;
             d.publish(Stage::Decode, &decode);
         }
         let attempt = PdAttempt(Arc::new(AttemptInner {
@@ -335,6 +468,11 @@ impl PdLoadManager {
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_tokens: None,
+            // The prompt length is unknown here, so the Decode charge is
+            // unknown too and the pool stays on request counts for this
+            // attempt.
+            decode_context: None,
+            decode_tokens: std::sync::atomic::AtomicU64::new(0),
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: DecodeState::Pending,
@@ -376,6 +514,13 @@ struct AttemptInner {
     prefill_worker: Mutex<Option<Arc<dyn Worker>>>,
     decode_worker: Mutex<Option<Arc<dyn Worker>>>,
     prefill_tokens: Option<u64>,
+    /// Prompt length this attempt will hold on a Decode engine, once per
+    /// sampling sequence. `None` when the prompt was never measured.
+    decode_context: Option<u64>,
+    /// What was actually charged for Decode occupancy, so the release moves and
+    /// later frees exactly that amount. Independent of the sampling-sequence
+    /// count: extra sequences share the prompt's blocks.
+    decode_tokens: std::sync::atomic::AtomicU64,
     /// Guards every stage transition and the decode fields below, so a commit
     /// and a release cannot interleave halfway through.
     state: Mutex<AttemptState>,
@@ -421,6 +566,11 @@ impl AttemptInner {
             .expect("admitted decode");
         load.pending_decode_requests -= 1;
         load.active_decode_requests += 1;
+        let tokens = self
+            .decode_tokens
+            .load(std::sync::atomic::Ordering::Relaxed);
+        load.pending_decode_tokens = load.pending_decode_tokens.saturating_sub(tokens);
+        load.active_decode_tokens += tokens;
         load.publish(Stage::Decode, &endpoint);
         if let Some(since) = state.pending_since {
             metrics::histogram!("vllm_router_pd_decode_pending_seconds")
@@ -449,8 +599,20 @@ impl AttemptInner {
         let key = (Stage::Decode, endpoint.clone());
         if let Some(load) = loads.get_mut(&key) {
             match state.decode {
-                DecodeState::Pending => load.pending_decode_requests -= 1,
-                DecodeState::Active => load.active_decode_requests -= 1,
+                DecodeState::Pending => {
+                    load.pending_decode_requests -= 1;
+                    let tokens = self
+                        .decode_tokens
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    load.pending_decode_tokens = load.pending_decode_tokens.saturating_sub(tokens);
+                }
+                DecodeState::Active => {
+                    load.active_decode_requests -= 1;
+                    let tokens = self
+                        .decode_tokens
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    load.active_decode_tokens = load.active_decode_tokens.saturating_sub(tokens);
+                }
                 DecodeState::Unbound | DecodeState::Finished => unreachable!(),
             }
             load.publish(Stage::Decode, &endpoint);

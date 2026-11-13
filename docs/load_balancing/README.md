@@ -267,9 +267,13 @@ vllm-router --vllm-pd-disaggregation \
 
 Prefill selection considers reusable KV and current work. Decode selection favors the least busy worker. Both stages inherit `--policy` unless overridden.
 
+Decode ranks candidates by the logical context tokens they already hold, not by their pending plus active request count. Request counts are a poor proxy for KV pressure in long conversations: two 64K sequences and four 4K sequences are both "a few requests" but differ eightfold in KV. The comparison needs a known prompt length for every candidate, so any admitted request the router could not measure keeps the whole pool on request counts.
+
 Configure the engines' P/D connector and enable prefix caching and KV events on prefill workers. For native Python vLLM metadata discovery, set `VLLM_SERVER_DEV_MODE=1`.
 
 If event discovery is unavailable, add `--pd-kv-events http://prefill:8000=tcp://prefill:5557` for each prefill worker.
+
+Decode is charged only for the context it newly allocates, which needs to know which blocks a Decode engine already holds. Enable KV events there too (`--kv-events-config` with `enable_kv_cache_events`) and point the flag at those workers, e.g. `--pd-kv-events http://decode:8000=tcp://decode:5557`. Without a Decode source every candidate's cache identity stays unverified: the marginal figure is withheld, ranking stays on full context tokens, and the decision metric reports `context_tokens` rather than `context_tokens_marginal`. A source is only accepted for a stage whose policy is `kv_aware`.
 
 ### Session affinity
 
