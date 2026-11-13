@@ -1,7 +1,7 @@
 # L3 nightly (https://github.com/vllm-project/router/issues/273).
 # pipeline.yml uploads this file for NIGHTLY=1 or nightly-test, including forks.
 # Jobs whose gate is narrower than that upload keep their own if.
-# NIGHTLY=1 on this test pipeline does not publish images.
+# NIGHTLY=1 on this test pipeline runs tests without publishing images.
 
 env:
   RUST_IMAGE: "rust:1.95.0-bookworm"
