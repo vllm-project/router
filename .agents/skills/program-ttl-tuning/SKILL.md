@@ -328,8 +328,6 @@ the deployment.
 | A | feature disabled | baseline |
 | B | `binding_only: true` | Program-to-Rank affinity alone |
 | C | full configuration | affinity plus retention |
-| C2 | `resume_order: "fcfs"` | whether MRU matters for the workload |
-| C3 | `token_capacity_per_dp_rank: null` | value of token-level admission versus the count guard |
 
 Run each direction-finding arm on a small task subset; keep the full task set
 for the paired baseline/candidate rounds. Report affinity and retention
