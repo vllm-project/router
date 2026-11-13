@@ -1,5 +1,5 @@
-//! Advisory Regular Completion observations. A generation belongs to exactly
-//! one registered target and CacheKey within this policy; it is not a Worker UUID.
+//! Advisory Regular Completion observations. A registration ID is local to the
+//! Router process and identifies one registration; it is not a Worker UUID.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -30,6 +30,8 @@ impl CompletionHistoryRequest {
 
 impl TargetBinding {
     fn is_history_worker(&self, worker: &dyn Worker) -> bool {
+        // The Weak keeps this allocation's address from being recycled; the
+        // registration ID separately fences re-registration of the same Arc.
         self.history_worker
             .as_ref()
             .is_some_and(|registered| std::ptr::addr_eq(registered.as_ptr(), worker))
@@ -65,9 +67,11 @@ impl HistoryHit {
     }
 }
 
+type HistoryBucket = Vec<(HistoryObservation, Instant)>;
+
 #[derive(Default)]
 pub(super) struct CompletionHistory {
-    records: Mutex<HashMap<(u64, u64), Vec<(HistoryObservation, Instant)>>>,
+    records: Mutex<HashMap<(u64, u64), HistoryBucket>>,
 }
 
 impl CompletionHistory {
