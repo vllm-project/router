@@ -171,6 +171,7 @@ fn provisional_decode(
                 .occupancy(Stage::Decode)
         })?;
     Some(StageDecision {
+        prediction: None,
         fallback_reason: None,
         credited_prefix_tokens: None,
         worker_index,
@@ -2718,9 +2719,9 @@ mod admission_tests {
         assert_eq!(first.prefill.worker_index, 1); // Warm P wins over the first idle P.
         assert_eq!(first.prefill.new_prefill_tokens, Some(1));
         assert_eq!(first.prefill.credited_prefix_tokens, Some(32));
-        let (target, tokens) = first.prefill.prediction.as_ref().unwrap();
-        assert_eq!(target.instance_id.as_ref(), p[1].base_url());
-        assert_eq!(*tokens, 32);
+        let prediction = first.prefill.prediction.as_ref().unwrap();
+        assert_eq!(prediction.target().instance_id.as_ref(), p[1].base_url());
+        assert_eq!(prediction.cached_tokens(), Some(32));
         assert!(a.kv_observation().is_some());
         assert_eq!(first.prefill.fallback_reason, None);
         let (second, b) = manager
@@ -2811,7 +2812,7 @@ mod admission_tests {
                 .prefill
                 .prediction
                 .as_ref()
-                .map(|(_, count)| *count),
+                .and_then(|prediction| prediction.cached_tokens()),
             Some(32)
         );
         assert!(unknown.kv_observation().is_none());
@@ -2992,6 +2993,45 @@ mod admission_tests {
         attempt.finish_prefill();
         drop(attempt);
         assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn deferred_decode_commit_retains_the_admitted_prefill_observation() {
+        use crate::kv_observation::{test_helpers::*, CacheObservation};
+        let metrics = render(|| {
+            let manager = Arc::new(PdLoadManager::default());
+            let p = pool("p", 2);
+            let d = pool("d", 2);
+            let tokens: Vec<u32> = (0..33).collect();
+            let policy = resident_prefix_policy(&p, &tokens);
+            let inputs = token_inputs(&p, &tokens, &policy);
+            let mut context = context();
+            context.prefill_inputs = Some(&inputs);
+            let (_, attempt) = manager
+                .admit_deferred(|loads| {
+                    select_pd_pair(loads, &p, &d, &policy, &policy, &context, false)
+                })
+                .unwrap();
+            let observation = attempt.kv_observation().unwrap().clone();
+            assert!(attempt.decode_pending_commit());
+            attempt.finish_prefill();
+            manager
+                .commit_decode(&attempt, |loads| {
+                    select_decode_stage(loads, &d, &policy, &context)
+                })
+                .unwrap();
+            assert!(Arc::ptr_eq(&observation, attempt.kv_observation().unwrap()));
+            observation.record_once(CacheObservation::Observed(32));
+            drop(attempt);
+            drop(observation);
+            assert!(manager.snapshot().is_empty());
+        });
+        assert!(has_outcome(&metrics, "observed", "none"), "{metrics}");
+        assert!(
+            metrics
+                .contains("vllm_router_kv_cached_token_absolute_error_sum{direction=\"exact\"} 0"),
+            "{metrics}"
+        );
     }
 
     #[test]

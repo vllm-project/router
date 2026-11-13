@@ -1,5 +1,5 @@
-use super::kv_observation::{KvRouteAttempt, KvRoutePrediction};
 use crate::core::Worker;
+use crate::kv_observation::{KvRouteAttempt, KvRoutePrediction};
 use crate::policies::{AffinityKey, AffinityRecord, RequestHeaders};
 use axum::body::Body;
 use futures_util::StreamExt;
@@ -162,7 +162,7 @@ pub struct PdRequestContext<'a> {
 
 #[derive(Debug, Clone)]
 pub struct StageDecision {
-    pub prediction: Option<(crate::kv_index::RoutableTarget, u64)>,
+    pub prediction: Option<KvRoutePrediction>,
     pub fallback_reason: Option<&'static str>,
     pub credited_prefix_tokens: Option<u64>,
     pub worker_index: usize,
@@ -262,17 +262,10 @@ impl PdLoadManager {
             prefill: selection.prefill.endpoint.clone(),
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
-            observation: prefill
-                .prediction
-                .as_ref()
-                .filter(|_| !crate::backend::is_grpc_url(&prefill.endpoint.http_url))
-                .map(|(target, tokens)| {
-                    KvRouteAttempt::new(KvRoutePrediction {
-                        target: target.clone(),
-                        cached_tokens: Some(*tokens),
-                        multi_prompt: false,
-                    })
-                }),
+            observation: KvRouteAttempt::for_http(
+                prefill.prediction.clone(),
+                &prefill.endpoint.http_url,
+            ),
             prefill_tokens: selection.prefill.new_prefill_tokens,
             state: Mutex::new(AttemptState {
                 prefill: true,

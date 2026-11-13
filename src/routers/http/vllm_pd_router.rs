@@ -1,21 +1,19 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
-use super::kv_observation::{
-    observe_merged_json, observe_unavailable, KvRouteAttempt, SseUsageObservation,
-    UnavailableReason,
-};
+use super::kv_observation::{observe_merged_json, observe_unavailable, SseUsageObservation};
 use super::logprobs_merge;
-use super::pd_cached_tokens;
 use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext};
 use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
+use super::usage_stream;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::backend::preprocess::{ADAPTER_FIELDS, NAMED_LORA_FIELD};
 use crate::config::KvConnector;
 use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
+use crate::kv_observation::{KvRouteAttempt, UnavailableReason};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{
@@ -371,36 +369,33 @@ fn finalize_decode_stream(
         .and_then(|value| value.split(';').next())
         .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"));
     let stream = decode_response.bytes_stream();
-    let body = if status.is_success()
-        && pd_cached_tokens::is_supported_path(path)
-        && is_sse
-        && !is_encoded
-    {
-        let cached = prefill_response_json.and_then(usage_merge::cached_tokens);
-        let observer = match (observation, cached) {
-            (Some(attempt), Some(count)) => Some(SseUsageObservation::new(
-                attempt.clone(),
-                status,
-                Some(count),
-            )),
-            (Some(attempt), None) => {
-                observe_unavailable(attempt, status, UnavailableReason::MissingUsage);
-                None
+    let body =
+        if status.is_success() && usage_stream::is_supported_path(path) && is_sse && !is_encoded {
+            let cached = prefill_response_json.and_then(usage_merge::cached_tokens);
+            let observer = match (observation, cached) {
+                (Some(attempt), Some(count)) => Some(SseUsageObservation::new(
+                    attempt.clone(),
+                    status,
+                    Some(count),
+                )),
+                (Some(attempt), None) => {
+                    observe_unavailable(attempt, status, UnavailableReason::MissingUsage);
+                    None
+                }
+                _ => None,
+            };
+            Body::from_stream(usage_stream::rewrite_sse_stream(
+                stream,
+                cached,
+                prefill_response_json.and_then(usage_merge::usage_snapshot),
+                observer,
+            ))
+        } else {
+            if let Some(attempt) = observation {
+                observe_unavailable(attempt, status, UnavailableReason::PdUsageNotComparable);
             }
-            _ => None,
+            Body::from_stream(stream)
         };
-        Body::from_stream(pd_cached_tokens::rewrite_sse_stream(
-            stream,
-            cached,
-            prefill_response_json.and_then(usage_merge::usage_snapshot),
-            observer,
-        ))
-    } else {
-        if let Some(attempt) = observation {
-            observe_unavailable(attempt, status, UnavailableReason::PdUsageNotComparable);
-        }
-        Body::from_stream(stream)
-    };
     response_with_body(status, &headers, body)
 }
 
@@ -427,7 +422,7 @@ fn finalize_decode_body(
     let is_encoded = response_is_encoded(&headers);
     let mut headers = header_utils::preserve_response_headers(&headers);
     headers.remove(http::header::CONTENT_LENGTH);
-    let reconcile_cache = pd_cached_tokens::is_supported_path(path);
+    let reconcile_cache = usage_stream::is_supported_path(path);
     if !status.is_success()
         || is_encoded
         || original.len() > MAX_JSON_REWRITE_BYTES
@@ -463,7 +458,7 @@ fn finalize_decode_body(
         if let Some(prefill) = prefill_response_json {
             changed |= usage_merge::merge_pd_usage(prefill, &mut json);
         }
-        match pd_cached_tokens::reconcile_usage(&mut json, cached, prefill_response_json) {
+        match usage_stream::reconcile_usage(&mut json, cached, prefill_response_json) {
             Ok(rewritten) => {
                 changed |= rewritten;
                 if let Some(attempt) = observation {
@@ -2105,7 +2100,7 @@ impl VllmPDRouter {
         &self,
         original_request: Value,
         prefill_worker: Arc<dyn Worker>,
-        mut decode_worker: Arc<dyn Worker>,
+        decode_worker: Arc<dyn Worker>,
         path: &str,
         headers: Option<&HeaderMap>,
         attempt: PdAttempt,
@@ -2122,6 +2117,7 @@ impl VllmPDRouter {
                 headers,
                 attempt,
                 prefill_permit,
+                commit,
             )
             .await;
         if let Some(observer) = observation {
@@ -2147,11 +2143,12 @@ impl VllmPDRouter {
         &self,
         original_request: Value,
         prefill_worker: Arc<dyn Worker>,
-        decode_worker: Arc<dyn Worker>,
+        mut decode_worker: Arc<dyn Worker>,
         path: &str,
         headers: Option<&HeaderMap>,
         attempt: PdAttempt,
         prefill_permit: Option<OwnedSemaphorePermit>,
+        commit: Option<&DecodeCommitInput>,
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
@@ -3798,7 +3795,7 @@ mod tests {
 
     #[tokio::test]
     async fn merged_pd_observation_compares_prefill_usage_for_json_and_sse() {
-        use super::super::kv_observation::KvRoutePrediction;
+        use crate::kv_observation::KvRoutePrediction;
         let decode =
             json!({"usage":{"prompt_tokens":96,"prompt_tokens_details":{"cached_tokens":0}}});
         let event = format!("data: {decode}\n\ndata: [DONE]\n\n");
@@ -3813,13 +3810,12 @@ mod tests {
                     metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
                 let handle = recorder.handle();
                 let _recorder = metrics::set_default_local_recorder(&recorder);
-                let attempt = KvRouteAttempt::new(KvRoutePrediction {
+                let attempt = KvRouteAttempt::new(KvRoutePrediction::Single {
                     target: crate::kv_index::RoutableTarget {
                         instance_id: Arc::from("prefill-A"),
                         dp_rank: 0,
                     },
-                    cached_tokens: Some(80),
-                    multi_prompt: false,
+                    cached_tokens: 80,
                 });
                 let prefill = json!({"usage":{"prompt_tokens":96,"prompt_tokens_details":{"cached_tokens":actual}}});
                 let path = "/v1/chat/completions";
@@ -3862,7 +3858,7 @@ mod tests {
 
     #[tokio::test]
     async fn pd_sse_passthrough_invalidates_earlier_usage() {
-        use super::super::kv_observation::KvRoutePrediction;
+        use crate::kv_observation::KvRoutePrediction;
         let usage =
             r#"data: {"usage":{"prompt_tokens":33,"prompt_tokens_details":{"cached_tokens":0}}}"#;
         let oversized = format!(
@@ -3878,13 +3874,12 @@ mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _recorder = metrics::set_default_local_recorder(&recorder);
-        let attempt = KvRouteAttempt::new(KvRoutePrediction {
+        let attempt = KvRouteAttempt::new(KvRoutePrediction::Single {
             target: crate::kv_index::RoutableTarget {
                 instance_id: Arc::from("prefill-A"),
                 dp_rank: 0,
             },
-            cached_tokens: Some(32),
-            multi_prompt: false,
+            cached_tokens: 32,
         });
         let prefill =
             json!({"usage":{"prompt_tokens":33,"prompt_tokens_details":{"cached_tokens":32}}});

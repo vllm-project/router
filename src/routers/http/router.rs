@@ -1,8 +1,5 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
-use super::kv_observation::{
-    comparable_attempt, observe_json_response, observe_unavailable, KvResponseStream,
-    KvRouteAttempt, KvRoutePrediction, KvSseObserver, UnavailableReason,
-};
+use super::kv_observation::{observe_json_response, observe_unavailable};
 use super::program_adapter::ProgramCompletion;
 use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
 use crate::backend::{
@@ -14,6 +11,7 @@ use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
     RetryExecutor, Worker, WorkerRegistry, WorkerType,
 };
+use crate::kv_observation::{KvRouteAttempt, UnavailableReason};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -149,15 +147,7 @@ impl RequestLoadGuard {
         }
         let (kv_slot, kv_attempt) = match receipt {
             Some(receipt) => {
-                let attempt = ((receipt.predicted_cached_tokens.is_some() || receipt.multi_prompt)
-                    && !crate::backend::is_grpc_url(worker.url()))
-                .then(|| {
-                    KvRouteAttempt::new(KvRoutePrediction {
-                        target: receipt.decision.target.clone(),
-                        cached_tokens: receipt.predicted_cached_tokens,
-                        multi_prompt: receipt.multi_prompt,
-                    })
-                });
+                let attempt = KvRouteAttempt::for_http(receipt.prediction, worker.url());
                 (receipt.slot, attempt)
             }
             None => (None, None),
@@ -193,7 +183,12 @@ impl RequestLoadGuard {
                     worker.url() == sent_to && worker.worker_type() == WorkerType::Regular
                 })
         });
-        comparable_attempt(Some(attempt), status, unattributed)
+        if unattributed {
+            observe_unavailable(&attempt, status, UnavailableReason::PdUsageNotComparable);
+            None
+        } else {
+            Some(attempt)
+        }
     }
 
     fn begin_decode(&self) {
@@ -2146,7 +2141,8 @@ impl Router {
                 insert_router_stages(&mut response_headers, &header_stages);
             }
 
-            let stream = res.bytes_stream();
+            let stream =
+                super::usage_stream::observe_sse_stream(res.bytes_stream(), kv_attempt, status);
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let (mut producer_output_frame, output_frame) = if completion_echo.is_some() {
                 let (producer, consumer) = output_frame_tracking();
@@ -2157,7 +2153,6 @@ impl Router {
 
             // Spawn task to forward stream and detect completion
             let producer_load = load.clone();
-            let mut kv_observer = kv_attempt.map(|attempt| KvSseObserver::new(attempt, status));
             let producer = tokio::spawn(async move {
                 let mut stream = stream;
                 let mut first_sse = true;
@@ -2165,9 +2160,6 @@ impl Router {
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            if let Some(observer) = &mut kv_observer {
-                                observer.observe(&bytes);
-                            }
                             if completion_echo.is_none() {
                                 producer_load.begin_decode();
                             }
@@ -2223,9 +2215,6 @@ impl Router {
                 }
                 if let Some(completion) = &completion {
                     completion.finish(stream_succeeded);
-                }
-                if let Some(observer) = &mut kv_observer {
-                    observer.finish(stream_succeeded);
                 }
             });
 
@@ -3379,21 +3368,28 @@ impl RouterTrait for Router {
                     }
                 }
 
-                if Self::should_proxy_transparent_directly(program_completion.is_some()) {
+                // Use the existing complete JSON path for either Program tracking or
+                // KV observation. Both now have identical buffering and observation caps.
+                if Self::should_proxy_transparent_directly(
+                    program_completion.is_some() || kv_attempt.is_some(),
+                ) {
                     let stream: Pin<
                         Box<
-                            dyn futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
+                            dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>
                                 + Send,
                         >,
-                    > = if let Some(attempt) = kv_attempt.clone() {
-                        Box::pin(KvResponseStream::new(
+                    > = if is_stream {
+                        super::usage_stream::observe_sse_stream(
                             response.bytes_stream(),
-                            attempt,
+                            kv_attempt.clone(),
                             status,
-                            is_stream,
-                        ))
+                        )
                     } else {
-                        Box::pin(response.bytes_stream())
+                        Box::pin(
+                            response
+                                .bytes_stream()
+                                .map(|chunk| chunk.map_err(std::io::Error::other)),
+                        )
                     };
                     response_builder
                         .body(Body::from_stream(stream))
@@ -3406,7 +3402,7 @@ impl RouterTrait for Router {
                         })
                 } else if Self::should_buffer_transparent_response(
                     is_stream,
-                    program_completion.is_some(),
+                    program_completion.is_some() || kv_attempt.is_some(),
                 ) {
                     match response.bytes().await {
                         Ok(bytes) => {
@@ -3452,18 +3448,21 @@ impl RouterTrait for Router {
                 } else {
                     let stream: Pin<
                         Box<
-                            dyn futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
+                            dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>
                                 + Send,
                         >,
-                    > = if let Some(attempt) = kv_attempt.clone() {
-                        Box::pin(KvResponseStream::new(
+                    > = if is_stream {
+                        super::usage_stream::observe_sse_stream(
                             response.bytes_stream(),
-                            attempt,
+                            kv_attempt.clone(),
                             status,
-                            is_stream,
-                        ))
+                        )
                     } else {
-                        Box::pin(response.bytes_stream())
+                        Box::pin(
+                            response
+                                .bytes_stream()
+                                .map(|chunk| chunk.map_err(std::io::Error::other)),
+                        )
                     };
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let completion = status.is_success().then_some(program_completion).flatten();
@@ -3550,6 +3549,7 @@ impl RouterTrait for Router {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use crate::kv_observation::KvRoutePrediction;
     use std::collections::HashMap;
 
     struct CompletionResponseFixture {
@@ -3574,8 +3574,13 @@ mod tests {
         let receipt = KvSelectionReceipt {
             worker_index: 0,
             new_prefill_tokens: 4,
-            predicted_cached_tokens: Some(16),
-            multi_prompt: false,
+            prediction: Some(KvRoutePrediction::Single {
+                target: crate::kv_index::RoutableTarget {
+                    instance_id: url.into(),
+                    dp_rank: 0,
+                },
+                cached_tokens: 16,
+            }),
             decision: crate::policies::CostDecision {
                 target: crate::kv_index::RoutableTarget {
                     instance_id: url.into(),
@@ -3608,8 +3613,13 @@ mod tests {
                 Some(KvSelectionReceipt {
                     worker_index: 0,
                     new_prefill_tokens: 4,
-                    predicted_cached_tokens: Some(16),
-                    multi_prompt: false,
+                    prediction: Some(KvRoutePrediction::Single {
+                        target: crate::kv_index::RoutableTarget {
+                            instance_id: url.into(),
+                            dp_rank: 0,
+                        },
+                        cached_tokens: 16,
+                    }),
                     slot: None,
                     decision: crate::policies::CostDecision {
                         target: crate::kv_index::RoutableTarget {
@@ -5378,49 +5388,58 @@ mod tests {
 
     #[tokio::test]
     async fn multi_prompt_json_and_sse_do_not_report_prediction_error() {
-        for streaming in [false, true] {
-            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-            let handle = recorder.handle();
-            let ids = vec![1, 2, 3, 4, 5, 6];
-            let fixture = http_kv_fixture(
-                [vec![ids.clone(), ids.clone()], vec![ids.clone(), ids]],
-                0,
-                true,
-            )
-            .await;
-            let request: CompletionRequest = serde_json::from_value(serde_json::json!({
-                "model": "kv-observation-test", "prompt": ["one", "two"], "stream": streaming
-            }))
-            .unwrap();
-            let route = fixture
-                .router
-                .route_typed_request(None, &request, "/v1/completions", None);
-            tokio::pin!(route);
-            let response = std::future::poll_fn(|context| {
-                metrics::with_local_recorder(&recorder, || {
-                    std::future::Future::poll(route.as_mut(), context)
-                })
-            })
-            .await;
-            assert!(response.status().is_success());
-            if streaming {
-                assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
-            }
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            if streaming {
-                assert!(std::str::from_utf8(&body).unwrap().contains("data: [DONE]"));
-            } else {
-                assert_eq!(
-                    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["usage"]
-                        ["prompt_tokens_details"]["cached_tokens"],
-                    4
+        use crate::kv_observation::test_helpers::has_outcome;
+        for transparent in [false, true] {
+            for streaming in [false, true] {
+                let recorder =
+                    metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+                let handle = recorder.handle();
+                let _recorder = metrics::set_default_local_recorder(&recorder);
+                let ids = vec![1, 2, 3, 4, 5, 6];
+                let fixture = http_kv_fixture(
+                    [vec![ids.clone(), ids.clone()], vec![ids.clone(), ids]],
+                    0,
+                    true,
+                )
+                .await;
+                let value = serde_json::json!({
+                    "model": "kv-observation-test", "prompt": ["one", "two"], "stream": streaming
+                });
+                let response = if transparent {
+                    fixture
+                        .router
+                        .route_transparent(None, "/v1/completions", &Method::POST, value)
+                        .await
+                } else {
+                    let request: CompletionRequest = serde_json::from_value(value).unwrap();
+                    fixture
+                        .router
+                        .route_typed_request(None, &request, "/v1/completions", None)
+                        .await
+                };
+                assert!(response.status().is_success());
+                if streaming {
+                    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+                }
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                if streaming {
+                    assert!(std::str::from_utf8(&body).unwrap().contains("data: [DONE]"));
+                } else {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["usage"]
+                            ["prompt_tokens_details"]["cached_tokens"],
+                        4
+                    );
+                }
+                let metrics = handle.render();
+                assert!(
+                    has_outcome(&metrics, "unavailable", "multi_prompt_usage_not_aggregate"),
+                    "transparent={transparent}, streaming={streaming}: {metrics}"
                 );
+                assert!(!metrics.contains("vllm_router_kv_cached_token_absolute_error"));
             }
-            assert!(!handle
-                .render()
-                .contains("vllm_router_kv_cached_token_absolute_error"));
         }
     }
 

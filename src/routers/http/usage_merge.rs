@@ -106,7 +106,7 @@ fn replace_if_changed(usage: &mut Map<String, Value>, key: &str, value: Value) -
 
 /// Merge valid Prefill input counts and input details into existing Decode
 /// usage. Preserve unknown Decode fields and never synthesize missing usage.
-/// Cache-token ownership/validation is handled by `pd_cached_tokens`.
+/// Cache-token ownership/validation is handled by `usage_stream`.
 pub(super) fn merge_pd_usage(prefill: &Value, decode: &mut Value) -> bool {
     let (input_key, details_key, output_key) = usage_dialect(decode, Some(prefill)).keys();
     let Some(source) = usage_object(prefill) else {

@@ -57,3 +57,18 @@ usage never falls back to decode usage. Opaque responses do not supply accuracy
 samples. Program-bound P/D paths that bypass KV prediction and gRPC workers do
 not supply these pairs. The metric assumes the backend reports total cached tokens. A local-only
 backend counter has different semantics.
+
+JSON and SSE share the same attempt receipt; a failed dispatch, cancellation,
+or response observation can finalize it only once. Multi-prompt predictions
+carry no aggregate cached-token count and cannot enter the accuracy histograms.
+Conflicting SSE counts are `invalid_usage`, rather than a last-value-wins sample.
+
+All colocated non-streaming requests with KV observation use the complete-body
+buffering path, including Program requests. Observation is limited to 1 MiB;
+a larger body is still returned intact but records `oversized_json`. This is
+an observation budget, not a limit on the complete response buffer. SSE uses
+one framer with the same 1 MiB budget for both ordinary observation and P/D
+reconciliation. Ordinary observation forwards original fragments immediately;
+P/D reconciliation buffers one frame to merge usage. Oversized or incomplete
+frames do not contribute accuracy samples. Transport chunks and serialized
+P/D frames occupy additional memory beyond the framing accumulator.

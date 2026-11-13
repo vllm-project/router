@@ -15,6 +15,7 @@ use sha2::{Digest as _, Sha256};
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::kv_index::{CacheKey, MatchQuery, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo};
+use crate::kv_observation::KvRoutePrediction;
 use crate::request_identity::StableIdentity;
 
 /// Read-only placement port owned by its policy consumer.
@@ -60,9 +61,11 @@ impl<'a> KvRequestTokens<'a> {
 }
 
 /// Immutable P work estimate from one placement snapshot.
+/// The prediction owns its target's Arc, so this is intentionally Clone rather
+/// than Copy: it remains bound to that snapshot after admission changes pools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefillWorkEstimate {
-    pub prediction: Option<(RoutableTarget, u64)>,
+    pub prediction: Option<KvRoutePrediction>,
     pub new_prefill_tokens: u64,
     pub placement_verified: bool,
 }
@@ -476,8 +479,7 @@ pub struct CostDecision {
 pub struct KvSelectionReceipt {
     pub worker_index: usize,
     pub new_prefill_tokens: u64,
-    pub predicted_cached_tokens: Option<u64>,
-    pub multi_prompt: bool,
+    pub prediction: Option<KvRoutePrediction>,
     pub decision: CostDecision,
     pub slot: Option<KvRequestSlot>,
 }
@@ -934,8 +936,7 @@ struct SelectionPlan {
     grouped: Vec<Vec<TierMatch>>,
     input_tokens: Vec<usize>,
     prefill_tokens: Vec<Option<u64>>,
-    predicted_cached_tokens: Vec<Option<u64>>,
-    multi_prompt: Vec<bool>,
+    predictions: Vec<Option<KvRoutePrediction>>,
     has_tokens: bool,
 }
 
@@ -1266,8 +1267,7 @@ impl KvAwarePolicy {
                     grouped: vec![Vec::new(); count],
                     input_tokens: vec![0; count],
                     prefill_tokens: vec![None; count],
-                    predicted_cached_tokens: vec![None; count],
-                    multi_prompt: vec![false; count],
+                    predictions: vec![None; count],
                     has_tokens: false,
                 }
             } else {
@@ -1381,8 +1381,7 @@ impl KvAwarePolicy {
             return Some(KvSelectionReceipt {
                 worker_index,
                 new_prefill_tokens,
-                predicted_cached_tokens: plan.predicted_cached_tokens[position],
-                multi_prompt: plan.multi_prompt[position],
+                prediction: plan.predictions[position].clone(),
                 decision,
                 slot,
             });
@@ -1474,10 +1473,8 @@ impl KvAwarePolicy {
         let mut input_tokens = Vec::with_capacity(bindings.len());
         let mut prefill_tokens = Vec::with_capacity(bindings.len());
         let mut predicted_by_candidate = Vec::with_capacity(bindings.len());
-        let mut multi_prompt = Vec::with_capacity(bindings.len());
         for ((binding, prompts), &worker_index) in bindings.iter().zip(prompts).zip(&healthy) {
             let mut total_input = 0usize;
-            multi_prompt.push(prompts.len() > 1);
             let mut total_prefill = 0u64;
             let mut total_predicted = 0u64;
             let mut single_matches = Vec::new();
@@ -1556,7 +1553,16 @@ impl KvAwarePolicy {
             grouped.push(single_matches);
             input_tokens.push(total_input);
             prefill_tokens.push((has_tokens && prompts.len() > 1).then_some(total_prefill));
-            predicted_by_candidate.push(prediction_verified.then_some(total_predicted));
+            predicted_by_candidate.push(if prompts.len() > 1 {
+                Some(KvRoutePrediction::MultiPrompt {
+                    target: binding.target.clone(),
+                })
+            } else {
+                prediction_verified.then(|| KvRoutePrediction::Single {
+                    target: binding.target.clone(),
+                    cached_tokens: total_predicted,
+                })
+            });
         }
         Some(SelectionPlan {
             healthy,
@@ -1564,8 +1570,7 @@ impl KvAwarePolicy {
             grouped,
             input_tokens,
             prefill_tokens,
-            predicted_cached_tokens: predicted_by_candidate,
-            multi_prompt,
+            predictions: predicted_by_candidate,
             has_tokens,
         })
     }
@@ -1859,7 +1864,10 @@ impl KvAwareOps for KvAwarePolicy {
                     new_prefill_tokens = new_prefill_tokens
                         .saturating_add(prefix.remaining_work(candidate.input_tokens));
                     if verified && prompts.len() == 1 {
-                        prediction = Some((binding.target.clone(), prefix.predicted_cached_tokens));
+                        prediction = Some(KvRoutePrediction::Single {
+                            target: binding.target.clone(),
+                            cached_tokens: prefix.predicted_cached_tokens,
+                        });
                     }
                 }
                 PrefillWorkEstimate {
@@ -2196,7 +2204,10 @@ mod tests {
             assert!(mask[receipt.worker_index], "{case}: ineligible worker");
             assert_eq!(receipt.new_prefill_tokens, 1, "{case}");
             assert_eq!(
-                receipt.predicted_cached_tokens,
+                receipt
+                    .prediction
+                    .as_ref()
+                    .and_then(KvRoutePrediction::cached_tokens),
                 Some(u64::from(2 * block_size)),
                 "{case}"
             );
@@ -2825,7 +2836,13 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.worker_index, 0);
         assert_eq!(receipt.new_prefill_tokens, 4);
-        assert_eq!(receipt.predicted_cached_tokens, None);
+        assert_eq!(
+            receipt
+                .prediction
+                .as_ref()
+                .and_then(KvRoutePrediction::cached_tokens),
+            None
+        );
         release_receipt(&workers, &receipt);
         let receipt = policy
             .select_worker_with_inputs(
@@ -2838,7 +2855,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(receipt.new_prefill_tokens, 12);
-        assert_eq!(receipt.predicted_cached_tokens, None);
+        assert_eq!(
+            receipt
+                .prediction
+                .as_ref()
+                .and_then(KvRoutePrediction::cached_tokens),
+            None
+        );
         release_receipt(&workers, &receipt);
     }
 
