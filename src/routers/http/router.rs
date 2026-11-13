@@ -334,9 +334,8 @@ impl Router {
         let pool_kind = crate::backend::classify_worker_urls(&worker_urls)?;
         let default_policy = ctx.policy_registry.get_default_policy();
         let kv_aware_completion_history = ctx.router_config.kv_aware_completion_history
-            && !ctx.router_config.enable_igw
-            && ctx.router_config.program_scheduling.is_none()
-            && ctx.router_config.intra_node_data_parallel_size == 1;
+            && ctx.router_config.regular_history_support().is_ok()
+            && pool_kind != Some(crate::backend::WorkerPoolKind::Grpc);
         let pending_kv_supervisor = if kv_aware_ops(default_policy.as_ref()).is_some() {
             let (mut supervisor, signals) =
                 crate::kv_index::KvIndexSupervisor::new_http_full_attention(
@@ -460,12 +459,19 @@ impl Router {
                 let provider = kv_index_supervisor.as_ref().and_then(|supervisor| {
                     supervisor.match_provider_for_worker(worker_arc.base_url())
                 });
-                kv_aware.register_http_worker(
-                    &worker_arc,
-                    kv_worker_info.get(worker_arc.base_url()),
-                    provider,
-                    kv_aware_completion_history,
-                );
+                if kv_aware_completion_history {
+                    kv_aware.register_history_worker(
+                        &worker_arc,
+                        kv_worker_info.get(worker_arc.base_url()),
+                        provider,
+                    );
+                } else {
+                    kv_aware.register_worker(
+                        worker_arc.as_ref(),
+                        kv_worker_info.get(worker_arc.base_url()),
+                        provider,
+                    );
+                }
             }
 
             // Notify PolicyRegistry about the new worker
@@ -680,7 +686,11 @@ impl Router {
             .kv_index_supervisor
             .as_ref()
             .and_then(|supervisor| supervisor.match_provider_for_worker(worker.base_url()));
-        kv_aware.register_http_worker(worker, info, provider, self.kv_aware_completion_history);
+        if self.kv_aware_completion_history {
+            kv_aware.register_history_worker(worker, info, provider);
+        } else {
+            kv_aware.register_worker(worker.as_ref(), info, provider);
+        }
     }
 
     fn remove_kv_worker(&self, worker_url: &str, target_urls: &[String]) {
@@ -1524,6 +1534,8 @@ impl Router {
 
         let http_inputs = tokio::sync::OnceCell::new();
         let history_registrations = std::sync::OnceLock::new();
+        // Skip registration capture for ineligible input; policy selection still
+        // checks the per-worker credit mask before accepting a history hint.
         let history_model = if self.kv_aware_completion_history
             && completion.is_some_and(|c| c.worker_credit)
         {
@@ -1589,10 +1601,7 @@ impl Router {
                 let history = history_model.and_then(|model| {
                     // Tag per-Worker tokens before any preparation RPC. A retry may
                     // reuse the tokens but may not assign them to a replacement.
-                    let (original_policy, registrations) = history_registrations.get_or_init(|| {
-                        (policy.clone(), kv_ops.and_then(|ops| ops.capture_completion_history(&workers, model)))
-                    });
-                    registrations.as_ref().filter(|_| Arc::ptr_eq(&policy, original_policy))
+                    history_registrations.get_or_init(|| kv_ops.and_then(|ops| ops.capture_completion_history(&workers, model))).as_ref()
                 });
                 let excluded_workers = failed_workers.lock().clone();
                 let needs_http_input = prepared.is_none()
@@ -3606,6 +3615,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn regular_history_startup_respects_policy_temperature_and_opt_in() {
+        use crate::config::RouterConfig;
+        for (policy, requested, enabled) in [
+            (serde_json::json!({"type": "random"}), true, false),
+            (
+                serde_json::json!({"type": "kv_aware", "router_temperature": 1.0}),
+                true,
+                false,
+            ),
+            (
+                serde_json::json!({"type": "kv_aware", "router_temperature": 0.0}),
+                false,
+                false,
+            ),
+            (
+                serde_json::json!({"type": "kv_aware", "router_temperature": 0.0}),
+                true,
+                true,
+            ),
+        ] {
+            let config = RouterConfig {
+                policy: serde_json::from_value(policy).unwrap(),
+                kv_aware_completion_history: requested,
+                ..Default::default()
+            };
+            let ctx = Arc::new(
+                crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
+            );
+            let router = Router::new(vec![], &ctx).await.unwrap();
+            assert_eq!(router.kv_aware_completion_history, enabled);
+        }
+    }
+
+    #[tokio::test]
     async fn app_context_rejects_invalid_static_source_config() {
         use crate::config::RouterConfig;
         let config = RouterConfig {
@@ -3672,7 +3715,7 @@ mod tests {
         let router = Router::new(vec![], &ctx).await.unwrap();
         router.add_worker(&worker).await.unwrap();
         let req: CompletionRequest =
-            serde_json::from_value(json!({"model":"future-model","prompt":[77]})).unwrap();
+            serde_json::from_value(json!({"model":"future-model","prompt":vec![77;8]})).unwrap();
         assert_eq!(
             router
                 .route_typed_request(None, &req, "/v1/completions", None)
@@ -3685,8 +3728,8 @@ mod tests {
         assert_eq!(
             kv_aware_policy(policy.as_ref())
                 .unwrap()
-                .observed_completion_prefix(registered.as_ref(), &[77]),
-            1
+                .observed_completion_prefix(registered.as_ref(), &[77; 8]),
+            8
         );
         let supervisor = router.kv_index_supervisor.as_ref().unwrap();
         let provider = supervisor.match_provider_for_worker(&worker).unwrap();
@@ -4831,7 +4874,7 @@ mod tests {
                 instance_id: Arc::from(format!("worker-{worker_index}")),
                 dp_rank: 0,
             };
-            policy.register_http_worker(
+            policy.register_history_worker(
                 &worker,
                 Some(&crate::kv_index::WorkerKvInfo {
                     instance_id: target.instance_id.to_string(),
@@ -4844,7 +4887,6 @@ mod tests {
                     ..Default::default()
                 }),
                 Some(index.clone()),
-                true,
             );
             if worker_index == warm {
                 worker.increment_load();
@@ -4896,7 +4938,7 @@ mod tests {
         model: &str,
     ) {
         use crate::kv_index::{CacheKey, HashMode, KvBlockIndexer};
-        kv.register_http_worker(
+        kv.register_history_worker(
             worker,
             Some(&crate::kv_index::WorkerKvInfo {
                 instance_id: target.instance_id.to_string(),
@@ -4909,7 +4951,6 @@ mod tests {
                 ..Default::default()
             }),
             Some(Arc::new(KvBlockIndexer::new())),
-            true,
         );
     }
 
@@ -4926,7 +4967,7 @@ mod tests {
         let policy = f.router.policy_registry.get_default_policy();
         let kv = kv_aware_policy(policy.as_ref()).unwrap();
         // Same source, successful response and request with the option off/on.
-        for (enabled, prefix) in [(false, 0), (true, 33)] {
+        for (enabled, prefix) in [(false, 0), (true, 32)] {
             f.router.kv_aware_completion_history = enabled;
             assert_eq!(
                 selected_http_worker(
@@ -4985,9 +5026,10 @@ mod tests {
         let dispatch = |id: u32| {
             let router = f.router.clone();
             tokio::spawn(async move {
-                let req: CompletionRequest =
-                    serde_json::from_value(serde_json::json!({"model":"model","prompt":[id]}))
-                        .unwrap();
+                let req: CompletionRequest = serde_json::from_value(
+                    serde_json::json!({"model":"model","prompt":vec![id;16]}),
+                )
+                .unwrap();
                 router
                     .route_typed_request(None, &req, "/v1/completions", None)
                     .await
@@ -4999,7 +5041,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(kv.observed_completion_prefix(f.worker.as_ref(), &[7]), 0);
+        assert_eq!(
+            kv.observed_completion_prefix(f.worker.as_ref(), &[7; 16]),
+            0
+        );
         let (send, chunks) =
             tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
         f.responses
@@ -5011,7 +5056,7 @@ mod tests {
         // The nonstream request is still reading its body. Waiting on the
         // actual observation (not a delay) distinguishes headers from return.
         tokio::time::timeout(timeout, async {
-            while kv.observed_completion_prefix(f.worker.as_ref(), &[7]) == 0 {
+            while kv.observed_completion_prefix(f.worker.as_ref(), &[7; 16]) == 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -5023,14 +5068,17 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(manager.sample(&target).active_prefill_tokens, 2);
+        assert_eq!(manager.sample(&target).active_prefill_tokens, 32);
         cancel.abort();
         assert!(cancel.await.unwrap_err().is_cancelled());
-        assert_eq!(kv.observed_completion_prefix(f.worker.as_ref(), &[9]), 0);
+        assert_eq!(
+            kv.observed_completion_prefix(f.worker.as_ref(), &[9; 16]),
+            0
+        );
         assert_eq!(
             manager.sample(&target),
             crate::policies::LoadSample {
-                active_prefill_tokens: 1,
+                active_prefill_tokens: 16,
                 active_requests: 1
             }
         );
@@ -5045,7 +5093,10 @@ mod tests {
                 .status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
-        assert_eq!(kv.observed_completion_prefix(f.worker.as_ref(), &[7]), 1);
+        assert_eq!(
+            kv.observed_completion_prefix(f.worker.as_ref(), &[7; 16]),
+            16
+        );
         assert_eq!(
             manager.sample(&target),
             crate::policies::LoadSample::default()

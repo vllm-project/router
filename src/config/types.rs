@@ -1346,6 +1346,40 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    /// Configuration-only gates. An enabled flag does not qualify a request or registration.
+    pub(crate) fn history_policy_support(&self, policy: &PolicyConfig) -> Result<(), &'static str> {
+        if self.enable_igw {
+            return Err("inference_gateway");
+        }
+        if self.program_scheduling.is_some() {
+            return Err("program_scheduling");
+        }
+        if self.intra_node_data_parallel_size != 1 {
+            return Err("multi_rank");
+        }
+        match policy {
+            PolicyConfig::KvAware {
+                router_temperature, ..
+            } if *router_temperature == 0.0 => Ok(()),
+            PolicyConfig::KvAware { .. } => Err("nonzero_router_temperature"),
+            _ => Err("not_kv_aware"),
+        }
+    }
+
+    pub(crate) fn regular_history_support(&self) -> Result<(), &'static str> {
+        let RoutingMode::Regular { worker_urls } = &self.mode else {
+            return Err("not_regular");
+        };
+        self.history_policy_support(&self.policy)?;
+        if worker_urls
+            .iter()
+            .any(|url| crate::backend::is_grpc_url(url))
+        {
+            return Err("grpc_worker_pool");
+        }
+        Ok(())
+    }
+
     /// Create a new configuration with mode and policy
     pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
         Self {

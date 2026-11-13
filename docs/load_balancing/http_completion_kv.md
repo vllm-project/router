@@ -38,9 +38,14 @@ real-Worker acceptance requirements.
 `--kv-aware-completion-history` (off by default) can break a lowest-cost tie
 between independently addressed Regular HTTP workers when `--router-temperature 0`
 (the Router's selection temperature, not the request's sampling temperature).
-A valid session binding wins first. If any retry-eligible target has positive
-event credit, the usual scorer decides. Otherwise, among equally scored and
-equally ranked targets, prefer the longest previously observed token prefix.
+A valid session binding wins first. This is a proposed subset of
+[#295 §4B](https://github.com/vllm-project/router/issues/295), not an accepted
+change to its ordering. If any retry-eligible target has positive event credit
+(even below one billable token), the usual scorer decides. Otherwise, use the
+longest exact overlap in **complete-block tokens** at each registration's block
+size; do not exceed the ordinary pick's work or backlog. Both the scorer cost
+and the load components must tie. A history-selected worker can become the
+session's binding under the existing affinity rules and its separate TTL.
 History never grants KV credit: a known 33-token request with no event credit
 still reserves 33 tokens. Preparation uses the existing Direct or per-worker
 tokens; enabling history sends no additional preparation RPC.
@@ -49,9 +54,12 @@ Only plain, single-prompt requests whose explicit model matches the registered
 cache identity qualify. Successful upstream **headers**, not dispatch or body
 completion, record the selected worker's prefix. A later body failure does not
 undo that observation. An error or cancellation before headers records nothing.
-Records expire after 60 seconds; each policy instance keeps the latest 128
-observations, at most the first 256 token IDs each (32,768 retained IDs, not a
-process memory limit). Replacement or removal fences the old registration.
+Records expire 60 seconds after a successful observation. Observing the same
+retained prefix on the same registration refreshes one entry; looking it up
+does not. Each policy keeps at most 128 entries of at most 256 IDs each
+(32,768 retained IDs, not a process memory limit). At capacity, an oldest
+entry from a most-represented registration is evicted. A block larger than the
+prefix cap cannot yield a hint. Replacement or removal fences the old registration.
 KV Remove/Clear changes placement evidence, not the fact that the request was
 routed. An unobserved same-address engine restart cannot be identified by this
 local history. This option does not enable P/D, gRPC, IGW or Program history.
