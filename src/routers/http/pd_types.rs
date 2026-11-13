@@ -1,4 +1,5 @@
 use crate::core::Worker;
+use crate::kv_observation::{KvRouteAttempt, KvRoutePrediction};
 use crate::policies::{AffinityKey, AffinityRecord, RequestHeaders};
 use axum::body::Body;
 use futures_util::StreamExt;
@@ -161,6 +162,7 @@ pub struct PdRequestContext<'a> {
 
 #[derive(Debug, Clone)]
 pub struct StageDecision {
+    pub prediction: Option<KvRoutePrediction>,
     pub fallback_reason: Option<&'static str>,
     pub credited_prefix_tokens: Option<u64>,
     pub worker_index: usize,
@@ -260,6 +262,10 @@ impl PdLoadManager {
             prefill: selection.prefill.endpoint.clone(),
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
+            observation: KvRouteAttempt::for_http(
+                prefill.prediction.clone(),
+                &prefill.endpoint.http_url,
+            ),
             prefill_tokens: selection.prefill.new_prefill_tokens,
             state: Mutex::new(AttemptState {
                 prefill: true,
@@ -335,6 +341,7 @@ impl PdLoadManager {
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_tokens: None,
+            observation: None,
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: DecodeState::Pending,
@@ -370,6 +377,7 @@ struct AttemptState {
 }
 
 struct AttemptInner {
+    observation: Option<Arc<KvRouteAttempt>>,
     admitted_at: std::time::Instant,
     loads: Arc<Mutex<Loads>>,
     prefill: PdEndpoint,
@@ -507,6 +515,9 @@ impl Drop for DecodeBodyGuard {
 }
 
 impl PdAttempt {
+    pub(super) fn kv_observation(&self) -> Option<&Arc<KvRouteAttempt>> {
+        self.0.observation.as_ref()
+    }
     pub(super) fn attach_workers(
         &self,
         prefill_worker: Arc<dyn Worker>,

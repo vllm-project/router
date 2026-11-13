@@ -12,6 +12,28 @@ pub(super) fn usage_object(value: &Value) -> Option<&Map<String, Value>> {
         .or_else(|| value.pointer("/response/usage").and_then(Value::as_object))
 }
 
+pub(super) fn cached_tokens(response: &Value) -> Option<u64> {
+    let usage = usage_object(response)?;
+    // Validate each candidate against its matching input count, so an invalid
+    // legacy spelling cannot hide a valid Responses spelling. Keep support for
+    // details-only snapshots; an explicit input count must be valid and bound
+    // the cache count. Zero remains a valid cache count.
+    [
+        ("prompt_tokens_details", "prompt_tokens"),
+        ("input_tokens_details", "input_tokens"),
+    ]
+    .iter()
+    .find_map(|(details_key, input_key)| {
+        let cached = usage.get(*details_key)?.get("cached_tokens")?.as_u64()?;
+        if let Some(input) = usage.get(*input_key) {
+            if cached > input.as_u64()? {
+                return None;
+            }
+        }
+        Some(cached)
+    })
+}
+
 pub(super) fn usage_object_mut(value: &mut Value) -> Option<&mut Map<String, Value>> {
     if value.get("usage").is_some_and(Value::is_object) {
         value.get_mut("usage").and_then(Value::as_object_mut)
@@ -84,7 +106,7 @@ fn replace_if_changed(usage: &mut Map<String, Value>, key: &str, value: Value) -
 
 /// Merge valid Prefill input counts and input details into existing Decode
 /// usage. Preserve unknown Decode fields and never synthesize missing usage.
-/// Cache-token ownership/validation is handled by `pd_cached_tokens`.
+/// Cache-token ownership/validation is handled by `usage_stream`.
 pub(super) fn merge_pd_usage(prefill: &Value, decode: &mut Value) -> bool {
     let (input_key, details_key, output_key) = usage_dialect(decode, Some(prefill)).keys();
     let Some(source) = usage_object(prefill) else {
