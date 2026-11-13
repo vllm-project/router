@@ -7445,35 +7445,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_healthy_workers_reports_rejected_api_key() {
-        let (url, server) = start_auth_mock_server(Some("worker-key")).await;
-
-        let error = Router::wait_for_healthy_workers(&[url], 1, 1, Some("other-key"))
-            .await
-            .unwrap_err();
-
-        assert!(error.contains("401"), "{error}");
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn test_add_worker_reports_rejected_api_key() {
         use crate::config::RouterConfig;
 
-        let (startup_url, startup_server) = start_healthy_mock_server().await;
-        let (rejecting_url, rejecting_server) = start_auth_mock_server(Some("other-key")).await;
+        let (url, server) = start_auth_mock_server(Some("worker-key")).await;
+
+        let error =
+            Router::wait_for_healthy_workers(std::slice::from_ref(&url), 1, 1, Some("other-key"))
+                .await
+                .unwrap_err();
+        assert!(error.contains("401"), "{error}");
+
+        // add_worker reports the rejected key the same way.
         let config = RouterConfig {
-            api_key: Some("worker-key".to_string()),
+            api_key: Some("other-key".to_string()),
             worker_startup_timeout_secs: 1,
             worker_startup_check_interval_secs: 1,
             ..Default::default()
         };
-        let (router, _ctx) = start_router(config, vec![startup_url]).await;
-
-        let error = router.add_worker(&rejecting_url).await.unwrap_err();
-
+        let (router, _ctx) = start_router(config, vec![]).await;
+        let error = router.add_worker(&url).await.unwrap_err();
         assert!(error.contains("401"), "{error}");
-        startup_server.abort();
-        rejecting_server.abort();
+
+        server.abort();
     }
 
     #[tokio::test]

@@ -247,13 +247,12 @@ has tracing support.
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key used for requests to workers. |
+| `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key sent on requests to workers, including HTTP health checks. |
 | `--api-key-validation-urls` | `string [0..] (repeatable)` | `[]` | — | — | Validation URLs; an empty list falls back to comma-separated `API_KEY_VALIDATION_URLS` from the environment or `.env`. |
 
-The regular router also sends `--api-key` as a bearer token on HTTP worker
-health checks: `/health` during the startup wait and `/add_worker`, and
-`--health-check-endpoint` for runtime checks. gRPC workers and P/D mode do not
-receive it on health checks.
+Health checks of gRPC workers, and of workers in PD and `--enable-igw` mode,
+do not carry the key yet. The startup wait and `add_worker` always probe
+`/health`, regardless of `--health-check-endpoint`.
 
 ## WASM middleware
 

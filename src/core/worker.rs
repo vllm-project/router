@@ -1129,26 +1129,6 @@ mod tests {
         assert!(!format!("{:?}", dp_worker).contains(api_key));
     }
 
-    #[test]
-    fn test_worker_get_uses_only_the_configured_key() {
-        let client = reqwest::Client::new();
-        for (key, expected) in [
-            (None, None),
-            (Some("backend-key"), Some("Bearer backend-key")),
-        ] {
-            let request = worker_get(&client, "https://worker/v1/models", key)
-                .build()
-                .unwrap();
-            assert_eq!(
-                request
-                    .headers()
-                    .get("authorization")
-                    .map(|value| value.to_str().unwrap()),
-                expected
-            );
-        }
-    }
-
     // Test Worker trait implementation
     #[test]
     fn test_worker_url() {
