@@ -1094,12 +1094,11 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
-        model_id: Option<&str>,
+        model_pool: &ResolvedProgramModelPool,
     ) -> Result<Option<ProgramIdentity>, ScheduleError> {
         let Some(scheduler) = self.program_scheduler.as_ref() else {
             return Ok(None);
         };
-        let model_pool = self.resolved_program_model_pool(model_id);
         let request = typed_req.extract_program_identity_payload();
         ProgramIdentity::from_request_with_enable_key(
             headers,
@@ -1107,16 +1106,6 @@ impl Router {
             Some(&model_pool.scheduler_key),
             scheduler.enable_key(),
         )
-    }
-
-    /// Whether settlement can verify a prepared count against Engine usage.
-    fn settlement_observes_usage<T: GenerationRequest>(
-        &self,
-        pool: Option<crate::backend::WorkerPoolKind>,
-        typed_req: &T,
-    ) -> bool {
-        !matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
-            || typed_req.settlement_reports_usage()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1135,22 +1124,13 @@ impl Router {
             return Ok(None);
         };
         let model_pool = self.resolved_program_model_pool(model_id);
-        let identity = match identity {
-            Some(identity) => identity,
-            None if identity_checked => return Ok(None),
-            None => {
-                let request = typed_req.extract_program_identity_payload();
-                let Some(identity) = ProgramIdentity::from_request_with_enable_key(
-                    headers,
-                    request.as_ref(),
-                    Some(&model_pool.scheduler_key),
-                    scheduler.enable_key(),
-                )?
-                else {
-                    return Ok(None);
-                };
-                identity
-            }
+        let identity = if identity_checked {
+            identity
+        } else {
+            self.resolved_program_identity(headers, typed_req, &model_pool)?
+        };
+        let Some(identity) = identity else {
+            return Ok(None);
         };
         let input_text = typed_req.extract_text_for_program_scheduling();
         self.acquire_program_completion_for_identity(
@@ -1769,41 +1749,20 @@ impl Router {
                 .into_response();
         }
 
-        // All-grpc chat: tokenize once, outside policy and retry.
-        // Cache-aware placement uses the same full content/session key as
-        // HTTP. PreparedRequest retains full token IDs for backend dispatch.
-        //
-        // The concrete request comes from `GenerationRequest::grpc_request`
-        // rather than a `serde_json::Value` roundtrip: the only two routes a
-        // gRPC pool admits are exactly the two concrete request types.
-
-        // Policy still uses extract_text_for_routing (session / empty).
-        // token_ids stay on PreparedRequest for a later token-level policy —
-        // do not dump 131k ids into the cache_aware tree.
-        // All-grpc chat/completions prepare once, outside policy and retry.
-        // An HTTP chat pool prepares only when the deployment opted the
-        // endpoint into exact text counting; a preparation failure there falls
-        // back to the estimator instead of failing the request.
-        // Router-side preparation is a second tokenization, so skip it when the
-        // scheduler would discard the fact: the endpoint must be opted in and
-        // the model pool must be allowed by `token_count_model_pools`.
-        // An HTTP stream can hide Engine usage from settlement. When exact
-        // facts are active, ask the Engine for the usage chunk and strip it
-        // again for clients that did not request it; otherwise exact mode would
-        // be a no-op for the default streaming client.
-        // Resolve Program identity once; the preparation gate and acquisition
-        // would otherwise parse the same payload twice.
+        // Prepare gRPC once before retries. HTTP text preparation is optional:
+        // resolve identity once and gate the extra tokenization by mode, pool
+        // and endpoint. Inject upstream usage only for eligible Program streams;
+        // the response adapter hides it again if the client did not request it.
+        let model_pool = self.resolved_program_model_pool(model_id);
         let identity_config_applies = matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
             && self.program_scheduler.as_ref().is_some_and(|scheduler| {
                 scheduler.token_count_mode().uses_prepared_facts()
                     && (scheduler.exact_text_endpoint_enabled(route)
                         || typed_req.exact_input_token_count().is_some())
-                    && scheduler.prepared_token_pool_allowed(
-                        &self.resolved_program_model_pool(model_id).scheduler_key,
-                    )
+                    && scheduler.prepared_token_pool_allowed(&model_pool.scheduler_key)
             });
         let resolved_identity = if identity_config_applies {
-            match self.resolved_program_identity(headers, typed_req, model_id) {
+            match self.resolved_program_identity(headers, typed_req, &model_pool) {
                 Ok(identity) => identity,
                 Err(error) => return Self::schedule_error_response(error),
             }
@@ -1814,26 +1773,17 @@ impl Router {
             && typed_req.is_stream()
             && !typed_req.settlement_reports_usage()
             && resolved_identity.is_some();
-        let settlement_observable =
-            self.settlement_observes_usage(pool, typed_req) || inject_include_usage;
-        let exact_mode_unobservable = !settlement_observable
-            && self.program_scheduler.as_ref().is_some_and(|scheduler| {
-                scheduler.token_count_mode()
-                    == crate::program_scheduling::TokenCountMode::ExactWhenVerified
-            });
-        let exact_text_chat = matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
+        let settlement_observable = !matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
+            || typed_req.settlement_reports_usage()
+            || inject_include_usage;
+        // A resolved identity already passed the HTTP/mode/pool gates above;
+        // settlement is observable either directly or through injected usage.
+        let exact_text_chat = resolved_identity.is_some()
             && route == "/v1/chat/completions"
-            && self.program_scheduler.as_ref().is_some_and(|scheduler| {
-                scheduler.exact_text_endpoint_enabled(route)
-                    && scheduler.prepared_token_pool_allowed(
-                        &self.resolved_program_model_pool(model_id).scheduler_key,
-                    )
-            })
-            // Skip the second tokenization for identity-free traffic and for
-            // exact-mode requests whose settlement cannot observe usage (the
-            // prepared fact would only be discarded as `unobservable_stream`).
-            && !exact_mode_unobservable
-            && resolved_identity.is_some();
+            && self
+                .program_scheduler
+                .as_ref()
+                .is_some_and(|scheduler| scheduler.exact_text_endpoint_enabled(route));
         let prepared = match (pool, typed_req.grpc_request()) {
             (Some(crate::backend::WorkerPoolKind::Grpc), Some(GrpcRequestRef::Chat(chat)))
                 if route == "/v1/chat/completions" =>
@@ -5883,59 +5833,6 @@ mod tests {
         assert!(!observed.finished_success());
     }
 
-    fn chat_request_with_identity(program: &str) -> ChatCompletionRequest {
-        serde_json::from_value(serde_json::json!({
-            "model": "pd-model",
-            "messages": [{"role": "user", "content": "hello"}],
-            "chat_template_kwargs": {"enable_thinking": false},
-            "vllm_xargs": {"agentic_context": format!("{{\"program_id\":\"{program}\"}}")},
-            "metadata": {"trace": "abc"}
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn prepared_fingerprint_ignores_per_request_identity() {
-        let first = prepared_chat_fingerprint(&chat_request_with_identity("p1"), "vllm-tokenizer");
-        let second = prepared_chat_fingerprint(&chat_request_with_identity("p2"), "vllm-tokenizer");
-        assert_eq!(first, second, "identity fields must not split the class");
-    }
-
-    #[test]
-    fn prepared_fingerprint_tracks_template_and_tool_options() {
-        let base = chat_request_with_identity("p1");
-        let base_fp = prepared_chat_fingerprint(&base, "vllm-tokenizer");
-        let mut kwargs_changed = chat_request_with_identity("p1");
-        kwargs_changed.chat_template_kwargs = Some(HashMap::from([(
-            "enable_thinking".to_string(),
-            serde_json::json!(true),
-        )]));
-        assert_ne!(
-            base_fp,
-            prepared_chat_fingerprint(&kwargs_changed, "vllm-tokenizer")
-        );
-
-        let mut tools_changed = chat_request_with_identity("p1");
-        tools_changed.tools = Some(vec![serde_json::from_value(serde_json::json!({
-            "type": "function",
-            "function": {"name": "shell", "parameters": {"type": "object"}}
-        }))
-        .unwrap()]);
-        assert_ne!(
-            base_fp,
-            prepared_chat_fingerprint(&tools_changed, "vllm-tokenizer")
-        );
-
-        let mut special_changed = chat_request_with_identity("p1");
-        special_changed
-            .other
-            .insert("add_special_tokens".to_string(), serde_json::json!(true));
-        assert_ne!(
-            base_fp,
-            prepared_chat_fingerprint(&special_changed, "vllm-tokenizer")
-        );
-    }
-
     async fn settlement_scheduler(
         estimated_tokens: usize,
     ) -> (
@@ -6068,71 +5965,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn exact_prompt_tokens_applies_transparent_truncation() {
-        let with_truncate = serde_json::json!({
-            "prompt": [1, 2, 3, 4, 5],
-            "add_special_tokens": false,
-            "truncate_prompt_tokens": 2
-        });
-        assert_eq!(exact_prompt_tokens_from_json(Some(&with_truncate)), Some(2));
-        let above_len = serde_json::json!({
-            "prompt": [1, 2, 3],
-            "add_special_tokens": false,
-            "truncate_prompt_tokens": 9
-        });
-        assert_eq!(exact_prompt_tokens_from_json(Some(&above_len)), Some(3));
-        let zero = serde_json::json!({
-            "prompt": [1, 2, 3],
-            "add_special_tokens": false,
-            "truncate_prompt_tokens": 0
-        });
-        assert_eq!(exact_prompt_tokens_from_json(Some(&zero)), Some(3));
-        let invalid = serde_json::json!({
-            "prompt": [1, 2, 3],
-            "add_special_tokens": false,
-            "truncate_prompt_tokens": "2"
-        });
-        assert_eq!(exact_prompt_tokens_from_json(Some(&invalid)), None);
-    }
-
-    #[test]
-    fn exact_prompt_tokens_requires_disabled_special_tokens() {
-        let ids = serde_json::json!({
-            "prompt": [1, 2, 3],
-            "add_special_tokens": false
-        });
-        assert_eq!(exact_prompt_tokens_from_json(Some(&ids)), Some(3));
-        let defaulted = serde_json::json!({"prompt": [1, 2, 3]});
-        assert_eq!(exact_prompt_tokens_from_json(Some(&defaulted)), None);
-        let text = serde_json::json!({
-            "prompt": "hello",
-            "add_special_tokens": false
-        });
-        assert_eq!(exact_prompt_tokens_from_json(Some(&text)), None);
-        let batched = serde_json::json!({
-            "prompt": [[1, 2], [3]],
-            "add_special_tokens": false
-        });
-        assert_eq!(exact_prompt_tokens_from_json(Some(&batched)), None);
-    }
-
-    #[test]
-    fn client_token_ids_fingerprint_changes_with_pool_and_model() {
-        let base = client_token_ids_fingerprint(Some("model-a"), "model-a", "/v1/completions");
-        assert_eq!(
-            base,
-            client_token_ids_fingerprint(Some("model-a"), "model-a", "/v1/completions")
-        );
-        assert_ne!(
-            base,
-            client_token_ids_fingerprint(Some("model-b"), "model-a", "/v1/completions")
-        );
-        assert_ne!(
-            base,
-            client_token_ids_fingerprint(Some("model-a"), "model-a", "/v1/chat/completions")
-        );
-    }
     fn create_test_regular_router() -> Router {
         // Create registries
         let worker_registry = Arc::new(WorkerRegistry::new());

@@ -208,8 +208,7 @@ impl ProgramScheduler {
         now: Instant,
         shadow_tokens: usize,
     ) -> Option<&'static str> {
-        let decision = state.decisions.get(program)?;
-        let _ = decision;
+        state.decisions.get(program)?;
         if self.config.pd_mode || shadow_tokens == 0 {
             return None;
         }
@@ -414,12 +413,12 @@ mod tests {
         }
     }
 
-    fn identity() -> super::super::ProgramIdentity {
+    pub(super) fn identity(name: &str) -> super::super::ProgramIdentity {
         super::super::ProgramIdentity::from_request(
             None,
             Some(&json!({
                 "vllm_xargs": {"agentic_context": {
-                    "program_id": "p",
+                    "program_id": name,
                     "expected_resume": true
                 }}
             })),
@@ -429,14 +428,19 @@ mod tests {
         .unwrap()
     }
 
+    fn config(mode: TokenCountMode, capacity: usize) -> ProgramSchedulerConfig {
+        let mut config = ProgramSchedulerConfig {
+            token_count_mode: mode,
+            ..Default::default()
+        };
+        config.progress_ttl.token_capacity = Some(capacity);
+        config
+    }
+
     #[tokio::test]
     async fn exact_mode_admits_with_engine_scale_demand() {
-        let mut config = ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
-            token_count_verification_settlements: 0,
-            ..ProgramSchedulerConfig::default()
-        };
-        config.progress_ttl.token_capacity = Some(100_000);
+        let mut config = config(TokenCountMode::ExactWhenVerified, 100_000);
+        config.token_count_verification_settlements = 0;
         let scheduler = ProgramScheduler::new(config);
         let fingerprint = TokenizerFingerprint::from_parts(&["model", "client"]);
         let context = scheduler.resolve_arrival_tokens(
@@ -446,7 +450,12 @@ mod tests {
         assert_eq!(context.tokens(), 98_304);
         assert_eq!(context.source(), TokenFactSource::ClientTokenIds);
         let dispatch = scheduler
-            .acquire(identity(), context, std::slice::from_ref(&target()), None)
+            .acquire(
+                identity("p"),
+                context,
+                std::slice::from_ref(&target()),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(dispatch.context_tokens(), 98_304);
@@ -473,7 +482,12 @@ mod tests {
         assert_eq!(context.tokens(), 100);
         assert_eq!(context.shadow_tokens(), Some(120));
         let dispatch = scheduler
-            .acquire(identity(), context, std::slice::from_ref(&target()), None)
+            .acquire(
+                identity("p"),
+                context,
+                std::slice::from_ref(&target()),
+                None,
+            )
             .await
             .unwrap();
         scheduler.complete(
@@ -545,11 +559,7 @@ mod tests {
     async fn shadow_outcome_is_only_sampled_for_a_queued_front_turn() {
         // An already-active Program has no admission gate to counterfactually
         // evaluate, so shadow sampling must not report an outcome for it.
-        let mut config = ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::Shadow,
-            ..ProgramSchedulerConfig::default()
-        };
-        config.progress_ttl.token_capacity = Some(100_000);
+        let config = config(TokenCountMode::Shadow, 100_000);
         let scheduler = ProgramScheduler::new(config);
         let fingerprint = TokenizerFingerprint::from_parts(&["model", "active"]);
         let context = scheduler.resolve_arrival_tokens(
@@ -560,7 +570,12 @@ mod tests {
             ),
         );
         let dispatch = scheduler
-            .acquire(identity(), context, std::slice::from_ref(&target()), None)
+            .acquire(
+                identity("p"),
+                context,
+                std::slice::from_ref(&target()),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(dispatch.context_tokens(), 60_000);
@@ -582,11 +597,7 @@ mod tests {
         // The applied 45k demand exceeds a 40k rank while the prepared 30k
         // fits, and the queue has no active Program (batch-gain admission is
         // disabled), so the real gate yields the exact-deny counterfactual.
-        let mut config = ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::Shadow,
-            ..ProgramSchedulerConfig::default()
-        };
-        config.progress_ttl.token_capacity = Some(40_000);
+        let mut config = config(TokenCountMode::Shadow, 40_000);
         config.progress_ttl.decode_buffer_tokens = 10;
         let scheduler = ProgramScheduler::new(config);
         scheduler.sync_targets("model", std::slice::from_ref(&target()));
@@ -604,10 +615,10 @@ mod tests {
         let mut state = scheduler.state.lock();
         let handle = state
             .runtime
-            .retain_request(&identity(), context, None, now);
+            .retain_request(&identity("p"), context, None, now);
         scheduler.ensure_decision_state(
             &mut state,
-            &identity(),
+            &identity("p"),
             handle.program().clone(),
             context,
             now,
@@ -625,11 +636,7 @@ mod tests {
         // estimate fits both the low watermark and the reserve, while the
         // prepared 800-token count fits immediate capacity but not the reserve.
         // The old comparison (immediate headroom only) reported both_admit.
-        let mut config = ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::Shadow,
-            ..ProgramSchedulerConfig::default()
-        };
-        config.progress_ttl.token_capacity = Some(1_000);
+        let mut config = config(TokenCountMode::Shadow, 1_000);
         config.progress_ttl.low_watermark_ratio = 1.0;
         config.progress_ttl.decode_buffer_tokens = 10;
         config.progress_ttl.stats_window_size = 2;
@@ -663,10 +670,10 @@ mod tests {
         }
         let handle = state
             .runtime
-            .retain_request(&identity(), context, None, now);
+            .retain_request(&identity("p"), context, None, now);
         scheduler.ensure_decision_state(
             &mut state,
-            &identity(),
+            &identity("p"),
             handle.program().clone(),
             context,
             now,
@@ -690,11 +697,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_mode_applies_only_after_a_matching_settlement() {
-        let mut config = ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
-            ..ProgramSchedulerConfig::default()
-        };
-        config.progress_ttl.token_capacity = Some(1_000_000);
+        let config = config(TokenCountMode::ExactWhenVerified, 1_000_000);
         // Default probation is one matching settlement.
         assert_eq!(config.token_count_verification_settlements, 1);
         let scheduler = ProgramScheduler::new(config);
@@ -710,7 +713,12 @@ mod tests {
         );
 
         let dispatch = scheduler
-            .acquire(identity(), pending, std::slice::from_ref(&target()), None)
+            .acquire(
+                identity("p"),
+                pending,
+                std::slice::from_ref(&target()),
+                None,
+            )
             .await
             .unwrap();
         scheduler.complete(
@@ -736,18 +744,19 @@ mod tests {
 
     #[tokio::test]
     async fn exact_mode_mismatch_keeps_the_fingerprint_on_probation() {
-        let mut config = ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
-            ..ProgramSchedulerConfig::default()
-        };
-        config.progress_ttl.token_capacity = Some(1_000_000);
+        let config = config(TokenCountMode::ExactWhenVerified, 1_000_000);
         let scheduler = ProgramScheduler::new(config);
         let fingerprint = TokenizerFingerprint::from_parts(&["model", "mismatch"]);
         let arrival =
             ArrivalTokenFacts::new(100, Some(TokenFacts::prepared_token_ids(500, fingerprint)));
         let pending = scheduler.resolve_arrival_tokens("model", arrival);
         let dispatch = scheduler
-            .acquire(identity(), pending, std::slice::from_ref(&target()), None)
+            .acquire(
+                identity("p"),
+                pending,
+                std::slice::from_ref(&target()),
+                None,
+            )
             .await
             .unwrap();
         scheduler.complete(
@@ -811,11 +820,7 @@ mod tests {
 
     #[tokio::test]
     async fn shadow_mode_records_counterfactual_and_keeps_estimated_admission() {
-        let mut config = ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::Shadow,
-            ..ProgramSchedulerConfig::default()
-        };
-        config.progress_ttl.token_capacity = Some(200_000);
+        let config = config(TokenCountMode::Shadow, 200_000);
         let scheduler = ProgramScheduler::new(config);
         let fingerprint = TokenizerFingerprint::from_parts(&["model", "shadow"]);
         let context = scheduler.resolve_arrival_tokens(
@@ -823,7 +828,12 @@ mod tests {
             ArrivalTokenFacts::new(4, Some(TokenFacts::client_token_ids(98_304, fingerprint))),
         );
         let dispatch = scheduler
-            .acquire(identity(), context, std::slice::from_ref(&target()), None)
+            .acquire(
+                identity("p"),
+                context,
+                std::slice::from_ref(&target()),
+                None,
+            )
             .await
             .unwrap();
         // Decisions keep the estimated demand ...
@@ -839,12 +849,8 @@ mod tests {
     #[tokio::test]
     async fn exact_mode_queues_a_program_the_estimate_would_admit() {
         let fingerprint = TokenizerFingerprint::from_parts(&["model", "queue"]);
-        let mut exact_config = ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
-            token_count_verification_settlements: 0,
-            ..ProgramSchedulerConfig::default()
-        };
-        exact_config.progress_ttl.token_capacity = Some(150_000);
+        let mut exact_config = config(TokenCountMode::ExactWhenVerified, 150_000);
+        exact_config.token_count_verification_settlements = 0;
         let exact_scheduler = ProgramScheduler::new(exact_config);
         let exact_context = exact_scheduler.resolve_arrival_tokens(
             "model",
@@ -854,7 +860,7 @@ mod tests {
         // The first Program consumes over half the rank capacity ...
         exact_scheduler
             .acquire(
-                identity(),
+                identity("p"),
                 exact_context,
                 std::slice::from_ref(&target()),
                 None,
@@ -864,18 +870,7 @@ mod tests {
         let second = tokio::time::timeout(
             std::time::Duration::from_millis(50),
             exact_scheduler.acquire(
-                super::super::ProgramIdentity::from_request(
-                    None,
-                    Some(&json!({
-                        "vllm_xargs": {"agentic_context": {
-                            "program_id": "q",
-                            "expected_resume": true
-                        }}
-                    })),
-                    Some("model"),
-                )
-                .unwrap()
-                .unwrap(),
+                identity("q"),
                 exact_context,
                 std::slice::from_ref(&target()),
                 None,
@@ -888,14 +883,12 @@ mod tests {
         );
 
         // ... while the estimated demand admits it immediately.
-        let mut estimated_config = ProgramSchedulerConfig::default();
-        estimated_config.progress_ttl.token_capacity = Some(150_000);
-        let estimated_scheduler = ProgramScheduler::new(estimated_config);
+        let estimated_scheduler = ProgramScheduler::new(config(TokenCountMode::Estimated, 150_000));
         let estimated_context = estimated_scheduler
             .resolve_arrival_tokens("model", ArrivalTokenFacts::estimated_only(4));
         estimated_scheduler
             .acquire(
-                identity(),
+                identity("p"),
                 estimated_context,
                 std::slice::from_ref(&target()),
                 None,
@@ -905,18 +898,7 @@ mod tests {
         let admitted = tokio::time::timeout(
             std::time::Duration::from_millis(200),
             estimated_scheduler.acquire(
-                super::super::ProgramIdentity::from_request(
-                    None,
-                    Some(&json!({
-                        "vllm_xargs": {"agentic_context": {
-                            "program_id": "q",
-                            "expected_resume": true
-                        }}
-                    })),
-                    Some("model"),
-                )
-                .unwrap()
-                .unwrap(),
+                identity("q"),
                 estimated_context,
                 std::slice::from_ref(&target()),
                 None,
@@ -928,11 +910,7 @@ mod tests {
 
     #[tokio::test]
     async fn revocation_falls_back_to_estimation() {
-        let mut config = ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
-            ..ProgramSchedulerConfig::default()
-        };
-        config.progress_ttl.token_capacity = Some(100_000);
+        let config = config(TokenCountMode::ExactWhenVerified, 100_000);
         let scheduler = ProgramScheduler::new(config);
         let fingerprint = TokenizerFingerprint::from_parts(&["model", "client"]);
         {
@@ -961,20 +939,10 @@ mod tests {
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod revocation_tests {
+    use super::tests::identity;
     use super::*;
     use crate::program_scheduling::*;
     use std::time::Duration;
-    fn identity(name: &str) -> ProgramIdentity {
-        ProgramIdentity::from_request(
-            None,
-            Some(&serde_json::json!({
-                "vllm_xargs":{"agentic_context":{"program_id":name,"expected_resume":true}}
-            })),
-            Some("model"),
-        )
-        .unwrap()
-        .unwrap()
-    }
 
     #[tokio::test]
     async fn revocation_between_resolution_and_retention_uses_the_original_estimate() {
