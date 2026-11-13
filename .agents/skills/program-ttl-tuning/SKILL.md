@@ -1,6 +1,7 @@
 ---
 name: program-ttl-tuning
-description: Ordered procedure for tuning Program scheduling and Progress-TTL on vLLM Router (PR #286), portable across model, accelerator, node count, and agent workload. Use it to establish a pressure point, calibrate capacity and cost coefficients, then tune admission, TTL, and placement in order. Covers enabling the feature on a new deployment, re-tuning after a model or workload change, and diagnosing a stalled token cache-hit ratio, a TTFT tail, or job timeouts. Complements docs/program_scheduling/program-scheduling.md.
+description: >-
+  Ordered procedure for tuning Program scheduling and Progress-TTL on vLLM Router (PR #286), portable across model, accelerator, node count, and agent workload. Use it to establish a pressure point, calibrate capacity and cost coefficients, then tune admission, TTL, and placement in order. Covers enabling the feature on a new deployment, re-tuning after a model or workload change, and diagnosing a stalled token cache-hit ratio, a TTFT tail, or job timeouts. Complements docs/program_scheduling/program-scheduling.md.
 ---
 
 # Program scheduling tuning
@@ -51,11 +52,14 @@ record the result as a non-regression case rather than a failed experiment.
 
 ## Facts that drive most decisions
 
-1. `max_acting_ttl_seconds` is an upper bound. The acting TTL is
+1. The automatic acting TTL is bounded by
    `min(max_acting_ttl_seconds, cache_miss_impact_seconds)`, where the impact is
    the calibrated cold-prefill cost for the uncached prefix multiplied by
-   `(2 - decode_throughput_alpha)`. Raising the bound alone changes
-   nothing while the cost model stays cheap.
+   `(2 - decode_throughput_alpha)`. Once the continuity window is mature, the
+   interval fit selects the TTL with the best estimated utility within that
+   bound; it can select a smaller TTL or zero even when the bound is positive.
+   Raising `max_acting_ttl_seconds` alone has no effect while the impact cap
+   binds, and a higher cap does not guarantee a longer selected TTL.
 2. Before `stats_window_size` samples accumulate, the automatic TTL is `0` and
    the growth reserve is `0`. A cold Router therefore pauses on the first tool
    gap.
@@ -70,11 +74,16 @@ comparison.
 
 ### 1.1 Program identity reaches the Router
 
-Only requests carrying the configured `program_scheduling_enable_key` enter
-Program scheduling. The default, `vllm_xargs.agentic_context`, requires a body
-object; header-only harnesses need `auto`, and harnesses that post to
-`/v1/messages` need a translation bridge, because only `/v1/chat/completions`
-and `/v1/completions` enter the Program path.
+Requests must satisfy the configured `program_scheduling_enable_key` to enter
+Program scheduling. The default, `vllm_xargs.agentic_context`, requires canonical
+identity metadata in the JSON body; header-only harnesses need `auto` and a
+supported session identity header. In addition to `/v1/chat/completions` and
+`/v1/completions`, POST requests handled by the default transparent-proxy
+fallback, including `/v1/messages`, run Program intake without a path filter.
+They still need valid identity metadata. A protocol translation bridge is needed
+only if the backend does not support the harness's API; any bridge must preserve
+that metadata. Backend protocol support and Program-path entry are separate
+checks.
 
 ```bash
 curl -s "<router-url>/scheduling/diagnostics" |
@@ -121,8 +130,8 @@ gap coverage        = TTL > p95(tool-call gap)
 
 - `r` is in-flight requests divided by concurrency. It depends on the workload:
   interactive coding agents have been observed around 0.28–0.37 at low pressure,
-  while batch or single-shot traffic sits lower and long deliberation loops
-  higher. It approaches 1 near saturation, so linear extrapolation overestimates
+  while traffic with no gaps can approach 1 and long tool or deliberation gaps
+  reduce it. It approaches 1 near saturation, so linear extrapolation overestimates
   headroom. Measure it per concurrency step instead of assuming a value.
 - The working-set ratio decides whether retention has anything to save. The
   in-flight ratio decides whether retention will throttle useful backend
@@ -212,7 +221,7 @@ changes dominate everything.
 | `token_capacity_per_dp_rank` | `null` (count guard only) | `0.95 * log capacity`; wrong-by-a-lot values show up as constant queueing or `unexpected_cache_discontinuity` |
 | `max_active_programs_per_target` | `64` | Scale with concurrency: about `CC / dp * 1.2`. Leaving it at a value sized for a smaller run makes the count guard bind before token admission |
 | `high_watermark_ratio` / `low_watermark_ratio` | `1.0` / `1.0` | Keep 1.0 when capacity already carries the 0.95 discount |
-| `admission_waiting_request_threshold` | `1` | Raise only with evidence of request avalanches; it batches admits and adds latency |
+| `admission_waiting_request_threshold` | `1` | Backend waiting-queue ceiling: ordinary admission/resume blocks when `waiting >= threshold`; `0` disables the gate. Raising it relaxes backpressure and can worsen backend queueing. Increase only when evidence shows the gate suppresses useful concurrency, not in response to a request avalanche |
 | `decode_buffer_tokens` | `100` | Raise toward the p95 output length when harnesses omit `expected_output_length` |
 
 ### 4.2 Queue timeouts and Program lifetime
@@ -229,9 +238,9 @@ changes dominate everything.
 |---|---:|---|
 | `max_acting_ttl_seconds` | `10` | Only a bound. Change it after, not before, the cost model is trustworthy |
 | `stats_window_size` | `100` | Lower it for short experiments; otherwise the first minutes run with TTL = 0 |
-| `prefill_cost_model.*` | reference values | Calibrated values; this is what makes TTL non-zero |
-| `decode_throughput_alpha` | `0.15` | Lower values weight cache-miss impact higher and extend TTL |
-| request-level `kv_retention_ttl_seconds` | unset | Overrides the computed TTL without the impact cap. Use only when gaps are known to exceed the impact |
+| `prefill_cost_model.*` | reference values | Calibrated values determine cache-miss impact; a non-zero TTL also requires a mature interval window and a useful fitted candidate |
+| `decode_throughput_alpha` | `0.15` | Lower values increase cache-miss impact and may extend the fitted TTL; check the selected TTL rather than assuming it increases |
+| request-level `kv_retention_ttl_seconds` | unset | Overrides the computed TTL without the impact cap on this internal-DP path. Use for the controlled retention diagnostic in section 5; measure queueing and end-to-end cost before keeping an override |
 
 ### 4.4 Placement
 
@@ -267,17 +276,24 @@ End-to-end side, from the run summary plus `rank_queue_size` /
 
 | Observation | Meaning | Ordered changes |
 |---|---|---|
-| hit and JCT both rise, queue wait high | retention is throttling useful concurrency | restore watermarks, lower `decode_buffer_tokens`, raise the waiting threshold, raise the Program count guard |
+| hit and JCT both rise, queue wait high | retention or admission gates may be throttling useful concurrency | check the blocking reason and backend waiting count; restore watermarks and correct output reservations first. Raise the waiting threshold or Program count guard only if that gate is suppressing useful concurrency and the backend has headroom |
 | hit flat, queue wait high | capacity too small for the workload | recalibrate capacity, then sweep it ±10% |
 | p50 improves, p95 worsens | mean/median trade-off | disable `global_queue` or raise headroom ratio |
 | cross-Rank moves appear | paused Programs are being relocated | `global_queue: false` |
 | task timeouts rise | pool lifetime or starvation | align `queue_timeout_seconds` and `force_resume_timeout_seconds` with the task timeout |
 
-If the mechanism is visibly active but the hit rate stays flat, run a TTL sweep
-before changing anything else: `0` (admission only), then 0.5x, 1x, and 4x the
-measured gap p95, all else equal. Gains should appear at the first arm whose TTL
-covers the gap. A flat sweep means TTL is not the limiting factor; return to
-section 3. Fixed-second values are only meaningful once the gap scale is known.
+If the mechanism is visibly active but the hit rate stays flat, run a controlled
+TTL sweep before changing anything else. On this internal-DP path, attach
+request-level `kv_retention_ttl_seconds` to every request in each arm: `0`
+(admission without post-request TTL retention), then 0.5x, 1x, and 4x the measured
+gap p95, all else equal. This override isolates retention duration from the
+automatic interval fit and impact cap; sweeping `max_acting_ttl_seconds` alone
+does not establish that the acting TTL changed. Verify the armed TTL and pause
+reasons in each arm, since capacity or segment yields can still end retention
+early. A flat sweep is informative only if retention actually changed; then
+return to section 3 to investigate other limits. Restore automatic TTL selection
+after the diagnostic. Fixed-second values are only meaningful once the gap scale
+is known.
 
 ## 6. Evidence standard and stop conditions
 
