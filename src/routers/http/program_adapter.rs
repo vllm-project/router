@@ -439,14 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_usage_from_the_producer_is_used_without_wire_usage() {
-        let (scheduler, dispatch) = settlement_fixture().await;
-        let estimator = Arc::new(MomentumTokenEstimator::default());
-        let (_, calibration) = estimator.estimate(
-            TokenEstimateScope::new("model", "/v1/chat/completions"),
-            "observer usage",
-        );
-        let completion =
-            ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
+        let (scheduler, completion) = settlement_fixture("observer usage").await;
         // The client did not ask for a wire usage chunk; the producer still
         // knows the Engine's counts.
         completion.engine_observer().record_usage(Some(123), 7);
@@ -459,14 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_wire_usage_remains_authoritative_without_a_producer_observation() {
-        let (scheduler, dispatch) = settlement_fixture().await;
-        let estimator = Arc::new(MomentumTokenEstimator::default());
-        let (_, calibration) = estimator.estimate(
-            TokenEstimateScope::new("model", "/v1/chat/completions"),
-            "HTTP usage",
-        );
-        let completion =
-            ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
+        let (scheduler, completion) = settlement_fixture("HTTP usage").await;
         completion.observe_sse_chunk(
             b"data: {\"usage\":{\"prompt_tokens\":155,\"completion_tokens\":7}}\n",
         );
@@ -480,14 +466,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_engine_prompt_info_discards_synthetic_wire_prompt_count() {
-        let (scheduler, dispatch) = settlement_fixture().await;
-        let estimator = Arc::new(MomentumTokenEstimator::default());
-        let (_, calibration) = estimator.estimate(
-            TokenEstimateScope::new("model", "/v1/chat/completions"),
-            "no prompt info",
-        );
-        let completion =
-            ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
+        let (scheduler, completion) = settlement_fixture("no prompt info").await;
         // The producer saw completion tokens but the Engine never reported
         // `prompt_info`; gRPC wire usage contains a synthetic fallback count.
         completion.engine_observer().record_usage(None, 7);
@@ -502,14 +481,7 @@ mod tests {
 
     #[tokio::test]
     async fn wire_error_frame_does_not_count_as_a_successful_round() {
-        let (scheduler, dispatch) = settlement_fixture().await;
-        let estimator = Arc::new(MomentumTokenEstimator::default());
-        let (_, calibration) = estimator.estimate(
-            TokenEstimateScope::new("model", "/v1/chat/completions"),
-            "wire error",
-        );
-        let completion =
-            ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
+        let (_, completion) = settlement_fixture("wire error").await;
         completion
             .observe_sse_chunk(b"data: {\"error\":\"gRPC stream closed before finish_info\"}\n\n");
         completion.finish(true);
@@ -518,14 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn producer_error_outcome_overrides_body_eof_success() {
-        let (scheduler, dispatch) = settlement_fixture().await;
-        let estimator = Arc::new(MomentumTokenEstimator::default());
-        let (_, calibration) = estimator.estimate(
-            TokenEstimateScope::new("model", "/v1/chat/completions"),
-            "producer error",
-        );
-        let completion =
-            ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
+        let (_, completion) = settlement_fixture("producer error").await;
         completion.engine_observer().record_error();
         completion.finish(true);
         assert!(!completion.finished_success());
@@ -533,22 +498,13 @@ mod tests {
 
     #[tokio::test]
     async fn error_free_stream_still_succeeds() {
-        let (scheduler, dispatch) = settlement_fixture().await;
-        let estimator = Arc::new(MomentumTokenEstimator::default());
-        let (_, calibration) = estimator.estimate(
-            TokenEstimateScope::new("model", "/v1/chat/completions"),
-            "clean stream",
-        );
-        let completion = ProgramCompletion::new(scheduler, dispatch, estimator, calibration);
+        let (_, completion) = settlement_fixture("clean stream").await;
         completion.observe_sse_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n");
         completion.finish(true);
         assert!(completion.finished_success());
     }
 
-    async fn settlement_fixture() -> (
-        Arc<ProgramScheduler>,
-        crate::program_scheduling::ProgramDispatch,
-    ) {
+    async fn settlement_fixture(input: &str) -> (Arc<ProgramScheduler>, ProgramCompletion) {
         let scheduler = Arc::new(ProgramScheduler::new(ProgramSchedulerConfig::default()));
         let target = ProgramTarget {
             id: "rank-0".into(),
@@ -573,6 +529,13 @@ mod tests {
             )
             .await
             .unwrap();
-        (scheduler, dispatch)
+        let estimator = Arc::new(MomentumTokenEstimator::default());
+        let (_, calibration) = estimator.estimate(
+            TokenEstimateScope::new("model", "/v1/chat/completions"),
+            input,
+        );
+        let completion =
+            ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
+        (scheduler, completion)
     }
 }

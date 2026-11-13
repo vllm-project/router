@@ -115,14 +115,6 @@ pub struct TokenFacts {
 }
 
 impl TokenFacts {
-    pub fn estimated(tokens: usize) -> Self {
-        Self {
-            tokens,
-            source: TokenFactSource::Estimated,
-            fingerprint: None,
-        }
-    }
-
     pub fn client_token_ids(tokens: usize, fingerprint: TokenizerFingerprint) -> Self {
         Self {
             tokens,
@@ -149,12 +141,6 @@ impl TokenFacts {
 
     pub fn fingerprint(&self) -> Option<TokenizerFingerprint> {
         self.fingerprint
-    }
-
-    /// Whether this count was produced before dispatch and is eligible for
-    /// `exact_when_verified` once its fingerprint is accepted.
-    pub fn is_prepared(&self) -> bool {
-        self.source.is_prepared()
     }
 }
 
@@ -388,25 +374,7 @@ impl ContextTokens {
             || (other.tokens == self.tokens
                 && other.source.is_prepared()
                 && !self.source.is_prepared());
-        let (tokens, source, fingerprint, fallback) = if other_wins {
-            (
-                other.tokens,
-                other.source,
-                other.fingerprint,
-                other.fallback,
-            )
-        } else {
-            (self.tokens, self.source, self.fingerprint, self.fallback)
-        };
         Self {
-            tokens,
-            estimated_tokens: if other_wins {
-                other.estimated_tokens
-            } else {
-                self.estimated_tokens
-            },
-            source,
-            fingerprint,
             // Both counters describe what the *same* prepared fact would have
             // decided, so keeping either is enough; prefer the larger count and
             // let a tie keep the prepared provenance.
@@ -419,7 +387,7 @@ impl ContextTokens {
                 (Some(value), None) | (None, Some(value)) => Some(value),
                 (None, None) => None,
             },
-            fallback,
+            ..if other_wins { other } else { self }
         }
     }
 }
@@ -483,6 +451,7 @@ pub fn resolve_context_tokens(
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use TokenCountMode::{Estimated, ExactWhenVerified, Shadow};
 
     fn fingerprint() -> TokenizerFingerprint {
         TokenizerFingerprint::from_parts(&["model-a", "{}", "vllm-tokenizer"])
@@ -492,57 +461,30 @@ mod tests {
     fn unobservable_stream_keeps_the_estimate() {
         let prepared = TokenFacts::prepared_token_ids(100, fingerprint());
         let unobservable = ArrivalTokenFacts::new(50, Some(prepared)).with_observability(false);
-        let context = resolve_context_tokens(
-            TokenCountMode::ExactWhenVerified,
-            unobservable,
-            true,
-            false,
-            true,
-        );
+        let context = resolve_context_tokens(ExactWhenVerified, unobservable, true, false, true);
         assert_eq!(context.tokens(), 50);
         assert_eq!(
             context.fallback(),
             Some(TokenFactFallback::UnobservableStream)
         );
         let observable = ArrivalTokenFacts::new(50, Some(prepared));
-        let context = resolve_context_tokens(
-            TokenCountMode::ExactWhenVerified,
-            observable,
-            true,
-            false,
-            true,
-        );
+        let context = resolve_context_tokens(ExactWhenVerified, observable, true, false, true);
         assert_eq!(context.tokens(), 100);
-        assert_eq!(
-            context.source(),
-            crate::program_scheduling::TokenFactSource::PreparedTokenIds
-        );
+        assert_eq!(context.source(), TokenFactSource::PreparedTokenIds);
     }
 
     #[test]
     fn exact_mode_probation_keeps_estimate_until_verified() {
         let prepared = TokenFacts::prepared_token_ids(98_304, fingerprint());
         let arrival = ArrivalTokenFacts::new(4, Some(prepared));
-        let pending = resolve_context_tokens(
-            TokenCountMode::ExactWhenVerified,
-            arrival,
-            true,
-            false,
-            false,
-        );
+        let pending = resolve_context_tokens(ExactWhenVerified, arrival, true, false, false);
         assert_eq!(pending.tokens(), 4);
         assert_eq!(pending.shadow_tokens(), Some(98_304));
         assert_eq!(
             pending.fallback(),
             Some(TokenFactFallback::FingerprintUnverified)
         );
-        let verified = resolve_context_tokens(
-            TokenCountMode::ExactWhenVerified,
-            arrival,
-            true,
-            false,
-            true,
-        );
+        let verified = resolve_context_tokens(ExactWhenVerified, arrival, true, false, true);
         assert_eq!(verified.tokens(), 98_304);
         assert_eq!(verified.fallback(), None);
     }
@@ -563,7 +505,7 @@ mod tests {
             100,
             Some(TokenFacts::prepared_token_ids(98_304, fingerprint())),
         );
-        let context = resolve_context_tokens(TokenCountMode::Estimated, arrival, true, false, true);
+        let context = resolve_context_tokens(Estimated, arrival, true, false, true);
         assert_eq!(context.tokens(), 100);
         assert_eq!(context.source(), TokenFactSource::Estimated);
         assert_eq!(context.shadow_tokens(), None);
@@ -573,7 +515,7 @@ mod tests {
     fn shadow_mode_records_counterfactual_without_changing_decision() {
         let arrival =
             ArrivalTokenFacts::new(4, Some(TokenFacts::client_token_ids(98_304, fingerprint())));
-        let context = resolve_context_tokens(TokenCountMode::Shadow, arrival, true, false, true);
+        let context = resolve_context_tokens(Shadow, arrival, true, false, true);
         assert_eq!(context.tokens(), 4);
         assert_eq!(context.shadow_tokens(), Some(98_304));
     }
@@ -582,13 +524,7 @@ mod tests {
     fn exact_mode_applies_prepared_count_when_allowed() {
         let arrival =
             ArrivalTokenFacts::new(4, Some(TokenFacts::client_token_ids(98_304, fingerprint())));
-        let context = resolve_context_tokens(
-            TokenCountMode::ExactWhenVerified,
-            arrival,
-            true,
-            false,
-            true,
-        );
+        let context = resolve_context_tokens(ExactWhenVerified, arrival, true, false, true);
         assert_eq!(context.tokens(), 98_304);
         assert_eq!(context.source(), TokenFactSource::ClientTokenIds);
         assert_eq!(context.fallback(), None);
@@ -598,20 +534,13 @@ mod tests {
     fn exact_mode_falls_back_when_pool_not_allowed_or_revoked() {
         let arrival =
             ArrivalTokenFacts::new(4, Some(TokenFacts::client_token_ids(98_304, fingerprint())));
-        let not_allowed = resolve_context_tokens(
-            TokenCountMode::ExactWhenVerified,
-            arrival,
-            false,
-            false,
-            true,
-        );
+        let not_allowed = resolve_context_tokens(ExactWhenVerified, arrival, false, false, true);
         assert_eq!(not_allowed.tokens(), 4);
         assert_eq!(
             not_allowed.fallback(),
             Some(TokenFactFallback::PoolNotAllowed)
         );
-        let revoked =
-            resolve_context_tokens(TokenCountMode::ExactWhenVerified, arrival, true, true, true);
+        let revoked = resolve_context_tokens(ExactWhenVerified, arrival, true, true, true);
         assert_eq!(revoked.tokens(), 4);
         assert_eq!(
             revoked.fallback(),
@@ -622,7 +551,7 @@ mod tests {
     #[test]
     fn exact_mode_labels_missing_prepared_fact() {
         let context = resolve_context_tokens(
-            TokenCountMode::ExactWhenVerified,
+            ExactWhenVerified,
             ArrivalTokenFacts::estimated_only(512),
             true,
             false,

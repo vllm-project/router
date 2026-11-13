@@ -952,31 +952,13 @@ impl GenerationRequest for CompletionRequest {
     }
 
     fn exact_input_token_count(&self) -> Option<usize> {
-        // A token-ID prompt counts as the exact Engine input only when the
-        // client also disabled special-token rewriting. With the default
-        // option the Engine may prepend BOS, so `len(prompt)` would be an
-        // estimate rather than the Engine's own count.
-        let rewrites_disabled = self
-            .other
-            .get("add_special_tokens")
-            .and_then(serde_json::Value::as_bool)
-            == Some(false);
-        if !rewrites_disabled {
-            return None;
+        // A batch has no single Program context length.
+        match &self.prompt {
+            PromptInput::IntArray(ids) if !ids.is_empty() => {
+                exact_token_count(ids.len(), &self.other)
+            }
+            _ => None,
         }
-        let tokens = self.prompt.token_array_len()?;
-        // The Engine keeps only the last N tokens when truncation is enabled;
-        // an untruncated count would overstate the Engine input and then be
-        // revoked as a mismatch. `0` and an absent value mean no truncation.
-        let truncate = match self.other.get("truncate_prompt_tokens") {
-            None => None,
-            Some(value) if value.is_null() => None,
-            Some(value) => Some(usize::try_from(value.as_u64()?).ok()?),
-        };
-        Some(match truncate {
-            Some(limit) if limit > 0 && tokens > limit => limit,
-            _ => tokens,
-        })
     }
 
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
@@ -2819,17 +2801,6 @@ impl PromptInput {
         matches!(self, PromptInput::IntArray(_) | PromptInput::IntBatch(_))
     }
 
-    /// Exact token count when the prompt is one token-ID array.
-    ///
-    /// Batched token IDs describe several independent prompts in one request,
-    /// so they have no single Program context length and return `None`.
-    pub fn token_array_len(&self) -> Option<usize> {
-        match self {
-            PromptInput::IntArray(ids) if !ids.is_empty() => Some(ids.len()),
-            _ => None,
-        }
-    }
-
     /// Get the total token count if token-based, otherwise estimate from text
     pub fn estimated_token_count(&self) -> usize {
         match self {
@@ -2845,6 +2816,27 @@ impl PromptInput {
             PromptInput::IntBatch(batches) => batches.iter().map(|b| b.len()).sum(),
         }
     }
+}
+
+/// Shared typed/transparent token-ID counting contract. Special-token
+/// rewriting must be disabled; positive truncation keeps the last N tokens.
+/// Invalid limits fall back rather than guessing the Engine's behavior.
+pub(crate) fn exact_token_count(
+    tokens: usize,
+    options: &serde_json::Map<String, Value>,
+) -> Option<usize> {
+    if options.get("add_special_tokens").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let limit = match options.get("truncate_prompt_tokens") {
+        None | Some(Value::Null) => 0,
+        Some(value) => usize::try_from(value.as_u64()?).ok()?,
+    };
+    Some(if limit == 0 {
+        tokens
+    } else {
+        tokens.min(limit)
+    })
 }
 
 /// LoRA adapter path - can be single path or batch of paths (VLLM extension)
@@ -3318,118 +3310,75 @@ mod tests {
 
     #[test]
     fn settlement_observes_usage_only_when_the_wire_reports_it() {
-        let chat = |body: serde_json::Value| {
-            serde_json::from_value::<ChatCompletionRequest>(body).unwrap()
-        };
-        let base = serde_json::json!({
-            "model": "model-a",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        // Non-streaming bodies always carry usage.
-        assert!(chat(base.clone()).settlement_reports_usage());
-        let streaming = serde_json::json!({
-            "model": "model-a",
-            "messages": [{"role": "user", "content": "hi"}],
-            "stream": true
-        });
-        assert!(!chat(streaming.clone()).settlement_reports_usage());
-        let streaming_with_usage = serde_json::json!({
-            "model": "model-a",
-            "messages": [{"role": "user", "content": "hi"}],
-            "stream": true,
-            "stream_options": {"include_usage": true}
-        });
-        assert!(chat(streaming_with_usage).settlement_reports_usage());
+        for (stream, include_usage, expected) in [
+            (false, None, true),
+            (true, None, false),
+            (true, Some(false), false),
+            (true, Some(true), true),
+        ] {
+            let mut body = serde_json::json!({
+                "model": "model-a", "prompt": [1, 2],
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": stream
+            });
+            if let Some(include_usage) = include_usage {
+                body["stream_options"] = serde_json::json!({"include_usage": include_usage});
+            }
+            let chat: ChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+            let completion: CompletionRequest = serde_json::from_value(body).unwrap();
+            assert_eq!(chat.settlement_reports_usage(), expected);
+            assert_eq!(completion.settlement_reports_usage(), expected);
+        }
+    }
 
-        let completion =
-            |body: serde_json::Value| serde_json::from_value::<CompletionRequest>(body).unwrap();
-        assert!(
-            completion(serde_json::json!({"model": "model-a", "prompt": [1, 2]}))
-                .settlement_reports_usage()
+    /// Both request representations must implement the same Engine contract.
+    fn assert_exact_count(body: serde_json::Value, expected: Option<usize>) {
+        let typed: CompletionRequest = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(typed.exact_input_token_count(), expected, "typed: {body}");
+        assert_eq!(
+            crate::backend::token_count::exact_prompt_tokens_from_json(Some(&body)),
+            expected,
+            "transparent: {body}"
         );
-        assert!(!completion(serde_json::json!({
-            "model": "model-a",
-            "prompt": [1, 2],
-            "stream": true
-        }))
-        .settlement_reports_usage());
     }
 
     #[test]
     fn token_id_prompt_count_applies_engine_truncation() {
-        let request = |truncate: serde_json::Value, prompt: serde_json::Value| {
-            serde_json::from_value::<CompletionRequest>(serde_json::json!({
-                "model": "model-a",
-                "prompt": prompt,
-                "add_special_tokens": false,
-                "truncate_prompt_tokens": truncate,
-                "max_tokens": 4
-            }))
-            .unwrap()
-        };
-        assert_eq!(
-            request(serde_json::json!(2), serde_json::json!([1, 2, 3, 4]))
-                .exact_input_token_count(),
-            Some(2)
-        );
-        assert_eq!(
-            request(serde_json::json!(8), serde_json::json!([1, 2, 3, 4]))
-                .exact_input_token_count(),
-            Some(4)
-        );
-        assert_eq!(
-            request(serde_json::json!(0), serde_json::json!([1, 2, 3, 4]))
-                .exact_input_token_count(),
-            Some(4)
-        );
-        // Invalid or negative limits fall back to the estimator rather than
-        // guessing an Engine-side truncation rule.
-        assert_eq!(
-            request(serde_json::json!("2"), serde_json::json!([1, 2, 3, 4]))
-                .exact_input_token_count(),
-            None
-        );
-        assert_eq!(
-            request(serde_json::json!(null), serde_json::json!([1, 2, 3, 4]))
-                .exact_input_token_count(),
-            Some(4)
-        );
+        for (limit, expected) in [
+            (serde_json::json!(2), Some(2)),
+            (serde_json::json!(8), Some(4)),
+            (serde_json::json!(0), Some(4)),
+            (serde_json::json!(null), Some(4)),
+            (serde_json::json!("2"), None),
+            (serde_json::json!(-1), None),
+        ] {
+            assert_exact_count(
+                serde_json::json!({
+                    "prompt": [1, 2, 3, 4], "add_special_tokens": false,
+                    "truncate_prompt_tokens": limit
+                }),
+                expected,
+            );
+        }
     }
 
     #[test]
     fn token_id_prompt_is_exact_only_when_special_tokens_are_disabled() {
-        let base = serde_json::json!({
-            "model": "model-a",
-            "prompt": [11, 12, 13, 14],
-            "max_tokens": 4
-        });
-        let without_option: CompletionRequest = serde_json::from_value(base.clone()).unwrap();
-        assert_eq!(without_option.exact_input_token_count(), None);
-
-        let with_option: CompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "model-a",
-            "prompt": [11, 12, 13, 14],
-            "add_special_tokens": false,
-            "max_tokens": 4
-        }))
-        .unwrap();
-        assert_eq!(with_option.exact_input_token_count(), Some(4));
-
-        let text_prompt: CompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "model-a",
-            "prompt": "hello",
-            "add_special_tokens": false
-        }))
-        .unwrap();
-        assert_eq!(text_prompt.exact_input_token_count(), None);
-
-        let batch_prompt: CompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "model-a",
-            "prompt": [[1, 2], [3, 4, 5]],
-            "add_special_tokens": false
-        }))
-        .unwrap();
-        assert_eq!(batch_prompt.exact_input_token_count(), None);
+        let base = serde_json::json!({"model": "model-a", "prompt": [11, 12, 13, 14]});
+        assert_exact_count(base.clone(), None);
+        for (prompt, expected) in [
+            (serde_json::json!([11, 12, 13, 14]), Some(4)),
+            (serde_json::json!("hello"), None),
+            (serde_json::json!([[1, 2], [3, 4, 5]]), None),
+            (serde_json::json!([]), None),
+        ] {
+            let mut body = base.clone();
+            body["prompt"] = prompt;
+            body["add_special_tokens"] = serde_json::json!(true);
+            assert_exact_count(body.clone(), None);
+            body["add_special_tokens"] = serde_json::json!(false);
+            assert_exact_count(body, expected);
+        }
     }
 
     #[test]

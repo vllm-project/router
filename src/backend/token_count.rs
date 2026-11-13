@@ -108,15 +108,6 @@ pub(crate) fn client_token_ids_fingerprint(
 /// token-ID array.
 pub(crate) fn exact_prompt_tokens_from_json(request: Option<&serde_json::Value>) -> Option<usize> {
     let request = request?;
-    // The Engine must not prepend special tokens for `len(prompt)` to be the
-    // exact Engine input count.
-    if request
-        .get("add_special_tokens")
-        .and_then(serde_json::Value::as_bool)
-        != Some(false)
-    {
-        return None;
-    }
     let array = request.get("prompt")?.as_array()?;
     if array.is_empty() {
         return None;
@@ -124,54 +115,84 @@ pub(crate) fn exact_prompt_tokens_from_json(request: Option<&serde_json::Value>)
     if !array.iter().all(|value| value.as_u64().is_some()) {
         return None;
     }
-    // The Engine keeps only the last N tokens; `0`/absent means no truncation.
-    // An invalid limit falls back to the estimator instead of guessing.
-    let truncate = match request.get("truncate_prompt_tokens") {
-        None => None,
-        Some(value) if value.is_null() => None,
-        Some(value) => Some(usize::try_from(value.as_u64()?).ok()?),
-    };
-    let tokens = array.len();
-    Some(match truncate {
-        Some(limit) if limit > 0 && tokens > limit => limit,
-        _ => tokens,
-    })
+    crate::protocols::spec::exact_token_count(array.len(), request.as_object()?)
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
+
+    fn fingerprint(overrides: Value) -> TokenizerFingerprint {
+        let mut body = json!({
+            "model": "model", "messages": [{"role": "user", "content": "hello"}],
+            "chat_template_kwargs": {"enable_thinking": false},
+            "vllm_xargs": {"agentic_context": "{\"program_id\":\"p1\"}"},
+            "metadata": {"trace": "abc"}
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(overrides.as_object().unwrap().clone());
+        prepared_chat_fingerprint(&serde_json::from_value(body).unwrap(), "vllm-tokenizer")
+    }
+
+    #[test]
+    fn prepared_fingerprint_ignores_per_request_identity() {
+        assert_eq!(
+            fingerprint(json!({})),
+            fingerprint(json!({
+                "vllm_xargs": {"agentic_context": "{\"program_id\":\"p2\"}"}
+            })),
+            "identity fields must not split the class"
+        );
+    }
+
+    #[test]
+    fn prepared_fingerprint_tracks_template_and_tool_options() {
+        let base = fingerprint(json!({}));
+        for change in [
+            json!({"chat_template_kwargs": {"enable_thinking": true}}),
+            json!({"tools": [{"type": "function", "function": {
+                "name": "shell", "parameters": {"type": "object"}
+            }}]}),
+            json!({"add_special_tokens": true}),
+        ] {
+            assert_ne!(base, fingerprint(change.clone()), "{change}");
+        }
+    }
 
     #[test]
     fn response_format_must_have_its_own_verification_class() {
-        let request = |format: serde_json::Value| -> ChatCompletionRequest {
-            serde_json::from_value(serde_json::json!({
-                "model": "model", "messages": [{"role": "user", "content": "hello"}],
-                "response_format": format
-            }))
-            .unwrap()
-        };
         assert_ne!(
-            prepared_chat_fingerprint(&request(serde_json::Value::Null), "vllm-tokenizer"),
-            prepared_chat_fingerprint(
-                &request(serde_json::json!({"type":"json_object"})),
-                "vllm-tokenizer"
-            )
+            fingerprint(json!({"response_format": null})),
+            fingerprint(json!({"response_format": {"type": "json_object"}}))
         );
     }
 
     #[test]
     fn reasoning_effort_must_have_its_own_verification_class() {
-        let request = |effort: &str| -> ChatCompletionRequest {
-            serde_json::from_value(serde_json::json!({
-                "model":"model", "messages":[{"role":"user","content":"hello"}],
-                "reasoning_effort":effort
-            }))
-            .unwrap()
-        };
         assert_ne!(
-            prepared_chat_fingerprint(&request("none"), "vllm-tokenizer"),
-            prepared_chat_fingerprint(&request("high"), "vllm-tokenizer")
+            fingerprint(json!({"reasoning_effort": "none"})),
+            fingerprint(json!({"reasoning_effort": "high"}))
         );
+    }
+
+    #[test]
+    fn client_token_ids_fingerprint_changes_with_pool_and_model() {
+        let base = client_token_ids_fingerprint(Some("model-a"), "model-a", "/v1/completions");
+        assert_eq!(
+            base,
+            client_token_ids_fingerprint(Some("model-a"), "model-a", "/v1/completions")
+        );
+        for (model, pool, endpoint) in [
+            ("model-b", "model-a", "/v1/completions"),
+            ("model-a", "other-pool", "/v1/completions"),
+            ("model-a", "model-a", "/v1/chat/completions"),
+        ] {
+            assert_ne!(
+                base,
+                client_token_ids_fingerprint(Some(model), pool, endpoint)
+            );
+        }
     }
 }
