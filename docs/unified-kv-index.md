@@ -40,14 +40,14 @@ Router 保存缓存位置的元数据，实际 KV 张量仍在引擎中。它要
 
 ```mermaid
 flowchart TB
-  F[旧全注意力事件] --> D[连续路径入口：沿用树插入、分裂、锚点]
-  H[混合注意力事件] --> S[稀疏入口：校验并写入实际发布的 hash]
-  D --> R[同一事实表：GroupShard.reverse]
+  F["旧全注意力事件"] --> D["连续路径入口：沿用树插入、分裂、锚点"]
+  H["混合注意力事件"] --> S["稀疏入口：校验并写入实际发布的 hash"]
+  D --> R["同一事实表：GroupShard.reverse"]
   S --> R
-  T[共享压缩前缀树：连续路径的派生索引] <--> R
-  R --> Q[同一目标的缓存证据]
-  Q --> L[按布局解释连续页、检查点、滑窗、压缩状态]
-  L --> P[原有 TierMatch 与路由评分]
+  T["共享压缩前缀树：连续路径的派生索引"] <--> R
+  R --> Q["同一目标的缓存证据"]
+  Q --> L["按布局解释连续页、检查点、滑窗、压缩状态"]
+  L --> P["原有 TierMatch 与路由评分"]
 ```
 
 - 旧全注意力保留按本地内容 hash 遍历共享树的能力，包括可验证的旧 hash/parent 语义。
@@ -198,11 +198,11 @@ reverse[(Worker{source=W1, dp_rank=1, incarnation=8}, GPU)]
 
 ```mermaid
 flowchart LR
-  R[root] --> AB[A · B，共用前 32 tokens]
-  AB --> CD[C · D]
-  AB --> XY[X · Y]
-  CD -.记录.-> W1[W1/rank0]
-  XY -.记录.-> W2[W2/rank0]
+  R["root"] --> AB["A · B，共用前 32 tokens"]
+  AB --> CD["C · D"]
+  AB --> XY["X · Y"]
+  CD -.-> W1["W1/rank0"]
+  XY -.-> W2["W2/rank0"]
 ```
 
 | 步骤 | 树的变化 | 事实表变化 |
@@ -250,14 +250,14 @@ sequenceDiagram
 
 ```mermaid
 flowchart TB
-  Q[请求：tokens、身份、目标、复用上限] --> C{布局类型}
-  C -->|旧全注意力| T[本地内容 hash 遍历共享树]
-  C -->|混合| H[按目标根 hash 重建完整前缀链]
-  T --> F[读取统一事实表的目录和记录]
+  Q["请求：tokens、身份、目标、复用上限"] --> C{"布局类型"}
+  C -->|旧全注意力| T["本地内容 hash 遍历共享树"]
+  C -->|混合| H["按目标根 hash 重建完整前缀链"]
+  T --> F["读取统一事实表的目录和记录"]
   H --> F
-  F --> G[得到同一目标各组的边界证据]
-  G --> B[按恢复规则求共同边界]
-  B --> S[replay 扣减、hash 对齐、原评分]
+  F --> G["得到同一目标各组的边界证据"]
+  G --> B["按恢复规则求共同边界"]
+  B --> S["replay 扣减、hash 对齐、原评分"]
 ```
 
 请求级禁读、prompt scoring、LoRA、salt 等先经过原有准入判断。混合布局失信时返回无缓存信用，不能落回单组全注意力查询而绕过其他必需组。
@@ -300,11 +300,11 @@ G0 中 h3、h4 可以仍在，内容路径也可以仍在，但不能跨过 h2 �
 
 ```mermaid
 flowchart LR
-  R[Remove：来源、组、hash、tier] --> O[定位本 owner 的观察]
-  O --> F[从 reverse 删除匹配项]
-  F --> A[检查相关别名是否仍有观察]
-  A --> T[必要时移除树上的派生目录]
-  T --> K[保留其他 owner 的路径与记录]
+  R["Remove：来源、组、hash、tier"] --> O["定位本 owner 的观察"]
+  O --> F["从 reverse 删除匹配项"]
+  F --> A["检查相关别名是否仍有观察"]
+  A --> T["必要时移除树上的派生目录"]
+  T --> K["保留其他 owner 的路径与记录"]
 ```
 
 “更新”使用同样的增删操作：经验证可独立恢复的 CPU 副本先 Store，GPU 副本再 Remove；只保留 CPU 后按原有传输成本评分。不能把任意 CPU placeholder 或 chunk 内成员 hash 当作独立可恢复副本。
@@ -338,10 +338,10 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-  B[全局屏障：普通操作共享，清池/退休独占] --> W1[W1/rank0 来源读写锁]
-  B --> W2[W2/rank0 来源读写锁]
-  W1 --> G0[G0 拓扑锁：树分裂和回收]
-  W1 --> G1[G1 拓扑锁]
+  B["全局屏障：普通操作共享，清池/退休独占"] --> W1["W1/rank0 来源读写锁"]
+  B --> W2["W2/rank0 来源读写锁"]
+  W1 --> G0["G0 拓扑锁：树分裂和回收"]
+  W1 --> G1["G1 拓扑锁"]
   W2 --> G0
   W2 --> G1
 ```
@@ -420,12 +420,12 @@ src/kv_hash.rs               # 复用现有 hash 算法
 
 ```mermaid
 flowchart LR
-  W[workers：发现并绑定来源] --> E[events：解释外部事件]
-  E --> I[index：共享事实]
-  W --> L[layout：验证模型恢复规则]
-  I --> Q[query：取快照与组合]
+  W["workers：发现并绑定来源"] --> E["events：解释外部事件"]
+  E --> I["index：共享事实"]
+  W --> L["layout：验证模型恢复规则"]
+  I --> Q["query：取快照与组合"]
   L --> Q
-  Q --> P[policy：评分选路]
+  Q --> P["policy：评分选路"]
 ```
 
 | 层 | 负责 | 不应承担 |
