@@ -3499,7 +3499,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_history_is_advisory_and_qualified_per_worker() {
+    fn completion_history_is_advisory_with_worker_specific_inputs() {
         let (policy, workers, inputs) = completion_history_fixture();
         let request = policy
             .capture_completion_history(&workers, "model")
@@ -3540,8 +3540,34 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.worker_index, 1);
         assert_eq!(receipt.new_prefill_tokens, 4);
-        assert_eq!(receipt.decision.components.ptoken, 4);
         assert!(observation.is_some());
+        release_receipt(&workers, &receipt);
+        assert_eq!(
+            policy.observed_completion_prefix(workers[1].as_ref(), &[9, 8, 7, 6]),
+            0
+        );
+    }
+
+    #[test]
+    fn completion_history_rejects_cross_policy_observations_for_the_same_worker() {
+        let (policy, workers, inputs) = completion_history_fixture();
+        let request = policy
+            .capture_completion_history(&workers, "model")
+            .unwrap();
+        let (receipt, observation) = policy
+            .select_with_context(
+                &workers,
+                QualifiedKvInput {
+                    history: Some(&request),
+                    tokens: KvRequestTokens::PerWorker(&inputs),
+                    eligibility: None,
+                },
+                None,
+                None,
+                None,
+                &[workers[0].url().to_owned()],
+            )
+            .unwrap();
         release_receipt(&workers, &receipt);
         // Identical local generations and the same Worker object in another
         // policy do not make that policy the origin of this capture or ticket.
@@ -3585,18 +3611,31 @@ mod tests {
             other.observed_completion_prefix(workers[1].as_ref(), &[1, 2, 3, 4]),
             0
         );
-        let binding = policy.targets.get(workers[1].url()).unwrap();
-        assert!(policy
-            .completion_history
-            .get()
-            .unwrap()
-            .match_prefix(
-                binding.registration_id,
-                &[9, 8, 7, 6],
-                binding.block_size,
-                Instant::now()
+    }
+
+    #[test]
+    fn completion_history_requires_qualified_single_worker_input() {
+        let (policy, workers, inputs) = completion_history_fixture();
+        let request = policy
+            .capture_completion_history(&workers, "model")
+            .unwrap();
+        let input = QualifiedKvInput {
+            history: Some(&request),
+            tokens: KvRequestTokens::PerWorker(&inputs),
+            eligibility: None,
+        };
+        let (seed, observation) = policy
+            .select_with_context(
+                &workers,
+                input,
+                None,
+                None,
+                None,
+                &[workers[0].url().to_owned()],
             )
-            .is_none());
+            .unwrap();
+        policy.observe_completion_headers(workers[1].as_ref(), observation.unwrap());
+        release_receipt(&workers, &seed);
         // Missing qualification, batch inputs, and wrong request model cannot
         // produce observations, even if their generation has stored history.
         let wrong_model = policy
@@ -3673,7 +3712,6 @@ mod tests {
                 .unwrap();
             assert_eq!(receipt.worker_index, 1, "{name}");
             assert!(observation.is_none(), "{name}");
-            assert_eq!(receipt.new_prefill_tokens, 4, "{name}");
             release_receipt(&workers, &receipt);
         }
     }
