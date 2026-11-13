@@ -717,6 +717,13 @@ impl ConfigValidator {
                         .to_string(),
                 });
             }
+            if pd_mode && program.prediction_profile.mode == PredictionMode::Active {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason:
+                        "active return-time prediction does not support vLLM PD mode; use off or shadow"
+                            .to_string(),
+                });
+            }
             if pd_mode {
                 program
                     .pd
@@ -1139,6 +1146,30 @@ mod tests {
             Some("/definitely/missing/prediction-profile.json".to_string());
 
         assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
+    }
+
+    #[test]
+    fn active_return_prediction_rejects_pd_mode() {
+        let mut config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), Some(8081))],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            PolicyConfig::Random,
+        );
+        let mut program = ProgramSchedulingConfig {
+            token_capacity_per_dp_rank: Some(1_000),
+            enable_batch_gain_admission: false,
+            ..Default::default()
+        };
+        program.prediction_profile.mode = PredictionMode::Active;
+        config.program_scheduling = Some(program);
+
+        let error = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(error.contains("active return-time prediction does not support vLLM PD mode"));
     }
 
     #[test]

@@ -6,6 +6,26 @@
 use super::ProgressTtlFactors;
 use std::time::Duration;
 
+/// Victim ordering used when logical occupancy exceeds the repair watermark.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityRepairPolicy {
+    /// Preserve the original Progress-TTL age/context ordering.
+    #[default]
+    Legacy,
+    /// Release the least valuable applied TTL protection first.
+    RetentionValue,
+}
+
+impl CapacityRepairPolicy {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::RetentionValue => "retention_value",
+        }
+    }
+}
+
 /// Offline-calibrated cold-prefill cost model.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -66,6 +86,8 @@ pub struct ProgressTtlConfig {
     pub high_watermark_ratio: f64,
     /// Admission and resume capacity ratio.
     pub low_watermark_ratio: f64,
+    /// Victim ordering used by capacity repair.
+    pub capacity_repair_policy: CapacityRepairPolicy,
     /// Maximum cache-continuous service rounds before pressure may yield.
     pub max_segment_rounds: usize,
     /// Fixed sample count required before rolling estimates are active.
@@ -86,6 +108,7 @@ impl Default for ProgressTtlConfig {
             max_acting_ttl: Duration::from_secs(10),
             high_watermark_ratio: 1.0,
             low_watermark_ratio: 1.0,
+            capacity_repair_policy: CapacityRepairPolicy::default(),
             max_segment_rounds: 14,
             stats_window_size: 100,
             enable_batch_gain_admission: true,

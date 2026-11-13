@@ -44,8 +44,8 @@ pub use observations::{
     VllmMetricsObservationProvider,
 };
 pub use policy::{
-    BatchGainEstimate, BatchGainInputs, DecodeThroughputModel, PrefillCostModel, ProgressTtlConfig,
-    ProgressTtlPolicyMath,
+    BatchGainEstimate, BatchGainInputs, CapacityRepairPolicy, DecodeThroughputModel,
+    PrefillCostModel, ProgressTtlConfig, ProgressTtlPolicyMath,
 };
 pub use request_pool::ProgramRequestHandle;
 pub use runtime::ProgramRuntime;

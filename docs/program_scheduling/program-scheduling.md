@@ -106,6 +106,7 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 | `max_acting_ttl_seconds` | `10.0` | Caps the request-specific acting TTL chosen from the mature interval window and cache-miss impact. Before the window is complete, the automatic TTL is `0`; request-scoped `kv_retention_ttl_seconds` overrides the computed value. |
 | `high_watermark_ratio` | `1.0` | Multiplies token capacity to define when capacity repair starts pausing reasoning Programs. It must be greater than or equal to `low_watermark_ratio`. |
 | `low_watermark_ratio` | `1.0` | Multiplies token capacity to define the admission/resume limit and the occupancy target of capacity repair. Lower values leave more free KV headroom. |
+| `capacity_repair_policy` | `legacy` | Selects capacity-repair victim ordering. `legacy` preserves the original age/context heuristic. `retention_value` first releases the lowest applied-TTL value, calculated from remaining or last-applied TTL and cache-miss impact, then uses the legacy order as a deterministic tie-breaker. Both policies preserve the same watermarks and capacity-safety fallback. |
 | `max_segment_rounds` | `14` | Caps the rolling estimate of protected continuous-service rounds. An idle Program that reaches this limit yields under local queue pressure and receives one-shot lower resume priority. |
 | `stats_window_size` | `100` | Sets the fixed number of valid samples required before request-growth and continuity estimates become active, and bounds their rolling windows. Until then, growth reserve is zero and automatic acting TTL is zero. |
 | `enable_batch_gain_admission` | `true` | Allows modeled decode batch gain to bypass only the continuous-growth reserve when it covers candidate recovery and continuity-loss costs. It never bypasses immediate capacity or Program-count limits. |
@@ -120,6 +121,9 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 ## Canonical request metadata
 
 The canonical contract is `vllm_xargs.agentic_context`. Identity semantics match AgentInfer EngineCore.
+Agent and harness authors implementing workflow-conditioned return-time TTL should also follow the
+[agent integration contract](agent-integration.md), which defines field stability, terminal signaling,
+classification cardinality, and rollout validation.
 
 ```json
 {
@@ -240,10 +244,9 @@ Report absolute and relative results for job completion time, request throughput
 
 Progress-TTL currently protects KV indirectly by controlling request admission. Physical eviction, offload, and prefetch are not executed by this feature. A future Router-to-engine KV hint must receive explicit `accepted`, `rejected`, or `unsupported` feedback and an eventual `applied`, `failed`, or `expired` result. Router residency accounting must not change until the engine reports `applied`.
 
-## Workflow prediction shadow profiles
+## Workflow prediction profiles
 
-Program scheduling can collect two independent shadow signals without changing
-TTL, pause ordering, or admission:
+Program scheduling can collect two independent workflow signals:
 
 - Return-time prediction conditions completion-to-next-arrival intervals on
   stable workflow identity. Explicit terminal completions contribute
@@ -256,7 +259,9 @@ TTL, pause ordering, or admission:
 Requests may supply `workflow_profile_id` and `profile_version` inside
 `vllm_xargs.agentic_context`. These values select a compatible offline seed;
 they are never metric labels. Both predictors always maintain a bounded online
-overlay when `prediction_profile.mode` is `shadow`.
+overlay when `prediction_profile.mode` is `shadow` or `active`.
+See [Agent integration for workflow TTL prediction](agent-integration.md) for
+the complete agent-side metadata and lifecycle contract.
 
 ```json
 {
@@ -293,11 +298,14 @@ snapshot uses the same schema, so an operator may validate and promote it as a
 future offline seed. File serialization and replacement occur outside the
 scheduler mutex.
 
-In V0, `off` and `shadow` are the only modes. Shadow predictions are visible in
-structured logs, `/scheduling_diagnostics`, and bounded-cardinality metrics,
-but real decisions continue to use the existing rank-level fitted TTL and
-`decode_buffer_tokens` fallback. Activation requires a separate rollout after
-calibration has been evaluated.
+`off` disables collection and prediction. `shadow` exposes both predictions in
+structured logs, `/scheduling/diagnostics`, and bounded-cardinality metrics
+without changing decisions. In regular HTTP mode, `active` replaces the
+rank-level fitted acting TTL with a mature key-conditioned `suggested_ttl`.
+Request-scoped `kv_retention_ttl_seconds` remains authoritative, and an
+unavailable or insufficiently supported return prediction falls back to the
+existing fitted TTL. Output-length prediction remains observational in this
+branch. vLLM PD mode accepts only `off` or `shadow`.
 
 ## PD Program scheduling
 

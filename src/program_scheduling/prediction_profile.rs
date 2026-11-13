@@ -610,6 +610,7 @@ fn best_ttl(
     if total <= 0.0 || cache_miss_cost <= 0.0 || max_ttl <= 0.0 {
         return 0.0;
     }
+    let max_ttl = max_ttl.min(cache_miss_cost);
     let mut best = (0.0, 0.0);
     let last_bound = bounds.last().copied().unwrap_or(0.0);
     let overflow_upper = if max_observed > last_bound {
@@ -635,7 +636,10 @@ fn best_ttl(
             retained_cost += probability * upper.min(candidate);
         }
         let utility = cache_miss_cost * hit_probability - retained_cost;
-        if utility >= best.1 {
+        // Equal utility does not justify a longer reservation. Keeping the
+        // earliest candidate preserves distinct return-time buckets instead of
+        // collapsing every fully covered histogram onto the TTL cap.
+        if utility > best.1 {
             best = (candidate, utility);
         }
     }
@@ -710,6 +714,26 @@ mod tests {
     #[test]
     fn overflow_returns_are_not_hits_at_the_final_ttl_boundary() {
         assert_eq!(best_ttl(&[0.0, 1.0], 0.0, &[10.0], 100.0, 10.0, 20.0), 0.0);
+    }
+
+    #[test]
+    fn best_ttl_keeps_observed_return_bucket_when_later_utility_ties() {
+        let bounds = [1.0, 2.0, 5.0, 10.0];
+        let fast = best_ttl(&[20.0, 0.0, 0.0, 0.0, 0.0], 0.0, &bounds, 8.0, 10.0, 1.0);
+        let slow = best_ttl(&[0.0, 0.0, 20.0, 0.0, 0.0], 0.0, &bounds, 8.0, 10.0, 5.0);
+
+        assert_eq!(fast, 1.0);
+        assert_eq!(slow, 5.0);
+    }
+
+    #[test]
+    fn best_ttl_with_no_return_mass_still_separates_fast_and_slow_returns() {
+        let bounds = [1.0, 2.0, 5.0, 10.0];
+        let fast = best_ttl(&[20.0, 0.0, 0.0, 0.0, 0.0], 20.0, &bounds, 8.0, 10.0, 1.0);
+        let slow = best_ttl(&[0.0, 0.0, 20.0, 0.0, 0.0], 20.0, &bounds, 8.0, 10.0, 5.0);
+
+        assert_eq!(fast, 1.0);
+        assert_eq!(slow, 0.0);
     }
 
     #[test]

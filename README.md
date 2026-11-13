@@ -249,6 +249,8 @@ For detailed configuration options, hash key priorities, and usage examples, see
 
 For the optional agent metadata contract, scheduling enablement, request-scoped hints, and engine KV-control boundary, see [Program Scheduling](docs/program_scheduling/program-scheduling.md).
 
+For agent and harness integration with workflow-conditioned return-time TTL, see [Agent integration for workflow TTL prediction](docs/program_scheduling/agent-integration.md).
+
 For Program-scoped PD scheduling (D-rank affinity, admission, bounded prefill permits) and warm remote KV reuse with automatic TTL, see [PD Program Scheduling](docs/program_scheduling/pd-program-scheduling.md).
 
 ## Advanced Features

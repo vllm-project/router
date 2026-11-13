@@ -4,8 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 use crate::program_scheduling::{
-    DecodeThroughputModel, PrefillCostModel, ProgramBindingStrategy, ProgramResumeOrder,
-    ProgramSchedulingEnableKey,
+    CapacityRepairPolicy, DecodeThroughputModel, PrefillCostModel, ProgramBindingStrategy,
+    ProgramResumeOrder, ProgramSchedulingEnableKey,
 };
 
 /// Main router configuration
@@ -138,9 +138,13 @@ pub enum PredictionMode {
     /// Collect and evaluate predictions without changing scheduling decisions.
     #[default]
     Shadow,
+    /// Use mature return-time predictions for regular-HTTP acting TTL decisions.
+    ///
+    /// Output-length prediction remains observational in this mode.
+    Active,
 }
 
-/// Shared configuration for workflow-profile shadow predictors.
+/// Shared configuration for workflow-profile predictors.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PredictionProfileConfig {
     #[serde(default)]
@@ -422,6 +426,8 @@ pub struct ProgramSchedulingConfig {
     pub high_watermark_ratio: f64,
     #[serde(default = "default_program_low_watermark_ratio")]
     pub low_watermark_ratio: f64,
+    #[serde(default)]
+    pub capacity_repair_policy: CapacityRepairPolicy,
     #[serde(default = "default_program_max_segment_rounds")]
     pub max_segment_rounds: usize,
     #[serde(default = "default_program_stats_window_size")]
@@ -546,6 +552,7 @@ impl Default for ProgramSchedulingConfig {
             max_acting_ttl_seconds: default_program_max_acting_ttl_seconds(),
             high_watermark_ratio: default_program_high_watermark_ratio(),
             low_watermark_ratio: default_program_low_watermark_ratio(),
+            capacity_repair_policy: CapacityRepairPolicy::default(),
             max_segment_rounds: default_program_max_segment_rounds(),
             stats_window_size: default_program_stats_window_size(),
             enable_batch_gain_admission: default_program_enable_batch_gain_admission(),
@@ -605,6 +612,8 @@ struct ProgramSchedulingConfigInput {
     high_watermark_ratio: f64,
     #[serde(default = "default_program_low_watermark_ratio")]
     low_watermark_ratio: f64,
+    #[serde(default)]
+    capacity_repair_policy: CapacityRepairPolicy,
     #[serde(default = "default_program_max_segment_rounds")]
     max_segment_rounds: usize,
     #[serde(default = "default_program_stats_window_size")]
@@ -720,6 +729,7 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             max_acting_ttl_seconds: input.max_acting_ttl_seconds,
             high_watermark_ratio: input.high_watermark_ratio,
             low_watermark_ratio: input.low_watermark_ratio,
+            capacity_repair_policy: input.capacity_repair_policy,
             max_segment_rounds: input.max_segment_rounds,
             stats_window_size: input.stats_window_size,
             enable_batch_gain_admission: input.enable_batch_gain_admission,
@@ -1601,6 +1611,26 @@ mod tests {
         let serialized = serde_json::to_value(legacy).unwrap();
         assert_eq!(serialized["token_capacity_per_dp_rank"], 456);
         assert!(serialized.get("token_capacity_per_target").is_none());
+    }
+
+    #[test]
+    fn program_scheduling_capacity_repair_policy_is_opt_in() {
+        let defaults: ProgramSchedulingConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            defaults.capacity_repair_policy,
+            CapacityRepairPolicy::Legacy
+        );
+
+        let configured: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"capacity_repair_policy":"retention_value"}"#).unwrap();
+        assert_eq!(
+            configured.capacity_repair_policy,
+            CapacityRepairPolicy::RetentionValue
+        );
+        assert_eq!(
+            serde_json::to_value(configured).unwrap()["capacity_repair_policy"],
+            "retention_value"
+        );
     }
 
     #[test]
