@@ -29,6 +29,7 @@ use super::openai::{
     completion_final_response, final_response, finish_reason_name, now_secs, sse_chunk,
     sse_usage_chunk, SSE_DONE,
 };
+use super::outcome::EngineOutcomeObserver;
 use super::pb::control_client::ControlClient;
 use super::pb::finish_info::FinishReason;
 use super::pb::inference_client::InferenceClient;
@@ -338,6 +339,7 @@ impl GrpcEngineBackend {
         prepared: PreparedRequest,
         on_first_output: Option<FirstOutputCallback>,
         handoff: KvHandoff,
+        observer: Option<std::sync::Arc<EngineOutcomeObserver>>,
     ) -> Response {
         let PreparedRequest {
             request,
@@ -469,6 +471,7 @@ impl GrpcEngineBackend {
             on_first_output,
             fail_on_abort: abort_request_id.is_some(),
             abort,
+            observer,
         };
         if request.stream {
             stream_openai(stream, reply, n_prompt_tokens).await
@@ -501,6 +504,7 @@ struct ChatReply {
     /// path can cancel P instead of returning an aborted reply as success.
     fail_on_abort: bool,
     abort: EngineAbortGuard,
+    observer: Option<std::sync::Arc<EngineOutcomeObserver>>,
 }
 
 fn fill_engine_ms(stages: &mut serde_json::Value) {
@@ -522,6 +526,21 @@ fn fill_engine_ms(stages: &mut serde_json::Value) {
     if let Some(first) = first {
         stages["engine_ms"] = serde_json::json!(first - pre);
     }
+}
+
+/// Settle the producer's terminal `finish_reason` for a streaming attempt.
+///
+/// The body ends normally after `finish_reason="abort"`, so the attempt must
+/// record an error (and therefore settle as failed) rather than succeeding on
+/// EOF.
+fn record_finish_outcome(observer: Option<&EngineOutcomeObserver>, finish: Option<&str>) -> bool {
+    let aborted = finish == Some("abort");
+    if aborted {
+        if let Some(observer) = observer {
+            observer.record_error();
+        }
+    }
+    !aborted
 }
 
 async fn stream_openai(
@@ -546,6 +565,7 @@ async fn stream_openai(
         on_first_output: _,
         fail_on_abort: _,
         abort,
+        observer,
     } = reply;
     let header_stages = stages.clone();
     let stages_on = crate::backend::stages_enabled();
@@ -560,12 +580,16 @@ async fn stream_openai(
             let mut first = true;
             let mut first_token_logged = false;
             let mut prompt_tokens = n_prompt_tokens as u32;
+            let mut engine_prompt_tokens: Option<u32> = None;
             let mut completion_tokens = 0u32;
             loop {
                 let item = match tokio::time::timeout(request_timeout, stream.next()).await {
                     Ok(Some(item)) => item,
                     Ok(None) => break,
                     Err(_) => {
+                        if let Some(observer) = &observer {
+                            observer.record_error();
+                        }
                         let _ = send_stream_chunk(
                             &tx,
                             &mut producer_output_frame,
@@ -584,6 +608,7 @@ async fn stream_openai(
                         }
                         if let Some(info) = &msg.prompt_info {
                             prompt_tokens = info.num_prompt_tokens;
+                            engine_prompt_tokens = Some(info.num_prompt_tokens);
                         }
                         if let Some(outputs) = &msg.outputs {
                             completion_tokens =
@@ -593,6 +618,9 @@ async fn stream_openai(
                             match output_text_and_finish(&msg, &mut detok, prefer_worker_text) {
                                 Ok(output) => output,
                                 Err(error) => {
+                                    if let Some(observer) = &observer {
+                                        observer.record_error();
+                                    }
                                     let _ = send_stream_chunk(
                                         &tx,
                                         &mut producer_output_frame,
@@ -659,6 +687,12 @@ async fn stream_openai(
                             first = false;
                         }
                         if finish.is_some() {
+                            if let Some(observer) = &observer {
+                                observer.record_usage(
+                                    engine_prompt_tokens.map(|tokens| tokens as usize),
+                                    completion_tokens as usize,
+                                );
+                            }
                             if include_usage {
                                 let usage = Usage {
                                     prompt_tokens,
@@ -677,10 +711,13 @@ async fn stream_openai(
                                 SSE_DONE.to_string(),
                                 false,
                             );
-                            return finish.as_deref() != Some("abort");
+                            return record_finish_outcome(observer.as_deref(), finish.as_deref());
                         }
                     }
                     Err(status) => {
+                        if let Some(observer) = &observer {
+                            observer.record_error();
+                        }
                         let _ = send_stream_chunk(
                             &tx,
                             &mut producer_output_frame,
@@ -693,6 +730,9 @@ async fn stream_openai(
                         return false;
                     }
                 }
+            }
+            if let Some(observer) = &observer {
+                observer.record_error();
             }
             let _ = send_stream_chunk(
                 &tx,
@@ -748,6 +788,7 @@ async fn collect_openai(
         on_first_output,
         fail_on_abort,
         abort,
+        observer,
     } = reply;
     let mut detok = tok
         .as_ref()
@@ -756,6 +797,7 @@ async fn collect_openai(
     let mut token_ids: Vec<u32> = Vec::new();
     let mut finish = None;
     let mut prompt_tokens = prompt_ids.len() as u32;
+    let mut engine_prompt_tokens: Option<u32> = None;
     let mut completion_tokens = 0u32;
     let mut first_output_seen = false;
     loop {
@@ -763,6 +805,9 @@ async fn collect_openai(
             Ok(Some(item)) => item,
             Ok(None) => break,
             Err(_) => {
+                if let Some(observer) = &observer {
+                    observer.record_error();
+                }
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
                     "gRPC stream exceeded request timeout",
@@ -778,11 +823,15 @@ async fn collect_openai(
                 }
                 if let Some(info) = &msg.prompt_info {
                     prompt_tokens = info.num_prompt_tokens;
+                    engine_prompt_tokens = Some(info.num_prompt_tokens);
                 }
                 let (delta, reason) =
                     match output_text_and_finish(&msg, &mut detok, prefer_worker_text) {
                         Ok(output) => output,
                         Err(error) => {
+                            if let Some(observer) = &observer {
+                                observer.record_error();
+                            }
                             return (StatusCode::BAD_GATEWAY, error).into_response();
                         }
                     };
@@ -810,6 +859,9 @@ async fn collect_openai(
                 }
             }
             Err(status) => {
+                if let Some(observer) = &observer {
+                    observer.record_error();
+                }
                 return (
                     StatusCode::BAD_GATEWAY,
                     format!("grpc stream: {}", status.message()),
@@ -819,15 +871,27 @@ async fn collect_openai(
         }
     }
     if finish.is_none() {
+        if let Some(observer) = &observer {
+            observer.record_error();
+        }
         return (
             StatusCode::BAD_GATEWAY,
             "gRPC stream closed before finish_info",
         )
             .into_response();
     }
+    if let Some(observer) = &observer {
+        observer.record_usage(
+            engine_prompt_tokens.map(|tokens| tokens as usize),
+            completion_tokens as usize,
+        );
+    }
     abort.disarm();
     if fail_on_abort && finish.as_deref() == Some("abort") {
         warn!(%request_id, "gRPC decode finished aborted");
+        if let Some(observer) = &observer {
+            observer.record_error();
+        }
         return (StatusCode::BAD_GATEWAY, "gRPC decode finished aborted").into_response();
     }
     let mut resp = match shape {
@@ -994,5 +1058,19 @@ mod tests {
             true,
         ));
         assert!(consumer.on_frame());
+    }
+
+    #[test]
+    fn abort_finish_records_an_error_and_fails_the_round() {
+        let observer = EngineOutcomeObserver::default();
+        assert!(!record_finish_outcome(Some(&observer), Some("abort")));
+        assert!(observer.failed());
+
+        let observer = EngineOutcomeObserver::default();
+        assert!(record_finish_outcome(Some(&observer), Some("stop")));
+        assert!(!observer.failed());
+
+        // No observer still reports the aborted round as failed.
+        assert!(!record_finish_outcome(None, Some("abort")));
     }
 }

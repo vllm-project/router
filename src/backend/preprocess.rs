@@ -674,29 +674,13 @@ impl TokenizeOut {
     }
 }
 
-pub fn tokenize_chat_request_timed(
-    request: &ChatCompletionRequest,
-    frontend: &FrontendHandle,
-) -> Result<TokenizeOut> {
-    match &frontend.0 {
-        Frontend::TestIds(ids) => {
-            if ids.is_empty() {
-                return Err(anyhow!("pinned test token_ids are empty"));
-            }
-            Ok(TokenizeOut {
-                token_ids: Arc::from(ids.clone()),
-                adapt_ms: 0.0,
-                template_ms: 0.0,
-                encode_ms: 0.0,
-                encode_backend: "test-pin",
-                cached_tokens: 0,
-            })
-        }
-        Frontend::Vllm(vllm) => tokenize_vllm(request, vllm),
-    }
-}
-
-fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Result<TokenizeOut> {
+/// Reject request shapes whose output the gRPC response adapter cannot parse.
+///
+/// This governs *dispatch* for a `grpc://` pool, where the Router has to parse
+/// the Engine stream into the client response. It does not affect rendering or
+/// tokenization: `tokenize_chat_request_for_count_timed` deliberately skips it,
+/// because an exact input-token count only needs the rendered prompt.
+pub(crate) fn check_output_adapter_support(request: &ChatCompletionRequest) -> Result<()> {
     if request
         .tools
         .as_ref()
@@ -715,6 +699,62 @@ fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Re
             "reasoning_effort requires vllm-chat output parsing, which the gRPC response adapter does not yet expose"
         ));
     }
+    Ok(())
+}
+
+fn pinned_test_tokenize(frontend: &FrontendHandle) -> Option<Result<TokenizeOut>> {
+    match &frontend.0 {
+        Frontend::TestIds(ids) => Some(if ids.is_empty() {
+            Err(anyhow!("pinned test token_ids are empty"))
+        } else {
+            Ok(TokenizeOut {
+                token_ids: Arc::from(ids.clone()),
+                adapt_ms: 0.0,
+                template_ms: 0.0,
+                encode_ms: 0.0,
+                encode_backend: "test-pin",
+                cached_tokens: 0,
+            })
+        }),
+        Frontend::Vllm(_) => None,
+    }
+}
+
+/// Tokenize for gRPC dispatch: output-adapter support is a precondition.
+pub fn tokenize_chat_request_timed(
+    request: &ChatCompletionRequest,
+    frontend: &FrontendHandle,
+) -> Result<TokenizeOut> {
+    if let Some(pinned) = pinned_test_tokenize(frontend) {
+        return pinned;
+    }
+    check_output_adapter_support(request)?;
+    match &frontend.0 {
+        Frontend::TestIds(_) => unreachable!("pinned frontend handled above"),
+        Frontend::Vllm(vllm) => tokenize_vllm(request, vllm),
+    }
+}
+
+/// Tokenize only, for an exact input-token count.
+///
+/// The HTTP passthrough path never parses the Engine output in the Router, so a
+/// request with active tool calling (or `reasoning_effort`) can still be counted
+/// exactly; only the rendered prompt matters here. Dispatch paths that do parse
+/// the output must use `tokenize_chat_request_timed`.
+pub fn tokenize_chat_request_for_count_timed(
+    request: &ChatCompletionRequest,
+    frontend: &FrontendHandle,
+) -> Result<TokenizeOut> {
+    if let Some(pinned) = pinned_test_tokenize(frontend) {
+        return pinned;
+    }
+    match &frontend.0 {
+        Frontend::TestIds(_) => unreachable!("pinned frontend handled above"),
+        Frontend::Vllm(vllm) => tokenize_vllm(request, vllm),
+    }
+}
+
+fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Result<TokenizeOut> {
     let t0 = Instant::now();
     let kwargs = request.chat_template_kwargs.clone().unwrap_or_default();
     if request.other.contains_key("chat_template") {

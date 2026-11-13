@@ -294,7 +294,12 @@ impl PdProgramRuntime {
         reserve_output_budget(&mut identity, request, path, default_output);
         let dispatch = self
             .scheduler
-            .acquire(identity, tokens, targets, None)
+            .acquire(
+                identity,
+                crate::program_scheduling::ContextTokens::estimated(tokens),
+                targets,
+                None,
+            )
             .await?;
         Ok(Some(ProgramCompletion::new(
             self.scheduler.clone(),
@@ -1116,7 +1121,7 @@ mod tests {
         assert_eq!(bytes.as_ref(), input.as_bytes());
         let program = &scheduler.diagnostics().ranks[0].programs[0];
         assert_eq!(program.in_flight_requests, 0);
-        assert_eq!(program.estimated_context_tokens, 120);
+        assert_eq!(program.context_tokens, 120);
         assert_eq!(program.state, "active");
     }
 

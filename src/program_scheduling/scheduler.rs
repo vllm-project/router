@@ -8,7 +8,7 @@ use super::scheduler_state::{
     RankObservationState,
 };
 use super::{
-    BackendObservation, ProgramBindingCandidate, ProgramIdentity, ProgramRef,
+    BackendObservation, ContextTokens, ProgramBindingCandidate, ProgramIdentity, ProgramRef,
     ProgramSchedulerConfig, ProgramState, ProgramStatus, ProgramTarget, ProgressTtlPolicyMath,
 };
 use crate::config::types::PredictionMode;
@@ -629,10 +629,11 @@ impl ProgramScheduler {
         state: &mut ProgramSchedulerState,
         identity: &ProgramIdentity,
         reference: ProgramRef,
-        estimated_context_tokens: usize,
+        context: impl Into<ContextTokens>,
         now: Instant,
         routing_text: Option<&str>,
     ) {
+        let context = context.into();
         let _ = state.lineage.observe(
             identity.model_pool(),
             identity.program_id(),
@@ -647,15 +648,39 @@ impl ProgramScheduler {
                 p.in_flight_requests > 0 || p.waiting_requests > 1
             });
         if let Some(decision) = state.decisions.get_mut(&reference) {
-            // Keep a queued tail from changing the front turn's budget. A new
-            // PD front turn uses its own context even when it is smaller than
-            // the previous turn; non-PD keeps the observed shrink policy.
-            if !preserve_front
-                && (self.config.pd_mode
-                    || estimated_context_tokens >= decision.estimated_context_tokens)
-            {
-                decision.estimated_context_tokens = estimated_context_tokens;
-                decision.context_shrink_observations = 0;
+            if !preserve_front {
+                if self.config.pd_mode {
+                    // A new PD front turn uses its own context even when it is
+                    // smaller than the previous turn.
+                    decision.context_tokens = context.tokens();
+                    decision.context_token_source = context.source();
+                    decision.context_token_fingerprint = context.fingerprint();
+                    decision.shadow_context_facts = context.shadow_facts();
+                    decision.context_shrink_observations = 0;
+                } else {
+                    let current_tokens = decision.context_tokens;
+                    let merged = ContextTokens {
+                        tokens: decision.context_tokens,
+                        estimated_tokens: decision.context_tokens,
+                        source: decision.context_token_source,
+                        fingerprint: decision.context_token_fingerprint,
+                        shadow: decision.shadow_context_facts,
+                        fallback: None,
+                    }
+                    .max_with(context);
+                    decision.context_tokens = merged.tokens();
+                    decision.context_token_source = merged.source();
+                    // Assign unconditionally: an estimate that wins must not
+                    // keep the fingerprint of an older prepared count.
+                    decision.context_token_fingerprint = merged.fingerprint();
+                    decision.shadow_context_facts = merged.shadow_facts();
+                    // A shrink confirmation must survive arrivals that demand
+                    // *less* context: only growth (or an equal arrival) proves
+                    // the Program is still at the larger size.
+                    if context.tokens() >= current_tokens {
+                        decision.context_shrink_observations = 0;
+                    }
+                }
             }
             decision.task_id = identity.task_id().map(str::to_string);
             decision.session_id = identity.session_id().map(str::to_string);
@@ -681,7 +706,7 @@ impl ProgramScheduler {
             identity.placement_key().to_string(),
             identity.placement_hash_key().to_string(),
             home_target,
-            estimated_context_tokens,
+            context,
             now,
         );
         decision.task_id = identity.task_id().map(str::to_string);
@@ -995,6 +1020,55 @@ mod tests {
     use crate::program_scheduling::{ProgramBindingStrategy, ProgramIdentity};
     use serde_json::json;
 
+    #[tokio::test]
+    async fn shrink_confirmation_survives_smaller_arrivals() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(1_000_000);
+        let scheduler = ProgramScheduler::new(config);
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://worker".into(),
+            dp_rank: Some(0),
+        };
+        let identity = ProgramIdentity::from_request(
+            None,
+            Some(&json!({"vllm_xargs":{"agentic_context":{
+                "program_id":"program","expected_resume":true
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap();
+        let first = scheduler
+            .acquire(
+                identity.clone(),
+                crate::program_scheduling::ContextTokens::estimated(100_000),
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        {
+            let mut state = scheduler.state.lock();
+            let decision = state.decisions.get_mut(first.program()).expect("decision");
+            decision.context_shrink_observations = 2;
+        }
+        // A smaller arrival is exactly what compaction looks like; it must not
+        // erase the confirmations that are still being collected.
+        let smaller = scheduler.resolve_arrival_tokens(
+            "model",
+            crate::program_scheduling::ArrivalTokenFacts::estimated_only(20_000),
+        );
+        scheduler
+            .acquire(identity, smaller, std::slice::from_ref(&target), None)
+            .await
+            .unwrap();
+        let state = scheduler.state.lock();
+        let decision = state.decisions.get(first.program()).expect("decision");
+        assert_eq!(decision.context_tokens, 100_000);
+        assert_eq!(decision.context_shrink_observations, 2);
+    }
+
     #[test]
     fn observation_epoch_preserves_post_checkpoint_delta() {
         let mut config = ProgramSchedulerConfig::default();
@@ -1130,26 +1204,32 @@ mod tests {
         let now = Instant::now();
         let mut state = scheduler.state.lock();
         let first = identity("first");
-        let first_handle = state
-            .runtime
-            .retain_request(&first, 100, Some("cold-a"), now);
+        let first_handle = state.runtime.retain_request(
+            &first,
+            crate::program_scheduling::ContextTokens::estimated(100),
+            Some("cold-a"),
+            now,
+        );
         scheduler.ensure_decision_state(
             &mut state,
             &first,
             first_handle.program().clone(),
-            100,
+            crate::program_scheduling::ContextTokens::estimated(100),
             now,
             Some("cold-a"),
         );
         let second = identity("second");
-        let second_handle = state
-            .runtime
-            .retain_request(&second, 100, Some("cold-b"), now);
+        let second_handle = state.runtime.retain_request(
+            &second,
+            crate::program_scheduling::ContextTokens::estimated(100),
+            Some("cold-b"),
+            now,
+        );
         scheduler.ensure_decision_state(
             &mut state,
             &second,
             second_handle.program().clone(),
-            100,
+            crate::program_scheduling::ContextTokens::estimated(100),
             now,
             Some("cold-b"),
         );
@@ -1193,22 +1273,32 @@ mod tests {
         let now = Instant::now();
         let mut state = scheduler.state.lock();
         let explicit = identity(Some(7));
-        let handle = state.runtime.retain_request(&explicit, 100, None, now);
+        let handle = state.runtime.retain_request(
+            &explicit,
+            crate::program_scheduling::ContextTokens::estimated(100),
+            None,
+            now,
+        );
         scheduler.ensure_decision_state(
             &mut state,
             &explicit,
             handle.program().clone(),
-            100,
+            crate::program_scheduling::ContextTokens::estimated(100),
             now,
             None,
         );
         let inferred = identity(None);
-        state.runtime.retain_request(&inferred, 110, None, now);
+        state.runtime.retain_request(
+            &inferred,
+            crate::program_scheduling::ContextTokens::estimated(110),
+            None,
+            now,
+        );
         scheduler.ensure_decision_state(
             &mut state,
             &inferred,
             handle.program().clone(),
-            110,
+            crate::program_scheduling::ContextTokens::estimated(110),
             now,
             None,
         );
@@ -1238,7 +1328,12 @@ mod tests {
         .unwrap()
         .unwrap();
         let dispatch = scheduler
-            .acquire(identity, 100, std::slice::from_ref(&old_target), None)
+            .acquire(
+                identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                std::slice::from_ref(&old_target),
+                None,
+            )
             .await
             .unwrap();
         scheduler.sync_targets("model", std::slice::from_ref(&new_target));

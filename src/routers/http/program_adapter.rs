@@ -3,6 +3,7 @@
 //! This module understands transport envelopes only. Identity parsing and all
 //! scheduling decisions remain in `program_scheduling`.
 
+use crate::backend::EngineOutcomeObserver;
 use crate::program_scheduling::{ProgramDispatch, ProgramScheduler, ProgramUsageObservation};
 use crate::token_estimator::{MomentumTokenEstimator, TokenEstimateCalibration};
 use parking_lot::Mutex;
@@ -25,6 +26,8 @@ struct ProgramCompletionInner {
     token_estimator: Arc<MomentumTokenEstimator>,
     token_estimate_calibration: TokenEstimateCalibration,
     finished: AtomicBool,
+    finished_success: AtomicBool,
+    observer: Arc<EngineOutcomeObserver>,
     pd_ttl: Mutex<Option<std::time::Duration>>,
     replacement_dispatch: Mutex<Option<ProgramDispatch>>,
 }
@@ -45,6 +48,8 @@ impl ProgramCompletion {
                 token_estimator,
                 token_estimate_calibration,
                 finished: AtomicBool::new(false),
+                finished_success: AtomicBool::new(false),
+                observer: Arc::new(EngineOutcomeObserver::default()),
                 pd_ttl: Mutex::new(None),
                 replacement_dispatch: Mutex::new(None),
             }),
@@ -81,18 +86,52 @@ impl ProgramCompletion {
     pub(super) fn finish(&self, success: bool) {
         self.inner.finish(success);
     }
+
+    /// Terminal Engine outcome channel for the gRPC producer.
+    pub(super) fn engine_observer(&self) -> Arc<EngineOutcomeObserver> {
+        self.inner.observer.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn finished_success(&self) -> bool {
+        self.inner.finished_success.load(Ordering::Acquire)
+    }
 }
 
 impl ProgramCompletionInner {
-    fn finish(&self, success: bool) {
+    fn finish(&self, mut success: bool) {
         if self.finished.swap(true, Ordering::AcqRel) {
             return;
         }
-        let usage = {
+        let (mut usage, wire_error) = {
             let mut accumulator = self.usage.lock();
             accumulator.finish_sse();
-            accumulator.observation
+            (accumulator.observation, accumulator.wire_error)
         };
+        // The gRPC producer knows the Engine's final counts even when the client
+        // did not ask for a wire `usage` chunk; prefer them over missing SSE.
+        if let Some((prompt_tokens, completion_tokens)) = self.observer.usage() {
+            usage.merge(ProgramUsageObservation {
+                prompt_tokens,
+                completion_tokens: Some(completion_tokens),
+                cached_prompt_tokens: None,
+            });
+            // gRPC wire usage falls back to the Router's prepared count when
+            // Engine prompt_info is absent. The producer's observation is
+            // authoritative, including None: never verify a prepared count
+            // against its own synthetic wire copy. HTTP has no producer usage
+            // observation, so its independently reported wire count is kept.
+            usage.prompt_tokens = prompt_tokens;
+        }
+        if self.observer.failed() {
+            // A producer error frame (timeout, tonic error, premature EOF) is
+            // not a successful completion even though the SSE body ended.
+            success = false;
+        }
+        if wire_error {
+            success = false;
+        }
+        self.finished_success.store(success, Ordering::Release);
         if success {
             self.token_estimator
                 .observe_feedback(&self.token_estimate_calibration, usage.prompt_tokens);
@@ -128,6 +167,9 @@ impl Drop for ProgramCompletionInner {
 struct ProgramUsageAccumulator {
     observation: ProgramUsageObservation,
     sse_buffer: Vec<u8>,
+    /// A wire-level error payload ended the stream; the body-level EOF must not
+    /// be treated as success.
+    wire_error: bool,
 }
 
 impl ProgramUsageAccumulator {
@@ -135,7 +177,19 @@ impl ProgramUsageAccumulator {
 
     fn observe_json(&mut self, body: &[u8]) {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+            self.observe_error(&value);
             self.observe_value(&value);
+        }
+    }
+
+    /// An `error` payload is the gRPC producer's terminal failure frame and may
+    /// also come from an upstream error body; neither is a completed attempt.
+    fn observe_error(&mut self, value: &serde_json::Value) {
+        if value.get("error").is_some_and(|error| !error.is_null()) {
+            self.wire_error = true;
+        }
+        if value.get("object").and_then(serde_json::Value::as_str) == Some("error") {
+            self.wire_error = true;
         }
     }
 
@@ -172,6 +226,14 @@ impl ProgramUsageAccumulator {
         };
         let data = data.trim();
         let data = data.as_bytes();
+        if data
+            .windows(b"\"error\"".len())
+            .any(|window| window == b"\"error\"")
+        {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(data) {
+                self.observe_error(&value);
+            }
+        }
         if data
             .windows(b"\"usage\"".len())
             .any(|window| window == b"\"usage\"")
@@ -373,5 +435,107 @@ mod tests {
             .return_time_profiles
             .iter()
             .any(|entry| entry.no_return_count >= 1.0));
+    }
+
+    #[tokio::test]
+    async fn engine_usage_from_the_producer_is_used_without_wire_usage() {
+        let (scheduler, completion) = settlement_fixture("observer usage").await;
+        // The client did not ask for a wire usage chunk; the producer still
+        // knows the Engine's counts.
+        completion.engine_observer().record_usage(Some(123), 7);
+        completion.observe_sse_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n");
+        completion.finish(true);
+        assert!(completion.finished_success());
+        let snapshot = scheduler.diagnostics();
+        assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 123);
+    }
+
+    #[tokio::test]
+    async fn http_wire_usage_remains_authoritative_without_a_producer_observation() {
+        let (scheduler, completion) = settlement_fixture("HTTP usage").await;
+        completion.observe_sse_chunk(
+            b"data: {\"usage\":{\"prompt_tokens\":155,\"completion_tokens\":7}}\n",
+        );
+        completion.finish(true);
+        assert!(completion.finished_success());
+        assert_eq!(
+            scheduler.diagnostics().ranks[0].programs[0].context_tokens,
+            155
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_engine_prompt_info_discards_synthetic_wire_prompt_count() {
+        let (scheduler, completion) = settlement_fixture("no prompt info").await;
+        // The producer saw completion tokens but the Engine never reported
+        // `prompt_info`; gRPC wire usage contains a synthetic fallback count.
+        completion.engine_observer().record_usage(None, 7);
+        completion.observe_sse_chunk(
+            b"data: {\"usage\":{\"prompt_tokens\":155,\"completion_tokens\":7}}\n",
+        );
+        completion.finish(true);
+        assert!(completion.finished_success());
+        let snapshot = scheduler.diagnostics();
+        assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 100);
+    }
+
+    #[tokio::test]
+    async fn wire_error_frame_does_not_count_as_a_successful_round() {
+        let (_, completion) = settlement_fixture("wire error").await;
+        completion
+            .observe_sse_chunk(b"data: {\"error\":\"gRPC stream closed before finish_info\"}\n\n");
+        completion.finish(true);
+        assert!(!completion.finished_success());
+    }
+
+    #[tokio::test]
+    async fn producer_error_outcome_overrides_body_eof_success() {
+        let (_, completion) = settlement_fixture("producer error").await;
+        completion.engine_observer().record_error();
+        completion.finish(true);
+        assert!(!completion.finished_success());
+    }
+
+    #[tokio::test]
+    async fn error_free_stream_still_succeeds() {
+        let (_, completion) = settlement_fixture("clean stream").await;
+        completion.observe_sse_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n");
+        completion.finish(true);
+        assert!(completion.finished_success());
+    }
+
+    async fn settlement_fixture(input: &str) -> (Arc<ProgramScheduler>, ProgramCompletion) {
+        let scheduler = Arc::new(ProgramScheduler::new(ProgramSchedulerConfig::default()));
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://worker".into(),
+            dp_rank: None,
+        };
+        let identity = ProgramIdentity::from_request(
+            None,
+            Some(&serde_json::json!({"vllm_xargs":{"agentic_context":{
+                "program_id":"observer","expected_resume":true
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap();
+        let dispatch = scheduler
+            .acquire(
+                identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        let estimator = Arc::new(MomentumTokenEstimator::default());
+        let (_, calibration) = estimator.estimate(
+            TokenEstimateScope::new("model", "/v1/chat/completions"),
+            input,
+        );
+        let completion =
+            ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration);
+        (scheduler, completion)
     }
 }

@@ -1577,7 +1577,7 @@ mod tests {
             epoch,
             Instant::now(),
             Instant::now(),
-            3,
+            crate::program_scheduling::ContextTokens::estimated(3),
             false,
             None,
             ProgramRequestHints::default(),

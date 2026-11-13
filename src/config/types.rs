@@ -1,11 +1,11 @@
 use super::ConfigResult;
 use crate::config::validation::ConfigValidator;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::program_scheduling::{
     DecodeThroughputModel, PrefillCostModel, ProgramBindingStrategy, ProgramResumeOrder,
-    ProgramSchedulingEnableKey,
+    ProgramSchedulingEnableKey, TokenCountMode,
 };
 
 /// Main router configuration
@@ -398,6 +398,46 @@ pub struct ProgramSchedulingConfig {
     pub hash_virtual_nodes: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_capacity_per_dp_rank: Option<usize>,
+    /// Input-token fact source used for admission, growth, and TTL cost.
+    /// Omit for compatible estimated counts; opt into `exact_when_verified`
+    /// for automatic verification and fallback. `shadow` is an advanced
+    /// diagnostic option that never applies prepared counts to decisions.
+    #[serde(default)]
+    pub token_count_mode: TokenCountMode,
+    /// Model pools allowed to apply prepared exact counts. Empty means all.
+    ///
+    /// Entries may be plain model names (`model-a`) or internal pool keys
+    /// (`program:model:model-a`, `program:all`,
+    /// `program:fallback:unlabeled`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub token_count_model_pools: Vec<String>,
+    /// Matching settlements required before a fingerprint is applied exactly.
+    ///
+    /// `0` restores the legacy trust-on-first-use behaviour. The default `1`
+    /// keeps the estimate for the first settlement of each equivalence class,
+    /// so an unverified count is never used to admit work.
+    #[serde(default = "default_token_count_verification_settlements")]
+    pub token_count_verification_settlements: usize,
+    /// Optional text endpoints allowed to use Router-tokenized facts.
+    /// Empty by default, including in `exact_when_verified` mode, to avoid
+    /// adding HTTP text tokenization unless the deployment explicitly opts in.
+    ///
+    /// Exactness for HTTP text requires verified tokenizer/template
+    /// equivalence; deployments opt in per endpoint (for example
+    /// `/v1/chat/completions`) and the Router revokes a fingerprint whose
+    /// prepared count disagrees with Engine usage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exact_text_endpoints: Vec<String>,
+    /// Metrics endpoint override keyed by Program target base URL.
+    ///
+    /// Required for `grpc://` targets: their base URL is not an HTTP metrics
+    /// address, and an unmapped target keeps reporting a missing observation.
+    #[serde(
+        default,
+        rename = "metrics_base_urls",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub metrics_base_urls: BTreeMap<String, String>,
     #[serde(default = "default_program_max_active_programs_per_target")]
     pub max_active_programs_per_target: usize,
     #[serde(default = "default_program_metrics_interval_seconds")]
@@ -473,13 +513,58 @@ impl ProgramSchedulingConfig {
                 reason: "program_scheduling_config_json requires enable_program_scheduling"
                     .to_string(),
             }),
-            (true, None) => Ok(Some(Self::default())),
-            (true, Some(raw)) => serde_json::from_str(raw).map(Some).map_err(|error| {
-                super::ConfigError::ValidationFailed {
-                    reason: format!("Invalid program_scheduling_config_json: {error}"),
-                }
-            }),
+            (true, None) => {
+                let config = Self::default();
+                Self::validate_token_count_config(&config)?;
+                Ok(Some(config))
+            }
+            (true, Some(raw)) => {
+                let config: Self = serde_json::from_str(raw).map_err(|error| {
+                    super::ConfigError::ValidationFailed {
+                        reason: format!("Invalid program_scheduling_config_json: {error}"),
+                    }
+                })?;
+                Self::validate_token_count_config(&config)?;
+                Ok(Some(config))
+            }
         }
+    }
+
+    /// Validate the token-count knobs before they can silently degrade.
+    fn validate_token_count_config(config: &Self) -> ConfigResult<()> {
+        const TEXT_ENDPOINTS: [&str; 2] = ["/v1/chat/completions", "/v1/completions"];
+        for endpoint in &config.exact_text_endpoints {
+            if !TEXT_ENDPOINTS.contains(&endpoint.as_str()) {
+                return Err(super::ConfigError::ValidationFailed {
+                    reason: format!(
+                        "exact_text_endpoints entry {endpoint:?} is not a Router text endpoint ({})",
+                        TEXT_ENDPOINTS.join(", ")
+                    ),
+                });
+            }
+        }
+        for (target, metrics_url) in &config.metrics_base_urls {
+            if target.trim().is_empty() {
+                return Err(super::ConfigError::ValidationFailed {
+                    reason: "metrics_base_urls contains an empty target base URL".to_string(),
+                });
+            }
+            if !(metrics_url.starts_with("http://") || metrics_url.starts_with("https://")) {
+                return Err(super::ConfigError::ValidationFailed {
+                    reason: format!(
+                        "metrics_base_urls value for {target} must be an HTTP(S) URL, got {metrics_url:?}"
+                    ),
+                });
+            }
+        }
+        for pool in &config.token_count_model_pools {
+            if pool.trim().is_empty() {
+                return Err(super::ConfigError::ValidationFailed {
+                    reason: "token_count_model_pools contains an empty entry".to_string(),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn defaulted_calibration_fields(&self) -> Vec<&'static str> {
@@ -531,6 +616,11 @@ impl Default for ProgramSchedulingConfig {
             binding_strategy: ProgramBindingStrategy::default(),
             hash_virtual_nodes: default_program_hash_virtual_nodes(),
             token_capacity_per_dp_rank: None,
+            token_count_mode: TokenCountMode::default(),
+            token_count_model_pools: Vec::new(),
+            token_count_verification_settlements: default_token_count_verification_settlements(),
+            exact_text_endpoints: Vec::new(),
+            metrics_base_urls: BTreeMap::new(),
             max_active_programs_per_target: default_program_max_active_programs_per_target(),
             metrics_interval_seconds: default_program_metrics_interval_seconds(),
             admission_waiting_request_threshold:
@@ -581,6 +671,16 @@ struct ProgramSchedulingConfigInput {
     hash_virtual_nodes: u32,
     #[serde(default, alias = "token_capacity_per_target")]
     token_capacity_per_dp_rank: Option<usize>,
+    #[serde(default)]
+    token_count_mode: TokenCountMode,
+    #[serde(default)]
+    token_count_model_pools: Vec<String>,
+    #[serde(default = "default_token_count_verification_settlements")]
+    token_count_verification_settlements: usize,
+    #[serde(default)]
+    exact_text_endpoints: Vec<String>,
+    #[serde(default, rename = "metrics_base_urls")]
+    metrics_base_urls: BTreeMap<String, String>,
     #[serde(default = "default_program_max_active_programs_per_target")]
     max_active_programs_per_target: usize,
     #[serde(default = "default_program_metrics_interval_seconds")]
@@ -708,6 +808,11 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             binding_strategy: input.binding_strategy,
             hash_virtual_nodes: input.hash_virtual_nodes,
             token_capacity_per_dp_rank: input.token_capacity_per_dp_rank,
+            token_count_mode: input.token_count_mode,
+            token_count_model_pools: input.token_count_model_pools,
+            token_count_verification_settlements: input.token_count_verification_settlements,
+            exact_text_endpoints: input.exact_text_endpoints,
+            metrics_base_urls: input.metrics_base_urls,
             max_active_programs_per_target: input.max_active_programs_per_target,
             metrics_interval_seconds: input.metrics_interval_seconds,
             admission_waiting_request_threshold: input.admission_waiting_request_threshold,
@@ -737,6 +842,10 @@ fn default_program_cross_rank_headroom_ratio() -> f64 {
 
 fn default_program_hash_virtual_nodes() -> u32 {
     160
+}
+
+fn default_token_count_verification_settlements() -> usize {
+    1
 }
 
 fn default_program_max_active_programs_per_target() -> usize {
@@ -1402,6 +1511,61 @@ mod tests {
     use super::*;
 
     // ============= RouterConfig Tests =============
+
+    #[test]
+    fn token_count_knobs_fail_fast_on_unmatchable_values() {
+        let invalid = [
+            r#"{"exact_text_endpoints":["/v1/chat/completions/"]}"#,
+            r#"{"metrics_base_urls":{"grpc://engine:1":"grpc://engine:2"}}"#,
+            r#"{"token_count_model_pools":[""]}"#,
+        ];
+        for raw in invalid {
+            assert!(
+                ProgramSchedulingConfig::resolve(true, Some(raw)).is_err(),
+                "expected {raw} to be rejected"
+            );
+        }
+        let accepted = ProgramSchedulingConfig::resolve(
+            true,
+            Some(r#"{"exact_text_endpoints":["/v1/chat/completions"],"token_count_model_pools":["model-a","program:all"]}"#),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(accepted.exact_text_endpoints, ["/v1/chat/completions"]);
+        assert_eq!(accepted.token_count_model_pools, ["model-a", "program:all"]);
+    }
+
+    #[test]
+    fn program_token_count_mode_parses_and_defaults_to_estimated() {
+        let default = ProgramSchedulingConfig::resolve(true, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(default.token_count_mode, TokenCountMode::Estimated);
+        assert!(default.token_count_model_pools.is_empty());
+
+        let configured = ProgramSchedulingConfig::resolve(
+            true,
+            Some(r#"{"token_count_mode":"exact_when_verified","token_count_model_pools":["model-a"]}"#),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            configured.token_count_mode,
+            TokenCountMode::ExactWhenVerified
+        );
+        assert_eq!(configured.token_count_model_pools, vec!["model-a"]);
+
+        let shadow =
+            ProgramSchedulingConfig::resolve(true, Some(r#"{"token_count_mode":"shadow"}"#))
+                .unwrap()
+                .unwrap();
+        assert_eq!(shadow.token_count_mode, TokenCountMode::Shadow);
+
+        assert!(
+            ProgramSchedulingConfig::resolve(true, Some(r#"{"token_count_mode":"bogus"}"#))
+                .is_err()
+        );
+    }
 
     #[test]
     fn test_router_config_default() {

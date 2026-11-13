@@ -3,7 +3,7 @@
 //! RequestPool owns request blocking data only. It does not select targets,
 //! estimate capacity, run retries, or decide Program state transitions.
 
-use super::{ProgramRef, ProgramRequestHints};
+use super::{ContextTokens, ProgramRef, ProgramRequestHints};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,7 +34,7 @@ impl ProgramRequestHandle {
 pub(crate) struct PendingProgramRequest {
     pub(crate) id: u64,
     pub(crate) arrived_at: Instant,
-    pub(crate) estimated_context_tokens: usize,
+    pub(crate) context: ContextTokens,
     pub(crate) routing_text: Option<String>,
     pub(crate) hints: ProgramRequestHints,
     notifier: Arc<Notify>,
@@ -54,7 +54,7 @@ impl RequestPool {
         &mut self,
         program: ProgramRef,
         arrived_at: Instant,
-        estimated_context_tokens: usize,
+        context: ContextTokens,
         routing_text: Option<&str>,
         hints: ProgramRequestHints,
     ) -> ProgramRequestHandle {
@@ -67,7 +67,7 @@ impl RequestPool {
             .push_back(PendingProgramRequest {
                 id: request_id,
                 arrived_at,
-                estimated_context_tokens,
+                context,
                 routing_text: routing_text.map(str::to_string),
                 hints,
                 notifier: Arc::clone(&notifier),
@@ -162,13 +162,38 @@ impl RequestPool {
         self.requests
             .get(program)
             .and_then(VecDeque::front)
-            .map(|request| request.estimated_context_tokens)
+            .map(|request| request.context.tokens())
+    }
+
+    /// Replace retained facts atomically; report the largest changed demand per Program.
+    pub(crate) fn update_contexts(
+        &mut self,
+        mut update: impl FnMut(&ProgramRef, ContextTokens) -> ContextTokens,
+    ) -> Vec<(ProgramRef, ContextTokens)> {
+        let mut changes = Vec::new();
+        for (program, requests) in &mut self.requests {
+            let mut changed_context: Option<ContextTokens> = None;
+            for request in requests {
+                let context = update(program, request.context);
+                if context != request.context {
+                    request.context = context;
+                    changed_context = Some(
+                        changed_context.map_or(context, |previous| previous.max_with(context)),
+                    );
+                }
+            }
+            if let Some(context) = changed_context {
+                changes.push((program.clone(), context));
+            }
+        }
+        changes
     }
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use crate::program_scheduling::ContextTokens as CT;
 
     fn program(generation: u64) -> ProgramRef {
         ProgramRef::new("model".into(), "program".into(), generation)
@@ -181,33 +206,27 @@ mod tests {
         let first = pool.retain(
             program.clone(),
             Instant::now(),
-            100,
+            CT::estimated(100),
             None,
             ProgramRequestHints::default(),
         );
         let second = pool.retain(
             program.clone(),
             Instant::now(),
-            200,
+            CT::estimated(200),
             Some("text"),
             ProgramRequestHints::default(),
         );
         assert_eq!(pool.len(), 2);
         assert_eq!(pool.program_len(&program), 2);
         assert!(pool.front(&second).is_none());
-        assert_eq!(pool.front(&first).unwrap().estimated_context_tokens, 100);
-        assert_eq!(
-            pool.take_front(&first).unwrap().estimated_context_tokens,
-            100
-        );
+        assert_eq!(pool.front(&first).unwrap().context.tokens(), 100);
+        assert_eq!(pool.take_front(&first).unwrap().context.tokens(), 100);
         assert_eq!(
             pool.front(&second).unwrap().routing_text.as_deref(),
             Some("text")
         );
-        assert_eq!(
-            pool.take_front(&second).unwrap().estimated_context_tokens,
-            200
-        );
+        assert_eq!(pool.take_front(&second).unwrap().context.tokens(), 200);
         assert!(pool.is_empty());
     }
 
@@ -219,21 +238,21 @@ mod tests {
         let old_front = pool.retain(
             old.clone(),
             Instant::now(),
-            100,
+            CT::estimated(100),
             None,
             ProgramRequestHints::default(),
         );
         let old_tail = pool.retain(
             old.clone(),
             Instant::now(),
-            110,
+            CT::estimated(110),
             None,
             ProgramRequestHints::default(),
         );
         let new_front = pool.retain(
             replacement.clone(),
             Instant::now(),
-            120,
+            CT::estimated(120),
             None,
             ProgramRequestHints::default(),
         );
@@ -241,10 +260,7 @@ mod tests {
         assert_eq!(pool.cancel(&old_front), Some(true));
         assert_eq!(pool.program_len(&old), 0);
         assert_eq!(pool.program_len(&replacement), 1);
-        assert_eq!(
-            pool.front(&new_front).unwrap().estimated_context_tokens,
-            120
-        );
+        assert_eq!(pool.front(&new_front).unwrap().context.tokens(), 120);
     }
 
     #[tokio::test]
@@ -254,14 +270,14 @@ mod tests {
         let front = pool.retain(
             program.clone(),
             Instant::now(),
-            100,
+            CT::estimated(100),
             None,
             ProgramRequestHints::default(),
         );
         let tail = pool.retain(
             program.clone(),
             Instant::now(),
-            110,
+            CT::estimated(110),
             None,
             ProgramRequestHints::default(),
         );

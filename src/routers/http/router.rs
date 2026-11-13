@@ -1,6 +1,9 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
 use super::program_adapter::ProgramCompletion;
 use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
+use crate::backend::token_count::{
+    client_token_ids_fingerprint, exact_prompt_tokens_from_json, prepared_chat_fingerprint,
+};
 use crate::backend::{
     stream_output::{output_frame_tracking, OutputFrameConsumer, OutputFrameProducer},
     PrepareError,
@@ -20,8 +23,9 @@ use crate::policies::{
     PolicyRegistry,
 };
 use crate::program_scheduling::{
-    BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
-    ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
+    ArrivalTokenFacts, BackendObservationProvider, ProgramIdentity, ProgramScheduler,
+    ProgramSchedulerConfig, ProgramTarget, ScheduleError, TokenFacts,
+    VllmMetricsObservationProvider,
 };
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
@@ -261,6 +265,155 @@ fn hold_request_load_with_output_frame(
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
+/// Settle one Program attempt on the response's true terminal state.
+///
+/// A gRPC dispatch returns a streaming body, so finishing at header time would
+/// settle the attempt before the Engine reported usage or a terminal error.
+/// Successful streams settle after the last chunk, buffered bodies settle after
+/// the body is complete, and a non-success status settles immediately. The
+/// underlying completion is idempotent, so cancellation and error paths may
+/// also settle it exactly once.
+async fn settle_program_completion_on_response(
+    response: Response,
+    is_stream: bool,
+    completion: ProgramCompletion,
+) -> Response {
+    if !response.status().is_success() {
+        completion.finish(false);
+        return response;
+    }
+    if !is_stream {
+        // The gRPC buffered adapter has already read the Engine response and
+        // recorded its usage in the completion observer, so the attempt settles
+        // at header time exactly as before. The body passes through untouched.
+        completion.finish(true);
+        return response;
+    }
+    // Streaming attempts settle on the stream's terminal state: forward every
+    // chunk while observing SSE usage/error frames, and finish once at EOF (or
+    // failure). The body is never buffered ahead of the client.
+    let (parts, body) = response.into_parts();
+    let stream = ProgramSettlementBody {
+        inner: Box::pin(body.into_data_stream()),
+        completion: Some(completion),
+    };
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+/// Body adapter that settles a Program attempt when the stream terminates.
+struct ProgramSettlementBody {
+    inner: Pin<Box<dyn futures_util::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send>>,
+    completion: Option<ProgramCompletion>,
+}
+
+impl futures_util::Stream for ProgramSettlementBody {
+    type Item = Result<axum::body::Bytes, axum::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                if let Some(completion) = &this.completion {
+                    completion.observe_sse_chunk(&chunk);
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                if let Some(completion) = this.completion.take() {
+                    completion.finish(false);
+                }
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                if let Some(completion) = this.completion.take() {
+                    completion.finish(true);
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for ProgramSettlementBody {
+    fn drop(&mut self) {
+        // Client cancellation or an early stream closure still settles once.
+        if let Some(completion) = self.completion.take() {
+            completion.finish(false);
+        }
+    }
+}
+
+/// Ensure the upstream streaming request asks for the usage chunk.
+fn inject_stream_usage(value: &mut serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    match object.get_mut("stream_options") {
+        Some(serde_json::Value::Object(options)) => {
+            options.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+        }
+        _ => {
+            object.insert(
+                "stream_options".to_string(),
+                serde_json::json!({"include_usage": true}),
+            );
+        }
+    }
+}
+
+/// Removes the trailing `usage` SSE data line from a client-visible stream.
+///
+/// The Router injects `stream_options.include_usage` upstream for exact token
+/// facts, but a client that did not request usage must not receive that chunk.
+/// Lines are buffered across chunk boundaries; other bytes pass through.
+#[derive(Debug, Default)]
+struct SseUsageStripper {
+    pending: Vec<u8>,
+}
+
+impl SseUsageStripper {
+    fn push(&mut self, chunk: &[u8]) -> Option<axum::body::Bytes> {
+        self.pending.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some(position) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line = self.pending.drain(..=position).collect::<Vec<_>>();
+            if !is_usage_sse_line(&line) {
+                out.extend_from_slice(&line);
+            }
+        }
+        (!out.is_empty()).then(|| axum::body::Bytes::from(out))
+    }
+
+    fn finish(&mut self) -> Option<axum::body::Bytes> {
+        let line = std::mem::take(&mut self.pending);
+        (!line.is_empty() && !is_usage_sse_line(&line)).then(|| axum::body::Bytes::from(line))
+    }
+}
+
+/// Whether one SSE line is the final usage-only frame.
+///
+/// Only the trailing frame emitted for `stream_options.include_usage` may be
+/// removed. A backend that also attaches `usage` (possibly `null`) to ordinary
+/// deltas, or emits usage alongside non-empty `choices`, must keep those
+/// frames: dropping them would lose content, tool calls and finish reasons.
+fn is_usage_sse_line(line: &[u8]) -> bool {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let Some(data) = line.strip_prefix(b"data:") else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(data.trim_ascii()) else {
+        return false;
+    };
+    let has_usage = value.get("usage").is_some_and(|usage| !usage.is_null());
+    let choices_empty = value
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|choices| choices.is_empty());
+    has_usage && choices_empty
+}
+
 struct TypedDispatch<'a> {
     headers: Option<&'a HeaderMap>,
     route: &'a str,
@@ -269,6 +422,10 @@ struct TypedDispatch<'a> {
     completion: Option<&'a CompletionRoute>,
     load: RequestLoadGuard,
     prepared: Option<crate::backend::PreparedRequest>,
+    /// Body to forward instead of `typed_req` (usage-injected HTTP stream).
+    request_body: Option<serde_json::Value>,
+    /// Strip the usage chunk this Router injected upstream.
+    strip_usage: bool,
 }
 
 struct SelectedWorker {
@@ -352,9 +509,25 @@ impl Router {
             None
         };
         let request_timeout = Duration::from_secs(ctx.router_config.request_timeout_secs);
+        // HTTP pools are transparent proxies unless exact text counting is
+        // enabled; only then does the Router tokenize, so only then are the
+        // encoding caches relevant (and the warning below wrong).
+        let exact_text_tokenization =
+            ctx.router_config
+                .program_scheduling
+                .as_ref()
+                .is_some_and(|config| {
+                    config.token_count_mode.uses_prepared_facts()
+                        && !config.exact_text_endpoints.is_empty()
+                });
         let frontend = if pool_kind == Some(crate::backend::WorkerPoolKind::Http) {
-            crate::backend::frontend::warn_ignored_encoding_caches();
-            crate::backend::EngineFrontend::with_request_timeout(request_timeout)
+            if exact_text_tokenization {
+                crate::backend::EngineFrontend::from_env(request_timeout)
+                    .map_err(|error| format!("tokenizer cache: {error}"))?
+            } else {
+                crate::backend::frontend::warn_ignored_encoding_caches();
+                crate::backend::EngineFrontend::with_request_timeout(request_timeout)
+            }
         } else {
             crate::backend::EngineFrontend::from_env(request_timeout)
                 .map_err(|error| format!("tokenizer cache: {error}"))?
@@ -523,6 +696,23 @@ impl Router {
             .as_ref()
             .map(ProgramSchedulerConfig::from)
             .map(ProgramScheduler::new)
+            .inspect(|scheduler| {
+                scheduler.publish_token_count_mode();
+                if scheduler.exact_text_enabled() {
+                    let tokenizer_override = std::env::var("VLLM_ROUTER_TOKENIZER").unwrap_or_default();
+                    let model_override = std::env::var("VLLM_ROUTER_MODEL").unwrap_or_default();
+                    if tokenizer_override.is_empty() && model_override.is_empty() {
+                        warn!(
+                            event = "exact_text_tokenizer_unset",
+                            "Program scheduling will tokenize HTTP text for exact facts, but neither \
+                             VLLM_ROUTER_TOKENIZER nor VLLM_ROUTER_MODEL is set; request-model \
+                             resolution may download from Hugging Face. Point \
+                             VLLM_ROUTER_TOKENIZER at the deployed model directory so the Router \
+                             count matches the Engine's chat template."
+                        );
+                    }
+                }
+            })
             .map(Arc::new);
         let program_observation_handle = program_scheduler.as_ref().map(|scheduler| {
             let scheduler = scheduler.clone();
@@ -530,10 +720,12 @@ impl Router {
             let provider = VllmMetricsObservationProvider::new(
                 ctx.client.clone(),
                 ctx.router_config.api_key.clone(),
-            );
+            )
+            .with_metrics_base_urls(scheduler.metrics_base_urls());
             Arc::new(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(scheduler.metrics_interval());
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut last_failed = std::collections::BTreeSet::new();
                 loop {
                     interval.tick().await;
                     Self::sync_program_targets_from_registry(&scheduler, &worker_registry);
@@ -543,13 +735,32 @@ impl Router {
                     }
                     let epoch = scheduler.begin_observation(&targets);
                     let (observations, failures) = provider.observe(&targets).await;
-                    for failure in failures {
-                        warn!(
-                            base_url = failure.base_url,
-                            error = failure.error,
-                            "Program scheduling backend observation failed"
+                    let failed_now = failures
+                        .iter()
+                        .map(|failure| failure.base_url.clone())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    for failure in &failures {
+                        if last_failed.contains(&failure.base_url) {
+                            debug!(
+                                base_url = failure.base_url,
+                                error = failure.error,
+                                "Program scheduling backend observation still failing"
+                            );
+                        } else {
+                            warn!(
+                                base_url = failure.base_url,
+                                error = failure.error,
+                                "Program scheduling backend observation failed"
+                            );
+                        }
+                    }
+                    for recovered in last_failed.difference(&failed_now) {
+                        info!(
+                            base_url = recovered,
+                            "Program scheduling backend observation recovered"
                         );
                     }
+                    last_failed = failed_now;
                     scheduler.apply_observations(epoch, observations);
                     scheduler.tick();
                     if let Some((path, revision, snapshot)) =
@@ -874,25 +1085,51 @@ impl Router {
         !tracked
     }
 
+    /// Whether this request would create a Program completion at all.
+    ///
+    /// Router-side exact counting is a second tokenization, so it must not run
+    /// for identity-free requests: `acquire_program_completion` would discard
+    /// the fact after paying the tokenizer and possible cold model load.
+    fn resolved_program_identity<T: GenerationRequest>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        model_pool: &ResolvedProgramModelPool,
+    ) -> Result<Option<ProgramIdentity>, ScheduleError> {
+        let Some(scheduler) = self.program_scheduler.as_ref() else {
+            return Ok(None);
+        };
+        let request = typed_req.extract_program_identity_payload();
+        ProgramIdentity::from_request_with_enable_key(
+            headers,
+            request.as_ref(),
+            Some(&model_pool.scheduler_key),
+            scheduler.enable_key(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn acquire_program_completion<T: GenerationRequest>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
         model_id: Option<&str>,
         endpoint: &str,
+        prepared_facts: Option<TokenFacts>,
+        observable: bool,
+        identity: Option<ProgramIdentity>,
+        identity_checked: bool,
     ) -> Result<Option<ProgramCompletion>, ScheduleError> {
         let Some(scheduler) = &self.program_scheduler else {
             return Ok(None);
         };
-        let request = typed_req.extract_program_identity_payload();
         let model_pool = self.resolved_program_model_pool(model_id);
-        let Some(identity) = ProgramIdentity::from_request_with_enable_key(
-            headers,
-            request.as_ref(),
-            Some(&model_pool.scheduler_key),
-            scheduler.enable_key(),
-        )?
-        else {
+        let identity = if identity_checked {
+            identity
+        } else {
+            self.resolved_program_identity(headers, typed_req, &model_pool)?
+        };
+        let Some(identity) = identity else {
             return Ok(None);
         };
         let input_text = typed_req.extract_text_for_program_scheduling();
@@ -902,6 +1139,8 @@ impl Router {
             &model_pool,
             endpoint,
             &input_text,
+            prepared_facts,
+            observable,
         )
         .await
     }
@@ -927,16 +1166,77 @@ impl Router {
         else {
             return Ok(None);
         };
+        let prepared_facts = self.prepared_token_facts(
+            exact_prompt_tokens_from_json(request),
+            None,
+            model_id,
+            &model_pool.scheduler_key,
+            endpoint,
+        );
+        // A transparent proxy only observes Engine usage on the wire: a
+        // streaming body without `stream_options.include_usage` cannot verify
+        // a prepared fact, so exact mode must keep the estimate.
+        let observable = request.is_none_or(|body| {
+            body.get("stream").and_then(serde_json::Value::as_bool) != Some(true)
+                || body
+                    .pointer("/stream_options/include_usage")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        });
         self.acquire_program_completion_for_identity(
             scheduler,
             identity,
             &model_pool,
             endpoint,
             input_text,
+            prepared_facts,
+            observable,
         )
         .await
     }
 
+    /// Build the pre-dispatch input-token fact for one attempt.
+    ///
+    /// A prepared chat carries the exact IDs the Engine will receive. A
+    /// token-ID prompt already *is* the Engine input, so the client array
+    /// length is the exact fact even on the transparent HTTP path. Every other
+    /// shape returns `None` and keeps the byte estimator.
+    fn prepared_token_facts(
+        &self,
+        typed_exact_tokens: Option<usize>,
+        prepared: Option<&crate::backend::PreparedRequest>,
+        model_id: Option<&str>,
+        model_pool: &str,
+        endpoint: &str,
+    ) -> Option<TokenFacts> {
+        // Default `estimated` mode and excluded pools discard the fact, so do
+        // not pay for canonical JSON + SHA-256 (or env lookups) to build it.
+        let Some(scheduler) = &self.program_scheduler else {
+            return None;
+        };
+        if !scheduler.token_count_mode().uses_prepared_facts()
+            || !scheduler.prepared_token_pool_allowed(model_pool)
+        {
+            return None;
+        }
+        if let Some(prepared) = prepared {
+            let tokens = prepared.tokenized.token_ids.len();
+            if tokens > 0 {
+                let fingerprint = prepared_chat_fingerprint(
+                    prepared.request.as_ref(),
+                    prepared.tokenized.encode_backend,
+                );
+                return Some(TokenFacts::prepared_token_ids(tokens, fingerprint));
+            }
+        }
+        let tokens = typed_exact_tokens?;
+        Some(TokenFacts::client_token_ids(
+            tokens,
+            client_token_ids_fingerprint(model_id, model_pool, endpoint),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn acquire_program_completion_for_identity(
         &self,
         scheduler: &Arc<ProgramScheduler>,
@@ -944,17 +1244,29 @@ impl Router {
         model_pool: &ResolvedProgramModelPool,
         endpoint: &str,
         input_text: &str,
+        prepared_facts: Option<TokenFacts>,
+        observable: bool,
     ) -> Result<Option<ProgramCompletion>, ScheduleError> {
         let (estimated_context_tokens, calibration) = self.program_token_estimator.estimate(
             TokenEstimateScope::new(&model_pool.scheduler_key, endpoint),
             input_text,
+        );
+        let arrival = ArrivalTokenFacts::new(estimated_context_tokens, prepared_facts)
+            .with_observability(observable);
+        let context = scheduler.resolve_arrival_tokens(&model_pool.scheduler_key, arrival);
+        RouterMetrics::record_agent_aware_context_token_fact(
+            &model_pool.scheduler_key,
+            endpoint,
+            context.source().as_str(),
+            context.tokens(),
+            context.fallback().map(|reason| reason.as_str()),
         );
         let targets = self.program_targets_for_model(model_pool);
         let routing_text = scheduler
             .uses_cache_aware_binding()
             .then(|| input_text.to_string());
         let dispatch = scheduler
-            .acquire_from_snapshot(identity, estimated_context_tokens, targets, routing_text)
+            .acquire_from_snapshot(identity, context, targets, routing_text)
             .await?;
         Ok(Some(ProgramCompletion::new(
             scheduler.clone(),
@@ -1437,13 +1749,41 @@ impl Router {
                 .into_response();
         }
 
-        // All-grpc chat: tokenize once, outside policy and retry.
-        // Cache-aware placement uses the same full content/session key as
-        // HTTP. PreparedRequest retains full token IDs for backend dispatch.
-        //
-        // The concrete request comes from `GenerationRequest::grpc_request`
-        // rather than a `serde_json::Value` roundtrip: the only two routes a
-        // gRPC pool admits are exactly the two concrete request types.
+        // Prepare gRPC once before retries. HTTP text preparation is optional:
+        // resolve identity once and gate the extra tokenization by mode, pool
+        // and endpoint. Inject upstream usage only for eligible Program streams;
+        // the response adapter hides it again if the client did not request it.
+        let model_pool = self.resolved_program_model_pool(model_id);
+        let identity_config_applies = matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
+            && self.program_scheduler.as_ref().is_some_and(|scheduler| {
+                scheduler.token_count_mode().uses_prepared_facts()
+                    && (scheduler.exact_text_endpoint_enabled(route)
+                        || typed_req.exact_input_token_count().is_some())
+                    && scheduler.prepared_token_pool_allowed(&model_pool.scheduler_key)
+            });
+        let resolved_identity = if identity_config_applies {
+            match self.resolved_program_identity(headers, typed_req, &model_pool) {
+                Ok(identity) => identity,
+                Err(error) => return Self::schedule_error_response(error),
+            }
+        } else {
+            None
+        };
+        let inject_include_usage = matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
+            && typed_req.is_stream()
+            && !typed_req.settlement_reports_usage()
+            && resolved_identity.is_some();
+        let settlement_observable = !matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
+            || typed_req.settlement_reports_usage()
+            || inject_include_usage;
+        // A resolved identity already passed the HTTP/mode/pool gates above;
+        // settlement is observable either directly or through injected usage.
+        let exact_text_chat = resolved_identity.is_some()
+            && route == "/v1/chat/completions"
+            && self
+                .program_scheduler
+                .as_ref()
+                .is_some_and(|scheduler| scheduler.exact_text_endpoint_enabled(route));
         let prepared = match (pool, typed_req.grpc_request()) {
             (Some(crate::backend::WorkerPoolKind::Grpc), Some(GrpcRequestRef::Chat(chat)))
                 if route == "/v1/chat/completions" =>
@@ -1481,9 +1821,40 @@ impl Router {
                 )
                     .into_response();
             }
+            (Some(crate::backend::WorkerPoolKind::Http), Some(GrpcRequestRef::Chat(chat)))
+                if exact_text_chat =>
+            {
+                let started = Instant::now();
+                match self.frontend.prepare_for_token_count(chat.clone()).await {
+                    Ok(prepared) => {
+                        RouterMetrics::record_agent_aware_token_prepare(
+                            started.elapsed().as_secs_f64(),
+                        );
+                        Some(prepared)
+                    }
+                    Err(error) => {
+                        RouterMetrics::record_agent_aware_token_prepare_failure();
+                        debug!(
+                            event = "exact_text_prepare_failed",
+                            endpoint = route,
+                            error = %error,
+                            "falling back to the byte estimator for Program context tokens"
+                        );
+                        None
+                    }
+                }
+            }
             _ => None,
         };
 
+        let injected_body = if inject_include_usage {
+            serde_json::to_value(typed_req).ok().map(|mut value| {
+                inject_stream_usage(&mut value);
+                value
+            })
+        } else {
+            None
+        };
         let completion = match (pool, typed_req.grpc_request()) {
             (
                 Some(crate::backend::WorkerPoolKind::Http),
@@ -1502,7 +1873,16 @@ impl Router {
             _ => typed_req.extract_text_for_routing(),
         };
         let text = &text;
+        // Build the token fact once per request, not per retry attempt.
+        let prepared_facts = self.prepared_token_facts(
+            typed_req.exact_input_token_count(),
+            prepared.as_ref(),
+            model_id,
+            &self.resolved_program_model_pool(model_id).scheduler_key,
+            route,
+        );
         let prepared = &prepared;
+        let injected_body = &injected_body;
         let completion = completion.as_ref();
         let cache_key = std::sync::OnceLock::new();
         let cache_key = &cache_key;
@@ -1532,6 +1912,7 @@ impl Router {
         let http_inputs = &http_inputs;
         let failed_workers = &failed_workers;
         let affinity_key = &affinity_key;
+        let resolved_identity = &resolved_identity;
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
@@ -1540,7 +1921,16 @@ impl Router {
                 // previous ProgramCompletion finishes exactly once before a
                 // retry invokes this closure again.
                 let program_completion = match self
-                    .acquire_program_completion(headers, typed_req, model_id, route)
+                    .acquire_program_completion(
+                        headers,
+                        typed_req,
+                        model_id,
+                        route,
+                        prepared_facts,
+                        settlement_observable,
+                        resolved_identity.as_ref().cloned(),
+                        identity_config_applies,
+                    )
                     .await
                 {
                     Ok(completion) => completion,
@@ -1553,7 +1943,14 @@ impl Router {
                 let kv_ops = kv_aware_ops(policy.as_ref());
                 let workers = self.available_workers(model_id);
                 let excluded_workers = failed_workers.lock().clone();
-                let needs_http_input = prepared.is_none()
+                // Router-rendered token IDs are an exact-token fact, not a
+                // replacement for the Engine's own KV-aware input. On an HTTP
+                // pool the policy keeps using the Engine `/tokenize` path even
+                // when exact-text preparation produced IDs; only gRPC dispatch
+                // already owns the token IDs it sends.
+                let prepared_for_kv = prepared.is_some()
+                    && matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc));
+                let needs_http_input = !prepared_for_kv
                     && (kv_ops.is_some() || policy.needs_cache_routing_key());
                 let binding_skips_rpc = needs_http_input && excluded_workers.is_empty()
                     && affinity_key.as_ref().is_some_and(|key| {
@@ -1598,7 +1995,14 @@ impl Router {
                         .await
                         .as_ref()
                 };
-                let request_tokens = if let Some(prepared) = &prepared {
+                let request_tokens = if prepared_for_kv {
+                    let Some(prepared) = prepared.as_ref() else {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "prepared gRPC input missing before dispatch",
+                        )
+                            .into_response();
+                    };
                     if kv_ops.is_some() {
                         RouterMetrics::record_kv_routing_input("grpc", "prepared");
                     }
@@ -1701,6 +2105,8 @@ impl Router {
                             completion,
                             load,
                             prepared: (*prepared).clone(),
+                            request_body: injected_body.clone(),
+                            strip_usage: inject_include_usage,
                         },
                         program_completion.clone(),
                     )
@@ -1884,6 +2290,8 @@ impl Router {
             completion,
             load,
             prepared,
+            request_body,
+            strip_usage,
         } = dispatch;
         let completion_echo = completion.map(|input| input.echo);
         let load_incremented = load.tracks_worker();
@@ -1912,15 +2320,21 @@ impl Router {
                 Some(Arc::new(move || load.begin_decode())
                     as crate::backend::grpc::FirstOutputCallback)
             };
+            let engine_observer = program_completion
+                .as_ref()
+                .map(|completion| completion.engine_observer());
             let mut response = self
                 .frontend
-                .dispatch_with_first_output(worker_url, prepared, on_first_output)
+                .dispatch_with_first_output(worker_url, prepared, on_first_output, engine_observer)
                 .await;
+            if let Some(completion) = program_completion {
+                // Settlement follows the true terminal state, including usage
+                // and cancellation, instead of the response header.
+                response =
+                    settle_program_completion_on_response(response, is_stream, completion).await;
+            }
             if is_stream && response.status().is_success() {
                 response = hold_request_load_until_body_done(response, load);
-            }
-            if let Some(completion) = &program_completion {
-                completion.finish(response.status().is_success());
             }
             return response;
         }
@@ -1939,8 +2353,12 @@ impl Router {
                     }
                 };
 
-                // Parse the request body
-                let json_val = match serde_json::to_value(typed_req) {
+                // Parse the request body (or reuse the usage-injected body).
+                let json_val = match request_body
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(|| serde_json::to_value(typed_req))
+                {
                     Ok(j) => j,
                     Err(e) => {
                         return (
@@ -1962,7 +2380,9 @@ impl Router {
             } else {
                 let request_url = format!("{}{}", worker_url, route);
                 (
-                    if let Some(completion) = completion {
+                    if let Some(body) = request_body.as_ref() {
+                        self.client.post(&request_url).json(body)
+                    } else if let Some(completion) = completion {
                         completion.forward_request(&self.client, &request_url, headers, typed_req)
                     } else {
                         self.client.post(&request_url).json(typed_req)
@@ -2072,6 +2492,12 @@ impl Router {
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            if strip_usage {
+                // Filtering the injected usage changes the body length. Let
+                // the HTTP server frame the stream instead of forwarding the
+                // upstream length for a body we no longer send verbatim.
+                response_headers.remove(CONTENT_LENGTH);
+            }
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
             if stages_on {
@@ -2092,6 +2518,7 @@ impl Router {
             let producer_load = load.clone();
             let producer = tokio::spawn(async move {
                 let mut stream = stream;
+                let mut usage_stripper = strip_usage.then(SseUsageStripper::default);
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
                 while let Some(chunk) = stream.next().await {
@@ -2131,9 +2558,21 @@ impl Router {
                             let has_output = completion_output
                                 .as_mut()
                                 .is_some_and(|observer| observer.observe(&bytes));
+                            let outgoing = match usage_stripper.as_mut() {
+                                Some(stripper) => match stripper.push(&bytes) {
+                                    Some(bytes) => bytes,
+                                    None => {
+                                        if has_output {
+                                            producer_load.begin_decode();
+                                        }
+                                        continue;
+                                    }
+                                },
+                                None => bytes,
+                            };
                             let sent = match producer_output_frame.as_mut() {
-                                Some(output_frame) => output_frame.send(&tx, bytes, has_output),
-                                None => tx.send(Ok(bytes)).is_ok(),
+                                Some(output_frame) => output_frame.send(&tx, outgoing, has_output),
+                                None => tx.send(Ok(outgoing)).is_ok(),
                             };
                             if !sent {
                                 stream_succeeded = false;
@@ -2148,6 +2587,11 @@ impl Router {
                             let _ = tx.send(Err(format!("Stream error: {}", e)));
                             break;
                         }
+                    }
+                }
+                if let Some(stripper) = usage_stripper.as_mut() {
+                    if let Some(tail) = stripper.finish() {
+                        let _ = tx.send(Ok(tail));
                     }
                 }
                 if let Some(completion) = &completion {
@@ -4632,6 +5076,8 @@ mod tests {
                     // false` expressed before the field became a guard.
                     load: RequestLoadGuard::new(None, None),
                     prepared: None,
+                    request_body: None,
+                    strip_usage: false,
                 },
                 None,
             )
@@ -5358,6 +5804,167 @@ mod tests {
         router
     }
 
+    #[tokio::test]
+    async fn stream_error_frame_settles_the_attempt_as_failed() {
+        let (scheduler, dispatch) = settlement_scheduler(100).await;
+        let completion = program_completion(&scheduler, dispatch);
+        let observed = completion.clone();
+        let chunks = vec![Ok::<_, axum::Error>(axum::body::Bytes::from(
+            "data: {\"error\":\"gRPC stream closed before finish_info\"}\n\n",
+        ))];
+        let response = Response::new(Body::from_stream(futures_util::stream::iter(chunks)));
+        let settled = settle_program_completion_on_response(response, true, completion).await;
+        let _ = to_bytes(settled.into_body(), 1_000_000).await.unwrap();
+        assert!(!observed.finished_success());
+    }
+
+    #[tokio::test]
+    async fn producer_error_outcome_settles_the_attempt_as_failed() {
+        let (scheduler, dispatch) = settlement_scheduler(100).await;
+        let completion = program_completion(&scheduler, dispatch);
+        completion.engine_observer().record_error();
+        let observed = completion.clone();
+        let chunks = vec![Ok::<_, axum::Error>(axum::body::Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        ))];
+        let response = Response::new(Body::from_stream(futures_util::stream::iter(chunks)));
+        let settled = settle_program_completion_on_response(response, true, completion).await;
+        let _ = to_bytes(settled.into_body(), 1_000_000).await.unwrap();
+        assert!(!observed.finished_success());
+    }
+
+    async fn settlement_scheduler(
+        estimated_tokens: usize,
+    ) -> (
+        Arc<ProgramScheduler>,
+        crate::program_scheduling::ProgramDispatch,
+    ) {
+        let scheduler = Arc::new(ProgramScheduler::new(ProgramSchedulerConfig::default()));
+        let target = crate::program_scheduling::ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let identity = crate::program_scheduling::ProgramIdentity::from_request(
+            None,
+            Some(&serde_json::json!({
+                "vllm_xargs": {"agentic_context": {
+                    "program_id": "program-a",
+                    "expected_resume": true
+                }}
+            })),
+            Some("model-a"),
+        )
+        .unwrap()
+        .unwrap();
+        let dispatch = scheduler
+            .acquire(
+                identity,
+                crate::program_scheduling::ContextTokens::estimated(estimated_tokens),
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        (scheduler, dispatch)
+    }
+
+    fn program_completion(
+        scheduler: &Arc<ProgramScheduler>,
+        dispatch: crate::program_scheduling::ProgramDispatch,
+    ) -> ProgramCompletion {
+        let estimator = Arc::new(crate::token_estimator::MomentumTokenEstimator::default());
+        let (_, calibration) = estimator.estimate(
+            crate::token_estimator::TokenEstimateScope::new("model-a", "/v1/chat/completions"),
+            &"x".repeat(400),
+        );
+        ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration)
+    }
+
+    #[tokio::test]
+    async fn streaming_program_attempt_settles_after_the_last_chunk() {
+        let (scheduler, dispatch) = settlement_scheduler(100).await;
+        let completion = program_completion(&scheduler, dispatch);
+        let chunks = vec![
+            Ok::<_, axum::Error>(axum::body::Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+            )),
+            Ok(axum::body::Bytes::from(
+                "data: {\"usage\":{\"prompt_tokens\":123,\"completion_tokens\":7}}\n\n",
+            )),
+            Ok(axum::body::Bytes::from("data: [DONE]\n\n")),
+        ];
+        let response = Response::new(Body::from_stream(futures_util::stream::iter(chunks)));
+        let settled = settle_program_completion_on_response(response, true, completion).await;
+        let body = to_bytes(settled.into_body(), 1_000_000).await.unwrap();
+        assert!(body.ends_with(b"data: [DONE]\n\n"));
+        // The Engine's own prompt count replaces the arrival estimate.
+        let snapshot = scheduler.diagnostics();
+        assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 123);
+    }
+
+    #[tokio::test]
+    async fn buffered_program_attempt_settles_at_header_time_with_producer_usage() {
+        let (scheduler, dispatch) = settlement_scheduler(100).await;
+        let completion = program_completion(&scheduler, dispatch);
+        // The gRPC collect path recorded the Engine counts before returning.
+        completion.engine_observer().record_usage(Some(177), 3);
+        let response = Response::new(Body::from(
+            "{\"usage\":{\"prompt_tokens\":177,\"completion_tokens\":3}}",
+        ));
+        let settled = settle_program_completion_on_response(response, false, completion).await;
+        let body = to_bytes(settled.into_body(), 1_000_000).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("\"prompt_tokens\":177"));
+        // Growth is applied immediately; a smaller estimated observation would
+        // keep the two-observation shrink rule instead.
+        let snapshot = scheduler.diagnostics();
+        assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 177);
+    }
+
+    #[test]
+    fn sse_usage_stripper_only_drops_the_final_usage_only_frame() {
+        let mut stripper = SseUsageStripper::default();
+        let first = b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n";
+        assert_eq!(stripper.push(first).as_deref(), Some(&first[..]));
+        // Ordinary deltas may carry a null `usage`, or even a usage object,
+        // next to non-empty choices; both must be preserved.
+        let null_usage =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}],\"usage\":null}\n\n";
+        assert_eq!(stripper.push(null_usage).as_deref(), Some(&null_usage[..]));
+        let usage_with_choices =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}],\"usage\":{\"prompt_tokens\":3}}\n\n";
+        assert_eq!(
+            stripper.push(usage_with_choices).as_deref(),
+            Some(&usage_with_choices[..])
+        );
+        // The final usage-only frame is dropped even when split across chunks.
+        let part_a = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3";
+        let part_b = b"}}\n\n";
+        assert!(stripper.push(part_a).is_none());
+        assert_eq!(stripper.push(part_b).as_deref(), Some(&b"\n"[..]));
+        assert!(stripper.finish().is_none());
+    }
+
+    #[test]
+    fn inject_stream_usage_keeps_other_options() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "stream": true,
+            "stream_options": {"include_usage": false}
+        });
+        inject_stream_usage(&mut body);
+        assert_eq!(
+            body["stream_options"]["include_usage"],
+            serde_json::Value::Bool(true)
+        );
+        let mut without = serde_json::json!({"model": "m", "stream": true});
+        inject_stream_usage(&mut without);
+        assert_eq!(
+            without["stream_options"]["include_usage"],
+            serde_json::Value::Bool(true)
+        );
+    }
+
     fn create_test_regular_router() -> Router {
         // Create registries
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -6032,6 +6639,8 @@ mod tests {
                     completion: Some(&completion),
                     load,
                     prepared: None,
+                    request_body: None,
+                    strip_usage: false,
                 },
                 None,
             )
@@ -6215,6 +6824,8 @@ mod tests {
                         completion: Some(&completion),
                         load,
                         prepared: None,
+                        request_body: None,
+                        strip_usage: false,
                     },
                     None,
                 )
@@ -6589,6 +7200,39 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_identity_is_not_forwarded_on_the_exact_text_path() {
+        let mut router = create_test_regular_router();
+        let config = ProgramSchedulerConfig {
+            token_count_mode: crate::program_scheduling::TokenCountMode::Shadow,
+            exact_text_endpoints: vec!["/v1/chat/completions".to_string()],
+            ..ProgramSchedulerConfig::default()
+        };
+        router.program_scheduler = Some(Arc::new(ProgramScheduler::new(config)));
+
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "hello"}],
+            "vllm_xargs": {
+                "agentic_context": {
+                    "program_id": "p",
+                    "parent_program_id": "p"
+                }
+            }
+        }))
+        .unwrap();
+        let response = router
+            .route_typed_request(None, &request, "/v1/chat/completions", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("parent_program_id must differ from program_id"),
+            "unexpected body: {body}"
+        );
     }
 
     #[tokio::test]
@@ -7287,5 +7931,251 @@ mod tests {
         assert!(registry.revision() > revision_before_recovery);
 
         health_checker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn usage_filter_preserves_stream_framing_across_token_modes() {
+        use crate::program_scheduling::TokenCountMode;
+        for mode in [
+            None,
+            Some(TokenCountMode::Estimated),
+            Some(TokenCountMode::Shadow),
+            Some(TokenCountMode::ExactWhenVerified),
+        ] {
+            for (identified, client_usage) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+                let capture = captured.clone();
+                let app = axum::Router::new().route(
+                    "/v1/chat/completions",
+                    axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                        let capture = capture.clone();
+                        async move {
+                            let include = body.pointer("/stream_options/include_usage")
+                                .and_then(serde_json::Value::as_bool) == Some(true);
+                            *capture.lock() = Some(body);
+                            let mut sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n".to_string();
+                            if include {
+                                sse.push_str("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\n");
+                            }
+                            sse.push_str("data: [DONE]\n\n");
+                            Response::builder()
+                                .header(CONTENT_TYPE, "text/event-stream")
+                                .header(CONTENT_LENGTH, sse.len())
+                                .body(Body::from(sse)).unwrap()
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let mut router = router_pointing_at(address);
+                router.frontend.pin_test_token_ids(vec![1; 10]);
+                router.program_scheduler = mode.map(|token_count_mode| {
+                    Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                        token_count_mode,
+                        token_count_verification_settlements: 0,
+                        exact_text_endpoints: vec!["/v1/chat/completions".into()],
+                        ..Default::default()
+                    }))
+                });
+                let mut body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hello"}],"stream":true});
+                if identified {
+                    body["vllm_xargs"] = serde_json::json!({"agentic_context":{"program_id":"p","expected_resume":false}});
+                }
+                if client_usage {
+                    body["stream_options"] = serde_json::json!({"include_usage":true});
+                }
+                let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+                let response = router
+                    .route_typed_request(None, &request, "/v1/chat/completions", None)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let declared = response
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .map(|value| value.to_str().unwrap().parse::<usize>().unwrap());
+                let bytes = to_bytes(response.into_body(), 10000).await.unwrap();
+                let inject = identified
+                    && !client_usage
+                    && mode.is_some_and(|mode| mode.uses_prepared_facts());
+                assert_eq!(
+                    captured
+                        .lock()
+                        .as_ref()
+                        .unwrap()
+                        .pointer("/stream_options/include_usage")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true),
+                    client_usage || inject
+                );
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("hello"));
+                assert!(text.ends_with("data: [DONE]\n\n"));
+                assert_eq!(text.contains("\"usage\""), client_usage);
+                // A changed body must not advertise the upstream byte count;
+                // ordinary streams and explicitly requested usage stay intact.
+                assert_eq!(
+                    declared,
+                    if inject { None } else { Some(bytes.len()) },
+                    "mode={mode:?}, identity={identified}, client_usage={client_usage}"
+                );
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_token_verification_uses_only_engine_prompt_info() {
+        use crate::program_scheduling::{
+            ArrivalTokenFacts, TokenCountMode, TokenFacts, TokenizerFingerprint,
+        };
+        for prompt_info in [None, Some(10), Some(12)] {
+            let scheduler = Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                token_count_mode: TokenCountMode::ExactWhenVerified,
+                ..Default::default()
+            }));
+            let fp = TokenizerFingerprint::from_parts(&["prompt-info"]);
+            let arrival = ArrivalTokenFacts::new(100, Some(TokenFacts::prepared_token_ids(10, fp)));
+            let context = scheduler.resolve_arrival_tokens("model-a", arrival);
+            let identity = ProgramIdentity::from_request(
+                None,
+                Some(&serde_json::json!({"vllm_xargs":{"agentic_context":{
+                    "program_id":"p","expected_resume":true
+                }}})),
+                Some("model-a"),
+            )
+            .unwrap()
+            .unwrap();
+            let target = crate::program_scheduling::ProgramTarget {
+                id: "rank-0".into(),
+                base_url: "grpc://worker".into(),
+                dp_rank: None,
+            };
+            let dispatch = scheduler
+                .acquire(identity, context, &[target], None)
+                .await
+                .unwrap();
+            let completion = program_completion(&scheduler, dispatch);
+            completion.engine_observer().record_usage(prompt_info, 1);
+            // The gRPC producer fills wire usage with prepared IDs when the
+            // Engine omitted prompt_info. That fallback is client-visible but
+            // must never become independent verification evidence.
+            let wire = format!("data: {{\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":1}}}}\n\ndata: [DONE]\n\n",prompt_info.unwrap_or(10));
+            let response = Response::new(Body::from(wire.clone()));
+            let response = settle_program_completion_on_response(response, true, completion).await;
+            let bytes = to_bytes(response.into_body(), 10000).await.unwrap();
+            assert_eq!(bytes.as_ref(), wire.as_bytes());
+            let diagnostic = scheduler.diagnostics();
+            assert_eq!(
+                diagnostic.verified_token_fingerprints,
+                usize::from(prompt_info == Some(10))
+            );
+            assert_eq!(
+                diagnostic.revoked_token_fingerprints,
+                usize::from(prompt_info == Some(12))
+            );
+            assert_eq!(
+                scheduler
+                    .resolve_arrival_tokens("model-a", arrival)
+                    .source()
+                    .is_prepared(),
+                prompt_info == Some(10)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_counts_leave_http_kv_inputs_on_engine_preparation() {
+        use crate::program_scheduling::TokenCountMode;
+        for mode in [
+            TokenCountMode::Estimated,
+            TokenCountMode::Shadow,
+            TokenCountMode::ExactWhenVerified,
+        ] {
+            for identified in [false, true] {
+                let ids = vec![1, 2, 3, 4, 5, 6];
+                let mut fixture = http_kv_fixture([vec![ids.clone()], vec![ids]], 0, true).await;
+                fixture.router.frontend.pin_test_token_ids(vec![9; 100]);
+                fixture.router.program_scheduler =
+                    Some(Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                        token_count_mode: mode,
+                        token_count_verification_settlements: 0,
+                        exact_text_endpoints: vec!["/v1/chat/completions".into()],
+                        ..Default::default()
+                    })));
+                let mut body =
+                    serde_json::json!({"model":"m","messages":[{"role":"user","content":"hello"}]});
+                if identified {
+                    body["vllm_xargs"] = serde_json::json!({"agentic_context":{"program_id":"p","expected_resume":false}});
+                }
+                let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+                let response = fixture
+                    .router
+                    .route_typed_request(None, &request, "/v1/chat/completions", None)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                to_bytes(response.into_body(), 10000).await.unwrap();
+                assert!(
+                    fixture
+                        .calls
+                        .lock()
+                        .iter()
+                        .any(|(_, path, _)| path.ends_with("/render")),
+                    "{mode:?}: skipped Engine input preparation"
+                );
+                let loads = fixture.loads.lock();
+                assert_eq!(loads.len(), 1);
+                assert!(
+                    loads[0].1.active_prefill_tokens <= 6,
+                    "{mode:?}: Router-only 100 IDs leaked into KV routing: {:?}",
+                    loads[0]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_counting_preserves_dp_and_public_headers() {
+        use crate::program_scheduling::TokenCountMode;
+        for mode in [
+            None,
+            Some(TokenCountMode::Estimated),
+            Some(TokenCountMode::Shadow),
+            Some(TokenCountMode::ExactWhenVerified),
+        ] {
+            let (address, server) = spawn_header_echo_backend().await;
+            let mut router = create_test_regular_router();
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.worker_registry.register(Arc::new(BasicWorker::new(
+                format!("http://{address}@1"),
+                WorkerType::Regular,
+            )));
+            router.intra_node_data_parallel_size = 2;
+            router.frontend.pin_test_token_ids(vec![1; 10]);
+            router.program_scheduler = mode.map(|token_count_mode| {
+                Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                    token_count_mode,
+                    token_count_verification_settlements: 0,
+                    exact_text_endpoints: vec!["/v1/chat/completions".into()],
+                    ..Default::default()
+                }))
+            });
+            let request:ChatCompletionRequest=serde_json::from_value(serde_json::json!({"model":"m","messages":[{"role":"user","content":"hello"}],"vllm_xargs":{"agentic_context":{"program_id":"p","expected_resume":false}}})).unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", "Bearer test-token".parse().unwrap());
+            headers.insert("x-public", "keep".parse().unwrap());
+            let response = router
+                .route_typed_request(Some(&headers), &request, "/v1/chat/completions", None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 10000).await.unwrap();
+            let echoed: HashMap<String, Vec<String>> = serde_json::from_slice(&body).unwrap();
+            assert_eq!(echoed["x-data-parallel-rank"], vec!["1"]);
+            assert_eq!(echoed["authorization"], vec!["Bearer test-token"]);
+            assert_eq!(echoed["x-public"], vec!["keep"]);
+            server.abort();
+        }
     }
 }

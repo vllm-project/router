@@ -701,6 +701,15 @@ impl GenerationRequest for ChatCompletionRequest {
         program_identity_payload(Some(&self.other), self.user.as_deref())
     }
 
+    fn settlement_reports_usage(&self) -> bool {
+        !self.stream
+            || self
+                .stream_options
+                .as_ref()
+                .and_then(|options| options.include_usage)
+                == Some(true)
+    }
+
     fn affinity_identity(&self) -> IdentityFields<'_> {
         IdentityFields {
             other: Some(&self.other),
@@ -942,8 +951,27 @@ impl GenerationRequest for CompletionRequest {
         Some(GrpcRequestRef::Completion(self))
     }
 
+    fn exact_input_token_count(&self) -> Option<usize> {
+        // A batch has no single Program context length.
+        match &self.prompt {
+            PromptInput::IntArray(ids) if !ids.is_empty() => {
+                exact_token_count(ids.len(), &self.other)
+            }
+            _ => None,
+        }
+    }
+
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
         program_identity_payload(Some(&self.other), self.user.as_deref())
+    }
+
+    fn settlement_reports_usage(&self) -> bool {
+        !self.stream
+            || self
+                .stream_options
+                .as_ref()
+                .and_then(|options| options.include_usage)
+                == Some(true)
     }
 
     fn affinity_identity(&self) -> IdentityFields<'_> {
@@ -2594,6 +2622,24 @@ pub trait GenerationRequest: Send + Sync {
         self.extract_text_for_routing()
     }
 
+    /// Exact input-token count when the request itself carries the token IDs
+    /// that will be forwarded to the Engine.
+    ///
+    /// Only request shapes whose prompt *is* the token ID array qualify: the
+    /// count then needs no tokenizer and no estimator, and the Engine observes
+    /// exactly those IDs (plus any explicitly configured special tokens).
+    fn exact_input_token_count(&self) -> Option<usize> {
+        None
+    }
+
+    /// Whether a non-gRPC settlement can observe the Engine's own prompt
+    /// usage. gRPC paths record producer usage independently of the wire, but a
+    /// streaming HTTP client that does not request
+    /// `stream_options.include_usage` never sees a usage count.
+    fn settlement_reports_usage(&self) -> bool {
+        true
+    }
+
     /// Extract only the small body subset used for Program identity parsing.
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
         None
@@ -2770,6 +2816,27 @@ impl PromptInput {
             PromptInput::IntBatch(batches) => batches.iter().map(|b| b.len()).sum(),
         }
     }
+}
+
+/// Shared typed/transparent token-ID counting contract. Special-token
+/// rewriting must be disabled; positive truncation keeps the last N tokens.
+/// Invalid limits fall back rather than guessing the Engine's behavior.
+pub(crate) fn exact_token_count(
+    tokens: usize,
+    options: &serde_json::Map<String, Value>,
+) -> Option<usize> {
+    if options.get("add_special_tokens").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let limit = match options.get("truncate_prompt_tokens") {
+        None | Some(Value::Null) => 0,
+        Some(value) => usize::try_from(value.as_u64()?).ok()?,
+    };
+    Some(if limit == 0 {
+        tokens
+    } else {
+        tokens.min(limit)
+    })
 }
 
 /// LoRA adapter path - can be single path or batch of paths (VLLM extension)
@@ -3240,6 +3307,79 @@ pub(crate) mod cache_routing {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_observes_usage_only_when_the_wire_reports_it() {
+        for (stream, include_usage, expected) in [
+            (false, None, true),
+            (true, None, false),
+            (true, Some(false), false),
+            (true, Some(true), true),
+        ] {
+            let mut body = serde_json::json!({
+                "model": "model-a", "prompt": [1, 2],
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": stream
+            });
+            if let Some(include_usage) = include_usage {
+                body["stream_options"] = serde_json::json!({"include_usage": include_usage});
+            }
+            let chat: ChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+            let completion: CompletionRequest = serde_json::from_value(body).unwrap();
+            assert_eq!(chat.settlement_reports_usage(), expected);
+            assert_eq!(completion.settlement_reports_usage(), expected);
+        }
+    }
+
+    /// Both request representations must implement the same Engine contract.
+    fn assert_exact_count(body: serde_json::Value, expected: Option<usize>) {
+        let typed: CompletionRequest = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(typed.exact_input_token_count(), expected, "typed: {body}");
+        assert_eq!(
+            crate::backend::token_count::exact_prompt_tokens_from_json(Some(&body)),
+            expected,
+            "transparent: {body}"
+        );
+    }
+
+    #[test]
+    fn token_id_prompt_count_applies_engine_truncation() {
+        for (limit, expected) in [
+            (serde_json::json!(2), Some(2)),
+            (serde_json::json!(8), Some(4)),
+            (serde_json::json!(0), Some(4)),
+            (serde_json::json!(null), Some(4)),
+            (serde_json::json!("2"), None),
+            (serde_json::json!(-1), None),
+        ] {
+            assert_exact_count(
+                serde_json::json!({
+                    "prompt": [1, 2, 3, 4], "add_special_tokens": false,
+                    "truncate_prompt_tokens": limit
+                }),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn token_id_prompt_is_exact_only_when_special_tokens_are_disabled() {
+        let base = serde_json::json!({"model": "model-a", "prompt": [11, 12, 13, 14]});
+        assert_exact_count(base.clone(), None);
+        for (prompt, expected) in [
+            (serde_json::json!([11, 12, 13, 14]), Some(4)),
+            (serde_json::json!("hello"), None),
+            (serde_json::json!([[1, 2], [3, 4, 5]]), None),
+            (serde_json::json!([]), None),
+        ] {
+            let mut body = base.clone();
+            body["prompt"] = prompt;
+            body["add_special_tokens"] = serde_json::json!(true);
+            assert_exact_count(body.clone(), None);
+            body["add_special_tokens"] = serde_json::json!(false);
+            assert_exact_count(body, expected);
+        }
+    }
 
     #[test]
     fn program_identity_payload_excludes_generation_content() {

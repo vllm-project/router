@@ -581,6 +581,35 @@ mod tests {
     }
 
     #[test]
+    fn vllm_xargs_is_accepted_as_router_plane_identity_and_dropped() {
+        // The canonical Program identity travels in `vllm_xargs`; the gRPC
+        // adapter must accept it for the HTTP layer to read, and must not
+        // forward it as an Engine field.
+        let req = chat(serde_json::json!({
+            "model": "qwen",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+            "vllm_xargs": {"agentic_context": {
+                "program_id": "program-a",
+                "expected_resume": true
+            }}
+        }));
+        let proto = chat_to_generate_request(&req, vec![5, 6], "req-2".into()).unwrap();
+        match proto.prompt.unwrap() {
+            pb::generate_request::Prompt::TokenIds(ids) => assert_eq!(ids.ids, vec![5, 6]),
+            other => panic!("expected token_ids, got {other:?}"),
+        }
+        // The typed request still exposes the identity to the scheduler.
+        let payload =
+            crate::protocols::spec::GenerationRequest::extract_program_identity_payload(&req)
+                .unwrap();
+        assert_eq!(
+            payload["vllm_xargs"]["agentic_context"]["program_id"],
+            "program-a"
+        );
+    }
+
+    #[test]
     fn prefers_max_completion_tokens() {
         let req = chat(serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}],

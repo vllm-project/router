@@ -171,6 +171,28 @@ impl EngineFrontend {
         })
     }
 
+    pub async fn prepare_for_token_count(
+        &self,
+        mut request: ChatCompletionRequest,
+    ) -> Result<PreparedRequest, PrepareError> {
+        let (handle, t_req, resolve_ms) = self.resolve_with_defaults(&mut request).await?;
+        let mut tokenized =
+            crate::backend::preprocess::tokenize_chat_request_for_count_timed(&request, &handle)
+                .map_err(|e| PrepareError::Invalid(format!("preprocess: {e}")))?;
+        // The Engine applies the same left truncation, so counting the
+        // untruncated rendering would overstate the Engine input.
+        truncate_grpc_prompt(&request, &mut tokenized)?;
+        Ok(PreparedRequest {
+            request: Arc::new(request),
+            tokenized,
+            handle,
+            resolve_ms,
+            t_req,
+            shape: ResponseShape::Chat,
+            emit_token_ids: false,
+        })
+    }
+
     /// Wire adapter path for `/v1/completions` on the gRPC pool: the client
     /// already sent token ids, so there is no chat template / router tokenize.
     /// Sampling defaults are resolved like `prepare`; encode fields report 0.
@@ -203,7 +225,7 @@ impl EngineFrontend {
 
     /// Convert + GenerateStream + detok on the selected worker URL.
     pub async fn dispatch(&self, worker_url: &str, prepared: PreparedRequest) -> Response {
-        self.dispatch_with_first_output(worker_url, prepared, None)
+        self.dispatch_with_first_output(worker_url, prepared, None, None)
             .await
     }
 
@@ -212,9 +234,16 @@ impl EngineFrontend {
         worker_url: &str,
         prepared: PreparedRequest,
         on_first_output: Option<FirstOutputCallback>,
+        observer: Option<std::sync::Arc<super::outcome::EngineOutcomeObserver>>,
     ) -> Response {
         self.grpc
-            .dispatch_prepared(worker_url, prepared, on_first_output, KvHandoff::default())
+            .dispatch_prepared(
+                worker_url,
+                prepared,
+                on_first_output,
+                KvHandoff::default(),
+                observer,
+            )
             .await
     }
 
@@ -250,7 +279,7 @@ impl EngineFrontend {
             kv_transfer_params,
         };
         self.grpc
-            .dispatch_prepared(worker_url, prepared, None, handoff)
+            .dispatch_prepared(worker_url, prepared, None, handoff, None)
             .await
     }
 }

@@ -525,10 +525,12 @@ mod generation_tests {
             .is_some());
 
         let diagnostics = ctx.router.scheduling_diagnostics().unwrap();
+        // The legacy key stays for compatibility; the new key is authoritative.
         assert_eq!(
             diagnostics["ranks"][0]["programs"][0]["estimated_context_tokens"],
             10
         );
+        assert_eq!(diagnostics["ranks"][0]["programs"][0]["context_tokens"], 10);
         assert_eq!(diagnostics["ranks"][0]["programs"][0]["state"], "paused");
         ctx.shutdown().await;
     }
