@@ -199,7 +199,8 @@ pub struct KvRequestSlot {
     manager: Arc<dyn SlotManager>,
     target: RoutableTarget,
     /// What this request currently has charged to the target's prefill load.
-    prefill_tokens: Arc<AtomicU64>,
+    /// Held under a lock with the state so a report cannot race the release.
+    charge: Arc<Mutex<u64>>,
     /// Affinity binding reference acquired with this reservation, if any.
     affinity: Option<Arc<AffinityRecord>>,
     // 0 = prefill, 1 = decode, 2 = freed.
@@ -216,23 +217,22 @@ impl KvRequestSlot {
         Self {
             manager,
             target,
-            prefill_tokens: Arc::new(AtomicU64::new(prefill_tokens)),
+            charge: Arc::new(Mutex::new(prefill_tokens)),
             affinity,
             state: Arc::new(AtomicU8::new(0)),
         }
     }
 
     pub fn begin_decode(&self) {
+        let mut charge = self.charge.lock();
         if self
             .state
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            self.manager.begin_decode(
-                &self.target,
-                &self.target,
-                self.prefill_tokens.load(Ordering::Acquire),
-            );
+            self.manager
+                .begin_decode(&self.target, &self.target, *charge);
+            *charge = 0;
         }
     }
 
@@ -241,10 +241,12 @@ impl KvRequestSlot {
     /// Only the difference is applied, so a growing report (a preemption) adds
     /// load back exactly once, and a request that already finished is ignored.
     pub(crate) fn apply_prefill_progress(&self, remaining: u64) {
+        let mut charge = self.charge.lock();
         if self.state.load(Ordering::Acquire) != 0 {
             return;
         }
-        let previous = self.prefill_tokens.swap(remaining, Ordering::AcqRel);
+        let previous = *charge;
+        *charge = remaining;
         let delta = remaining as i64 - previous as i64;
         if delta != 0 {
             self.manager.adjust_prefill(&self.target, delta);
@@ -271,7 +273,7 @@ impl std::fmt::Debug for KvRequestSlot {
         formatter
             .debug_struct("KvRequestSlot")
             .field("target", &self.target)
-            .field("prefill_tokens", &self.prefill_tokens)
+            .field("charge", &*self.charge.lock())
             .field("state", &self.state.load(Ordering::Relaxed))
             .finish()
     }
