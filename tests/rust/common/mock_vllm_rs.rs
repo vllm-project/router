@@ -142,7 +142,7 @@ impl Default for MockVllmRs {
             aborts: Arc::new(Mutex::new(Vec::new())),
             progress: Vec::new(),
             progress_hold: Duration::ZERO,
-        omit_finish: false,
+            omit_finish: false,
             hold: None,
         }
     }
