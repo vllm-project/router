@@ -198,7 +198,9 @@ pub(crate) fn kv_aware_policy(policy: &dyn LoadBalancingPolicy) -> Option<&KvAwa
 pub struct KvRequestSlot {
     manager: Arc<dyn SlotManager>,
     target: RoutableTarget,
-    prefill_tokens: u64,
+    /// What this request currently has charged to the target's prefill load.
+    /// Held under a lock with the state so a report cannot race the release.
+    charge: Arc<Mutex<u64>>,
     /// Affinity binding reference acquired with this reservation, if any.
     affinity: Option<Arc<AffinityRecord>>,
     // 0 = prefill, 1 = decode, 2 = freed.
@@ -215,20 +217,39 @@ impl KvRequestSlot {
         Self {
             manager,
             target,
-            prefill_tokens,
+            charge: Arc::new(Mutex::new(prefill_tokens)),
             affinity,
             state: Arc::new(AtomicU8::new(0)),
         }
     }
 
     pub fn begin_decode(&self) {
+        let mut charge = self.charge.lock();
         if self
             .state
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             self.manager
-                .begin_decode(&self.target, &self.target, self.prefill_tokens);
+                .begin_decode(&self.target, &self.target, *charge);
+            *charge = 0;
+        }
+    }
+
+    /// Replace this request's charge with the work the worker says is left.
+    ///
+    /// Only the difference is applied, so a growing report (a preemption) adds
+    /// load back exactly once, and a request that already finished is ignored.
+    pub(crate) fn apply_prefill_progress(&self, remaining: u64) {
+        let mut charge = self.charge.lock();
+        if self.state.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let previous = *charge;
+        *charge = remaining;
+        let delta = remaining as i64 - previous as i64;
+        if delta != 0 {
+            self.manager.adjust_prefill(&self.target, delta);
         }
     }
 
@@ -252,7 +273,7 @@ impl std::fmt::Debug for KvRequestSlot {
         formatter
             .debug_struct("KvRequestSlot")
             .field("target", &self.target)
-            .field("prefill_tokens", &self.prefill_tokens)
+            .field("charge", &*self.charge.lock())
             .field("state", &self.state.load(Ordering::Relaxed))
             .finish()
     }
@@ -277,6 +298,9 @@ pub trait SlotManager: LoadProvider {
         prefill_tokens: u64,
     );
     fn free(&self, target: &RoutableTarget);
+
+    /// Move a target's prefill load by `delta` without ending the request.
+    fn adjust_prefill(&self, target: &RoutableTarget, delta: i64);
 
     /// Drop idle state for a target that is no longer registered. Implementers
     /// may keep active state until its matching request cleanup arrives.
@@ -349,6 +373,17 @@ impl LoadProvider for InMemorySlotManager {
 }
 
 impl SlotManager for InMemorySlotManager {
+    fn adjust_prefill(&self, target: &RoutableTarget, delta: i64) {
+        self.update_or_insert(target, |slot| {
+            if delta >= 0 {
+                slot.active_prefill_tokens
+                    .fetch_add(delta as u64, Ordering::AcqRel);
+            } else {
+                atomic_saturating_sub_u64(&slot.active_prefill_tokens, delta.unsigned_abs());
+            }
+        });
+    }
+
     fn begin_prefill(&self, target: &RoutableTarget, prefill_tokens: u64) {
         self.update_or_insert(target, |slot| {
             slot.active_prefill_tokens
@@ -2011,6 +2046,7 @@ mod tests {
     use crate::request_identity::{resolve_affinity_identity, IdentityFields};
     use http::HeaderMap;
     use serde_json::Value as JsonValue;
+    use std::sync::atomic::AtomicBool;
 
     fn affinity_from_request(
         headers: Option<&HeaderMap>,
@@ -2317,6 +2353,136 @@ mod tests {
         slots.begin_decode(&active, &active, 32);
         slots.free(&active);
         assert!(!slots.slots.contains_key(&active));
+    }
+
+    /// Blocks inside the load adjustment, so a test can put a cancel inside the
+    /// window between a report passing its state check and moving the total.
+    struct GatedSlots {
+        inner: InMemorySlotManager,
+        arm: AtomicBool,
+        entered: std::sync::mpsc::Sender<()>,
+        gate: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl LoadProvider for GatedSlots {
+        fn sample(&self, target: &RoutableTarget) -> LoadSample {
+            self.inner.sample(target)
+        }
+    }
+
+    impl SlotManager for GatedSlots {
+        fn begin_prefill(&self, target: &RoutableTarget, prefill_tokens: u64) {
+            self.inner.begin_prefill(target, prefill_tokens);
+        }
+
+        fn begin_decode(
+            &self,
+            prefill_target: &RoutableTarget,
+            decode_target: &RoutableTarget,
+            prefill_tokens: u64,
+        ) {
+            self.inner
+                .begin_decode(prefill_target, decode_target, prefill_tokens);
+        }
+
+        fn free(&self, target: &RoutableTarget) {
+            self.inner.free(target);
+        }
+
+        fn adjust_prefill(&self, target: &RoutableTarget, delta: i64) {
+            if self.arm.swap(false, Ordering::AcqRel) {
+                let _ = self.entered.send(());
+                let gate = self.gate.lock();
+                let _ = gate.recv();
+            }
+            self.inner.adjust_prefill(target, delta);
+        }
+    }
+
+    #[test]
+    fn a_cancel_waits_for_a_report_already_in_the_ledger() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let slots = Arc::new(GatedSlots {
+            inner: InMemorySlotManager::new(),
+            arm: AtomicBool::new(true),
+            entered: entered_tx,
+            gate: Mutex::new(gate_rx),
+        });
+        let t = target("race", 0);
+        slots.begin_prefill(&t, 100);
+        let slot = Arc::new(KvRequestSlot::new(slots.clone(), t.clone(), 100, None));
+
+        // The report reaches the ledger adjustment with its state check behind it.
+        let reporter = {
+            let slot = slot.clone();
+            std::thread::spawn(move || slot.apply_prefill_progress(300))
+        };
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("report reaches the adjustment");
+
+        // A cancel must not slip past it: it owns the same charge. The thread
+        // announces itself first, so the check below cannot pass merely because
+        // it was never scheduled.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let canceller = {
+            let slot = slot.clone();
+            std::thread::spawn(move || {
+                let _ = started_tx.send(());
+                slot.release();
+                let _ = done_tx.send(());
+            })
+        };
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the cancel thread starts");
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(150))
+                .is_err(),
+            "the cancel must wait for the report to finish moving the ledger"
+        );
+
+        gate_tx.send(()).expect("open the gate");
+        reporter.join().expect("report finishes");
+        canceller.join().expect("cancel finishes");
+        assert_eq!(
+            slots.sample(&t).active_prefill_tokens,
+            0,
+            "the request must not stay charged after the cancel"
+        );
+    }
+
+    #[test]
+    fn prefill_progress_replaces_the_charge_in_both_directions() {
+        let slots = Arc::new(InMemorySlotManager::new());
+        let t = target("prog", 0);
+        slots.begin_prefill(&t, 1000);
+        let slot = KvRequestSlot::new(slots.clone(), t.clone(), 1000, None);
+
+        slot.apply_prefill_progress(400);
+        assert_eq!(slots.sample(&t).active_prefill_tokens, 400);
+
+        // A preemption can put work back; only the difference is applied.
+        slot.apply_prefill_progress(900);
+        assert_eq!(slots.sample(&t).active_prefill_tokens, 900);
+    }
+
+    #[test]
+    fn prefill_progress_after_release_is_ignored() {
+        let slots = Arc::new(InMemorySlotManager::new());
+        let t = target("prog-done", 0);
+        slots.begin_prefill(&t, 1000);
+        let slot = KvRequestSlot::new(slots.clone(), t.clone(), 1000, None);
+
+        slot.apply_prefill_progress(400);
+        slot.release();
+        assert_eq!(slots.sample(&t).active_prefill_tokens, 0);
+
+        slot.apply_prefill_progress(800);
+        assert_eq!(slots.sample(&t).active_prefill_tokens, 0);
     }
 
     #[test]

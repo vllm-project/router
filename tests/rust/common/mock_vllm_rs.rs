@@ -24,7 +24,8 @@ use vllm_router_rs::backend::pb::{
     control_server::{Control, ControlServer},
     finish_info, generate_request,
     inference_server::{Inference, InferenceServer},
-    FinishInfo, GenerateRequest, GenerateResponse, PromptInfo, SequenceOutput, TokenIds,
+    FinishInfo, GenerateRequest, GenerateResponse, PrefillProgress, PromptInfo, SequenceOutput,
+    TokenIds,
 };
 
 #[derive(Clone, Default)]
@@ -69,6 +70,15 @@ pub struct MockVllmRs {
     pub aborts: Arc<Mutex<Vec<String>>>,
     /// After `hold_after` recorded requests, wait until [`HoldGate::release`].
     pub hold: Option<HoldGate>,
+    /// Prefill progress values to stream before the output frames, as the
+    /// engine does while a prefill runs. Empty sends none.
+    pub progress: Vec<u32>,
+    /// Wait between the progress frames and the first output, so a test can
+    /// observe the worker while its prefill is still running.
+    pub progress_hold: Duration,
+    /// Close the stream without a `FinishInfo` frame, as a prefill that only
+    /// reports progress does.
+    pub omit_finish: bool,
 }
 
 /// Blocks requests after the first `hold_after` ones until [`HoldGate::release`].
@@ -130,6 +140,9 @@ impl Default for MockVllmRs {
             stream_failures_remaining: Arc::new(AtomicUsize::new(0)),
             aborted_finishes_remaining: Arc::new(AtomicUsize::new(0)),
             aborts: Arc::new(Mutex::new(Vec::new())),
+            progress: Vec::new(),
+            progress_hold: Duration::ZERO,
+            omit_finish: false,
             hold: None,
         }
     }
@@ -217,6 +230,7 @@ impl Inference for MockVllmRs {
             }
         }
         Ok(Response::new(GenerateResponse {
+            prefill_progress: None,
             prompt_info,
             outputs: Some(SequenceOutput {
                 index: 0,
@@ -292,6 +306,9 @@ impl Inference for MockVllmRs {
             .as_ref()
             .map(|params| json_to_proto_struct(params).expect("JSON object"));
         let reply_delay = self.reply_delay;
+        let progress = self.progress.clone();
+        let progress_hold = self.progress_hold;
+        let omit_finish = self.omit_finish;
         let cancelled = self.cancelled.clone();
         let fail_stream = self
             .stream_failures_remaining
@@ -316,6 +333,7 @@ impl Inference for MockVllmRs {
             }
             let _ = tx
                 .send(Ok(GenerateResponse {
+                    prefill_progress: None,
                     prompt_info: Some(PromptInfo {
                         num_prompt_tokens: n_prompt,
                         ..Default::default()
@@ -323,6 +341,20 @@ impl Inference for MockVllmRs {
                     outputs: None,
                 }))
                 .await;
+            for remaining in progress {
+                let _ = tx
+                    .send(Ok(GenerateResponse {
+                        prefill_progress: Some(PrefillProgress {
+                            remaining_prefill_tokens: remaining,
+                        }),
+                        prompt_info: None,
+                        outputs: None,
+                    }))
+                    .await;
+            }
+            if !progress_hold.is_zero() {
+                tokio::time::sleep(progress_hold).await;
+            }
             if fail_stream {
                 let _ = tx.send(Err(Status::internal("decode failed"))).await;
                 return;
@@ -331,7 +363,7 @@ impl Inference for MockVllmRs {
             let total: u32 = frames.iter().map(|(_, ids)| ids.len() as u32).sum();
             let mut finish_kv = finish_kv;
             for (index, (text, token_ids)) in frames.into_iter().enumerate() {
-                let finish_info = (index == last).then(|| FinishInfo {
+                let finish_info = (!omit_finish && index == last).then(|| FinishInfo {
                     num_output_tokens: total,
                     finish_reason: finish_reason as i32,
                     kv_transfer_params: finish_kv.take(),
@@ -339,6 +371,7 @@ impl Inference for MockVllmRs {
                 });
                 let sent = tx
                     .send(Ok(GenerateResponse {
+                        prefill_progress: None,
                         prompt_info: None,
                         outputs: Some(SequenceOutput {
                             index: 0,

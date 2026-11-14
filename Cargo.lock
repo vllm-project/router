@@ -7264,8 +7264,7 @@ dependencies = [
 [[package]]
 name = "vllm-proto"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24b93fe7d8a27c54819d60b372ca57eb6dd23445bdabcf7c70325fc9572e8cc8"
+source = "git+https://github.com/KaisennHu/vllm-proto?branch=master#16c9a069ea7fff1909e9782a6dfb34fde8b0f5e1"
 dependencies = [
  "prost 0.14.4",
  "prost-types",
