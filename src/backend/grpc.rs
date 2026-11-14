@@ -438,8 +438,19 @@ impl GrpcEngineBackend {
             warn!(%engine_request_id, "prefill GenerateStream finished aborted");
             return Err((StatusCode::BAD_GATEWAY, "grpc prefill aborted").into_response());
         }
+        // A stream can carry progress and close without a finish frame. Decode is
+        // already dispatched by then, so refuse the handoff instead of sending it
+        // empty.
+        let Some(finish) = finish else {
+            warn!(%engine_request_id, "prefill stream ended without a finish frame");
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "grpc prefill stream ended without a finish frame",
+            )
+                .into_response());
+        };
         Ok(finish
-            .and_then(|finish| finish.kv_transfer_params)
+            .kv_transfer_params
             .map(|params| proto_struct_to_json(&params)))
     }
 
