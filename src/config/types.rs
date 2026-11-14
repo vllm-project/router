@@ -20,10 +20,6 @@ pub struct RouterConfig {
     /// Workers listed here skip HTTP control-plane discovery and probing.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pd_kv_event_sources: HashMap<String, PdKvEventSources>,
-    /// Price a running prefill from the remaining work the worker reports instead
-    /// of from the charge taken at admission.
-    #[serde(default)]
-    pub enable_prefill_progress: bool,
     /// Worker connection mode
     #[serde(default)]
     pub connection_mode: ConnectionMode,
@@ -1305,7 +1301,6 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             pd_kv_event_sources: HashMap::new(),
-            enable_prefill_progress: false,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3001,
@@ -2072,7 +2067,6 @@ mod tests {
     #[test]
     fn test_full_pd_mode_config() {
         let config = RouterConfig {
-            enable_prefill_progress: false,
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![
                     ("http://prefill1:8000".to_string(), Some(8001)),
@@ -2145,7 +2139,6 @@ mod tests {
         selector.insert("app".to_string(), "vllm".to_string());
 
         let config = RouterConfig {
-            enable_prefill_progress: false,
             mode: RoutingMode::Regular {
                 worker_urls: vec![
                     "http://worker1:8000".to_string(),
@@ -2217,7 +2210,6 @@ mod tests {
         selectors.insert("version".to_string(), "v1".to_string());
 
         let config = RouterConfig {
-            enable_prefill_progress: false,
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://worker1".to_string()],
             },

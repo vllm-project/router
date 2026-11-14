@@ -33,7 +33,6 @@ use vllm_router_rs::routers::http::router::Router;
 
 fn test_config(worker_urls: Vec<String>) -> RouterConfig {
     RouterConfig {
-        enable_prefill_progress: false,
         epd: None,
         mode: RoutingMode::Regular { worker_urls },
         pd_kv_event_sources: Default::default(),

@@ -137,11 +137,6 @@ struct CliArgs {
     #[arg(long, default_value_t = false)]
     vllm_pd_disaggregation: bool,
 
-    /// Price a running prefill from the remaining work the worker reports instead of from the
-    /// charge taken at admission. Off by default.
-    #[arg(long, default_value_t = false)]
-    enable_prefill_progress: bool,
-
     /// ZMQ service discovery address for vLLM P2P NCCL coordination (e.g., "0.0.0.0:30001")
     /// Required for --vllm-pd-disaggregation mode. Workers register their HTTP and ZMQ addresses here.
     #[arg(long)]
@@ -635,7 +630,6 @@ impl CliArgs {
                 })?,
             mode,
             pd_kv_event_sources,
-            enable_prefill_progress: self.enable_prefill_progress,
             policy,
             connection_mode,
             host: self.host.clone(),

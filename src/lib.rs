@@ -83,7 +83,6 @@ struct Router {
     request_timeout_secs: u64,
     request_id_headers: Option<Vec<String>>,
     vllm_pd_disaggregation: bool,
-    enable_prefill_progress: bool,
     vllm_discovery_address: Option<String>,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
@@ -230,7 +229,6 @@ impl Router {
             epd: None,
             mode,
             pd_kv_event_sources: config::parse_pd_kv_events(&self.pd_kv_events)?,
-            enable_prefill_progress: self.enable_prefill_progress,
             policy,
             host: self.host.clone(),
             port: self.port,
@@ -333,7 +331,6 @@ impl Router {
         request_timeout_secs = 1800,  // Add configurable request timeout
         request_id_headers = None,  // Custom request ID headers
         vllm_pd_disaggregation = false,  // New flag for PD mode
-        enable_prefill_progress = false,
         vllm_discovery_address = None,
         prefill_urls = None,
         decode_urls = None,
@@ -417,8 +414,7 @@ impl Router {
         request_timeout_secs: u64,
         request_id_headers: Option<Vec<String>>,
         vllm_pd_disaggregation: bool,
-        enable_prefill_progress: bool,
-        vllm_discovery_address: Option<String>,
+            vllm_discovery_address: Option<String>,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
         prefill_policy: Option<PolicyType>,
@@ -523,7 +519,6 @@ impl Router {
             request_timeout_secs,
             request_id_headers,
             vllm_pd_disaggregation,
-            enable_prefill_progress,
             vllm_discovery_address,
             prefill_urls,
             decode_urls,

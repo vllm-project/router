@@ -223,19 +223,9 @@ impl PrefillCharge {
 #[derive(Debug, Default)]
 pub struct PdLoadManager {
     loads: Arc<Mutex<Loads>>,
-    /// Price a running prefill from the worker's report instead of the charge
-    /// taken at admission.
-    prefill_progress: bool,
 }
 
 impl PdLoadManager {
-    pub(super) fn with_prefill_progress(prefill_progress: bool) -> Self {
-        Self {
-            loads: Arc::default(),
-            prefill_progress,
-        }
-    }
-
     #[cfg(test)]
     pub(super) fn snapshot(&self) -> Loads {
         self.loads.lock().clone()
@@ -312,7 +302,6 @@ impl PdLoadManager {
                 Some(tokens) => PrefillCharge::Charged(tokens),
                 None => PrefillCharge::Unknown,
             }),
-            prefill_progress: self.prefill_progress,
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: decode_state,
@@ -387,7 +376,6 @@ impl PdLoadManager {
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_charge: Mutex::new(PrefillCharge::Unknown),
-            prefill_progress: self.prefill_progress,
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: DecodeState::Pending,
@@ -430,8 +418,6 @@ struct AttemptInner {
     decode_worker: Mutex<Option<Arc<dyn Worker>>>,
     /// What this attempt currently has charged to the prefill ledger.
     prefill_charge: Mutex<PrefillCharge>,
-    /// Whether a report from the worker replaces the admission charge.
-    prefill_progress: bool,
     /// Guards every stage transition and the decode fields below, so a commit
     /// and a release cannot interleave halfway through.
     state: Mutex<AttemptState>,
@@ -440,9 +426,6 @@ struct AttemptInner {
 impl PdAttempt {
     /// Replace this attempt's estimated prefill work with the engine's report.
     pub(super) fn apply_prefill_progress(&self, remaining: u64) {
-        if !self.0.prefill_progress {
-            return;
-        }
         // Held through the ledger update so a release cannot slip in between.
         let mut charge = self.0.prefill_charge.lock();
         let (delta, next, converted) = charge.on_report(remaining);

@@ -1294,9 +1294,7 @@ impl PdRouterBase {
         } else {
             None
         };
-        let pd_load = Arc::new(PdLoadManager::with_prefill_progress(
-            ctx.router_config.enable_prefill_progress,
-        ));
+        let pd_load = Arc::new(PdLoadManager::default());
         Ok(PdRouterBase {
             kv_state,
             pd_load,

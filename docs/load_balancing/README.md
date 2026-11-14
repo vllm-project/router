@@ -348,4 +348,4 @@ warns at startup when a worker reports an older `engine_version`, and
 
 ### Prefill progress
 
-`--enable-prefill-progress` prices a running prefill from the progress its worker reports. Enable it on both the router and the worker. Requires the vLLM Rust frontend; Python `http://` workers do not report progress.
+The router prices a running prefill from the progress its worker reports. Requires the vLLM Rust frontend with `--enable-prefill-progress`; Python `http://` workers do not report progress.

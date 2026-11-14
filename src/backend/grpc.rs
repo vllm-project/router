@@ -266,6 +266,77 @@ impl GrpcEngineBackend {
     /// P/D prefill leg as unary `Generate`. Returns the engine's
     /// `FinishInfo.kv_transfer_params`, which the decode leg consumes.
     #[allow(clippy::result_large_err)]
+    pub(crate) async fn prefill_prepared(
+        &self,
+        worker_url: &str,
+        prepared: &PreparedRequest,
+        engine_request_id: String,
+        kv_transfer_params: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, Response> {
+        tracing::info!("prefill_prepared enter");
+        let mut proto = chat_to_generate_request(
+            prepared.request.as_ref(),
+            prepared.tokenized.token_ids.as_ref().to_vec(),
+            engine_request_id.clone(),
+        )
+        .map_err(|error| (StatusCode::BAD_REQUEST, error).into_response())?;
+        limit_to_prefill(&mut proto);
+        set_kv_transfer_params(&mut proto, kv_transfer_params)
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error).into_response())?;
+
+        let channel = self.channel_for(worker_url).await.map_err(|error| {
+            error!(error = %error, "grpc prefill connect failed");
+            (StatusCode::BAD_GATEWAY, error).into_response()
+        })?;
+        let abort = EngineAbortGuard::new(&channel, Some(&engine_request_id), self.connect_timeout);
+        let mut client = InferenceClient::new(channel);
+        let mut tonic_req = tonic::Request::new(proto);
+        tonic_req.set_timeout(self.request_timeout);
+        if let Some(rank) = parse_dp_rank(worker_url) {
+            tonic_req
+                .metadata_mut()
+                .insert(DP_RANK_METADATA, rank.to_string().parse().unwrap());
+        }
+        let response = match tokio::time::timeout(self.request_timeout, client.generate(tonic_req))
+            .await
+        {
+            Ok(Ok(response)) => {
+                abort.disarm();
+                response.into_inner()
+            }
+            Ok(Err(status)) => {
+                abort.disarm();
+                warn!(code = ?status.code(), msg = %status.message(), "prefill Generate failed");
+                return Err((
+                    grpc_status_code(&status),
+                    format!("grpc Generate: {}", status.message()),
+                )
+                    .into_response());
+            }
+            Err(_) => {
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "grpc Generate exceeded request timeout",
+                )
+                    .into_response());
+            }
+        };
+        let finish = response.outputs.and_then(|outputs| outputs.finish_info);
+        if finish
+            .as_ref()
+            .is_some_and(|finish| finish.finish_reason == FinishReason::Aborted as i32)
+        {
+            warn!(%engine_request_id, "prefill Generate finished aborted");
+            return Err((StatusCode::BAD_GATEWAY, "grpc Generate: prefill aborted").into_response());
+        }
+        Ok(finish
+            .and_then(|finish| finish.kv_transfer_params)
+            .map(|params| proto_struct_to_json(&params)))
+    }
+
+    /// P/D prefill leg as `GenerateStream`: the same `FinishInfo` as the unary
+    /// call, plus each prefill progress report the engine emits for the request.
+    #[allow(clippy::result_large_err)]
     pub(crate) async fn prefill_prepared_streaming(
         &self,
         worker_url: &str,
