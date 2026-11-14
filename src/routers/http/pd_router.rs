@@ -1294,10 +1294,9 @@ impl PdRouterBase {
         } else {
             None
         };
-        let pd_load = Arc::new(PdLoadManager::default());
         Ok(PdRouterBase {
             kv_state,
-            pd_load,
+            pd_load: Arc::new(PdLoadManager::default()),
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
             worker_startup_timeout_secs: ctx.router_config.worker_startup_timeout_secs,

@@ -273,7 +273,6 @@ impl GrpcEngineBackend {
         engine_request_id: String,
         kv_transfer_params: &serde_json::Value,
     ) -> Result<Option<serde_json::Value>, Response> {
-        tracing::info!("prefill_prepared enter");
         let mut proto = chat_to_generate_request(
             prepared.request.as_ref(),
             prepared.tokenized.token_ids.as_ref().to_vec(),

@@ -276,7 +276,7 @@ impl PdLoadManager {
             p.unknown_prefill_requests += 1;
         }
         p.publish(Stage::Prefill, &prefill.endpoint);
-        let now = tokio::time::Instant::now();
+        let now = std::time::Instant::now();
         let (decode_endpoint, affinity, decode_state, pending_since) = if defer_decode {
             (None, None, DecodeState::Unbound, None)
         } else {
@@ -339,7 +339,7 @@ impl PdLoadManager {
         d.publish(Stage::Decode, &decision.endpoint);
         state.decode_endpoint = Some(decision.endpoint.clone());
         state.affinity = decision.affinity.clone();
-        state.pending_since = Some(tokio::time::Instant::now());
+        state.pending_since = Some(std::time::Instant::now());
         state.decode = DecodeState::Pending;
         metrics::histogram!("vllm_router_pd_decode_selection_gap_seconds")
             .record(inner.admitted_at.elapsed().as_secs_f64());
@@ -370,7 +370,7 @@ impl PdLoadManager {
             d.publish(Stage::Decode, &decode);
         }
         let attempt = PdAttempt(Arc::new(AttemptInner {
-            admitted_at: tokio::time::Instant::now(),
+            admitted_at: std::time::Instant::now(),
             loads: self.loads.clone(),
             prefill,
             prefill_worker: Mutex::new(None),
@@ -381,7 +381,7 @@ impl PdLoadManager {
                 decode: DecodeState::Pending,
                 decode_endpoint: Some(decode),
                 affinity: None,
-                pending_since: Some(tokio::time::Instant::now()),
+                pending_since: Some(std::time::Instant::now()),
             }),
         }));
         attempt.attach_workers(prefill_worker, decode_worker);
@@ -407,11 +407,11 @@ struct AttemptState {
     /// Decode binding held alive until this attempt finishes.
     affinity: Option<Arc<AffinityRecord>>,
     /// When the decode slot was charged, for the pending histogram.
-    pending_since: Option<tokio::time::Instant>,
+    pending_since: Option<std::time::Instant>,
 }
 
 struct AttemptInner {
-    admitted_at: tokio::time::Instant,
+    admitted_at: std::time::Instant,
     loads: Arc<Mutex<Loads>>,
     prefill: PdEndpoint,
     prefill_worker: Mutex<Option<Arc<dyn Worker>>>,
