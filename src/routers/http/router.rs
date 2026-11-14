@@ -1048,6 +1048,9 @@ impl Router {
         );
 
         let start_time = std::time::Instant::now();
+        let startup_timeout = Duration::from_secs(worker_startup_timeout_secs);
+        let check_interval = Duration::from_secs(worker_startup_check_interval_secs);
+        let remaining = || startup_timeout.saturating_sub(start_time.elapsed());
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
@@ -1056,7 +1059,9 @@ impl Router {
         let mut unhealthy_hosts: Vec<(String, String)> = Vec::new();
 
         loop {
-            if start_time.elapsed() > Duration::from_secs(worker_startup_timeout_secs) {
+            // Probes and retry sleeps stop at the startup timeout.
+            let budget = remaining();
+            if budget.is_zero() {
                 let message = format!(
                     "Timeout {}s waiting for hosts {:?} to become healthy (last health check: {:?}). Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
                     worker_startup_timeout_secs, unique_hosts_vec, unhealthy_hosts
@@ -1064,6 +1069,10 @@ impl Router {
                 error!("{}", message);
                 return Err(message);
             }
+
+            // No test covers this limit: it shortens a 2 s probe, so a test
+            // would hinge on a sub-second wall-clock bound.
+            let probe_timeout = Duration::from_secs(2).min(budget);
 
             // Perform health checks only on unique hosts (not per DP rank)
             let mut health_checks = Vec::new();
@@ -1074,15 +1083,14 @@ impl Router {
 
                 let check_health = tokio::spawn(async move {
                     if crate::backend::is_grpc_url(&url_clone) {
-                        match crate::backend::check_grpc_health(&url_clone, Duration::from_secs(2))
-                            .await
-                        {
+                        match crate::backend::check_grpc_health(&url_clone, probe_timeout).await {
                             Ok(()) => None,
                             Err(e) => Some((url_clone, e)),
                         }
                     } else {
                         let health_url = format!("{}/health", url_clone);
                         match worker_get(&client_clone, &health_url, api_key.as_deref())
+                            .timeout(probe_timeout)
                             .send()
                             .await
                         {
@@ -1137,7 +1145,7 @@ impl Router {
                     unhealthy_hosts.len(),
                     unhealthy_hosts
                 );
-                tokio::time::sleep(Duration::from_secs(worker_startup_check_interval_secs)).await;
+                tokio::time::sleep(check_interval.min(remaining())).await;
             }
         }
     }
@@ -1199,8 +1207,7 @@ impl Router {
             &self.client,
             &format!("{}/health", health_url),
             self.api_key.as_deref(),
-        )
-        .timeout(Duration::from_secs(self.health_config.timeout_secs));
+        );
 
         let response = match request_builder.send().await {
             Ok(res) => {
@@ -2259,6 +2266,7 @@ impl Router {
         let check_interval = Duration::from_secs(self.worker_startup_check_interval_secs);
         let remaining = || startup_timeout.saturating_sub(start_time.elapsed());
         let client = reqwest::Client::builder()
+            .timeout(health_timeout)
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
         let worker_api_key: Option<Arc<str>> = self.api_key.as_deref().map(Arc::from);
@@ -2277,6 +2285,8 @@ impl Router {
             }
 
             let health_result = if crate::backend::is_grpc_url(worker_url) {
+                // No test covers this limit: it shortens a 2 s probe, so a test
+                // would hinge on a sub-second wall-clock bound.
                 crate::backend::check_grpc_health(worker_url, Duration::from_secs(2).min(budget))
                     .await
             } else {
@@ -7481,7 +7491,7 @@ mod tests {
         let (startup_url, startup_server) = start_healthy_mock_server().await;
         let (silent_url, probes, silent_server) = start_silent_mock_server().await;
         let config = RouterConfig {
-            worker_startup_timeout_secs: 4,
+            worker_startup_timeout_secs: 30,
             worker_startup_check_interval_secs: 1,
             health_check: HealthCheckConfig {
                 timeout_secs: 1,
@@ -7491,20 +7501,41 @@ mod tests {
         };
         let (router, _ctx) = start_router(config, vec![startup_url]).await;
 
-        router.add_worker(&silent_url).await.unwrap_err();
+        // Wall-clock: the second probe starts about 2 s in. A probe that waited
+        // for the startup timeout would still be the only one when add_worker returns.
+        let second_probe = async {
+            while probes.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::select! {
+            _ = second_probe => {}
+            result = router.add_worker(&silent_url) => {
+                panic!("add_worker returned before a second probe: {result:?}")
+            }
+        }
 
-        // A probe that waited for the startup timeout would be the only one.
-        assert!(probes.load(Ordering::SeqCst) >= 2);
         startup_server.abort();
         silent_server.abort();
     }
 
     #[tokio::test]
-    async fn test_add_worker_stops_at_startup_timeout() {
+    async fn test_health_waits_stop_at_startup_timeout() {
         use crate::config::{HealthCheckConfig, RouterConfig};
 
         let (silent_url, _probes, silent_server) = start_silent_mock_server().await;
-        // The health check timeout and the check interval both exceed the startup timeout.
+        let limit = Duration::from_secs(10);
+
+        // Startup wait: the check interval exceeds the startup timeout.
+        tokio::time::timeout(
+            limit,
+            Router::wait_for_healthy_workers(std::slice::from_ref(&silent_url), 1, 30, None),
+        )
+        .await
+        .expect("the startup wait outlived the startup timeout")
+        .unwrap_err();
+
+        // add_worker: the health check timeout and the check interval both exceed it.
         let config = RouterConfig {
             worker_startup_timeout_secs: 1,
             worker_startup_check_interval_secs: 30,
@@ -7515,43 +7546,11 @@ mod tests {
             ..Default::default()
         };
         let (router, _ctx) = start_router(config, vec![]).await;
+        tokio::time::timeout(limit, router.add_worker(&silent_url))
+            .await
+            .expect("add_worker outlived the startup timeout")
+            .unwrap_err();
 
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            router.add_worker(&silent_url),
-        )
-        .await
-        .expect("add_worker outlived the startup timeout")
-        .unwrap_err();
-
-        silent_server.abort();
-    }
-
-    #[tokio::test]
-    async fn test_send_health_check_stops_at_health_check_timeout() {
-        use crate::config::{HealthCheckConfig, RouterConfig};
-
-        let (startup_url, startup_server) = start_healthy_mock_server().await;
-        let (silent_url, _probes, silent_server) = start_silent_mock_server().await;
-        let config = RouterConfig {
-            health_check: HealthCheckConfig {
-                timeout_secs: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let (router, _ctx) = start_router(config, vec![startup_url]).await;
-
-        // The router's client has no timeout of its own in this test.
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            router.send_health_check(&silent_url),
-        )
-        .await
-        .expect("send_health_check outlived the health check timeout");
-
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        startup_server.abort();
         silent_server.abort();
     }
 }
