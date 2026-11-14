@@ -74,8 +74,6 @@ class RouterArgs:
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
     request_timeout_secs: int = 1800
-    # Poll interval for the worker /load endpoint, in milliseconds
-    # <instance-id>=<http-base> mappings for grpc:// workers
     # Max concurrent requests for rate limiting
     max_concurrent_requests: int = 32768
     # Queue size for pending requests when max concurrent limit reached
