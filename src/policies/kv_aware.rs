@@ -2422,15 +2422,22 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("report reaches the adjustment");
 
-        // A cancel must not slip past it: it owns the same charge.
+        // A cancel must not slip past it: it owns the same charge. The thread
+        // announces itself first, so the check below cannot pass merely because
+        // it was never scheduled.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let canceller = {
             let slot = slot.clone();
             std::thread::spawn(move || {
+                let _ = started_tx.send(());
                 slot.release();
                 let _ = done_tx.send(());
             })
         };
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the cancel thread starts");
         assert!(
             done_rx
                 .recv_timeout(std::time::Duration::from_millis(150))
