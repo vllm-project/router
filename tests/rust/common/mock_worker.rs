@@ -58,6 +58,10 @@ impl MockWorker {
         }
     }
 
+    pub async fn port(&self) -> u16 {
+        self.config.read().await.port
+    }
+
     /// Start the mock worker server
     pub async fn start(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         let config = self.config.clone();
@@ -76,6 +80,7 @@ impl MockWorker {
             .route("/get_server_info", get(server_info_handler))
             .route("/get_model_info", get(model_info_handler))
             .route("/generate", post(generate_handler))
+            .route("/custom/v1/generate", post(custom_generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/completions", post(completions_handler))
             .route("/v1/rerank", post(rerank_handler))
@@ -380,6 +385,29 @@ async fn generate_handler(
         }))
         .into_response()
     }
+}
+
+async fn custom_generate_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let config = config.read().await;
+
+    capture_request(config.port, "/custom/v1/generate", &headers);
+
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
+    Json(json!({
+        "choices": [{
+            "token_ids": payload["token_ids"],
+            "finish_reason": "stop"
+        }],
+        "custom_request_field": payload["custom_request_field"]
+    }))
+    .into_response()
 }
 
 async fn chat_completions_handler(

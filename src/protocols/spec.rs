@@ -2257,6 +2257,10 @@ pub struct InferenceGenerateRequest {
 }
 
 impl GenerationRequest for InferenceGenerateRequest {
+    fn http_token_input_route<'a>(&self, _route: &'a str) -> &'a str {
+        "/inference/v1/generate"
+    }
+
     fn extract_cache_routing_key(&self) -> String {
         cache_routing::tokens(&self.token_ids)
     }
@@ -2588,6 +2592,11 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
+
+    /// Schema route used to prepare effective HTTP token inputs.
+    fn http_token_input_route<'a>(&self, route: &'a str) -> &'a str {
+        route
+    }
 
     /// Extract prompt content used only by opted-in Program scheduling.
     fn extract_text_for_program_scheduling(&self) -> String {

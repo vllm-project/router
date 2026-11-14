@@ -319,6 +319,10 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
         true
     }
 
+    fn needs_request_body(&self) -> bool {
+        true
+    }
+
     fn needs_headers(&self) -> bool {
         true
     }
