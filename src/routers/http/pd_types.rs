@@ -182,6 +182,44 @@ pub struct PdSelection {
     pub decode: StageDecision,
 }
 
+/// What one request currently contributes to the prefill ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefillCharge {
+    /// Admitted without a token estimate; nothing charged yet.
+    Unknown,
+    /// This many tokens are charged and released when the request ends.
+    Charged(u64),
+    /// The request released its charge; further calls change nothing.
+    Released,
+}
+
+impl PrefillCharge {
+    /// Ledger delta when the engine reports `remaining` tokens left.
+    ///
+    /// The first report after an unknown admission charges what it reports and
+    /// converts the request from unknown to known; later reports move the
+    /// charge by the difference, in either direction.
+    fn on_report(self, remaining: u64) -> (i64, Self, bool) {
+        match self {
+            Self::Released => (0, self, false),
+            Self::Unknown => (remaining as i64, Self::Charged(remaining), true),
+            Self::Charged(charged) => (
+                remaining as i64 - charged as i64,
+                Self::Charged(remaining),
+                false,
+            ),
+        }
+    }
+
+    /// Tokens to release when the request ends, and whether it was unknown.
+    fn on_finish(self) -> (u64, bool, Self) {
+        match self {
+            Self::Released | Self::Unknown => (0, matches!(self, Self::Unknown), Self::Released),
+            Self::Charged(charged) => (charged, false, Self::Released),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct PdLoadManager {
     loads: Arc<Mutex<Loads>>,
@@ -260,7 +298,10 @@ impl PdLoadManager {
             prefill: selection.prefill.endpoint.clone(),
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
-            prefill_tokens: selection.prefill.new_prefill_tokens,
+            prefill_charge: Mutex::new(match selection.prefill.new_prefill_tokens {
+                Some(tokens) => PrefillCharge::Charged(tokens),
+                None => PrefillCharge::Unknown,
+            }),
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: decode_state,
@@ -334,7 +375,7 @@ impl PdLoadManager {
             prefill,
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
-            prefill_tokens: None,
+            prefill_charge: Mutex::new(PrefillCharge::Unknown),
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: DecodeState::Pending,
@@ -375,10 +416,39 @@ struct AttemptInner {
     prefill: PdEndpoint,
     prefill_worker: Mutex<Option<Arc<dyn Worker>>>,
     decode_worker: Mutex<Option<Arc<dyn Worker>>>,
-    prefill_tokens: Option<u64>,
+    /// What this attempt currently has charged to the prefill ledger.
+    prefill_charge: Mutex<PrefillCharge>,
     /// Guards every stage transition and the decode fields below, so a commit
     /// and a release cannot interleave halfway through.
     state: Mutex<AttemptState>,
+}
+
+impl PdAttempt {
+    /// Replace this attempt's estimated prefill work with the engine's report.
+    pub(super) fn apply_prefill_progress(&self, remaining: u64) {
+        // Held through the ledger update so a release cannot slip in between.
+        let mut charge = self.0.prefill_charge.lock();
+        let (delta, next, converted) = charge.on_report(remaining);
+        *charge = next;
+        if delta == 0 && !converted {
+            return;
+        }
+        tracing::debug!(remaining, delta, converted, "prefill progress applied");
+        let mut loads = self.0.loads.lock();
+        if let Some(load) = loads.get_mut(&(Stage::Prefill, self.0.prefill.clone())) {
+            if converted {
+                load.unknown_prefill_requests = load.unknown_prefill_requests.saturating_sub(1);
+            }
+            if delta >= 0 {
+                load.active_prefill_tokens =
+                    load.active_prefill_tokens.saturating_add(delta as u64);
+            } else {
+                let drop = delta.unsigned_abs();
+                load.active_prefill_tokens = load.active_prefill_tokens.saturating_sub(drop);
+            }
+            load.publish(Stage::Prefill, &self.0.prefill);
+        }
+    }
 }
 
 impl AttemptInner {
@@ -387,14 +457,18 @@ impl AttemptInner {
         if !state.prefill {
             return;
         }
+        // Same hold as `apply_prefill_progress`.
+        let mut charge = self.prefill_charge.lock();
+        let (released, was_unknown, next) = charge.on_finish();
+        *charge = next;
         let mut loads = self.loads.lock();
         let key = (Stage::Prefill, self.prefill.clone());
         if let Some(load) = loads.get_mut(&key) {
             load.prefill_requests -= 1;
-            if let Some(tokens) = self.prefill_tokens {
-                load.active_prefill_tokens -= tokens;
+            if was_unknown {
+                load.unknown_prefill_requests = load.unknown_prefill_requests.saturating_sub(1);
             } else {
-                load.unknown_prefill_requests -= 1;
+                load.active_prefill_tokens = load.active_prefill_tokens.saturating_sub(released);
             }
             load.publish(Stage::Prefill, &self.prefill);
             if load.idle() {

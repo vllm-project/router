@@ -100,7 +100,7 @@ async-channel = "2"
 # tonic 0.12 copy for traces.
 tonic = { version = "0.14", features = ["transport"] }
 tonic-health = "0.14"
-vllm-proto = "0.2"
+vllm-proto = { git = "https://github.com/KaisennHu/vllm-proto", branch = "master" }
 # `kv_transfer_params` is a protobuf `Struct`.
 prost-types = "0.14"
 # Rust crates in the vLLM tree (not pip). Unpublished on crates.io; Cargo

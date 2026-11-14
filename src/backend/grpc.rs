@@ -265,6 +265,7 @@ impl GrpcEngineBackend {
 
     /// P/D prefill leg as unary `Generate`. Returns the engine's
     /// `FinishInfo.kv_transfer_params`, which the decode leg consumes.
+    #[allow(clippy::result_large_err)]
     pub(crate) async fn prefill_prepared(
         &self,
         worker_url: &str,
@@ -329,6 +330,127 @@ impl GrpcEngineBackend {
         }
         Ok(finish
             .and_then(|finish| finish.kv_transfer_params)
+            .map(|params| proto_struct_to_json(&params)))
+    }
+
+    /// P/D prefill leg as `GenerateStream`: the same `FinishInfo` as the unary
+    /// call, plus each prefill progress report the engine emits for the request.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn prefill_prepared_streaming(
+        &self,
+        worker_url: &str,
+        prepared: &PreparedRequest,
+        engine_request_id: String,
+        kv_transfer_params: &serde_json::Value,
+        mut on_progress: impl FnMut(u64),
+    ) -> Result<Option<serde_json::Value>, Response> {
+        let mut proto = chat_to_generate_request(
+            prepared.request.as_ref(),
+            prepared.tokenized.token_ids.as_ref().to_vec(),
+            engine_request_id.clone(),
+        )
+        .map_err(|error| (StatusCode::BAD_REQUEST, error).into_response())?;
+        limit_to_prefill(&mut proto);
+        set_kv_transfer_params(&mut proto, kv_transfer_params)
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error).into_response())?;
+
+        let channel = self.channel_for(worker_url).await.map_err(|error| {
+            error!(error = %error, "grpc prefill connect failed");
+            (StatusCode::BAD_GATEWAY, error).into_response()
+        })?;
+        let abort = EngineAbortGuard::new(&channel, Some(&engine_request_id), self.connect_timeout);
+        let mut client = InferenceClient::new(channel);
+        let mut tonic_req = tonic::Request::new(proto);
+        tonic_req.set_timeout(self.request_timeout);
+        if let Some(rank) = parse_dp_rank(worker_url) {
+            tonic_req
+                .metadata_mut()
+                .insert(DP_RANK_METADATA, rank.to_string().parse().unwrap());
+        }
+        let mut stream = match tokio::time::timeout(
+            self.request_timeout,
+            client.generate_stream(tonic_req),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response.into_inner(),
+            Ok(Err(status)) => {
+                warn!(code = ?status.code(), msg = %status.message(), "prefill GenerateStream failed");
+                return Err((
+                    grpc_status_code(&status),
+                    format!("grpc GenerateStream: {}", status.message()),
+                )
+                    .into_response());
+            }
+            Err(_) => {
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "grpc GenerateStream exceeded request timeout",
+                )
+                    .into_response());
+            }
+        };
+
+        let mut finish = None;
+        loop {
+            let message = match tokio::time::timeout(self.request_timeout, stream.message()).await {
+                Ok(Ok(message)) => message,
+                Ok(Err(status)) => {
+                    warn!(code = ?status.code(), msg = %status.message(), "prefill stream failed");
+                    return Err((
+                        grpc_status_code(&status),
+                        format!("grpc GenerateStream: {}", status.message()),
+                    )
+                        .into_response());
+                }
+                Err(_) => {
+                    return Err((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "grpc GenerateStream exceeded request timeout",
+                    )
+                        .into_response());
+                }
+            };
+            let Some(message) = message else {
+                break;
+            };
+            tracing::debug!(
+                has_progress = message.prefill_progress.is_some(),
+                "prefill frame"
+            );
+            if let Some(progress) = message.prefill_progress {
+                tracing::debug!(
+                    remaining = progress.remaining_prefill_tokens,
+                    "prefill frame progress"
+                );
+                on_progress(u64::from(progress.remaining_prefill_tokens));
+            }
+            if let Some(info) = message.outputs.and_then(|outputs| outputs.finish_info) {
+                finish = Some(info);
+            }
+        }
+        // The stream is drained: the request is done, so stop guarding it.
+        abort.disarm();
+        if finish
+            .as_ref()
+            .is_some_and(|finish| finish.finish_reason == FinishReason::Aborted as i32)
+        {
+            warn!(%engine_request_id, "prefill GenerateStream finished aborted");
+            return Err((StatusCode::BAD_GATEWAY, "grpc prefill aborted").into_response());
+        }
+        // A stream can carry progress and close without a finish frame. Decode is
+        // already dispatched by then, so refuse the handoff instead of sending it
+        // empty.
+        let Some(finish) = finish else {
+            warn!(%engine_request_id, "prefill stream ended without a finish frame");
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "grpc prefill stream ended without a finish frame",
+            )
+                .into_response());
+        };
+        Ok(finish
+            .kv_transfer_params
             .map(|params| proto_struct_to_json(&params)))
     }
 
@@ -935,6 +1057,7 @@ mod tests {
     #[test]
     fn prompt_info_does_not_count_as_generated_output() {
         let prompt_info = GenerateResponse {
+            prefill_progress: None,
             prompt_info: Some(PromptInfo {
                 num_prompt_tokens: 32,
                 ..Default::default()
@@ -953,6 +1076,7 @@ mod tests {
         assert_eq!(decode_started.load(Ordering::Relaxed), 0);
 
         let output = GenerateResponse {
+            prefill_progress: None,
             prompt_info: None,
             outputs: Some(SequenceOutput {
                 num_tokens: 1,
