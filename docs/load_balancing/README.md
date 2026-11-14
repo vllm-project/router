@@ -348,6 +348,4 @@ warns at startup when a worker reports an older `engine_version`, and
 
 ### Prefill progress
 
-With `--enable-prefill-progress`, a running request is priced by the remaining prefill work its worker reports instead of by the charge the router took at admission. Both sides must opt in: the router flag here and `--enable-prefill-progress` on the worker.
-
-This needs the vLLM Rust frontend (`vllm-rs`). Progress travels on the request's gRPC `GenerateStream`, which the Python OpenAI server does not serve, so a `http://` prefill worker never reports it and the flag has no effect there.
+`--enable-prefill-progress` prices a running prefill from the progress its worker reports. Enable it on both the router and the worker. Requires the vLLM Rust frontend; Python `http://` workers do not report progress.
