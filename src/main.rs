@@ -635,6 +635,7 @@ impl CliArgs {
                 })?,
             mode,
             pd_kv_event_sources,
+            enable_prefill_progress: self.enable_prefill_progress,
             policy,
             connection_mode,
             host: self.host.clone(),
@@ -769,9 +770,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("DEBUG: Parsing CLI arguments with clap");
     println!("DEBUG: Filtered args: {:?}", filtered_args);
     let cli_args = CliArgs::parse_from(filtered_args);
-    vllm_router_rs::routers::http::pd_types::set_prefill_progress(
-        cli_args.enable_prefill_progress,
-    );
     println!("DEBUG: CLI args parsed successfully");
     println!(
         "DEBUG: vllm_pd_disaggregation: {}",

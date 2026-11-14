@@ -20,6 +20,10 @@ pub struct RouterConfig {
     /// Workers listed here skip HTTP control-plane discovery and probing.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pd_kv_event_sources: HashMap<String, PdKvEventSources>,
+    /// Price a running prefill from the remaining work the worker reports instead
+    /// of from the charge taken at admission.
+    #[serde(default)]
+    pub enable_prefill_progress: bool,
     /// Worker connection mode
     #[serde(default)]
     pub connection_mode: ConnectionMode,
@@ -1301,6 +1305,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             pd_kv_event_sources: HashMap::new(),
+            enable_prefill_progress: false,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3001,

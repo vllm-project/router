@@ -102,6 +102,7 @@ async fn pd_router_with_kv_sources(
         },
         policy: PolicyConfig::RoundRobin,
         pd_kv_event_sources,
+        enable_prefill_progress: true,
         kv_connector: KvConnector::Nixl,
         worker_startup_timeout_secs: 5,
         intra_node_data_parallel_size: dp_size,

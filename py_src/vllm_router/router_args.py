@@ -16,6 +16,7 @@ class RouterArgs:
     # PD-specific configuration
     mini_lb: bool = False
     vllm_pd_disaggregation: bool = False  # Enable vLLM PD disaggregated mode
+    enable_prefill_progress: bool = False  # Price prefill from worker reports
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
     )  # List of (url, bootstrap_port)
@@ -284,6 +285,12 @@ class RouterArgs:
             f"--{prefix}vllm-pd-disaggregation",
             action="store_true",
             help="Enable vLLM PD (Prefill-Decode) disaggregated mode",
+        )
+        parser.add_argument(
+            f"--{prefix}enable-prefill-progress",
+            action="store_true",
+            help="Price a running prefill from the remaining work the worker reports "
+            "instead of from the charge taken at admission",
         )
         parser.add_argument(
             f"--{prefix}prefill",

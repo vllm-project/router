@@ -68,13 +68,6 @@ pub(super) enum Stage {
 pub struct PdLoadSample {
     pub prefill_requests: usize,
     pub active_prefill_tokens: u64,
-    /// Router-local prefill tokens charged by this router.
-    pub local_prefill_tokens: u64,
-    /// Worker-reported work at the current anchor.
-    /// Router-local ledger at the moment the anchor's poll was sent.
-    /// When the anchor's poll was sent; drives decay between samples.
-    /// Observed drain rate, in thousandths of a token per second.
-    /// Worker sample counter reflected in active_prefill_tokens.
     pub unknown_prefill_requests: usize,
     pub pending_decode_requests: usize,
     pub active_decode_requests: usize,
@@ -230,9 +223,19 @@ impl PrefillCharge {
 #[derive(Debug, Default)]
 pub struct PdLoadManager {
     loads: Arc<Mutex<Loads>>,
+    /// Price a running prefill from the worker's report instead of the charge
+    /// taken at admission.
+    prefill_progress: bool,
 }
 
 impl PdLoadManager {
+    pub(super) fn with_prefill_progress(prefill_progress: bool) -> Self {
+        Self {
+            loads: Arc::default(),
+            prefill_progress,
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn snapshot(&self) -> Loads {
         self.loads.lock().clone()
@@ -279,7 +282,6 @@ impl PdLoadManager {
         p.prefill_requests += 1;
         if let Some(tokens) = prefill.new_prefill_tokens {
             p.active_prefill_tokens += tokens;
-            p.local_prefill_tokens += tokens;
         } else {
             p.unknown_prefill_requests += 1;
         }
@@ -310,6 +312,7 @@ impl PdLoadManager {
                 Some(tokens) => PrefillCharge::Charged(tokens),
                 None => PrefillCharge::Unknown,
             }),
+            prefill_progress: self.prefill_progress,
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: decode_state,
@@ -384,6 +387,7 @@ impl PdLoadManager {
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_charge: Mutex::new(PrefillCharge::Unknown),
+            prefill_progress: self.prefill_progress,
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: DecodeState::Pending,
@@ -426,27 +430,17 @@ struct AttemptInner {
     decode_worker: Mutex<Option<Arc<dyn Worker>>>,
     /// What this attempt currently has charged to the prefill ledger.
     prefill_charge: Mutex<PrefillCharge>,
+    /// Whether a report from the worker replaces the admission charge.
+    prefill_progress: bool,
     /// Guards every stage transition and the decode fields below, so a commit
     /// and a release cannot interleave halfway through.
     state: Mutex<AttemptState>,
 }
 
-/// Off unless the router is started with `--enable-prefill-progress`.
-static PREFILL_PROGRESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-fn prefill_progress_enabled() -> bool {
-    *PREFILL_PROGRESS.get().unwrap_or(&false)
-}
-
-/// Set once from the CLI at startup; later calls are ignored.
-pub fn set_prefill_progress(enabled: bool) {
-    let _ = PREFILL_PROGRESS.set(enabled);
-}
-
 impl PdAttempt {
     /// Replace this attempt's estimated prefill work with the engine's report.
     pub(super) fn apply_prefill_progress(&self, remaining: u64) {
-        if !prefill_progress_enabled() {
+        if !self.0.prefill_progress {
             return;
         }
         // Held through the ledger update so a release cannot slip in between.
@@ -465,11 +459,9 @@ impl PdAttempt {
             if delta >= 0 {
                 load.active_prefill_tokens =
                     load.active_prefill_tokens.saturating_add(delta as u64);
-                load.local_prefill_tokens = load.local_prefill_tokens.saturating_add(delta as u64);
             } else {
                 let drop = delta.unsigned_abs();
                 load.active_prefill_tokens = load.active_prefill_tokens.saturating_sub(drop);
-                load.local_prefill_tokens = load.local_prefill_tokens.saturating_sub(drop);
             }
             load.publish(Stage::Prefill, &self.0.prefill);
         }
@@ -494,7 +486,6 @@ impl AttemptInner {
                 load.unknown_prefill_requests = load.unknown_prefill_requests.saturating_sub(1);
             } else {
                 load.active_prefill_tokens = load.active_prefill_tokens.saturating_sub(released);
-                load.local_prefill_tokens = load.local_prefill_tokens.saturating_sub(released);
             }
             load.publish(Stage::Prefill, &self.prefill);
             if load.idle() {
