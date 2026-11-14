@@ -1925,7 +1925,7 @@ impl Router {
                 }));
             let mut response = self
                 .frontend
-                .dispatch_with_progress(worker_url, prepared, on_first_output, on_progress)
+                .dispatch_with(worker_url, prepared, on_first_output, on_progress)
                 .await;
             if is_stream && response.status().is_success() {
                 response = hold_request_load_until_body_done(response, load);

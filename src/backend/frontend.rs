@@ -203,12 +203,12 @@ impl EngineFrontend {
 
     /// Convert + GenerateStream + detok on the selected worker URL.
     pub async fn dispatch(&self, worker_url: &str, prepared: PreparedRequest) -> Response {
-        self.dispatch_with_first_output(worker_url, prepared, None)
-            .await
+        self.dispatch_with(worker_url, prepared, None, None).await
     }
 
-    /// Dispatch a colocated request, reporting the worker's prefill progress.
-    pub(crate) async fn dispatch_with_progress(
+    /// The single colocated entry: the first-output and progress callbacks are
+    /// both optional, so callers that need neither pass `None`.
+    pub(crate) async fn dispatch_with(
         &self,
         worker_url: &str,
         prepared: PreparedRequest,
@@ -221,23 +221,6 @@ impl EngineFrontend {
                 prepared,
                 on_first_output,
                 on_progress,
-                KvHandoff::default(),
-            )
-            .await
-    }
-
-    pub(crate) async fn dispatch_with_first_output(
-        &self,
-        worker_url: &str,
-        prepared: PreparedRequest,
-        on_first_output: Option<FirstOutputCallback>,
-    ) -> Response {
-        self.grpc
-            .dispatch_prepared(
-                worker_url,
-                prepared,
-                on_first_output,
-                None,
                 KvHandoff::default(),
             )
             .await
