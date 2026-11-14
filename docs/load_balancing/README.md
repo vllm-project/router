@@ -345,3 +345,9 @@ This allows optimizing each stage independently:
 warns at startup when a worker reports an older `engine_version`, and
 `power_of_two` uses the router's local load counts for them. See
 [gRPC P/D disaggregation](../backend/grpc.md#pd-disaggregation).
+
+### Prefill progress
+
+With `--enable-prefill-progress`, a running request is priced by the remaining prefill work its worker reports instead of by the charge the router took at admission. Both sides must opt in: the router flag here and `--enable-prefill-progress` on the worker.
+
+This needs the vLLM Rust frontend (`vllm-rs`). Progress travels on the request's gRPC `GenerateStream`, which the Python OpenAI server does not serve, so a `http://` prefill worker never reports it and the flag has no effect there.
