@@ -10,8 +10,7 @@ routing, with sequential or concurrent dispatch, for `/v1/chat/completions`,
 contract for cold HTTP chat completions and completions. Program warm-remote
 execution, gRPC P/D, and worker-management errors are outside this contract;
 warm-remote backend responses retain their existing passthrough behavior.
-Other errors and
-other router backends have their own error handling.
+Other router backends have their own error handling.
 
 ## Status mapping
 
@@ -141,8 +140,9 @@ Receiving Prefill non-2xx headers drops the pending local Decode future or held
 Decode response before profiling cleanup or collecting the Prefill error body.
 The common failure wrapper releases local load, then attempts both profiling
 stops concurrently with a shared two-second cleanup deadline. Cleanup is best
-effort: request cancellation or a timeout may interrupt a stop request; neither
-can delay local Decode cancellation or resource release. Dropping local HTTP
+effort: request cancellation or a timeout may interrupt a stop request, leaving
+the existing profiling timeout task to retry cleanup. Neither can delay local
+Decode cancellation or resource release. Dropping local HTTP
 work does not guarantee that the remote engine immediately stops computation.
 
 After the downstream status and headers have been sent, a body transport failure

@@ -51,6 +51,15 @@ async fn logs_and_otel_use_safe_diagnostics_at_info_and_debug() {
         let f = Fixture::direct(Duration::from_millis(150)).await;
         let response = f.request("/v1/chat/completions", "p-422", false).await;
         outputs.push(response.text().await.unwrap());
+        let initial_logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let failures: Vec<_> = initial_logs
+            .lines()
+            .filter(|line| line.contains("P/D request failed"))
+            .collect();
+        assert_eq!(failures.len(), usize::from(level == tracing::Level::DEBUG));
+        assert!(failures.iter().all(|line| line.contains("DEBUG")));
+        assert!(!initial_logs.contains("P/D error classification"));
+        assert!(!initial_logs.contains("Transparent proxy request failed"));
         assert_eq!(
             f.request("/v1/chat/completions", "p-preview", false)
                 .await

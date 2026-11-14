@@ -935,9 +935,10 @@ impl VllmPDRouter {
         let Some(handle) = handle else {
             return;
         };
-        handle.abort();
-        // Stop profiling on the worker
+        // Retain the existing timeout task as a fallback if this request is
+        // cancelled or its bounded cleanup expires while awaiting the backend.
         self.pd_router.stop_profiling(worker_url).await;
+        handle.abort();
     }
 
     /// Modify request for prefill stage (limit output to 1 token)
@@ -2098,14 +2099,19 @@ impl VllmPDRouter {
         {
             Ok(response) => Ok(response),
             Err(error) => {
+                // Sequential routing may commit to a different Decode after P.
+                let decode_base = attempt
+                    .decode_endpoint()
+                    .map(|endpoint| endpoint.http_url)
+                    .unwrap_or_else(|| decode_worker.base_url().to_owned());
                 attempt.release();
-                metrics.record_failure(&error, prefill_worker.base_url(), decode_worker.base_url());
+                metrics.record_failure(&error, prefill_worker.base_url(), &decode_base);
                 // The race has dropped both legs and local load is released.
                 // Bound best-effort cleanup independently of error-body capture.
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
                     tokio::join!(
                         self.stop_profiling(prefill_worker.base_url()),
-                        self.stop_profiling(decode_worker.base_url()),
+                        self.stop_profiling(&decode_base),
                     );
                 })
                 .await;
@@ -3575,15 +3581,7 @@ impl RouterTrait for VllmPDRouter {
                 .await
             {
                 Ok(response) => attempt.track_response(response),
-                Err(e) => {
-                    error!(
-                        "Transparent proxy request failed: prefill={}, decode={}, error={}",
-                        prefill_worker.url(),
-                        decode_worker.url(),
-                        e
-                    );
-                    e.into_response()
-                }
+                Err(error) => error.into_response(),
             }
         }
     }
@@ -6476,18 +6474,17 @@ mod tests {
                     tokio::time::timeout(std::time::Duration::from_millis(100), &mut request).await;
                 assert_eq!(
                     decode.load(),
-                    2,
-                    "the error body still owns its reservation: {concurrent} {shape}"
+                    1,
+                    "error capture must release only its reservation: {concurrent} {shape}"
                 );
-                if shape == "buffered" {
-                    assert!(response.is_err(), "the stalled body must remain pending");
-                    request.abort();
-                    assert!(request.await.unwrap_err().is_cancelled());
-                } else {
-                    let response = response.expect("passthrough headers must arrive").unwrap();
-                    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-                    drop(response);
-                }
+                // Error bodies use bounded capture for every response shape;
+                // they no longer enter the successful streaming passthrough.
+                assert!(
+                    response.is_err(),
+                    "stalled error capture must remain pending"
+                );
+                request.abort();
+                assert!(request.await.unwrap_err().is_cancelled());
                 assert_eq!(decode.load(), 1, "another request's load must survive");
                 drop(unrelated);
                 assert_eq!(decode.load(), 0);
@@ -6873,11 +6870,7 @@ mod tests {
                     "{path} {mode}: {}",
                     response.status()
                 );
-                assert_eq!(
-                    decode.load(),
-                    if mode == "decode_http" { 2 } else { 1 },
-                    "{path} {mode}"
-                );
+                assert_eq!(decode.load(), 1, "{path} {mode}");
                 drop(response);
                 assert_eq!(
                     decode.load(),

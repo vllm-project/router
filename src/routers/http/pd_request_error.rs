@@ -664,18 +664,52 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn diagnostic_limit_preserves_unicode_boundaries() {
-        for message in ["a".repeat(2049), "界".repeat(1000), "😀".repeat(1000)] {
-            let bounded = bounded_diagnostic(&message);
-            assert!(bounded.len() <= 2048);
-            assert!(message.starts_with(bounded));
-            assert!(message.len() - bounded.len() >= message.len() - 2048);
-            assert!(
-                bounded.len() + message[bounded.len()..].chars().next().unwrap().len_utf8() > 2048
-            );
+    #[tokio::test]
+    async fn public_diagnostic_limit_preserves_unicode_boundaries() {
+        for message in [
+            "a".repeat(2049),
+            "界".repeat(1000),
+            "😀".repeat(1000),
+            "short".into(),
+        ] {
+            let upstream = http::Response::builder()
+                .status(400)
+                .header("content-type", "application/json")
+                .body(Bytes::from(
+                    json!({"error": {"message": message, "code": "bad_input"}}).to_string(),
+                ))
+                .unwrap();
+            let response =
+                capture_upstream_error(PdPhase::Prefill, reqwest::Response::from(upstream))
+                    .await
+                    .into_response();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let parsed: crate::protocols::spec::ErrorResponse =
+                serde_json::from_slice(&body).unwrap();
+            let diagnostic = parsed
+                .error
+                .message
+                .strip_prefix("Upstream prefill request failed (HTTP 400). ")
+                .unwrap();
+            assert!(diagnostic.len() <= 2048);
+            assert!(message.starts_with(diagnostic));
+            assert_eq!(parsed.error.code.as_deref(), Some("bad_input"));
+            if message.len() > 2048 {
+                assert!(
+                    diagnostic.len()
+                        + message[diagnostic.len()..]
+                            .chars()
+                            .next()
+                            .unwrap()
+                            .len_utf8()
+                        > 2048
+                );
+            } else {
+                assert_eq!(diagnostic, message);
+            }
         }
-        assert_eq!(bounded_diagnostic("short"), "short");
     }
 
     #[test]

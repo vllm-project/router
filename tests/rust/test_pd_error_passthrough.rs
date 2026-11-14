@@ -64,7 +64,9 @@ async fn prefill_gates_real_http_headers_and_wins_over_decode() {
             let f = Fixture::new(Duration::from_secs(2), discovery).await;
             f.warmup().await; // NIXL push identity activates the real concurrent branch.
                               // Clear the warmup/health flush notification before this request.
-            f.control.d_flushed.notified().await;
+            tokio::time::timeout(Duration::from_secs(1), f.control.d_flushed.notified())
+                .await
+                .expect("warmup Decode response must have flushed");
             f.control.p_wait.store(true, Ordering::SeqCst);
             f.control.p_status.store(p_status, Ordering::SeqCst);
             f.control.d_status.store(d_status, Ordering::SeqCst);
