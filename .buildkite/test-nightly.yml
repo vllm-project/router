@@ -255,6 +255,48 @@ steps:
     artifact_paths:
       - "tests/python/e2e/perf/l1_encode/results/**/*.json"
 
+  # Reuse the L4 functional test against the pinned ROCm engine. Two full
+  # workers on one host; this does not require a P/D connector or RDMA.
+  - label: ":large_purple_circle: ROCm kv_aware e2e (2 GPUs)"
+    key: "rocm-kv-aware-e2e"
+    depends_on: "upload-nightly-pipeline"
+    # Host pre-command waits for the lease inside the job: 360m + 90m execution.
+    # See .buildkite/README.md for the hook and observed pre-command timeouts.
+    # Bound pytest itself separately below so a test hang cannot consume this.
+    timeout_in_minutes: 450
+    retry:
+      automatic: false
+      manual:
+        allowed: true
+    mirror_hardwares: mi300_2
+    command: |
+      bash -euo pipefail <<'BASH'
+      timeout --signal=TERM --kill-after=30s 600 bash .buildkite/scripts/install_packages.sh router-bin
+      timeout --signal=TERM --kill-after=30s 600 python3 -m pip install --disable-pip-version-check pytest==9.1.1 requests==2.34.2
+      export ROUTER_BIN=/workdir/target/release/vllm-router
+      export CUDA_VISIBLE_DEVICES=0,1
+      # The dedicated host preset exposes physical GPUs; each worker narrows
+      # CUDA_VISIBLE_DEVICES independently. Clear host masks at this boundary;
+      # inherited-HIP handling in the helper is covered by its CPU regression.
+      unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
+      # Keep scratch reclamation enabled, matching the manually validated run.
+      export HSA_NO_SCRATCH_RECLAIM=0
+      export KV_AWARE_WORKER_LOG_QUIET=1
+      export KV_AWARE_E2E_MODEL=Qwen/Qwen3-0.6B
+      export KV_AWARE_KV_EVENTS=1 KV_AWARE_KV_EVENTS_REPLAY=1
+      export KV_AWARE_WORKER_SERVE_EXTRA="--enable-prefix-caching --enable-log-requests --enforce-eager --gpu-memory-utilization 0.4 --max-model-len 4096"
+      export TMPDIR=/workdir/target/ci-logs/kv-aware-rocm
+      mkdir -p "$$TMPDIR"
+      timeout --signal=TERM --kill-after=120s 1800 \
+        python3 -m pytest tests/python/e2e/function/kv_aware/test_kv_aware_prefix_cache.py \
+        --confcutdir=tests/python/e2e/function/kv_aware \
+        --junitxml="$$TMPDIR/results.xml" -m e2e -v -s 2>&1 | tee "$$TMPDIR/pytest.log"
+      BASH
+    artifact_paths:
+      - "target/ci-logs/kv-aware-rocm/pytest.log"
+      - "target/ci-logs/kv-aware-rocm/results.xml"
+      - "target/ci-logs/kv-aware-rocm/kv_aware_worker_logs_*/*.log"
+
   # This queue is intentionally separate from the shared amd_mi300_* queues.
   # Those agents run --no-plugins, while this lane needs the Docker plugin
   # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host.
