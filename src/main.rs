@@ -137,6 +137,11 @@ struct CliArgs {
     #[arg(long, default_value_t = false)]
     vllm_pd_disaggregation: bool,
 
+    /// Price a running prefill from the remaining work the worker reports instead of from the
+    /// charge taken at admission. Off by default.
+    #[arg(long, default_value_t = false)]
+    enable_prefill_progress: bool,
+
     /// ZMQ service discovery address for vLLM P2P NCCL coordination (e.g., "0.0.0.0:30001")
     /// Required for --vllm-pd-disaggregation mode. Workers register their HTTP and ZMQ addresses here.
     #[arg(long)]
@@ -764,6 +769,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("DEBUG: Parsing CLI arguments with clap");
     println!("DEBUG: Filtered args: {:?}", filtered_args);
     let cli_args = CliArgs::parse_from(filtered_args);
+    vllm_router_rs::routers::http::pd_types::set_prefill_progress(
+        cli_args.enable_prefill_progress,
+    );
     println!("DEBUG: CLI args parsed successfully");
     println!(
         "DEBUG: vllm_pd_disaggregation: {}",

@@ -431,15 +431,16 @@ struct AttemptInner {
     state: Mutex<AttemptState>,
 }
 
-/// Off by default: set VLLM_ROUTER_PREFILL_PROGRESS=1 to price a running
-/// prefill from what the worker reports instead of from the admission charge.
+/// Off unless the router is started with `--enable-prefill-progress`.
+static PREFILL_PROGRESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 fn prefill_progress_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("VLLM_ROUTER_PREFILL_PROGRESS")
-            .map(|value| value != "0")
-            .unwrap_or(false)
-    })
+    *PREFILL_PROGRESS.get().unwrap_or(&false)
+}
+
+/// Set once from the CLI at startup; later calls are ignored.
+pub fn set_prefill_progress(enabled: bool) {
+    let _ = PREFILL_PROGRESS.set(enabled);
 }
 
 impl PdAttempt {
