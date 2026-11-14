@@ -249,11 +249,6 @@ impl PdKvState {
     /// only delay its own refresh, never the request path. Never hold the
     /// admission load lock.
     async fn bind(&self, workers: &[Arc<dyn Worker>], policy: &dyn KvAwareOps) {
-        tracing::info!(
-            pool = workers.len(),
-            published = ?self.published,
-            "pd_kv_state: bind entered"
-        );
         let _bind_guard = self.bind_lock.lock().await;
         // Bindings outlive the pool that installed them: another role's pool
         // keeps its base registered, so removal is decided by every live pool
@@ -424,15 +419,6 @@ impl PdKvState {
                     .then(|| self.supervisor.match_provider_for_worker(worker.base_url()))
                     .flatten()
             });
-            tracing::info!(
-                base = %worker.base_url(),
-                url = %worker.url(),
-                has_binding = bindings.contains_key(worker.base_url()),
-                cache_key = info.map(|info| info.cache_key.is_some()),
-                ranks = ?info.map(|info| info.ranks.clone()),
-                matches = matches.is_some(),
-                "pd_kv_state: registered worker"
-            );
             policy.register_worker(worker.as_ref(), info, matches);
             targets.insert(worker.url().to_owned(), signature);
         }
@@ -692,22 +678,15 @@ impl PdKvState {
     ) -> Option<HashMap<String, u64>> {
         let kv = kv_aware_ops(policy.as_ref())?;
         let allow_credit = self.credit_by_base(request).await;
-        // Bound before the macro: `Value::as_str` inside a tracing field parse is read
-        // as a type path.
-        let request_model = request.get("model").and_then(|value| value.as_str());
-        let request_salt = request.get("cache_salt").and_then(|value| value.as_str());
-        tracing::info!(
-            model = ?request_model,
-            salt = ?request_salt,
-            allow = ?allow_credit,
-            "pd_kv_state: decode credit gate"
-        );
         // A salted request must not be credited with unsalted blocks: the same rule
         // Prefill applies to its own estimate, so both stages price the same prefix.
         let cache_salt = request.get("cache_salt").and_then(Value::as_str);
         // Nothing to price unless some Decode base can be credited. Checking
         // first keeps the render fan-out and the hash walk off the request path
         // for every deployment whose Decode pool publishes no KV events.
+        //
+        // `credit_fallback` returns the reason credit is *not* allowed, or `None`
+        // when it is: the guard must therefore look for a worker with no fallback.
         if !workers.iter().any(|worker| {
             KvAwarePolicy::credit_fallback(
                 cache_salt,
@@ -716,7 +695,7 @@ impl PdKvState {
                     .copied()
                     .unwrap_or(false),
             )
-            .is_some()
+            .is_none()
         }) {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
             return None;
@@ -776,15 +755,6 @@ impl PdKvState {
                     .unwrap_or(false)
             });
         if !decode_priced {
-            tracing::info!(
-                kv_aware = kv_aware_ops(decode_policy.as_ref()).is_some(),
-                decode_bases = ?decode_workers
-                    .iter()
-                    .map(|worker| worker.base_url().to_owned())
-                    .collect::<Vec<_>>(),
-                allow = ?allow_credit,
-                "pd_kv_state: decode not priced"
-            );
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
         }
         let prefill_bases: Vec<_> = prefill_workers
