@@ -342,6 +342,104 @@ async fn cache_aware_prefix_overrides_load() {
     );
 }
 
+fn long_prompt(tokens: usize, extra: Value) -> Value {
+    let ids: Vec<i32> = (0..tokens).map(|i| (i % 7) as i32 + 1).collect();
+    prompt(&ids, extra)
+}
+
+/// A worker that reports its prefill finished must look cheaper than one still
+/// holding work, and cancelling it must give that advantage back.
+/// Send a probe and report which worker took it, without draining a body that
+/// the mocks keep open.
+async fn probe_target(router: &Router, servers: &[MockVllmRsServer], body: Value) -> usize {
+    let before = hits(servers);
+    let request: CompletionRequest = serde_json::from_value(body).expect("completion request");
+    let response = router.route_completion(None, &request, None).await;
+    assert!(response.status().is_success());
+    wait_for_hit(servers, &before).await;
+    let target = grew(&before, &hits(servers));
+    drop(response);
+    target
+}
+
+#[tokio::test]
+async fn a_streamed_report_moves_the_routing_and_a_cancel_gives_it_back() {
+    // `a` reports its prefill as done and holds the stream; `b` reports the same
+    // as it was admitted, so it keeps owing that prefill.
+    let a = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        progress: vec![0],
+        progress_hold: Duration::from_secs(30),
+        ..MockVllmRs::default()
+    })
+    .await;
+    let b = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        progress: vec![500],
+        progress_hold: Duration::from_secs(30),
+        ..MockVllmRs::default()
+    })
+    .await;
+    let servers = vec![a, b];
+    let router = Arc::new(start_router(&servers, kv_aware()).await);
+
+    // Idle workers cost the same, so which one takes the first request is a tie.
+    // Ask until `b` takes the 500-token request it will keep owing.
+    let mut held_b = None;
+    for _ in 0..40 {
+        let before = hits(&servers);
+        let request: CompletionRequest =
+            serde_json::from_value(long_prompt(500, json!({ "stream": true })))
+                .expect("completion request");
+        let response = router.route_completion(None, &request, None).await;
+        assert!(response.status().is_success());
+        wait_for_hit(&servers, &before).await;
+        if grew(&before, &hits(&servers)) == 1 {
+            held_b = Some(response);
+            break;
+        }
+        drop(response);
+    }
+    let held_b = held_b.expect("b takes a request of its own");
+
+    // `a` takes a 2000-token streaming request and reports the prefill done.
+    let before = hits(&servers);
+    let streamed: CompletionRequest =
+        serde_json::from_value(long_prompt(2000, json!({ "stream": true }))).expect("request");
+    let streamed = router.route_completion(None, &streamed, None).await;
+    assert!(streamed.status().is_success());
+    wait_for_hit(&servers, &before).await;
+    assert_eq!(
+        grew(&before, &hits(&servers)),
+        0,
+        "a takes the streamed request"
+    );
+
+    // Once the report lands, `a` owes nothing and `b` still owes 500.
+    let mut routed_to_a = false;
+    for _ in 0..60 {
+        if probe_target(&router, &servers, prompt(&[9], json!({ "stream": true }))).await == 0 {
+            routed_to_a = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        routed_to_a,
+        "the reported prefill should make `a` the cheaper worker"
+    );
+
+    // Cancelling the stream must not leave `a` charged, or `b` becomes cheaper.
+    drop(streamed);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for _ in 0..10 {
+        assert_eq!(
+            probe_target(&router, &servers, prompt(&[10], json!({ "stream": true }))).await,
+            0,
+            "the cancelled request must release only its own charge"
+        );
+    }
+    drop(held_b);
+}
+
 #[tokio::test]
 async fn kv_aware_prefers_the_less_loaded_worker() {
     // Equal-cost cold requests are no longer pinned to one worker, so a run

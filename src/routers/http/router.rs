@@ -7299,34 +7299,4 @@ mod tests {
 
         health_checker.shutdown().await;
     }
-
-    #[test]
-    fn a_progress_report_moves_the_charge_that_a_cancel_then_clears() {
-        use crate::kv_index::RoutableTarget;
-        use crate::policies::{InMemorySlotManager, KvRequestSlot, LoadProvider, SlotManager};
-
-        let manager = Arc::new(InMemorySlotManager::new());
-        let target = RoutableTarget {
-            instance_id: Arc::from("progress-worker"),
-            dp_rank: 0,
-        };
-        manager.begin_prefill(&target, 100);
-        let slot = KvRequestSlot::new(manager.clone(), target.clone(), 100, None);
-        // This is the guard the gRPC progress callback holds.
-        let guard = RequestLoadGuard::new(None, Some(slot));
-
-        guard.apply_prefill_progress(40);
-        assert_eq!(
-            manager.sample(&target).active_prefill_tokens,
-            40,
-            "the report must replace the admission charge"
-        );
-
-        guard.release();
-        assert_eq!(
-            manager.sample(&target).active_prefill_tokens,
-            0,
-            "the cancel must clear the reported charge"
-        );
-    }
 }
