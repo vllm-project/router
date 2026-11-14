@@ -347,8 +347,6 @@ fn long_prompt(tokens: usize, extra: Value) -> Value {
     prompt(&ids, extra)
 }
 
-/// A worker that reports its prefill finished must look cheaper than one still
-/// holding work, and cancelling it must give that advantage back.
 /// Send a probe and report which worker took it, without draining a body that
 /// the mocks keep open.
 async fn probe_target(router: &Router, servers: &[MockVllmRsServer], body: Value) -> usize {
@@ -362,18 +360,20 @@ async fn probe_target(router: &Router, servers: &[MockVllmRsServer], body: Value
     target
 }
 
+/// A report has to move the routing, and cancelling the stream has to give back a
+/// charge that is not zero yet.
 #[tokio::test]
-async fn a_streamed_report_moves_the_routing_and_a_cancel_gives_it_back() {
-    // `a` reports its prefill as done and holds the stream; `b` reports the same
-    // as it was admitted, so it keeps owing that prefill.
+async fn a_report_moves_the_routing_and_a_cancel_clears_what_is_left() {
+    // `a` starts cheap and then reports far more work than it was admitted with;
+    // `b` holds a stream that owes exactly what it was admitted with.
     let a = MockVllmRsServer::spawn_with_state(MockVllmRs {
-        progress: vec![0],
+        progress: vec![1500],
         progress_hold: Duration::from_secs(30),
         ..MockVllmRs::default()
     })
     .await;
     let b = MockVllmRsServer::spawn_with_state(MockVllmRs {
-        progress: vec![500],
+        progress: vec![1000],
         progress_hold: Duration::from_secs(30),
         ..MockVllmRs::default()
     })
@@ -381,13 +381,12 @@ async fn a_streamed_report_moves_the_routing_and_a_cancel_gives_it_back() {
     let servers = vec![a, b];
     let router = Arc::new(start_router(&servers, kv_aware()).await);
 
-    // Idle workers cost the same, so which one takes the first request is a tie.
-    // Ask until `b` takes the 500-token request it will keep owing.
+    // Idle workers tie, so ask until `b` takes the 1000-token stream it keeps.
     let mut held_b = None;
     for _ in 0..40 {
         let before = hits(&servers);
         let request: CompletionRequest =
-            serde_json::from_value(long_prompt(500, json!({ "stream": true })))
+            serde_json::from_value(long_prompt(1000, json!({ "stream": true })))
                 .expect("completion request");
         let response = router.route_completion(None, &request, None).await;
         assert!(response.status().is_success());
@@ -400,10 +399,12 @@ async fn a_streamed_report_moves_the_routing_and_a_cancel_gives_it_back() {
     }
     let held_b = held_b.expect("b takes a request of its own");
 
-    // `a` takes a 2000-token streaming request and reports the prefill done.
+    // `a` is admitted at 100 tokens and then reports 1500 left, so it becomes the
+    // more expensive worker. Without the report, or without the callback, `a`
+    // would still look cheapest.
     let before = hits(&servers);
     let streamed: CompletionRequest =
-        serde_json::from_value(long_prompt(2000, json!({ "stream": true }))).expect("request");
+        serde_json::from_value(long_prompt(100, json!({ "stream": true }))).expect("request");
     let streamed = router.route_completion(None, &streamed, None).await;
     assert!(streamed.status().is_success());
     wait_for_hit(&servers, &before).await;
@@ -413,28 +414,29 @@ async fn a_streamed_report_moves_the_routing_and_a_cancel_gives_it_back() {
         "a takes the streamed request"
     );
 
-    // Once the report lands, `a` owes nothing and `b` still owes 500.
-    let mut routed_to_a = false;
+    // 1500 against 1000: routing has to avoid `a` now.
+    let mut routed_to_b = false;
     for _ in 0..60 {
-        if probe_target(&router, &servers, prompt(&[9], json!({ "stream": true }))).await == 0 {
-            routed_to_a = true;
+        if probe_target(&router, &servers, prompt(&[9], json!({ "stream": true }))).await == 1 {
+            routed_to_b = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
-        routed_to_a,
-        "the reported prefill should make `a` the cheaper worker"
+        routed_to_b,
+        "the reported prefill should make `a` the more expensive worker"
     );
 
-    // Cancelling the stream must not leave `a` charged, or `b` becomes cheaper.
+    // Cancelling `a` clears the 1500 it reported, so it becomes the cheap one
+    // again. If the cancel left that charge behind, routing would keep choosing `b`.
     drop(streamed);
     tokio::time::sleep(Duration::from_millis(100)).await;
     for _ in 0..10 {
         assert_eq!(
             probe_target(&router, &servers, prompt(&[10], json!({ "stream": true }))).await,
             0,
-            "the cancelled request must release only its own charge"
+            "the cancelled request must release the charge it reported"
         );
     }
     drop(held_b);
