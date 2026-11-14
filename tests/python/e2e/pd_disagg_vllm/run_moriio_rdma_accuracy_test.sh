@@ -94,6 +94,8 @@ else
 fi
 
 mkdir -p "${LOG_DIR}"
+# Docker bind mounts require an absolute host path, including caller overrides.
+LOG_DIR="$(cd "${LOG_DIR}" && pwd -P)"
 docker volume create "${EVAL_PIP_CACHE_VOLUME}" >/dev/null
 
 # OpenSSH joins command arguments without preserving their boundaries. Render a
@@ -288,9 +290,9 @@ wait_for_health "prefill" "http://${COORDINATOR_FABRIC_IP}:${PREFILL_PORT}/healt
 wait_for_health "decode" "http://${WORKER_FABRIC_IP}:${DECODE_PORT}/health" "${ENGINE_STARTUP_TIMEOUT}"
 wait_for_health "router discovery" "http://127.0.0.1:${ROUTER_PORT}/health" "${ROUTER_STARTUP_TIMEOUT}"
 
-# This request must traverse prefill on node A and decode on node B. A correct
-# response therefore proves that MoRI registered and transferred GPU KV memory
-# across the RDMA fabric, not merely that host-memory verbs work.
+# Exercise the configured cross-node P/D path and reject invalid completions.
+# A structurally valid response alone does not establish KV-transfer integrity;
+# that requires transport evidence and accuracy validation.
 curl --fail --silent --show-error \
   --max-time "${REQUEST_TIMEOUT}" \
   -H 'Content-Type: application/json' \
@@ -299,13 +301,11 @@ curl --fail --silent --show-error \
   | tee "${LOG_DIR}/smoke-response.json"
 echo
 
-if [[ "${SMOKE_ONLY}" == "true" ]]; then
-  echo "MoRI RDMA cross-node smoke passed (read_mode=${MORIIO_READ_MODE})"
-  exit 0
-fi
-
 EVAL_COMMAND=$(cat <<EOF
 set -Eeuo pipefail
+# Validate before installing dependencies, including in smoke-only mode.
+python3 tests/python/helpers/completion_validation.py /evidence/smoke-response.json
+if [[ "${SMOKE_ONLY}" == true ]]; then exit 0; fi
 export PIP_ROOT_USER_ACTION=ignore
 export PIP_CACHE_DIR=/root/.cache/pip
 python3 -m pip install --disable-pip-version-check --quiet requests
@@ -336,10 +336,15 @@ docker run --rm \
   --name "${EVAL_CONTAINER}" \
   --network host \
   -v "${REPO_ROOT}:/workdir" \
+  -v "${LOG_DIR}:/evidence:ro" \
   -v "${EVAL_PIP_CACHE_VOLUME}:/root/.cache/pip" \
   -w /workdir \
   --entrypoint bash \
   "${ROCM_VLLM_IMAGE}" \
   -lc "${EVAL_COMMAND}"
 
-echo "MoRI RDMA cross-node accuracy passed (read_mode=${MORIIO_READ_MODE})"
+if [[ "${SMOKE_ONLY}" == true ]]; then
+  echo "MoRI RDMA cross-node smoke passed (read_mode=${MORIIO_READ_MODE})"
+else
+  echo "MoRI RDMA cross-node accuracy passed (read_mode=${MORIIO_READ_MODE})"
+fi
