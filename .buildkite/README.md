@@ -207,8 +207,15 @@ Builds Docker image for the router.
 test on two MI300X GPUs on one host. It runs when L3 is uploaded: default
 branch with `NIGHTLY=1`, or a non-default branch labeled `nightly-test`,
 including `ROCM_ONLY=1` builds. No NVIDIA image build is required.
-The job timeout accommodates the shared-host lease wait (up to six hours);
-pytest itself has a separate 30-minute timeout.
+The 450-minute job timeout covers 360 minutes of host lease acquisition plus
+90 minutes of setup/execution headroom. The host `pre-command` hook invokes
+`vllm-router-rocm-hold-cluster-lease` after the agent accepts the job; this is
+inside Buildkite's step timer, not a wait before dispatch. Existing lanes have
+hit this mismatch: [build 1225](https://buildkite.com/vllm/router/builds/1225)
+timed out in the hook before the test command started. #508 aligns those lanes.
+Artifact installation and Python dependency installation each have a ten-minute
+bound; pytest has a separate 30-minute bound. On forced termination, container
+teardown remains the final cleanup boundary for workers.
 
 The pinned ROCm image supplies `vllm-rs`; the router binary comes from this
 build. Two full Qwen3-0.6B workers publish KV events with replay enabled.
@@ -222,7 +229,7 @@ pytest output, and JUnit results are collected under `target/ci-logs/kv-aware-ro
 - `medium_cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
 - `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation; 4-GPU router_policy c16)
 - `mithril-h100-pool`: NVIDIA H100 SXM tests (2-GPU gRPC prefix-KV perf)
-- `router_rocm_mi300_2`: dedicated two-node MI300X MoRI tests (`spawn=1`)
+- `router_rocm_mi300_2`: MI300X MoRI tests and the single-host, two-GPU KV-aware functional lane (`spawn=1`)
 - `default`: General purpose queue
 
 ## Adding New Tests

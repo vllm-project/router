@@ -260,20 +260,28 @@ steps:
   - label: ":large_purple_circle: ROCm kv_aware e2e (2 GPUs)"
     key: "rocm-kv-aware-e2e"
     depends_on: "upload-nightly-pipeline"
-    # Includes up to 360 minutes for the shared-host lease and setup/cleanup.
+    # Host pre-command waits for the lease inside the job: 360m + 90m execution.
+    # See .buildkite/README.md for the hook and observed pre-command timeouts.
     # Bound pytest itself separately below so a test hang cannot consume this.
     timeout_in_minutes: 450
+    retry:
+      automatic: false
+      manual:
+        allowed: true
     mirror_hardwares: mi300_2
     command: |
       bash -euo pipefail <<'BASH'
-      bash .buildkite/scripts/install_packages.sh router-bin
-      python3 -m pip install --disable-pip-version-check pytest requests
+      timeout --signal=TERM --kill-after=30s 600 bash .buildkite/scripts/install_packages.sh router-bin
+      timeout --signal=TERM --kill-after=30s 600 python3 -m pip install --disable-pip-version-check pytest==9.1.1 requests==2.34.2
       export ROUTER_BIN=/workdir/target/release/vllm-router
       export CUDA_VISIBLE_DEVICES=0,1
       # The dedicated host preset exposes physical GPUs; each worker narrows
-      # CUDA_VISIBLE_DEVICES independently. Avoid conflicting inherited masks.
+      # CUDA_VISIBLE_DEVICES independently. Clear host masks at this boundary;
+      # inherited-HIP handling in the helper is covered by its CPU regression.
       unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
+      # Keep scratch reclamation enabled, matching the manually validated run.
       export HSA_NO_SCRATCH_RECLAIM=0
+      export KV_AWARE_WORKER_LOG_QUIET=1
       export KV_AWARE_E2E_MODEL=Qwen/Qwen3-0.6B
       export KV_AWARE_KV_EVENTS=1 KV_AWARE_KV_EVENTS_REPLAY=1
       export KV_AWARE_WORKER_SERVE_EXTRA="--enable-prefix-caching --enable-log-requests --enforce-eager --gpu-memory-utilization 0.4 --max-model-len 4096"
