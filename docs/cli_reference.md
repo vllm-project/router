@@ -85,6 +85,7 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | `--kv-event-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static KV-event source as `WORKER_URL=ENDPOINT[,ENDPOINT...]`; repeatable, one entry per worker. |
 | `--kv-event-replay-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Replay endpoint(s) for a static KV-event source, same `WORKER_URL=ENDPOINT[,ENDPOINT...]` form. |
 | `--kv-event-block-size` | `u32` | `16` | `integer` | `16` | KV cache block size in tokens for workers registered through `--kv-event-source`. |
+| `--kv-event-max-batch-events` | `usize` | `16384` | `—` | `—` | KV events kept from one message. An oversized batch keeps the newest events unless the discarded prefix carries a removal or a clear, in which case the batch is kept whole. |
 | `--kv-event-model` | `string` | `unset` | `string` | `unset` | Model id advertised to static KV-event sources; `unset` keeps the served model id. |
 
 The Rust CLI requires worker URLs in regular mode unless service discovery is

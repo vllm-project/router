@@ -349,19 +349,27 @@ fn select_stage(
                 .copied()
                 .unwrap_or(0)
         };
+        // `projected` is built from `selected_indices`, so a candidate's endpoint is
+        // `endpoints[selected_indices[index]]`. Indexing `endpoints` with the candidate
+        // index would read another engine's queue.
+        let endpoint_of = |index: usize| endpoints[selected_indices[index]].clone();
         let fits = |index: usize| -> bool {
             let worker = &projected[index];
             let limits = kv.decode_limits(worker.as_ref());
-            let tokens_ok = limits.tokens.is_none_or(|capacity| {
-                (worker.load() as u64)
-                    .saturating_add(additional_tokens(worker))
-                    .saturating_mul(100)
-                    <= capacity.saturating_mul(KV_CAPACITY_WATERMARK_PERCENT)
-            });
+            // The projection carries tokens only when every candidate's token count was
+            // observed. Otherwise it is a request count, and comparing it against a token
+            // ceiling would decide on unlike units.
+            let tokens_ok = !decode_tokens_known
+                || limits.tokens.is_none_or(|capacity| {
+                    (worker.load() as u64)
+                        .saturating_add(additional_tokens(worker))
+                        .saturating_mul(100)
+                        <= capacity.saturating_mul(KV_CAPACITY_WATERMARK_PERCENT)
+                });
             // Slots are counted in requests, which live on the stage sample rather
-            // than in the projected token load.
+            // than in the projected load.
             let running = loads
-                .get(&(Stage::Decode, endpoints[index].clone()))
+                .get(&(Stage::Decode, endpoint_of(index)))
                 .map(|sample| {
                     (sample.pending_decode_requests + sample.active_decode_requests) as u64
                 })

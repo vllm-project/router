@@ -77,16 +77,31 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
     // overflow). Keep the newest events instead. Losing the oldest blocks only
     // makes the estimate conservative - an unindexed block is priced as cold, so a
     // request is never credited for KV the engine may no longer hold.
-    let mut events = events;
-    let limit = max_batch_events();
-    if events.len() > limit {
-        let drop_from = events.len() - limit;
-        events.drain(0..drop_from);
-    }
     let events = events
         .into_iter()
         .map(decode_event)
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?;
+    let limit = max_batch_events();
+    let mut events = events;
+    if events.len() > limit {
+        let drop_from = events.len() - limit;
+        // Only stores are safe to discard: a discarded removal or clear would leave
+        // blocks in the index that the engine has already freed, and the credit would
+        // then over-favour that engine. When an authoritative event is in the prefix,
+        // keep the whole batch rather than trust a truncated view of it.
+        let authoritative = events[..drop_from]
+            .iter()
+            .any(|event| !matches!(event, KVEvent::BlockStored(_)));
+        if authoritative {
+            tracing::warn!(
+                "kv_index: keeping an oversized KV event batch of {} events; the discarded \
+                 prefix carries a removal or clear",
+                events.len()
+            );
+        } else {
+            events.drain(0..drop_from);
+        }
+    }
     Ok(KVEventBatch {
         ts,
         events,
@@ -482,13 +497,22 @@ mod tests {
     #[test]
     fn bounded_messagepack_and_trailing_bytes() {
         assert!(decode_batch(&vec![0; MAX_PAYLOAD_BYTES + 1]).is_err());
-        let clear = Value::Map(vec![("type".into(), "AllBlocksCleared".into())]);
-        // An oversized batch is truncated to the newest events rather than
+        // An oversized batch of stores is truncated to the newest events rather than
         // rejected: dropping it whole made the index - and therefore the credit -
         // silently inert.
-        let truncated = decode_batch(&encode(vec![clear; DEFAULT_MAX_BATCH_EVENTS + 1], 0.into()))
-            .expect("oversized batches are truncated, not rejected");
+        let truncated = decode_batch(&encode(
+            vec![stored(); DEFAULT_MAX_BATCH_EVENTS + 1],
+            0.into(),
+        ))
+        .expect("oversized batches of stores are truncated, not rejected");
         assert_eq!(truncated.events.len(), max_batch_events());
+        // A discarded removal or clear must not be dropped: the index would keep blocks
+        // the engine has freed, so such a batch is kept whole.
+        let clear = Value::Map(vec![("type".into(), "AllBlocksCleared".into())]);
+        let mut events = vec![clear];
+        events.extend((0..=DEFAULT_MAX_BATCH_EVENTS).map(|_| stored()));
+        let kept = decode_batch(&encode(events, 0.into())).expect("authoritative batch is kept");
+        assert_eq!(kept.events.len(), DEFAULT_MAX_BATCH_EVENTS + 2);
         let mut payload = encode(vec![stored()], 0.into());
         payload.push(0);
         assert!(decode_batch(&payload).is_err());

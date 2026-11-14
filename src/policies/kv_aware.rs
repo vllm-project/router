@@ -1156,15 +1156,35 @@ impl KvAwarePolicy {
         self.targets
             .get(worker.url())
             .map(|entry| entry.clone())
-            .unwrap_or_else(|| TargetBinding {
-                target: RoutableTarget {
-                    instance_id: Arc::from(worker.base_url()),
-                    dp_rank: worker.dp_rank().unwrap_or(0) as u32,
-                },
-                generation: 0,
-                cache_key: None,
-                matches: self.matches.clone(),
-                block_size: self.params.block_size,
+            .unwrap_or_else(|| {
+                // A miss here is what surfaces as `decode_unbound`, so name the table
+                // that was consulted: same instance as registration or not, and which
+                // keys it holds.
+                let me = self as *const KvAwarePolicy as usize;
+                let mut keys: Vec<String> = self
+                    .targets
+                    .iter()
+                    .map(|entry| entry.key().clone())
+                    .take(8)
+                    .collect();
+                keys.sort();
+                tracing::info!(
+                    policy = me,
+                    url = %worker.url(),
+                    base = %worker.base_url(),
+                    keys = ?keys,
+                    "kv_aware: binding miss"
+                );
+                TargetBinding {
+                    target: RoutableTarget {
+                        instance_id: Arc::from(worker.base_url()),
+                        dp_rank: worker.dp_rank().unwrap_or(0) as u32,
+                    },
+                    generation: 0,
+                    cache_key: None,
+                    matches: self.matches.clone(),
+                    block_size: self.params.block_size,
+                }
             })
     }
 
