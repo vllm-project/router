@@ -436,6 +436,25 @@ async fn grpc_pd_aborted_prefill_skips_decode() {
 }
 
 #[tokio::test]
+async fn grpc_pd_prefill_that_only_reports_progress_fails_the_request() {
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        progress: vec![64, 32],
+        omit_finish: true,
+        ..Default::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router(&prefill, &decode).await;
+
+    let response = router.route_chat(None, &chat(false), None).await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        worker_counter("vllm_router_pd_prefill_errors_total", &prefill.grpc_url),
+        1.0
+    );
+}
+
+#[tokio::test]
 async fn grpc_pd_non_streaming_decode_releases_load_before_body_is_read() {
     let (_prefill, decode, router) = push_pair().await;
     let d = router
