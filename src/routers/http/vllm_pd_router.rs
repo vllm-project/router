@@ -2047,7 +2047,7 @@ impl VllmPDRouter {
         };
         let prefill_worker = prefill_workers[selection.prefill.worker_index].clone();
         let decode_worker = decode_workers[selection.decode.worker_index].clone();
-        info!(
+        debug!(
             "Chat: Selected prefill={} [policy:{}], decode={} [policy:{}]",
             prefill_worker.url(),
             self.policy_registry.get_prefill_policy().name(),
