@@ -194,6 +194,10 @@ pub(crate) fn kv_aware_policy(policy: &dyn LoadBalancingPolicy) -> Option<&KvAwa
 
 /// Shared request accounting handle. The adapter signals output and completion;
 /// concurrent body/producer cleanup updates the counters only once.
+/// Test hook that runs once, before a report takes the slot lock.
+#[cfg(test)]
+type PauseHook = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Clone)]
 pub struct KvRequestSlot {
     manager: Arc<dyn SlotManager>,
@@ -205,7 +209,7 @@ pub struct KvRequestSlot {
     affinity: Option<Arc<AffinityRecord>>,
     /// Test-only pause between entering a report and taking the lock.
     #[cfg(test)]
-    pause: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
+    pause: Arc<Mutex<Option<PauseHook>>>,
     // 0 = prefill, 1 = decode, 2 = freed.
     state: Arc<AtomicU8>,
 }
@@ -1751,6 +1755,7 @@ impl Default for KvAwarePolicy {
 }
 
 impl LoadBalancingPolicy for KvAwarePolicy {
+    #[cfg(feature = "ready")]
     fn charged_prefill_tokens(&self, worker_url: &str) -> Option<u64> {
         let binding = self.targets.get(worker_url)?;
         let slots = self.slot_manager.as_ref()?;

@@ -64,7 +64,9 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// This is used for regular routing mode where requests go to a single worker.
     /// Now uses Arc<dyn Worker> for better performance and to avoid unnecessary cloning.
     /// Prefill tokens this policy currently charges to a worker, when it keeps
-    /// such a ledger. Used to observe the colocated progress path.
+    /// such a ledger. Test support: `charged_prefill_tokens` is only compiled
+    /// with the `ready` feature, which every test build enables.
+    #[cfg(feature = "ready")]
     #[doc(hidden)]
     fn charged_prefill_tokens(&self, _worker_url: &str) -> Option<u64> {
         None

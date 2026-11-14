@@ -2393,7 +2393,9 @@ impl Router {
         }
     }
 
-    /// Prefill tokens the policy currently charges to `worker_url`.
+    /// Prefill tokens the policy currently charges to `worker_url`. Test
+    /// support, compiled only with the `ready` feature.
+    #[cfg(feature = "ready")]
     #[doc(hidden)]
     pub fn charged_prefill_tokens(&self, worker_url: &str) -> Option<u64> {
         self.policy_registry
