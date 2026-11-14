@@ -5,7 +5,7 @@
 //! - Multi-Router Mode (enable_igw=true): RouterManager coordinates everything
 
 use crate::config::RouterConfig;
-use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
+use crate::core::{BasicWorker, CircuitBreakerConfig, Worker, WorkerRegistry, WorkerType};
 use crate::policies::kv_aware_ops;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
@@ -60,15 +60,12 @@ pub struct RouterManager {
     /// HTTP client for querying worker info
     client: reqwest::Client,
 
-    /// Configuration
-    #[allow(dead_code)] // May be used in future enhancements
-    config: RouterConfig,
 }
 
 impl RouterManager {
     /// Create a new router manager with shared registries
     pub fn new(
-        config: RouterConfig,
+        _config: RouterConfig,
         client: reqwest::Client,
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<crate::policies::PolicyRegistry>,
@@ -79,7 +76,6 @@ impl RouterManager {
             routers: Arc::new(DashMap::new()),
             default_router: Arc::new(std::sync::RwLock::new(None)),
             client,
-            config,
         }
     }
 
@@ -184,27 +180,19 @@ impl RouterManager {
             labels.insert("cost".to_string(), cost.to_string());
         }
 
-        let worker = match config.worker_type.as_deref() {
-            Some("prefill") => WorkerFactory::create_prefill_with_labels(
-                config.url.clone(),
-                config.bootstrap_port,
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
-            Some("decode") => WorkerFactory::create_decode_with_labels(
-                config.url.clone(),
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
-            _ => WorkerFactory::create_regular_with_labels(
-                config.url.clone(),
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
+        let worker_type = match config.worker_type.as_deref() {
+            Some("prefill") => WorkerType::Prefill {
+                bootstrap_port: config.bootstrap_port,
+            },
+            Some("decode") => WorkerType::Decode,
+            _ => WorkerType::Regular,
         };
+        let worker = BasicWorker::new(config.url.clone(), worker_type)
+            .with_labels(labels.clone())
+            .with_circuit_breaker_config(CircuitBreakerConfig::default());
 
         // Register worker
-        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+        let worker_arc: Arc<dyn Worker> = Arc::new(worker);
         let worker_id = self.worker_registry.register(worker_arc.clone());
 
         // Notify PolicyRegistry about the new worker

@@ -983,26 +983,27 @@ impl Router {
         worker_startup_timeout_secs: u64,
         worker_startup_check_interval_secs: u64,
     ) -> Result<(), String> {
+        Self::wait_for_healthy_workers_with_api_key(
+            worker_urls,
+            worker_startup_timeout_secs,
+            worker_startup_check_interval_secs,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn wait_for_healthy_workers_with_api_key(
+        worker_urls: &[String],
+        worker_startup_timeout_secs: u64,
+        worker_startup_check_interval_secs: u64,
+        api_key: Option<&str>,
+    ) -> Result<(), String> {
         if worker_urls.is_empty() {
             return Err(
                 "Timeout waiting for workers to become healthy: no workers provided".to_string(),
             );
         }
 
-        // Perform health check asynchronously
-        Self::wait_for_healthy_workers_async(
-            worker_urls,
-            worker_startup_timeout_secs,
-            worker_startup_check_interval_secs,
-        )
-        .await
-    }
-
-    async fn wait_for_healthy_workers_async(
-        worker_urls: &[String],
-        worker_startup_timeout_secs: u64,
-        worker_startup_check_interval_secs: u64,
-    ) -> Result<(), String> {
         // Extract unique base URLs (hosts) for health checks
         // This deduplicates DP-aware URLs like http://host:8081@0, @1, @2, @3
         // to only check http://host:8081 once
@@ -1058,6 +1059,7 @@ impl Router {
             for base_url in &unique_hosts_vec {
                 let client_clone = client.clone();
                 let url_clone = base_url.clone();
+                let api_key = api_key.map(str::to_owned);
 
                 let check_health = tokio::spawn(async move {
                     if crate::backend::is_grpc_url(&url_clone) {
@@ -1069,7 +1071,11 @@ impl Router {
                         }
                     } else {
                         let health_url = format!("{}/health", url_clone);
-                        match client_clone.get(&health_url).send().await {
+                        let mut request = client_clone.get(&health_url);
+                        if let Some(key) = api_key {
+                            request = request.bearer_auth(key);
+                        }
+                        match request.send().await {
                             Ok(res) => {
                                 if res.status().is_success() {
                                     None

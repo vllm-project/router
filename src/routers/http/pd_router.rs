@@ -520,6 +520,7 @@ fn build_dp_workers(
     worker_type: WorkerType,
     circuit_breaker_config: &CircuitBreakerConfig,
     health_config: Option<&HealthConfig>,
+    api_key: Option<&str>,
 ) -> Result<Vec<Arc<dyn Worker>>, String> {
     let (base_url, _) = dp_utils::parse_worker_url(url);
 
@@ -527,6 +528,7 @@ fn build_dp_workers(
     // IPv6+DP URL corruption where HTTP clients read @N as userinfo (RFC 3986).
     let dp_worker = |rank: usize| -> Arc<dyn Worker> {
         let worker = DPAwareWorker::new(base_url.clone(), rank, dp_size, worker_type.clone())
+            .with_api_key(api_key.map(str::to_owned))
             .with_circuit_breaker_config(circuit_breaker_config.clone());
         let worker = match health_config {
             Some(config) => worker.with_health_config(config.clone()),
@@ -541,6 +543,7 @@ fn build_dp_workers(
             Some(rank) => dp_worker(rank),
             None => {
                 let worker = BasicWorker::new(url.to_string(), worker_type.clone())
+                    .with_api_key(api_key.map(str::to_owned))
                     .with_dp_size(dp_size)
                     .with_circuit_breaker_config(circuit_breaker_config.clone());
                 let worker = match health_config {
@@ -763,10 +766,11 @@ impl PdRouterBase {
 
     // Private helper method to perform health check on a new server
     async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
-        crate::routers::http::router::Router::wait_for_healthy_workers(
+        crate::routers::http::router::Router::wait_for_healthy_workers_with_api_key(
             &[url.to_string()],
             self.worker_startup_timeout_secs,
             self.worker_startup_check_interval_secs,
+            self.api_key.as_deref(),
         )
         .await
         .map_err(|_| PDRouterError::HealthCheckFailed {
@@ -983,6 +987,7 @@ impl PdRouterBase {
             worker_type,
             &self.circuit_breaker_config,
             None,
+            self.api_key.as_deref(),
         )
         .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
@@ -1178,10 +1183,11 @@ impl PdRouterBase {
             prefill_urls.iter().map(|(url, _)| url.clone()).collect();
         for urls in [&prefill_base_urls, &decode_urls] {
             if !urls.is_empty() {
-                crate::routers::http::router::Router::wait_for_healthy_workers(
+                crate::routers::http::router::Router::wait_for_healthy_workers_with_api_key(
                     urls,
                     ctx.router_config.worker_startup_timeout_secs,
                     ctx.router_config.worker_startup_check_interval_secs,
+                    ctx.router_config.api_key.as_deref(),
                 )
                 .await?;
             }
@@ -1213,6 +1219,7 @@ impl PdRouterBase {
                 worker_type,
                 &core_cb_config,
                 Some(&health_config),
+                ctx.router_config.api_key.as_deref(),
             )? {
                 ctx.worker_registry.register(worker);
             }
