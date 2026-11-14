@@ -431,14 +431,14 @@ struct AttemptInner {
     state: Mutex<AttemptState>,
 }
 
-/// Experiment switch: set VLLM_ROUTER_PREFILL_PROGRESS=0 to stream progress
-/// without consuming it.
+/// Off by default: set VLLM_ROUTER_PREFILL_PROGRESS=1 to price a running
+/// prefill from what the worker reports instead of from the admission charge.
 fn prefill_progress_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("VLLM_ROUTER_PREFILL_PROGRESS")
             .map(|value| value != "0")
-            .unwrap_or(true)
+            .unwrap_or(false)
     })
 }
 
