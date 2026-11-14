@@ -203,6 +203,9 @@ pub struct KvRequestSlot {
     charge: Arc<Mutex<u64>>,
     /// Affinity binding reference acquired with this reservation, if any.
     affinity: Option<Arc<AffinityRecord>>,
+    /// Test-only pause between entering a report and taking the lock.
+    #[cfg(test)]
+    pause: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
     // 0 = prefill, 1 = decode, 2 = freed.
     state: Arc<AtomicU8>,
 }
@@ -219,6 +222,8 @@ impl KvRequestSlot {
             target,
             charge: Arc::new(Mutex::new(prefill_tokens)),
             affinity,
+            #[cfg(test)]
+            pause: Arc::new(Mutex::new(None)),
             state: Arc::new(AtomicU8::new(0)),
         }
     }
@@ -241,6 +246,10 @@ impl KvRequestSlot {
     /// Only the difference is applied, so a growing report (a preemption) adds
     /// load back exactly once, and a request that already finished is ignored.
     pub(crate) fn apply_prefill_progress(&self, remaining: u64) {
+        #[cfg(test)]
+        if let Some(pause) = self.pause.lock().clone() {
+            pause();
+        }
         let mut charge = self.charge.lock();
         if self.state.load(Ordering::Acquire) != 0 {
             return;
@@ -1742,6 +1751,12 @@ impl Default for KvAwarePolicy {
 }
 
 impl LoadBalancingPolicy for KvAwarePolicy {
+    fn charged_prefill_tokens(&self, worker_url: &str) -> Option<u64> {
+        let binding = self.targets.get(worker_url)?;
+        let slots = self.slot_manager.as_ref()?;
+        Some(slots.sample(&binding.target).active_prefill_tokens)
+    }
+
     fn select_worker_with_headers(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -2352,6 +2367,48 @@ mod tests {
         slots.begin_decode(&active, &active, 32);
         slots.free(&active);
         assert!(!slots.slots.contains_key(&active));
+    }
+
+    #[test]
+    fn a_report_paused_before_the_lock_cannot_leave_load_behind() {
+        let slots = Arc::new(InMemorySlotManager::new());
+        let t = target("race", 0);
+        slots.begin_prefill(&t, 100);
+        let slot = Arc::new(KvRequestSlot::new(slots.clone(), t.clone(), 100, None));
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let gate_rx = Mutex::new(gate_rx);
+        *slot.pause.lock() = Some(Arc::new(move || {
+            let _ = entered_tx.send(());
+            let gate = gate_rx.lock();
+            let _ = gate.recv();
+        }));
+
+        // The report pauses inside the slot, before it takes the lock.
+        let reporter = {
+            let slot = slot.clone();
+            std::thread::spawn(move || slot.apply_prefill_progress(300))
+        };
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("report enters the slot");
+
+        // A cancel lands while that report is still in flight.
+        let canceller = {
+            let slot = slot.clone();
+            std::thread::spawn(move || slot.release())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        gate_tx.send(()).expect("open the gate");
+        reporter.join().expect("report finishes");
+        canceller.join().expect("cancel finishes");
+
+        assert_eq!(
+            slots.sample(&t).active_prefill_tokens,
+            0,
+            "a cancel during a report must not leave the worker charged"
+        );
     }
 
     #[test]

@@ -343,6 +343,51 @@ async fn cache_aware_prefix_overrides_load() {
 }
 
 #[tokio::test]
+async fn kv_aware_applies_progress_reports_to_the_colocated_ledger() {
+    let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        progress: vec![40, 7],
+        progress_hold: Duration::from_millis(300),
+        ..MockVllmRs::default()
+    })
+    .await;
+    let router = start_router(std::slice::from_ref(&server), kv_aware()).await;
+    let url = server.grpc_url.clone();
+
+    // While the prefill runs, the ledger follows what the worker reports.
+    let request = complete(
+        &router,
+        std::slice::from_ref(&server),
+        prompt(&[1, 2, 3], json!({})),
+    );
+    let watcher = async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if router.charged_prefill_tokens(&url) == Some(7) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ledger never reached the last report: {:?}",
+                router.charged_prefill_tokens(&url)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::join!(request, watcher);
+
+    // And the charge is gone once the request ends.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while router.charged_prefill_tokens(&url) != Some(0) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ledger not cleared: {:?}",
+            router.charged_prefill_tokens(&url)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
 async fn kv_aware_prefers_the_less_loaded_worker() {
     // Equal-cost cold requests are no longer pinned to one worker, so a run
     // of them may use either worker.

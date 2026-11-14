@@ -2393,6 +2393,14 @@ impl Router {
         }
     }
 
+    /// Prefill tokens the policy currently charges to `worker_url`.
+    #[doc(hidden)]
+    pub fn charged_prefill_tokens(&self, worker_url: &str) -> Option<u64> {
+        self.policy_registry
+            .get_default_policy()
+            .charged_prefill_tokens(worker_url)
+    }
+
     pub fn remove_worker(&self, worker_url: &str) {
         if self.intra_node_data_parallel_size > 1 {
             // remove dp-aware workers in a prefix-matching fashion
