@@ -12,6 +12,7 @@ the policy is the same for `grpc://host:port`.
 | `round_robin` | General purpose, even distribution | No | No |
 | `random` | Simple deployments | No | No |
 | `consistent_hash` | Multi-turn conversations, KV cache reuse | Yes | No |
+| `sticky_least_loaded` | Multi-turn sessions with explicit lifetimes | Yes | Yes (active sessions) |
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
 | `kv_aware` | KV reuse and stage-aware load scoring | No | Yes |
@@ -49,8 +50,8 @@ The consistent hash policy extracts a routing key in the following priority orde
 | 1 | HTTP Header | `X-Session-ID` | `X-Session-ID: session-abc-123` |
 | 2 | HTTP Header | `X-User-ID` | `X-User-ID: user-456` |
 | 3 | HTTP Header | `X-Tenant-ID` | `X-Tenant-ID: tenant-xyz` |
-| 4 | HTTP Header | `X-Request-ID` | `X-Request-ID: req-789` |
-| 5 | HTTP Header | `X-Correlation-ID` | `X-Correlation-ID: corr-001` |
+| 4 | HTTP Header | `X-Correlation-ID` | `X-Correlation-ID: corr-001` |
+| 5 | HTTP Header | `X-Request-ID` | `X-Request-ID: req-789` |
 | 6 | HTTP Header | `X-Trace-ID` | `X-Trace-ID: trace-002` |
 | 7 | Request Body | `session_params.session_id` | `{"session_params": {"session_id": "..."}}` |
 | 8 | Request Body | `user` | `{"user": "..."}` (OpenAI format) |
@@ -117,6 +118,39 @@ curl -X POST http://router:8000/v1/chat/completions \
 - **Unhealthy fallback**: If the target worker is unhealthy, falls back to the first healthy worker
 - **Virtual nodes**: Uses 160 virtual nodes per worker for even distribution
 - **DP-aware routing**: Supports data-parallel worker URLs (e.g., `http://worker:8000@0`)
+
+---
+
+## Sticky least loaded
+
+`sticky_least_loaded` assigns each new session to the healthy worker with the fewest active sessions. The router selects the worker and records the reservation in one operation. If workers tie, rendezvous hashing breaks the tie. Later requests keep their worker until release, expiration, or worker unavailability.
+
+```bash
+vllm-router --policy sticky_least_loaded \
+  --worker-urls http://worker1:8000 http://worker2:8000
+```
+
+In prefill/decode mode, both stages inherit `--policy`. Use `--prefill-policy` or `--decode-policy` to configure a stage independently. Each sticky stage tracks its own reservations.
+
+### Session IDs
+
+Send the same `X-Session-ID` on every turn. The router checks headers first, then the body fields supported by the route. Both follow the order in the [Hash Key Priority table](#hash-key-priority). If the first matching header contains a new ID on each request, the router creates a separate reservation each time.
+
+Requests without an explicit ID go to a least-loaded worker without creating a reservation. Separate typed requests with identical prompts can reach different workers when active-session counts tie.
+
+### Release and expiration
+
+After all requests for a session complete, release its reservation with the same ID in the query string. If API-key validation is enabled, include an `Authorization: Bearer <token>` header.
+
+```bash
+curl -X POST 'http://router:30000/finish_session?session_id=my-session-123'
+```
+
+The router accepts repeated releases and unknown IDs. Release clears the reservation across the default, per-model, prefill, and decode policies. In-flight generations continue. Use IDs that are unique across models, for example `model-a:conversation-123`.
+
+By default, sessions expire after two hours of inactivity. Set `VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S` on the router to change the timeout in seconds. The router checks a returning session immediately and sweeps other idle entries at most once per minute as requests arrive. After expiration or worker loss, a session can move to a worker with a cold KV cache.
+
+Each router process holds its own reservations in memory and loses them on restart. With multiple replicas, route all turns and the release call for a session to the same router.
 
 ---
 
@@ -317,6 +351,7 @@ Multiple router replicas need ingress stickiness to preserve affinity.
 | Scenario | Recommended Policy |
 |----------|-------------------|
 | Chat applications with conversation history | `consistent_hash` |
+| Multi-turn sessions with explicit release and load balancing by active-session count | `sticky_least_loaded` |
 | Batch inference with no state | `round_robin` |
 | Variable request complexity | `power_of_two` |
 | Repeated system prompts / few-shot | `cache_aware` |
