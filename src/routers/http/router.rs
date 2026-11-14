@@ -2254,15 +2254,20 @@ impl Router {
         crate::backend::classify_worker_urls(&urls)?;
 
         let start_time = std::time::Instant::now();
+        let startup_timeout = Duration::from_secs(self.worker_startup_timeout_secs);
+        let health_timeout = Duration::from_secs(self.health_config.timeout_secs);
+        let check_interval = Duration::from_secs(self.worker_startup_check_interval_secs);
+        let remaining = || startup_timeout.saturating_sub(start_time.elapsed());
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.health_config.timeout_secs))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
         let worker_api_key: Option<Arc<str>> = self.api_key.as_deref().map(Arc::from);
         let mut last_health_error = String::from("none");
 
         loop {
-            if start_time.elapsed() > Duration::from_secs(self.worker_startup_timeout_secs) {
+            // Probes and retry sleeps stop at the startup timeout.
+            let budget = remaining();
+            if budget.is_zero() {
                 let message = format!(
                     "Timeout {}s waiting for worker {} to become healthy (last health check: {}). Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
                     self.worker_startup_timeout_secs, worker_url, last_health_error
@@ -2272,10 +2277,12 @@ impl Router {
             }
 
             let health_result = if crate::backend::is_grpc_url(worker_url) {
-                crate::backend::check_grpc_health(worker_url, Duration::from_secs(2)).await
+                crate::backend::check_grpc_health(worker_url, Duration::from_secs(2).min(budget))
+                    .await
             } else {
                 let health_url = format!("{}/health", worker_url);
                 match worker_get(&client, &health_url, self.api_key.as_deref())
+                    .timeout(health_timeout.min(budget))
                     .send()
                     .await
                 {
@@ -2400,10 +2407,7 @@ impl Router {
                         warn!("The worker url {} does not have http or https prefix. Please add the prefix to the url.", worker_url);
                     }
 
-                    tokio::time::sleep(Duration::from_secs(
-                        self.worker_startup_check_interval_secs,
-                    ))
-                    .await;
+                    tokio::time::sleep(check_interval.min(remaining())).await;
                     continue;
                 }
             }
@@ -7492,6 +7496,34 @@ mod tests {
         // A probe that waited for the startup timeout would be the only one.
         assert!(probes.load(Ordering::SeqCst) >= 2);
         startup_server.abort();
+        silent_server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_add_worker_stops_at_startup_timeout() {
+        use crate::config::{HealthCheckConfig, RouterConfig};
+
+        let (silent_url, _probes, silent_server) = start_silent_mock_server().await;
+        // The health check timeout and the check interval both exceed the startup timeout.
+        let config = RouterConfig {
+            worker_startup_timeout_secs: 1,
+            worker_startup_check_interval_secs: 30,
+            health_check: HealthCheckConfig {
+                timeout_secs: 30,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (router, _ctx) = start_router(config, vec![]).await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            router.add_worker(&silent_url),
+        )
+        .await
+        .expect("add_worker outlived the startup timeout")
+        .unwrap_err();
+
         silent_server.abort();
     }
 
