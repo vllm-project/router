@@ -158,6 +158,16 @@ struct CliArgs {
     )]
     pd_kv_events: Vec<String>,
 
+    /// KV events kept from one message. Oversized batches are truncated to the
+    /// newest events instead of being dropped, because a dropped batch makes the
+    /// index - and the credit it prices - silently inert.
+    #[arg(
+        long = "kv-event-max-batch-events",
+        default_value_t = 16384,
+        value_name = "N"
+    )]
+    kv_event_max_batch_events: usize,
+
     /// Specific policy for prefill nodes in PD mode. kv_aware uses the prefill load profile.
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
     prefill_policy: Option<String>,
@@ -617,6 +627,9 @@ impl CliArgs {
         )?;
 
         let pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
+        // The decoder keeps the newest events of an oversized batch; publish the
+        // configured limit once, before any subscription starts.
+        vllm_router_rs::kv_index::set_max_batch_events(self.kv_event_max_batch_events);
 
         // Build RouterConfig
         Ok(RouterConfig {
@@ -630,6 +643,7 @@ impl CliArgs {
                 })?,
             mode,
             pd_kv_event_sources,
+            kv_event_max_batch_events: self.kv_event_max_batch_events,
             policy,
             connection_mode,
             host: self.host.clone(),

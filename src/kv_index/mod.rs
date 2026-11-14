@@ -15,7 +15,7 @@ pub mod types;
 pub mod wire;
 
 pub use admit::validate_device_batch;
-pub use decode::decode_batch;
+pub use decode::{decode_batch, set_max_batch_events};
 pub use discovery::{
     CacheKey, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, WorkerKvInfo,
 };

@@ -11,6 +11,30 @@ const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 /// The payload byte cap is checked before parsing; nesting depth is limited
 /// during each parse. The event count is checked after materializing the Value
 /// tree. These limits do not constitute a hard decoded-heap budget.
+/// Events kept from one message unless the operator overrides it.
+///
+/// The publisher batches per step, so a large value only matters when the consumer
+/// falls behind; keeping the newest events bounds memory without discarding a whole
+/// batch, which would make the index - and therefore the credit - silently inert.
+pub const DEFAULT_MAX_BATCH_EVENTS: usize = 16384;
+
+static MAX_BATCH_EVENTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_BATCH_EVENTS);
+
+/// Override the per-message event limit. Values of zero are ignored.
+///
+/// Set once at startup from `--kv-event-max-batch-events`; keeping it process-wide
+/// avoids threading a limit through every decode call.
+pub fn set_max_batch_events(limit: usize) {
+    if limit > 0 {
+        MAX_BATCH_EVENTS.store(limit, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn max_batch_events() -> usize {
+    MAX_BATCH_EVENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err("KV event payload exceeds 16 MiB".into());
@@ -47,13 +71,37 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
     let Value::Array(events) = batch.remove(1) else {
         return Err("KV events must be an array".into());
     };
-    if events.len() > 4096 {
-        return Err("KV event batch exceeds the event limit".into());
-    }
+    // An oversized batch used to be rejected whole, which made the consumer drop
+    // it: the index then under-counted every block in that batch and the credit
+    // went silently inert (a measured run reported a 0% Decode hit rate after one
+    // overflow). Keep the newest events instead. Losing the oldest blocks only
+    // makes the estimate conservative - an unindexed block is priced as cold, so a
+    // request is never credited for KV the engine may no longer hold.
     let events = events
         .into_iter()
         .map(decode_event)
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?;
+    let limit = max_batch_events();
+    let mut events = events;
+    if events.len() > limit {
+        let drop_from = events.len() - limit;
+        // Only stores are safe to discard: a discarded removal or clear would leave
+        // blocks in the index that the engine has already freed, and the credit would
+        // then over-favour that engine. When an authoritative event is in the prefix,
+        // keep the whole batch rather than trust a truncated view of it.
+        let authoritative = events[..drop_from]
+            .iter()
+            .any(|event| !matches!(event, KVEvent::BlockStored(_)));
+        if authoritative {
+            tracing::warn!(
+                "kv_index: keeping an oversized KV event batch of {} events; the discarded \
+                 prefix carries a removal or clear",
+                events.len()
+            );
+        } else {
+            events.drain(0..drop_from);
+        }
+    }
     Ok(KVEventBatch {
         ts,
         events,
@@ -449,8 +497,22 @@ mod tests {
     #[test]
     fn bounded_messagepack_and_trailing_bytes() {
         assert!(decode_batch(&vec![0; MAX_PAYLOAD_BYTES + 1]).is_err());
+        // An oversized batch of stores is truncated to the newest events rather than
+        // rejected: dropping it whole made the index - and therefore the credit -
+        // silently inert.
+        let truncated = decode_batch(&encode(
+            vec![stored(); DEFAULT_MAX_BATCH_EVENTS + 1],
+            0.into(),
+        ))
+        .expect("oversized batches of stores are truncated, not rejected");
+        assert_eq!(truncated.events.len(), max_batch_events());
+        // A discarded removal or clear must not be dropped: the index would keep blocks
+        // the engine has freed, so such a batch is kept whole.
         let clear = Value::Map(vec![("type".into(), "AllBlocksCleared".into())]);
-        assert!(decode_batch(&encode(vec![clear; 4097], 0.into())).is_err());
+        let mut events = vec![clear];
+        events.extend((0..=DEFAULT_MAX_BATCH_EVENTS).map(|_| stored()));
+        let kept = decode_batch(&encode(events, 0.into())).expect("authoritative batch is kept");
+        assert_eq!(kept.events.len(), DEFAULT_MAX_BATCH_EVENTS + 2);
         let mut payload = encode(vec![stored()], 0.into());
         payload.push(0);
         assert!(decode_batch(&payload).is_err());

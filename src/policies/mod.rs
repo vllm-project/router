@@ -29,10 +29,11 @@ pub use factory::PolicyFactory;
 pub(crate) use kv_aware::kv_aware_policy;
 pub use kv_aware::{
     cost_components, kv_aware_ops, AffinityKey, AffinityRecord, CandidateView, CostComponents,
-    CostDecision, CostParams, InMemorySlotManager, KvAffinityTable, KvAwareOps, KvAwarePolicy,
-    KvRequestSlot, KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample,
-    MultiplicativeScorer, Picker, PrefillWorkEstimate, Scorer, SelectionError, SlotManager,
-    StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits, WorkerTokenInputs,
+    CostDecision, CostParams, DecodeWorkEstimate, InMemorySlotManager, KvAffinityTable, KvAwareOps,
+    KvAwarePolicy, KvRequestSlot, KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample,
+    MultiplicativeScorer, Picker, PrefillWorkEstimate, PromptHashes, Scorer, SelectionError,
+    SlotManager, StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits,
+    WorkerTokenInputs,
 };
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
