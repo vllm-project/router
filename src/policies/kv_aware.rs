@@ -1742,13 +1742,6 @@ impl Default for KvAwarePolicy {
 }
 
 impl LoadBalancingPolicy for KvAwarePolicy {
-    #[cfg(feature = "ready")]
-    fn charged_prefill_tokens(&self, worker_url: &str) -> Option<u64> {
-        let binding = self.targets.get(worker_url)?;
-        let slots = self.slot_manager.as_ref()?;
-        Some(slots.sample(&binding.target).active_prefill_tokens)
-    }
-
     fn select_worker_with_headers(
         &self,
         workers: &[Arc<dyn Worker>],
