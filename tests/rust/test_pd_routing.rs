@@ -795,6 +795,7 @@ mod test_pd_routing {
 
         for (mode, policy) in test_cases {
             let config = RouterConfig {
+                enable_prefill_progress: false,
                 mode,
                 pd_kv_event_sources: Default::default(),
                 policy,
