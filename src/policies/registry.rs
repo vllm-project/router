@@ -10,6 +10,7 @@ use super::{
     RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
 };
 use crate::config::types::PolicyConfig;
+use crate::core::{Worker, WorkerType};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -26,6 +27,10 @@ pub struct PolicyRegistry {
 
     /// Default policy instance (cached)
     default_policy: Arc<dyn LoadBalancingPolicy>,
+
+    /// Router-wide Encode policy, always independent of consumer policies.
+    encode_policy: Arc<RwLock<Option<Arc<dyn LoadBalancingPolicy>>>>,
+    encode_selection_context: Arc<super::SelectionContext>,
 
     /// Prefill policy for PD mode
     prefill_policy: Arc<RwLock<Option<Arc<dyn LoadBalancingPolicy>>>>,
@@ -57,6 +62,8 @@ impl PolicyRegistry {
             model_policies: Arc::new(RwLock::new(HashMap::new())),
             model_worker_counts: Arc::new(RwLock::new(HashMap::new())),
             default_policy,
+            encode_policy: Arc::new(RwLock::new(None)),
+            encode_selection_context: Arc::new(super::SelectionContext::default()),
             prefill_policy: Arc::new(RwLock::new(None)),
             decode_policy: Arc::new(RwLock::new(None)),
             kv_affinity_table,
@@ -112,7 +119,61 @@ impl PolicyRegistry {
         policy
     }
 
-    /// Called when a worker is removed
+    /// Clean policy state for a successfully removed worker, then update its
+    /// consumer count. Call once with the object returned by registry removal.
+    /// Encode workers do not participate in consumer policies or accounting.
+    pub fn notify_consumer_removed(&self, removed: &dyn Worker) {
+        if !removed.worker_type().is_consumer() {
+            return;
+        }
+        self.clear_consumer_cache_state(removed);
+        self.on_worker_removed(removed.model_id());
+    }
+
+    /// Invalidate affinity for an actual removed or replaced consumer without
+    /// changing model accounting. Same-model replacements retain their policy.
+    pub fn clear_consumer_cache_state(&self, removed: &dyn Worker) {
+        if !removed.worker_type().is_consumer() {
+            return;
+        }
+        if matches!(removed.worker_type(), WorkerType::Decode) {
+            if let Some(kv) = super::kv_aware_ops(self.get_decode_policy().as_ref()) {
+                kv.unregister_worker(removed.url());
+            }
+        }
+        let model_id = removed.model_id();
+        let mut policies = Vec::new();
+        if let Some(policy) = self.get_policy(model_id) {
+            policies.push(policy);
+        }
+        // PD routing uses role-specific instances, even when their configs
+        // match the model policy. Clean the actual removed worker's role.
+        let routing_policy = match removed.worker_type() {
+            WorkerType::Prefill { .. } => Some(self.get_prefill_policy()),
+            WorkerType::Decode => Some(self.get_decode_policy()),
+            _ => None,
+        };
+        if let Some(policy) = routing_policy {
+            // Unconfigured PD policies fall back to the shared default Arc.
+            if !policies
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, &policy))
+            {
+                policies.push(policy);
+            }
+        }
+        // The last-worker notification removes the model's policy mapping,
+        // so clean both instances before updating the count.
+        for policy in policies {
+            if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                cache_aware.remove_worker_by_url(removed.url());
+                debug!("Removed worker from cache-aware tree: {}", removed.url());
+            }
+        }
+    }
+
+    /// Decrement model accounting without worker-specific cleanup.
+    /// Use `notify_consumer_removed` after removing a consumer from the registry.
     pub fn on_worker_removed(&self, model_id: &str) {
         let should_cleanup = {
             let mut counts = self.model_worker_counts.write().unwrap();
@@ -296,6 +357,9 @@ impl PolicyRegistry {
         if let Some(policy) = self.decode_policy.read().unwrap().as_ref() {
             policy.finish_session(session_id);
         }
+        if let Some(policy) = self.get_encode_policy() {
+            policy.finish_session(session_id);
+        }
     }
 
     /// Clear all policies (useful for testing). Policy rebuilds also drop
@@ -306,6 +370,27 @@ impl PolicyRegistry {
         let mut counts = self.model_worker_counts.write().unwrap();
         counts.clear();
         self.kv_affinity_table.clear();
+    }
+
+    /// Configure a separate E instance through the common factory. Replacement
+    /// and item selection share the context-before-slot lock order.
+    pub fn set_encode_policy(&self, config: &PolicyConfig) -> Result<(), super::PolicyRoleError> {
+        super::PolicyFactory::validate_role(config, WorkerType::Encode)?;
+        let policy =
+            super::PolicyFactory::create_from_config(config, Some(&self.kv_affinity_table));
+        self.encode_selection_context.with_selection(|| {
+            *self.encode_policy.write().unwrap() = Some(policy);
+        });
+        Ok(())
+    }
+
+    /// No consumer fallback: non-EPD registries leave this slot empty.
+    pub fn get_encode_policy(&self) -> Option<Arc<dyn LoadBalancingPolicy>> {
+        self.encode_policy.read().unwrap().as_ref().map(Arc::clone)
+    }
+
+    pub fn get_encode_selection_context(&self) -> Arc<super::SelectionContext> {
+        Arc::clone(&self.encode_selection_context)
     }
 
     /// Set the prefill policy for PD mode
@@ -352,6 +437,156 @@ impl std::fmt::Debug for PolicyRegistry {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_slot_is_optional_and_uses_independent_instances() {
+        for config in [
+            PolicyConfig::Random,
+            PolicyConfig::RoundRobin,
+            PolicyConfig::RendezvousHash,
+            PolicyConfig::StickyLeastLoaded,
+            PolicyConfig::ConsistentHash { virtual_nodes: 317 },
+            PolicyConfig::PowerOfTwo {
+                load_check_interval_secs: 73,
+            },
+        ] {
+            let registry = PolicyRegistry::new(config.clone());
+            assert!(registry.get_encode_policy().is_none());
+            registry.set_encode_policy(&config).unwrap();
+            let encode = registry.get_encode_policy().unwrap();
+            assert_eq!(encode.name(), config.name());
+            assert!(!Arc::ptr_eq(&encode, &registry.get_default_policy()));
+            assert!(!Arc::ptr_eq(&encode, &registry.get_prefill_policy()));
+            assert!(!Arc::ptr_eq(&encode, &registry.get_decode_policy()));
+            let clone = registry.clone();
+            assert!(Arc::ptr_eq(
+                &registry.get_encode_selection_context(),
+                &clone.get_encode_selection_context()
+            ));
+            registry.set_prefill_policy(Arc::new(RandomPolicy::new()));
+            registry.set_decode_policy(Arc::new(RoundRobinPolicy::new()));
+            assert!(Arc::ptr_eq(&encode, &clone.get_encode_policy().unwrap()));
+        }
+    }
+
+    #[test]
+    fn encode_round_robin_state_is_independent_and_shared_by_registry_clones() {
+        use crate::core::{BasicWorker, Worker, WorkerType};
+        let workers: Vec<Arc<dyn Worker>> = ["http://e0:8000", "http://e1:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new(url.into(), WorkerType::Encode)) as Arc<dyn Worker>
+            })
+            .collect();
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry
+            .set_encode_policy(&PolicyConfig::RoundRobin)
+            .unwrap();
+        let global = registry.get_default_policy();
+        let encode = registry.get_encode_policy().unwrap();
+        let prefill: Vec<Arc<dyn Worker>> = ["http://p0", "http://p1"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new(
+                    url.into(),
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let decode: Vec<Arc<dyn Worker>> = ["http://d0", "http://d1"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new(url.into(), WorkerType::Decode)) as Arc<dyn Worker>
+            })
+            .collect();
+        registry.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
+        registry.set_decode_policy(Arc::new(RoundRobinPolicy::new()));
+        assert_eq!(encode.select_worker(&workers, None), Some(0));
+        assert_eq!(
+            registry.get_prefill_policy().select_worker(&prefill, None),
+            Some(0)
+        );
+        assert_eq!(
+            registry.get_decode_policy().select_worker(&decode, None),
+            Some(0)
+        );
+        let cloned = registry.clone();
+        assert!(Arc::ptr_eq(&encode, &cloned.get_encode_policy().unwrap()));
+        assert_eq!(
+            cloned
+                .get_encode_policy()
+                .unwrap()
+                .select_worker(&workers, None),
+            Some(1)
+        );
+        assert_eq!(
+            registry.get_prefill_policy().select_worker(&prefill, None),
+            Some(1)
+        );
+        assert_eq!(
+            registry.get_decode_policy().select_worker(&decode, None),
+            Some(1)
+        );
+        assert_eq!(global.select_worker(&prefill, None), Some(0));
+        let other = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        other.set_encode_policy(&PolicyConfig::RoundRobin).unwrap();
+        assert_eq!(
+            other
+                .get_encode_policy()
+                .unwrap()
+                .select_worker(&workers, None),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn encode_slot_survives_consumer_policy_cleanup_and_can_be_configured() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let cloned = registry.clone();
+        let global = registry.get_default_policy();
+        registry.set_encode_policy(&PolicyConfig::Random).unwrap();
+        let encode = registry.get_encode_policy().unwrap();
+        assert_eq!(encode.name(), "random");
+        assert!(Arc::ptr_eq(&encode, &cloned.get_encode_policy().unwrap()));
+        assert!(Arc::ptr_eq(&global, &registry.get_default_policy()));
+        assert!(registry.get_worker_counts().is_empty());
+        assert!(registry.get_all_mappings().is_empty());
+        registry.on_worker_added("model", None);
+        registry.on_worker_removed("model");
+        registry.clear();
+        assert!(Arc::ptr_eq(&encode, &registry.get_encode_policy().unwrap()));
+        registry
+            .set_encode_policy(&PolicyConfig::RoundRobin)
+            .unwrap();
+        assert_eq!(registry.get_encode_policy().unwrap().name(), "round_robin");
+        assert!(!Arc::ptr_eq(
+            &registry.get_encode_policy().unwrap(),
+            &global
+        ));
+    }
+
+    #[test]
+    fn encode_random_selects_only_healthy_encode_candidates() {
+        use crate::core::{BasicWorker, Worker, WorkerType};
+        let workers: Vec<Arc<dyn Worker>> = ["http://e0:8000", "http://e1:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new(url.into(), WorkerType::Encode)) as Arc<dyn Worker>
+            })
+            .collect();
+        let registry = PolicyRegistry::new(PolicyConfig::RendezvousHash);
+        registry.set_encode_policy(&PolicyConfig::Random).unwrap();
+        let policy = registry.get_encode_policy().unwrap();
+        workers[0].set_healthy(false);
+        for _ in 0..8 {
+            assert_eq!(policy.select_worker(&workers, None), Some(1));
+        }
+        workers[1].set_healthy(false);
+        assert_eq!(policy.select_worker(&workers, None), None);
+        assert_eq!(policy.select_worker(&[], None), None);
+    }
 
     #[test]
     fn test_policy_registry_basic() {

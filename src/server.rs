@@ -1,6 +1,6 @@
 use crate::{
-    config::{HistoryBackend, RouterConfig, TraceConfig},
-    core::{WorkerRegistry, WorkerType},
+    config::{HistoryBackend, RouterConfig, RoutingMode, TraceConfig},
+    core::{CircuitBreakerConfig, HealthConfig, WorkerFactory, WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
@@ -75,6 +75,10 @@ impl AppContext {
                 source.validate(worker).map_err(|error| error.to_string())?;
             }
         }
+        // Validate before touching the URL-keyed registry, including for Rust
+        // callers that create a context directly instead of using the CLI.
+        crate::config::ConfigValidator::validate_epd(&router_config)
+            .map_err(|error| error.to_string())?;
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
@@ -85,6 +89,54 @@ impl AppContext {
                 .kv_aware_session_affinity_ttl_secs
                 .map(std::time::Duration::from_secs),
         ));
+
+        // Single registration point for the static E pool. Router construction
+        // only registers its consumers, and Encode does not affect their
+        // per-model policy counts. Cloned contexts share these worker objects.
+        if let Some(epd) = &router_config.epd {
+            // validate_epd already checked role compatibility before creating
+            // any policy. Use the same resolution for the actual Encode slot.
+            let encode_resolution = crate::config::ConfigValidator::resolve_encode_policy(
+                epd,
+                &router_config.policy,
+                crate::config::EncodePolicySource::ExplicitJson,
+            )
+            .map_err(|error| error.to_string())?;
+            if let Some(fallback) = &encode_resolution.fallback {
+                warn!(
+                    inherited_policy = fallback.inherited_policy,
+                    fallback_policy = encode_resolution.policy.name(),
+                    reason = fallback.reason,
+                    "Encode policy is unset and the inherited main policy does not support Encode; \
+                     using independent round_robin for Encode. Consumer policy remains unchanged. \
+                     Set --encode-policy or epd.encode_policy to select Encode explicitly"
+                );
+            }
+            policy_registry
+                .set_encode_policy(&encode_resolution.policy)
+                .map_err(|error| error.to_string())?;
+            let cb = router_config.effective_circuit_breaker_config();
+            let circuit_breaker = CircuitBreakerConfig {
+                failure_threshold: cb.failure_threshold,
+                success_threshold: cb.success_threshold,
+                timeout_duration: Duration::from_secs(cb.timeout_duration_secs),
+                window_duration: Duration::from_secs(cb.window_duration_secs),
+            };
+            let health = HealthConfig {
+                timeout_secs: router_config.health_check.timeout_secs,
+                check_interval_secs: router_config.health_check.check_interval_secs,
+                endpoint: router_config.health_check.endpoint.clone(),
+                failure_threshold: router_config.health_check.failure_threshold,
+                success_threshold: router_config.health_check.success_threshold,
+            };
+            for url in &epd.encoder_urls {
+                worker_registry.register(Arc::from(WorkerFactory::create_encode_with_config(
+                    url.clone(),
+                    circuit_breaker.clone(),
+                    health.clone(),
+                )));
+            }
+        }
 
         let router_manager = None;
 
@@ -699,6 +751,7 @@ async fn list_workers_rest(
                         WorkerType::Regular => "regular",
                         WorkerType::Prefill { .. } => "prefill",
                         WorkerType::Decode => "decode",
+                        WorkerType::Encode => "encode",
                     },
                     "is_healthy": worker.is_healthy(),
                     "load": worker.load(),
@@ -719,6 +772,7 @@ async fn list_workers_rest(
                 "prefill_count": state.context.worker_registry.get_prefill_workers().len(),
                 "decode_count": state.context.worker_registry.get_decode_workers().len(),
                 "regular_count": state.context.worker_registry.get_by_type(&WorkerType::Regular).len(),
+                "encode_count": state.context.worker_registry.get_by_type(&WorkerType::Encode).len(),
             }
         });
         Json(response).into_response()
@@ -745,22 +799,29 @@ async fn get_worker(
             };
             (StatusCode::NOT_FOUND, Json(error)).into_response()
         }
+    } else if let Some(worker) = state.context.worker_registry.get_by_url(&url) {
+        Json(json!({
+            "url": worker.url(),
+            "model_id": worker.model_id(),
+            "is_healthy": worker.is_healthy()
+        }))
+        .into_response()
+    } else if matches!(state.context.router_config.mode, RoutingMode::OpenAI { .. })
+        && state.router.get_worker_urls().contains(&url)
+    {
+        // OpenAI routers expose their base URL without registering a worker.
+        Json(json!({
+            "url": url,
+            "model_id": "unknown",
+            "is_healthy": true
+        }))
+        .into_response()
     } else {
-        let workers = state.router.get_worker_urls();
-        if workers.contains(&url) {
-            Json(json!({
-                "url": url,
-                "model_id": "unknown",
-                "is_healthy": true
-            }))
-            .into_response()
-        } else {
-            let error = WorkerErrorResponse {
-                error: format!("Worker {url} not found"),
-                code: "WORKER_NOT_FOUND".to_string(),
-            };
-            (StatusCode::NOT_FOUND, Json(error)).into_response()
-        }
+        let error = WorkerErrorResponse {
+            error: format!("Worker {url} not found"),
+            code: "WORKER_NOT_FOUND".to_string(),
+        };
+        (StatusCode::NOT_FOUND, Json(error)).into_response()
     }
 }
 
@@ -1346,6 +1407,186 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_review_contract_inherits_main_policy() {
+        let config = RouterConfig {
+            epd: Some(
+                serde_json::from_value(
+                    serde_json::json!({"encoder_urls": ["http://encoder:8000"]}),
+                )
+                .unwrap(),
+            ),
+            ..RouterConfig::default()
+        };
+        let context = AppContext::new(config, Client::new(), 64, None, vec![]).unwrap();
+        assert_eq!(
+            context.policy_registry.get_encode_policy().unwrap().name(),
+            "random"
+        );
+    }
+
+    #[test]
+    fn context_falls_back_for_inherited_incompatible_encode_configuration() {
+        use crate::config::{EncodePolicySource, PolicyConfig};
+        for policy in ["cache_aware", "kv_aware"] {
+            let inherited_config = RouterConfig {
+                policy: policy.parse().unwrap(),
+                epd: Some(
+                    serde_json::from_value(
+                        serde_json::json!({"encoder_urls": ["http://encoder:8000"]}),
+                    )
+                    .unwrap(),
+                ),
+                ..RouterConfig::default()
+            };
+            crate::config::ConfigValidator::validate_epd(&inherited_config).unwrap();
+            let context =
+                AppContext::new(inherited_config.clone(), Client::new(), 64, None, vec![]).unwrap();
+            assert_eq!(
+                context.policy_registry.get_encode_policy().unwrap().name(),
+                "round_robin"
+            );
+            assert_eq!(context.policy_registry.get_default_policy().name(), policy);
+
+            let mut explicit_config = inherited_config;
+            explicit_config.epd.as_mut().unwrap().encode_policy = Some(policy.parse().unwrap());
+            let error = crate::config::ConfigValidator::validate_epd(&explicit_config).unwrap_err();
+            match error {
+                crate::config::ConfigError::UnsupportedEncodePolicy {
+                    policy: name,
+                    role,
+                    reason,
+                    origin,
+                    message,
+                } => {
+                    assert_eq!(name, policy);
+                    assert_eq!(role, WorkerType::Encode);
+                    assert!(!reason.is_empty());
+                    assert_eq!(origin, EncodePolicySource::ExplicitJson);
+                    assert!(message.contains("epd.encode_policy"));
+                }
+                other => panic!("{other}"),
+            }
+            assert!(
+                AppContext::new(explicit_config.clone(), Client::new(), 64, None, vec![])
+                    .err()
+                    .unwrap()
+                    .contains("unsupported for Encode")
+            );
+            explicit_config.epd.as_mut().unwrap().encode_policy = Some(PolicyConfig::RoundRobin);
+            assert!(
+                AppContext::new(explicit_config.clone(), Client::new(), 64, None, vec![]).is_ok()
+            );
+            explicit_config.epd = None;
+            let context =
+                AppContext::new(explicit_config, Client::new(), 64, None, vec![]).unwrap();
+            assert!(context.policy_registry.get_encode_policy().is_none());
+        }
+    }
+
+    #[test]
+    fn context_validates_generic_encode_parameters() {
+        for policy in [
+            crate::config::PolicyConfig::ConsistentHash { virtual_nodes: 0 },
+            crate::config::PolicyConfig::PowerOfTwo {
+                load_check_interval_secs: 0,
+            },
+        ] {
+            let mut config = RouterConfig::default();
+            config.epd = Some(crate::config::EpdConfig {
+                encoder_urls: vec!["http://encoder:8000".into()],
+                encode_policy: Some(policy),
+                consumer_zmq_addrs: Default::default(),
+            });
+            assert!(AppContext::new(config, Client::new(), 64, None, vec![]).is_err());
+        }
+    }
+
+    #[test]
+    fn context_initializes_independent_encode_policy_from_rust_and_json_configs() {
+        use crate::config::{EpdConfig, PolicyConfig, RoutingMode};
+        for policy in [
+            None,
+            Some(PolicyConfig::RoundRobin),
+            Some(PolicyConfig::Random),
+        ] {
+            let config = RouterConfig {
+                mode: RoutingMode::Regular {
+                    worker_urls: vec!["http://consumer:8000".into()],
+                },
+                policy: PolicyConfig::RendezvousHash,
+                epd: Some(EpdConfig {
+                    encoder_urls: vec!["http://encoder:8000".into()],
+                    encode_policy: policy.clone(),
+                    consumer_zmq_addrs: Default::default(),
+                }),
+                ..RouterConfig::default()
+            };
+            let restored = serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+            for config in [config, restored] {
+                let context = AppContext::new(config, Client::new(), 64, None, vec![]).unwrap();
+                let registry = &context.policy_registry;
+                let expected = policy
+                    .as_ref()
+                    .map(PolicyConfig::name)
+                    .unwrap_or("rendezvous_hash");
+                assert_eq!(registry.get_encode_policy().unwrap().name(), expected);
+                assert_eq!(registry.get_default_policy().name(), "rendezvous_hash");
+                assert!(!Arc::ptr_eq(
+                    &registry.get_encode_policy().unwrap(),
+                    &registry.get_default_policy()
+                ));
+                assert!(registry.get_worker_counts().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn static_encoders_register_once_and_context_clones_preserve_state() {
+        let config = RouterConfig {
+            mode: crate::config::RoutingMode::Regular {
+                worker_urls: vec!["http://consumer:8000".into()],
+            },
+            epd: Some(crate::config::EpdConfig {
+                encoder_urls: vec![
+                    "http://encoder-a:8000".into(),
+                    "https://encoder-b:8000".into(),
+                ],
+                encode_policy: None,
+                consumer_zmq_addrs: Default::default(),
+            }),
+            ..RouterConfig::default()
+        };
+        let context = AppContext::new(config.clone(), Client::new(), 64, None, vec![]).unwrap();
+        let worker = context
+            .worker_registry
+            .get_by_url("http://encoder-a:8000")
+            .unwrap();
+        worker.increment_load();
+        worker.set_healthy(false);
+        let cloned = context.clone();
+        let reused = cloned.worker_registry.get_by_url(worker.url()).unwrap();
+        assert!(Arc::ptr_eq(&worker, &reused));
+        assert_eq!(context.worker_registry.stats().encode_workers, 2);
+        assert_eq!(
+            context.worker_registry.get_by_model_fast("unknown").len(),
+            2
+        );
+        assert_eq!(reused.load(), 1);
+        assert!(!reused.is_healthy());
+        assert!(context.policy_registry.get_worker_counts().is_empty());
+        for url in ["http://consumer:8000", "http://consumer:8000/"] {
+            let mut conflicting = config.clone();
+            conflicting.epd.as_mut().unwrap().encoder_urls = vec![url.into()];
+            assert!(
+                AppContext::new(conflicting, Client::new(), 64, None, vec![])
+                    .err()
+                    .unwrap()
+                    .contains("Encode and consumer")
+            );
+        }
+    }
 
     #[tokio::test]
     async fn completion_extractor_matches_locked_axum_json() {

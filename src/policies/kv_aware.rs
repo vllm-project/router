@@ -1707,12 +1707,27 @@ impl Default for KvAwarePolicy {
 }
 
 impl LoadBalancingPolicy for KvAwarePolicy {
+    fn validate_role(role: &crate::core::WorkerType) -> Result<(), super::PolicyRoleError> {
+        if *role == crate::core::WorkerType::Encode {
+            return Err(super::PolicyRoleError {
+                policy: "kv_aware",
+                role: role.clone(),
+                reason: "KV placement and token transfer costs do not apply to Encode",
+            });
+        }
+        Ok(())
+    }
+
     fn select_worker_with_headers(
         &self,
         workers: &[Arc<dyn Worker>],
         _request_text: Option<&str>,
         _headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
+        for worker in workers {
+            Self::validate_role(&worker.worker_type()).ok()?;
+        }
+
         self.select_worker_with_token_ids(workers, None)
     }
 

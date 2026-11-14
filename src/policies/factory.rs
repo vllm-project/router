@@ -12,6 +12,22 @@ use std::sync::Arc;
 pub struct PolicyFactory;
 
 impl PolicyFactory {
+    /// Forward to policy-owned declarations without constructing state or threads.
+    pub fn validate_role(
+        config: &PolicyConfig,
+        role: crate::core::WorkerType,
+    ) -> Result<(), super::PolicyRoleError> {
+        match config {
+            PolicyConfig::Random => RandomPolicy::validate_role(&role),
+            PolicyConfig::RoundRobin => RoundRobinPolicy::validate_role(&role),
+            PolicyConfig::PowerOfTwo { .. } => PowerOfTwoPolicy::validate_role(&role),
+            PolicyConfig::CacheAware { .. } => CacheAwarePolicy::validate_role(&role),
+            PolicyConfig::KvAware { .. } => KvAwarePolicy::validate_role(&role),
+            PolicyConfig::ConsistentHash { .. } => ConsistentHashPolicy::validate_role(&role),
+            PolicyConfig::RendezvousHash => RendezvousHashPolicy::validate_role(&role),
+            PolicyConfig::StickyLeastLoaded => StickyLeastLoadedPolicy::validate_role(&role),
+        }
+    }
     /// Create a policy from configuration
     ///
     /// `kv_affinity_table` is the registry-owned table whose idle TTL carries
@@ -96,6 +112,36 @@ impl PolicyFactory {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn role_validation_is_pure_and_keeps_existing_consumer_roles() {
+        use crate::core::WorkerType;
+        for name in [
+            "round_robin",
+            "random",
+            "power_of_two",
+            "consistent_hash",
+            "rendezvous_hash",
+            "sticky_least_loaded",
+            "cache_aware",
+            "kv_aware",
+        ] {
+            let config: PolicyConfig = name.parse().unwrap();
+            for role in [
+                WorkerType::Regular,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                WorkerType::Decode,
+            ] {
+                assert!(PolicyFactory::validate_role(&config, role).is_ok());
+            }
+            assert_eq!(
+                PolicyFactory::validate_role(&config, WorkerType::Encode).is_ok(),
+                !matches!(name, "cache_aware" | "kv_aware")
+            );
+        }
+    }
 
     #[test]
     fn test_create_from_config() {

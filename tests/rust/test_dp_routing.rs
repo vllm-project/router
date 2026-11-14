@@ -439,6 +439,7 @@ mod dp_e2e_tests {
                 };
                 config.port = 8000;
                 config.epd = Some(EpdConfig {
+                    encode_policy: None,
                     encoder_urls: vec![format!("{base}/e")],
                     consumer_zmq_addrs: addresses.clone(),
                 });
@@ -518,13 +519,15 @@ mod dp_e2e_tests {
         let mut config = make_regular_config(vec![consumer.clone()], 2);
         config.port = 8000;
         config.epd = Some(EpdConfig {
+            encode_policy: None,
             encoder_urls: vec![format!("{base}/e")],
             consumer_zmq_addrs: [(consumer, "tcp://127.0.0.1:19001".into())].into(),
         });
         ConfigValidator::validate(&config).unwrap();
         let context = common::create_test_context(config);
         let router = RouterFactory::create_router(&context).await.unwrap();
-        assert_eq!(context.worker_registry.get_all().len(), 1);
+        assert_eq!(context.worker_registry.get_regular_workers(None).len(), 1);
+        assert_eq!(context.worker_registry.stats().encode_workers, 1);
         let response = router.route_transparent(None, "/v1/chat/completions", &Method::POST, json!({
             "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]}]
         })).await;
@@ -549,6 +552,7 @@ mod dp_e2e_tests {
             let mut config = make_regular_config(vec![consumer.clone()], 2);
             config.port = 8000;
             config.epd = Some(EpdConfig {
+                encode_policy: None,
                 encoder_urls: vec![format!("{base}/e")],
                 consumer_zmq_addrs: [(consumer.clone(), "tcp://127.0.0.1:19001".into())].into(),
             });
@@ -583,6 +587,7 @@ mod dp_e2e_tests {
                 let mut config = make_pd_config(vec![(prefill, None)], vec![decode], 4);
                 config.port = 8000;
                 config.epd = Some(EpdConfig {
+                    encode_policy: None,
                     encoder_urls: vec![format!("{base}/e")],
                     consumer_zmq_addrs: Default::default(),
                 });
@@ -607,6 +612,7 @@ mod dp_e2e_tests {
         let mut config = make_pd_config(prefill, vec![format!("{base}/d")], 2);
         config.port = 8000;
         config.epd = Some(EpdConfig {
+            encode_policy: None,
             encoder_urls: vec![format!("{base}/e")],
             consumer_zmq_addrs: [("p0", 2), ("p1", 4)]
                 .into_iter()
@@ -666,6 +672,7 @@ mod dp_e2e_tests {
             };
             config.port = 8000;
             config.epd = Some(EpdConfig {
+                encode_policy: None,
                 encoder_urls: vec![format!("{base}/e")],
                 consumer_zmq_addrs: if push {
                     (0..dp_size)
@@ -1457,5 +1464,31 @@ mod dp_e2e_tests {
 
         prefill_worker.stop().await;
         decode_worker.stop().await;
+    }
+    #[tokio::test]
+    async fn removing_dp_consumer_removes_all_ranks_and_policy_counts() {
+        use vllm_router_rs::core::WorkerFactory;
+        let mut worker = MockWorker::new(MockWorkerConfig::default());
+        let worker_url = worker.start().await.unwrap();
+        let config = make_regular_config(vec![worker_url.clone()], 2);
+        let context = common::create_test_context(config.clone());
+        context
+            .worker_registry
+            .register(Arc::from(WorkerFactory::create_encode(
+                "http://encoder:8000".into(),
+            )));
+        let router = RouterFactory::create_router(&context).await.unwrap();
+        assert_eq!(context.worker_registry.get_regular_workers(None).len(), 2);
+        assert_eq!(context.worker_registry.stats().encode_workers, 1);
+        router.remove_worker(&worker_url);
+
+        assert!(context.worker_registry.get_regular_workers(None).is_empty());
+        assert_eq!(context.worker_registry.stats().encode_workers, 1);
+        assert!(context.policy_registry.get_worker_counts().is_empty());
+        assert!(context
+            .worker_registry
+            .get_by_url("http://encoder:8000")
+            .is_some());
+        worker.stop().await;
     }
 }

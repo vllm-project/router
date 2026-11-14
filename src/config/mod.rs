@@ -7,6 +7,14 @@ pub use validation::*;
 /// Configuration errors
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error("{message}")]
+    UnsupportedEncodePolicy {
+        policy: &'static str,
+        role: crate::core::WorkerType,
+        reason: &'static str,
+        origin: EncodePolicySource,
+        message: String,
+    },
     #[error("Validation failed: {reason}")]
     ValidationFailed { reason: String },
 

@@ -18,6 +18,7 @@ target/release/vllm-router \
   --policy random \
   --epd-config '{
     "encoder_urls": ["http://e0:8000", "http://e1:8000"],
+    "encode_policy": "round_robin",
     "consumer_zmq_addrs": {
       "http://pd0:8000": "tcp://pd0:14579",
       "http://pd1:8000": "tcp://pd1:14579"
@@ -28,9 +29,183 @@ target/release/vllm-router \
 `consumer_zmq_addrs` is for Mooncake PUSH and must map each configured PD HTTP URL
 to that worker's configured EC control address. For NIXL PULL or the shared-file
 example connector, omit this map. The PD worker is selected before encoding so
-the producer and the HTTP request use the same destination. Media items are
-assigned to encoders round-robin; images landing on the same encoder are
-batched into a single request, like the Python EPD proxy.
+the producer and the HTTP request use the same destination. The Encode policy
+assigns each media item to an available encoder; images landing on the same
+encoder are batched into a single request, like the Python EPD proxy.
+
+## Encode policy, health, and load
+
+E, P, and D use the same `LoadBalancingPolicy::select_worker_with_headers`
+interface. Encode constructs its own policy instance through the common factory:
+its counter, hash ring, and load cache are independent of consumer instances.
+All requests, registry/context clones, and EncoderStage instances for the same
+router share the Encode instance and its synchronous selection context.
+
+Configuration priority is native CLI `--encode-policy` > JSON `epd.encode_policy`
+> the complete main `RouterConfig.policy`. Omitted or null Encode configuration
+inherits the main configuration, including its parameters, when compatible with
+Encode, and creates a separate instance. An incompatible inherited policy falls
+back to independent `round_robin` with a startup warning. P/D overrides and
+per-model consumer policies do not change that resolution. `--encode-policy`
+requires `--epd-config` and uses the existing CLI policy parameters. JSON is
+parsed before the override: invalid JSON, unknown
+names, and incorrect types remain errors. A known policy that is incompatible
+with Encode may be replaced by a compatible CLI override.
+
+| Policy | Encode behavior |
+| --- | --- |
+| `round_robin` | One ordinary selection per item, using the configured encoder order. |
+| `random` | One independent uniform choice per item. |
+| `power_of_two` | Compare two candidates using local in-flight HTTP batch load; no new encoder polling or item reservations. |
+| `consistent_hash`, `rendezvous_hash` | Request/session affinity within the independent Encode pool. |
+| `sticky_least_loaded` | Keep each session on one Encode worker and assign new sessions by tracked session count. `/finish_session` also releases the independent Encode session. |
+| `cache_aware` | Unsupported for Encode. An explicit Encode setting fails; an inherited main setting falls back to independent `round_robin`. |
+| `kv_aware` | Unsupported for Encode. An explicit Encode setting fails; an inherited main setting falls back to independent `round_robin`. |
+
+Role compatibility is declared by each policy. Explicit incompatible Encode
+configuration is rejected before constructing any policy, including the main
+policy's cache eviction thread. An inherited incompatible main policy uses
+Encode-only `round_robin` instead. A direct selector call with an unsupported
+role returns `None` before modifying state or metrics; EPD selection failure
+remains `503`.
+
+The CLI still defaults to main `cache_aware`, while Rust
+`RouterConfig::default()` still uses `random`. When EPD is enabled without an
+Encode override, an inherited policy that is incompatible with Encode falls
+back to an independent `round_robin` instance and startup emits a warning. The
+consumer keeps the configured main policy. Explicitly configured incompatible
+Encode policies remain hard errors. Invalid policy parameters also remain
+errors. These commands start with cache-aware or KV-aware consumers and
+round-robin Encode:
+
+```bash
+vllm-router --worker-urls http://pd0:8000 \
+  --epd-config '{"encoder_urls":["http://e0:8000"]}'
+vllm-router --worker-urls http://pd0:8000 --policy kv_aware \
+  --epd-config '{"encoder_urls":["http://e0:8000"]}'
+```
+
+The KV-aware example is Regular E+PD; existing static P/D KV-aware restrictions
+still apply. With no override, `--policy random` uses independent Random
+instances for consumers and Encode. Explicit JSON strings `"round_robin"` and
+`"random"` retain their existing meaning and serialization. All common policy
+names accept shorthand defaults, and parameterized policies also accept tagged
+objects:
+
+```json
+{
+  "encoder_urls": ["http://e0:8000", "http://e1:8000"],
+  "encode_policy": {"type":"consistent_hash", "virtual_nodes":317}
+}
+```
+
+The resolver and factory entry retain the full `PolicyConfig`. The existing
+factories currently ignore `consistent_hash.virtual_nodes` (the ring still uses
+160 virtual nodes per worker) and `power_of_two.load_check_interval_secs`
+(which does not control polling). These fields round-trip in tagged JSON and
+must be positive, but retaining them does not make them operational. Use a
+tagged object for custom parameters; parameterized policies serialize as objects.
+
+Startup errors name an explicit `--encode-policy` or `epd.encode_policy` that
+needs correction. For inherited `cache_aware` or `kv_aware`, the startup warning
+names the inherited policy, the reason it does not support Encode, and the
+`round_robin` fallback. The warning also explains that the consumer policy
+remains unchanged and how to configure Encode explicitly.
+
+A shared synchronous selection context keeps a request's RR choices consecutive
+when the candidate pool and availability are stable. Every item calls the
+ordinary selector, which rechecks health/circuit state; changing availability
+can change the sequence. The lock covers only synchronous selections, and
+policy replacement uses the same lock order. HTTP calls, response processing,
+and batch load guards run after it is released. All item assignments must
+succeed before HTTP dispatch; a failed selection does not rewind the counter.
+Images assigned to one encoder are combined into one HTTP request; audio/video
+items remain singleton calls. Common selection may scan health once per item.
+
+For hashing, provide a stable `X-Session-ID` or another existing session header.
+The existing priority is headers (`x-session-id`, `x-user-id`, `x-tenant-id`,
+`x-correlation-id`, `x-request-id`, `x-trace-id`) before body session/user fields,
+then request-content fallback. Per-request IDs do not provide cross-request
+session affinity. Without a matching header, Encode serializes and extracts or
+hashes the original body once, outside the selection lock. Each item receives
+only the prepared canonical key through internal policy data, with no repeated
+body scan and no changed key prefix. The internal key cannot be imported from
+an HTTP header and is never forwarded to encoders or consumers. The ordinary
+consumer key-extraction path is unchanged.
+
+With a stable pool and availability, all items in one hash request have the
+same key and select the same encoder, producing one image batch. A health or
+registry change may redirect selection. This is request/session affinity;
+media content cache affinity is outside this implementation. Canonical key
+preparation is at most one body scan/hash, while each item's hash policy still
+computes its ring lookup or worker scores. Long session/user keys still cost
+proportionally to their key length; one body serialization can still use a
+large allocation. The consumer's own selection cost is separate.
+
+### Rust API migration
+
+This revision changes public Rust source APIs. Replace
+`Some(EncodePolicy::Random)` with `Some(PolicyConfig::Random)` (likewise for RR);
+`EncodePolicy` is removed and `EpdConfig.encode_policy` is now
+`Option<PolicyConfig>`. Existing JSON string compatibility does not preserve the
+old Rust type. For example:
+
+```rust
+use vllm_router_rs::config::{ConfigValidator, EncodePolicySource, EpdConfig, PolicyConfig};
+let epd = EpdConfig {
+    encoder_urls: vec!["http://encoder:8000".into()],
+    encode_policy: Some(PolicyConfig::Random),
+    consumer_zmq_addrs: Default::default(),
+};
+let main = PolicyConfig::RoundRobin;
+let resolution = ConfigValidator::resolve_encode_policy(
+    &epd,
+    &main,
+    EncodePolicySource::ExplicitJson,
+)?;
+let effective: &PolicyConfig = &resolution.policy;
+```
+
+`effective_encode_policy()` becomes `effective_encode_policy(&main_policy)` and
+returns the configured value or the raw main-policy inheritance reference.
+Runtime startup resolves an inherited `cache_aware` or `kv_aware` policy to an
+independent `round_robin` Encode instance. `PolicyRegistry::set_encode_policy` takes
+`&PolicyConfig` and returns `Result<(), PolicyRoleError>`;
+`get_encode_policy` returns `Option<Arc<dyn LoadBalancingPolicy>>` with no
+consumer fallback. Non-EPD registries leave that slot empty.
+`LoadBalancingPolicy::select_encode_batch` and the RR/random overrides are
+removed; external callers and trait implementations must migrate to repeated
+`select_worker_with_headers` calls. To keep a request's sequence together, use
+the registry's shared `get_encode_selection_context().with_selection(...)`,
+read the current policy inside that closure, and keep HTTP work outside it.
+Do not call `select_and_reserve` inside the closure: it would relock the context
+and create per-item reservations. No version bump is included in this Draft.
+
+Static encoders are registered at startup with the `Encode` role. They use the
+router's health-check endpoint (default `/health`), timeout, interval, and
+success/failure thresholds, together with its circuit-breaker configuration.
+Selection requires a healthy worker whose circuit breaker permits execution.
+If no encoder is available, a raw-media request returns `503` before consumer
+submission. Text-only and existing-embeds requests still bypass Encode.
+Encode workers appear in management listings but stay outside inference
+consumer pools and cannot satisfy consumer readiness on their own.
+
+Encode `load` counts in-flight encoder HTTP batches. A batch of several images
+adds one, and the count stays held until the response body/JSON is consumed or
+the attempt fails. Completion, failure, or dropping the encoder future releases
+that batch's load once; periodic load resets preserve active Encode batches.
+This counter measures router-side HTTP work, not media-item count or the
+engine's GPU queue. RR/random selection does not balance by this load; power-of-two reads it.
+Item selection does not increment Encode processed/load or existing consumer
+processed/policy metrics. HTTP batch execution owns that accounting.
+
+Encode `processed_requests` counts completed HTTP batch attempts, including
+HTTP, transport, and response-JSON failures. Dropping an unfinished future
+releases load without adding a completion or a circuit-breaker outcome.
+Successful JSON responses and HTTP 4xx count as reachable-worker outcomes;
+transport errors, HTTP 5xx, and unreadable JSON count as failed outcomes.
+
+## Request and metadata behavior
 
 Send ordinary OpenAI chat requests to `/v1/chat/completions`. Each raw media item
 is sent to an encoder. Published metadata replaces that item with an embeds
@@ -39,6 +214,16 @@ its content-derived uuid pinned and its transfer is forwarded, so the consumer
 re-preprocesses into the same mm_hash and can still reuse the published
 embedding. Repeated images keep their original positions and independent
 transfer IDs.
+
+Encoder responses use the existing JSON metadata contract. When `item_indices`
+is present it must be a batch-local integer array with in-range, non-repeated
+positions; malformed indices or non-numeric metadata fail the request with
+`502` before the consumer is called. Three missing-data cases remain valid
+fallbacks: no EC report, no entry for an item, or an entry without non-empty
+placeholder metadata. In each case the router keeps the raw media with its
+content-derived UUID and forwards the reported transfer handle when one exists.
+Connector-specific fields under `ec_transfer_params` remain opaque and are
+passed through unchanged.
 Other request fields, including sampling options, pass through unchanged.
 Text-only and existing embeds inputs do not call the encoders. Mooncake consumers
 with rank-qualified URLs reject caller-provided nonempty `ec_transfer_params`
@@ -46,6 +231,11 @@ with HTTP 400: those handles may belong to a different consumer. Send raw media
 through the router instead. Unranked DP=1 and address-map-free NIXL/Example inputs
 retain their existing behavior. PD responses,
 including SSE streams, use the existing transparent forwarding path.
+
+The native Rust configuration supports static HTTP encoders and data-parallel consumers; Python
+launcher, dynamic discovery, IGW, gRPC encoder transport, full
+cancellation, and real GPU performance are separate follow-up work or
+validation environments.
 
 Encoder failures are returned without submitting a partially prepared PD
 request. There is no automatic replay of EPD requests in this prototype.
@@ -60,10 +250,11 @@ owns request completion/abort cleanup.
 - Regular E+PD or static vLLM E/P/D mode, including consumer DP>1, no IGW.
 - HTTP(S) backends only; gRPC encoder and consumer URLs are rejected at startup.
 - Encoder TP/PP constraints remain backend-specific and unchanged.
-- Static E URLs; E health-aware routing and dynamic consumer discovery are not added.
-  The service registry has no encoder role, and vLLM does not publish EC control
-  addresses, so Mooncake PUSH cannot resolve a newly registered consumer. Dynamic
-  discovery for NIXL PULL or the example connector is a smaller follow-up.
+- Static E URLs with health- and circuit-breaker-aware selection. Dynamic
+  Encode/consumer discovery is not supported. The discovery service registry
+  has no encoder role, and vLLM does not publish EC control addresses, so
+  Mooncake PUSH cannot resolve a newly registered consumer. Dynamic discovery
+  for NIXL PULL or the example connector is a smaller follow-up.
 - JSON metadata only, not legacy tensor-base64 metadata from old E servers.
 - No early metadata publication, encoder batching changes, or engine/scheduler changes.
 - Image E2E validation is performed separately; do not infer audio/video coverage

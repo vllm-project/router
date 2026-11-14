@@ -30,7 +30,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::Instant;
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use tracing::{debug, error, info, warn};
@@ -43,6 +43,18 @@ type ProgramPrefillCandidate = (String, Arc<dyn Worker>);
 struct MooncakePrefillInfo {
     bootstrap_addr: String,
     dp_engine_ids: HashMap<usize, String>,
+}
+
+#[derive(Debug)]
+enum NixlIdentityOwner {
+    Worker(Weak<dyn Worker>),
+    Discovery,
+}
+
+#[derive(Debug)]
+struct CachedNixlIdentity {
+    identity: Value,
+    owner: NixlIdentityOwner,
 }
 
 /// Request-scoped facts threaded into decode-response handling: the route,
@@ -104,8 +116,9 @@ pub struct VllmPDRouter {
     kv_connector: KvConnector,
     /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
-    /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
-    nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, Value>>>,
+    /// NIXL push identity and its source per prefill base_url and dp_rank.
+    /// Direct-worker reads must match the selected worker instance. Never held across an await.
+    nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, CachedNixlIdentity>>>,
     /// Tokenizer and tonic clients for `grpc://` prefill and decode pools.
     grpc_frontend: crate::backend::EngineFrontend,
 }
@@ -787,9 +800,47 @@ impl VllmPDRouter {
         })
     }
 
-    fn get_nixl_push_identity(&self, prefill_url: &str, dp_rank: Option<usize>) -> Option<Value> {
-        let identity = self.get_nixl_info(prefill_url, dp_rank)?;
-        Self::is_nixl_push_mode(&identity).then_some(identity)
+    fn get_discovered_nixl_push_identity(
+        &self,
+        prefill_url: &str,
+        dp_rank: Option<usize>,
+    ) -> Option<Value> {
+        let info = self.nixl_prefill_info.read().unwrap();
+        let per_rank = info.get(prefill_url)?;
+        let cached = match dp_rank {
+            Some(rank) => per_rank.get(&rank)?,
+            None => per_rank.values().next()?,
+        };
+        (matches!(cached.owner, NixlIdentityOwner::Discovery)
+            && Self::is_nixl_push_mode(&cached.identity))
+        .then(|| cached.identity.clone())
+    }
+
+    fn get_nixl_push_identity_for_worker(&self, worker: &Arc<dyn Worker>) -> Option<Value> {
+        let info = self.nixl_prefill_info.read().unwrap();
+        let cached = info
+            .get(worker.base_url())?
+            .get(&worker.dp_rank().unwrap_or(0))?;
+        let NixlIdentityOwner::Worker(owner) = &cached.owner else {
+            return None;
+        };
+        if !Arc::ptr_eq(&owner.upgrade()?, worker) {
+            return None;
+        }
+        // Validate the entry's source and registry membership together under
+        // the cache lock. A newly published worker cannot use the retired
+        // instance's identity, even before its invalidation callback runs.
+        let current = self.pd_router.worker_registry.get_by_url(worker.url())?;
+        (Arc::ptr_eq(&current, worker) && Self::is_nixl_push_mode(&cached.identity))
+            .then(|| cached.identity.clone())
+    }
+
+    fn selected_nixl_push_identity(&self, worker: &Arc<dyn Worker>) -> Option<Value> {
+        if self.use_discovery {
+            self.get_discovered_nixl_push_identity(worker.base_url(), worker.dp_rank())
+        } else {
+            self.get_nixl_push_identity_for_worker(worker)
+        }
     }
 
     fn ensure_nixl_push_identity(
@@ -798,14 +849,15 @@ impl VllmPDRouter {
         dp_rank: Option<usize>,
         prefill_response_json: Option<&Value>,
     ) -> Option<Value> {
-        if let Some(identity) = self.get_nixl_push_identity(prefill_url, dp_rank) {
-            return Some(identity);
+        // A response belongs to this request's worker. Prefer it over cached
+        // state and let the caller decide whether that worker is still current
+        // before publishing the identity for subsequent requests.
+        if let Some(json) = prefill_response_json {
+            return json
+                .get("kv_transfer_params")
+                .and_then(Self::nixl_push_identity_from_kvt);
         }
-        let identity = prefill_response_json
-            .and_then(|json| json.get("kv_transfer_params"))
-            .and_then(Self::nixl_push_identity_from_kvt)?;
-        self.store_nixl_info(prefill_url, dp_rank, identity.clone());
-        Some(identity)
+        self.get_discovered_nixl_push_identity(prefill_url, dp_rank)
     }
 
     fn maybe_cache_nixl_push_identity(
@@ -813,29 +865,54 @@ impl VllmPDRouter {
         prefill_url: &str,
         dp_rank: Option<usize>,
         prefill_response_json: &Value,
+        worker: Option<&Arc<dyn Worker>>,
     ) {
         if let Some(identity) = prefill_response_json
             .get("kv_transfer_params")
             .and_then(Self::nixl_push_identity_from_kvt)
         {
-            self.store_nixl_info(prefill_url, dp_rank, identity);
+            self.store_nixl_info(prefill_url, dp_rank, identity, worker);
         }
     }
 
+    /// Inspect physical entries in lifecycle tests, including retired entries.
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     fn get_nixl_info(&self, prefill_url: &str, dp_rank: Option<usize>) -> Option<Value> {
         let info = self.nixl_prefill_info.read().unwrap();
         let per_rank = info.get(prefill_url)?;
         match dp_rank {
-            Some(rank) => per_rank.get(&rank).cloned(),
-            None => per_rank.values().next().cloned(),
+            Some(rank) => per_rank.get(&rank),
+            None => per_rank.values().next(),
         }
+        .map(|cached| cached.identity.clone())
     }
 
-    fn store_nixl_info(&self, prefill_url: &str, dp_rank: Option<usize>, identity: Value) {
+    fn store_nixl_info(
+        &self,
+        prefill_url: &str,
+        dp_rank: Option<usize>,
+        identity: Value,
+        worker: Option<&Arc<dyn Worker>>,
+    ) {
         let mut info = self.nixl_prefill_info.write().unwrap();
-        info.entry(prefill_url.to_string())
-            .or_default()
-            .insert(dp_rank.unwrap_or(0), identity);
+        if let Some(worker) = worker {
+            // Hold the cache lock across the registration check and insertion:
+            // replacement either rejects this old response here or evicts it
+            // afterward. A late response cannot undo completed invalidation.
+            let current = self.pd_router.worker_registry.get_by_url(worker.url());
+            if !current.is_some_and(|current| Arc::ptr_eq(&current, worker)) {
+                return;
+            }
+        }
+        info.entry(prefill_url.to_string()).or_default().insert(
+            dp_rank.unwrap_or(0),
+            CachedNixlIdentity {
+                identity,
+                owner: worker.map_or(NixlIdentityOwner::Discovery, |worker| {
+                    NixlIdentityOwner::Worker(Arc::downgrade(worker))
+                }),
+            },
+        );
     }
 
     /// A bare URL evicts every rank; a `@rank` URL evicts only that rank.
@@ -855,6 +932,14 @@ impl VllmPDRouter {
                 info.remove(&base_url);
             }
         }
+        drop(info);
+        #[cfg(all(test, feature = "cpu", feature = "ready"))]
+        tests::AFTER_NIXL_EVICTION.with(|slot| {
+            let callback = slot.borrow_mut().take();
+            if let Some(callback) = callback {
+                callback();
+            }
+        });
     }
 
     /// Generate vLLM-specific request ID with prefill/decode addressing
@@ -1231,10 +1316,9 @@ impl VllmPDRouter {
             // discovery-backed Nixl pool keeps its admission pick.
             KvConnector::Nixl => {
                 !self.use_discovery
-                    && prefill_workers.iter().all(|worker| {
-                        self.get_nixl_push_identity(worker.base_url(), worker.dp_rank())
-                            .is_none()
-                    })
+                    && prefill_workers
+                        .iter()
+                        .all(|worker| self.get_nixl_push_identity_for_worker(worker).is_none())
             }
             KvConnector::Mooncake => true,
             KvConnector::MoriIO => false,
@@ -1251,14 +1335,13 @@ impl VllmPDRouter {
     /// commitment is free to move.
     fn prefill_pinned_to_provisional(
         &self,
-        prefill_worker: &dyn Worker,
+        prefill_worker: &Arc<dyn Worker>,
         prefill_response: Option<&Value>,
     ) -> bool {
         prefill_pins_commitment(
             self.kv_connector,
             prefill_response,
-            self.get_nixl_push_identity(prefill_worker.base_url(), prefill_worker.dp_rank())
-                .is_some(),
+            self.selected_nixl_push_identity(prefill_worker).is_some(),
         )
     }
 
@@ -2306,14 +2389,18 @@ impl VllmPDRouter {
             });
         }
 
+        self.maybe_cache_nixl_push_identity(
+            &prefill_base_url,
+            prefill_dp_rank,
+            &prefill_response_json,
+            (!self.use_discovery).then_some(&prefill_worker),
+        );
         // The Prefill response is the first point where a deferred decode
         // target can be chosen against live state without delaying dispatch:
         // the decode request body is built from this same response.
         if let Some(commit) = commit {
-            let pinned = self.prefill_pinned_to_provisional(
-                prefill_worker.as_ref(),
-                Some(&prefill_response_json),
-            );
+            let pinned =
+                self.prefill_pinned_to_provisional(&prefill_worker, Some(&prefill_response_json));
             // Score the refresh against the client body, not the encoder
             // output; without EPD the two are the same value.
             let request = commit_scoring_body(client_request.as_ref(), &original_request);
@@ -2501,8 +2588,7 @@ impl VllmPDRouter {
         };
 
         if commit.is_none() && matches!(self.kv_connector, KvConnector::Nixl) {
-            if let Some(identity) = self.get_nixl_push_identity(&prefill_base_url, prefill_dp_rank)
-            {
+            if let Some(identity) = self.get_nixl_push_identity_for_worker(&prefill_worker) {
                 let decode_params = Self::build_nixl_push_decode_params(&identity, &request_id);
                 return self
                     .process_grpc_concurrent_chat(
@@ -2544,6 +2630,12 @@ impl VllmPDRouter {
             Some(kv) => json!({ "kv_transfer_params": kv }),
             None => json!({}),
         };
+        self.maybe_cache_nixl_push_identity(
+            &prefill_base_url,
+            prefill_dp_rank,
+            &prefill_response_json,
+            Some(&prefill_worker),
+        );
 
         // Prefill is done, so the decode pool can be read live. The committed
         // worker replaces the admission-time pick for dispatch and metrics;
@@ -2551,10 +2643,8 @@ impl VllmPDRouter {
         // with, exactly as on the HTTP path.
         let decode_worker = match commit {
             Some(input) => {
-                let pinned = self.prefill_pinned_to_provisional(
-                    prefill_worker.as_ref(),
-                    Some(&prefill_response_json),
-                );
+                let pinned = self
+                    .prefill_pinned_to_provisional(&prefill_worker, Some(&prefill_response_json));
                 match self
                     .select_and_commit_decode(attempt, input, request, headers, pinned)
                     .await
@@ -2711,6 +2801,7 @@ impl VllmPDRouter {
                 &prefill_base_url,
                 prefill_worker.dp_rank(),
                 &json!({ "kv_transfer_params": kv }),
+                Some(&prefill_worker),
             );
         }
         RouterMetrics::record_pd_request(path);
@@ -2732,12 +2823,25 @@ impl VllmPDRouter {
         decode_worker: &Arc<dyn Worker>,
         path: &str,
     ) -> Option<(Value, Value, String)> {
+        if !self.use_discovery
+            && !self
+                .pd_router
+                .worker_registry
+                .get_by_url(prefill_worker.url())
+                .is_some_and(|current| Arc::ptr_eq(&current, prefill_worker))
+        {
+            return None;
+        }
+
         let prefill_base_url = prefill_worker.base_url().to_string();
         let prefill_dp_rank = prefill_worker.dp_rank();
+        let identity = if matches!(self.kv_connector, KvConnector::Nixl) {
+            Some(self.selected_nixl_push_identity(prefill_worker)?)
+        } else {
+            None
+        };
         let concurrent = match self.kv_connector {
-            KvConnector::Nixl => self
-                .get_nixl_push_identity(&prefill_base_url, prefill_dp_rank)
-                .is_some(),
+            KvConnector::Nixl => identity.is_some(),
             KvConnector::MoriIO => self.moriio_transfer_mode() == Some(MoriIOTransferMode::Write),
             KvConnector::Mooncake => false,
         };
@@ -2767,8 +2871,10 @@ impl VllmPDRouter {
                 obj.remove("ec_transfer_params");
             }
         }
-        decode_request["kv_transfer_params"] = self
-            .build_decode_kv_transfer_params(
+        decode_request["kv_transfer_params"] = if let Some(identity) = identity {
+            Self::build_nixl_push_decode_params(&identity, &request_id)
+        } else {
+            self.build_decode_kv_transfer_params(
                 &prefill_base_url,
                 None,
                 transfer_id.as_deref(),
@@ -2776,7 +2882,8 @@ impl VllmPDRouter {
                 prefill_dp_rank.map(|rank| rank as u32),
                 Some(&request_id),
             )
-            .await?;
+            .await?
+        };
 
         Some((prefill_request, decode_request, request_id))
     }
@@ -2903,7 +3010,12 @@ impl VllmPDRouter {
             }
         };
         if let Some(prefill_json) = prefill_response_json.as_ref() {
-            self.maybe_cache_nixl_push_identity(&prefill_base_url, prefill_dp_rank, prefill_json);
+            self.maybe_cache_nixl_push_identity(
+                &prefill_base_url,
+                prefill_dp_rank,
+                prefill_json,
+                (!self.use_discovery).then_some(&prefill_worker),
+            );
         }
         // Prefill succeeded and consumed the embeddings; the pending EC
         // transfers are now owned by the decode phase, so disarm the
@@ -3000,11 +3112,13 @@ impl VllmPDRouter {
             let program_runtime = PdProgramRuntime::new(ctx, service_registry.clone(), true)?;
 
             Ok(Self {
-                epd: ctx
-                    .router_config
-                    .epd
-                    .clone()
-                    .map(super::epd::EncoderStage::new),
+                epd: ctx.router_config.epd.clone().map(|config| {
+                    super::epd::EncoderStage::new(
+                        config,
+                        ctx.worker_registry.clone(),
+                        ctx.policy_registry.clone(),
+                    )
+                }),
                 pd_router,
                 program_runtime,
                 service_registry,
@@ -3120,11 +3234,13 @@ impl VllmPDRouter {
             }
 
             Ok(Self {
-                epd: ctx
-                    .router_config
-                    .epd
-                    .clone()
-                    .map(super::epd::EncoderStage::new),
+                epd: ctx.router_config.epd.clone().map(|config| {
+                    super::epd::EncoderStage::new(
+                        config,
+                        ctx.worker_registry.clone(),
+                        ctx.policy_registry.clone(),
+                    )
+                }),
                 pd_router,
                 program_runtime,
                 service_registry,
@@ -3163,9 +3279,12 @@ impl VllmPDRouter {
     /// Remove a prefill server from the router
     /// Delegates to the underlying PdRouterBase
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
+        let result = self.pd_router.remove_prefill_server(url).await;
+        // Evict after registry removal so a late response cannot republish
+        // the old identity between eviction and removal. Clear on errors too.
         self.evict_nixl_info(url);
         self.grpc_frontend.remove_worker(url);
-        self.pd_router.remove_prefill_server(url).await
+        result
     }
 
     /// Remove a decode server from the router
@@ -3641,8 +3760,14 @@ impl WorkerManagement for VllmPDRouter {
     }
 
     fn remove_worker(&self, worker_url: &str) {
-        self.evict_nixl_info(worker_url);
         self.pd_router.remove_worker(worker_url);
+        self.evict_nixl_info(worker_url);
+    }
+
+    fn invalidate_worker_state(&self, worker: &dyn Worker) {
+        if matches!(worker.worker_type(), WorkerType::Prefill { .. }) {
+            self.evict_nixl_info(worker.url());
+        }
     }
 
     fn get_worker_urls(&self) -> Vec<String> {
@@ -3652,6 +3777,842 @@ impl WorkerManagement for VllmPDRouter {
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
+
+    // One-shot, thread-local scheduling point: a deferred response can write
+    // after eviction releases its lock, while the public removal is running.
+    thread_local! {
+        pub(super) static AFTER_NIXL_EVICTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[tokio::test]
+    async fn nixl_identity_generation_rejects_both_directions_of_cross_instance_reuse() {
+        let router = test_vllm_pd_router().await;
+        let url = "http://prefill:8000";
+        let prefill = || -> Arc<dyn Worker> {
+            Arc::new(BasicWorker::new(
+                url.into(),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ))
+        };
+        let previous = prefill();
+        let previous_id = router.worker_registry().register(previous.clone());
+        router.store_nixl_info(url, None, IgwNixlFixture::identity(0), Some(&previous));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://decode:8000".into(),
+            WorkerType::Decode,
+        ));
+        let request = json!({"messages": []});
+        assert!(router
+            .try_build_concurrent_requests(&request, &previous, &decode, "/v1/chat/completions")
+            .await
+            .is_some());
+
+        let current = prefill();
+        let current_id = router.worker_registry().register(current.clone());
+        assert_eq!(
+            previous_id, current_id,
+            "a stable worker ID is not a generation"
+        );
+        assert!(
+            router
+                .try_build_concurrent_requests(&request, &current, &decode, "/v1/chat/completions")
+                .await
+                .is_none(),
+            "new Arc reused the previous Arc's identity"
+        );
+        assert!(
+            router
+                .get_nixl_push_identity_for_worker(&previous)
+                .is_none(),
+            "a retired Arc must miss even while its identity remains cached"
+        );
+
+        router.store_nixl_info(url, None, IgwNixlFixture::identity(1), Some(&current));
+        let retired_fast_path = router
+            .try_build_concurrent_requests(&request, &previous, &decode, "/v1/chat/completions")
+            .await;
+        assert!(
+            retired_fast_path.is_none(),
+            "old Arc reused the new Arc's identity"
+        );
+        let (_, decode_request, _) = router
+            .try_build_concurrent_requests(&request, &current, &decode, "/v1/chat/completions")
+            .await
+            .expect("current instance must retain the concurrent fast path");
+        for field in ["remote_engine_id", "remote_host", "remote_port", "tp_size"] {
+            assert_eq!(
+                decode_request["kv_transfer_params"][field],
+                IgwNixlFixture::identity(1)[field]
+            );
+        }
+        router.store_nixl_info(url, None, IgwNixlFixture::identity(0), Some(&previous));
+        assert_eq!(
+            router.get_nixl_push_identity_for_worker(&current),
+            Some(IgwNixlFixture::identity(1))
+        );
+        router.worker_registry().remove_by_url(url).unwrap();
+        assert!(
+            router.get_nixl_push_identity_for_worker(&current).is_none(),
+            "matching owner alone must not allow reads after registry removal"
+        );
+    }
+
+    #[tokio::test]
+    async fn nixl_identity_generation_preserves_other_dp_ranks() {
+        let router = test_vllm_pd_router().await;
+        let base = "http://prefill:8000";
+        let rank_worker = |rank| -> Arc<dyn Worker> {
+            Arc::new(crate::core::DPAwareWorker::new(
+                base.into(),
+                rank,
+                2,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ))
+        };
+        let previous = rank_worker(0);
+        let survivor = rank_worker(1);
+        for (worker, generation) in [(&previous, 0), (&survivor, 1)] {
+            router.worker_registry().register(worker.clone());
+            router.store_nixl_info(
+                base,
+                worker.dp_rank(),
+                IgwNixlFixture::identity(generation),
+                Some(worker),
+            );
+        }
+        let current = rank_worker(0);
+        router.worker_registry().register(current.clone());
+        assert!(router.get_nixl_push_identity_for_worker(&current).is_none());
+        assert!(router
+            .get_nixl_push_identity_for_worker(&previous)
+            .is_none());
+        assert_eq!(
+            router.get_nixl_push_identity_for_worker(&survivor),
+            Some(IgwNixlFixture::identity(1))
+        );
+        router.store_nixl_info(base, Some(0), IgwNixlFixture::identity(2), Some(&current));
+        assert_eq!(
+            router.get_nixl_push_identity_for_worker(&current),
+            Some(IgwNixlFixture::identity(2))
+        );
+        router.evict_nixl_info(current.url());
+        assert_eq!(
+            router.get_nixl_push_identity_for_worker(&survivor),
+            Some(IgwNixlFixture::identity(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn nixl_identity_sources_are_isolated_between_discovery_and_direct_workers() {
+        let router = test_vllm_pd_router().await;
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://prefill:8000".into(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://decode:8000".into(),
+            WorkerType::Decode,
+        ));
+        router.worker_registry().register(prefill.clone());
+        router.store_nixl_info(prefill.url(), None, IgwNixlFixture::identity(0), None);
+        assert_eq!(
+            router.get_discovered_nixl_push_identity(prefill.url(), None),
+            Some(IgwNixlFixture::identity(0))
+        );
+        assert!(
+            router
+                .try_build_concurrent_requests(
+                    &json!({"messages": []}),
+                    &prefill,
+                    &decode,
+                    "/v1/chat/completions",
+                )
+                .await
+                .is_none(),
+            "unowned discovery state must not enable direct dispatch"
+        );
+        router.store_nixl_info(
+            prefill.url(),
+            None,
+            IgwNixlFixture::identity(1),
+            Some(&prefill),
+        );
+        assert_eq!(
+            router.get_nixl_push_identity_for_worker(&prefill),
+            Some(IgwNixlFixture::identity(1))
+        );
+        assert!(router
+            .get_discovered_nixl_push_identity(prefill.url(), None)
+            .is_none());
+        assert!(router
+            .ensure_nixl_push_identity(prefill.url(), None, None)
+            .is_none());
+        assert_eq!(
+            router.ensure_nixl_push_identity(
+                prefill.url(),
+                None,
+                Some(&json!({"kv_transfer_params": IgwNixlFixture::identity(2)}))
+            ),
+            Some(IgwNixlFixture::identity(2)),
+            "sequential decode must prefer this response over cached state"
+        );
+    }
+
+    #[tokio::test]
+    async fn nixl_identity_cache_does_not_retain_retired_worker() {
+        let router = test_vllm_pd_router().await;
+        let url = "http://prefill:8000";
+        let previous: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            url.into(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        router.worker_registry().register(previous.clone());
+        router.store_nixl_info(url, None, IgwNixlFixture::identity(0), Some(&previous));
+        let retired = Arc::downgrade(&previous);
+        let current: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            url.into(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        router.worker_registry().register(current.clone());
+        drop(previous);
+        assert!(retired.upgrade().is_none());
+        assert!(router.get_nixl_push_identity_for_worker(&current).is_none());
+        assert!(
+            router.get_nixl_info(url, None).is_some(),
+            "exercise an expired owner still in the cache"
+        );
+    }
+
+    async fn check_single_router_nixl_removal(entrypoint: &str) {
+        use crate::config::{RouterConfig, RoutingMode};
+        use crate::server::{build_app_with_request_tracing, AppContext, AppState};
+
+        let prefill_url = "http://prefill:8000";
+        let survivor_url = "http://survivor:8000";
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(prefill_url.into(), None), (survivor_url.into(), None)],
+                decode_urls: vec!["http://decode:8000".into()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            kv_connector: KvConnector::Nixl,
+            ..Default::default()
+        };
+        crate::config::ConfigValidator::validate(&config).unwrap();
+        let context =
+            Arc::new(AppContext::new(config, reqwest::Client::new(), 64, None, vec![]).unwrap());
+        let mut router = test_vllm_pd_router().await;
+        router.pd_router.worker_registry = context.worker_registry.clone();
+        router.pd_router.policy_registry = context.policy_registry.clone();
+        router.policy_registry = context.policy_registry.clone();
+        let router = Arc::new(router);
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url.into(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        for current in [
+            worker.clone(),
+            Arc::new(BasicWorker::new(
+                survivor_url.into(),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            )) as Arc<dyn Worker>,
+        ] {
+            context.worker_registry.register(current.clone());
+            context
+                .policy_registry
+                .on_worker_added(current.model_id(), None);
+            router.store_nixl_info(
+                current.url(),
+                None,
+                IgwNixlFixture::identity(0),
+                Some(&current),
+            );
+        }
+        let app = build_app_with_request_tracing(
+            Arc::new(AppState {
+                router: router.clone(),
+                context: context.clone(),
+                concurrency_queue_tx: None,
+                router_manager: None,
+            }),
+            1024 * 1024,
+            vec![],
+            vec![],
+            false,
+            false,
+        );
+
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registered_at_write = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        AFTER_NIXL_EVICTION.with(|slot| {
+            let router = router.clone();
+            let worker = worker.clone();
+            let attempted = attempted.clone();
+            let registered_at_write = registered_at_write.clone();
+            *slot.borrow_mut() = Some(Box::new(move || {
+                registered_at_write.store(
+                    router.worker_registry().get_by_url(worker.url()).is_some(),
+                    Ordering::SeqCst,
+                );
+                // This is the same guarded publication used by a late direct
+                // Prefill response, scheduled immediately after eviction.
+                router.store_nixl_info(
+                    prefill_url,
+                    None,
+                    IgwNixlFixture::identity(0),
+                    Some(&worker),
+                );
+                attempted.store(true, Ordering::SeqCst);
+            }));
+        });
+        if entrypoint == "prefill" {
+            router.remove_prefill_server(prefill_url).await.unwrap();
+        } else {
+            let encoded: String =
+                url::form_urlencoded::byte_serialize(prefill_url.as_bytes()).collect();
+            let request = match entrypoint {
+                "rest" => Request::delete(format!("/workers/{encoded}")),
+                "legacy" => Request::post(format!("/remove_worker?url={encoded}")),
+                _ => unreachable!(),
+            };
+            let response = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert!(attempted.load(Ordering::SeqCst));
+        assert!(context.worker_registry.get_by_url(prefill_url).is_none());
+        assert_eq!(
+            context.policy_registry.get_worker_counts().get("unknown"),
+            Some(&1)
+        );
+        assert!(
+            router.get_nixl_info(prefill_url, None).is_none(),
+            "late identity survived {entrypoint} removal; worker registered at publication: {}",
+            registered_at_write.load(Ordering::SeqCst)
+        );
+        // A response arriving after the entire removal also remains rejected.
+        router.store_nixl_info(
+            prefill_url,
+            None,
+            IgwNixlFixture::identity(0),
+            Some(&worker),
+        );
+        assert!(router.get_nixl_info(prefill_url, None).is_none());
+        assert_eq!(
+            router.get_nixl_info(survivor_url, None),
+            Some(IgwNixlFixture::identity(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn single_router_nixl_rest_delete_rejects_late_identity() {
+        check_single_router_nixl_removal("rest").await;
+    }
+
+    #[tokio::test]
+    async fn single_router_nixl_legacy_remove_rejects_late_identity() {
+        check_single_router_nixl_removal("legacy").await;
+    }
+
+    #[tokio::test]
+    async fn single_router_nixl_prefill_remove_rejects_late_identity() {
+        check_single_router_nixl_removal("prefill").await;
+    }
+
+    #[tokio::test]
+    async fn single_router_nixl_prefill_removal_scopes_ranks_and_evicts_on_error() {
+        let router = test_vllm_pd_router().await;
+        let base = "http://prefill:8000";
+        for rank in 0..2 {
+            let worker: Arc<dyn Worker> = Arc::new(crate::core::DPAwareWorker::new(
+                base.into(),
+                rank,
+                2,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ));
+            router.worker_registry().register(worker.clone());
+            router
+                .policy_registry
+                .on_worker_added(worker.model_id(), None);
+            router.store_nixl_info(
+                base,
+                Some(rank),
+                IgwNixlFixture::identity(rank),
+                Some(&worker),
+            );
+        }
+        router
+            .remove_prefill_server(&format!("{base}@0"))
+            .await
+            .unwrap();
+        assert!(router.get_nixl_info(base, Some(0)).is_none());
+        assert_eq!(
+            router.get_nixl_info(base, Some(1)),
+            Some(IgwNixlFixture::identity(1))
+        );
+        router.remove_prefill_server(base).await.unwrap();
+        assert!(router.get_nixl_info(base, None).is_none());
+        assert!(router.worker_registry().get_prefill_workers().is_empty());
+        // Error paths must still clear orphaned identities for the target rank.
+        router.store_nixl_info(base, Some(0), IgwNixlFixture::identity(0), None);
+        assert!(router
+            .remove_prefill_server(&format!("{base}@0"))
+            .await
+            .is_err());
+        assert!(router.get_nixl_info(base, Some(0)).is_none());
+        assert!(router.policy_registry.get_worker_counts().is_empty());
+    }
+
+    struct IgwNixlFixture {
+        app: axum::Router,
+        manager: Arc<crate::routers::router_manager::RouterManager>,
+        pd: Arc<dyn RouterTrait>,
+        prefill_url: String,
+        generation: Arc<AtomicUsize>,
+        decode_params: Arc<std::sync::Mutex<Vec<Value>>>,
+        pause_prefill: Arc<std::sync::atomic::AtomicBool>,
+        prefill_entered: Arc<tokio::sync::Notify>,
+        prefill_release: Arc<tokio::sync::Notify>,
+        backend: tokio::task::JoinHandle<()>,
+    }
+
+    impl IgwNixlFixture {
+        fn identity(generation: usize) -> Value {
+            json!({
+                "transfer_mode": "push",
+                "remote_engine_id": format!("engine-{generation}"),
+                "remote_host": format!("host-{generation}"),
+                "remote_port": 10000 + generation,
+                "tp_size": 1 + generation,
+            })
+        }
+
+        async fn new() -> Self {
+            Self::new_with_push(true).await
+        }
+
+        async fn new_with_push(push: bool) -> Self {
+            use crate::routers::router_manager::{RouterId, RouterManager};
+            use crate::server::{build_app_with_request_tracing, AppContext, AppState};
+            use axum::routing::post;
+
+            let generation = Arc::new(AtomicUsize::new(0));
+            let decode_params = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pause_prefill = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let prefill_entered = Arc::new(tokio::sync::Notify::new());
+            let prefill_release = Arc::new(tokio::sync::Notify::new());
+            let backend = axum::Router::new()
+                .route(
+                    "/p/v1/chat/completions",
+                    post({
+                        let generation = generation.clone();
+                        let pause = pause_prefill.clone();
+                        let entered = prefill_entered.clone();
+                        let release = prefill_release.clone();
+                        move || {
+                            let mut identity = Self::identity(generation.load(Ordering::SeqCst));
+                            if !push {
+                                identity["transfer_mode"] = json!("pull");
+                                identity["remote_block_ids"] = json!([1, 2]);
+                            }
+                            let paused = pause.swap(false, Ordering::SeqCst);
+                            let entered = entered.clone();
+                            let release = release.clone();
+                            async move {
+                                if paused {
+                                    entered.notify_one();
+                                    release.notified().await;
+                                }
+                                axum::Json(json!({"choices": [], "kv_transfer_params": identity}))
+                            }
+                        }
+                    }),
+                )
+                .route(
+                    "/d/v1/chat/completions",
+                    post({
+                        let generation = generation.clone();
+                        let received = decode_params.clone();
+                        move |axum::Json(body): axum::Json<Value>| {
+                            let expected = Self::identity(generation.load(Ordering::SeqCst));
+                            let params = body["kv_transfer_params"].clone();
+                            received.lock().unwrap().push(params.clone());
+                            async move {
+                                for field in
+                                    ["remote_engine_id", "remote_host", "remote_port", "tp_size"]
+                                {
+                                    if params[field] != expected[field] {
+                                        return (StatusCode::CONFLICT, axum::Json(json!({
+                                        "error": "stale NIXL push identity", "received": params,
+                                    }))).into_response();
+                                    }
+                                }
+                                axum::Json(json!({"choices": [{"index": 0, "message": {
+                                "role": "assistant", "content": "ok",
+                            }, "finish_reason": "stop"}]}))
+                                .into_response()
+                            }
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let backend =
+                tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+            let config = crate::config::RouterConfig {
+                enable_igw: true,
+                kv_connector: KvConnector::Nixl,
+                ..Default::default()
+            };
+            crate::config::ConfigValidator::validate(&config).unwrap();
+            let context = Arc::new(
+                AppContext::new(config.clone(), reqwest::Client::new(), 64, None, vec![]).unwrap(),
+            );
+            let manager = Arc::new(RouterManager::new(
+                config.clone(),
+                context.client.clone(),
+                context.worker_registry.clone(),
+                context.policy_registry.clone(),
+            ));
+            let regular = crate::routers::RouterFactory::create_regular_router(&[], &context)
+                .await
+                .unwrap();
+            manager.register_router(RouterId::new("http-regular".into()), Arc::from(regular));
+            let pd: Arc<dyn RouterTrait> = Arc::from(
+                crate::routers::RouterFactory::create_vllm_pd_router(
+                    &[],
+                    &[],
+                    None,
+                    None,
+                    None,
+                    &config.policy,
+                    &context,
+                )
+                .await
+                .unwrap(),
+            );
+            manager.register_router(RouterId::new("http-pd".into()), pd.clone());
+            let app = build_app_with_request_tracing(
+                Arc::new(AppState {
+                    router: manager.clone(),
+                    context,
+                    concurrency_queue_tx: None,
+                    router_manager: Some(manager.clone()),
+                }),
+                1024 * 1024,
+                vec![],
+                vec![],
+                false,
+                false,
+            );
+            let fixture = Self {
+                app,
+                manager,
+                pd,
+                prefill_url: format!("{base}/p"),
+                generation,
+                decode_params,
+                pause_prefill,
+                prefill_entered,
+                prefill_release,
+                backend,
+            };
+            fixture.post_worker(&fixture.prefill_url, "prefill").await;
+            fixture.post_worker(&format!("{base}/d"), "decode").await;
+            fixture
+        }
+
+        fn router(&self) -> &VllmPDRouter {
+            self.pd.as_any().downcast_ref().unwrap()
+        }
+
+        async fn post_worker(&self, url: &str, role: &str) {
+            Self::post_worker_request(self.app.clone(), url, role).await;
+        }
+
+        async fn post_worker_request(app: axum::Router, url: &str, role: &str) {
+            let response = app
+                .oneshot(
+                    Request::post("/workers")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"url": url, "worker_type": role, "model_id": "model"})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        async fn request(app: axum::Router) -> Response {
+            app.oneshot(Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"model": "model", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 4}).to_string())).unwrap()).await.unwrap()
+        }
+
+        async fn assert_current_identity(&self) {
+            let response = Self::request(self.app.clone()).await;
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 16384)
+                .await
+                .unwrap();
+            let expected = Self::identity(self.generation.load(Ordering::SeqCst));
+            let received = self.decode_params.lock().unwrap().last().unwrap().clone();
+            for field in ["remote_engine_id", "remote_host", "remote_port", "tp_size"] {
+                assert_eq!(
+                    received[field],
+                    expected[field],
+                    "decode received stale {field}; body={}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                self.router().get_nixl_push_identity_for_worker(
+                    &self
+                        .router()
+                        .worker_registry()
+                        .get_by_url(&self.prefill_url)
+                        .unwrap(),
+                ),
+                Some(expected)
+            );
+        }
+    }
+
+    impl Drop for IgwNixlFixture {
+        fn drop(&mut self) {
+            self.backend.abort();
+        }
+    }
+
+    async fn check_igw_nixl_replacement(delete_first: bool) {
+        let fixture = IgwNixlFixture::new().await;
+        // Learn identity from an actual prefill response, then exercise the warm fast path.
+        fixture.assert_current_identity().await;
+        fixture.assert_current_identity().await;
+        fixture.generation.store(1, Ordering::SeqCst);
+        if delete_first {
+            let encoded: String =
+                url::form_urlencoded::byte_serialize(fixture.prefill_url.as_bytes()).collect();
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(
+                    Request::delete(format!("/workers/{encoded}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                fixture
+                    .router()
+                    .get_nixl_info(&fixture.prefill_url, None)
+                    .is_none(),
+                "DELETE must evict the removed prefill identity"
+            );
+        }
+        fixture.post_worker(&fixture.prefill_url, "prefill").await;
+        let cached_after_post = fixture.router().get_nixl_info(&fixture.prefill_url, None);
+        fixture.assert_current_identity().await;
+        assert!(
+            cached_after_post.is_none(),
+            "POST must invalidate the previous identity"
+        );
+        fixture.assert_current_identity().await;
+    }
+
+    #[tokio::test]
+    async fn igw_nixl_post_replacement_uses_new_push_identity() {
+        check_igw_nixl_replacement(false).await;
+    }
+
+    #[tokio::test]
+    async fn igw_nixl_dispatch_between_registration_and_invalidation_uses_new_identity() {
+        let fixture = IgwNixlFixture::new().await;
+        fixture.assert_current_identity().await;
+        fixture.assert_current_identity().await;
+        let previous = fixture
+            .router()
+            .worker_registry()
+            .get_by_url(&fixture.prefill_url)
+            .unwrap();
+        fixture.generation.store(1, Ordering::SeqCst);
+
+        let registered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *fixture.manager.after_worker_registration.lock() = Some(Box::new({
+            let registered = registered.clone();
+            move || {
+                registered.notify_one();
+                // The sender is dropped on test failure too, so this never
+                // leaves a management thread blocked after an assertion.
+                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(15));
+            }
+        }));
+        let runtime = tokio::runtime::Handle::current();
+        let app = fixture.app.clone();
+        let url = fixture.prefill_url.clone();
+        // The hook blocks synchronously: keep it off the current-thread runtime
+        // while the test's main thread continues driving I/O and timers.
+        let replacement = tokio::task::spawn_blocking(move || {
+            runtime.block_on(IgwNixlFixture::post_worker_request(app, &url, "prefill"));
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), registered.notified())
+            .await
+            .expect("replacement did not publish the new worker");
+        let current = fixture
+            .router()
+            .worker_registry()
+            .get_by_url(&fixture.prefill_url)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&previous, &current));
+        assert_eq!(
+            fixture.router().get_nixl_info(&fixture.prefill_url, None),
+            Some(IgwNixlFixture::identity(0)),
+            "old identity must still be present at the scheduling point"
+        );
+
+        fixture.pause_prefill.store(true, Ordering::SeqCst);
+        let decode_count = fixture.decode_params.lock().unwrap().len();
+        let request = tokio::spawn(IgwNixlFixture::request(fixture.app.clone()));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fixture.prefill_entered.notified(),
+        )
+        .await
+        .expect("new worker did not receive the prefill request");
+        let decode_count_while_prefill_paused = fixture.decode_params.lock().unwrap().len();
+        fixture.prefill_release.notify_one();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 16384)
+            .await
+            .unwrap();
+        let received = fixture
+            .decode_params
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        // Release management before asserting, including on the broken head.
+        // The receiver may already be gone if the hook timed out on slow CI.
+        let _ = release_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(5), replacement)
+            .await
+            .unwrap()
+            .unwrap();
+        for field in ["remote_engine_id", "remote_host", "remote_port", "tp_size"] {
+            assert_eq!(
+                received[field],
+                IgwNixlFixture::identity(1)[field],
+                "decode received retired {field} before invalidation; status={status}, body={}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(decode_count_while_prefill_paused, decode_count);
+        fixture.assert_current_identity().await;
+        fixture.assert_current_identity().await;
+    }
+
+    #[tokio::test]
+    async fn igw_nixl_delete_readd_uses_new_push_identity() {
+        check_igw_nixl_replacement(true).await;
+    }
+
+    #[tokio::test]
+    async fn igw_nixl_late_prefill_response_cannot_restore_replaced_identity() {
+        let fixture = IgwNixlFixture::new().await;
+        fixture.pause_prefill.store(true, Ordering::SeqCst);
+        let request = tokio::spawn(IgwNixlFixture::request(fixture.app.clone()));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fixture.prefill_entered.notified(),
+        )
+        .await
+        .unwrap();
+        fixture.generation.store(1, Ordering::SeqCst);
+        fixture.post_worker(&fixture.prefill_url, "prefill").await;
+        fixture.prefill_release.notify_one();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap();
+        // The in-flight request may fail against the retired engine, but it
+        // must not publish that engine's identity for subsequent requests.
+        drop(response);
+        assert!(
+            fixture
+                .router()
+                .get_nixl_info(&fixture.prefill_url, None)
+                .is_none(),
+            "a retired worker response repopulated the cache"
+        );
+        fixture.assert_current_identity().await;
+        fixture.assert_current_identity().await;
+    }
+
+    #[tokio::test]
+    async fn igw_nixl_pull_replacement_keeps_response_params_without_caching() {
+        let fixture = IgwNixlFixture::new_with_push(false).await;
+        for generation in [0, 1] {
+            fixture.generation.store(generation, Ordering::SeqCst);
+            fixture.post_worker(&fixture.prefill_url, "prefill").await;
+            let response = IgwNixlFixture::request(fixture.app.clone()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = axum::body::to_bytes(response.into_body(), 16384)
+                .await
+                .unwrap();
+            assert!(fixture
+                .router()
+                .get_nixl_info(&fixture.prefill_url, None)
+                .is_none());
+            let received = fixture
+                .decode_params
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .clone();
+            assert_eq!(received["transfer_mode"], "pull");
+            assert_eq!(received["remote_block_ids"], json!([1, 2]));
+            assert_eq!(received["remote_engine_id"], format!("engine-{generation}"));
+        }
+    }
+
     async fn finalize_decode_response(
         response: reqwest::Response,
         prefill: Option<&Value>,
@@ -3700,8 +4661,6 @@ mod tests {
         });
         url
     }
-
-    use super::*;
 
     #[tokio::test]
     async fn prefill_body_limit_rejects_oversized_responses() {
@@ -4134,9 +5093,35 @@ mod tests {
             }
             assert_eq!(
                 router
-                    .get_nixl_push_identity(&format!("http://{address}/p"), None)
+                    .get_discovered_nixl_push_identity(&format!("http://{address}/p"), None)
                     .is_some(),
                 push
+            );
+            let prefills = router
+                .discovery_candidates(
+                    vec![(format!("{address}/p"), "P".into(), None)],
+                    ServiceType::Prefill,
+                )
+                .unwrap();
+            let decodes = router
+                .discovery_candidates(
+                    vec![(format!("{address}/d"), "D".into(), None)],
+                    ServiceType::Decode,
+                )
+                .unwrap();
+            assert!(router.worker_registry().get_all().is_empty());
+            assert_eq!(
+                router
+                    .try_build_concurrent_requests(
+                        &json!({"messages": []}),
+                        &prefills[0],
+                        &decodes[0],
+                        "/v1/chat/completions",
+                    )
+                    .await
+                    .is_some(),
+                push,
+                "discovered workers must reuse discovery identities without registry membership"
             );
             server.abort();
         }
@@ -5341,6 +6326,11 @@ mod tests {
                         "transfer_mode": "push", "remote_engine_id": "P",
                         "remote_host": "127.0.0.1", "remote_port": 1234,
                     }),
+                    router
+                        .worker_registry()
+                        .get_by_url(&p)
+                        .filter(|_| !discovered)
+                        .as_ref(),
                 );
             }
             let request_router = router.clone();
@@ -5868,6 +6858,7 @@ mod tests {
             },
             epd: Some(EpdConfig {
                 encoder_urls: vec![encoder],
+                encode_policy: None,
                 consumer_zmq_addrs: Default::default(),
             }),
             worker_startup_timeout_secs: 5,
@@ -6480,6 +7471,7 @@ mod tests {
                     Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
                 let unrelated = crate::core::WorkerLoadGuard::new(decode.as_ref());
                 let router = test_vllm_pd_router().await;
+                router.pd_router.worker_registry.register(prefill.clone());
                 if concurrent {
                     router.store_nixl_info(
                         prefill.base_url(),
@@ -6488,9 +7480,9 @@ mod tests {
                             "transfer_mode": "push", "remote_engine_id": "test-prefill",
                             "remote_host": "127.0.0.1", "remote_port": 1234,
                         }),
+                        Some(&prefill),
                     );
                 }
-                router.pd_router.worker_registry.register(prefill.clone());
                 router.pd_router.worker_registry.register(decode.clone());
                 let mut request = tokio::spawn(async move {
                     router
@@ -6612,6 +7604,8 @@ mod tests {
         let decode: Arc<dyn Worker> =
             Arc::new(BasicWorker::new(urls[1].clone(), WorkerType::Decode));
         let router = test_vllm_pd_router().await;
+        router.pd_router.worker_registry.register(prefill.clone());
+        router.pd_router.worker_registry.register(decode.clone());
         router.store_nixl_info(
             prefill.base_url(),
             None,
@@ -6619,9 +7613,8 @@ mod tests {
                 "transfer_mode": "push", "remote_engine_id": "test-prefill",
                 "remote_host": "127.0.0.1", "remote_port": 1234, "tp_size": 1,
             }),
+            Some(&prefill),
         );
-        router.pd_router.worker_registry.register(prefill.clone());
-        router.pd_router.worker_registry.register(decode.clone());
         let task = tokio::spawn(async move {
             dispatch_reservation_test_request(&router, "/v1/chat/completions").await
         });

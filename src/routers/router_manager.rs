@@ -50,6 +50,14 @@ pub struct RouterManager {
     /// Policy registry for managing model-to-policy mappings
     policy_registry: Arc<crate::policies::PolicyRegistry>,
 
+    /// Keep management API topology changes and policy notifications in order.
+    /// Never held during backend discovery or across an await.
+    worker_mutation: parking_lot::Mutex<()>,
+
+    /// One-shot scheduling point after registry publication, before invalidation.
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    pub(crate) after_worker_registration: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+
     /// All routers managed by this manager
     /// RouterId examples: "http-regular", "http-pd"
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
@@ -76,6 +84,9 @@ impl RouterManager {
         Self {
             worker_registry,
             policy_registry,
+            worker_mutation: parking_lot::Mutex::new(()),
+            #[cfg(all(test, feature = "cpu", feature = "ready"))]
+            after_worker_registration: parking_lot::Mutex::new(None),
             routers: Arc::new(DashMap::new()),
             default_router: Arc::new(std::sync::RwLock::new(None)),
             client,
@@ -110,7 +121,7 @@ impl RouterManager {
     /// Get router for a specific model based on worker types
     pub fn get_router_for_model(&self, model_id: &str) -> Option<Arc<dyn RouterTrait>> {
         // Query workers for this model from registry
-        let workers = self.worker_registry.get_by_model(model_id);
+        let workers = self.worker_registry.get_consumer_workers(Some(model_id));
 
         if !workers.is_empty() {
             // Determine router based on worker types
@@ -144,11 +155,7 @@ impl RouterManager {
 
     /// Get workers for routing decision
     pub fn get_workers_for_request(&self, model_id: Option<&str>) -> Vec<Arc<dyn Worker>> {
-        if let Some(model) = model_id {
-            self.worker_registry.get_by_model(model)
-        } else {
-            self.worker_registry.get_all()
-        }
+        self.worker_registry.get_consumer_workers(model_id)
     }
 
     /// Add a worker to the registry
@@ -203,14 +210,48 @@ impl RouterManager {
             ),
         };
 
-        // Register worker
+        // Serialize the registry update and its policy notification. Discovery
+        // above can await, but this critical section only updates local state.
+        let _mutation = self.worker_mutation.lock();
         let worker_arc: Arc<dyn Worker> = Arc::from(worker);
-        let worker_id = self.worker_registry.register(worker_arc.clone());
+        let registration = self
+            .worker_registry
+            .register_with_previous(worker_arc.clone());
+        let worker_id = registration.worker_id;
+
+        #[cfg(all(test, feature = "cpu", feature = "ready"))]
+        {
+            let callback = self.after_worker_registration.lock().take();
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
+
+        if let Some(previous) = registration.previous.as_ref() {
+            self.invalidate_child_worker_state(previous.as_ref());
+            self.policy_registry
+                .clear_consumer_cache_state(previous.as_ref());
+        }
 
         // Notify PolicyRegistry about the new worker
         // Extract policy hint from labels if provided
         let policy_hint = labels.get("policy").map(|s| s.as_str());
-        let policy = self.policy_registry.on_worker_added(&model_id, policy_hint);
+        // This API creates consumers. A replaced Encode worker never counted
+        // toward consumer policies, even when it shares the new model ID.
+        let policy = match registration
+            .previous
+            .filter(|previous| previous.worker_type().is_consumer())
+        {
+            Some(previous) if previous.model_id() == model_id => {
+                self.policy_registry.get_policy_or_default(&model_id)
+            }
+            previous => {
+                if let Some(previous) = previous {
+                    self.policy_registry.on_worker_removed(previous.model_id());
+                }
+                self.policy_registry.on_worker_added(&model_id, policy_hint)
+            }
+        };
         if worker_arc.worker_type() == WorkerType::Regular {
             if let Some(kv) = kv_aware_ops(policy.as_ref()) {
                 kv.register_worker(worker_arc.as_ref(), None, None);
@@ -252,12 +293,20 @@ impl RouterManager {
         })
     }
 
+    fn invalidate_child_worker_state(&self, worker: &dyn Worker) {
+        for router in self.routers.iter() {
+            router.value().invalidate_worker_state(worker);
+        }
+    }
+
     /// Remove a worker from the registry
     pub fn remove_worker_from_registry(
         &self,
         url: &str,
     ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
+        let _mutation = self.worker_mutation.lock();
         if let Some(worker) = self.worker_registry.remove_by_url(url) {
+            self.invalidate_child_worker_state(worker.as_ref());
             if worker.worker_type() == WorkerType::Regular {
                 let policy = self
                     .policy_registry
@@ -272,7 +321,9 @@ impl RouterManager {
                     }
                 }
             }
-            self.policy_registry.on_worker_removed(worker.model_id());
+            // Notify for the object actually removed, not an earlier lookup.
+            self.policy_registry
+                .notify_consumer_removed(worker.as_ref());
             info!(
                 "Removed worker with URL {} for model {}",
                 url,
@@ -315,6 +366,7 @@ impl RouterManager {
                 regular: registry_stats.regular_workers,
                 prefill: registry_stats.prefill_workers,
                 decode: registry_stats.decode_workers,
+                encode: registry_stats.encode_workers,
             },
         };
 
@@ -386,6 +438,7 @@ impl RouterManager {
                 WorkerType::Regular => "regular".to_string(),
                 WorkerType::Prefill { .. } => "prefill".to_string(),
                 WorkerType::Decode => "decode".to_string(),
+                WorkerType::Encode => "encode".to_string(),
             },
             is_healthy: worker.is_healthy(),
             load: worker.load(),
@@ -885,5 +938,127 @@ impl std::fmt::Debug for RouterManager {
             .field("workers_count", &self.worker_registry.get_all().len())
             .field("default_router", &*self.default_router.read().unwrap())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn inference_views_ignore_encode_only_workers() {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(Arc::from(WorkerFactory::create_encode(
+            "http://encoder:8000".into(),
+        )));
+        let config = RouterConfig::default();
+        let manager = RouterManager::new(
+            config.clone(),
+            reqwest::Client::new(),
+            registry,
+            Arc::new(crate::policies::PolicyRegistry::new(config.policy)),
+        );
+        assert!(manager.get_workers_for_request(None).is_empty());
+        assert!(manager.get_workers_for_request(Some("unknown")).is_empty());
+        assert!(manager.get_router_for_model("unknown").is_none());
+        assert_eq!(manager.list_workers().total, 1);
+    }
+
+    #[tokio::test]
+    async fn manager_readiness_preserves_registered_router_contract() {
+        let config = RouterConfig {
+            enable_igw: true,
+            ..Default::default()
+        };
+        let context = Arc::new(
+            crate::server::AppContext::new(
+                config.clone(),
+                reqwest::Client::new(),
+                64,
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+        let manager = RouterManager::new(
+            config,
+            context.client.clone(),
+            context.worker_registry.clone(),
+            context.policy_registry.clone(),
+        );
+        assert_eq!(
+            manager.readiness().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let router = crate::routers::RouterFactory::create_regular_router(&[], &context)
+            .await
+            .unwrap();
+        assert_eq!(router.readiness().status(), StatusCode::SERVICE_UNAVAILABLE);
+        manager.register_router(RouterId::new("http-regular".into()), Arc::from(router));
+        // Keep IGW's existing registration-based readiness; Phase 1 does not
+        // introduce child-health readiness semantics for non-EPD deployments.
+        assert_eq!(manager.readiness().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn manager_model_listing_preserves_registry_view() {
+        let registry = Arc::new(WorkerRegistry::new());
+        for (url, role, model) in [
+            ("http://encoder:8000", WorkerType::Encode, "encode-only"),
+            ("http://consumer:8000", WorkerType::Regular, "inference"),
+            ("http://consumer2:8000", WorkerType::Regular, "inference"),
+        ] {
+            registry.register(Arc::new(
+                crate::core::BasicWorker::new(url.into(), role).with_labels(
+                    std::collections::HashMap::from([("model_id".into(), model.into())]),
+                ),
+            ));
+        }
+        let expected = registry.get_models();
+        let config = RouterConfig::default();
+        let manager = RouterManager::new(
+            config.clone(),
+            reqwest::Client::new(),
+            registry,
+            Arc::new(crate::policies::PolicyRegistry::new(config.policy)),
+        );
+        let response = manager.get_models(Request::new(Body::empty())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Preserve registry contents/order rather than adding manager-only sorting.
+        assert_eq!(models["models"], serde_json::json!(expected));
+    }
+
+    #[test]
+    fn list_workers_reports_encode_role_and_count() {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(Arc::from(WorkerFactory::create_encode(
+            "http://encoder:8080".to_string(),
+        )));
+        registry.register(Arc::from(WorkerFactory::create_regular(
+            "http://consumer:8080".to_string(),
+        )));
+        let config = RouterConfig::default();
+        let manager = RouterManager::new(
+            config.clone(),
+            reqwest::Client::new(),
+            registry,
+            Arc::new(crate::policies::PolicyRegistry::new(config.policy)),
+        );
+        let response = serde_json::to_value(manager.list_workers()).unwrap();
+        assert_eq!(response["stats"]["by_type"]["encode"], 1);
+        assert_eq!(response["stats"]["by_type"]["regular"], 1);
+        assert_eq!(response["total"], 2);
+        let encoder = response["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|worker| worker["url"] == "http://encoder:8080")
+            .unwrap();
+        assert_eq!(encoder["worker_type"], "encode");
+        assert_eq!(encoder["connection_mode"], "Http");
     }
 }

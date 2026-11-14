@@ -15,7 +15,6 @@ use super::hash_key;
 use super::LoadBalancingPolicy;
 use super::RequestHeaders;
 use crate::core::Worker;
-use crate::metrics::RouterMetrics;
 
 /// Number of virtual nodes per physical worker (for better load distribution)
 pub const VIRTUAL_NODES_PER_WORKER: u32 = 160;
@@ -372,8 +371,7 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
                     "CONSISTENT_HASH_DEBUG: Hash ring empty, falling back to worker: {}",
                     worker_url
                 );
-                RouterMetrics::record_processed_request(worker_url);
-                RouterMetrics::record_policy_decision(self.name(), worker_url);
+                super::record_selection_metrics(self.name(), workers[fallback_idx].as_ref());
                 return Some(fallback_idx);
             }
         };
@@ -413,9 +411,7 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
                     );
 
                     // Increment processed counter
-                    workers[idx].increment_processed();
-                    RouterMetrics::record_processed_request(worker_url);
-                    RouterMetrics::record_policy_decision(self.name(), worker_url);
+                    super::record_processed_selection(self.name(), workers[idx].as_ref());
 
                     Some(idx)
                 } else {
@@ -425,11 +421,7 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
                         workers[idx].url()
                     );
                     let fallback_idx = healthy_indices[0];
-                    let worker_url = workers[fallback_idx].url();
-
-                    workers[fallback_idx].increment_processed();
-                    RouterMetrics::record_processed_request(worker_url);
-                    RouterMetrics::record_policy_decision(self.name(), worker_url);
+                    super::record_processed_selection(self.name(), workers[fallback_idx].as_ref());
 
                     Some(fallback_idx)
                 }
@@ -441,11 +433,7 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
                     target_worker_url
                 );
                 let fallback_idx = healthy_indices[0];
-                let worker_url = workers[fallback_idx].url();
-
-                workers[fallback_idx].increment_processed();
-                RouterMetrics::record_processed_request(worker_url);
-                RouterMetrics::record_policy_decision(self.name(), worker_url);
+                super::record_processed_selection(self.name(), workers[fallback_idx].as_ref());
 
                 Some(fallback_idx)
             }
@@ -511,6 +499,112 @@ mod tests {
     use super::*;
     use crate::core::BasicWorker;
     use crate::core::WorkerType;
+
+    #[derive(Default)]
+    struct SelectionMetrics {
+        processed: Arc<std::sync::atomic::AtomicU64>,
+        decisions: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl metrics::Recorder for SelectionMetrics {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            match key.name() {
+                "vllm_router_processed_requests_total" => {
+                    metrics::Counter::from_arc(self.processed.clone())
+                }
+                "vllm_router_policy_decisions_total" => {
+                    metrics::Counter::from_arc(self.decisions.clone())
+                }
+                _ => panic!("unexpected counter {key:?}"),
+            }
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn all_hash_selection_branches_preserve_consumer_and_encode_accounting() {
+        use std::sync::atomic::Ordering;
+        for role in [WorkerType::Regular, WorkerType::Encode] {
+            for branch in ["empty_ring", "hit", "unhealthy_target", "removed_target"] {
+                let policy = ConsistentHashPolicy::new();
+                let pool: Vec<Arc<dyn Worker>> = ["http://w0", "http://w1"]
+                    .into_iter()
+                    .map(|url| {
+                        Arc::new(BasicWorker::new(url.into(), role.clone())) as Arc<dyn Worker>
+                    })
+                    .collect();
+                // Freeze the normal pool-change detector, then supply exact
+                // ring states for otherwise difficult fallback branches.
+                *policy.current_workers.write().unwrap() =
+                    pool.iter().map(|w| w.url().to_owned()).collect();
+                if branch != "empty_ring" {
+                    let target = if branch == "removed_target" {
+                        "http://removed"
+                    } else {
+                        pool[0].url()
+                    };
+                    policy.hash_ring.write().unwrap().insert(0, target.into());
+                }
+                if branch == "unhealthy_target" {
+                    pool[0].set_healthy(false);
+                }
+                let metrics = SelectionMetrics::default();
+                let chosen = metrics::with_local_recorder(&metrics, || {
+                    policy.select_worker_with_headers(&pool, Some("session"), None)
+                })
+                .unwrap();
+                assert_eq!(chosen, usize::from(branch == "unhealthy_target"));
+                let consumer = role.is_consumer();
+                assert_eq!(
+                    pool.iter().map(|w| w.processed_requests()).sum::<usize>(),
+                    usize::from(consumer && branch != "empty_ring"),
+                    "{role:?} {branch}"
+                );
+                assert_eq!(
+                    metrics.processed.load(Ordering::Relaxed),
+                    u64::from(consumer)
+                );
+                assert_eq!(
+                    metrics.decisions.load(Ordering::Relaxed),
+                    u64::from(consumer)
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_fbi_hash_consistency() {
