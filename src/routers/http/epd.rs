@@ -22,6 +22,12 @@ struct MediaItem {
     media: Value,
 }
 
+struct EncodedItem {
+    mm_hash: String,
+    reported: Value,
+    metadata: Option<Map<String, Value>>,
+}
+
 #[derive(Debug)]
 pub(super) struct EncoderStage {
     config: EpdConfig,
@@ -330,84 +336,28 @@ impl EncoderStage {
             )
         }))
         .await;
-        let replies: Vec<Value> = replies.into_iter().collect::<Result<_, _>>()?;
+        let replies: Vec<_> = replies.into_iter().collect::<Result<_, _>>()?;
         let mut handles = Map::new();
         // Sort transfers by content position, including caller-supplied embeds.
         let mut transfers = Vec::new();
         let mut used_transfer_ids = Vec::new();
         let mut rewritten = 0;
-        for ((_, indices), mut reply) in groups.iter().zip(replies) {
-            let Some(Value::Object(params)) = reply.get_mut("ec_transfer_params").map(Value::take)
-            else {
-                // No EC report at all: keep the raw media but pin its uuid so
-                // the consumer derives the same mm_hash the encoder used.
-                for &index in indices {
-                    let item = &items[index];
-                    body["messages"][item.message_index]["content"][item.content_index] =
-                        item.media.clone();
-                }
-                continue;
-            };
-            // Position is the reliable correlation when the engine rehashes
-            // uuids with processing options; the uuid key and the single-entry
-            // shape are fallbacks for encoders without position metadata.
-            let mut by_position: HashMap<usize, (&String, &Value)> = HashMap::new();
-            for (mm_hash, reported) in params.iter() {
-                let Some(item_indices) = reported.get("item_indices") else {
-                    continue;
-                };
-                let item_indices = item_indices.as_array().ok_or_else(|| {
-                    (StatusCode::BAD_GATEWAY, "Invalid encoder item index".into())
-                })?;
-                for local in item_indices {
-                    let local = local
-                        .as_u64()
-                        .and_then(|value| usize::try_from(value).ok())
-                        .filter(|&value| value < indices.len())
-                        .ok_or_else(|| {
-                            (StatusCode::BAD_GATEWAY, "Invalid encoder item index".into())
-                        })?;
-                    if by_position.insert(local, (mm_hash, reported)).is_some() {
-                        return Err((
-                            StatusCode::BAD_GATEWAY,
-                            "Duplicate encoder item index".into(),
-                        ));
-                    }
-                }
-            }
-            for (local, &index) in indices.iter().enumerate() {
+        for ((_, indices), reply) in groups.iter().zip(replies) {
+            for (&index, report) in indices.iter().zip(reply) {
                 let item = &items[index];
-                let entry = by_position
-                    .get(&local)
-                    .map(|(hash, reported)| ((*hash).clone(), (*reported).clone()))
-                    .or_else(|| {
-                        params
-                            .get_key_value(&item.content_id)
-                            .map(|(hash, reported)| (hash.clone(), reported.clone()))
-                    })
-                    .or_else(|| {
-                        if indices.len() == 1 && params.len() == 1 {
-                            params
-                                .iter()
-                                .next()
-                                .map(|(hash, reported)| (hash.clone(), reported.clone()))
-                        } else {
-                            None
-                        }
-                    });
-                let Some((hash, reported)) = entry else {
-                    // Unreported item (e.g. an encoder-side processor cache
-                    // hit): keep the raw media with its uuid pinned.
+                let Some(EncodedItem {
+                    mm_hash: hash,
+                    reported,
+                    metadata,
+                }) = report
+                else {
+                    // Missing report or unreported item (e.g. a processor cache
+                    // hit): pin the uuid so the consumer derives the same hash.
                     body["messages"][item.message_index]["content"][item.content_index] =
                         item.media.clone();
                     continue;
                 };
-                if let Some(metadata) = reported
-                    .get("metadata")
-                    .and_then(Value::as_object)
-                    .filter(|m| !m.is_empty())
-                {
-                    let metadata = flatten_metadata(metadata)?;
+                if let Some(metadata) = metadata {
                     let kind = match item.kind {
                         "image_url" => "image_embeds",
                         "video_url" => "video_embeds",
@@ -541,8 +491,8 @@ async fn encode_group(
     consumer_addr: Option<&str>,
     worker: &dyn Worker,
     registry: &WorkerRegistry,
-) -> Result<Value, EpdError> {
-    // A batch stays in flight until its response body/JSON has been consumed.
+) -> Result<Vec<Option<EncodedItem>>, EpdError> {
+    // A batch stays in flight through response consumption and metadata validation.
     // Dropping the future releases load without inventing a completion/outcome.
     let _load = WorkerLoadGuard::new(worker);
     let mut payload = json!({
@@ -585,17 +535,18 @@ async fn encode_group(
         if !response.status().is_success() {
             return Err((response.status(), "Encoder request failed".into()));
         }
-        response.json::<Value>().await.map_err(|e| {
+        let reply = response.json::<Value>().await.map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
                 format!("Invalid encoder response: {e}"),
             )
-        })
+        })?;
+        parse_batch_response(reply, items, indices)
     }
     .await;
     worker.increment_processed();
     // Match consumer circuit semantics: client errors are reachable workers;
-    // transport failures, 5xx and unreadable JSON are failed batch attempts.
+    // transport failures, 5xx, unreadable JSON and invalid batch metadata fail.
     let success = result
         .as_ref()
         .map_or_else(|(status, _)| status.is_client_error(), |_| true);
@@ -611,6 +562,71 @@ async fn encode_group(
         "EPD encoder batch complete"
     );
     result
+}
+
+fn parse_batch_response(
+    reply: Value,
+    items: &[MediaItem],
+    indices: &[usize],
+) -> Result<Vec<Option<EncodedItem>>, EpdError> {
+    let Some(Value::Object(params)) = reply.get("ec_transfer_params") else {
+        return Ok(indices.iter().map(|_| None).collect());
+    };
+    // Position is the reliable correlation when the engine rehashes uuids
+    // with processing options; uuid and single-entry shapes are fallbacks.
+    let mut by_position: HashMap<usize, (&String, &Value)> = HashMap::new();
+    for (mm_hash, reported) in params {
+        let Some(item_indices) = reported.get("item_indices") else {
+            continue;
+        };
+        let item_indices = item_indices
+            .as_array()
+            .ok_or_else(|| (StatusCode::BAD_GATEWAY, "Invalid encoder item index".into()))?;
+        for local in item_indices {
+            let local = local
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|&value| value < indices.len())
+                .ok_or_else(|| (StatusCode::BAD_GATEWAY, "Invalid encoder item index".into()))?;
+            if by_position.insert(local, (mm_hash, reported)).is_some() {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "Duplicate encoder item index".into(),
+                ));
+            }
+        }
+    }
+    indices
+        .iter()
+        .enumerate()
+        .map(|(local, &index)| {
+            let entry = by_position
+                .get(&local)
+                .copied()
+                .or_else(|| params.get_key_value(&items[index].content_id))
+                .or_else(|| {
+                    if indices.len() == 1 && params.len() == 1 {
+                        params.iter().next()
+                    } else {
+                        None
+                    }
+                });
+            let Some((hash, reported)) = entry else {
+                return Ok(None);
+            };
+            let metadata = reported
+                .get("metadata")
+                .and_then(Value::as_object)
+                .filter(|m| !m.is_empty())
+                .map(flatten_metadata)
+                .transpose()?;
+            Ok(Some(EncodedItem {
+                mm_hash: hash.clone(),
+                reported: reported.clone(),
+                metadata,
+            }))
+        })
+        .collect()
 }
 
 fn flatten_metadata(metadata: &Map<String, Value>) -> Result<Map<String, Value>, EpdError> {
@@ -1737,24 +1753,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_encoder_item_indices_are_rejected() {
+    async fn malformed_encoder_metadata_counts_as_failed_batches_and_opens_circuit() {
         for mode in [
             "bad_indices_type",
             "bad_index_fractional",
             "bad_index_out_of_range",
             "duplicate_index",
+            "invalid",
         ] {
-            let (stage, _, server) = mock(mode).await;
+            let (stage, seen, server) = mock(mode).await;
+            let worker: Arc<dyn Worker> =
+                Arc::from(crate::core::WorkerFactory::create_encode_with_config(
+                    stage.config.encoder_urls[0].clone(),
+                    crate::core::CircuitBreakerConfig {
+                        failure_threshold: 2,
+                        ..Default::default()
+                    },
+                    Default::default(),
+                ));
+            stage.worker_registry.register(worker.clone());
+            let revision = stage.worker_registry.revision();
             let mut input = request();
             input["messages"][0]["content"] = json!([input["messages"][0]["content"][0].clone()]);
+            for attempt in 1..=2 {
+                let error = stage
+                    .prepare(&Client::new(), input.clone(), "pd", None, None)
+                    .await
+                    .err()
+                    .unwrap();
+                assert_eq!(error.0, StatusCode::BAD_GATEWAY, "mode: {mode}");
+                assert_eq!(worker.load(), 0, "mode: {mode}");
+                assert_eq!(worker.processed_requests(), attempt, "mode: {mode}");
+                assert_eq!(
+                    worker.circuit_breaker().total_successes(),
+                    0,
+                    "mode: {mode}"
+                );
+                assert_eq!(
+                    worker.circuit_breaker().total_failures(),
+                    attempt as u64,
+                    "mode: {mode}"
+                );
+                assert_eq!(worker.is_available(), attempt < 2, "mode: {mode}");
+                assert_eq!(
+                    stage.worker_registry.revision() > revision,
+                    attempt == 2,
+                    "mode: {mode}"
+                );
+            }
             let error = stage
                 .prepare(&Client::new(), input, "pd", None, None)
                 .await
                 .err()
                 .unwrap();
-            assert_eq!(error.0, StatusCode::BAD_GATEWAY, "mode: {mode}");
+            assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE, "mode: {mode}");
+            assert_eq!(seen.lock().unwrap().len(), 2, "mode: {mode}");
+            assert_eq!(worker.processed_requests(), 2, "mode: {mode}");
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_batch_records_failure_without_changing_sibling_outcome() {
+        let (bad_stage, _, bad_server) = mock("bad_index_out_of_range").await;
+        let (good_stage, _, good_server) = mock("normal").await;
+        let stage = test_stage(EpdConfig {
+            encoder_urls: vec![
+                bad_stage.config.encoder_urls[0].clone(),
+                good_stage.config.encoder_urls[0].clone(),
+            ],
+            encode_policy: None,
+            consumer_zmq_addrs: Default::default(),
+        });
+        let error = stage
+            .prepare(&Client::new(), request(), "pd", None, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+        for (index, url) in stage.config.encoder_urls.iter().enumerate() {
+            let worker = stage.worker_registry.get_by_url(url).unwrap();
+            assert_eq!(worker.load(), 0);
+            assert_eq!(worker.processed_requests(), 1);
+            assert_eq!(
+                worker.circuit_breaker().total_failures(),
+                u64::from(index == 0)
+            );
+            assert_eq!(
+                worker.circuit_breaker().total_successes(),
+                u64::from(index == 1)
+            );
+        }
+        bad_server.abort();
+        good_server.abort();
     }
 
     #[tokio::test]
