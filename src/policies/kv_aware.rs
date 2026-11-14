@@ -198,7 +198,8 @@ pub(crate) fn kv_aware_policy(policy: &dyn LoadBalancingPolicy) -> Option<&KvAwa
 pub struct KvRequestSlot {
     manager: Arc<dyn SlotManager>,
     target: RoutableTarget,
-    prefill_tokens: u64,
+    /// What this request currently has charged to the target's prefill load.
+    prefill_tokens: Arc<AtomicU64>,
     /// Affinity binding reference acquired with this reservation, if any.
     affinity: Option<Arc<AffinityRecord>>,
     // 0 = prefill, 1 = decode, 2 = freed.
@@ -215,7 +216,7 @@ impl KvRequestSlot {
         Self {
             manager,
             target,
-            prefill_tokens,
+            prefill_tokens: Arc::new(AtomicU64::new(prefill_tokens)),
             affinity,
             state: Arc::new(AtomicU8::new(0)),
         }
@@ -227,8 +228,26 @@ impl KvRequestSlot {
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            self.manager
-                .begin_decode(&self.target, &self.target, self.prefill_tokens);
+            self.manager.begin_decode(
+                &self.target,
+                &self.target,
+                self.prefill_tokens.load(Ordering::Acquire),
+            );
+        }
+    }
+
+    /// Replace this request's charge with the work the worker says is left.
+    ///
+    /// Only the difference is applied, so a growing report (a preemption) adds
+    /// load back exactly once, and a request that already finished is ignored.
+    pub(crate) fn apply_prefill_progress(&self, remaining: u64) {
+        if self.state.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let previous = self.prefill_tokens.swap(remaining, Ordering::AcqRel);
+        let delta = remaining as i64 - previous as i64;
+        if delta != 0 {
+            self.manager.adjust_prefill(&self.target, delta);
         }
     }
 
@@ -277,6 +296,9 @@ pub trait SlotManager: LoadProvider {
         prefill_tokens: u64,
     );
     fn free(&self, target: &RoutableTarget);
+
+    /// Move a target's prefill load by `delta` without ending the request.
+    fn adjust_prefill(&self, target: &RoutableTarget, delta: i64);
 
     /// Drop idle state for a target that is no longer registered. Implementers
     /// may keep active state until its matching request cleanup arrives.
@@ -349,6 +371,17 @@ impl LoadProvider for InMemorySlotManager {
 }
 
 impl SlotManager for InMemorySlotManager {
+    fn adjust_prefill(&self, target: &RoutableTarget, delta: i64) {
+        self.update_or_insert(target, |slot| {
+            if delta >= 0 {
+                slot.active_prefill_tokens
+                    .fetch_add(delta as u64, Ordering::AcqRel);
+            } else {
+                atomic_saturating_sub_u64(&slot.active_prefill_tokens, delta.unsigned_abs());
+            }
+        });
+    }
+
     fn begin_prefill(&self, target: &RoutableTarget, prefill_tokens: u64) {
         self.update_or_insert(target, |slot| {
             slot.active_prefill_tokens
@@ -2317,6 +2350,36 @@ mod tests {
         slots.begin_decode(&active, &active, 32);
         slots.free(&active);
         assert!(!slots.slots.contains_key(&active));
+    }
+
+    #[test]
+    fn prefill_progress_replaces_the_charge_in_both_directions() {
+        let slots = Arc::new(InMemorySlotManager::new());
+        let t = target("prog", 0);
+        slots.begin_prefill(&t, 1000);
+        let slot = KvRequestSlot::new(slots.clone(), t.clone(), 1000, None);
+
+        slot.apply_prefill_progress(400);
+        assert_eq!(slots.sample(&t).active_prefill_tokens, 400);
+
+        // A preemption can put work back; only the difference is applied.
+        slot.apply_prefill_progress(900);
+        assert_eq!(slots.sample(&t).active_prefill_tokens, 900);
+    }
+
+    #[test]
+    fn prefill_progress_after_release_is_ignored() {
+        let slots = Arc::new(InMemorySlotManager::new());
+        let t = target("prog-done", 0);
+        slots.begin_prefill(&t, 1000);
+        let slot = KvRequestSlot::new(slots.clone(), t.clone(), 1000, None);
+
+        slot.apply_prefill_progress(400);
+        slot.release();
+        assert_eq!(slots.sample(&t).active_prefill_tokens, 0);
+
+        slot.apply_prefill_progress(800);
+        assert_eq!(slots.sample(&t).active_prefill_tokens, 0);
     }
 
     #[test]

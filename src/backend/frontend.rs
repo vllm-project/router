@@ -207,6 +207,25 @@ impl EngineFrontend {
             .await
     }
 
+    /// Dispatch a colocated request, reporting the worker's prefill progress.
+    pub(crate) async fn dispatch_with_progress(
+        &self,
+        worker_url: &str,
+        prepared: PreparedRequest,
+        on_first_output: Option<FirstOutputCallback>,
+        on_progress: Option<Box<dyn FnMut(u64) + Send>>,
+    ) -> Response {
+        self.grpc
+            .dispatch_prepared(
+                worker_url,
+                prepared,
+                on_first_output,
+                on_progress,
+                KvHandoff::default(),
+            )
+            .await
+    }
+
     pub(crate) async fn dispatch_with_first_output(
         &self,
         worker_url: &str,
@@ -214,7 +233,13 @@ impl EngineFrontend {
         on_first_output: Option<FirstOutputCallback>,
     ) -> Response {
         self.grpc
-            .dispatch_prepared(worker_url, prepared, on_first_output, KvHandoff::default())
+            .dispatch_prepared(
+                worker_url,
+                prepared,
+                on_first_output,
+                None,
+                KvHandoff::default(),
+            )
             .await
     }
 
@@ -272,7 +297,7 @@ impl EngineFrontend {
             kv_transfer_params,
         };
         self.grpc
-            .dispatch_prepared(worker_url, prepared, None, handoff)
+            .dispatch_prepared(worker_url, prepared, None, None, handoff)
             .await
     }
 }

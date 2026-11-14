@@ -459,6 +459,7 @@ impl GrpcEngineBackend {
         worker_url: &str,
         prepared: PreparedRequest,
         on_first_output: Option<FirstOutputCallback>,
+        on_progress: Option<Box<dyn FnMut(u64) + Send>>,
         handoff: KvHandoff,
     ) -> Response {
         let PreparedRequest {
@@ -589,6 +590,7 @@ impl GrpcEngineBackend {
             stages,
             t_req,
             on_first_output,
+            on_progress,
             fail_on_abort: abort_request_id.is_some(),
             abort,
         };
@@ -605,6 +607,7 @@ fn stages_header(stages: &serde_json::Value) -> HeaderValue {
 }
 
 struct ChatReply {
+    on_progress: Option<Box<dyn FnMut(u64) + Send>>,
     request_id: String,
     model: String,
     created: u64,
@@ -666,6 +669,7 @@ async fn stream_openai(
         mut stages,
         t_req,
         on_first_output: _,
+        mut on_progress,
         fail_on_abort: _,
         abort,
     } = reply;
@@ -700,6 +704,11 @@ async fn stream_openai(
                 };
                 match item {
                     Ok(msg) => {
+                        if let Some(progress) = msg.prefill_progress.as_ref() {
+                            if let Some(callback) = on_progress.as_mut() {
+                                callback(u64::from(progress.remaining_prefill_tokens));
+                            }
+                        }
                         if stages.get("first_grpc_msg_ms").is_none() {
                             stages["first_grpc_msg_ms"] =
                                 serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
@@ -868,6 +877,7 @@ async fn collect_openai(
         mut stages,
         t_req,
         on_first_output,
+        mut on_progress,
         fail_on_abort,
         abort,
     } = reply;
@@ -894,6 +904,11 @@ async fn collect_openai(
         };
         match item {
             Ok(msg) => {
+                if let Some(progress) = msg.prefill_progress.as_ref() {
+                    if let Some(callback) = on_progress.as_mut() {
+                        callback(u64::from(progress.remaining_prefill_tokens));
+                    }
+                }
                 if stages.get("first_grpc_msg_ms").is_none() {
                     stages["first_grpc_msg_ms"] =
                         serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);

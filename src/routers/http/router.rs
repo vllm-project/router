@@ -157,6 +157,12 @@ impl RequestLoadGuard {
         }
     }
 
+    fn apply_prefill_progress(&self, remaining: u64) {
+        if let Some(slot) = &self.state.kv_slot {
+            slot.apply_prefill_progress(remaining);
+        }
+    }
+
     fn release(&self) {
         if self.state.released.swap(true, Ordering::AcqRel) {
             return;
@@ -1912,9 +1918,14 @@ impl Router {
                 Some(Arc::new(move || load.begin_decode())
                     as crate::backend::grpc::FirstOutputCallback)
             };
+            let progress_load = load.clone();
+            let on_progress: Option<Box<dyn FnMut(u64) + Send>> =
+                Some(Box::new(move |remaining| {
+                    progress_load.apply_prefill_progress(remaining);
+                }));
             let mut response = self
                 .frontend
-                .dispatch_with_first_output(worker_url, prepared, on_first_output)
+                .dispatch_with_progress(worker_url, prepared, on_first_output, on_progress)
                 .await;
             if is_stream && response.status().is_success() {
                 response = hold_request_load_until_body_done(response, load);
