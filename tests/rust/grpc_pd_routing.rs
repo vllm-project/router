@@ -157,8 +157,8 @@ async fn grpc_pd_completion_passes_client_token_ids_to_both_legs() {
     .await;
     let decode = MockVllmRsServer::spawn().await;
     let router = pd_router(&prefill, &decode).await;
-    // Must not be used: the ids come from the client.
-    router.pin_test_token_ids(vec![9]);
+    // No second pin: `pd_router` already pins ids the client does not send, which is
+    // what makes the captured client ids meaningful.
 
     let response = router
         .route_completion(None, &completion(json!([11, 12, 13, 14]), false), None)
@@ -177,6 +177,56 @@ async fn grpc_pd_completion_passes_client_token_ids_to_both_legs() {
 
     assert_eq!(prefill.captured()[0].token_ids, vec![11, 12, 13, 14]);
     assert_eq!(decode.captured()[0].token_ids, vec![11, 12, 13, 14]);
+}
+
+/// The same path must serve a streaming completion: completion-shaped chunks carrying
+/// `choices[].text` (never chat deltas) and a terminal `[DONE]`.
+#[tokio::test]
+async fn grpc_pd_completion_streams_text_completion_events() {
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        finish_kv_transfer_params: Some(prefill_kv()),
+        ..Default::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router(&prefill, &decode).await;
+
+    let response = router
+        .route_completion(None, &completion(json!([11, 12, 13]), true), None)
+        .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("data: [DONE]"),
+        "stream must terminate: {text}"
+    );
+
+    let chunks: Vec<Value> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|payload| *payload != "[DONE]")
+        .filter_map(|payload| serde_json::from_str(payload).ok())
+        .collect();
+    assert!(!chunks.is_empty(), "{text}");
+
+    let mut streamed = String::new();
+    for chunk in &chunks {
+        assert_eq!(chunk["object"], "text_completion", "{chunk}");
+        let Some(choice) = chunk["choices"].get(0) else {
+            continue;
+        };
+        assert!(
+            choice.get("delta").is_none(),
+            "completion chunks must not use chat deltas: {chunk}"
+        );
+        if let Some(piece) = choice["text"].as_str() {
+            streamed.push_str(piece);
+        }
+    }
+    assert!(!streamed.is_empty(), "no text streamed: {text}");
 }
 
 /// A prompt the gRPC wire cannot carry is rejected before any worker is used.
@@ -1211,8 +1261,11 @@ async fn grpc_pd_nixl_push_client_disconnect_during_prefill_releases_both_legs()
     assert_eq!(d.load(), 0);
 }
 
+/// A route this path still does not serve is refused before either stage is used.
+/// Completions used to be that route; it is served now, so the guard is checked with one
+/// that remains unsupported instead of testing an internal entry point.
 #[tokio::test]
-async fn grpc_pd_rejects_non_chat_routes_before_dispatch() {
+async fn grpc_pd_rejects_unsupported_routes_before_dispatch() {
     let prefill = MockVllmRsServer::spawn().await;
     let decode = MockVllmRsServer::spawn().await;
     let router = pd_router(&prefill, &decode).await;
@@ -1220,9 +1273,9 @@ async fn grpc_pd_rejects_non_chat_routes_before_dispatch() {
     let response = router
         .route_transparent(
             None,
-            "/v1/completions",
+            "/v1/embeddings",
             &axum::http::Method::POST,
-            json!({"model": "test-model", "prompt": "hi", "max_tokens": 4}),
+            json!({"model": "test-model", "input": "hi"}),
         )
         .await;
     assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
