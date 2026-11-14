@@ -342,6 +342,58 @@ async fn cache_aware_prefix_overrides_load() {
     );
 }
 
+async fn wait_for_charge(router: &Router, url: &str, expected: u64, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if router.charged_prefill_tokens(url) == Some(expected) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: ledger is {:?}, wanted {expected}",
+            router.charged_prefill_tokens(url)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn cancelling_a_streaming_request_releases_only_its_own_charge() {
+    let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        progress: vec![500],
+        progress_hold: Duration::from_secs(30),
+        ..MockVllmRs::default()
+    })
+    .await;
+    let router = Arc::new(start_router(std::slice::from_ref(&server), kv_aware()).await);
+    let url = server.grpc_url.clone();
+
+    let first: CompletionRequest =
+        serde_json::from_value(prompt(&[1, 2, 3], json!({ "stream": true }))).unwrap();
+    let first = router.route_completion(None, &first, None).await;
+    assert!(first.status().is_success());
+    wait_for_charge(&router, &url, 500, "first stream reports progress").await;
+
+    let second: CompletionRequest =
+        serde_json::from_value(prompt(&[4, 5, 6], json!({ "stream": true }))).unwrap();
+    let second = router.route_completion(None, &second, None).await;
+    assert!(second.status().is_success());
+    wait_for_charge(&router, &url, 1000, "second stream reports progress").await;
+
+    // Cancelling one stream must take only that request's charge with it.
+    drop(first);
+    wait_for_charge(
+        &router,
+        &url,
+        500,
+        "the cancelled stream releases its charge",
+    )
+    .await;
+
+    drop(second);
+    wait_for_charge(&router, &url, 0, "the last stream releases its charge").await;
+}
+
 #[tokio::test]
 async fn kv_aware_applies_progress_reports_to_the_colocated_ledger() {
     let server = MockVllmRsServer::spawn_with_state(MockVllmRs {

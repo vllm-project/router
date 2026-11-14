@@ -194,10 +194,6 @@ pub(crate) fn kv_aware_policy(policy: &dyn LoadBalancingPolicy) -> Option<&KvAwa
 
 /// Shared request accounting handle. The adapter signals output and completion;
 /// concurrent body/producer cleanup updates the counters only once.
-/// Test hook that runs once, before a report takes the slot lock.
-#[cfg(test)]
-type PauseHook = Arc<dyn Fn() + Send + Sync>;
-
 #[derive(Clone)]
 pub struct KvRequestSlot {
     manager: Arc<dyn SlotManager>,
@@ -207,9 +203,6 @@ pub struct KvRequestSlot {
     charge: Arc<Mutex<u64>>,
     /// Affinity binding reference acquired with this reservation, if any.
     affinity: Option<Arc<AffinityRecord>>,
-    /// Test-only pause between entering a report and taking the lock.
-    #[cfg(test)]
-    pause: Arc<Mutex<Option<PauseHook>>>,
     // 0 = prefill, 1 = decode, 2 = freed.
     state: Arc<AtomicU8>,
 }
@@ -226,8 +219,6 @@ impl KvRequestSlot {
             target,
             charge: Arc::new(Mutex::new(prefill_tokens)),
             affinity,
-            #[cfg(test)]
-            pause: Arc::new(Mutex::new(None)),
             state: Arc::new(AtomicU8::new(0)),
         }
     }
@@ -250,10 +241,6 @@ impl KvRequestSlot {
     /// Only the difference is applied, so a growing report (a preemption) adds
     /// load back exactly once, and a request that already finished is ignored.
     pub(crate) fn apply_prefill_progress(&self, remaining: u64) {
-        #[cfg(test)]
-        if let Some(pause) = self.pause.lock().clone() {
-            pause();
-        }
         let mut charge = self.charge.lock();
         if self.state.load(Ordering::Acquire) != 0 {
             return;
@@ -2066,6 +2053,7 @@ mod tests {
     use crate::request_identity::{resolve_affinity_identity, IdentityFields};
     use http::HeaderMap;
     use serde_json::Value as JsonValue;
+    use std::sync::atomic::AtomicBool;
 
     fn affinity_from_request(
         headers: Option<&HeaderMap>,
@@ -2374,42 +2362,96 @@ mod tests {
         assert!(!slots.slots.contains_key(&active));
     }
 
+    /// Blocks inside the load adjustment, so a test can put a cancel inside the
+    /// window between a report passing its state check and moving the total.
+    struct GatedSlots {
+        inner: InMemorySlotManager,
+        arm: AtomicBool,
+        entered: std::sync::mpsc::Sender<()>,
+        gate: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl LoadProvider for GatedSlots {
+        fn sample(&self, target: &RoutableTarget) -> LoadSample {
+            self.inner.sample(target)
+        }
+    }
+
+    impl SlotManager for GatedSlots {
+        fn begin_prefill(&self, target: &RoutableTarget, prefill_tokens: u64) {
+            self.inner.begin_prefill(target, prefill_tokens);
+        }
+
+        fn begin_decode(
+            &self,
+            prefill_target: &RoutableTarget,
+            decode_target: &RoutableTarget,
+            prefill_tokens: u64,
+        ) {
+            self.inner
+                .begin_decode(prefill_target, decode_target, prefill_tokens);
+        }
+
+        fn free(&self, target: &RoutableTarget) {
+            self.inner.free(target);
+        }
+
+        fn adjust_prefill(&self, target: &RoutableTarget, delta: i64) {
+            if self.arm.swap(false, Ordering::AcqRel) {
+                let _ = self.entered.send(());
+                let gate = self.gate.lock();
+                let _ = gate.recv();
+            }
+            self.inner.adjust_prefill(target, delta);
+        }
+    }
+
     #[test]
-    fn a_report_paused_before_the_lock_cannot_leave_load_behind() {
-        let slots = Arc::new(InMemorySlotManager::new());
+    fn a_cancel_waits_for_a_report_already_in_the_ledger() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let slots = Arc::new(GatedSlots {
+            inner: InMemorySlotManager::new(),
+            arm: AtomicBool::new(true),
+            entered: entered_tx,
+            gate: Mutex::new(gate_rx),
+        });
         let t = target("race", 0);
         slots.begin_prefill(&t, 100);
         let slot = Arc::new(KvRequestSlot::new(slots.clone(), t.clone(), 100, None));
 
-        // Parking the report here fixes the interleaving the bug needed: the
-        // state check has passed and the total has not been touched yet.
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
-        let gate_rx = Mutex::new(gate_rx);
-        *slot.pause.lock() = Some(Arc::new(move || {
-            let _ = entered_tx.send(());
-            let gate = gate_rx.lock();
-            let _ = gate.recv();
-        }));
-
+        // The report reaches the ledger adjustment with its state check behind it.
         let reporter = {
             let slot = slot.clone();
             std::thread::spawn(move || slot.apply_prefill_progress(300))
         };
         entered_rx
             .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("report enters the slot");
+            .expect("report reaches the adjustment");
 
-        // The cancel finishes before the report is allowed to continue, so the
-        // order is fixed rather than raced.
-        slot.release();
+        // A cancel must not slip past it: it owns the same charge.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let canceller = {
+            let slot = slot.clone();
+            std::thread::spawn(move || {
+                slot.release();
+                let _ = done_tx.send(());
+            })
+        };
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(150))
+                .is_err(),
+            "the cancel must wait for the report to finish moving the ledger"
+        );
+
         gate_tx.send(()).expect("open the gate");
         reporter.join().expect("report finishes");
-
+        canceller.join().expect("cancel finishes");
         assert_eq!(
             slots.sample(&t).active_prefill_tokens,
             0,
-            "a cancel during a report must not leave the worker charged"
+            "the request must not stay charged after the cancel"
         );
     }
 
