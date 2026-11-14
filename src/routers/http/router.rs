@@ -6,6 +6,7 @@ use crate::backend::{
     PrepareError,
 };
 use crate::config::types::RetryConfig;
+use crate::core::worker::worker_get;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
     RetryExecutor, Worker, WorkerRegistry, WorkerType,
@@ -365,6 +366,7 @@ impl Router {
                 &worker_urls,
                 ctx.router_config.worker_startup_timeout_secs,
                 ctx.router_config.worker_startup_check_interval_secs,
+                ctx.router_config.api_key.as_deref(),
             )
             .await?;
         }
@@ -404,6 +406,7 @@ impl Router {
             failure_threshold: ctx.router_config.health_check.failure_threshold,
             success_threshold: ctx.router_config.health_check.success_threshold,
         };
+        let worker_api_key: Option<Arc<str>> = ctx.router_config.api_key.as_deref().map(Arc::from);
         let mut kv_worker_info = HashMap::new();
         let (kv_index_supervisor, kv_signal_handle) =
             if let Some((supervisor, mut signals)) = pending_kv_supervisor {
@@ -440,13 +443,15 @@ impl Router {
                         WorkerType::Regular,
                     )
                     .with_circuit_breaker_config(core_cb_config.clone())
-                    .with_health_config(health_config.clone()),
+                    .with_health_config(health_config.clone())
+                    .with_worker_api_key(worker_api_key.clone()),
                 )
             } else {
                 Arc::new(
                     BasicWorker::new(url.clone(), WorkerType::Regular)
                         .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(health_config.clone()),
+                        .with_health_config(health_config.clone())
+                        .with_worker_api_key(worker_api_key.clone()),
                 )
             };
             ctx.worker_registry.register(worker_arc.clone());
@@ -978,10 +983,15 @@ impl Router {
         workers.iter().map(|w| w.url().to_string()).collect()
     }
 
-    pub async fn wait_for_healthy_workers(
+    /// Wait until at least one of `worker_urls` passes its health check.
+    ///
+    /// `api_key` is the bearer token for HTTP health requests. With `None`
+    /// they carry no `Authorization` header.
+    pub(crate) async fn wait_for_healthy_workers(
         worker_urls: &[String],
         worker_startup_timeout_secs: u64,
         worker_startup_check_interval_secs: u64,
+        api_key: Option<&str>,
     ) -> Result<(), String> {
         if worker_urls.is_empty() {
             return Err(
@@ -994,6 +1004,7 @@ impl Router {
             worker_urls,
             worker_startup_timeout_secs,
             worker_startup_check_interval_secs,
+            api_key,
         )
         .await
     }
@@ -1002,6 +1013,7 @@ impl Router {
         worker_urls: &[String],
         worker_startup_timeout_secs: u64,
         worker_startup_check_interval_secs: u64,
+        api_key: Option<&str>,
     ) -> Result<(), String> {
         // Extract unique base URLs (hosts) for health checks
         // This deduplicates DP-aware URLs like http://host:8081@0, @1, @2, @3
@@ -1040,17 +1052,17 @@ impl Router {
             .timeout(Duration::from_secs(2))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        let api_key: Option<Arc<str>> = api_key.map(Arc::from);
+        let mut unhealthy_hosts: Vec<(String, String)> = Vec::new();
 
         loop {
             if start_time.elapsed() > Duration::from_secs(worker_startup_timeout_secs) {
-                error!(
-                    "Timeout {}s waiting for hosts {:?} to become healthy. Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
-                    worker_startup_timeout_secs, unique_hosts_vec
+                let message = format!(
+                    "Timeout {}s waiting for hosts {:?} to become healthy (last health check: {:?}). Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
+                    worker_startup_timeout_secs, unique_hosts_vec, unhealthy_hosts
                 );
-                return Err(format!(
-                    "Timeout {}s waiting for hosts {:?} to become healthy. Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
-                    worker_startup_timeout_secs, unique_hosts_vec
-                ));
+                error!("{}", message);
+                return Err(message);
             }
 
             // Perform health checks only on unique hosts (not per DP rank)
@@ -1058,6 +1070,7 @@ impl Router {
             for base_url in &unique_hosts_vec {
                 let client_clone = client.clone();
                 let url_clone = base_url.clone();
+                let api_key = api_key.clone();
 
                 let check_health = tokio::spawn(async move {
                     if crate::backend::is_grpc_url(&url_clone) {
@@ -1069,7 +1082,10 @@ impl Router {
                         }
                     } else {
                         let health_url = format!("{}/health", url_clone);
-                        match client_clone.get(&health_url).send().await {
+                        match worker_get(&client_clone, &health_url, api_key.as_deref())
+                            .send()
+                            .await
+                        {
                             Ok(res) => {
                                 if res.status().is_success() {
                                     None
@@ -1088,7 +1104,7 @@ impl Router {
             // Wait for all health checks to complete
             let results = futures::future::join_all(health_checks).await;
 
-            let mut unhealthy_hosts = Vec::new();
+            unhealthy_hosts.clear();
             let mut healthy_host_count = 0;
 
             for result in results {
@@ -1179,7 +1195,12 @@ impl Router {
             };
         }
 
-        let request_builder = self.client.get(format!("{}/health", health_url));
+        let request_builder = worker_get(
+            &self.client,
+            &format!("{}/health", health_url),
+            self.api_key.as_deref(),
+        )
+        .timeout(Duration::from_secs(self.health_config.timeout_secs));
 
         let response = match request_builder.send().await {
             Ok(res) => {
@@ -2233,27 +2254,38 @@ impl Router {
         crate::backend::classify_worker_urls(&urls)?;
 
         let start_time = std::time::Instant::now();
+        let startup_timeout = Duration::from_secs(self.worker_startup_timeout_secs);
+        let health_timeout = Duration::from_secs(self.health_config.timeout_secs);
+        let check_interval = Duration::from_secs(self.worker_startup_check_interval_secs);
+        let remaining = || startup_timeout.saturating_sub(start_time.elapsed());
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.worker_startup_timeout_secs))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        let worker_api_key: Option<Arc<str>> = self.api_key.as_deref().map(Arc::from);
+        let mut last_health_error = String::from("none");
 
         loop {
-            if start_time.elapsed() > Duration::from_secs(self.worker_startup_timeout_secs) {
-                error!(
-                    "Timeout {}s waiting for worker {} to become healthy. Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
-                    self.worker_startup_timeout_secs, worker_url
+            // Probes and retry sleeps stop at the startup timeout.
+            let budget = remaining();
+            if budget.is_zero() {
+                let message = format!(
+                    "Timeout {}s waiting for worker {} to become healthy (last health check: {}). Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
+                    self.worker_startup_timeout_secs, worker_url, last_health_error
                 );
-                return Err(format!(
-                    "Timeout {}s waiting for worker {} to become healthy. Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
-                    self.worker_startup_timeout_secs, worker_url
-                ));
+                error!("{}", message);
+                return Err(message);
             }
 
             let health_result = if crate::backend::is_grpc_url(worker_url) {
-                crate::backend::check_grpc_health(worker_url, Duration::from_secs(2)).await
+                crate::backend::check_grpc_health(worker_url, Duration::from_secs(2).min(budget))
+                    .await
             } else {
-                match client.get(format!("{}/health", worker_url)).send().await {
+                let health_url = format!("{}/health", worker_url);
+                match worker_get(&client, &health_url, self.api_key.as_deref())
+                    .timeout(health_timeout.min(budget))
+                    .send()
+                    .await
+                {
                     Ok(res) if res.status().is_success() => Ok(()),
                     Ok(res) => Err(format!("HTTP health status {}", res.status())),
                     Err(error) => Err(error.to_string()),
@@ -2296,7 +2328,8 @@ impl Router {
                                 WorkerType::Regular,
                             )
                             .with_circuit_breaker_config(self.circuit_breaker_config.clone())
-                            .with_health_config(self.health_config.clone());
+                            .with_health_config(self.health_config.clone())
+                            .with_worker_api_key(worker_api_key.clone());
 
                             let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                             self.worker_registry.register(worker_arc.clone());
@@ -2334,7 +2367,8 @@ impl Router {
                         let new_worker =
                             BasicWorker::new(worker_url.to_string(), WorkerType::Regular)
                                 .with_circuit_breaker_config(self.circuit_breaker_config.clone())
-                                .with_health_config(self.health_config.clone());
+                                .with_health_config(self.health_config.clone())
+                                .with_worker_api_key(worker_api_key.clone());
 
                         let worker_arc = Arc::new(new_worker);
                         self.worker_registry.register(worker_arc.clone());
@@ -2364,6 +2398,7 @@ impl Router {
                 }
                 Err(e) => {
                     debug!("Worker {} health check pending - error: {}", worker_url, e);
+                    last_health_error = e;
 
                     if !worker_url.starts_with("http://")
                         && !worker_url.starts_with("https://")
@@ -2372,10 +2407,7 @@ impl Router {
                         warn!("The worker url {} does not have http or https prefix. Please add the prefix to the url.", worker_url);
                     }
 
-                    tokio::time::sleep(Duration::from_secs(
-                        self.worker_startup_check_interval_secs,
-                    ))
-                    .await;
+                    tokio::time::sleep(check_interval.min(remaining())).await;
                     continue;
                 }
             }
@@ -6814,7 +6846,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_healthy_workers_empty_list() {
         // Empty list will return error immediately
-        let result = Router::wait_for_healthy_workers(&[], 1, 1).await;
+        let result = Router::wait_for_healthy_workers(&[], 1, 1, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no workers provided"));
     }
@@ -6823,7 +6855,8 @@ mod tests {
     async fn test_wait_for_healthy_workers_invalid_urls() {
         // This test will timeout quickly since the URLs are invalid
         let result =
-            Router::wait_for_healthy_workers(&["http://nonexistent:8080".to_string()], 1, 1).await;
+            Router::wait_for_healthy_workers(&["http://nonexistent:8080".to_string()], 1, 1, None)
+                .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Timeout"));
     }
@@ -7126,7 +7159,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_healthy_workers_all_healthy() {
         let (url, _handle) = start_healthy_mock_server().await;
-        let result = Router::wait_for_healthy_workers(&[url], 5, 1).await;
+        let result = Router::wait_for_healthy_workers(&[url], 5, 1, None).await;
         assert!(result.is_ok());
     }
 
@@ -7137,7 +7170,8 @@ mod tests {
         let (healthy_url, _handle) = start_healthy_mock_server().await;
         let unreachable_url = "http://127.0.0.1:1".to_string(); // port 1 is unreachable
 
-        let result = Router::wait_for_healthy_workers(&[healthy_url, unreachable_url], 5, 1).await;
+        let result =
+            Router::wait_for_healthy_workers(&[healthy_url, unreachable_url], 5, 1, None).await;
         assert!(result.is_ok());
     }
 
@@ -7194,7 +7228,7 @@ mod tests {
             .map(|rank| format!("{}@{}", base_url, rank))
             .collect();
 
-        let result = Router::wait_for_healthy_workers(&dp_urls, 5, 1).await;
+        let result = Router::wait_for_healthy_workers(&dp_urls, 5, 1, None).await;
         assert!(result.is_ok());
     }
 
@@ -7220,9 +7254,13 @@ mod tests {
         // ── Step 1: wait_for_healthy_workers (mirrors PdRouterBase::new startup) ──
         // This succeeds because the healthy worker responds immediately,
         // even though the delayed worker is still returning 503.
-        let result =
-            Router::wait_for_healthy_workers(&[healthy_url.clone(), delayed_url.clone()], 10, 1)
-                .await;
+        let result = Router::wait_for_healthy_workers(
+            &[healthy_url.clone(), delayed_url.clone()],
+            10,
+            1,
+            None,
+        )
+        .await;
         assert!(
             result.is_ok(),
             "Startup should succeed with at least one healthy worker"
@@ -7287,5 +7325,233 @@ mod tests {
         assert!(registry.revision() > revision_before_recovery);
 
         health_checker.shutdown().await;
+    }
+
+    /// Helper: start a mock server whose /health returns 200 only for the given
+    /// bearer token, or only without an Authorization header when the key is
+    /// `None`. Anything else gets 401.
+    async fn start_auth_mock_server(
+        api_key: Option<&str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{http::header::AUTHORIZATION, routing::get, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let expected = api_key.map(|key| format!("Bearer {key}"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = AxumRouter::new().route(
+            "/health",
+            get(move |headers: HeaderMap| async move {
+                let sent = headers.get(AUTHORIZATION).map(|value| value.as_bytes());
+                if sent == expected.as_deref().map(str::as_bytes) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    /// Helper: start a server that accepts connections and never answers.
+    /// Also returns the number of connections it has accepted.
+    async fn start_silent_mock_server() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let handle = tokio::spawn(async move {
+            let mut connections = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                connections.push(stream);
+            }
+        });
+        (format!("http://{}", addr), accepted, handle)
+    }
+
+    /// Helper: build a regular router over `worker_urls`.
+    async fn start_router(
+        config: crate::config::RouterConfig,
+        worker_urls: Vec<String>,
+    ) -> (Router, Arc<crate::server::AppContext>) {
+        let ctx = Arc::new(
+            crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
+        );
+        let router = Router::new(worker_urls, &ctx).await.unwrap();
+        (router, ctx)
+    }
+
+    /// Run the startup wait, add_worker, the periodic check and
+    /// send_health_check against workers that accept only `api_key`.
+    async fn assert_health_checks_pass(api_key: Option<&str>, dp_size: usize) {
+        use crate::config::RouterConfig;
+
+        let (startup_url, startup_server) = start_auth_mock_server(api_key).await;
+        let (added_url, added_server) = start_auth_mock_server(api_key).await;
+        let config = RouterConfig {
+            api_key: api_key.map(str::to_owned),
+            intra_node_data_parallel_size: dp_size,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            ..Default::default()
+        };
+
+        let (router, ctx) = start_router(config, vec![startup_url.clone()]).await;
+        router.add_worker(&added_url).await.unwrap();
+
+        for base_url in [&startup_url, &added_url] {
+            for rank in 0..dp_size {
+                let url = if dp_size > 1 {
+                    format!("{base_url}@{rank}")
+                } else {
+                    base_url.clone()
+                };
+                let worker = ctx
+                    .worker_registry
+                    .get_by_url(&url)
+                    .unwrap_or_else(|| panic!("{url} is not registered"));
+                worker.check_health_async().await.unwrap();
+                let response = router.send_health_check(worker.url()).await;
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+
+        startup_server.abort();
+        added_server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_health_checks_send_api_key() {
+        assert_health_checks_pass(Some("worker-key"), 1).await;
+    }
+
+    #[tokio::test]
+    async fn test_health_checks_send_no_authorization_without_api_key() {
+        assert_health_checks_pass(None, 1).await;
+    }
+
+    #[tokio::test]
+    async fn test_health_checks_send_api_key_dp_aware() {
+        assert_health_checks_pass(Some("worker-key"), 2).await;
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_healthy_workers_reports_rejected_api_key() {
+        use crate::config::RouterConfig;
+
+        let (url, server) = start_auth_mock_server(Some("worker-key")).await;
+
+        let error =
+            Router::wait_for_healthy_workers(std::slice::from_ref(&url), 1, 1, Some("other-key"))
+                .await
+                .unwrap_err();
+        assert!(error.contains("401"), "{error}");
+
+        // add_worker reports the rejected key the same way.
+        let config = RouterConfig {
+            api_key: Some("other-key".to_string()),
+            worker_startup_timeout_secs: 1,
+            worker_startup_check_interval_secs: 1,
+            ..Default::default()
+        };
+        let (router, _ctx) = start_router(config, vec![]).await;
+        let error = router.add_worker(&url).await.unwrap_err();
+        assert!(error.contains("401"), "{error}");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_add_worker_probes_at_health_check_timeout() {
+        use crate::config::{HealthCheckConfig, RouterConfig};
+        use std::sync::atomic::Ordering;
+
+        let (startup_url, startup_server) = start_healthy_mock_server().await;
+        let (silent_url, probes, silent_server) = start_silent_mock_server().await;
+        let config = RouterConfig {
+            worker_startup_timeout_secs: 4,
+            worker_startup_check_interval_secs: 1,
+            health_check: HealthCheckConfig {
+                timeout_secs: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (router, _ctx) = start_router(config, vec![startup_url]).await;
+
+        router.add_worker(&silent_url).await.unwrap_err();
+
+        // A probe that waited for the startup timeout would be the only one.
+        assert!(probes.load(Ordering::SeqCst) >= 2);
+        startup_server.abort();
+        silent_server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_add_worker_stops_at_startup_timeout() {
+        use crate::config::{HealthCheckConfig, RouterConfig};
+
+        let (silent_url, _probes, silent_server) = start_silent_mock_server().await;
+        // The health check timeout and the check interval both exceed the startup timeout.
+        let config = RouterConfig {
+            worker_startup_timeout_secs: 1,
+            worker_startup_check_interval_secs: 30,
+            health_check: HealthCheckConfig {
+                timeout_secs: 30,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (router, _ctx) = start_router(config, vec![]).await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            router.add_worker(&silent_url),
+        )
+        .await
+        .expect("add_worker outlived the startup timeout")
+        .unwrap_err();
+
+        silent_server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_send_health_check_stops_at_health_check_timeout() {
+        use crate::config::{HealthCheckConfig, RouterConfig};
+
+        let (startup_url, startup_server) = start_healthy_mock_server().await;
+        let (silent_url, _probes, silent_server) = start_silent_mock_server().await;
+        let config = RouterConfig {
+            health_check: HealthCheckConfig {
+                timeout_secs: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (router, _ctx) = start_router(config, vec![startup_url]).await;
+
+        // The router's client has no timeout of its own in this test.
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            router.send_health_check(&silent_url),
+        )
+        .await
+        .expect("send_health_check outlived the health check timeout");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        startup_server.abort();
+        silent_server.abort();
     }
 }

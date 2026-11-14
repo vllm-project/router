@@ -15,6 +15,20 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to create worker HTTP client")
 });
 
+/// GET request to a worker, with the router's API key as a bearer token when
+/// one is configured.
+pub(crate) fn worker_get(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = client.get(url);
+    match api_key {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    }
+}
+
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug {
@@ -289,6 +303,7 @@ pub struct WorkerMetadata {
 pub struct BasicWorker {
     metadata: WorkerMetadata,
     dp_size: Option<usize>,
+    api_key: Option<Arc<str>>,
     load_counter: Arc<AtomicUsize>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
@@ -330,6 +345,7 @@ impl BasicWorker {
         Self {
             metadata,
             dp_size: None,
+            api_key: None,
             load_counter: Arc::new(AtomicUsize::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
@@ -352,6 +368,12 @@ impl BasicWorker {
 
     pub fn with_health_config(mut self, config: HealthConfig) -> Self {
         self.metadata.health_config = config;
+        self
+    }
+
+    /// Set the API key sent as a bearer token on this worker's HTTP health checks.
+    pub fn with_worker_api_key(mut self, api_key: Option<Arc<str>>) -> Self {
+        self.api_key = api_key;
         self
     }
 
@@ -416,7 +438,11 @@ impl Worker for BasicWorker {
                 let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
 
                 // Use the shared client with a custom timeout for this request
-                match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
+                match worker_get(&WORKER_CLIENT, &health_url, self.api_key.as_deref())
+                    .timeout(timeout)
+                    .send()
+                    .await
+                {
                     Ok(response) => response.status().is_success(),
                     Err(_) => false,
                 }
@@ -540,6 +566,12 @@ impl DPAwareWorker {
     /// Configure health check settings for this worker
     pub fn with_health_config(mut self, config: HealthConfig) -> Self {
         self.base_worker = self.base_worker.with_health_config(config);
+        self
+    }
+
+    /// Set the API key sent as a bearer token on this worker's HTTP health checks.
+    pub fn with_worker_api_key(mut self, api_key: Option<Arc<str>>) -> Self {
+        self.base_worker = self.base_worker.with_worker_api_key(api_key);
         self
     }
 }
@@ -1082,6 +1114,19 @@ mod tests {
         assert_eq!(worker.metadata().health_config.timeout_secs, 15);
         assert_eq!(worker.metadata().health_config.check_interval_secs, 45);
         assert_eq!(worker.metadata().health_config.endpoint, "/custom-health");
+    }
+
+    #[test]
+    fn test_worker_api_key_is_redacted_from_debug_output() {
+        let api_key = "worker-secret";
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
+            .with_worker_api_key(Some(Arc::from(api_key)));
+        let dp_worker =
+            DPAwareWorker::new("http://test:8080".to_string(), 0, 2, WorkerType::Regular)
+                .with_worker_api_key(Some(Arc::from(api_key)));
+
+        assert!(!format!("{:?}", worker).contains(api_key));
+        assert!(!format!("{:?}", dp_worker).contains(api_key));
     }
 
     // Test Worker trait implementation
