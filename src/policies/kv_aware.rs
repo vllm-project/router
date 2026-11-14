@@ -2381,6 +2381,8 @@ mod tests {
         slots.begin_prefill(&t, 100);
         let slot = Arc::new(KvRequestSlot::new(slots.clone(), t.clone(), 100, None));
 
+        // Parking the report here fixes the interleaving the bug needed: the
+        // state check has passed and the total has not been touched yet.
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
         let gate_rx = Mutex::new(gate_rx);
@@ -2390,7 +2392,6 @@ mod tests {
             let _ = gate.recv();
         }));
 
-        // The report pauses inside the slot, before it takes the lock.
         let reporter = {
             let slot = slot.clone();
             std::thread::spawn(move || slot.apply_prefill_progress(300))
@@ -2399,15 +2400,11 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("report enters the slot");
 
-        // A cancel lands while that report is still in flight.
-        let canceller = {
-            let slot = slot.clone();
-            std::thread::spawn(move || slot.release())
-        };
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // The cancel finishes before the report is allowed to continue, so the
+        // order is fixed rather than raced.
+        slot.release();
         gate_tx.send(()).expect("open the gate");
         reporter.join().expect("report finishes");
-        canceller.join().expect("cancel finishes");
 
         assert_eq!(
             slots.sample(&t).active_prefill_tokens,
