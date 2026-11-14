@@ -795,7 +795,7 @@ mod test_pd_routing {
 
         for (mode, policy) in test_cases {
             let config = RouterConfig {
-                    mode,
+                mode,
                 pd_kv_event_sources: Default::default(),
                 policy,
                 host: "127.0.0.1".to_string(),

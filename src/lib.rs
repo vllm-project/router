@@ -414,7 +414,7 @@ impl Router {
         request_timeout_secs: u64,
         request_id_headers: Option<Vec<String>>,
         vllm_pd_disaggregation: bool,
-            vllm_discovery_address: Option<String>,
+        vllm_discovery_address: Option<String>,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
         prefill_policy: Option<PolicyType>,
