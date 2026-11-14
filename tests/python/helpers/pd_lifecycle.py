@@ -69,6 +69,35 @@ async def request(session, url, model, mode, sequence):
                     raise ValueError(
                         "first text already finished; cancellation untested"
                     )
+                # is_eof includes unread buffered bytes, unlike at_eof().
+                if response.content.is_eof():
+                    raise ValueError("response already at EOF; cancellation untested")
+                buffered = response.content.read_nowait()
+                for pending in buffered.splitlines():
+                    pending = pending.strip()
+                    if not pending or pending.startswith(b":"):
+                        continue
+                    if not pending.startswith(b"data:"):
+                        raise ValueError(
+                            "buffered SSE is incomplete; cancellation untested"
+                        )
+                    data = pending[5:].strip()
+                    if data == b"[DONE]":
+                        raise ValueError(
+                            "completion already buffered; cancellation untested"
+                        )
+                    event = json.loads(data)
+                    if not isinstance(event, dict) or "error" in event:
+                        raise ValueError("invalid buffered SSE completion")
+                    choices = event.get("choices", [])
+                    if not isinstance(choices, list) or any(
+                        not isinstance(c, dict) for c in choices
+                    ):
+                        raise ValueError("invalid buffered SSE choices")
+                    if any(c.get("finish_reason") is not None for c in choices):
+                        raise ValueError(
+                            "completion already buffered; cancellation untested"
+                        )
                 # Closing an unfinished response disconnects the HTTP client. This
                 # alone does not prove that the engine propagated the abort.
                 response.close()

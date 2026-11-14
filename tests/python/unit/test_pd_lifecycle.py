@@ -57,6 +57,15 @@ async def exercise(fault=None, output=None, cli=False):
             if fault == "bad_finish":
                 await chunk("blue", "abort")
                 return response
+            if fault in ("buffered_eof", "buffered_done"):
+                await response.write(
+                    b'data: {"choices":[{"text":"blue","finish_reason":null}]}\n\n'
+                    b'data: {"choices":[{"text":"","finish_reason":"stop"}]}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+                if fault == "buffered_done":
+                    await asyncio.sleep(0.02)  # terminal SSE buffered before HTTP EOF
+                return response
             await chunk("blue", "stop" if fault == "already_done" else None)
             if fault == "truncated":
                 return response
@@ -151,6 +160,8 @@ def test_success_and_progress_after_disconnect():
         "truncated",
         "stall",
         "already_done",
+        "buffered_eof",
+        "buffered_done",
         "recovery",
     ],
 )
