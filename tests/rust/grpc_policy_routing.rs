@@ -360,10 +360,10 @@ async fn probe_target(router: &Router, servers: &[MockVllmRsServer], body: Value
     target
 }
 
-/// A report has to move the routing, and cancelling the stream has to give back a
-/// charge that is not zero yet.
+/// A report has to move the routing, and a cancelled stream has to stop weighing on
+/// it. The charge itself is checked by the unit case, not here.
 #[tokio::test]
-async fn a_report_moves_the_routing_and_a_cancel_clears_what_is_left() {
+async fn a_report_moves_the_routing_and_a_cancel_removes_its_weight() {
     // `a` starts cheap and then reports far more work than it was admitted with;
     // `b` holds a stream that owes exactly what it was admitted with.
     let a = MockVllmRsServer::spawn_with_state(MockVllmRs {
@@ -428,15 +428,16 @@ async fn a_report_moves_the_routing_and_a_cancel_clears_what_is_left() {
         "the reported prefill should make `a` the more expensive worker"
     );
 
-    // Cancelling `a` clears the 1500 it reported, so it becomes the cheap one
-    // again. If the cancel left that charge behind, routing would keep choosing `b`.
+    // Cancelling `a` takes its weight out of the routing. This does not isolate the
+    // charge it reported: the score also weighs request counts, so the ledger case
+    // is the one that pins the release.
     drop(streamed);
     tokio::time::sleep(Duration::from_millis(100)).await;
     for _ in 0..10 {
         assert_eq!(
             probe_target(&router, &servers, prompt(&[10], json!({ "stream": true }))).await,
             0,
-            "the cancelled request must release the charge it reported"
+            "the cancelled stream must stop weighing on the routing"
         );
     }
     drop(held_b);
