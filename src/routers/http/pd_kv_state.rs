@@ -491,6 +491,56 @@ impl PdKvState {
         })
     }
 
+    /// Whether credit may be used for one base.
+    ///
+    /// `credit_fallback` returns the *reason* credit is refused, or `None` when it is
+    /// allowed. Both preparation paths call this instead of testing the option themselves,
+    /// because one of them had the polarity backwards and refused every eligible request.
+    fn credit_eligible(cache_salt: Option<&str>, model_verified: bool) -> bool {
+        KvAwarePolicy::credit_fallback(cache_salt, model_verified).is_none()
+    }
+
+    /// Whether **every** candidate can actually be priced.
+    ///
+    /// Two conditions, because they are checked in different places: the base must be
+    /// allowed to claim credit (salt and model identity) *and* its binding must carry a
+    /// cache key. A base whose model is merely advertised passes the first check but has no
+    /// index to match against, and pricing then falls back after the render has been paid
+    /// for. `decode_context_from_results` needs an estimate for every candidate, so the
+    /// caller must require the whole set rather than any member.
+    async fn all_priceable(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        cache_salt: Option<&str>,
+        allow_credit: &HashMap<String, bool>,
+    ) -> bool {
+        if workers.is_empty() {
+            return false;
+        }
+        let bindings = self.bindings.lock().await;
+        workers.iter().all(|worker| {
+            let base = worker.base_url();
+            if !Self::credit_eligible(cache_salt, allow_credit.get(base).copied().unwrap_or(false))
+            {
+                return false;
+            }
+            let Some(info) = bindings.get(base).and_then(|binding| binding.info.as_ref()) else {
+                return false;
+            };
+            if info.cache_key.is_none() {
+                return false;
+            }
+            // Registering a policy target also needs this rank in the source list, and an
+            // unranked worker counts as rank 0 there - the same convention here, or a source
+            // covering only rank 1 would pass this check and still fall back after render.
+            let rank = worker.dp_rank().unwrap_or(0) as u32;
+            if !info.ranks.is_empty() && !info.ranks.contains(&rank) {
+                return false;
+            }
+            true
+        })
+    }
+
     /// Whether any of `workers` is configured to publish KV events.
     ///
     /// Binding a pool that publishes nothing is not merely wasteful: the bind
@@ -498,9 +548,23 @@ impl PdKvState {
     /// makes every live session binding look stale. So the Decode pool is
     /// recorded for binding only when it has something to subscribe to.
     pub(super) fn publishes_for(&self, workers: &[Arc<dyn Worker>]) -> bool {
-        workers
+        if workers
             .iter()
             .any(|worker| self.published.contains(worker.base_url()))
+        {
+            return true;
+        }
+        // A source discovered through the worker's control interface has no static URL.
+        // Ask the bindings that actually exist, or discovery would subscribe, bind, and
+        // still never be priced.
+        let Ok(bindings) = self.bindings.try_lock() else {
+            return false;
+        };
+        workers.iter().any(|worker| {
+            bindings
+                .get(worker.base_url())
+                .is_some_and(|binding| binding.info.is_some())
+        })
     }
 
     /// Record the Decode pool the request path saw, so the refresh loop binds
@@ -531,6 +595,115 @@ impl PdKvState {
             .iter()
             .map(|(base, binding)| (base.clone(), Self::credit_allowed(binding, model)))
             .collect()
+    }
+
+    /// Prepare both stages for one request.
+    ///
+    /// Rendering runs for both pools at once, because it is the only network work here;
+    /// estimation is local and walks the rendered prompts once, sharing one hash cache and
+    /// one credit decision. Awaiting one pool and then the other made two slow backends add
+    /// up in admission latency.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn prepare_stages(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        prefill_policy: &Arc<dyn LoadBalancingPolicy>,
+        decode_workers: &[Arc<dyn Worker>],
+        decode_policy: &Arc<dyn LoadBalancingPolicy>,
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
+        defer_decode: bool,
+    ) -> (
+        HashMap<String, PdPrefillInput>,
+        Option<HashMap<String, u64>>,
+    ) {
+        let started = Instant::now();
+        {
+            let mut inputs = self.refresh_inputs.lock().await;
+            inputs.prefill = prefill_workers.iter().cloned().collect();
+            inputs.prefill_policy = Some(prefill_policy.clone());
+        }
+        let allow_credit = self.credit_by_base(request).await;
+        let cache_salt = request.get("cache_salt").and_then(Value::as_str);
+        let bases = |workers: &[Arc<dyn Worker>]| -> Vec<String> {
+            workers
+                .iter()
+                .map(|worker| worker.base_url().to_owned())
+                .collect()
+        };
+        // Decide whether any Decode candidate can be credited *before* rendering: a salted
+        // request, an unverified identity or a pool that publishes no events all end with
+        // the rendered result discarded, and the render is the slow part.
+        // A deferred decision only picks a provisional worker here and re-prices at commit,
+        // so rendering and pricing Decode now would be discarded - and could stall admission
+        // on a slow backend for nothing.
+        // A candidate can only be priced when its base is creditable. `decode_context_from_
+        // results` needs an estimate for every candidate, so pricing with a partial set
+        // always falls back - after paying for the slowest render. Require the whole set.
+        let decode_expected = !defer_decode && kv_aware_ops(decode_policy.as_ref()).is_some();
+        let decode_priced_here = decode_expected
+            && self
+                .all_priceable(decode_workers, cache_salt, &allow_credit)
+                .await;
+        let (prefill_results, decode_results) = tokio::join!(
+            self.tokenize(
+                bases(prefill_workers),
+                request,
+                route,
+                headers,
+                router_prompts
+            ),
+            async {
+                if decode_priced_here {
+                    self.tokenize(
+                        bases(decode_workers),
+                        request,
+                        route,
+                        headers,
+                        router_prompts,
+                    )
+                    .await
+                } else {
+                    HashMap::new()
+                }
+            },
+        );
+        // The index mixes the adapter name into the block hash, so hashing as the base
+        // model cannot match a cached LoRA prefix.
+        let lora_name = request
+            .get(crate::backend::preprocess::NAMED_LORA_FIELD)
+            .and_then(Value::as_str);
+        let mut hashes = PromptHashes::new();
+        let mut prepared = Self::build_prefill_inputs(request, &allow_credit, prefill_results);
+        if let Some(kv) = kv_aware_ops(prefill_policy.as_ref()) {
+            Self::attach_prefill_work(kv, prefill_workers, &mut prepared, lora_name, &mut hashes);
+        }
+        // One eligibility decision for both stages, so the two cannot diverge.
+
+        let decode_context = if decode_priced_here {
+            let kv = kv_aware_ops(decode_policy.as_ref()).expect("priced decode policy");
+            Self::decode_context_from_results(
+                kv,
+                decode_workers,
+                &allow_credit,
+                &decode_results,
+                lora_name,
+                &mut hashes,
+            )
+        } else {
+            // Only a request that meant to price Decode and could not is "unbound". A
+            // deferred decision skips pricing here by design and prices at commit, so
+            // counting it would flag a normal path in the diagnostic metric.
+            if decode_expected {
+                crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
+            }
+            None
+        };
+        metrics::histogram!("vllm_router_pd_kv_prepare_seconds")
+            .record(started.elapsed().as_secs_f64());
+        (prepared, decode_context)
     }
 
     /// Render the request against each base, or reuse the router's own ids.
@@ -593,6 +766,7 @@ impl PdKvState {
         kv: &dyn KvAwareOps,
         workers: &[Arc<dyn Worker>],
         prepared: &mut HashMap<String, PdPrefillInput>,
+        lora_name: Option<&str>,
         hashes: &mut PromptHashes,
     ) {
         let inputs: Vec<_> = workers
@@ -608,7 +782,7 @@ impl PdKvState {
             .collect();
         let work: Vec<_> = inputs
             .iter()
-            .zip(kv.estimate_prefill_work(&inputs, hashes))
+            .zip(kv.estimate_prefill_work_with_lora(&inputs, lora_name, hashes))
             .map(|((worker, _, _), estimate)| {
                 (worker.base_url().to_owned(), worker.dp_rank(), estimate)
             })
@@ -630,7 +804,7 @@ impl PdKvState {
         workers: &[Arc<dyn Worker>],
         allow_credit: &HashMap<String, bool>,
         results: &HashMap<String, Result<crate::backend::preprocess::HttpTokenInput, &'static str>>,
-        sequences: u32,
+        lora_name: Option<&str>,
         hashes: &mut PromptHashes,
     ) -> Option<HashMap<String, u64>> {
         let inputs: Vec<_> = workers
@@ -657,7 +831,7 @@ impl PdKvState {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unpriced");
             return None;
         }
-        let work = kv.estimate_decode_work(&inputs, sequences, hashes);
+        let work = kv.estimate_decode_work_with_lora(&inputs, lora_name, hashes);
         let mut context = HashMap::with_capacity(work.len());
         for ((worker, _, _), estimate) in inputs.iter().zip(work) {
             context.insert(worker.url().to_owned(), estimate.additional_tokens?);
@@ -665,7 +839,13 @@ impl PdKvState {
         Some(context)
     }
 
+    /// Same, with a hash cache the caller may share with the Prefill estimate so one
+    /// request hashes its prompt once.
     #[allow(clippy::too_many_arguments)]
+    /// Marginal Decode context per candidate, priced against the KV index.
+    /// `hashes` is the caller's cache: the admission path shares it with the
+    /// Prefill estimate, while the deferred commit starts a fresh one because it
+    /// prices against the index as it stands at commit time.
     pub(super) async fn prepare_decode_context(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -674,8 +854,14 @@ impl PdKvState {
         route: &str,
         headers: Option<&HeaderMap>,
         router_prompts: Option<&Arc<[Vec<u32>]>>,
-        sequences: u32,
     ) -> Option<HashMap<String, u64>> {
+        // The only caller is the deferred commit, which prices against the index as it
+        // stands now, so this owns its cache. The admission path shares one cache across both
+        // stages through `prepare_stages`.
+        let hashes = &mut PromptHashes::new();
+        let lora_name = request
+            .get(crate::backend::preprocess::NAMED_LORA_FIELD)
+            .and_then(Value::as_str);
         let kv = kv_aware_ops(policy.as_ref())?;
         let allow_credit = self.credit_by_base(request).await;
         // A salted request must not be credited with unsalted blocks: the same rule
@@ -684,16 +870,9 @@ impl PdKvState {
         // Nothing to price unless some Decode base can be credited. Checking
         // first keeps the render fan-out and the hash walk off the request path
         // for every deployment whose Decode pool publishes no KV events.
-        if !workers.iter().any(|worker| {
-            KvAwarePolicy::credit_fallback(
-                cache_salt,
-                allow_credit
-                    .get(worker.base_url())
-                    .copied()
-                    .unwrap_or(false),
-            )
-            .is_some()
-        }) {
+        // Same rule as the admission path: rendering a partial set always ends in a
+        // fallback, and the render is the slow part.
+        if !self.all_priceable(workers, cache_salt, &allow_credit).await {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
             return None;
         }
@@ -704,107 +883,14 @@ impl PdKvState {
         let results = self
             .tokenize(bases, request, route, headers, router_prompts)
             .await;
-        Self::decode_context_from_results(
-            kv,
-            workers,
-            &allow_credit,
-            &results,
-            sequences,
-            &mut PromptHashes::new(),
-        )
-    }
-
-    /// Prefill inputs and, when the Decode pool can be priced, its marginal
-    /// context - both computed from one hash cache.
-    ///
-    /// This is the KV-aware-prefill path. The other shape, a count-based
-    /// Prefill with a KV-aware Decode, goes through [`Self::prepare`] plus
-    /// [`Self::prepare_decode_context`] instead: the Prefill stage has no work
-    /// estimate to share there, so there is nothing to co-schedule.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn prepare_pair(
-        &self,
-        prefill_workers: &[Arc<dyn Worker>],
-        prefill_policy: &Arc<dyn LoadBalancingPolicy>,
-        decode_workers: &[Arc<dyn Worker>],
-        decode_policy: &Arc<dyn LoadBalancingPolicy>,
-        request: &Value,
-        route: &str,
-        headers: Option<&HeaderMap>,
-        router_prompts: Option<&Arc<[Vec<u32>]>>,
-        sequences: u32,
-    ) -> (
-        HashMap<String, PdPrefillInput>,
-        Option<HashMap<String, u64>>,
-    ) {
-        let started = Instant::now();
-        {
-            let mut inputs = self.refresh_inputs.lock().await;
-            inputs.prefill = prefill_workers.iter().cloned().collect();
-            inputs.prefill_policy = Some(prefill_policy.clone());
-        }
-        let allow_credit = self.credit_by_base(request).await;
-        let decode_priced = kv_aware_ops(decode_policy.as_ref()).is_some()
-            && decode_workers.iter().any(|worker| {
-                allow_credit
-                    .get(worker.base_url())
-                    .copied()
-                    .unwrap_or(false)
-            });
-        if !decode_priced {
-            crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
-        }
-        let prefill_bases: Vec<_> = prefill_workers
-            .iter()
-            .map(|worker| worker.base_url().to_owned())
-            .collect();
-        let decode_bases: Vec<_> = decode_workers
-            .iter()
-            .map(|worker| worker.base_url().to_owned())
-            .collect();
-        // Renders run together: they are network work over disjoint bases, and
-        // serialising them would add a whole fan-out to request latency. They
-        // compute no hashes, so nothing is shared across a mutable borrow here.
-        let (prefill_results, decode_results) = tokio::join!(
-            self.tokenize(prefill_bases, request, route, headers, router_prompts),
-            async {
-                if decode_priced {
-                    self.tokenize(decode_bases, request, route, headers, router_prompts)
-                        .await
-                } else {
-                    HashMap::new()
-                }
-            },
-        );
-        // One hash cache for both stages: the Decode estimate walks the same
-        // prompt with the same block size, so hashing it twice would be pure
-        // duplication, linear in prompt length, on the admission path.
-        let mut hashes = PromptHashes::new();
-        let mut prepared = Self::build_prefill_inputs(request, &allow_credit, prefill_results);
-        if let Some(kv) = kv_aware_ops(prefill_policy.as_ref()) {
-            Self::attach_prefill_work(kv, prefill_workers, &mut prepared, &mut hashes);
-        }
-        let decode_context = if decode_priced {
-            kv_aware_ops(decode_policy.as_ref()).and_then(|kv| {
-                Self::decode_context_from_results(
-                    kv,
-                    decode_workers,
-                    &allow_credit,
-                    &decode_results,
-                    sequences,
-                    &mut hashes,
-                )
-            })
-        } else {
-            None
-        };
-        metrics::histogram!("vllm_router_pd_kv_prepare_seconds")
-            .record(started.elapsed().as_secs_f64());
-        (prepared, decode_context)
+        Self::decode_context_from_results(kv, workers, &allow_credit, &results, lora_name, hashes)
     }
 
     /// `router_prompts` are the router's own token ids for `grpc://` pools;
     /// HTTP pools pass `None` and render through each backend.
+    /// Kept for callers that prepare one stage on its own; the request path uses
+    /// [`Self::prepare_with`] so both stages share one hash cache.
+    #[allow(dead_code)]
     pub(super) async fn prepare(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -813,6 +899,31 @@ impl PdKvState {
         route: &str,
         headers: Option<&HeaderMap>,
         router_prompts: Option<&Arc<[Vec<u32>]>>,
+    ) -> HashMap<String, PdPrefillInput> {
+        self.prepare_with(
+            workers,
+            policy,
+            request,
+            route,
+            headers,
+            router_prompts,
+            &mut PromptHashes::new(),
+        )
+        .await
+    }
+
+    /// Same, with a hash cache the caller may share with the Decode estimate so one
+    /// request hashes its prompt once.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn prepare_with(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
+        hashes: &mut PromptHashes,
     ) -> HashMap<String, PdPrefillInput> {
         let started = Instant::now();
         {
@@ -830,7 +941,10 @@ impl PdKvState {
             .await;
         let mut prepared = Self::build_prefill_inputs(request, &allow_credit, results);
         if let Some(kv) = kv_aware_ops(policy.as_ref()) {
-            Self::attach_prefill_work(kv, workers, &mut prepared, &mut PromptHashes::new());
+            let lora_name = request
+                .get(crate::backend::preprocess::NAMED_LORA_FIELD)
+                .and_then(Value::as_str);
+            Self::attach_prefill_work(kv, workers, &mut prepared, lora_name, hashes);
         }
         metrics::histogram!("vllm_router_pd_kv_prepare_seconds")
             .record(started.elapsed().as_secs_f64());
@@ -848,6 +962,102 @@ impl Drop for PdKvState {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod kv_input_tests {
     use super::*;
+
+    fn decode_worker(base: &str) -> Arc<dyn Worker> {
+        Arc::new(BasicWorker::new(base.to_string(), WorkerType::Decode))
+    }
+
+    fn bound(info: Option<WorkerKvInfo>) -> Binding {
+        Binding {
+            signature: "s".to_string(),
+            checked: Instant::now(),
+            info,
+            base_models: HashSet::from(["m".to_string()]),
+            probe_failures: 0,
+        }
+    }
+
+    /// One unpriceable candidate must not silence credit for the rest **if it is filtered
+    /// out first**, and `all_priceable` must reject a set that still contains it. This is the
+    /// pair of behaviours that kept a healthy-but-mismatched worker from disabling credit.
+    #[tokio::test]
+    async fn pricing_requires_every_remaining_candidate_to_be_bound() {
+        let state = PdKvState::new(Client::new());
+        let bound_worker = decode_worker("http://d0");
+        let unbound_worker = decode_worker("http://d1");
+        {
+            let mut bindings = state.bindings.lock().await;
+            bindings.insert(
+                bound_worker.base_url().to_string(),
+                bound(Some(WorkerKvInfo {
+                    instance_id: "i".to_string(),
+                    block_size: Some(16),
+                    ranks: vec![0],
+                    cache_key: Some(crate::kv_index::discovery::CacheKey {
+                        model: "m".into(),
+                        hash_mode: crate::kv_index::HashMode::Sha256,
+                        block_size: 16,
+                    }),
+                })),
+            );
+        }
+        let allow = HashMap::from([
+            (bound_worker.base_url().to_string(), true),
+            (unbound_worker.base_url().to_string(), true),
+        ]);
+
+        assert!(
+            state
+                .all_priceable(std::slice::from_ref(&bound_worker), None, &allow)
+                .await,
+            "a bound candidate is priceable"
+        );
+        assert!(
+            !state
+                .all_priceable(&[bound_worker, unbound_worker], None, &allow)
+                .await,
+            "a candidate without a cache key still makes the whole set unpriceable"
+        );
+    }
+
+    /// A source discovered through the worker's control interface has no static URL.
+    /// Answering from the static set alone made discovery useless: the subscription
+    /// succeeded, the binding existed, and the request path still skipped Decode pricing.
+    #[tokio::test]
+    async fn bound_decode_source_is_priceable_without_a_static_url() {
+        let state = PdKvState::new(Client::new());
+        let decode = decode_worker("http://d0");
+        assert!(
+            !state.publishes_for(std::slice::from_ref(&decode)),
+            "no static URL and no binding means nothing to price"
+        );
+
+        {
+            let mut bindings = state.bindings.lock().await;
+            bindings.insert(
+                decode.base_url().to_string(),
+                bound(Some(WorkerKvInfo {
+                    instance_id: "i".to_string(),
+                    block_size: Some(16),
+                    ranks: vec![0],
+                    cache_key: None,
+                })),
+            );
+        }
+        assert!(
+            state.publishes_for(std::slice::from_ref(&decode)),
+            "a bound source must be priced even without a static URL"
+        );
+
+        {
+            let mut bindings = state.bindings.lock().await;
+            bindings.insert(decode.base_url().to_string(), bound(None));
+        }
+        assert!(
+            !state.publishes_for(&[decode]),
+            "a binding without cache identity is not priceable"
+        );
+    }
     use crate::core::{BasicWorker, WorkerType};
     use crate::policies::{kv_aware_ops, KvAwarePolicy, PromptHashes};
     use axum::extract::Request;

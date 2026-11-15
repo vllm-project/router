@@ -71,7 +71,8 @@ pub struct PrefillWorkEstimate {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DecodeWorkEstimate {
     /// Logical context tokens the candidate must newly allocate: the prompt
-    /// once per sampling sequence, less the device blocks it already holds.
+    /// once per request - sequences share that copy - less the device blocks it already
+    /// holds.
     /// `None` when its cache identity is unverified, so the caller falls back
     /// to plain occupancy instead of comparing a credited figure against a
     /// full-price one.
@@ -123,7 +124,22 @@ pub trait KvAwareOps: Send + Sync {
     fn estimate_decode_work(
         &self,
         inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
-        sequences: u32,
+        hashes: &mut PromptHashes,
+    ) -> Vec<DecodeWorkEstimate>;
+    /// [`Self::estimate_prefill_work`], hashing under `lora_name` when the request carries an
+    /// adapter: the index mixes the adapter into the block hash, so the base namespace cannot
+    /// match a cached LoRA prefix.
+    fn estimate_prefill_work_with_lora(
+        &self,
+        inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
+        lora_name: Option<&str>,
+        hashes: &mut PromptHashes,
+    ) -> Vec<PrefillWorkEstimate>;
+    /// [`Self::estimate_decode_work`], hashing under `lora_name`.
+    fn estimate_decode_work_with_lora(
+        &self,
+        inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
+        lora_name: Option<&str>,
         hashes: &mut PromptHashes,
     ) -> Vec<DecodeWorkEstimate>;
     fn pick_prefill(&self, costs: &[f64], occupancy: &[usize]) -> Option<usize>;
@@ -1862,6 +1878,15 @@ impl KvAwareOps for KvAwarePolicy {
         inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
         hashes: &mut PromptHashes,
     ) -> Vec<PrefillWorkEstimate> {
+        self.estimate_prefill_work_with_lora(inputs, None, hashes)
+    }
+
+    fn estimate_prefill_work_with_lora(
+        &self,
+        inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
+        lora_name: Option<&str>,
+        hashes: &mut PromptHashes,
+    ) -> Vec<PrefillWorkEstimate> {
         let mut query_cache = HashMap::new();
         inputs
             .iter()
@@ -1875,10 +1900,19 @@ impl KvAwareOps for KvAwarePolicy {
                 let mut new_prefill_tokens = 0u64;
                 for (index, tokens) in prompts.iter().enumerate() {
                     let hits = if verified {
-                        let key = (binding.cache_key.clone(), index);
+                        // Keyed by the prompt content that this backend actually rendered:
+                        // two backends can render the same request into different ids, and
+                        // a position-only key would hand the second one the first one's
+                        // query.
+                        let key = (binding.cache_key.clone(), prompt_fingerprint(tokens));
                         if !query_cache.contains_key(&key) {
-                            let local =
-                                Self::hashes_for(hashes, binding.block_size, None, prompts, index);
+                            let local = Self::hashes_for(
+                                hashes,
+                                binding.block_size,
+                                lora_name,
+                                prompts,
+                                index,
+                            );
                             let found = Self::placement_matches_with(&binding, local);
                             query_cache.insert(key.clone(), found);
                         }
@@ -1910,7 +1944,8 @@ impl KvAwareOps for KvAwarePolicy {
             .collect()
     }
 
-    /// Marginal Decode context: the prompt, once per sampling sequence, less
+    /// Marginal Decode context: the prompt, once per request (sequences share one copy of
+    /// its blocks), less
     /// the device blocks this candidate already holds.
     ///
     /// The engine's `get_num_new_matched_tokens` subtracts its own block-aligned
@@ -1923,10 +1958,17 @@ impl KvAwareOps for KvAwarePolicy {
     fn estimate_decode_work(
         &self,
         inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
-        sequences: u32,
         hashes: &mut PromptHashes,
     ) -> Vec<DecodeWorkEstimate> {
-        let sequences = u64::from(sequences.max(1));
+        self.estimate_decode_work_with_lora(inputs, None, hashes)
+    }
+
+    fn estimate_decode_work_with_lora(
+        &self,
+        inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
+        lora_name: Option<&str>,
+        hashes: &mut PromptHashes,
+    ) -> Vec<DecodeWorkEstimate> {
         let mut query_cache = HashMap::new();
         inputs
             .iter()
@@ -1935,16 +1977,30 @@ impl KvAwareOps for KvAwarePolicy {
                 if !credit || binding.cache_key.is_none() {
                     return DecodeWorkEstimate::default();
                 }
+                // Decode occupancy shrinks only by blocks already on the device. A prefix
+                // that lives in host memory or on disk still needs a GPU block when it
+                // arrives, so the tiered credits must not discount it: that would understate
+                // the new occupancy and can pick a busier worker. Prefill keeps the tiered
+                // credits, because there they avoid recompute.
                 let params = CostParams {
                     block_size: binding.block_size,
+                    transfer_credits: TransferCredits {
+                        host_pinned: 0.0,
+                        external: 0.0,
+                        disk: 0.0,
+                        ..self.params.transfer_credits
+                    },
                     ..self.params
                 };
                 let mut additional = 0u64;
                 for (index, tokens) in prompts.iter().enumerate() {
-                    let key = (binding.cache_key.clone(), index);
+                    // Content, not position: two backends can render the same request into
+                    // different ids, and a position-only key would reuse the other
+                    // backend's match.
+                    let key = (binding.cache_key.clone(), prompt_fingerprint(tokens));
                     if !query_cache.contains_key(&key) {
                         let local =
-                            Self::hashes_for(hashes, binding.block_size, None, prompts, index);
+                            Self::hashes_for(hashes, binding.block_size, lora_name, prompts, index);
                         let found = Self::placement_matches_with(&binding, local);
                         query_cache.insert(key.clone(), found);
                     }
@@ -1965,11 +2021,14 @@ impl KvAwareOps for KvAwarePolicy {
                         },
                         &params,
                     );
-                    additional = additional.saturating_add(
-                        context
-                            .saturating_sub(reused.max(0.0) as u64)
-                            .saturating_mul(sequences),
-                    );
+                    // The engine shares one copy of the prompt's blocks across the
+                    // request's sequences, so the marginal cost is the prompt's
+                    // un-cached remainder once - the same amount the ledger charges when
+                    // this request becomes an existing one. Multiplying by `n` here made
+                    // a request cost more before admission than after, so the two sides of
+                    // the comparison disagreed.
+                    additional =
+                        additional.saturating_add(context.saturating_sub(reused.max(0.0) as u64));
                 }
                 DecodeWorkEstimate {
                     additional_tokens: Some(additional),
@@ -2184,6 +2243,7 @@ impl KvAwareOps for KvAwarePolicy {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
     use crate::request_identity::{resolve_affinity_identity, IdentityFields};
     use http::HeaderMap;
     use serde_json::Value as JsonValue;
@@ -3213,10 +3273,27 @@ mod tests {
                 unreachable!("ordinary-only qualification must not enter PD selection")
             }
 
+            fn estimate_prefill_work_with_lora(
+                &self,
+                _inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
+                _lora_name: Option<&str>,
+                _hashes: &mut PromptHashes,
+            ) -> Vec<PrefillWorkEstimate> {
+                unreachable!("ordinary-only qualification must not enter PD selection")
+            }
+
             fn estimate_decode_work(
                 &self,
                 _inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
-                _sequences: u32,
+                _hashes: &mut PromptHashes,
+            ) -> Vec<DecodeWorkEstimate> {
+                unreachable!("ordinary-only qualification must not enter PD selection")
+            }
+
+            fn estimate_decode_work_with_lora(
+                &self,
+                _inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
+                _lora_name: Option<&str>,
                 _hashes: &mut PromptHashes,
             ) -> Vec<DecodeWorkEstimate> {
                 unreachable!("ordinary-only qualification must not enter PD selection")
@@ -4329,7 +4406,6 @@ mod tests {
             .map(|worker| {
                 let estimate = kv_aware_ops(&policy).unwrap().estimate_decode_work(
                     &[(worker.as_ref(), &prompts[..], true)],
-                    1,
                     &mut PromptHashes::new(),
                 );
                 (
@@ -4366,7 +4442,6 @@ mod tests {
         let prompts = vec![ids];
         let estimates = kv_aware_ops(&policy).unwrap().estimate_decode_work(
             &[(workers[0].as_ref(), prompts.as_slice(), false)],
-            1,
             &mut PromptHashes::new(),
         );
         assert_eq!(estimates, vec![DecodeWorkEstimate::default()]);

@@ -248,6 +248,8 @@ Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyon
 
 HTTP Completion uses the existing [Direct/Worker input preparation](http_completion_kv.md), without local tokenizer assets. Unmodeled identities and unqualified targets stay routable without cache credit.
 
+With P/D disaggregation, the Decode stage is priced by the KV it must newly hold, and that price is reduced only by blocks the chosen Decode engine already has on the device; host and disk tiers still need a GPU block on arrival, so they are not credited. Decode credit therefore needs to see the Decode engine's own KV events: keep the Decode pool to `--pd-kv-events` sources configured at start-up. A Decode worker that joins later through service discovery is routable, but it does not receive Decode prefix credit until such a source exists for it.
+
 ```bash
 vllm-router --policy kv_aware \
   --worker-urls grpc://worker1:8000 grpc://worker2:8000

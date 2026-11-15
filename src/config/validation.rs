@@ -356,6 +356,19 @@ impl ConfigValidator {
                         prefill_urls.iter().map(|(url, _)| url.clone()).collect();
                     all.extend(decode_urls.iter().cloned());
                     Self::reject_mixed_worker_urls(&all)?;
+                    // `targets` is keyed by worker URL, so a URL in both pools is bound
+                    // once and the second stage never registers its own targets. Reject the
+                    // configuration rather than silently losing one stage's cache identity.
+                    let prefill: std::collections::HashSet<&String> =
+                        prefill_urls.iter().map(|(url, _)| url).collect();
+                    if let Some(overlap) = decode_urls.iter().find(|url| prefill.contains(url)) {
+                        return Err(ConfigError::ValidationFailed {
+                            reason: format!(
+                                "worker URL {overlap} is listed as both prefill and decode; \
+                                 one worker cannot serve both roles in P/D mode"
+                            ),
+                        });
+                    }
                 }
                 // Discovered P/D workers register as http://, so a grpc://
                 // static pool would end up mixed at runtime.

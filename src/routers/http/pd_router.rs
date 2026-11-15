@@ -81,10 +81,7 @@ impl<'a, 'b> Eligibility<'a, 'b> {
         ));
         worker.is_available()
             && granularity_matches
-            && self
-                .context
-                .model_id
-                .is_none_or(|model| worker.model_id() == "unknown" || worker.model_id() == model)
+            && model_eligible(worker, self.context.model_id)
     }
 
     /// Eligible worker indices for `stage`, with their endpoints in pool order.
@@ -206,6 +203,13 @@ pub(super) fn select_decode_stage(
         decode_policy,
         context,
     )
+}
+
+/// Whether a worker can serve this request model: the part of candidate eligibility that
+/// does not depend on live load. Selection and pricing both use it, so a worker that cannot
+/// be chosen cannot deny credit to the ones that can.
+pub(super) fn model_eligible(worker: &dyn Worker, model_id: Option<&str>) -> bool {
+    model_id.is_none_or(|model| worker.model_id() == "unknown" || worker.model_id() == model)
 }
 
 fn select_stage(
@@ -336,7 +340,19 @@ fn select_stage(
             context.affinity_key.as_ref(),
             context.lora_name,
             context.cache_salt,
-            context.decode_context,
+            // Marginal credit is only usable when the price table covers every candidate
+            // that is eligible right now. A worker that was unavailable when the prices were
+            // taken and recovered since has no entry, and `select_decode` would read the
+            // missing price as zero - making the recovered worker look free.
+            if !decode_tokens_known {
+                None
+            } else {
+                context.decode_context.filter(|prices| {
+                    projected
+                        .iter()
+                        .all(|worker| prices.contains_key(worker.base_url()))
+                })
+            },
         )?;
         (
             pick.index,
@@ -574,6 +590,9 @@ fn build_dp_workers(
 impl PdRouterBase {
     /// `router_prompts` are the router's token ids for `grpc://` pools. HTTP
     /// pools pass `None` and each backend renders the request itself.
+    /// Kept for callers that prepare Prefill on its own; the request path uses
+    /// [`Self::prepare_prefill_inputs_with`] so both stages share one hash cache.
+    #[allow(dead_code)]
     pub(super) async fn prepare_prefill_inputs(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -582,12 +601,42 @@ impl PdRouterBase {
         headers: Option<&HeaderMap>,
         router_prompts: Option<&Arc<[Vec<u32>]>>,
     ) -> Option<HashMap<String, super::pd_types::PdPrefillInput>> {
+        self.prepare_prefill_inputs_with(
+            workers,
+            request,
+            route,
+            headers,
+            router_prompts,
+            &mut crate::policies::PromptHashes::new(),
+        )
+        .await
+    }
+
+    /// Same, with a hash cache the caller may share with the Decode estimate.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn prepare_prefill_inputs_with(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
+        hashes: &mut crate::policies::PromptHashes,
+    ) -> Option<HashMap<String, super::pd_types::PdPrefillInput>> {
         let policy = self.policy_registry.get_prefill_policy();
         if kv_aware_ops(policy.as_ref()).is_some() {
             return Some(
                 self.kv_state
                     .as_ref()?
-                    .prepare(workers, &policy, request, route, headers, router_prompts)
+                    .prepare_with(
+                        workers,
+                        &policy,
+                        request,
+                        route,
+                        headers,
+                        router_prompts,
+                        hashes,
+                    )
                     .await,
             );
         }
@@ -736,8 +785,7 @@ impl PdRouterBase {
         let admitted = if defer {
             self.pd_load.admit_deferred(select)
         } else {
-            self.pd_load
-                .admit_sequences(select, context.decode_sequences, reserve_decode)
+            self.pd_load.admit_probe(select, reserve_decode)
         };
         if let Some((selection, attempt)) = &admitted {
             let deferred = attempt.decode_pending_commit();
@@ -1547,7 +1595,6 @@ impl PdRouterBase {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
-            decode_sequences: 1,
             decode_context: None,
             route: "/health_generate",
         };
@@ -2079,7 +2126,6 @@ mod tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
-            decode_sequences: 1,
             decode_context: None,
             route: "/health_generate",
         };
@@ -2110,7 +2156,6 @@ mod tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
-            decode_sequences: 1,
             decode_context: None,
             route: "/health_generate",
         };
@@ -2876,7 +2921,6 @@ mod admission_tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
-            decode_sequences: 1,
             decode_context: None,
             route: "/v1/completions",
         }
@@ -2943,7 +2987,6 @@ mod admission_tests {
             affinity_key: Some(affinity_key(session)),
             lora_name: None,
             cache_salt: None,
-            decode_sequences: 1,
             decode_context: None,
             route: "/v1/completions",
         }
@@ -3002,7 +3045,7 @@ mod admission_tests {
 
         // The commitment sees the live snapshot and charges exactly once.
         let decision = manager
-            .commit_decode(&attempt, 1, |loads| {
+            .commit_decode(&attempt, |loads| {
                 select_decode_stage(loads, &d, &policy, &context())
             })
             .unwrap();
@@ -3014,7 +3057,7 @@ mod admission_tests {
         );
         // A second commit is a no-op on the books.
         assert!(manager
-            .commit_decode(&attempt, 1, |loads| {
+            .commit_decode(&attempt, |loads| {
                 select_decode_stage(loads, &d, &policy, &context())
             })
             .is_none());
@@ -3048,7 +3091,7 @@ mod admission_tests {
         // A cancelled request closes the unbound state before dispatch.
         attempt.finish_decode();
         assert!(manager
-            .commit_decode(&attempt, 1, |loads| {
+            .commit_decode(&attempt, |loads| {
                 select_decode_stage(loads, &d, &policy, &context())
             })
             .is_none());
@@ -3060,10 +3103,10 @@ mod admission_tests {
                 select_pd_pair(loads, &p, &d, &policy, &policy, &context(), false)
             })
             .unwrap();
-        assert!(manager.commit_decode(&retry, 1, |_| None).is_none());
+        assert!(manager.commit_decode(&retry, |_| None).is_none());
         assert!(retry.decode_pending_commit());
         assert!(manager
-            .commit_decode(&retry, 1, |loads| {
+            .commit_decode(&retry, |loads| {
                 select_decode_stage(loads, &d, &policy, &context())
             })
             .is_some());
@@ -3105,7 +3148,7 @@ mod admission_tests {
                     })
                     .unwrap();
                 manager
-                    .commit_decode(&attempt, 1, |loads| {
+                    .commit_decode(&attempt, |loads| {
                         select_decode_stage(loads, &d, &policy, &context())
                     })
                     .expect("the commitment should land")
@@ -3668,7 +3711,6 @@ mod admission_tests {
                 affinity_key: None,
                 lora_name: None,
                 cache_salt: None,
-                decode_sequences: 1,
                 decode_context: None,
                 route: "/v1/completions",
             }
