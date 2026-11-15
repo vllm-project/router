@@ -320,14 +320,53 @@ fn select_stage(
         // deterministic minimum occupancy with rotating equal-load ties, and
         // the optional decode session binding on top.
         let kv = kv_aware_ops(policy)?;
+        // Admission: a candidate whose engine reports no room, or that already queues on capacity, stops being a candidate. When every candidate is full the request still goes to the least loaded one - refusing would turn a full pool into 503s - and the decision metric records that the ceiling was exceeded.
+        let full = |worker: &Arc<dyn Worker>| -> bool {
+            let Some(table) = context.capacity else {
+                return false;
+            };
+            matches!(
+                table.verdict(
+                    worker.base_url(),
+                    worker.dp_rank().map(|rank| rank as u32),
+                    context.capacity_add_tokens,
+                    context.capacity_add_sequences,
+                ),
+                crate::routers::http::pd_capacity::CapacityVerdict::Full
+            )
+        };
+        let eligible: Vec<usize> = (0..projected.len())
+            .filter(|&index| !full(&projected[index]))
+            .collect();
+        let all_full = eligible.is_empty();
+        let candidates: Vec<Arc<dyn Worker>> = if all_full {
+            projected.clone()
+        } else {
+            eligible
+                .iter()
+                .map(|&index| projected[index].clone())
+                .collect()
+        };
+        if all_full && context.capacity.is_some() {
+            crate::metrics::RouterMetrics::record_prefix_routing_decision(
+                "kv_aware",
+                "decode",
+                "capacity_fallback",
+            );
+        }
         let pick = kv.select_decode(
-            &projected,
+            &candidates,
             context.affinity_key.as_ref(),
             context.lora_name,
             context.cache_salt,
         )?;
+        let pick_index = if all_full {
+            pick.index
+        } else {
+            eligible[pick.index]
+        };
         (
-            pick.index,
+            pick_index,
             context.affinity_key.is_some().then_some(pick.outcome),
             pick.binding,
         )
@@ -499,6 +538,8 @@ impl Worker for PolicyWorker {
 #[derive(Debug, Clone)]
 pub struct PdRouterBase {
     pub(super) kv_state: Option<Arc<PdKvState>>,
+    /// Engine capacity and pressure, independent of `kv_state`: admission must work on deployments that publish no KV event source.
+    pub(super) capacity: Arc<crate::routers::http::pd_capacity::CapacityTable>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub(super) pd_load: Arc<PdLoadManager>,
     pub policy_registry: Arc<PolicyRegistry>,
@@ -1297,6 +1338,9 @@ impl PdRouterBase {
         Ok(PdRouterBase {
             kv_state,
             pd_load: Arc::new(PdLoadManager::default()),
+            capacity: Arc::new(crate::routers::http::pd_capacity::CapacityTable::new(
+                crate::kv_index::capacity::DEFAULT_MAX_KV_USAGE,
+            )),
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
             worker_startup_timeout_secs: ctx.router_config.worker_startup_timeout_secs,
@@ -1497,6 +1541,9 @@ impl PdRouterBase {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
+            capacity: None,
+            capacity_add_tokens: None,
+            capacity_add_sequences: 1,
             route: "/health_generate",
         };
         let (selection, _attempt) =
@@ -1827,6 +1874,9 @@ mod tests {
         PdRouterBase {
             kv_state: None,
             pd_load: Arc::new(PdLoadManager::default()),
+            capacity: Arc::new(crate::routers::http::pd_capacity::CapacityTable::new(
+                crate::kv_index::capacity::DEFAULT_MAX_KV_USAGE,
+            )),
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -1848,6 +1898,9 @@ mod tests {
         PdRouterBase {
             kv_state: None,
             pd_load: Arc::new(PdLoadManager::default()),
+            capacity: Arc::new(crate::routers::http::pd_capacity::CapacityTable::new(
+                crate::kv_index::capacity::DEFAULT_MAX_KV_USAGE,
+            )),
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -2027,6 +2080,9 @@ mod tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
+            capacity: None,
+            capacity_add_tokens: None,
+            capacity_add_sequences: 1,
             route: "/health_generate",
         };
         let (selection, attempt) = router
@@ -2056,6 +2112,9 @@ mod tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
+            capacity: None,
+            capacity_add_tokens: None,
+            capacity_add_sequences: 1,
             route: "/health_generate",
         };
         assert!(router.select_and_admit(&empty, &empty, &context).is_none());
@@ -2821,6 +2880,9 @@ mod admission_tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
+            capacity: None,
+            capacity_add_tokens: None,
+            capacity_add_sequences: 1,
             route: "/v1/completions",
         }
     }
@@ -2886,6 +2948,9 @@ mod admission_tests {
             affinity_key: Some(affinity_key(session)),
             lora_name: None,
             cache_salt: None,
+            capacity: None,
+            capacity_add_tokens: None,
+            capacity_add_sequences: 1,
             route: "/v1/completions",
         }
     }
@@ -3609,6 +3674,9 @@ mod admission_tests {
                 affinity_key: None,
                 lora_name: None,
                 cache_salt: None,
+                capacity: None,
+                capacity_add_tokens: None,
+                capacity_add_sequences: 1,
                 route: "/v1/completions",
             }
         }
