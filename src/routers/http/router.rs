@@ -314,6 +314,20 @@ const PROGRAM_MODEL_POOL_FALLBACK: &str = "program:fallback:unlabeled";
 const PROGRAM_MODEL_POOL_NAMED_PREFIX: &str = "program:model:";
 const UNLABELED_WORKER_MODEL_ID: &str = "unknown";
 
+fn completion_history_for_pool(
+    requested: bool,
+    pool: Option<crate::backend::WorkerPoolKind>,
+) -> Result<(), &'static str> {
+    if !requested {
+        return Err("not_requested_or_unsupported_config");
+    }
+    match pool {
+        Some(crate::backend::WorkerPoolKind::Http) => Ok(()),
+        Some(crate::backend::WorkerPoolKind::Grpc) => Err("grpc_worker_pool"),
+        None => Err("unresolved_worker_pool"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedProgramModelPool {
     scheduler_key: String,
@@ -334,8 +348,16 @@ impl Router {
         let pool_kind = crate::backend::classify_worker_urls(&worker_urls)?;
         let default_policy = ctx.policy_registry.get_default_policy();
         let kv_aware_completion_history = ctx.router_config.kv_aware_completion_history
-            && ctx.router_config.regular_history_support().is_ok()
-            && pool_kind != Some(crate::backend::WorkerPoolKind::Grpc);
+            && ctx.router_config.regular_history_support().is_ok();
+        if ctx.router_config.kv_aware_completion_history {
+            match completion_history_for_pool(kv_aware_completion_history, pool_kind) {
+                Ok(()) => info!("Completion history enabled for eligible HTTP requests"),
+                Err("unresolved_worker_pool") => {
+                    info!("Completion history pending until an HTTP worker pool is resolved")
+                }
+                Err(reason) => warn!(reason, "Completion history disabled for this worker pool"),
+            }
+        }
         let pending_kv_supervisor = if kv_aware_ops(default_policy.as_ref()).is_some() {
             let (mut supervisor, signals) =
                 crate::kv_index::KvIndexSupervisor::new_http_full_attention(
@@ -459,7 +481,7 @@ impl Router {
                 let provider = kv_index_supervisor.as_ref().and_then(|supervisor| {
                     supervisor.match_provider_for_worker(worker_arc.base_url())
                 });
-                if kv_aware_completion_history {
+                if completion_history_for_pool(kv_aware_completion_history, pool_kind).is_ok() {
                     kv_aware.register_history_worker(
                         &worker_arc,
                         kv_worker_info.get(worker_arc.base_url()),
@@ -686,7 +708,15 @@ impl Router {
             .kv_index_supervisor
             .as_ref()
             .and_then(|supervisor| supervisor.match_provider_for_worker(worker.base_url()));
-        if self.kv_aware_completion_history {
+        if completion_history_for_pool(
+            self.kv_aware_completion_history,
+            Some(match worker.connection_mode() {
+                crate::core::ConnectionMode::Http => crate::backend::WorkerPoolKind::Http,
+                crate::core::ConnectionMode::Grpc => crate::backend::WorkerPoolKind::Grpc,
+            }),
+        )
+        .is_ok()
+        {
             kv_aware.register_history_worker(worker, info, provider);
         } else {
             kv_aware.register_worker(worker.as_ref(), info, provider);
@@ -1536,7 +1566,8 @@ impl Router {
         let history_registrations = std::sync::OnceLock::new();
         // Skip registration capture for ineligible input; policy selection still
         // checks the per-worker credit mask before accepting a history hint.
-        let history_model = if self.kv_aware_completion_history
+        let history_model = if completion_history_for_pool(self.kv_aware_completion_history, pool)
+            .is_ok()
             && completion.is_some_and(|c| c.worker_credit)
         {
             use crate::protocols::spec::PromptInput;
@@ -3645,6 +3676,26 @@ mod tests {
             );
             let router = Router::new(vec![], &ctx).await.unwrap();
             assert_eq!(router.kv_aware_completion_history, enabled);
+            assert!(completion_history_for_pool(router.kv_aware_completion_history, None).is_err());
+            // Discovery starts empty. Resolve actual registered transports,
+            // rather than inferring an HTTP pool from an empty URL list.
+            for (url, is_http) in [
+                ("http://discovered:8000", true),
+                ("grpc://discovered:8000", false),
+            ] {
+                let worker: Arc<dyn Worker> =
+                    Arc::new(BasicWorker::new(url.to_owned(), WorkerType::Regular));
+                let id = router.worker_registry.register(worker);
+                let pool =
+                    crate::backend::classify_worker_urls(&router.worker_registry.get_all_urls())
+                        .unwrap();
+                assert_eq!(
+                    completion_history_for_pool(router.kv_aware_completion_history, pool).is_ok(),
+                    enabled && is_http,
+                    "{url}"
+                );
+                router.worker_registry.remove(&id);
+            }
         }
     }
 
@@ -3726,6 +3777,11 @@ mod tests {
         let policy = router.policy_registry.get_default_policy();
         let registered = router.worker_registry.get_by_url(&worker).unwrap();
         assert_eq!(
+            Arc::weak_count(&registered),
+            1,
+            "HTTP add-worker retains the history witness"
+        );
+        assert_eq!(
             kv_aware_policy(policy.as_ref())
                 .unwrap()
                 .observed_completion_prefix(registered.as_ref(), &[77; 8]),
@@ -3779,6 +3835,30 @@ mod tests {
         })
         .await
         .unwrap();
+        // Reuse the valid source to isolate the private registration caller's
+        // transport gate. This is not a gRPC inference/health backend test.
+        let info = supervisor.on_worker_added(&worker).await.unwrap();
+        assert!(info.cache_key.is_some());
+        assert!(supervisor.match_provider_for_worker(&worker).is_some());
+        router.worker_registry.remove_by_url(&worker).unwrap();
+        let grpc: Arc<dyn Worker> = Arc::new(BasicWorker::with_connection_mode(
+            worker.clone(),
+            WorkerType::Regular,
+            crate::core::ConnectionMode::Grpc,
+        ));
+        router.worker_registry.register(grpc.clone());
+        assert!(!Arc::ptr_eq(&registered, &grpc));
+        router.register_kv_target(&grpc, Some(&info));
+        assert_eq!(
+            Arc::weak_count(&grpc),
+            0,
+            "gRPC registration must not retain a history witness"
+        );
+        assert_eq!(
+            Arc::weak_count(&registered),
+            0,
+            "the old HTTP registration was replaced"
+        );
         supervisor.shutdown();
         task.abort();
     }
@@ -4957,6 +5037,23 @@ mod tests {
 
     #[tokio::test]
     async fn completion_history_http_tie_preserves_full_cost() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let count = |metric: &str| -> u64 {
+            handle
+                .render()
+                .lines()
+                .filter(|line| line.starts_with(metric))
+                .map(|line| {
+                    line.split_whitespace()
+                        .last()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap()
+                })
+                .sum()
+        };
         // The existing seed on worker 0 is unrelated to the actual Direct IDs.
         let mut f =
             http_kv_fixture([vec![vec![1, 2, 3, 4]], vec![vec![5, 6, 7, 8]]], 0, true).await;
@@ -4970,6 +5067,8 @@ mod tests {
         // Same source, successful response and request with the option off/on.
         for (enabled, prefix) in [(false, 0), (true, 32)] {
             f.router.kv_aware_completion_history = enabled;
+            let decisions = count("vllm_router_prefix_routing_decisions_total{");
+            let history_reasons = count("vllm_router_history_decisions_total{");
             assert_eq!(
                 selected_http_worker(
                     f.router
@@ -4982,6 +5081,14 @@ mod tests {
             assert_eq!(
                 kv.observed_completion_prefix(f.workers[1].as_ref(), &ids),
                 prefix
+            );
+            assert_eq!(
+                count("vllm_router_prefix_routing_decisions_total{") - decisions,
+                1
+            );
+            assert_eq!(
+                count("vllm_router_history_decisions_total{") - history_reasons,
+                u64::from(enabled)
             );
         }
         f.workers[0].set_healthy(true);
@@ -5005,6 +5112,12 @@ mod tests {
             ); 3]
         );
         assert!(f.workers.iter().all(|w| w.load() == 0));
+        let metrics = handle.render();
+        assert!(!metrics.contains("stage=\"regular_history\""));
+        assert!(metrics.lines().any(|line| line
+            .starts_with("vllm_router_history_decisions_total{")
+            && line.contains("phase=\"regular_history\"")
+            && line.contains("reason=\"no_tie\"")));
         assert!(f
             .calls
             .lock()

@@ -63,3 +63,10 @@ prefix cap cannot yield a hint. Replacement or removal fences the old registrati
 KV Remove/Clear changes placement evidence, not the fact that the request was
 routed. An unobserved same-address engine restart cannot be identified by this
 local history. This option does not enable P/D, gRPC, IGW or Program history.
+
+`vllm_router_prefix_routing_decisions_total` retains one observation per actual
+stage decision; retries can produce multiple decisions for one user request.
+History reasons use the separate `vllm_router_history_decisions_total` counter,
+with fixed `phase="regular_history"` and `reason` labels. `eligible_ordinary`
+means a qualifying overlap kept the ordinary pick; `override` means it changed
+the pick. Neither is an APC hit or proof of current cache residency.

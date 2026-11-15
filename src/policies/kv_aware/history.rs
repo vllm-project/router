@@ -22,7 +22,11 @@ pub struct CompletionHistoryRequest {
 }
 
 impl CompletionHistoryRequest {
-    pub(super) fn generation(&self, worker: &dyn Worker, binding: &TargetBinding) -> Option<u64> {
+    pub(super) fn registration_id(
+        &self,
+        worker: &dyn Worker,
+        binding: &TargetBinding,
+    ) -> Option<u64> {
         (self.registrations.contains(&binding.registration_id) && binding.is_history_worker(worker))
             .then_some(binding.registration_id)
     }
@@ -39,14 +43,14 @@ impl TargetBinding {
 }
 
 pub struct HistoryObservation {
-    generation: u64,
+    registration_id: u64,
     prefix: Arc<[u32]>,
 }
 
 impl HistoryObservation {
-    pub(super) fn new(generation: u64, tokens: &[u32]) -> Self {
+    pub(super) fn new(registration_id: u64, tokens: &[u32]) -> Self {
         Self {
-            generation,
+            registration_id,
             prefix: Arc::from(&tokens[..tokens.len().min(PREFIX_TOKENS)]),
         }
     }
@@ -76,7 +80,8 @@ pub(super) struct CompletionHistory {
 
 impl CompletionHistory {
     fn insert(&self, observation: HistoryObservation, block_size: u32, now: Instant) {
-        let Some(key) = Self::key(observation.generation, &observation.prefix, block_size) else {
+        let Some(key) = Self::key(observation.registration_id, &observation.prefix, block_size)
+        else {
             return;
         };
         let mut records = self.records.lock();
@@ -139,14 +144,14 @@ impl CompletionHistory {
 
     pub(super) fn match_prefix(
         &self,
-        generation: u64,
+        registration_id: u64,
         ids: &[u32],
         block_size: u32,
         now: Instant,
     ) -> Option<HistoryHit> {
         // Take references only. Prefix comparisons run outside both the store
         // lock and the policy's select-and-reserve lock.
-        let key = Self::key(generation, ids, block_size)?;
+        let key = Self::key(registration_id, ids, block_size)?;
         let prefixes: Vec<_> = self
             .records
             .lock()
@@ -175,7 +180,7 @@ impl KvAwarePolicy {
         let Some(store) = self.completion_history.get() else {
             return 0;
         };
-        let Some((generation, block_size)) = self
+        let Some((registration_id, block_size)) = self
             .targets
             .get(worker.url())
             .filter(|b| b.is_history_worker(worker))
@@ -184,7 +189,7 @@ impl KvAwarePolicy {
             return 0;
         };
         store
-            .match_prefix(generation, ids, block_size, now)
+            .match_prefix(registration_id, ids, block_size, now)
             .map_or(0, |hit| hit.len_at(now))
     }
 
@@ -218,14 +223,16 @@ impl KvAwarePolicy {
         observation: HistoryObservation,
     ) {
         // Keep the map read guard until publication. A replacement must either
-        // come after this insertion or make its old generation fail this check.
+        // come after this insertion or make its old registration ID fail this check.
         let Some(binding) = self.targets.get(worker.url()) else {
             return;
         };
         let Some(store) = self.completion_history.get() else {
             return;
         };
-        if binding.registration_id == observation.generation && binding.is_history_worker(worker) {
+        if binding.registration_id == observation.registration_id
+            && binding.is_history_worker(worker)
+        {
             store.insert(observation, binding.block_size, Instant::now());
         }
     }
@@ -290,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_history_bounds_expiry_and_generation_are_independent_of_credit() {
+    fn completion_history_bounds_expiry_and_registration_are_independent_of_credit() {
         let h = CompletionHistory::default();
         let now = Instant::now();
         let long = vec![9; PREFIX_TOKENS + 100];
@@ -347,7 +354,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 captured
-                    .generation(worker.as_ref(), &kv.binding_for_worker(worker.as_ref()))
+                    .registration_id(worker.as_ref(), &kv.binding_for_worker(worker.as_ref()))
                     .is_some(),
                 expected,
                 "{model}"

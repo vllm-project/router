@@ -77,7 +77,9 @@ impl AppContext {
         }
         if router_config.kv_aware_completion_history {
             match router_config.regular_history_support() {
-                Ok(()) => info!("Completion history enabled for eligible HTTP requests"),
+                Ok(()) => {
+                    info!("Completion history requested; awaiting an eligible resolved HTTP pool")
+                }
                 Err(reason) => warn!(reason, "Completion history disabled"),
             }
         }

@@ -21,6 +21,10 @@ mod history;
 use history::CompletionHistory;
 pub use history::{CompletionHistoryRequest, HistoryObservation};
 
+// Process-wide identity, allocated for every registration including load-only
+// targets. Never reuse an ID: even unreachable overflow fails closed.
+static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(1);
+
 /// Read-only placement port owned by its policy consumer.
 pub trait TieredMatchProvider: Send + Sync {
     fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch>;
@@ -956,7 +960,9 @@ impl TieredMatchProvider for EmptyMatchProvider {
 #[derive(Clone)]
 struct TargetBinding {
     target: RoutableTarget,
+    // Policy-local lifecycle fence used by selection and affinity.
     generation: u64,
+    // Process-wide registration identity used by advisory history.
     registration_id: u64,
     cache_key: Option<CacheKey>,
     matches: Arc<dyn TieredMatchProvider>,
@@ -996,7 +1002,7 @@ pub struct KvAwarePolicy {
     affinity: Arc<KvAffinityTable>,
     /// Serializes load sampling, selection, and reservation.
     selection_lock: Mutex<()>,
-    /// Every registration gets a new generation, including load-only targets.
+    /// Policy-local lifecycle counter, also advanced for load-only targets.
     next_generation: AtomicU64,
     completion_history: OnceLock<Arc<CompletionHistory>>,
 }
@@ -1081,7 +1087,6 @@ impl KvAwarePolicy {
         let block_size = cache_key
             .as_ref()
             .map_or(self.params.block_size, |key| key.block_size);
-        static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(1);
         let old = self.targets.insert(
             worker_url,
             TargetBinding {
@@ -1418,18 +1423,18 @@ impl KvAwarePolicy {
                             if prompts.len() != 1 || prompts[0].is_empty() {
                                 return None;
                             }
-                            let generation =
-                                request.generation(workers[index].as_ref(), binding)?;
+                            let registration_id =
+                                request.registration_id(workers[index].as_ref(), binding)?;
                             let ids = prompts[0].as_slice();
                             let hit = self.completion_history.get().and_then(|store| {
                                 store.match_prefix(
-                                    generation,
+                                    registration_id,
                                     ids,
                                     binding.block_size,
                                     Instant::now(),
                                 )
                             });
-                            Some((generation, ids, hit))
+                            Some((registration_id, ids, hit))
                         })
                         .collect()
                 })
@@ -1493,18 +1498,20 @@ impl KvAwarePolicy {
                         // A reporting peer outside the cost tie still takes
                         // precedence. In particular, rounding is for billing,
                         // not evidence that fractional placement credit is zero.
-                        let has_credit = feasible.iter().any(|&index| plan.history_credit[index]);
-                        history_reason = if has_credit {
-                            "positive_credit"
-                        } else {
-                            "no_tie"
+                        let has_credit = feasible.iter().try_fold(false, |seen, &index| {
+                            plan.history_credit.get(index).map(|credit| seen || *credit)
+                        });
+                        history_reason = match has_credit {
+                            None => "missing_evidence",
+                            Some(true) => "positive_credit",
+                            Some(false) => "no_tie",
                         };
                         let base = position;
                         let minimum = feasible
                             .iter()
                             .map(|&index| costs[index])
                             .reduce(f64::min)?;
-                        if !has_credit && costs[base] == minimum {
+                        if has_credit == Some(false) && costs[base] == minimum {
                             let now = Instant::now();
                             let mut longest = 0;
                             let mut tied = Vec::new();
@@ -1578,8 +1585,7 @@ impl KvAwarePolicy {
                 "kv_aware", "regular", outcome,
             );
             if history.is_some() {
-                crate::metrics::RouterMetrics::record_prefix_routing_decision(
-                    "kv_aware",
+                crate::metrics::RouterMetrics::record_history_decision(
                     "regular_history",
                     if used_binding {
                         "session_binding"
@@ -1615,10 +1621,10 @@ impl KvAwarePolicy {
             let observation_input = history_inputs
                 .get(position)
                 .and_then(Option::as_ref)
-                .map(|(generation, ids, _)| (*generation, *ids));
+                .map(|(registration_id, ids, _)| (*registration_id, *ids));
             drop(guard);
-            let observation =
-                observation_input.map(|(generation, ids)| HistoryObservation::new(generation, ids));
+            let observation = observation_input
+                .map(|(registration_id, ids)| HistoryObservation::new(registration_id, ids));
             return Some((
                 KvSelectionReceipt {
                     worker_index,
@@ -3595,13 +3601,13 @@ mod tests {
         }
         let other_capture = other.capture_completion_history(&workers, "model").unwrap();
         assert!(request
-            .generation(
+            .registration_id(
                 workers[0].as_ref(),
                 &other.binding_for_worker(workers[0].as_ref())
             )
             .is_none());
         assert!(other_capture
-            .generation(
+            .registration_id(
                 workers[0].as_ref(),
                 &policy.binding_for_worker(workers[0].as_ref())
             )
@@ -3958,13 +3964,13 @@ mod tests {
                 )
                 .unwrap();
             let binding = policy.targets.get(workers[index].url()).unwrap().clone();
-            let generation = captured
-                .generation(workers[index].as_ref(), &binding)
+            let registration_id = captured
+                .registration_id(workers[index].as_ref(), &binding)
                 .unwrap();
             // One old successful observation plus one still in flight.
             policy.observe_completion_headers(
                 workers[index].as_ref(),
-                HistoryObservation::new(generation, &[1, 2, 3, 4]),
+                HistoryObservation::new(registration_id, &[1, 2, 3, 4]),
             );
             pending.push((observation.unwrap(), binding));
             release_receipt(&workers, &receipt);
@@ -3984,7 +3990,7 @@ mod tests {
         policy.observe_completion_headers(workers[0].as_ref(), old_observation);
         let new_binding = policy.targets.get(workers[0].url()).unwrap().clone();
         assert!(captured
-            .generation(workers[0].as_ref(), &new_binding)
+            .registration_id(workers[0].as_ref(), &new_binding)
             .is_none());
         assert!(policy
             .completion_history
@@ -4020,8 +4026,12 @@ mod tests {
             WorkerType::Regular,
         ));
         let peer = policy.targets.get(workers[1].url()).unwrap();
-        assert!(captured.generation(replacement.as_ref(), &peer).is_none());
-        assert!(captured.generation(workers[1].as_ref(), &peer).is_some());
+        assert!(captured
+            .registration_id(replacement.as_ref(), &peer)
+            .is_none());
+        assert!(captured
+            .registration_id(workers[1].as_ref(), &peer)
+            .is_some());
         assert!(policy
             .completion_history
             .get()
@@ -4033,14 +4043,16 @@ mod tests {
                 Instant::now()
             )
             .is_some());
-        let peer_generation = peer.registration_id;
+        let peer_registration_id = peer.registration_id;
         drop(peer);
         let replaced_workers = vec![workers[0].clone(), replacement.clone()];
         let fresh = policy
             .capture_completion_history(&replaced_workers, "model")
             .unwrap();
         let binding = policy.targets.get(replacement.url()).unwrap();
-        assert!(fresh.generation(replacement.as_ref(), &binding).is_none());
+        assert!(fresh
+            .registration_id(replacement.as_ref(), &binding)
+            .is_none());
         drop(binding);
         let (receipt, observation) = policy
             .select_with_context(
@@ -4061,13 +4073,13 @@ mod tests {
         release_receipt(&replaced_workers, &receipt);
         policy.observe_completion_headers(
             replacement.as_ref(),
-            HistoryObservation::new(peer_generation, &[77, 88]),
+            HistoryObservation::new(peer_registration_id, &[77, 88]),
         );
         assert!(policy
             .completion_history
             .get()
             .unwrap()
-            .match_prefix(peer_generation, &[77, 88], 2, Instant::now())
+            .match_prefix(peer_registration_id, &[77, 88], 2, Instant::now())
             .is_none());
         // The registry replacement attempt did not invalidate the real peer.
         let (receipt, _) = policy
