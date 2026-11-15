@@ -218,7 +218,7 @@ changes dominate everything.
 
 | Field | Default | Guidance |
 |---|---:|---|
-| `token_capacity_per_dp_rank` | `null` (count guard only) | `0.95 * log capacity`; wrong-by-a-lot values show up as constant queueing or `unexpected_cache_discontinuity` |
+| `token_capacity_per_dp_rank` | `null` (count guard only) | `0.95 * log capacity`; recheck it when persistent queueing or INFO `unexpected_cache_discontinuity` events appear, but neither alone proves a capacity error |
 | `max_active_programs_per_target` | `64` | Scale with concurrency: about `CC / dp * 1.2`. Leaving it at a value sized for a smaller run makes the count guard bind before token admission |
 | `high_watermark_ratio` / `low_watermark_ratio` | `1.0` / `1.0` | Keep 1.0 when capacity already carries the 0.95 discount |
 | `admission_waiting_request_threshold` | `1` | Backend waiting-queue ceiling: ordinary admission/resume blocks when `waiting >= threshold`; `0` disables the gate. Raising it relaxes backpressure and can worsen backend queueing. Increase only when evidence shows the gate suppresses useful concurrency, not in response to a request avalanche |
@@ -261,14 +261,15 @@ changes dominate everything.
 
 ## 5. Symptom to first knob
 
-Mechanism side, read from `vllm_router_agent_aware_*` metrics:
+Mechanism side, use `vllm_router_agent_aware_*` Prometheus metrics,
+`/scheduling/diagnostics`, and Router INFO logs as identified below:
 
 | Observation | Likely cause | First change |
 |---|---|---|
 | `armed_ttl_seconds` near zero | window not matured, gaps longer than TTL, or understated cost | let the run reach maturity, then lower `stats_window_size`, then recalibrate |
 | many `max_segment_yield` pauses | one Program consumes full segments | raise `max_segment_rounds`, or lower `force_resume_timeout_seconds` |
-| `unexpected_cache_discontinuity` | physical eviction | recheck capacity; step concurrency down |
-| `capacity_accounting_source` falls back | missing engine labels or stale observations | verify per-engine metric labels, single API server per worker, idle run before traffic |
+| `unexpected_cache_discontinuity` (Router INFO log event) | explicitly reported cached tokens fall below the continuity threshold relative to the previous context within one placement; this alone does not prove physical eviction | inspect the log's `cached_prompt_tokens`, `previous_context_tokens`, and `cache_hit_vs_previous_context`; check whether the request prefix changed and correlate with backend cache pressure before changing capacity or concurrency |
+| `capacity_accounting_source` falls back (diagnostics) | missing engine labels or stale observations | verify per-engine metric labels, single API server per worker, idle run before traffic |
 | admits but no pauses and no hit gain | pressure too low, or Programs too short | return to section 3.5 |
 
 End-to-end side, from the run summary plus `rank_queue_size` /
