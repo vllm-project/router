@@ -70,6 +70,10 @@ pub struct WorkerRegistry {
 
     /// Monotonic topology and availability revision for read-side caches.
     revision: Arc<AtomicU64>,
+
+    /// Serialize ownership transfers, including concurrent first registration
+    /// and removal/re-registration of the same URL. Load transitions never take it.
+    mutation_lock: parking_lot::Mutex<()>,
 }
 
 impl WorkerRegistry {
@@ -84,11 +88,13 @@ impl WorkerRegistry {
             registration_order: Arc::new(RwLock::new(Vec::new())),
             url_to_id: Arc::new(DashMap::new()),
             revision: Arc::new(AtomicU64::new(0)),
+            mutation_lock: parking_lot::Mutex::new(()),
         }
     }
 
     /// Register a new worker
     pub fn register(&self, worker: Arc<dyn Worker>) -> WorkerId {
+        let _mutation = self.mutation_lock.lock();
         let (worker_id, is_new) = if let Some(existing_id) = self.url_to_id.get(worker.url()) {
             // Worker with this URL already exists, update it
             (existing_id.clone(), false)
@@ -102,7 +108,15 @@ impl WorkerRegistry {
                 .push(worker_id.clone());
         }
 
-        // Store worker
+        // Retire the previous writer before enabling the replacement. Retirement
+        // takes the same lock as publication, so an in-progress old write must
+        // finish before the new instance publishes its initial/current load.
+        if let Some(previous) = self.workers.get(&worker_id) {
+            previous.set_load_metrics_enabled(false);
+        }
+        worker.set_load_metrics_enabled(true);
+
+        // Store worker only after its initial metric has been published.
         self.workers.insert(worker_id.clone(), worker.clone());
 
         // Update URL mapping
@@ -146,7 +160,14 @@ impl WorkerRegistry {
 
     /// Remove a worker by ID
     pub fn remove(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
+        let _mutation = self.mutation_lock.lock();
+        self.remove_locked(worker_id)
+    }
+
+    /// Caller must hold mutation_lock throughout the topology change.
+    fn remove_locked(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
         if let Some((_, worker)) = self.workers.remove(worker_id) {
+            worker.set_load_metrics_enabled(false);
             // Remove from URL mapping
             self.url_to_id.remove(worker.url());
 
@@ -189,8 +210,9 @@ impl WorkerRegistry {
 
     /// Remove a worker by URL
     pub fn remove_by_url(&self, url: &str) -> Option<Arc<dyn Worker>> {
+        let _mutation = self.mutation_lock.lock();
         if let Some((_, worker_id)) = self.url_to_id.remove(url) {
-            self.remove(&worker_id)
+            self.remove_locked(&worker_id)
         } else {
             None
         }
@@ -468,6 +490,163 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorker, CircuitBreakerConfig, WorkerFactory};
     use std::collections::HashMap;
+
+    fn assert_load_sample(handle: &metrics_exporter_prometheus::PrometheusHandle, load: usize) {
+        let sample = handle
+            .render()
+            .lines()
+            .find(|line| line.starts_with("vllm_router_worker_load{"))
+            .map(str::to_owned);
+        assert_eq!(
+            sample,
+            Some(format!(
+                "vllm_router_worker_load{{worker=\"http://lifecycle:8000\"}} {load}"
+            ))
+        );
+    }
+
+    #[test]
+    fn worker_load_gauge_is_published_at_registration() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let registry = WorkerRegistry::new();
+        let worker = Arc::new(BasicWorker::new(
+            "http://lifecycle:8000".into(),
+            WorkerType::Regular,
+        ));
+
+        registry.register(worker.clone());
+        assert_load_sample(&handle, 0);
+        worker.increment_load();
+        registry.register(worker.clone());
+        assert_eq!(worker.load(), 1);
+        assert_load_sample(&handle, 1);
+    }
+
+    #[test]
+    fn retired_worker_cannot_overwrite_new_worker_load_gauge() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let registry = WorkerRegistry::new();
+        let old = Arc::new(BasicWorker::new(
+            "http://lifecycle:8000".into(),
+            WorkerType::Regular,
+        ));
+        let old_clone = old.as_ref().clone();
+        let id = registry.register(old.clone());
+        old.increment_load();
+        let current = Arc::new(BasicWorker::new(old.url().into(), WorkerType::Regular));
+        assert_eq!(registry.register(current.clone()), id);
+        current.increment_load();
+        current.increment_load();
+        assert_load_sample(&handle, 2);
+
+        old_clone.decrement_load();
+        assert_eq!(old.load(), 0);
+        assert_load_sample(&handle, 2);
+        old.increment_load();
+        assert_eq!(old.load(), 1);
+        assert_load_sample(&handle, 2);
+        old.reset_load();
+        assert_eq!(old.load(), 0);
+        assert_load_sample(&handle, 2);
+
+        current.decrement_load();
+        current.decrement_load();
+        assert_load_sample(&handle, 0);
+    }
+
+    #[test]
+    fn removed_worker_cannot_publish_after_url_is_registered_again() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let registry = WorkerRegistry::new();
+        let old = Arc::new(BasicWorker::new(
+            "http://lifecycle:8000".into(),
+            WorkerType::Regular,
+        ));
+        registry.register(old.clone());
+        old.increment_load();
+        registry.remove_by_url(old.url()).unwrap();
+        assert_load_sample(&handle, 0);
+        let current = Arc::new(BasicWorker::new(old.url().into(), WorkerType::Regular));
+        registry.register(current.clone());
+        current.increment_load();
+        old.decrement_load();
+        assert_eq!(old.load(), 0);
+        assert_load_sample(&handle, 1);
+    }
+
+    #[test]
+    fn concurrent_registrations_leave_one_load_gauge_owner() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let registry = WorkerRegistry::new();
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|_| {
+                let worker = BasicWorker::new("http://lifecycle:8000".into(), WorkerType::Regular);
+                worker.increment_load();
+                Arc::new(worker) as Arc<dyn Worker>
+            })
+            .collect();
+        let start = std::sync::Barrier::new(workers.len());
+        std::thread::scope(|scope| {
+            for worker in &workers {
+                scope.spawn(|| {
+                    metrics::with_local_recorder(&recorder, || {
+                        start.wait();
+                        registry.register(worker.clone());
+                    })
+                });
+            }
+        });
+        assert_eq!(registry.get_all().len(), 1);
+        let current = registry.get_by_url("http://lifecycle:8000").unwrap();
+        for worker in &workers {
+            if !Arc::ptr_eq(worker, &current) {
+                worker.decrement_load();
+                assert_eq!(worker.load(), 0);
+                assert_load_sample(&handle, 1);
+            }
+        }
+        current.decrement_load();
+        assert_load_sample(&handle, 0);
+    }
+
+    #[test]
+    fn retired_dp_worker_cannot_overwrite_new_worker_load_gauge() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let registry = WorkerRegistry::new();
+        let old = Arc::new(crate::core::DPAwareWorker::new(
+            "http://lifecycle:8000".into(),
+            0,
+            2,
+            WorkerType::Decode,
+        ));
+        registry.register(old.clone());
+        old.increment_load();
+        let current = Arc::new(crate::core::DPAwareWorker::new(
+            "http://lifecycle:8000".into(),
+            0,
+            2,
+            WorkerType::Decode,
+        ));
+        registry.register(current.clone());
+        current.increment_load();
+        current.increment_load();
+        old.decrement_load();
+        assert_eq!(old.load(), 0);
+        assert!(handle
+            .render()
+            .lines()
+            .any(|line| line == "vllm_router_worker_load{worker=\"http://lifecycle:8000@0\"} 2"));
+    }
 
     #[test]
     fn prefill_workers_follow_registration_order() {
