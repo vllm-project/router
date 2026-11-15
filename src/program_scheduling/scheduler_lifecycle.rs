@@ -76,6 +76,11 @@ impl ProgramScheduler {
     ) {
         let now = Instant::now();
         let mut state = self.state.lock();
+        // Reject duplicate/stale callbacks before any verification or ledger
+        // side effects, including when another attempt is still in flight.
+        if !state.runtime.is_live_attempt(dispatch) {
+            return;
+        }
         let Some(runtime_before) = state.runtime.view(dispatch.program()) else {
             return;
         };
@@ -104,14 +109,18 @@ impl ProgramScheduler {
                     None,
                 )
             };
-        self.reconcile_observed_prompt_tokens(
-            &mut state,
-            dispatch.program().model_pool(),
-            reconcile_source,
-            reconcile_fingerprint,
-            reconcile_prepared_tokens,
-            usage.prompt_tokens,
-        );
+        // A failed/cancelled request without usage is not evidence that the
+        // backend lacks usage support.
+        if success || usage.prompt_tokens.is_some() {
+            self.reconcile_observed_prompt_tokens(
+                &mut state,
+                dispatch.program().model_pool(),
+                reconcile_source,
+                reconcile_fingerprint,
+                reconcile_prepared_tokens,
+                usage.prompt_tokens,
+            );
+        }
         let fallback_cached_tokens = state
             .rank_factors
             .get(&target_id)

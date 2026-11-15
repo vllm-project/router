@@ -50,7 +50,8 @@ pub struct ProgramDiagnostic {
     pub legacy_estimated_context_tokens: usize,
     /// Provenance of `context_tokens`.
     pub context_token_source: &'static str,
-    /// Prepared counterfactual recorded by shadow mode, if any.
+    /// Pending prepared fact: a shadow counterfactual or exact-mode probation
+    /// witness. The serialized name is kept for compatibility.
     pub shadow_context_tokens: Option<usize>,
     /// Fingerprint of the prepared count behind `context_tokens`, if any.
     pub context_token_fingerprint: Option<String>,
@@ -174,6 +175,10 @@ pub struct ProgramSchedulerDiagnostic {
     pub verified_token_fingerprints: usize,
     /// Model pools whose exact facts are saturated off.
     pub saturated_model_pools: Vec<String>,
+    /// Pools disabled after repeated successful settlements without usage.
+    pub usage_unavailable_model_pools: Vec<String>,
+    /// Whether usage-observation tracking reached its bounded pool limit.
+    pub usage_tracking_saturated: bool,
     pub ranks: Vec<RankDiagnostic>,
 }
 
@@ -593,6 +598,13 @@ impl ProgramScheduler {
                 .iter()
                 .cloned()
                 .collect(),
+            usage_unavailable_model_pools: state
+                .token_usage_misses
+                .iter()
+                .filter(|(_, misses)| **misses >= super::scheduler_tokens::MAX_TOKEN_USAGE_MISSES)
+                .map(|(pool, _)| pool.clone())
+                .collect(),
+            usage_tracking_saturated: state.token_usage_tracking_saturated,
             ranks,
         }
     }

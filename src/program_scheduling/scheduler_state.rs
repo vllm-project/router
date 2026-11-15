@@ -257,7 +257,7 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) context_tokens: usize,
     /// Provenance of `context_tokens`.
     pub(crate) context_token_source: TokenFactSource,
-    /// Prepared counterfactual recorded by shadow mode, if any.
+    /// Pending prepared fact: shadow counterfactual or probation witness.
     pub(crate) shadow_context_facts: Option<crate::program_scheduling::TokenFacts>,
     /// Fingerprint of the prepared count that established `context_tokens`.
     pub(crate) context_token_fingerprint: Option<TokenizerFingerprint>,
@@ -499,6 +499,11 @@ pub(crate) struct ProgramSchedulerState {
     pub(crate) verified_token_fingerprints: BTreeMap<TokenizerFingerprint, (usize, u64)>,
     /// Monotonic sequence for verified-fingerprint eviction.
     pub(crate) token_fingerprint_verification_sequence: u64,
+    /// Consecutive successful settlements without Engine prompt usage, per
+    /// pool. Entries reaching the threshold stay disabled until restart.
+    pub(crate) token_usage_misses: BTreeMap<String, u8>,
+    /// Fail closed if the bounded pool-observation map fills.
+    pub(crate) token_usage_tracking_saturated: bool,
     /// Most recent P-side KV-cache pressure sample.
     pub(crate) prefill_pressure: Option<PrefillPressure>,
     /// Per-P-target metrics samples, keyed by base URL.
@@ -554,6 +559,8 @@ impl ProgramSchedulerState {
             token_fingerprint_revocations: 0,
             verified_token_fingerprints: BTreeMap::new(),
             token_fingerprint_verification_sequence: 0,
+            token_usage_misses: BTreeMap::new(),
+            token_usage_tracking_saturated: false,
             prefill_pressure: None,
             prefill_targets: HashMap::new(),
         }

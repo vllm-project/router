@@ -7,12 +7,6 @@
 use crate::program_scheduling::TokenizerFingerprint;
 use crate::protocols::spec::ChatCompletionRequest;
 
-/// Identity of a tokenizer/prompt-preparation equivalence class.
-///
-/// The Engine must tokenize the same model with the same template options and
-/// the same frontend assets for a prepared count to describe Engine input. The
-/// fingerprint covers every input that changes that mapping, so a mismatch
-/// revokes exactly one class instead of disabling a whole deployment.
 /// Canonical JSON for a fingerprint: object keys sorted at every level.
 ///
 /// `chat_template_kwargs` is a `HashMap`, so plain serialization would make the
@@ -53,6 +47,12 @@ pub(crate) fn canonical_json(value: &serde_json::Value) -> String {
     out
 }
 
+/// Router-side token-equivalence class, shared across Engine targets.
+///
+/// Engine version/target identity is not available before admission and is not
+/// included. A model pool must use equivalent tokenizer assets and templates
+/// on every target. One mismatching target revokes this class pool-wide until
+/// restart; probation on one target does not verify a heterogeneous fleet.
 pub(crate) fn prepared_chat_fingerprint(
     request: &ChatCompletionRequest,
     encode_backend: &str,

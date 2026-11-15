@@ -238,6 +238,14 @@ pub fn init_metrics() {
         "Prepared facts settled without an Engine prompt count to reconcile"
     );
     describe_gauge!(
+        "vllm_router_agent_aware_context_token_usage_unavailable",
+        "Whether optional token facts were disabled after missing Engine usage"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_usage_filter_errors_total",
+        "Injected-usage streams rejected for oversized lines or unsupported encoding"
+    );
+    describe_gauge!(
         "vllm_router_agent_aware_context_token_mode",
         "Active Program context-token count mode (1 for the selected mode)"
     );
@@ -1097,6 +1105,14 @@ impl RouterMetrics {
             "source" => source
         )
         .increment(1);
+    }
+
+    pub fn set_agent_aware_context_token_usage_unavailable(model_pool: &str) {
+        gauge!("vllm_router_agent_aware_context_token_usage_unavailable", "model_pool" => model_pool.to_string()).set(1.0);
+    }
+
+    pub fn record_agent_aware_usage_filter_error() {
+        counter!("vllm_router_agent_aware_usage_filter_errors_total").increment(1);
     }
 
     pub fn record_agent_aware_token_prepare(seconds: f64) {

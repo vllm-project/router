@@ -887,11 +887,11 @@ async fn collect_openai(
         );
     }
     abort.disarm();
-    if fail_on_abort && finish.as_deref() == Some("abort") {
+    // Program settlement must see aborts even when this adapter preserves the
+    // regular (non-PD) HTTP response status for compatibility.
+    let succeeded = record_finish_outcome(observer.as_deref(), finish.as_deref());
+    if fail_on_abort && !succeeded {
         warn!(%request_id, "gRPC decode finished aborted");
-        if let Some(observer) = &observer {
-            observer.record_error();
-        }
         return (StatusCode::BAD_GATEWAY, "gRPC decode finished aborted").into_response();
     }
     let mut resp = match shape {

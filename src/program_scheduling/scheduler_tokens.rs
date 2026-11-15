@@ -22,6 +22,9 @@ const MAX_REVOKED_FINGERPRINTS: usize = 64;
 /// Evicting an entry only re-subjects that class to a fresh probation window;
 /// it can never make an unverified count trusted.
 const MAX_VERIFIED_FINGERPRINTS: usize = 1024;
+/// Stop optional preparation after three successful responses without usage.
+pub(super) const MAX_TOKEN_USAGE_MISSES: u8 = 3;
+const MAX_TOKEN_USAGE_POOLS: usize = 64;
 
 impl ProgramScheduler {
     /// Record the active token-count mode once at startup.
@@ -45,6 +48,21 @@ impl ProgramScheduler {
             .any(|allowed| allowed == model_pool || model.is_some_and(|model| allowed == model))
     }
 
+    /// Gate optional preparation/usage injection before paying their CPU cost.
+    pub(crate) fn prepared_token_pool_enabled(&self, model_pool: &str) -> bool {
+        self.config.token_count_mode.uses_prepared_facts()
+            && self.prepared_token_pool_allowed(model_pool)
+            && !Self::usage_unavailable(&self.state.lock(), model_pool)
+    }
+
+    fn usage_unavailable(state: &ProgramSchedulerState, model_pool: &str) -> bool {
+        state.token_usage_tracking_saturated
+            || state
+                .token_usage_misses
+                .get(model_pool)
+                .is_some_and(|misses| *misses >= MAX_TOKEN_USAGE_MISSES)
+    }
+
     fn fingerprint_revoked(
         &self,
         state: &ProgramSchedulerState,
@@ -60,10 +78,12 @@ impl ProgramScheduler {
         model_pool: &str,
         context: ContextTokens,
     ) -> ContextTokens {
-        context.fallback_if_revoked(
-            state.token_fingerprint_saturated_pools.contains(model_pool)
-                || self.fingerprint_revoked(state, context.fingerprint()),
-        )
+        context
+            .fallback_if_revoked(
+                state.token_fingerprint_saturated_pools.contains(model_pool)
+                    || self.fingerprint_revoked(state, context.fingerprint()),
+            )
+            .fallback_if_usage_unavailable(Self::usage_unavailable(state, model_pool))
     }
 
     /// Revocation and all retained-fact updates share the scheduler lock. Scan
@@ -71,18 +91,28 @@ impl ProgramScheduler {
     fn refresh_retained_token_facts(&self, state: &mut ProgramSchedulerState) {
         let revoked = &state.revoked_token_fingerprints;
         let saturated = &state.token_fingerprint_saturated_pools;
+        let usage_misses = &state.token_usage_misses;
+        let usage_tracking_saturated = state.token_usage_tracking_saturated;
         let changes = state.runtime.update_retained_contexts(|program, context| {
-            context.fallback_if_revoked(
-                saturated.contains(program.model_pool())
-                    || context
-                        .fingerprint()
-                        .is_some_and(|fingerprint| revoked.contains_key(&fingerprint)),
-            )
+            context
+                .fallback_if_revoked(
+                    saturated.contains(program.model_pool())
+                        || context
+                            .fingerprint()
+                            .is_some_and(|fingerprint| revoked.contains_key(&fingerprint)),
+                )
+                .fallback_if_usage_unavailable(
+                    usage_tracking_saturated
+                        || usage_misses
+                            .get(program.model_pool())
+                            .is_some_and(|misses| *misses >= MAX_TOKEN_USAGE_MISSES),
+                )
         });
         let now = Instant::now();
         for (program, context) in changes {
-            // An admission can have committed before its waiter was polled.
-            // Return that idle placement to the queue to check the new demand.
+            // Recheck committed but unclaimed admissions. Once admit_front has
+            // claimed an attempt, it is in flight and cannot be recalled here,
+            // even if the transport has not sent its request yet.
             if !self.config.binding_only
                 && self.pause_idle(state, &program, ProgramPauseReason::CapacityRepair, now)
             {
@@ -142,7 +172,7 @@ impl ProgramScheduler {
     ) -> ContextTokens {
         let allowed = self.prepared_token_pool_allowed(model_pool);
         let threshold = self.config.token_count_verification_settlements;
-        let (revoked, verified) = {
+        let (revoked, verified, usage_unavailable) = {
             let state = self.state.lock();
             let fingerprint = arrival.prepared().and_then(|facts| facts.fingerprint());
             let revoked = state.token_fingerprint_saturated_pools.contains(model_pool)
@@ -156,7 +186,11 @@ impl ProgramScheduler {
                         .get(&fingerprint)
                         .is_some_and(|(count, _)| *count >= threshold)
                 });
-            (revoked, verified)
+            (
+                revoked,
+                verified,
+                Self::usage_unavailable(&state, model_pool),
+            )
         };
         super::resolve_context_tokens(
             self.config.token_count_mode,
@@ -164,6 +198,9 @@ impl ProgramScheduler {
             allowed,
             revoked,
             verified,
+        )
+        .fallback_if_usage_unavailable(
+            self.config.token_count_mode.uses_prepared_facts() && usage_unavailable,
         )
     }
 
@@ -283,17 +320,40 @@ impl ProgramScheduler {
         prepared_tokens: Option<usize>,
         observed_tokens: Option<usize>,
     ) {
+        if !source.is_prepared() || prepared_tokens.is_none() {
+            return;
+        }
+        let observed_tokens = observed_tokens.filter(|tokens| *tokens > 0);
         let (Some(prepared), Some(observed)) = (prepared_tokens, observed_tokens) else {
-            if prepared_tokens.is_some() && observed_tokens.is_none() && source.is_prepared() {
-                RouterMetrics::record_agent_aware_context_token_unobserved(
-                    model_pool,
-                    source.as_str(),
-                );
+            RouterMetrics::record_agent_aware_context_token_unobserved(model_pool, source.as_str());
+            if Self::usage_unavailable(state, model_pool) {
+                return;
             }
+            if !state.token_usage_misses.contains_key(model_pool)
+                && state.token_usage_misses.len() >= MAX_TOKEN_USAGE_POOLS
+            {
+                state.token_usage_tracking_saturated = true;
+                warn!(event = "token_fact_usage_tracking_saturated", bound = MAX_TOKEN_USAGE_POOLS,
+                    "usage tracking reached its pool bound; optional token facts disabled until restart");
+            } else {
+                let misses = state
+                    .token_usage_misses
+                    .entry(model_pool.to_string())
+                    .or_default();
+                *misses += 1;
+                if *misses < MAX_TOKEN_USAGE_MISSES {
+                    return;
+                }
+                warn!(event = "token_fact_usage_unavailable", model_pool, misses = *misses,
+                    "Engine prompt usage repeatedly absent; optional preparation and usage injection disabled for this pool until restart");
+            }
+            RouterMetrics::set_agent_aware_context_token_usage_unavailable(model_pool);
+            self.refresh_retained_token_facts(state);
             return;
         };
-        if !source.is_prepared() || observed == 0 {
-            return;
+        // Reset a partial streak; late responses cannot reopen a disabled pool.
+        if !Self::usage_unavailable(state, model_pool) {
+            state.token_usage_misses.remove(model_pool);
         }
         RouterMetrics::record_agent_aware_context_token_observation_delta(
             model_pool,
@@ -308,7 +368,8 @@ impl ProgramScheduler {
             self.mark_fingerprint_verified(state, fingerprint);
             return;
         }
-        // A mismatch re-subjects the class to probation until it matches again.
+        // A mismatch revokes this class until restart; matching later responses
+        // cannot clear the revocation.
         state.verified_token_fingerprints.remove(&fingerprint);
         if state.token_fingerprint_saturated_pools.contains(model_pool) {
             // Every prepared fact for this pool already falls back to estimation.
@@ -333,9 +394,6 @@ impl ProgramScheduler {
                  falling back to estimation for this fingerprint"
             );
         }
-        RouterMetrics::set_agent_aware_context_token_revoked(
-            state.revoked_token_fingerprints.len(),
-        );
         if state.revoked_token_fingerprints.len() > MAX_REVOKED_FINGERPRINTS {
             // Keeping the bound by eviction would make an old, known-bad
             // fingerprint trusted again. Fail closed instead, but only for the
@@ -355,6 +413,9 @@ impl ProgramScheduler {
                  fall back to estimation for every fingerprint until restart"
             );
         }
+        RouterMetrics::set_agent_aware_context_token_revoked(
+            state.revoked_token_fingerprints.len(),
+        );
         if newly_revoked {
             self.refresh_retained_token_facts(state);
         }
@@ -944,6 +1005,205 @@ mod revocation_tests {
     use crate::program_scheduling::*;
     use std::time::Duration;
 
+    #[test]
+    fn revoked_gauge_matches_the_bounded_map_after_overflow() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+            let mut state = scheduler.state.lock();
+            for index in 0..=MAX_REVOKED_FINGERPRINTS {
+                let fingerprint = TokenizerFingerprint::from_parts(&[&index.to_string()]);
+                scheduler.reconcile_observed_prompt_tokens(
+                    &mut state,
+                    "model",
+                    TokenFactSource::PreparedTokenIds,
+                    Some(fingerprint),
+                    Some(10),
+                    Some(11),
+                );
+            }
+            assert_eq!(
+                state.revoked_token_fingerprints.len(),
+                MAX_REVOKED_FINGERPRINTS
+            );
+            assert!(handle.render().lines().any(|line| line == format!(
+                "vllm_router_agent_aware_context_token_revoked_fingerprints {MAX_REVOKED_FINGERPRINTS}")));
+        });
+    }
+
+    #[tokio::test]
+    async fn failed_and_duplicate_settlements_do_not_trip_missing_usage_breaker() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
+            token_count_mode: TokenCountMode::ExactWhenVerified,
+            ..Default::default()
+        });
+        let fingerprint = TokenizerFingerprint::from_parts(&["missing-usage"]);
+        let context = scheduler.resolve_arrival_tokens(
+            "model",
+            ArrivalTokenFacts::new(100, Some(TokenFacts::prepared_token_ids(10, fingerprint))),
+        );
+        let targets = [ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: None,
+        }];
+        let first = scheduler
+            .acquire(identity("same"), context, &targets, None)
+            .await
+            .unwrap();
+        let second = scheduler
+            .acquire(identity("same"), context, &targets, None)
+            .await
+            .unwrap();
+        scheduler.complete(&first, true, false, None, None);
+        for _ in 0..MAX_TOKEN_USAGE_MISSES {
+            scheduler.complete(&first, true, false, None, None);
+        }
+        scheduler.complete(&second, false, false, None, None);
+        assert_eq!(scheduler.state.lock().token_usage_misses["model"], 1);
+        assert!(scheduler.prepared_token_pool_enabled("model"));
+    }
+
+    #[tokio::test]
+    async fn missing_usage_breaker_resets_partial_streaks_and_downgrades_retained_facts() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
+            token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_verification_settlements: 0,
+            ..Default::default()
+        });
+        let fingerprint = TokenizerFingerprint::from_parts(&["usage"]);
+        let arrival =
+            ArrivalTokenFacts::new(1000, Some(TokenFacts::prepared_token_ids(10, fingerprint)));
+        let context = scheduler.resolve_arrival_tokens("model", arrival);
+        let mut state = scheduler.state.lock();
+        let handle =
+            state
+                .runtime
+                .retain_request(&identity("waiting"), context, None, Instant::now());
+        for observed in [None, None, Some(10)] {
+            scheduler.reconcile_observed_prompt_tokens(
+                &mut state,
+                "model",
+                TokenFactSource::PreparedTokenIds,
+                Some(fingerprint),
+                Some(10),
+                observed,
+            );
+        }
+        assert!(!ProgramScheduler::usage_unavailable(&state, "model"));
+        for _ in 0..MAX_TOKEN_USAGE_MISSES {
+            scheduler.reconcile_observed_prompt_tokens(
+                &mut state,
+                "model",
+                TokenFactSource::PreparedTokenIds,
+                Some(fingerprint),
+                Some(10),
+                None,
+            );
+        }
+        assert_eq!(
+            state.runtime.front_request_context(handle.program()),
+            Some(1000)
+        );
+        // A late matching response must not re-enable preparation.
+        scheduler.reconcile_observed_prompt_tokens(
+            &mut state,
+            "model",
+            TokenFactSource::PreparedTokenIds,
+            Some(fingerprint),
+            Some(10),
+            Some(10),
+        );
+        drop(state);
+        assert!(!scheduler.prepared_token_pool_enabled("model"));
+        assert!(scheduler.prepared_token_pool_enabled("other-model"));
+        let context = scheduler.resolve_arrival_tokens("model", arrival);
+        assert_eq!(context.tokens(), 1000);
+        assert_eq!(
+            context.fallback(),
+            Some(TokenFactFallback::UsageUnavailable)
+        );
+        assert_eq!(
+            scheduler.diagnostics().usage_unavailable_model_pools,
+            ["model"]
+        );
+    }
+
+    #[test]
+    fn missing_usage_tracking_is_bounded_and_fails_closed() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
+            token_count_mode: TokenCountMode::ExactWhenVerified,
+            ..Default::default()
+        });
+        let mut state = scheduler.state.lock();
+        for index in 0..=MAX_TOKEN_USAGE_POOLS {
+            scheduler.reconcile_observed_prompt_tokens(
+                &mut state,
+                &format!("pool-{index}"),
+                TokenFactSource::PreparedTokenIds,
+                None,
+                Some(10),
+                None,
+            );
+        }
+        assert_eq!(state.token_usage_misses.len(), MAX_TOKEN_USAGE_POOLS);
+        assert!(state.token_usage_tracking_saturated);
+        drop(state);
+        assert!(!scheduler.prepared_token_pool_enabled("another-pool"));
+        assert!(scheduler.diagnostics().usage_tracking_saturated);
+    }
+
+    #[tokio::test]
+    async fn claimed_dispatch_keeps_its_facts_but_queued_successor_is_revoked() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
+            token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_verification_settlements: 0,
+            ..Default::default()
+        });
+        let fingerprint = TokenizerFingerprint::from_parts(&["claimed"]);
+        let arrival =
+            ArrivalTokenFacts::new(1000, Some(TokenFacts::prepared_token_ids(10, fingerprint)));
+        let context = scheduler.resolve_arrival_tokens("model", arrival);
+        let targets = [ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: None,
+        }];
+        // acquire claims an attempt; no transport has sent it in this test.
+        let dispatch = scheduler
+            .acquire(identity("claimed"), context, &targets, None)
+            .await
+            .unwrap();
+        let mut state = scheduler.state.lock();
+        let successor =
+            state
+                .runtime
+                .retain_request(&identity("claimed"), context, None, Instant::now());
+        scheduler.reconcile_observed_prompt_tokens(
+            &mut state,
+            "model",
+            TokenFactSource::PreparedTokenIds,
+            Some(fingerprint),
+            Some(10),
+            Some(1000),
+        );
+        assert!(state.runtime.is_live_attempt(&dispatch));
+        assert_eq!(dispatch.context_tokens(), 10);
+        assert_eq!(
+            state.runtime.front_request_context(successor.program()),
+            Some(1000)
+        );
+        assert_eq!(
+            state
+                .runtime
+                .view(dispatch.program())
+                .unwrap()
+                .in_flight_requests,
+            1
+        );
+    }
+
     #[tokio::test]
     async fn revocation_between_resolution_and_retention_uses_the_original_estimate() {
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
@@ -1150,5 +1410,69 @@ mod revocation_tests {
             dispatched.context_tokens()
         );
         assert_eq!(dispatched.context_tokens(), 1000);
+    }
+    #[tokio::test]
+    async fn duplicate_settlement_cannot_complete_probation() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
+            token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_verification_settlements: 2,
+            ..Default::default()
+        });
+        let fp = TokenizerFingerprint::from_parts(&["review-duplicate"]);
+        let arrival = ArrivalTokenFacts::new(100, Some(TokenFacts::prepared_token_ids(10, fp)));
+        let targets = [ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: None,
+        }];
+        let context = scheduler.resolve_arrival_tokens("model", arrival);
+        let first = scheduler
+            .acquire(identity("same"), context, &targets, None)
+            .await
+            .unwrap();
+        let _second = scheduler
+            .acquire(identity("same"), context, &targets, None)
+            .await
+            .unwrap();
+        scheduler.complete(&first, true, false, Some(10), None);
+        assert_eq!(
+            scheduler.resolve_arrival_tokens("model", arrival).source(),
+            TokenFactSource::Estimated
+        );
+        scheduler.complete(&first, true, false, Some(10), None);
+        assert_eq!(
+            scheduler.resolve_arrival_tokens("model", arrival).source(),
+            TokenFactSource::Estimated,
+            "one real completion plus its duplicate must not satisfy a two-settlement probation"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_settlement_cannot_revoke_a_fingerprint() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
+            token_count_mode: TokenCountMode::ExactWhenVerified,
+            ..Default::default()
+        });
+        let fp = TokenizerFingerprint::from_parts(&["review-stale"]);
+        let arrival = ArrivalTokenFacts::new(100, Some(TokenFacts::prepared_token_ids(10, fp)));
+        let targets = [ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: None,
+        }];
+        let context = scheduler.resolve_arrival_tokens("model", arrival);
+        let first = scheduler
+            .acquire(identity("same"), context, &targets, None)
+            .await
+            .unwrap();
+        let _second = scheduler
+            .acquire(identity("same"), context, &targets, None)
+            .await
+            .unwrap();
+        scheduler.complete(&first, true, false, Some(10), None);
+        assert_eq!(scheduler.diagnostics().revoked_token_fingerprints, 0);
+        scheduler.complete(&first, true, false, Some(11), None);
+        assert_eq!(scheduler.diagnostics().revoked_token_fingerprints, 0,
+            "a stale duplicate callback must not mutate another in-flight attempt's verification state");
     }
 }

@@ -68,7 +68,7 @@ impl fmt::Display for TokenFactSource {
 /// identity, sampling knobs, and credentials are excluded so one equivalence
 /// class is not split per request. A mismatch between two fingerprints is never
 /// compared as a "close enough" count; each fingerprint is verified or revoked
-/// on its own.
+/// across its pool, without distinguishing Engine versions or target ranks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct TokenizerFingerprint([u8; 16]);
 
@@ -201,12 +201,14 @@ pub enum TokenFactFallback {
     FingerprintRevoked,
     /// No pre-dispatch count was available for this request shape.
     NoPreparedFact,
-    /// Settlement cannot observe Engine usage (streaming HTTP client without
-    /// `stream_options.include_usage`), so a prepared count cannot be verified.
+    /// Settlement cannot observe Engine usage for this request, so a prepared
+    /// count cannot be verified.
     UnobservableStream,
     /// The fingerprint has not yet accumulated enough matching settlements
     /// (`token_count_verification_settlements`).
     FingerprintUnverified,
+    /// Repeated successful settlements lacked Engine prompt usage.
+    UsageUnavailable,
 }
 
 impl TokenFactFallback {
@@ -217,6 +219,7 @@ impl TokenFactFallback {
             Self::NoPreparedFact => "no_prepared_fact",
             Self::UnobservableStream => "unobservable_stream",
             Self::FingerprintUnverified => "fingerprint_unverified",
+            Self::UsageUnavailable => "usage_unavailable",
         }
     }
 }
@@ -266,7 +269,7 @@ impl fmt::Display for TokenCountMode {
     }
 }
 
-/// What the scheduler applied for one arrival, plus the shadow counterfactual.
+/// Applied demand for one arrival, plus its pending prepared fact, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextTokens {
     pub(crate) tokens: usize,
@@ -313,7 +316,7 @@ impl ContextTokens {
         }
     }
 
-    /// Attach the prepared counterfactual recorded by shadow mode.
+    /// Attach a prepared shadow counterfactual or exact-mode probation witness.
     ///
     /// The whole fact is kept, not only its count: settlement reconciles this
     /// prepared count with Engine usage even though the *applied* decision used
@@ -344,7 +347,7 @@ impl ContextTokens {
         self.shadow.map(|facts| facts.tokens())
     }
 
-    /// Prepared counterfactual with its provenance, when shadow mode recorded one.
+    /// Prepared counterfactual or probation witness, including its provenance.
     pub fn shadow_facts(&self) -> Option<TokenFacts> {
         self.shadow
     }
@@ -357,6 +360,15 @@ impl ContextTokens {
         if revoked && self.source.is_prepared() {
             Self::estimated(self.estimated_tokens)
                 .with_fallback(TokenFactFallback::FingerprintRevoked)
+        } else {
+            self
+        }
+    }
+
+    pub(crate) fn fallback_if_usage_unavailable(self, unavailable: bool) -> Self {
+        if unavailable {
+            Self::estimated(self.estimated_tokens)
+                .with_fallback(TokenFactFallback::UsageUnavailable)
         } else {
             self
         }
