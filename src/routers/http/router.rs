@@ -320,6 +320,15 @@ struct ResolvedProgramModelPool {
     registry_model: Option<String>,
 }
 
+/// `check_grpc_health` with `limit` on the probe as a whole: on its own it
+/// applies the limit to the connect and again to the check. No test covers
+/// this, since exceeding `limit` takes a slow TCP connect.
+async fn check_grpc_health_within(worker_url: &str, limit: Duration) -> Result<(), String> {
+    tokio::time::timeout(limit, crate::backend::check_grpc_health(worker_url, limit))
+        .await
+        .unwrap_or_else(|_| Err(format!("grpc health check timeout {worker_url}")))
+}
+
 impl Router {
     /// Create a new router with injected policy and client
     #[allow(clippy::too_many_arguments)]
@@ -1083,7 +1092,7 @@ impl Router {
 
                 let check_health = tokio::spawn(async move {
                     if crate::backend::is_grpc_url(&url_clone) {
-                        match crate::backend::check_grpc_health(&url_clone, probe_timeout).await {
+                        match check_grpc_health_within(&url_clone, probe_timeout).await {
                             Ok(()) => None,
                             Err(e) => Some((url_clone, e)),
                         }
@@ -2287,8 +2296,7 @@ impl Router {
             let health_result = if crate::backend::is_grpc_url(worker_url) {
                 // No test covers this limit: it shortens a 2 s probe, so a test
                 // would hinge on a sub-second wall-clock bound.
-                crate::backend::check_grpc_health(worker_url, Duration::from_secs(2).min(budget))
-                    .await
+                check_grpc_health_within(worker_url, Duration::from_secs(2).min(budget)).await
             } else {
                 let health_url = format!("{}/health", worker_url);
                 match worker_get(&client, &health_url, self.api_key.as_deref())
