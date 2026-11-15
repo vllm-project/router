@@ -1,5 +1,6 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
 use super::program_adapter::ProgramCompletion;
+use crate::backend::health::check_grpc_health_within;
 use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
 use crate::backend::{
     stream_output::{output_frame_tracking, OutputFrameConsumer, OutputFrameProducer},
@@ -320,13 +321,37 @@ struct ResolvedProgramModelPool {
     registry_model: Option<String>,
 }
 
-/// `check_grpc_health` with `limit` on the probe as a whole: on its own it
-/// applies the limit to the connect and again to the check. No test covers
-/// this, since exceeding `limit` takes a slow TCP connect.
-async fn check_grpc_health_within(worker_url: &str, limit: Duration) -> Result<(), String> {
-    tokio::time::timeout(limit, crate::backend::check_grpc_health(worker_url, limit))
-        .await
-        .unwrap_or_else(|_| Err(format!("grpc health check timeout {worker_url}")))
+/// Deadline of the startup wait and `add_worker`: probes and retry sleeps
+/// stop at the worker startup timeout.
+struct StartupBudget {
+    start: Instant,
+    startup: Duration,
+    interval: Duration,
+}
+
+impl StartupBudget {
+    fn new(startup_timeout_secs: u64, check_interval_secs: u64) -> Self {
+        Self {
+            start: Instant::now(),
+            startup: Duration::from_secs(startup_timeout_secs),
+            interval: Duration::from_secs(check_interval_secs),
+        }
+    }
+
+    /// Time left before the startup timeout.
+    fn remaining(&self) -> Duration {
+        self.startup.saturating_sub(self.start.elapsed())
+    }
+
+    /// Timeout for a probe that may take up to `cap`.
+    fn probe(&self, cap: Duration) -> Duration {
+        cap.min(self.remaining())
+    }
+
+    /// Sleep before the next probe.
+    fn backoff(&self) -> Duration {
+        self.interval.min(self.remaining())
+    }
 }
 
 impl Router {
@@ -1056,10 +1081,10 @@ impl Router {
             worker_startup_timeout_secs
         );
 
-        let start_time = std::time::Instant::now();
-        let startup_timeout = Duration::from_secs(worker_startup_timeout_secs);
-        let check_interval = Duration::from_secs(worker_startup_check_interval_secs);
-        let remaining = || startup_timeout.saturating_sub(start_time.elapsed());
+        let budget = StartupBudget::new(
+            worker_startup_timeout_secs,
+            worker_startup_check_interval_secs,
+        );
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
@@ -1068,9 +1093,7 @@ impl Router {
         let mut unhealthy_hosts: Vec<(String, String)> = Vec::new();
 
         loop {
-            // Probes and retry sleeps stop at the startup timeout.
-            let budget = remaining();
-            if budget.is_zero() {
+            if budget.remaining().is_zero() {
                 let message = format!(
                     "Timeout {}s waiting for hosts {:?} to become healthy (last health check: {:?}). Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
                     worker_startup_timeout_secs, unique_hosts_vec, unhealthy_hosts
@@ -1081,7 +1104,7 @@ impl Router {
 
             // No test covers this limit: it shortens a 2 s probe, so a test
             // would hinge on a sub-second wall-clock bound.
-            let probe_timeout = Duration::from_secs(2).min(budget);
+            let probe_timeout = budget.probe(Duration::from_secs(2));
 
             // Perform health checks only on unique hosts (not per DP rank)
             let mut health_checks = Vec::new();
@@ -1154,7 +1177,7 @@ impl Router {
                     unhealthy_hosts.len(),
                     unhealthy_hosts
                 );
-                tokio::time::sleep(check_interval.min(remaining())).await;
+                tokio::time::sleep(budget.backoff()).await;
             }
         }
     }
@@ -1186,6 +1209,11 @@ impl Router {
         }
     }
 
+    /// Send a health check to `worker_url` and relay the answer.
+    ///
+    /// An HTTP check applies no timeout of its own and inherits the client's
+    /// `--request-timeout-secs`. A gRPC check uses `check_grpc_health` with a
+    /// 2 s limit.
     pub async fn send_health_check(&self, worker_url: &str) -> Response {
         let health_url = if self.intra_node_data_parallel_size > 1 {
             // Need to extract the URL from "http://host:port@dp_rank"
@@ -2269,11 +2297,11 @@ impl Router {
         urls.push(worker_url.to_string());
         crate::backend::classify_worker_urls(&urls)?;
 
-        let start_time = std::time::Instant::now();
-        let startup_timeout = Duration::from_secs(self.worker_startup_timeout_secs);
+        let budget = StartupBudget::new(
+            self.worker_startup_timeout_secs,
+            self.worker_startup_check_interval_secs,
+        );
         let health_timeout = Duration::from_secs(self.health_config.timeout_secs);
-        let check_interval = Duration::from_secs(self.worker_startup_check_interval_secs);
-        let remaining = || startup_timeout.saturating_sub(start_time.elapsed());
         let client = reqwest::Client::builder()
             .timeout(health_timeout)
             .build()
@@ -2282,9 +2310,7 @@ impl Router {
         let mut last_health_error = String::from("none");
 
         loop {
-            // Probes and retry sleeps stop at the startup timeout.
-            let budget = remaining();
-            if budget.is_zero() {
+            if budget.remaining().is_zero() {
                 let message = format!(
                     "Timeout {}s waiting for worker {} to become healthy (last health check: {}). Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
                     self.worker_startup_timeout_secs, worker_url, last_health_error
@@ -2296,11 +2322,11 @@ impl Router {
             let health_result = if crate::backend::is_grpc_url(worker_url) {
                 // No test covers this limit: it shortens a 2 s probe, so a test
                 // would hinge on a sub-second wall-clock bound.
-                check_grpc_health_within(worker_url, Duration::from_secs(2).min(budget)).await
+                check_grpc_health_within(worker_url, budget.probe(Duration::from_secs(2))).await
             } else {
                 let health_url = format!("{}/health", worker_url);
                 match worker_get(&client, &health_url, self.api_key.as_deref())
-                    .timeout(health_timeout.min(budget))
+                    .timeout(budget.probe(health_timeout))
                     .send()
                     .await
                 {
@@ -2425,7 +2451,7 @@ impl Router {
                         warn!("The worker url {} does not have http or https prefix. Please add the prefix to the url.", worker_url);
                     }
 
-                    tokio::time::sleep(check_interval.min(remaining())).await;
+                    tokio::time::sleep(budget.backoff()).await;
                     continue;
                 }
             }
