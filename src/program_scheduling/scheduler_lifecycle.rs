@@ -111,7 +111,7 @@ impl ProgramScheduler {
             };
         // A failed/cancelled request without usage is not evidence that the
         // backend lacks usage support.
-        if success || usage.prompt_tokens.is_some() {
+        if success || usage.prompt_tokens.is_some_and(|tokens| tokens > 0) {
             self.reconcile_observed_prompt_tokens(
                 &mut state,
                 dispatch.program().model_pool(),

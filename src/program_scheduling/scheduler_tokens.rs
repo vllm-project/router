@@ -1056,11 +1056,16 @@ mod revocation_tests {
             .acquire(identity("same"), context, &targets, None)
             .await
             .unwrap();
+        let third = scheduler
+            .acquire(identity("same"), context, &targets, None)
+            .await
+            .unwrap();
         scheduler.complete(&first, true, false, None, None);
         for _ in 0..MAX_TOKEN_USAGE_MISSES {
             scheduler.complete(&first, true, false, None, None);
         }
         scheduler.complete(&second, false, false, None, None);
+        scheduler.complete(&third, false, false, Some(0), None);
         assert_eq!(scheduler.state.lock().token_usage_misses["model"], 1);
         assert!(scheduler.prepared_token_pool_enabled("model"));
     }
