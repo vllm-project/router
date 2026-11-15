@@ -247,10 +247,22 @@ has tracing support.
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key sent on requests to workers, including HTTP health checks. |
+| `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key for the router's own requests to workers, including HTTP health checks; see below. |
 | `--api-key-validation-urls` | `string [0..] (repeatable)` | `[]` | — | — | Validation URLs; an empty list falls back to comma-separated `API_KEY_VALIDATION_URLS` from the environment or `.env`. |
 
-gRPC, PD and `--enable-igw` worker health checks do not carry the key yet.
+The regular router sends `--api-key` on the requests it makes on its own:
+HTTP health checks, and the worker queries of KV-aware routing and EPD. On
+proxied requests it depends on the route. Typed routes such as
+`/v1/completions` forward the client's `Authorization` header and do not add
+the key. The transparent route, which serves `/v1/responses`, EPD chat
+completions and paths without a typed handler, sends the key in place of the
+client's header.
+
+`/flush_cache` and `/get_load` requests to workers do not carry the key. gRPC
+workers receive no credential, and PD and `--enable-igw` worker health checks
+do not carry the key yet. One key applies to all workers and is read at
+startup, so changing it takes a restart.
+
 The startup wait and `add_worker` always probe `/health`, regardless of
 `--health-check-endpoint`.
 

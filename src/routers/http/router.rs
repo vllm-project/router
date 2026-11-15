@@ -1212,8 +1212,7 @@ impl Router {
     /// Send a health check to `worker_url` and relay the answer.
     ///
     /// An HTTP check applies no timeout of its own and inherits the client's
-    /// `--request-timeout-secs`. A gRPC check uses `check_grpc_health` with a
-    /// 2 s limit.
+    /// `--request-timeout-secs`. A gRPC check is limited to 2 s.
     pub async fn send_health_check(&self, worker_url: &str) -> Response {
         let health_url = if self.intra_node_data_parallel_size > 1 {
             // Need to extract the URL from "http://host:port@dp_rank"
@@ -1233,8 +1232,7 @@ impl Router {
         };
 
         if crate::backend::is_grpc_url(health_url) {
-            return match crate::backend::check_grpc_health(health_url, Duration::from_secs(2)).await
-            {
+            return match check_grpc_health_within(health_url, Duration::from_secs(2)).await {
                 Ok(()) => StatusCode::OK.into_response(),
                 Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
             };
@@ -7512,6 +7510,12 @@ mod tests {
         };
         let (router, _ctx) = start_router(config, vec![]).await;
         let error = router.add_worker(&url).await.unwrap_err();
+        assert!(error.contains("401"), "{error}");
+
+        // So does the periodic check.
+        let worker = BasicWorker::new(url, WorkerType::Regular)
+            .with_worker_api_key(Some(Arc::from("other-key")));
+        let error = worker.check_health_async().await.unwrap_err().to_string();
         assert!(error.contains("401"), "{error}");
 
         server.abort();

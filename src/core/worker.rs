@@ -430,7 +430,7 @@ impl Worker for BasicWorker {
     async fn check_health_async(&self) -> WorkerResult<()> {
         use std::time::Duration;
 
-        let health_result = match &self.metadata.connection_mode {
+        let health_result: Result<(), String> = match &self.metadata.connection_mode {
             ConnectionMode::Http => {
                 // Perform HTTP health check
                 let url = self.normalised_url()?;
@@ -443,48 +443,52 @@ impl Worker for BasicWorker {
                     .send()
                     .await
                 {
-                    Ok(response) => response.status().is_success(),
-                    Err(_) => false,
+                    Ok(response) if response.status().is_success() => Ok(()),
+                    Ok(response) => Err(format!("HTTP health status {}", response.status())),
+                    Err(error) => Err(error.to_string()),
                 }
             }
             ConnectionMode::Grpc => {
                 let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
-                crate::backend::check_grpc_health(self.url(), timeout)
-                    .await
-                    .is_ok()
+                crate::backend::check_grpc_health(self.url(), timeout).await
             }
         };
 
-        if health_result {
-            // Health check succeeded
-            self.consecutive_failures.store(0, Ordering::Release);
-            let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
-
-            // Mark healthy if we've reached the success threshold
-            if !self.is_healthy()
-                && successes >= self.metadata.health_config.success_threshold as usize
-            {
-                self.set_healthy(true);
-                self.consecutive_successes.store(0, Ordering::Release);
-            }
-            Ok(())
-        } else {
-            // Health check failed
-            self.consecutive_successes.store(0, Ordering::Release);
-            let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
-
-            // Mark unhealthy if we've reached the failure threshold
-            if self.is_healthy()
-                && failures >= self.metadata.health_config.failure_threshold as usize
-            {
-                self.set_healthy(false);
+        match health_result {
+            Ok(()) => {
+                // Health check succeeded
                 self.consecutive_failures.store(0, Ordering::Release);
-            }
+                let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
 
-            Err(WorkerError::HealthCheckFailed {
-                url: self.metadata.url.clone(),
-                reason: format!("Health check failed (consecutive failures: {})", failures),
-            })
+                // Mark healthy if we've reached the success threshold
+                if !self.is_healthy()
+                    && successes >= self.metadata.health_config.success_threshold as usize
+                {
+                    self.set_healthy(true);
+                    self.consecutive_successes.store(0, Ordering::Release);
+                }
+                Ok(())
+            }
+            Err(reason) => {
+                // Health check failed
+                self.consecutive_successes.store(0, Ordering::Release);
+                let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+
+                // Mark unhealthy if we've reached the failure threshold
+                if self.is_healthy()
+                    && failures >= self.metadata.health_config.failure_threshold as usize
+                {
+                    // Logged once per transition; a rejected key shows as 401.
+                    tracing::warn!("Worker {} marked unhealthy: {}", self.metadata.url, reason);
+                    self.set_healthy(false);
+                    self.consecutive_failures.store(0, Ordering::Release);
+                }
+
+                Err(WorkerError::HealthCheckFailed {
+                    url: self.metadata.url.clone(),
+                    reason: format!("{} (consecutive failures: {})", reason, failures),
+                })
+            }
         }
     }
 
