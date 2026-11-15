@@ -11,6 +11,10 @@ const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 /// The payload byte cap is checked before parsing; nesting depth is limited
 /// during each parse. The event count is checked after materializing the Value
 /// tree. These limits do not constitute a hard decoded-heap budget.
+/// Batch size above which the consumer logs rather than acts: the whole message is still
+/// applied, because dropping events breaks block linkage.
+const LARGE_BATCH_WARNING: usize = 16384;
+
 pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err("KV event payload exceeds 16 MiB".into());
@@ -47,17 +51,23 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
     let Value::Array(events) = batch.remove(1) else {
         return Err("KV events must be an array".into());
     };
-    if events.len() > 4096 {
-        return Err("KV event batch exceeds the event limit".into());
-    }
+
     let events = events
         .into_iter()
         .map(decode_event)
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?;
+    // Nothing is dropped. A decoded event can depend on the ones before it - a store is
+    // only linkable when the index already holds its parent - so a trimmed head silently
+    // orphans the tail, which is the same class of failure as rejecting the batch whole.
+    // The publisher batches per step, so a message stays bounded in practice.
+    if events.len() > LARGE_BATCH_WARNING {
+        tracing::warn!(events = events.len(), "large KV event batch applied whole");
+    }
     Ok(KVEventBatch {
         ts,
         events,
         data_parallel_rank,
+        keep_from: 0,
     })
 }
 
@@ -449,8 +459,13 @@ mod tests {
     #[test]
     fn bounded_messagepack_and_trailing_bytes() {
         assert!(decode_batch(&vec![0; MAX_PAYLOAD_BYTES + 1]).is_err());
+        // Oversized batches are accepted now. One carrying a clear is kept whole, because
+        // trimming it would drop an authoritative event; one made only of stores is
+        // trimmed, and the caller still validates the untrimmed batch.
         let clear = Value::Map(vec![("type".into(), "AllBlocksCleared".into())]);
-        assert!(decode_batch(&encode(vec![clear; 4097], 0.into())).is_err());
+        let kept = decode_batch(&encode(vec![clear; 4097], 0.into())).unwrap();
+        assert_eq!(kept.events.len(), 4097);
+        assert_eq!(kept.keep_from, 0);
         let mut payload = encode(vec![stored()], 0.into());
         payload.push(0);
         assert!(decode_batch(&payload).is_err());

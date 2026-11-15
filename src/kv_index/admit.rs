@@ -210,6 +210,7 @@ mod tests {
         }))
         .unwrap();
         let mut batch = KVEventBatch {
+            keep_from: 0,
             ts: 0.0,
             events: vec![
                 KVEvent::AllBlocksCleared(Default::default()),
@@ -266,6 +267,7 @@ mod tests {
                 }))
                 .unwrap();
                 let mut batch = KVEventBatch {
+                    keep_from: 0,
                     ts: 1.0,
                     events: vec![KVEvent::AllBlocksCleared(Default::default()), stored],
                     data_parallel_rank: Some(3),
