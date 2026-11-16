@@ -356,23 +356,6 @@ impl ConfigValidator {
                         prefill_urls.iter().map(|(url, _)| url.clone()).collect();
                     all.extend(decode_urls.iter().cloned());
                     Self::reject_mixed_worker_urls(&all)?;
-                    // `targets` is keyed by the expanded worker URL. A bare URL
-                    // expands to every DP rank (or to the unranked worker when
-                    // the server has one engine), and a pinned URL names one
-                    // rank, so compare the identities the workers will actually
-                    // register rather than the configuration text. Otherwise
-                    // `http://host:8000` and `http://host:8000@0` pass as
-                    // different strings and rank 0 is registered by both stages.
-                    if let Some((prefill, decode)) =
-                        Self::overlapping_worker(prefill_urls, decode_urls)
-                    {
-                        return Err(ConfigError::ValidationFailed {
-                            reason: format!(
-                                "worker URL {decode} overlaps prefill URL {prefill} after DP \
-                                 expansion; one worker cannot serve both roles in P/D mode"
-                            ),
-                        });
-                    }
                 }
                 // Discovered P/D workers register as http://, so a grpc://
                 // static pool would end up mixed at runtime.
@@ -991,24 +974,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// First Prefill/Decode URL pair whose expanded DP workers are the same
-    /// worker identity.
-    ///
-    /// A bare URL is a wildcard: it expands to every rank the server reports,
-    /// so it overlaps any pinned rank on the same base. Two different pinned
-    /// ranks are distinct workers and do not overlap.
-    fn overlapping_worker<'a>(
-        prefill: &'a [(String, Option<u16>)],
-        decode: &'a [String],
-    ) -> Option<(&'a str, &'a str)> {
-        prefill.iter().find_map(|(prefill, _)| {
-            decode.iter().find_map(|decode| {
-                expanded_worker_overlap(prefill, decode)
-                    .then_some((prefill.as_str(), decode.as_str()))
-            })
-        })
-    }
-
     /// Validate URL format
     fn validate_urls(urls: &[String]) -> ConfigResult<()> {
         for url in urls {
@@ -1086,31 +1051,6 @@ fn base_url_without_rank(url: &str) -> &str {
         Some((base, rank)) if rank.parse::<usize>().is_ok() => base,
         _ => url,
     }
-}
-
-/// Split a worker URL into its base and optional pinned DP rank.
-fn worker_identity(url: &str) -> (&str, Option<usize>) {
-    match url.rsplit_once('@') {
-        Some((base, rank)) => match rank.parse::<usize>() {
-            Ok(rank) => (base, Some(rank)),
-            Err(_) => (url, None),
-        },
-        None => (url, None),
-    }
-}
-
-/// Whether two configured endpoints expand to at least one identical worker.
-///
-/// A bare endpoint expands to all ranks of its base, so it overlaps any pinned
-/// rank there; two different pinned ranks never overlap.
-fn expanded_worker_overlap(left: &str, right: &str) -> bool {
-    let (left_base, left_rank) = worker_identity(left);
-    let (right_base, right_rank) = worker_identity(right);
-    left_base == right_base
-        && match (left_rank, right_rank) {
-            (Some(left), Some(right)) => left == right,
-            _ => true,
-        }
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -1363,43 +1303,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn test_validate_pd_overlap_uses_expanded_dp_identity() {
-        let validate = |prefill: &str, decode: &str| {
-            ConfigValidator::validate(&RouterConfig::new(
-                RoutingMode::VllmPrefillDecode {
-                    prefill_urls: vec![(prefill.to_string(), None)],
-                    decode_urls: vec![decode.to_string()],
-                    prefill_policy: None,
-                    decode_policy: None,
-                    discovery_address: None,
-                },
-                PolicyConfig::Random,
-            ))
-        };
-
-        for (prefill, decode) in [
-            ("http://host:8000", "http://host:8000@0"),
-            ("http://host:8000@0", "http://host:8000"),
-            ("http://host:8000", "http://host:8000@1"),
-            ("http://host:8000@1", "http://host:8000"),
-            ("http://host:8000", "http://host:8000"),
-            ("http://host:8000@1", "http://host:8000@1"),
-        ] {
-            let error = validate(prefill, decode)
-                .expect_err(&format!("{prefill} and {decode} name the same DP worker"))
-                .to_string();
-            assert!(error.contains("DP expansion"), "{error}");
-        }
-
-        // Same base, different pinned ranks: two distinct workers.
-        validate("http://host:8000@0", "http://host:8000@1").unwrap();
-        validate("http://host:8000@1", "http://host:8000@0").unwrap();
-        // Different bases never overlap, even when one side is bare.
-        validate("http://host:8000", "http://other:8000@0").unwrap();
-        validate("http://host:8001@0", "http://host:8000@1").unwrap();
     }
 
     #[test]
