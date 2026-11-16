@@ -42,6 +42,16 @@ use uuid::Uuid;
 
 type ProgramPrefillCandidate = (String, Arc<dyn Worker>);
 
+#[derive(Debug)]
+struct ProfilingSession {
+    generation: Uuid,
+    timeout: tokio::task::AbortHandle,
+}
+
+// Serialize profiling I/O per worker; cancellation leaves the session and its
+// timeout registered so a later start can still supersede the fallback.
+type ProfilingWorker = Arc<Mutex<Option<ProfilingSession>>>;
+
 /// Mooncake prefill bootstrap info (engine_id per dp_rank)
 #[derive(Debug, Clone)]
 struct MooncakePrefillInfo {
@@ -99,8 +109,8 @@ pub struct VllmPDRouter {
     enable_profiling: bool,
     /// Profiling timeout in seconds
     profile_timeout_secs: u64,
-    /// Active profiling timeout tasks keyed by worker URL
-    profiling_tasks: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
+    /// Per-worker profiling state, including in-flight cleanup and its fallback.
+    profiling_tasks: Arc<Mutex<HashMap<String, ProfilingWorker>>>,
     /// Intra-node data parallel size for DP-aware routing (automatically enabled when > 1)
     intra_node_data_parallel_size: usize,
     /// KV connector type
@@ -886,59 +896,74 @@ impl VllmPDRouter {
             .unwrap_or_else(|| base.to_owned())
     }
 
-    /// Helper: Start profiling on a backend server with timeout
-    async fn start_profiling(&self, worker_url: &str) {
-        // Only profile if enabled
-        if !self.enable_profiling {
-            return;
-        }
-
-        // Start profiling on the worker
-        self.pd_router.start_profiling(worker_url).await;
-
-        // Spawn a timeout task that will call stop_profiling if timeout is reached
-        let timeout_secs = self.profile_timeout_secs;
-        let worker_url_owned = worker_url.to_string();
-        let pd_router_clone = self.pd_router.clone();
-        let profiling_tasks_clone = self.profiling_tasks.clone();
-
-        let task_handle = tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_secs(timeout_secs)).await;
-
-            info!(
-                "Profiling timeout reached for {}, stopping profiling",
-                worker_url_owned
-            );
-            pd_router_clone.stop_profiling(&worker_url_owned).await;
-
-            // Remove ourselves from the tasks map
-            let mut tasks = profiling_tasks_clone.lock().await;
-            tasks.remove(&worker_url_owned);
-        });
-
-        // Store the abort handle
-        let mut tasks = self.profiling_tasks.lock().await;
-        if let Some(old_handle) = tasks.insert(worker_url.to_string(), task_handle.abort_handle()) {
-            // Cancel any existing timeout task for this worker
-            old_handle.abort();
-        }
+    async fn profiling_worker(&self, worker_url: &str) -> ProfilingWorker {
+        let mut workers = self.profiling_tasks.lock().await;
+        // A live operation or timeout owns another Arc. Reclaim completed
+        // workers lazily without splitting concurrent callers across locks.
+        workers.retain(|_, worker| Arc::strong_count(worker) > 1);
+        workers
+            .entry(worker_url.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone()
     }
 
-    /// Helper: Stop profiling on a backend server and cancel timeout task
-    async fn stop_profiling(&self, worker_url: &str) {
-        // Only stop profiling if it was enabled
+    /// Start a new session while fencing the previous timeout with the worker lock.
+    async fn start_profiling(&self, worker_url: &str) {
         if !self.enable_profiling {
             return;
         }
+        let worker = self.profiling_worker(worker_url).await;
+        let mut session = worker.lock().await;
+        self.pd_router.start_profiling(worker_url).await;
+        // Keep the previous fallback if this start is cancelled. The worker
+        // lock prevents it from sending a stop while the start is awaited.
+        if let Some(previous) = session.take() {
+            previous.timeout.abort();
+        }
 
-        let handle = self.profiling_tasks.lock().await.remove(worker_url);
-        let Some(handle) = handle else {
+        let generation = Uuid::new_v4();
+        let timeout_secs = self.profile_timeout_secs;
+        let worker_url = worker_url.to_owned();
+        let pd_router = self.pd_router.clone();
+        let timeout_worker = worker.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
+            let mut session = timeout_worker.lock().await;
+            if session
+                .as_ref()
+                .is_none_or(|current| current.generation != generation)
+            {
+                return;
+            }
+            info!(
+                "Profiling timeout reached for {}, stopping profiling",
+                worker_url
+            );
+            // Hold only this worker's lock: a new start must not overtake an
+            // old stop that is already in flight.
+            pd_router.stop_profiling(&worker_url).await;
+            session.take();
+        });
+        *session = Some(ProfilingSession {
+            generation,
+            timeout: task.abort_handle(),
+        });
+    }
+
+    /// Stop once; retain the registered fallback until cleanup completes.
+    async fn stop_profiling(&self, worker_url: &str) {
+        if !self.enable_profiling {
             return;
-        };
-        // Retain the existing timeout task as a fallback if this request is
-        // cancelled or its bounded cleanup expires while awaiting the backend.
+        }
+        let worker = self.profiling_worker(worker_url).await;
+        let mut session = worker.lock().await;
+        if session.is_none() {
+            return;
+        }
         self.pd_router.stop_profiling(worker_url).await;
-        handle.abort();
+        if let Some(finished) = session.take() {
+            finished.timeout.abort();
+        }
     }
 
     /// Modify request for prefill stage (limit output to 1 token)
@@ -3656,6 +3681,174 @@ mod tests {
     }
 
     use super::*;
+
+    mod profiling_lifecycle {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::sync::{Notify, Semaphore};
+
+        struct Backend {
+            starts: AtomicUsize,
+            stops: AtomicUsize,
+            block_start: AtomicBool,
+            start_entered: Notify,
+            release_start: Semaphore,
+            stop_entered: Notify,
+            release_stop: Semaphore,
+        }
+
+        async fn fixture() -> (Arc<VllmPDRouter>, String, Arc<Backend>) {
+            let backend = Arc::new(Backend {
+                starts: AtomicUsize::new(0),
+                stops: AtomicUsize::new(0),
+                block_start: AtomicBool::new(false),
+                start_entered: Notify::new(),
+                release_start: Semaphore::new(0),
+                stop_entered: Notify::new(),
+                release_stop: Semaphore::new(0),
+            });
+            let app = axum::Router::new()
+                .route(
+                    "/start_profile",
+                    axum::routing::post({
+                        let backend = backend.clone();
+                        move || {
+                            let backend = backend.clone();
+                            async move {
+                                backend.starts.fetch_add(1, Ordering::SeqCst);
+                                if backend.block_start.load(Ordering::SeqCst) {
+                                    backend.start_entered.notify_one();
+                                    backend.release_start.acquire().await.unwrap().forget();
+                                }
+                                "ok"
+                            }
+                        }
+                    }),
+                )
+                .route(
+                    "/stop_profile",
+                    axum::routing::post({
+                        let backend = backend.clone();
+                        move || {
+                            let backend = backend.clone();
+                            async move {
+                                let previous = backend.stops.fetch_add(1, Ordering::SeqCst);
+                                backend.stop_entered.notify_one();
+                                if previous == 0 {
+                                    backend.release_stop.acquire().await.unwrap().forget();
+                                }
+                                "ok"
+                            }
+                        }
+                    }),
+                );
+            let url = spawn_test_server(app).await;
+            let mut router = test_vllm_pd_router().await;
+            router.enable_profiling = true;
+            router.profile_timeout_secs = 1;
+            (Arc::new(router), url, backend)
+        }
+
+        async fn cancel_first_stop(router: &Arc<VllmPDRouter>, url: &str, backend: &Backend) {
+            let stop = tokio::spawn({
+                let router = router.clone();
+                let url = url.to_owned();
+                async move { router.stop_profiling(&url).await }
+            });
+            tokio::time::timeout(Duration::from_secs(2), backend.stop_entered.notified())
+                .await
+                .expect("first stop must reach the backend");
+            stop.abort();
+            assert!(stop.await.unwrap_err().is_cancelled());
+        }
+
+        #[tokio::test]
+        async fn profiling_new_session_supersedes_cancelled_cleanup_fallback() {
+            let (mut router, url, backend) = fixture().await;
+            router.start_profiling(&url).await;
+            cancel_first_stop(&router, &url, &backend).await;
+            // The old fallback expires in one second; the new session must
+            // survive that deadline and still perform its own explicit stop.
+            Arc::get_mut(&mut router).unwrap().profile_timeout_secs = 60;
+            router.start_profiling(&url).await;
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert_eq!(backend.starts.load(Ordering::SeqCst), 2);
+            assert_eq!(backend.stops.load(Ordering::SeqCst), 1);
+            router.stop_profiling(&url).await;
+            router.stop_profiling(&url).await;
+            assert_eq!(backend.stops.load(Ordering::SeqCst), 2);
+            backend.release_stop.add_permits(1);
+        }
+
+        #[tokio::test]
+        async fn profiling_cancelled_cleanup_keeps_timeout_fallback() {
+            let (router, url, backend) = fixture().await;
+            router.start_profiling(&url).await;
+            cancel_first_stop(&router, &url, &backend).await;
+            tokio::time::timeout(Duration::from_secs(2), backend.stop_entered.notified())
+                .await
+                .expect("timeout must retry the cancelled cleanup");
+            router.stop_profiling(&url).await;
+            assert_eq!(backend.stops.load(Ordering::SeqCst), 2);
+            backend.release_stop.add_permits(1);
+        }
+
+        #[tokio::test]
+        async fn profiling_cancelled_start_keeps_previous_fallback() {
+            let (router, url, backend) = fixture().await;
+            router.start_profiling(&url).await;
+            backend.block_start.store(true, Ordering::SeqCst);
+            let start = tokio::spawn({
+                let router = router.clone();
+                let url = url.clone();
+                async move { router.start_profiling(&url).await }
+            });
+            tokio::time::timeout(Duration::from_secs(2), backend.start_entered.notified())
+                .await
+                .expect("replacement start must reach the backend");
+            start.abort();
+            assert!(start.await.unwrap_err().is_cancelled());
+            backend.release_stop.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(2), backend.stop_entered.notified())
+                .await
+                .expect("cancelled replacement must retain the previous fallback");
+            router.stop_profiling(&url).await;
+            assert_eq!(backend.stops.load(Ordering::SeqCst), 1);
+            backend.release_start.add_permits(1);
+        }
+
+        #[tokio::test]
+        async fn profiling_serializes_same_worker_without_blocking_other_workers() {
+            let (mut router, url, backend) = fixture().await;
+            Arc::get_mut(&mut router).unwrap().profile_timeout_secs = 60;
+            router.start_profiling(&url).await;
+            let stop = tokio::spawn({
+                let router = router.clone();
+                let url = url.clone();
+                async move { router.stop_profiling(&url).await }
+            });
+            tokio::time::timeout(Duration::from_secs(2), backend.stop_entered.notified())
+                .await
+                .unwrap();
+            let mut start = Box::pin(router.start_profiling(&url));
+            assert!(tokio::time::timeout(Duration::from_millis(40), &mut start)
+                .await
+                .is_err());
+            assert_eq!(backend.starts.load(Ordering::SeqCst), 1);
+            let other = spawn_test_server(axum::Router::new().fallback(|| async { "ok" })).await;
+            tokio::time::timeout(Duration::from_secs(1), router.start_profiling(&other))
+                .await
+                .expect("other workers must not wait for this worker's stop");
+            router.stop_profiling(&other).await;
+            backend.release_stop.add_permits(1);
+            stop.await.unwrap();
+            start.await;
+            assert_eq!(backend.starts.load(Ordering::SeqCst), 2);
+            router.stop_profiling(&url).await;
+            assert_eq!(backend.stops.load(Ordering::SeqCst), 2);
+        }
+    }
 
     #[tokio::test]
     async fn prefill_body_limit_rejects_oversized_responses() {

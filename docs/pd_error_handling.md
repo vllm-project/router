@@ -141,9 +141,12 @@ Decode response before profiling cleanup or collecting the Prefill error body.
 The common failure wrapper releases local load, then attempts both profiling
 stops concurrently with a shared two-second cleanup deadline. Cleanup is best
 effort: request cancellation or a timeout may interrupt a stop request, leaving
-the existing profiling timeout task to retry cleanup. Neither can delay local
-Decode cancellation or resource release. Dropping local HTTP
-work does not guarantee that the remote engine immediately stops computation.
+the existing profiling timeout task to retry cleanup. A new profiling session
+supersedes the previous session's timeout. Profiling HTTP operations are
+serialized per worker while their requests are awaited; other workers use
+independent locks. Neither cleanup nor capture can delay local Decode
+cancellation or resource release. Dropping local HTTP work does not guarantee
+that the remote engine immediately stops computation.
 
 After the downstream status and headers have been sent, a body transport failure
 terminates the body. The committed status cannot change, and the router does
