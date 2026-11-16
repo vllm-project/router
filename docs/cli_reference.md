@@ -134,6 +134,8 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--decode` | `string (repeatable)` | `[]` | `string (repeatable)` | `unset` | Add one decode URL per occurrence: `--decode URL`. |
 | `--vllm-discovery-address` | `string` | `unset` | `string` | `unset` | ZMQ registration address for vLLM workers, e.g. `0.0.0.0:30001`. |
 | `--kv-connector` | `nixl, mooncake, moriio` | `nixl` | `nixl, mooncake, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. |
+| `--pd-decode-commit-wait-ms` | `u64` | `0` | `integer` | `0` | Additional retry budget after an empty deferred Decode commitment, in milliseconds. Zero disables waiting. |
+| `--pd-held-kv-mode` | `unknown, prefill, transferred` | `unknown` | `unknown, prefill, transferred` | `unknown` | Explicit KV ownership after completed Prefill, independent of connector names. |
 | `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill KV publishers as URL=ENDPOINT[,ENDPOINT...]; requires kv_aware prefill. Endpoints follow DP-rank order; block size is 16. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
@@ -154,6 +156,39 @@ flag. Repeat the flag for each worker.
 
 The Rust binary consumes `--prefill` before clap parsing, so it does not appear
 in clap's option list in `--help`.
+
+After a successful Prefill, a deferred Decode commitment can retry selection
+with `--pd-decode-commit-wait-ms 100`, for example. The retry budget starts at
+the first empty selection. Retries refresh live membership and policy inputs;
+they do not repeat Prefill or reserve Decode capacity while waiting. This
+option preserves existing connector and policy restrictions on deferral.
+The budget bounds retry sleeps and asynchronous preparation, and is additional
+to the initial selection and backend request timeouts.
+
+Configure `--pd-held-kv-mode prefill` for deployments that retain blocks on
+Prefill awaiting a pull (NIXL pull, Mooncake, MoRI-IO READ). Use `transferred`
+when the completed Prefill has already transferred ownership (push/WRITE
+modes). Leave `unknown` for unclassified or mixed deployments. The Router
+does not infer ownership from the connector name.
+
+If commitment remains empty, requests with a possible Prefill hold return 503
+with JSON `error.reason=held_kv_unreclaimable`; explicitly transferred requests
+use `no_eligible_decode_worker`. Admission failures before Prefill retain their
+existing responses. Cancelling the request stops the retry loop.
+
+`vllm_router_pd_held_kv_total{result="unsupported"}` counts abandoned completed
+Prefills whose possible hold cannot be reclaimed. Explicitly transferred
+requests instead record `not_held`. This covers refused commitments, cancellation,
+Decode failures (including explicit errors in unencoded SSE frames), timeouts,
+and early response-body drops. Normal completion
+does not count as abandonment. Each affected attempt records once, even if
+multiple cleanup paths run. `vllm_router_pd_held_kv_wait_seconds` measures actual
+waiting, including cancelled waits, and `vllm_router_pd_decode_commit_total`
+records one final selection outcome rather than each polling miss.
+
+This mitigation does not release engine blocks: connector expiry still applies.
+The `released` and reclamation `failed` results require a future engine release
+API; Router load cleanup never reports either result.
 
 ## Program scheduling
 

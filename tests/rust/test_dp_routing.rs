@@ -283,6 +283,8 @@ mod dp_e2e_tests {
             enable_profiling: false,
             profile_timeout_secs: 30,
             epd: None,
+            pd_decode_commit_wait_ms: 0,
+            pd_held_kv_mode: Default::default(),
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
         }
@@ -335,6 +337,8 @@ mod dp_e2e_tests {
             enable_profiling: false,
             profile_timeout_secs: 30,
             epd: None,
+            pd_decode_commit_wait_ms: 0,
+            pd_held_kv_mode: Default::default(),
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
         }

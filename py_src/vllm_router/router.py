@@ -93,6 +93,10 @@ class Router:
         bootstrap_port_annotation: Kubernetes annotation name for bootstrap port (PD mode).
             Default: 'vllm.ai/bootstrap-port'
         request_timeout_secs: Request timeout in seconds. Default: 600
+        pd_decode_commit_wait_ms: Additional retry budget in milliseconds after an empty
+            deferred Decode commitment. Zero disables waiting. Default: 0
+        pd_held_kv_mode: Explicit KV ownership after completed Prefill: unknown,
+            prefill, or transferred. Default: unknown
         max_concurrent_requests: Maximum number of concurrent requests allowed for rate limiting. Default: 256
         queue_size: Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately). Default: 100
         queue_timeout_secs: Maximum time (in seconds) a request can wait in queue before timing out. Default: 60

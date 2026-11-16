@@ -119,6 +119,8 @@ struct Router {
     otlp_traces_endpoint: Option<String>,
     // KV connector for PD disaggregation ("nixl" or "mooncake")
     kv_connector: String,
+    pd_decode_commit_wait_ms: u64,
+    pd_held_kv_mode: String,
     // Explicit Program-level scheduling feature switch and optional overrides.
     enable_program_scheduling: bool,
     program_scheduling_config_json: Option<String>,
@@ -277,6 +279,15 @@ impl Router {
             history_backend: config::HistoryBackend::Memory,
             enable_profiling: false, // Profiling disabled in Python binding by default
             profile_timeout_secs: 10, // Default profiling timeout
+            pd_decode_commit_wait_ms: self.pd_decode_commit_wait_ms,
+            pd_held_kv_mode: match self.pd_held_kv_mode.as_str() {
+                "unknown" => config::PdHeldKvMode::Unknown,
+                "prefill" => config::PdHeldKvMode::Prefill,
+                "transferred" => config::PdHeldKvMode::Transferred,
+                other => return Err(config::ConfigError::ValidationFailed {
+                    reason: format!("Invalid pd_held_kv_mode '{other}': expected unknown, prefill, or transferred"),
+                }),
+            },
             kv_connector: match self.kv_connector.to_ascii_lowercase().as_str() {
                 "nixl" => config::KvConnector::Nixl,
                 "mooncake" => config::KvConnector::Mooncake,
@@ -382,6 +393,8 @@ impl Router {
         kv_event_replay_source = vec![],
         kv_event_block_size = 16,
         kv_event_model = None,
+        pd_decode_commit_wait_ms = 0,
+        pd_held_kv_mode = String::from("unknown"),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -459,6 +472,8 @@ impl Router {
         kv_event_replay_source: Vec<String>,
         kv_event_block_size: u32,
         kv_event_model: Option<String>,
+        pd_decode_commit_wait_ms: u64,
+        pd_held_kv_mode: String,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -549,6 +564,8 @@ impl Router {
             enable_trace,
             otlp_traces_endpoint,
             kv_connector,
+            pd_decode_commit_wait_ms,
+            pd_held_kv_mode,
             program_scheduling_config_json,
         })
     }

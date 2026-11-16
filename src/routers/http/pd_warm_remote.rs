@@ -527,6 +527,7 @@ async fn read_bounded(
     }
     Ok(bytes)
 }
+#[allow(clippy::too_many_arguments)]
 async fn prefill(
     client: &reqwest::Client,
     p: &ProgramTarget,
@@ -535,7 +536,10 @@ async fn prefill(
     params: Option<&Value>,
     max_metadata: usize,
     max_response: usize,
+    attempt: &super::pd_types::PdAttempt,
+    held_kv_mode: crate::config::PdHeldKvMode,
 ) -> Result<Value, PrefillError> {
+    attempt.restart_prefill_hold();
     let mut r = request.clone();
     r["max_tokens"] = json!(1);
     r["stream"] = json!(false);
@@ -561,6 +565,7 @@ async fn prefill(
     let bytes = read_bounded(response, max_response, Some("prefill"))
         .await
         .map_err(PrefillError::Failed)?;
+    attempt.prefill_completed(held_kv_mode);
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|_| PrefillError::Failed("Invalid PD prefill JSON".into()))?;
     if value.get("error").is_some()
@@ -645,6 +650,7 @@ pub(super) async fn execute(
     policy_prefill: usize,
     pd_load: &Arc<super::pd_types::PdLoadManager>,
     decode_worker: Arc<dyn Worker>,
+    held_kv_mode: crate::config::PdHeldKvMode,
 ) -> Option<Result<(Response, Option<PdResponseContext>), String>> {
     // Discovery lacks a registration incarnation fence for this protocol.
     if runtime.discovery {
@@ -867,6 +873,8 @@ pub(super) async fn execute(
                 warm.map(|c| &c.params),
                 warm_remote.config.max_metadata_bytes,
                 warm_remote.config.max_response_bytes,
+                &attempt,
+                held_kv_mode,
             )
             .await;
             // Only a warm read failure is retried cold. Ordinary upstream
@@ -894,6 +902,8 @@ pub(super) async fn execute(
                     None,
                     warm_remote.config.max_metadata_bytes,
                     warm_remote.config.max_response_bytes,
+                    &attempt,
+                    held_kv_mode,
                 )
                 .await;
             }
@@ -1043,6 +1053,8 @@ pub(super) async fn execute(
                 None,
                 warm_remote.config.max_metadata_bytes,
                 warm_remote.config.max_response_bytes,
+                &attempt,
+                held_kv_mode,
             )
             .await;
             drop(permit);

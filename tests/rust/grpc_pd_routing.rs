@@ -185,6 +185,104 @@ async fn grpc_pd_selects_decode_after_prefill_finishes() {
 }
 
 #[tokio::test]
+async fn grpc_pd_commit_wait_recovers_expires_and_cancels() {
+    use common::mock_vllm_rs::HoldGate;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    for outcome in ["recover", "expire", "cancel"] {
+        let gate = HoldGate::hold_all();
+        let p = MockVllmRsServer::spawn_with_state(MockVllmRs {
+            hold: Some(gate.clone()),
+            finish_kv_transfer_params: Some(prefill_kv()),
+            ..Default::default()
+        })
+        .await;
+        let d = MockVllmRsServer::spawn().await;
+        let prefills = vec![(p.grpc_url.clone(), None)];
+        let decodes = vec![d.grpc_url.clone()];
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: prefills.clone(),
+                decode_urls: decodes.clone(),
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            policy: PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            },
+            pd_decode_commit_wait_ms: if outcome == "expire" { 30 } else { 1000 },
+            worker_startup_timeout_secs: 5,
+            ..Default::default()
+        };
+        let ctx = create_test_context(config);
+        let router = Arc::new(
+            VllmPDRouter::new(prefills, decodes, None, &ctx)
+                .await
+                .unwrap(),
+        );
+        router.pin_test_token_ids(vec![1, 2, 3]);
+        let request = tokio::spawn({
+            let router = router.clone();
+            async move { router.route_chat(None, &chat(true), None).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while p.captured().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let registry = router.worker_registry();
+        let removed = registry.remove_by_url(&d.grpc_url).unwrap();
+        let p_worker = registry.get_prefill_workers()[0].clone();
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while p_worker.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(removed.load(), 0, "waiting must not reserve Decode");
+        if outcome == "cancel" {
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            registry.register(removed.clone());
+            tokio::task::yield_now().await;
+        } else {
+            if outcome == "recover" {
+                registry.register(removed.clone());
+            }
+            let response = tokio::time::timeout(Duration::from_secs(5), request)
+                .await
+                .unwrap()
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            if outcome == "recover" {
+                assert!(status.is_success());
+            } else {
+                assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+                let error: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(error["error"]["reason"], "held_kv_unreclaimable");
+            }
+        }
+        assert_eq!(p.captured().len(), 1);
+        assert_eq!(d.captured().len(), usize::from(outcome == "recover"));
+        assert_eq!(p_worker.load(), 0);
+        assert_eq!(removed.load(), 0);
+    }
+}
+
+#[tokio::test]
 async fn grpc_pd_cache_selection_refreshes_after_prefill() {
     check_grpc_deferred_decode(true, false).await;
 }

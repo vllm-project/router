@@ -64,6 +64,8 @@ class RouterArgs:
     vllm_discovery_address: Optional[str] = None
     # KV connector for PD disaggregation (nixl pull-based or mooncake push-based)
     kv_connector: str = "nixl"
+    pd_decode_commit_wait_ms: int = 0
+    pd_held_kv_mode: str = "unknown"
     # Explicit Program-level scheduling switch and optional JSON overrides.
     enable_program_scheduling: bool = False
     program_scheduling_config_json: Optional[str] = None
@@ -455,6 +457,18 @@ class RouterArgs:
             "(queries each prefill node's bootstrap server for engine_id per DP rank); "
             "'moriio' uses the MoRI-IO connector (either READ or WRITE modes).",
         )
+        parser.add_argument(
+            f"--{prefix}pd-decode-commit-wait-ms",
+            type=int,
+            default=RouterArgs.pd_decode_commit_wait_ms,
+            help="Additional wait in milliseconds after an empty deferred Decode commitment; 0 disables waiting.",
+        )
+        parser.add_argument(
+            f"--{prefix}pd-held-kv-mode",
+            choices=["unknown", "prefill", "transferred"],
+            default=RouterArgs.pd_held_kv_mode,
+            help="Explicit KV ownership after completed Prefill: unknown, retained on prefill, or already transferred.",
+        )
         # Prometheus configuration
         parser.add_argument(
             f"--{prefix}prometheus-port",
@@ -645,6 +659,10 @@ class RouterArgs:
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        if self.pd_decode_commit_wait_ms < 0:
+            raise ValueError("pd_decode_commit_wait_ms must be nonnegative")
+        if self.pd_held_kv_mode not in ("unknown", "prefill", "transferred"):
+            raise ValueError("pd_held_kv_mode must be unknown, prefill, or transferred")
         if self.kv_aware_session_affinity_ttl_secs is not None and not (
             1 <= self.kv_aware_session_affinity_ttl_secs <= 31_536_000
         ):

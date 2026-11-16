@@ -1,4 +1,6 @@
+use crate::config::PdHeldKvMode;
 use crate::core::Worker;
+use crate::metrics::RouterMetrics;
 use crate::policies::{AffinityKey, AffinityRecord, RequestHeaders};
 use axum::body::Body;
 use futures_util::StreamExt;
@@ -267,6 +269,7 @@ impl PdLoadManager {
                 decode_endpoint,
                 affinity,
                 pending_since,
+                held_kv: HeldKvState::default(),
             }),
         }));
         Some((selection, attempt))
@@ -341,6 +344,7 @@ impl PdLoadManager {
                 decode_endpoint: Some(decode),
                 affinity: None,
                 pending_since: Some(std::time::Instant::now()),
+                held_kv: HeldKvState::default(),
             }),
         }));
         attempt.attach_workers(prefill_worker, decode_worker);
@@ -367,6 +371,39 @@ struct AttemptState {
     affinity: Option<Arc<AffinityRecord>>,
     /// When the decode slot was charged, for the pending histogram.
     pending_since: Option<std::time::Instant>,
+    held_kv: HeldKvState,
+}
+
+/// Independent of load accounting: releasing a charge says nothing about engine blocks.
+#[derive(Debug, Default)]
+struct HeldKvState {
+    mode: Option<PdHeldKvMode>,
+    decode_outcome: Option<bool>,
+    recorded: bool,
+    external_decode_outcome: bool,
+    producer_succeeded: bool,
+    body_eof: bool,
+}
+
+impl HeldKvState {
+    fn record_abandonment(&mut self) {
+        if self.recorded || self.decode_outcome != Some(false) {
+            return;
+        }
+        let Some(mode) = self.mode else { return };
+        let result = if mode == PdHeldKvMode::Transferred {
+            "not_held"
+        } else {
+            "unsupported"
+        };
+        self.recorded = true;
+        RouterMetrics::record_pd_held_kv(result);
+        tracing::debug!(
+            ?mode,
+            result,
+            "Completed Prefill abandoned; engine reclamation unavailable"
+        );
+    }
 }
 
 struct AttemptInner {
@@ -382,6 +419,29 @@ struct AttemptInner {
 }
 
 impl AttemptInner {
+    fn record_decode_outcome(&self, success: bool) {
+        let mut state = self.state.lock();
+        if success && state.held_kv.external_decode_outcome {
+            state.held_kv.producer_succeeded = true;
+            if !state.held_kv.body_eof {
+                return;
+            }
+        }
+        state.held_kv.decode_outcome.get_or_insert(success);
+        state.held_kv.record_abandonment();
+    }
+
+    fn decode_body_eof(&self) {
+        let success = {
+            let mut state = self.state.lock();
+            state.held_kv.body_eof = true;
+            !state.held_kv.external_decode_outcome || state.held_kv.producer_succeeded
+        };
+        if success {
+            self.record_decode_outcome(true);
+        }
+    }
+
     fn finish_prefill(&self) {
         let mut state = self.state.lock();
         if !state.prefill {
@@ -468,6 +528,7 @@ impl AttemptInner {
 
 impl Drop for AttemptInner {
     fn drop(&mut self) {
+        self.record_decode_outcome(false);
         self.finish_prefill();
         self.finish_decode();
         // Restart the binding's idle clock after this attempt finishes.
@@ -498,15 +559,55 @@ impl std::fmt::Debug for PdAttempt {
 
 /// Body ownership releases D even when a producer still holds another clone
 /// of the attempt handle. The last attempt clone separately cleans up P.
-struct DecodeBodyGuard(PdAttempt);
+struct DecodeBodyGuard {
+    attempt: PdAttempt,
+    eof: bool,
+    sse_errors: Option<super::sse::ErrorObserver>,
+}
 
 impl Drop for DecodeBodyGuard {
     fn drop(&mut self) {
-        self.0.finish_decode();
+        if !self.eof {
+            self.attempt.record_decode_outcome(false);
+        }
+        self.attempt.finish_decode();
     }
 }
 
 impl PdAttempt {
+    /// An internal cold retry abandons the preceding backend Prefill hold.
+    pub(super) fn restart_prefill_hold(&self) {
+        let mut state = self.0.state.lock();
+        state.held_kv.decode_outcome.get_or_insert(false);
+        state.held_kv.record_abandonment();
+        state.held_kv = HeldKvState::default();
+    }
+
+    /// Called only after a successful Prefill response was fully consumed.
+    pub(super) fn prefill_completed(&self, mode: PdHeldKvMode) {
+        let mut state = self.0.state.lock();
+        state.held_kv.mode = Some(mode);
+        state.held_kv.record_abandonment();
+    }
+
+    pub(super) fn has_unreclaimable_hold(&self) -> bool {
+        let state = self.0.state.lock();
+        state
+            .held_kv
+            .mode
+            .is_some_and(|mode| mode != PdHeldKvMode::Transferred)
+            && state.held_kv.decode_outcome != Some(true)
+    }
+
+    pub(super) fn record_decode_outcome(&self, success: bool) {
+        self.0.record_decode_outcome(success);
+    }
+
+    /// gRPC producer status, rather than transport EOF, decides success.
+    pub(super) fn expect_decode_outcome(&self) {
+        self.0.state.lock().held_kv.external_decode_outcome = true;
+    }
+
     pub(super) fn attach_workers(
         &self,
         prefill_worker: Arc<dyn Worker>,
@@ -548,39 +649,265 @@ impl PdAttempt {
         self.0.finish_decode();
     }
     pub fn release(&self) {
+        self.record_decode_outcome(false);
         self.finish_prefill();
         self.finish_decode();
     }
 
     pub fn track_response(self, response: axum::response::Response) -> axum::response::Response {
+        if !response.status().is_success() {
+            self.record_decode_outcome(false);
+        }
         if self.0.state.lock().decode != DecodeState::Active {
             self.release();
             return response;
         }
+        let observe_sse = {
+            let state = self.0.state.lock();
+            state.held_kv.mode.is_some() && !state.held_kv.external_decode_outcome
+        } && response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+            })
+            && response
+                .headers()
+                .get_all(axum::http::header::CONTENT_ENCODING)
+                .iter()
+                .all(|value| {
+                    value
+                        .to_str()
+                        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("identity"))
+                });
         let (parts, body) = response.into_parts();
-        axum::response::Response::from_parts(parts, self.track_body(body))
+        axum::response::Response::from_parts(parts, self.track_body_inner(body, observe_sse))
     }
 
     /// Own occupancy through EOF, stream failure, or early client body drop.
     /// Capturing the guard in unfold's state also covers an unpolled body.
     pub fn track_body(self, body: Body) -> Body {
+        self.track_body_inner(body, false)
+    }
+
+    fn track_body_inner(self, body: Body, observe_sse: bool) -> Body {
         let stream = futures_util::stream::unfold(
-            (body.into_data_stream(), DecodeBodyGuard(self)),
-            |(mut stream, attempt)| async move {
+            (
+                body.into_data_stream(),
+                DecodeBodyGuard {
+                    attempt: self,
+                    eof: false,
+                    sse_errors: observe_sse.then(super::sse::ErrorObserver::default),
+                },
+            ),
+            |(mut stream, mut guard)| async move {
                 match stream.next().await {
-                    Some(Ok(bytes)) => Some((Ok(bytes), (stream, attempt))),
+                    Some(Ok(bytes)) => {
+                        if guard
+                            .sse_errors
+                            .as_mut()
+                            .is_some_and(|observer| observer.observe(&bytes))
+                        {
+                            guard.attempt.record_decode_outcome(false);
+                            guard.sse_errors = None;
+                        }
+                        Some((Ok(bytes), (stream, guard)))
+                    }
                     Some(Err(error)) => {
-                        attempt.0.finish_decode();
-                        Some((Err(error), (stream, attempt)))
+                        guard.attempt.record_decode_outcome(false);
+                        guard.attempt.finish_decode();
+                        Some((Err(error), (stream, guard)))
                     }
                     None => {
-                        attempt.0.finish_decode();
+                        guard.attempt.0.decode_body_eof();
+                        guard.eof = true;
+                        guard.attempt.finish_decode();
                         None
                     }
                 }
             },
         );
         Body::from_stream(stream)
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod held_kv_tests {
+    use super::*;
+    use crate::core::{BasicWorker, WorkerType};
+    use axum::response::IntoResponse;
+    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+    fn admit(manager: &PdLoadManager) -> PdAttempt {
+        manager.admit_bound(
+            Arc::new(BasicWorker::new(
+                "http://p".into(),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            )),
+            Arc::new(BasicWorker::new("http://d".into(), WorkerType::Decode)),
+        )
+    }
+
+    fn count(handle: &PrometheusHandle, result: &str) -> usize {
+        let prefix = format!("vllm_router_pd_held_kv_total{{result=\"{result}\"}} ");
+        handle
+            .render()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(&prefix)
+                    .and_then(|value| value.parse().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn held_kv_cleanup_is_once_and_never_fabricates_release() {
+        for mode in [
+            PdHeldKvMode::Unknown,
+            PdHeldKvMode::Prefill,
+            PdHeldKvMode::Transferred,
+        ] {
+            let recorder = PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _local = metrics::set_default_local_recorder(&recorder);
+            let manager = PdLoadManager::default();
+            let attempt = admit(&manager);
+            let other = admit(&manager);
+            attempt.prefill_completed(mode);
+            attempt.finish_prefill();
+            let clone = attempt.clone();
+            attempt.release();
+            clone.release();
+            drop(attempt);
+            drop(clone);
+            let expected = if mode == PdHeldKvMode::Transferred {
+                "not_held"
+            } else {
+                "unsupported"
+            };
+            assert_eq!(count(&handle, expected), 1);
+            assert_eq!(count(&handle, "released"), 0);
+            assert_eq!(count(&handle, "failed"), 0);
+            assert_eq!(
+                manager
+                    .snapshot()
+                    .values()
+                    .map(|load| load.pending_decode_requests)
+                    .sum::<usize>(),
+                1
+            );
+            drop(other);
+            assert!(manager.snapshot().is_empty());
+        }
+    }
+
+    #[test]
+    fn load_cleanup_does_not_imply_completed_prefill() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let manager = PdLoadManager::default();
+        let attempt = admit(&manager);
+        attempt.release();
+        assert_eq!(count(&handle, "unsupported"), 0);
+        // Concurrent P can complete after D has already failed.
+        attempt.prefill_completed(PdHeldKvMode::Unknown);
+        assert_eq!(count(&handle, "unsupported"), 1);
+        drop(attempt);
+        assert_eq!(count(&handle, "unsupported"), 1);
+    }
+
+    #[test]
+    fn internal_prefill_retry_reports_the_abandoned_hold_once() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let manager = PdLoadManager::default();
+        let attempt = admit(&manager);
+        attempt.prefill_completed(PdHeldKvMode::Prefill);
+        attempt.restart_prefill_hold();
+        assert_eq!(count(&handle, "unsupported"), 1);
+        attempt.prefill_completed(PdHeldKvMode::Prefill);
+        attempt.release();
+        attempt.release();
+        drop(attempt);
+        assert_eq!(count(&handle, "unsupported"), 2);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn held_kv_tracks_eof_failure_and_unpolled_body_drop() {
+        for terminal in [
+            "success",
+            "drop",
+            "error",
+            "http_error",
+            "grpc_failure",
+            "grpc_success",
+            "grpc_drop",
+            "sse_error",
+        ] {
+            let recorder = PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _local = metrics::set_default_local_recorder(&recorder);
+            let manager = PdLoadManager::default();
+            let attempt = admit(&manager);
+            attempt.prefill_completed(PdHeldKvMode::Prefill);
+            attempt.finish_prefill();
+            attempt.begin_decode();
+            if terminal.starts_with("grpc_") {
+                attempt.expect_decode_outcome();
+                if terminal != "grpc_failure" {
+                    attempt.record_decode_outcome(true);
+                }
+            }
+            let response = match terminal {
+                "sse_error" => (
+                    [("content-type", "text/event-stream")],
+                    Body::from_stream(futures_util::stream::iter(
+                        b"data: {\"error\":{\"message\":\"decode failed\"}}\n\n"
+                            .iter()
+                            .map(|byte| {
+                                Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&[*byte]))
+                            }),
+                    )),
+                )
+                    .into_response(),
+                "error" => Body::from_stream(futures_util::stream::iter([Err::<bytes::Bytes, _>(
+                    std::io::Error::other("broken decode"),
+                )]))
+                .into_response(),
+                "http_error" => (axum::http::StatusCode::BAD_GATEWAY, "failed").into_response(),
+                _ => "done".into_response(),
+            };
+            let response = attempt.clone().track_response(response);
+            if terminal == "drop" || terminal == "grpc_drop" {
+                drop(response);
+            } else {
+                let result = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+                assert_eq!(result.is_err(), terminal == "error");
+            }
+            if terminal == "grpc_failure" {
+                // Transport EOF cannot mask a producer-reported error.
+                assert_eq!(count(&handle, "unsupported"), 0);
+                attempt.record_decode_outcome(false);
+            }
+            drop(attempt);
+            assert_eq!(
+                count(&handle, "unsupported"),
+                usize::from(terminal != "success" && terminal != "grpc_success"),
+                "{terminal}"
+            );
+            assert!(manager.snapshot().is_empty());
+        }
     }
 }
 
