@@ -683,6 +683,16 @@ impl ConfigValidator {
                 reason: "Must be finite and positive when configured".into(),
             });
         }
+        if config
+            .decode_weight
+            .is_some_and(|beta| !beta.is_finite() || beta < 0.0)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "DECODE_WEIGHT".into(),
+                value: format!("{:?}", config.decode_weight),
+                reason: "Must be finite and nonnegative when configured".into(),
+            });
+        }
         for (field, value, positive) in [
             ("C_LIN", config.c_lin, false),
             ("C_ATT", config.c_att, false),
@@ -690,12 +700,15 @@ impl ConfigValidator {
             ("HIT_RATIO", config.hit_ratio, false),
             ("TTFT_SLO_BASE", config.ttft_slo_base, false),
             ("TTFT_SLO_PER_CHAR", config.ttft_slo_per_char, false),
+            ("TPOT_SLO", config.tpot_slo, true),
         ] {
             if !value.is_finite() || value < 0.0 || (positive && value == 0.0) {
                 return Err(ConfigError::InvalidValue {
                     field: field.into(),
                     value: value.to_string(),
-                    reason: "Must be finite and nonnegative (positive for rates and slack)".into(),
+                    reason:
+                        "Must be finite and nonnegative (positive for rates, TPOT_SLO and slack)"
+                            .into(),
                 });
             }
         }
@@ -1325,12 +1338,35 @@ mod tests {
     fn kv_aware_smetric_validates_the_nested_cost_model() {
         let mut smetric: super::super::types::SMetricConfig =
             serde_yaml::from_str(include_str!("../../examples/configs/smetric.yaml")).unwrap();
+        assert_eq!(smetric.decode_weight, None);
+        assert_eq!(smetric.tpot_slo, 0.020);
+        assert!(smetric.sample_all_event_requests);
         smetric.c_lin = -1.0;
         let selection: PolicyConfig =
             serde_json::from_value(serde_json::json!({"type":"kv_aware", "smetric":smetric}))
                 .unwrap();
         assert!(
             matches!(ConfigValidator::validate_policy(&selection), Err(ConfigError::InvalidValue { field, .. }) if field == "C_LIN")
+        );
+
+        let mut bad_beta: super::super::types::SMetricConfig =
+            serde_yaml::from_str(include_str!("../../examples/configs/smetric.yaml")).unwrap();
+        bad_beta.decode_weight = Some(-0.1);
+        let selection: PolicyConfig =
+            serde_json::from_value(serde_json::json!({"type":"kv_aware", "smetric":bad_beta}))
+                .unwrap();
+        assert!(
+            matches!(ConfigValidator::validate_policy(&selection), Err(ConfigError::InvalidValue { field, .. }) if field == "DECODE_WEIGHT")
+        );
+
+        let mut bad_tpot: super::super::types::SMetricConfig =
+            serde_yaml::from_str(include_str!("../../examples/configs/smetric.yaml")).unwrap();
+        bad_tpot.tpot_slo = 0.0;
+        let selection: PolicyConfig =
+            serde_json::from_value(serde_json::json!({"type":"kv_aware", "smetric":bad_tpot}))
+                .unwrap();
+        assert!(
+            matches!(ConfigValidator::validate_policy(&selection), Err(ConfigError::InvalidValue { field, .. }) if field == "TPOT_SLO")
         );
     }
 

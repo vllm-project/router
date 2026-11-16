@@ -602,6 +602,12 @@ impl crate::policies::TieredMatchProvider for KvBlockIndexer {
     fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
         self.find_matches(query)
     }
+
+    fn is_target_ready(&self, target: &RoutableTarget) -> bool {
+        !self
+            .suspended_sources
+            .contains_key(&(target.instance_id.clone(), target.dp_rank))
+    }
 }
 
 #[cfg(test)]

@@ -55,7 +55,7 @@ impl SMetricStrategy {
         workers: &[Arc<dyn Worker>],
         healthy: &[usize],
         candidates: &[CandidateView<'_>],
-        block_sizes: impl Iterator<Item = u32>,
+        binding_meta: impl Iterator<Item = (u32, bool)>,
         context: Option<&RoutingContext<'_>>,
     ) -> Option<(KvSelectionReceipt, Option<RequestTracker>)> {
         let empty_context = RoutingContext::default();
@@ -66,8 +66,10 @@ impl SMetricStrategy {
         let hits = context.kv.as_ref().map(|_| {
             candidates
                 .iter()
-                .zip(block_sizes)
-                .map(|(candidate, block_size)| prefix_match(candidate, block_size, chars))
+                .zip(binding_meta)
+                .map(|(candidate, (block_size, index_bound))| {
+                    prefix_match(candidate, block_size, index_bound, chars)
+                })
                 .collect::<Vec<_>>()
         });
         let selected_workers: Vec<_> = healthy.iter().map(|&i| workers[i].clone()).collect();
@@ -105,9 +107,15 @@ pub(super) struct PrefixMatch {
     pub(super) chars: usize,
     pub(super) tokens: usize,
     pub(super) observed: bool,
+    pub(super) index_bound: bool,
 }
 
-fn prefix_match(candidate: &CandidateView<'_>, block_size: u32, chars: usize) -> PrefixMatch {
+fn prefix_match(
+    candidate: &CandidateView<'_>,
+    block_size: u32,
+    index_bound: bool,
+    chars: usize,
+) -> PrefixMatch {
     let n = candidate.input_tokens;
     let b = block_size as usize;
     if n == 0 || b == 0 {
@@ -131,5 +139,6 @@ fn prefix_match(candidate: &CandidateView<'_>, block_size: u32, chars: usize) ->
         chars: ((chars as u128 * tokens as u128) / n as u128) as usize,
         tokens,
         observed: blocks > 0,
+        index_bound,
     }
 }

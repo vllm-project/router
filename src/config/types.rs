@@ -653,18 +653,45 @@ impl RoutingMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub struct SMetricConfig {
+    #[serde(default = "default_smetric_c_lin")]
     pub c_lin: f64,
     pub c_att: f64,
     pub prefill_rate: Option<f64>,
+    #[serde(default = "default_smetric_slack")]
     pub slack: f64,
     pub hit_ratio: f64,
     /// ttft_slo(req) = base + per_char * L, where L is the text character count.
     pub ttft_slo_base: f64,
     pub ttft_slo_per_char: f64,
+    /// Target inter-token decode latency SLO in seconds, used when learning
+    /// `DECODE_WEIGHT` (`beta`) online from pure-decode step intervals.
+    #[serde(default = "default_smetric_tpot_slo")]
+    pub tpot_slo: f64,
+    /// Standing decode contention weight (`beta`) per active colocated request.
+    /// When omitted (`None`), starts at `0.5` and adapts online from pure-decode
+    /// step latency slopes against `TPOT_SLO`.
+    #[serde(default, alias = "BETA")]
+    pub decode_weight: Option<f64>,
+    /// Whether to train the online prefill rate on all bound KV-event requests
+    /// (including confirmed cold cache misses with 0 matched blocks).
+    #[serde(default)]
+    pub sample_all_event_requests: bool,
     #[serde(default = "default_smetric_tree_size")]
     pub max_tree_size: usize,
     #[serde(default = "default_smetric_eviction_interval_secs")]
     pub eviction_interval_secs: u64,
+}
+
+fn default_smetric_c_lin() -> f64 {
+    1.0
+}
+
+fn default_smetric_slack() -> f64 {
+    1.0
+}
+
+fn default_smetric_tpot_slo() -> f64 {
+    0.020
 }
 
 fn default_smetric_eviction_interval_secs() -> u64 {

@@ -1,4 +1,4 @@
-use super::first_token::{FirstTokenObserver, Observation};
+use super::first_token::FirstTokenObserver;
 use super::program_adapter::ProgramCompletion;
 use crate::backend::{stream_output::OutputFrameConsumer, PrepareError};
 use crate::config::types::RetryConfig;
@@ -90,6 +90,8 @@ struct LoadTrackedBody {
     /// gRPC streams report the body frame containing their first model output.
     /// HTTP streams use their first frame.
     output_frame: Option<OutputFrameConsumer>,
+    /// Disabled when an upstream HTTP forwarding producer already observes SSE frames.
+    observe_sse: bool,
     producer_abort: Option<tokio::task::AbortHandle>,
     first_token: FirstTokenObserver,
 }
@@ -98,6 +100,7 @@ struct RequestLoadState {
     worker: Option<Arc<dyn Worker>>,
     kv_slot: Option<KvRequestSlot>,
     released: AtomicBool,
+    decode_started: AtomicBool,
     tracker: Mutex<Option<RequestTracker>>,
 }
 
@@ -115,6 +118,7 @@ impl RequestLoadGuard {
                 worker,
                 kv_slot,
                 released: AtomicBool::new(false),
+                decode_started: AtomicBool::new(false),
                 tracker: Mutex::new(None),
             }),
         }
@@ -142,12 +146,12 @@ impl RequestLoadGuard {
     fn first_output_callback(
         &self,
         is_stream: bool,
-    ) -> Option<crate::backend::grpc::FirstOutputCallback> {
+    ) -> Option<crate::backend::grpc::OutputCallback> {
         if is_stream && !self.has_tracker() {
             None
         } else {
             let load = self.clone();
-            Some(Arc::new(move || load.begin_decode()))
+            Some(Arc::new(move |tokens| load.on_output_tokens(tokens)))
         }
     }
 
@@ -155,12 +159,40 @@ impl RequestLoadGuard {
         self.state.worker.is_some()
     }
 
-    fn begin_decode(&self) {
-        if let Some(mut tracker) = self.state.tracker.lock().take() {
-            tracker.on_first_token();
+    fn begin_slot_decode(&self) {
+        if !self.state.decode_started.swap(true, Ordering::AcqRel) {
+            if let Some(slot) = &self.state.kv_slot {
+                slot.begin_decode();
+            }
         }
-        if let Some(slot) = &self.state.kv_slot {
-            slot.begin_decode();
+    }
+
+    fn on_output_tokens(&self, count: u32) {
+        if count == 0 || self.state.released.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(tracker) = self.state.tracker.lock().as_mut() {
+            tracker.on_output_tokens(count);
+        }
+        self.begin_slot_decode();
+    }
+
+    fn spawn_non_streaming_prefill_release(&self) {
+        let est = self
+            .state
+            .tracker
+            .lock()
+            .as_ref()
+            .and_then(|t| t.estimated_prefill());
+        if let Some(duration) = est {
+            let load = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(duration).await;
+                if let Some(mut tracker) = load.state.tracker.lock().take() {
+                    tracker.release_pending_without_sample();
+                }
+                load.begin_slot_decode();
+            });
         }
     }
 
@@ -197,22 +229,22 @@ impl futures_util::Stream for LoadTrackedBody {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let item = self.inner.as_mut().poll_next(cx);
         if let Poll::Ready(Some(Ok(bytes))) = &item {
-            let output_started = if let Some(output) = self.output_frame.as_mut() {
-                output.on_frame()
-            } else if self.load.has_tracker() {
-                match self.first_token.observe(bytes) {
-                    Observation::Output => true,
-                    Observation::End => {
-                        self.load.discard_tracker();
-                        false
-                    }
-                    Observation::Pending => false,
+            if let Some(output) = self.output_frame.as_mut() {
+                if output.on_frame() {
+                    self.load.begin_slot_decode();
                 }
-            } else {
-                true
-            };
-            if output_started {
-                self.load.begin_decode();
+            } else if self.observe_sse {
+                if self.load.has_tracker() {
+                    let step = self.first_token.observe_stream(bytes);
+                    if step.outputs > 0 {
+                        self.load.on_output_tokens(step.outputs);
+                    }
+                    if step.ended {
+                        self.load.discard_tracker();
+                    }
+                } else {
+                    self.load.begin_slot_decode();
+                }
             }
         }
         if matches!(&item, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
@@ -268,6 +300,7 @@ fn hold_request_load_with_output_frame(
     producer: Option<tokio::task::JoinHandle<()>>,
     output_frame: Option<OutputFrameConsumer>,
 ) -> Response {
+    let observe_sse = producer.is_none() && output_frame.is_none();
     let producer_abort = producer.as_ref().map(tokio::task::JoinHandle::abort_handle);
     if let Some(producer) = producer {
         let producer_load = load.clone();
@@ -281,6 +314,7 @@ fn hold_request_load_with_output_frame(
         inner: Box::pin(body.into_data_stream()),
         load,
         output_frame,
+        observe_sse,
         producer_abort,
         first_token: FirstTokenObserver::default(),
     };
@@ -1840,6 +1874,10 @@ impl Router {
         // stage split reports worker header wait and first SSE byte only.
         let stages_on = crate::backend::stages_enabled();
 
+        if !is_stream {
+            load.spawn_non_streaming_prefill_release();
+        }
+
         let t_send = Instant::now();
         let res = match otel_http::send_client_request(
             request_builder,
@@ -1937,13 +1975,15 @@ impl Router {
                     match chunk {
                         Ok(bytes) => {
                             if producer_load.has_tracker() {
-                                match first_token.observe(&bytes) {
-                                    Observation::Output => producer_load.begin_decode(),
-                                    Observation::End => producer_load.discard_tracker(),
-                                    Observation::Pending => {}
+                                let step = first_token.observe_stream(&bytes);
+                                if step.outputs > 0 {
+                                    producer_load.on_output_tokens(step.outputs);
+                                }
+                                if step.ended {
+                                    producer_load.discard_tracker();
                                 }
                             } else {
-                                producer_load.begin_decode();
+                                producer_load.begin_slot_decode();
                             }
                             if first_sse {
                                 first_sse = false;
@@ -4877,9 +4917,9 @@ mod tests {
         let callback = load
             .first_output_callback(true)
             .expect("streaming SMetric must observe native output before producer cleanup");
-        callback();
+        callback(1);
         load.release();
-        callback();
+        callback(1);
         assert_eq!(observed.pending.load(Ordering::SeqCst), 0);
         assert_eq!(observed.samples.load(Ordering::SeqCst), 1);
         assert!(RequestLoadGuard::new(None, None)

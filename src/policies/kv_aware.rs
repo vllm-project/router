@@ -18,6 +18,12 @@ use crate::kv_index::{CacheKey, MatchQuery, RoutableTarget, StorageTier, TierMat
 /// Read-only placement port owned by its policy consumer.
 pub trait TieredMatchProvider: Send + Sync {
     fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch>;
+
+    /// Whether the target's KV event stream is live and unsuspended so a 0-block
+    /// query result represents a confirmed cold miss rather than unknown state.
+    fn is_target_ready(&self, _target: &RoutableTarget) -> bool {
+        true
+    }
 }
 
 /// Optional operations used by adapters with tokenized requests and KV discovery.
@@ -499,6 +505,10 @@ impl TieredMatchProvider for EmptyMatchProvider {
     fn find_tiered_matches(&self, _query: &MatchQuery) -> Vec<TierMatch> {
         Vec::new()
     }
+
+    fn is_target_ready(&self, _target: &RoutableTarget) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -795,7 +805,12 @@ impl KvAwarePolicy {
                 workers,
                 &healthy,
                 &candidates,
-                bindings.iter().map(|binding| binding.block_size),
+                bindings.iter().map(|binding| {
+                    let ready = binding.cache_key.is_some()
+                        && placement_enabled
+                        && binding.matches.is_target_ready(&binding.target);
+                    (binding.block_size, ready)
+                }),
                 context,
             );
         }

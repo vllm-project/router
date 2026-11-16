@@ -7,6 +7,7 @@ pub(super) struct FirstTokenObserver {
     finished: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Observation {
     Pending,
@@ -14,7 +15,14 @@ pub(super) enum Observation {
     End,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct StreamObservation {
+    pub(super) outputs: u32,
+    pub(super) ended: bool,
+}
+
 impl FirstTokenObserver {
+    #[cfg(test)]
     pub(super) fn observe(&mut self, bytes: &[u8]) -> Observation {
         if self.finished {
             return Observation::End;
@@ -52,6 +60,62 @@ impl FirstTokenObserver {
         }
         Observation::Pending
     }
+
+    pub(super) fn observe_stream(&mut self, bytes: &[u8]) -> StreamObservation {
+        if self.finished {
+            return StreamObservation {
+                outputs: 0,
+                ended: true,
+            };
+        }
+        let mut step = StreamObservation::default();
+        for part in bytes.split_inclusive(|byte| *byte == b'\n') {
+            if self.line.len() + self.data.len() + part.len() > 1024 * 1024 {
+                self.finished = true;
+                self.line.clear();
+                self.data.clear();
+                step.ended = true;
+                return step;
+            }
+            self.line.extend_from_slice(part);
+            if part.last() != Some(&b'\n') {
+                continue;
+            }
+            let mut line = std::mem::take(&mut self.line);
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if line.is_empty() {
+                let data = std::mem::take(&mut self.data);
+                match classify_tokens(&data) {
+                    FrameKind::Pending => {}
+                    FrameKind::Output(tokens) => {
+                        step.outputs = step.outputs.saturating_add(tokens);
+                    }
+                    FrameKind::End => {
+                        self.finished = true;
+                        step.ended = true;
+                        return step;
+                    }
+                }
+            } else if let Some(data) = line.strip_prefix(b"data:") {
+                if !self.data.is_empty() {
+                    self.data.push(b'\n');
+                }
+                self.data
+                    .extend_from_slice(data.strip_prefix(b" ").unwrap_or(data));
+            }
+        }
+        step
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FrameKind {
+    Pending,
+    Output(u32),
+    End,
 }
 
 fn nonempty(value: Option<&Value>) -> bool {
@@ -62,27 +126,38 @@ fn function_output(value: &Value) -> bool {
     nonempty(value.get("name")) || nonempty(value.get("arguments"))
 }
 
+#[cfg(test)]
 fn classify(data: &[u8]) -> Observation {
+    match classify_tokens(data) {
+        FrameKind::Pending => Observation::Pending,
+        FrameKind::Output(_) => Observation::Output,
+        FrameKind::End => Observation::End,
+    }
+}
+
+fn classify_tokens(data: &[u8]) -> FrameKind {
     if data == b"[DONE]" {
-        return Observation::End;
+        return FrameKind::End;
     }
     let Ok(value) = serde_json::from_slice::<Value>(data) else {
-        return Observation::Pending;
+        return FrameKind::Pending;
     };
     if value.get("error").is_some_and(|error| !error.is_null()) {
-        return Observation::End;
+        return FrameKind::End;
     }
     let Some(choices) = value.get("choices").and_then(Value::as_array) else {
-        return Observation::Pending;
+        return FrameKind::Pending;
     };
     for choice in choices {
-        if nonempty(choice.get("text"))
-            || choice
-                .get("token_ids")
-                .and_then(Value::as_array)
-                .is_some_and(|ids| !ids.is_empty())
+        if let Some(ids) = choice
+            .get("token_ids")
+            .and_then(Value::as_array)
+            .filter(|ids| !ids.is_empty())
         {
-            return Observation::Output;
+            return FrameKind::Output(ids.len() as u32);
+        }
+        if nonempty(choice.get("text")) {
+            return FrameKind::Output(1);
         }
         if let Some(delta) = choice.get("delta") {
             if ["content", "reasoning", "reasoning_content", "refusal"]
@@ -98,11 +173,11 @@ fn classify(data: &[u8]) -> Observation {
                             .any(|call| call.get("function").is_some_and(function_output))
                     })
             {
-                return Observation::Output;
+                return FrameKind::Output(1);
             }
         }
     }
-    Observation::Pending
+    FrameKind::Pending
 }
 
 #[cfg(test)]

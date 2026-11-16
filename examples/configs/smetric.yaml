@@ -1,60 +1,57 @@
 # SMetric selection: --policy kv_aware --smetric-config <this file>
 # These are example starting values. Calibrate the cost model for your deployment
-# and set the TTFT budget to your service's latency requirements.
+# and set the TTFT and TPOT budgets to your service's latency requirements.
 # Design and parameter roles: https://arxiv.org/html/2607.08565v2#S4.SS2
 
 # Deployment calibration
-# Estimated work = C_LIN * n + C_ATT * n * (L - n / 2).
+# Estimated uncached prefill work = C_LIN * n + C_ATT * n * (L - n / 2).
 # L is the full prompt length; n is its uncached length, both in characters.
-# KV-event token hits are converted to equivalent characters before this model.
-# Fit the coefficients from prefill profiling of the model, engine and hardware.
-# Both must be nonnegative, with at least one positive.
-
-# Linear work per uncached character, in cost units/character.
+# Local GPU KV-event token hits are converted to equivalent characters before
+# evaluating this model.
+# Only the ratio C_ATT / C_LIN affects dimensionless routing when PREFILL_RATE is
+# learned online; C_LIN defaults to 1.0 when omitted.
 C_LIN: 1.0
 
 # Context-dependent attention work, in cost units/character^2.
 # Increase relative to C_LIN if profiling shows stronger long-context cost.
 C_ATT: 0.0001
 
-# Fixed processing rate in the SAME cost units/second as the model above (> 0).
-# Measure it for the deployment, or omit this key to learn a per-worker rate
-# from the first generated output or successful P/D prefill completion.
-# With KV Events, only requests with observed prefix evidence train the rate.
-PREFILL_RATE: 10000.0
+# Optional fixed processing rate in the SAME cost units/second as above (> 0).
+# Omit this key to learn a per-worker median (P50) concurrency-scaled prefill
+# rate online from first-token observations.
+# PREFILL_RATE: 10000.0
 
 # Routing controls
-# The TTFT check compares (pending work + new work) / rate against
-# SLACK * (TTFT_SLO_BASE + TTFT_SLO_PER_CHAR * L).
-# Start at 1.0; lower values tighten the routing budget, higher values relax it.
-# Queued work already makes the prediction respond to load. SLACK must be > 0.
-# This scales the routing gate, not the SLO used to evaluate service quality.
+# Unified dimensionless load functional on colocated worker w:
+#   Phi(w) = ((Q_w + C_w) * (B_w + 1)) / (R_w * T_SLO(L)) + DECODE_WEIGHT * B_w
+# where T_SLO(L) = SLACK * (TTFT_SLO_BASE + TTFT_SLO_PER_CHAR * L), and B_w is
+# the number of active co-resident requests on worker w (0 in P/D prefill mode).
+# A worker meets the latency budget iff Phi(w) <= 1.0.
 SLACK: 1.0
 
-# Cache-affinity evidence threshold, in [0, 1]. A candidate's cached prefix must
-# exceed HIT_RATIO * the expected reusable history (not necessarily all of L).
-# Start at 0.1; raise it to require stronger cache evidence, or lower it to
-# tolerate a larger gap between expected history and the observed prefix hit.
+# Standing decode contention weight (beta, alias BETA) per co-resident request.
+# Omit this key to start from the 0.5 default and learn beta online from pure-decode
+# inter-token step slopes (d_TPOT / d_B) normalized by (TPOT_SLO - tau_1).
+# Set an explicit nonnegative value (e.g. 0.5) to pin a fixed decode weight.
+# DECODE_WEIGHT: 0.5
+
+# Target inter-token decode latency SLO in seconds (> 0), used to normalize
+# online DECODE_WEIGHT learning when DECODE_WEIGHT is omitted.
+TPOT_SLO: 0.020
+
+# Train online prefill rate on all bound KV-event requests, including confirmed
+# 0-block cold misses. Recommended true when omitting PREFILL_RATE under KV Events.
+SAMPLE_ALL_EVENT_REQUESTS: true
+
+# Cache-affinity evidence threshold, in [0, 1]. A candidate's local cached prefix
+# must exceed HIT_RATIO * the expected reusable history to claim session affinity.
 HIT_RATIO: 0.1
 
 # User TTFT budget: BASE + PER_CHAR * L, in seconds.
 # Both terms must be nonnegative, with at least one positive.
-# These example values give a 1.2-second budget for a 10,000-character prompt.
-
-# Fixed TTFT allowance in seconds. Set to the service's baseline latency budget.
 TTFT_SLO_BASE: 0.2
-
-# Additional TTFT allowance in seconds/character. Increase if the service allows
-# more time for longer prompts; decrease for a tighter length-dependent budget.
 TTFT_SLO_PER_CHAR: 0.0001
 
-# Tree maintenance; these settings do not control the engine's KV cache or the
-# event-derived index. They apply only to request-history Tree routing.
-
-# Per-worker history limit in characters (> 0), not bytes or GPU KV capacity.
-# Increase to retain more prefix history at the cost of more router memory.
+# Tree maintenance (applies only to request-history Tree routing without KV Events).
 MAX_TREE_SIZE: 67108864
-
-# Seconds between Tree size-eviction sweeps. Shorter intervals enforce the limit
-# more often at higher sweep overhead; 0 disables periodic eviction.
 EVICTION_INTERVAL_SECS: 30

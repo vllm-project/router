@@ -9,16 +9,27 @@ use crate::tree::Tree;
 use dashmap::DashMap;
 use kv::PrefixMatch;
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Weak};
 use std::time::Duration;
 use tracing::{debug, warn};
 
+/// Cold-start default for `DECODE_WEIGHT` (`beta`) when omitted from config:
+/// places the saturation boundary at `B* = 1 / 0.5 = 2` co-resident decode streams
+/// until pure-decode step observations excite online linear slope estimation.
+pub(super) const DEFAULT_BETA: f64 = 0.5;
+const BETA_MIN: f64 = 0.02;
+const BETA_MAX: f64 = 2.0;
+const BETA_UNSET: u64 = u64::MAX;
+const BETA_SAMPLE_WINDOW: usize = 128;
+const BETA_MIN_BUCKET_SAMPLES: usize = 2;
+
 #[derive(Debug)]
 pub(super) struct SMetricStrategy {
     config: SMetricConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
+    model_betas: DashMap<String, Arc<BetaState>>,
     round_robin: AtomicUsize,
     states: DashMap<usize, Arc<WorkerState>>,
     retired: RwLock<HashMap<usize, Weak<dyn Worker>>>,
@@ -66,6 +77,7 @@ impl SMetricStrategy {
         Self {
             config,
             trees,
+            model_betas: DashMap::new(),
             states: DashMap::new(),
             retired: RwLock::new(HashMap::new()),
             round_robin: AtomicUsize::new(0),
@@ -73,6 +85,19 @@ impl SMetricStrategy {
             eviction_shutdown,
             eviction_handle,
         }
+    }
+
+    fn effective_beta(&self, worker: &Arc<dyn Worker>, state: Option<&WorkerState>) -> f64 {
+        self.config.decode_weight.unwrap_or_else(|| {
+            state
+                .and_then(|s| s.beta.get())
+                .or_else(|| {
+                    self.model_betas
+                        .get(worker.model_id())
+                        .and_then(|b| b.get())
+                })
+                .unwrap_or(DEFAULT_BETA)
+        })
     }
 
     fn select_prefill(
@@ -86,10 +111,14 @@ impl SMetricStrategy {
     ) -> Option<(usize, RequestTracker, u64)> {
         let retired = self.retired.read();
         let l = prompt.text.chars().count();
+        let budget = self.config.slack
+            * (self.config.ttft_slo_base + self.config.ttft_slo_per_char * l as f64);
         let start = self.round_robin.fetch_add(1, Ordering::Relaxed) % workers.len().max(1);
-        let mut min: Option<(usize, u64, u64)> = None; // index, score, own cost
-        let mut prev: Option<(usize, usize, u64, bool, u64)> = None; // index, hit, own cost, TTFT
-        let mut any_meets_ttft = false;
+        // min: (index, meets, phi, prefill_work, coloc_load, queued, score, own_cost)
+        let mut min: Option<(usize, bool, Option<f64>, u64, usize, u64, u64, u64)> = None;
+        // prev: (index, hit, own_cost, meets, score, prefill_work)
+        let mut prev: Option<(usize, usize, u64, bool, u64, u64)> = None;
+        let mut any_meets_slo = false;
         for offset in 0..workers.len() {
             let idx = (start + offset) % workers.len();
             let worker = &workers[idx];
@@ -106,46 +135,78 @@ impl SMetricStrategy {
                         tree.prefix_match_tenant_char_count(&prompt.text, &Self::tenant_key(worker))
                     })
             };
-            let n = (l - hit) as f64;
+            let n = l.saturating_sub(hit) as f64;
             let cost = (self.config.c_lin * n + self.config.c_att * n * (l as f64 - n / 2.0)).ceil()
                 as u64;
             let state = self.states.get(&Self::instance_id(worker));
-            let queued = state
+            let pending_work = state
                 .as_ref()
-                .map_or(0, |s| s.pending.load(Ordering::Acquire))
-                .saturating_add(cost);
+                .map_or(0, |s| s.pending.load(Ordering::Acquire));
+            let queued = pending_work.saturating_add(cost);
+            let worker_load = loads.map_or_else(|| worker.load(), |loads| loads[idx]);
+            let coloc_load = if colocated { worker_load } else { 0 };
+            let batch_factor = (coloc_load as u64).saturating_add(1);
+            let prefill_work = queued.saturating_mul(batch_factor);
             let rate = self
                 .config
                 .prefill_rate
                 .or_else(|| state.as_ref().and_then(|s| s.rates.lock().rate));
-            let meets = rate.is_none_or(|rate| {
-                (queued as f64) / rate
-                    <= self.config.slack
-                        * (self.config.ttft_slo_base + self.config.ttft_slo_per_char * l as f64)
-            });
-            any_meets_ttft |= meets;
-            let score = if colocated {
-                queued
-                    .saturating_mul(loads.map_or_else(|| worker.load(), |loads| loads[idx]) as u64)
+            let beta = if colocated {
+                self.effective_beta(worker, state.as_deref().map(Arc::as_ref))
             } else {
-                queued
+                0.0
             };
-            if min.is_none_or(|(_, best, _)| score < best) {
-                min = Some((idx, score, cost));
+            let decode_fraction = beta * (coloc_load as f64);
+            let phi = rate
+                .filter(|&r| r > 0.0 && budget > 0.0)
+                .map(|r| (prefill_work as f64) / (r * budget) + decode_fraction);
+            let meets = phi.map_or(decode_fraction <= 1.0, |p| p <= 1.0);
+            any_meets_slo |= meets;
+            let score = match phi {
+                Some(p) if beta > 0.0 => (p * 1_000_000.0).ceil() as u64,
+                _ => prefill_work,
+            };
+            if min.is_none_or(
+                |(_, best_meets, best_phi, best_pwork, best_load, best_q, _, _)| {
+                    if meets != best_meets {
+                        return meets;
+                    }
+                    if let (Some(p), Some(best_p)) = (phi, best_phi) {
+                        let cmp = p.total_cmp(&best_p);
+                        if cmp != std::cmp::Ordering::Equal {
+                            return cmp == std::cmp::Ordering::Less;
+                        }
+                        return queued < best_q;
+                    }
+                    (prefill_work, coloc_load, queued) < (best_pwork, best_load, best_q)
+                },
+            ) {
+                min = Some((
+                    idx,
+                    meets,
+                    phi,
+                    prefill_work,
+                    coloc_load,
+                    queued,
+                    score,
+                    cost,
+                ));
             }
-            if prev.is_none_or(|(_, best, _, _, _)| hit > best) {
-                prev = Some((idx, hit, cost, meets, score));
+            if prev.is_none_or(|(_, best_hit, _, _, best_score, _)| {
+                hit > best_hit || (hit == best_hit && score < best_score)
+            }) {
+                prev = Some((idx, hit, cost, meets, score, prefill_work));
             }
         }
-        let (prev_idx, hit, prev_cost, prev_meets, prev_score) = prev?;
-        let (min_idx, min_score, min_cost) = min?;
-        let (idx, cost, score) = if passes_turn_gate
+        let (prev_idx, hit, prev_cost, prev_meets, prev_score, prev_pwork) = prev?;
+        let (min_idx, _, _, min_pwork, _, _, min_score, min_cost) = min?;
+        let (idx, cost, score, sample_work) = if passes_turn_gate
             && (hit as f64) > self.config.hit_ratio * prompt.est_hit_chars as f64
-            && (prev_meets || !any_meets_ttft)
+            && (prev_meets || !any_meets_slo)
         {
-            (prev_idx, prev_cost, prev_score)
+            (prev_idx, prev_cost, prev_score, prev_pwork)
         } else {
-            (min_idx, min_cost, min_score)
+            (min_idx, min_cost, min_score, min_pwork)
         };
         if !prompt.text.is_empty() && event_hits.is_none() {
             self.trees
@@ -155,8 +216,20 @@ impl SMetricStrategy {
         }
         RouterMetrics::record_processed_request(workers[idx].url());
         RouterMetrics::record_policy_decision("kv_aware", workers[idx].url());
-        let tracker = self.track(&workers[idx], cost);
-        let tracker = if event_hits.as_ref().is_some_and(|hits| !hits[idx].observed) {
+        let selected_rate = self.config.prefill_rate.or_else(|| {
+            self.states
+                .get(&Self::instance_id(&workers[idx]))
+                .and_then(|s| s.rates.lock().rate)
+        });
+        let est_prefill = selected_rate.filter(|&r| r > 0.0).map(|r| {
+            Duration::from_secs_f64(((sample_work as f64) / r).clamp(0.001, budget.max(0.05)))
+        });
+        let tracker = self.track_with_sample(&workers[idx], cost, sample_work, est_prefill);
+        let skip_rate_sample = event_hits.as_ref().is_some_and(|hits| {
+            let h = &hits[idx];
+            !h.observed && !(self.config.sample_all_event_requests && h.index_bound)
+        });
+        let tracker = if skip_rate_sample {
             tracker.without_rate_sample()
         } else {
             tracker
@@ -164,25 +237,48 @@ impl SMetricStrategy {
         Some((idx, tracker, score))
     }
 
+    #[cfg(test)]
     fn track(&self, worker: &Arc<dyn Worker>, work: u64) -> RequestTracker {
+        self.track_with_sample(worker, work, work, None)
+    }
+
+    fn track_with_sample(
+        &self,
+        worker: &Arc<dyn Worker>,
+        work: u64,
+        sample_work: u64,
+        estimated_prefill: Option<Duration>,
+    ) -> RequestTracker {
         let state = self
             .states
             .get(&Self::instance_id(worker))
             .map(|s| s.clone())
             .unwrap_or_else(|| {
+                let learn_beta = self.config.decode_weight.is_none();
+                let pool_beta = learn_beta.then(|| {
+                    self.model_betas
+                        .entry(worker.model_id().to_string())
+                        .or_insert_with(|| Arc::new(BetaState::new()))
+                        .clone()
+                });
                 self.states
                     .entry(Self::instance_id(worker))
                     .or_insert_with(|| {
                         Arc::new(WorkerState {
-                            _worker: Arc::downgrade(worker),
+                            worker: Arc::downgrade(worker),
+                            model_id: worker.model_id().to_string(),
                             pending: AtomicU64::new(0),
                             rates: Mutex::new(RateHistory::default()),
+                            beta: BetaState::new(),
+                            pool_beta,
+                            tpot_slo: self.config.tpot_slo,
                             learn_rate: self.config.prefill_rate.is_none(),
+                            learn_beta,
                         })
                     })
                     .clone()
             });
-        RequestTracker::new(state, work)
+        RequestTracker::new_with_sample(state, work, sample_work, estimated_prefill)
     }
 
     fn balance(&self, workers: &[Arc<dyn Worker>], route: &str) -> Option<usize> {
@@ -227,6 +323,15 @@ impl Drop for SMetricStrategy {
 const RATE_WINDOW: usize = 64;
 const RATE_MIN_SAMPLES: usize = 8;
 
+fn sorted_median(sorted: &[f64]) -> f64 {
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        0.5 * (sorted[mid - 1] + sorted[mid])
+    }
+}
+
 #[derive(Debug, Default)]
 struct RateHistory {
     samples: VecDeque<f64>,
@@ -235,6 +340,9 @@ struct RateHistory {
 
 impl RateHistory {
     fn record(&mut self, rate: f64) {
+        if !rate.is_finite() || rate <= 0.0 {
+            return;
+        }
         if self.samples.len() == RATE_WINDOW {
             self.samples.pop_front();
         }
@@ -242,17 +350,106 @@ impl RateHistory {
         if self.samples.len() >= RATE_MIN_SAMPLES {
             let mut sorted: Vec<_> = self.samples.iter().copied().collect();
             sorted.sort_by(f64::total_cmp);
-            self.rate = Some(sorted[((sorted.len() - 1) as f64 * 0.9).round() as usize]);
+            self.rate = Some(sorted_median(&sorted));
         }
+    }
+}
+
+/// Online estimator of the standing decode contention weight:
+/// `TPOT_pure(b) = tau_1 + delta_tau * b  =>  beta = delta_tau / (TPOT_SLO - tau_1)`
+/// fitted across per-concurrency bucket medians once >= 2 distinct concurrency
+/// buckets `b` (other co-resident requests) have been observed.
+#[derive(Debug)]
+struct BetaState {
+    cached_bits: AtomicU64,
+    samples: Mutex<VecDeque<(usize, f64)>>,
+}
+
+impl BetaState {
+    fn new() -> Self {
+        Self {
+            cached_bits: AtomicU64::new(BETA_UNSET),
+            samples: Mutex::new(VecDeque::with_capacity(BETA_SAMPLE_WINDOW)),
+        }
+    }
+
+    fn get(&self) -> Option<f64> {
+        let bits = self.cached_bits.load(Ordering::Acquire);
+        (bits != BETA_UNSET).then(|| f64::from_bits(bits))
+    }
+
+    fn record(&self, peers: usize, tpot_secs: f64, tpot_slo: f64) {
+        if !tpot_secs.is_finite() || tpot_secs <= 0.0 || !tpot_slo.is_finite() || tpot_slo <= 0.0 {
+            return;
+        }
+        let mut samples = self.samples.lock();
+        if samples.len() == BETA_SAMPLE_WINDOW {
+            samples.pop_front();
+        }
+        samples.push_back((peers, tpot_secs));
+
+        let mut by_peers: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
+        for &(b, tpot) in samples.iter() {
+            by_peers.entry(b).or_default().push(tpot);
+        }
+        let mut buckets: Vec<(f64, f64)> = Vec::with_capacity(by_peers.len());
+        let mut isolated_median: Option<f64> = None;
+        for (b, mut vals) in by_peers {
+            if vals.len() < BETA_MIN_BUCKET_SAMPLES {
+                continue;
+            }
+            vals.sort_by(f64::total_cmp);
+            let med = sorted_median(&vals);
+            if b == 0 {
+                isolated_median = Some(med);
+            }
+            buckets.push((b as f64, med));
+        }
+
+        let learned = if buckets.len() < 2 {
+            // Persistence of Excitation not yet met: keep cold-start default unless
+            // isolated single-stream decode (b = 0) already exhausts TPOT_SLO.
+            isolated_median
+                .filter(|&m0| m0 >= tpot_slo)
+                .map(|_| BETA_MAX)
+        } else {
+            let k = buckets.len() as f64;
+            let mean_b = buckets.iter().map(|(b, _)| *b).sum::<f64>() / k;
+            let mean_m = buckets.iter().map(|(_, m)| *m).sum::<f64>() / k;
+            let mut num = 0.0;
+            let mut den = 0.0;
+            for &(b, m) in &buckets {
+                let db = b - mean_b;
+                num += db * (m - mean_m);
+                den += db * db;
+            }
+            let delta_tau = if den > 0.0 { (num / den).max(0.0) } else { 0.0 };
+            let tau_1 = (mean_m - delta_tau * mean_b).max(0.0);
+            let headroom = tpot_slo - tau_1;
+            let beta = if headroom <= 1e-6 {
+                BETA_MAX
+            } else {
+                (delta_tau / headroom).clamp(BETA_MIN, BETA_MAX)
+            };
+            Some(beta)
+        };
+
+        let bits = learned.map_or(BETA_UNSET, f64::to_bits);
+        self.cached_bits.store(bits, Ordering::Release);
     }
 }
 
 #[derive(Debug)]
 struct WorkerState {
-    _worker: Weak<dyn Worker>,
+    worker: Weak<dyn Worker>,
+    model_id: String,
     pending: AtomicU64,
     rates: Mutex<RateHistory>,
+    beta: BetaState,
+    pool_beta: Option<Arc<BetaState>>,
+    tpot_slo: f64,
     learn_rate: bool,
+    learn_beta: bool,
 }
 
 impl RequestObserver for WorkerState {
@@ -265,17 +462,39 @@ impl RequestObserver for WorkerState {
     }
 
     fn finish(&self, work: u64, elapsed: Option<Duration>) {
+        self.finish_with_sample(work, work, elapsed);
+    }
+
+    fn finish_with_sample(&self, work: u64, sample_work: u64, elapsed: Option<Duration>) {
         let _ = self
             .pending
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                 Some(pending.saturating_sub(work))
             });
         if let Some(elapsed) =
-            elapsed.filter(|elapsed| self.learn_rate && work > 0 && !elapsed.is_zero())
+            elapsed.filter(|elapsed| self.learn_rate && sample_work > 0 && !elapsed.is_zero())
         {
             self.rates
                 .lock()
-                .record(work as f64 / elapsed.as_secs_f64());
+                .record(sample_work as f64 / elapsed.as_secs_f64());
+        }
+    }
+
+    fn pure_decode_peers(&self) -> Option<usize> {
+        if !self.learn_beta || self.pending.load(Ordering::Acquire) != 0 {
+            return None;
+        }
+        let worker = self.worker.upgrade()?;
+        Some(worker.load().saturating_sub(1))
+    }
+
+    fn record_decode_step(&self, peers: usize, tpot_secs: f64) {
+        if !self.learn_beta || self.pending.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        self.beta.record(peers, tpot_secs, self.tpot_slo);
+        if let Some(pool_beta) = &self.pool_beta {
+            pool_beta.record(peers, tpot_secs, self.tpot_slo);
         }
     }
 }
@@ -286,7 +505,15 @@ impl SMetricStrategy {
         retired.retain(|_, worker| worker.strong_count() > 0);
         retired.insert(Self::instance_id(worker), Arc::downgrade(worker));
         self.states.remove(&Self::instance_id(worker));
-        self.trees.remove_if(worker.model_id(), |_, tree| {
+        let model_id = worker.model_id();
+        if !self
+            .states
+            .iter()
+            .any(|entry| entry.value().model_id == model_id)
+        {
+            self.model_betas.remove(model_id);
+        }
+        self.trees.remove_if(model_id, |_, tree| {
             tree.remove_tenant(&Self::tenant_key(worker));
             tree.tenant_char_count.is_empty()
         });
@@ -801,6 +1028,9 @@ mod tests {
             hit_ratio: 0.5,
             ttft_slo_base: 20.0,
             ttft_slo_per_char: 0.0,
+            tpot_slo: 0.020,
+            decode_weight: None,
+            sample_all_event_requests: false,
             max_tree_size: 1000,
             eviction_interval_secs: 30,
         };
@@ -865,6 +1095,9 @@ mod tests {
             hit_ratio: 0.5,
             ttft_slo_base: 10.0,
             ttft_slo_per_char: 0.0,
+            tpot_slo: 0.020,
+            decode_weight: None,
+            sample_all_event_requests: false,
             max_tree_size: 1000,
             eviction_interval_secs: 30,
         };
@@ -913,6 +1146,9 @@ mod tests {
             hit_ratio: 0.5,
             ttft_slo_base: 20.0,
             ttft_slo_per_char: 0.0,
+            tpot_slo: 0.020,
+            decode_weight: None,
+            sample_all_event_requests: false,
             max_tree_size: 1000,
             eviction_interval_secs: 30,
         };
@@ -972,6 +1208,9 @@ mod tests {
             hit_ratio: 0.5,
             ttft_slo_base: 20.0,
             ttft_slo_per_char: 0.0,
+            tpot_slo: 0.020,
+            decode_weight: None,
+            sample_all_event_requests: false,
             max_tree_size: 1000,
             eviction_interval_secs: 30,
         };
@@ -1071,6 +1310,9 @@ mod tests {
             hit_ratio: 0.1,
             ttft_slo_base: 20.0,
             ttft_slo_per_char: 0.0,
+            tpot_slo: 0.020,
+            decode_weight: None,
+            sample_all_event_requests: false,
             max_tree_size: 1000,
             eviction_interval_secs: 30,
         });
@@ -1113,5 +1355,211 @@ mod tests {
         assert_eq!(policy.balance(&workers, "<generic-policy-call>"), Some(0));
         workers[0].set_healthy(false);
         assert_eq!(policy.balance(&workers, "<generic-policy-call>"), None);
+    }
+
+    #[test]
+    fn unified_phi_defaults_to_beta_half_and_sheds_when_decode_saturates() {
+        let policy = SMetricStrategy::new(
+            serde_yaml::from_str(
+                "C_LIN: 1\nC_ATT: 0\nPREFILL_RATE: 1000000\nSLACK: 1\nHIT_RATIO: 0.5\nTTFT_SLO_BASE: 10\nTTFT_SLO_PER_CHAR: 0\nEVICTION_INTERVAL_SECS: 0\n",
+            )
+            .unwrap(),
+        );
+        let workers: Vec<Arc<dyn Worker>> = ["http://home", "http://idle"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new(url.into(), WorkerType::Regular)) as Arc<dyn Worker>
+            })
+            .collect();
+        assert_eq!(policy.effective_beta(&workers[0], None), 0.5);
+        assert_eq!(
+            select(&policy, &workers, &prompt("shared prefix", 0), false, true).0,
+            0
+        );
+
+        // At B_home = 1, Phi(home) ~= 0.5 <= 1.0: session stays on warm home worker.
+        workers[0].increment_load();
+        assert_eq!(
+            select(
+                &policy,
+                &workers,
+                &prompt("shared prefix next", 13),
+                true,
+                true
+            )
+            .0,
+            0
+        );
+
+        // At B_home = 2 with nonzero prefill work, Phi(home) = prefill + 1.0 > 1.0:
+        // home exceeds the unified budget and yields to idle worker 1.
+        workers[0].increment_load();
+        assert_eq!(
+            select(
+                &policy,
+                &workers,
+                &prompt("shared prefix turn3", 18),
+                true,
+                true
+            )
+            .0,
+            1
+        );
+        workers[0].decrement_load();
+        workers[0].decrement_load();
+    }
+
+    #[test]
+    fn rate_history_uses_p50_median_to_resist_fast_outliers() {
+        let mut history = RateHistory::default();
+        // Five normal prefill samples at 1000/s and three fast outliers at 50_000/s.
+        for &r in &[
+            1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 50_000.0, 50_000.0, 50_000.0,
+        ] {
+            history.record(r);
+        }
+        assert_eq!(history.rate, Some(1000.0));
+    }
+
+    #[test]
+    fn beta_estimator_recovers_pure_decode_slope_and_ignores_prefill_stalls() {
+        let policy = SMetricStrategy::new(
+            serde_yaml::from_str(
+                "C_LIN: 1\nC_ATT: 0\nPREFILL_RATE: 1000000\nSLACK: 1\nHIT_RATIO: 0.5\nTTFT_SLO_BASE: 10\nTTFT_SLO_PER_CHAR: 0\nTPOT_SLO: 0.020\nEVICTION_INTERVAL_SECS: 0\n",
+            )
+            .unwrap(),
+        );
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://w0".into(), WorkerType::Regular));
+        let workers = vec![worker.clone()];
+
+        // Admit one streaming request (`worker.load() == 1` => `peers = 0`).
+        let (_, mut tracker) = select(&policy, &workers, &prompt("turn1", 0), false, true);
+        worker.increment_load();
+        tracker.on_first_token();
+        let state = policy
+            .states
+            .get(&SMetricStrategy::instance_id(&worker))
+            .unwrap()
+            .clone();
+        assert_eq!(state.pure_decode_peers(), Some(0));
+
+        // Only one concurrency bucket (b = 0) observed: Persistence of Excitation
+        // keeps beta at DEFAULT_BETA = 0.5.
+        state.record_decode_step(0, 0.012);
+        state.record_decode_step(0, 0.012);
+        assert_eq!(policy.effective_beta(&worker, Some(&state)), 0.5);
+
+        // Second concurrency bucket (b = 1): tau_1 = 12ms, tau(1) = 14ms => delta_tau = 2ms,
+        // headroom = 20ms - 12ms = 8ms => beta = 2 / 8 = 0.25.
+        state.record_decode_step(1, 0.014);
+        state.record_decode_step(1, 0.014);
+        let learned = policy.effective_beta(&worker, Some(&state));
+        assert!(
+            (learned - 0.25).abs() < 1e-6,
+            "expected learned beta 0.25, got {learned}"
+        );
+
+        // Third bucket (b = 2) with an outlier inside the bucket: median resists outlier.
+        state.record_decode_step(2, 0.016);
+        state.record_decode_step(2, 0.016);
+        state.record_decode_step(2, 0.250);
+        let learned = policy.effective_beta(&worker, Some(&state));
+        assert!(
+            (learned - 0.25).abs() < 1e-6,
+            "bucket median must reject spike outlier, got {learned}"
+        );
+
+        // While another request is prefilling (`pending > 0`), `pure_decode_peers` is None
+        // and any overlapping decode window is discarded instead of polluting beta.
+        let concurrent_prefill = policy.track(&worker, 500);
+        assert_eq!(state.pure_decode_peers(), None);
+        for _ in 0..16 {
+            std::thread::sleep(Duration::from_millis(2));
+            tracker.on_output_tokens(1);
+        }
+        let after_prefill_overlap = policy.effective_beta(&worker, Some(&state));
+        assert!(
+            (after_prefill_overlap - 0.25).abs() < 1e-6,
+            "prefill-contaminated decode tokens must not alter beta, got {after_prefill_overlap}"
+        );
+        drop(concurrent_prefill);
+
+        // End-to-end streaming window test on clean pure decode (`pending == 0`, `b = 1`):
+        worker.increment_load(); // total load = 2 => peers = 1
+        let clean_policy = SMetricStrategy::new(
+            serde_yaml::from_str(
+                "C_LIN: 1\nC_ATT: 0\nPREFILL_RATE: 1000000\nSLACK: 1\nHIT_RATIO: 0.5\nTTFT_SLO_BASE: 10\nTTFT_SLO_PER_CHAR: 0\nTPOT_SLO: 0.050\nEVICTION_INTERVAL_SECS: 0\n",
+            )
+            .unwrap(),
+        );
+        let (_, mut stream_tracker) =
+            select(&clean_policy, &workers, &prompt("stream", 0), false, true);
+        stream_tracker.on_first_token();
+        for _ in 0..16 {
+            std::thread::sleep(Duration::from_millis(1));
+            stream_tracker.on_output_tokens(1);
+        }
+        let clean_state = clean_policy
+            .states
+            .get(&SMetricStrategy::instance_id(&worker))
+            .unwrap();
+        assert_eq!(clean_state.beta.samples.lock().len(), 2);
+
+        worker.decrement_load();
+        worker.decrement_load();
+    }
+
+    #[test]
+    fn sample_all_event_requests_trains_bound_cold_misses_only() {
+        let policy = SMetricStrategy::new(
+            serde_yaml::from_str(
+                "C_LIN: 1\nC_ATT: 0\nSLACK: 1\nHIT_RATIO: 0.1\nTTFT_SLO_BASE: 20\nTTFT_SLO_PER_CHAR: 0\nSAMPLE_ALL_EVENT_REQUESTS: true\nEVICTION_INTERVAL_SECS: 0\n",
+            )
+            .unwrap(),
+        );
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "grpc://worker:1".into(),
+            WorkerType::Regular,
+        ));
+        let p = prompt("cold-prompt", 0);
+
+        // Unbound / suspended source (`index_bound: false`) still skips rate training.
+        let (_, mut unbound_tracker, _) = policy
+            .select_prefill(
+                std::slice::from_ref(&worker),
+                &p,
+                false,
+                true,
+                Some(&[PrefixMatch::default()]),
+                None,
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+        unbound_tracker.on_first_token();
+        let state = policy
+            .states
+            .get(&SMetricStrategy::instance_id(&worker))
+            .unwrap()
+            .clone();
+        assert!(state.rates.lock().samples.is_empty());
+
+        // Bound live source (`index_bound: true`) records confirmed 0-block cold miss.
+        let (_, mut bound_tracker, _) = policy
+            .select_prefill(
+                std::slice::from_ref(&worker),
+                &p,
+                false,
+                true,
+                Some(&[PrefixMatch {
+                    index_bound: true,
+                    ..PrefixMatch::default()
+                }]),
+                None,
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+        bound_tracker.on_first_token();
+        assert_eq!(state.rates.lock().samples.len(), 1);
     }
 }
