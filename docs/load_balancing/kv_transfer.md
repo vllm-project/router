@@ -114,13 +114,14 @@ transfer_ms < saved_ms * margin
 
 ## Known bias in the estimates
 
-The planned rate from shadow mode is an upper estimate. Read it with these three facts in mind.
+The planned rate from shadow mode is an upper estimate. Read it with these four facts in mind.
 
 1. **The wait path is priced as serial time.** `source_wait_ms` treats the source's queued tokens as if they run one after another. Routing itself scores workers as `(new prefill + queued tokens) * (active requests + 1)`, so the two numbers are not on the same scale, and a batching engine drains its queue faster than the serial estimate. This overstates `wait_ms`.
 2. **The source's export work is free.** `fetch_ms` has no term for the busy source serving the read. This understates `fetch_ms`.
 3. **The counter counts selections, not requests.** `vllm_router_kv_transfer_plans_total` is incremented once per selection. A retried request is counted again, and there is no per-request total to divide by.
+4. **Host-memory blocks are counted as sendable, but the engine serves GPU blocks only.** The planner treats a peer's `HostPinned` blocks as exportable. The vLLM NIXL peer lookup pins and serves GPU blocks only, so the destination fetches the GPU part and computes the rest. A fetch is never wrong, only slower than estimated. This overstates `saved_ms` for peers that hold much of the prefix in host memory. It goes away once the engine can pin and serve host blocks under the same lease as GPU blocks, which is the intended follow-up on the engine side.
 
-Points 1 and 2 both favour `planned`. Calibrate the constants against a measured baseline before acting on the rate.
+Points 1, 2 and 4 all favour `planned`. Calibrate the constants against a measured baseline before acting on the rate.
 
 ## Modes and settings
 
