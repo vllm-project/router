@@ -44,6 +44,13 @@ fn decode_policy_can_defer(
     policy.can_redecide_at_dispatch(context.decode_cache.is_some())
 }
 
+fn matches_pd_worker_role(worker: &dyn Worker, stage: Stage) -> bool {
+    matches!(
+        (worker.worker_type(), stage),
+        (WorkerType::Prefill { .. }, Stage::Prefill) | (WorkerType::Decode, Stage::Decode)
+    )
+}
+
 /// Stage eligibility shared by admission and the deferred commitment.
 ///
 /// Admission must not switch an endpoint between aggregate and per-rank
@@ -1025,11 +1032,14 @@ impl PdRouterBase {
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
         // A bare URL that is not registered as-is was expanded per DP rank.
         if !url.contains('@') && self.worker_registry.get_by_url(url).is_none() {
-            return self.remove_dp_expanded_workers(url, "prefill");
+            return self.remove_dp_expanded_workers(url, Stage::Prefill);
         }
 
         // Exact URL match (with @rank or dp_size==1)
-        if let Some(removed) = self.worker_registry.remove_by_url(url) {
+        if let Some(removed) = self
+            .worker_registry
+            .remove_by_url_if(url, |worker| matches_pd_worker_role(worker, Stage::Prefill))
+        {
             self.policy_registry
                 .notify_consumer_removed(removed.as_ref());
             info!("Removed prefill server: {}", url);
@@ -1043,10 +1053,13 @@ impl PdRouterBase {
 
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
         if !url.contains('@') && self.worker_registry.get_by_url(url).is_none() {
-            return self.remove_dp_expanded_workers(url, "decode");
+            return self.remove_dp_expanded_workers(url, Stage::Decode);
         }
 
-        if let Some(removed) = self.worker_registry.remove_by_url(url) {
+        if let Some(removed) = self
+            .worker_registry
+            .remove_by_url_if(url, |worker| matches_pd_worker_role(worker, Stage::Decode))
+        {
             self.policy_registry
                 .notify_consumer_removed(removed.as_ref());
             info!("Removed decode server: {}", url);
@@ -1060,14 +1073,21 @@ impl PdRouterBase {
 
     /// Remove all DP-expanded workers for a bare URL by prefix match.
     /// When a bare URL like "http://host:8000" was expanded into
-    /// "http://host:8000@0", "@1", ..., "@N-1", this removes all of them.
-    fn remove_dp_expanded_workers(&self, url: &str, role: &str) -> Result<String, PDRouterError> {
+    /// "http://host:8000@0", "@1", ..., "@N-1", this removes matching roles.
+    fn remove_dp_expanded_workers(&self, url: &str, stage: Stage) -> Result<String, PDRouterError> {
+        let role = match stage {
+            Stage::Prefill => "prefill",
+            Stage::Decode => "decode",
+        };
         let prefix = format!("{}@", url);
         let all_workers = self.worker_registry.get_pd_workers();
         let mut removed_count = 0;
         for w in all_workers.iter() {
-            if w.url().starts_with(&prefix) {
-                if let Some(removed) = self.worker_registry.remove_by_url(w.url()) {
+            if w.url().starts_with(&prefix) && matches_pd_worker_role(w.as_ref(), stage) {
+                if let Some(removed) = self
+                    .worker_registry
+                    .remove_by_url_if(w.url(), |worker| matches_pd_worker_role(worker, stage))
+                {
                     self.policy_registry
                         .notify_consumer_removed(removed.as_ref());
                     removed_count += 1;
@@ -1883,7 +1903,7 @@ mod tests {
 
     // ============= Worker Management Tests =============
 
-    async fn check_role_specific_encode_removal(remove_prefill: bool) {
+    async fn check_role_specific_encode_removal_is_rejected(remove_prefill: bool) {
         // These direct public-method calls do not enable EPD discovery support.
         let router = create_test_pd_router();
         let consumer: Arc<dyn Worker> = Arc::new(BasicWorker::new(
@@ -1898,21 +1918,22 @@ mod tests {
                 "http://encoder:8000".into(),
             )));
 
-        if remove_prefill {
-            router
-                .remove_prefill_server("http://encoder:8000")
-                .await
-                .unwrap();
+        let revision = router.worker_registry.revision();
+        let result = if remove_prefill {
+            router.remove_prefill_server("http://encoder:8000").await
         } else {
+            router.remove_decode_server("http://encoder:8000").await
+        };
+        assert!(matches!(result, Err(PDRouterError::WorkerNotFound { .. })));
+        assert_eq!(router.worker_registry.revision(), revision);
+        assert_eq!(
             router
-                .remove_decode_server("http://encoder:8000")
-                .await
-                .unwrap();
-        }
-        assert!(router
-            .worker_registry
-            .get_by_url("http://encoder:8000")
-            .is_none());
+                .worker_registry
+                .get_by_url("http://encoder:8000")
+                .unwrap()
+                .worker_type(),
+            WorkerType::Encode
+        );
         assert!(router
             .worker_registry
             .get_by_url("http://consumer:8000")
@@ -1935,13 +1956,156 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prefill_encode_removal_preserves_consumer_policy() {
-        check_role_specific_encode_removal(true).await;
+    async fn prefill_removal_rejects_encode_and_preserves_consumer_policy() {
+        check_role_specific_encode_removal_is_rejected(true).await;
     }
 
     #[tokio::test]
-    async fn decode_encode_removal_preserves_consumer_policy() {
-        check_role_specific_encode_removal(false).await;
+    async fn decode_removal_rejects_encode_and_preserves_consumer_policy() {
+        check_role_specific_encode_removal_is_rejected(false).await;
+    }
+
+    #[tokio::test]
+    async fn prefill_removal_rejects_decode_worker() {
+        let router = create_test_pd_router();
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            "http://decode:8000".into(),
+            WorkerType::Decode,
+        )));
+
+        assert!(router
+            .remove_prefill_server("http://decode:8000")
+            .await
+            .is_err());
+        assert_eq!(
+            router
+                .worker_registry
+                .get_by_url("http://decode:8000")
+                .unwrap()
+                .worker_type(),
+            WorkerType::Decode
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_removal_rejects_prefill_worker() {
+        let router = create_test_pd_router();
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            "http://prefill:8000".into(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(1234),
+            },
+        )));
+
+        assert!(router
+            .remove_decode_server("http://prefill:8000")
+            .await
+            .is_err());
+        assert!(matches!(
+            router
+                .worker_registry
+                .get_by_url("http://prefill:8000")
+                .unwrap()
+                .worker_type(),
+            WorkerType::Prefill { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn role_specific_removal_rejects_regular_and_explicit_encode_rank() {
+        for role in [WorkerType::Regular, WorkerType::Encode] {
+            for url in ["http://worker:8000", "http://worker:8000@0"] {
+                let router = create_test_pd_router();
+                let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url.into(), role.clone()));
+                router.worker_registry.register(worker.clone());
+                let revision = router.worker_registry.revision();
+                for result in [
+                    router.remove_prefill_server(url).await,
+                    router.remove_decode_server(url).await,
+                ] {
+                    assert!(matches!(result, Err(PDRouterError::WorkerNotFound { .. })));
+                }
+                assert_eq!(router.worker_registry.revision(), revision);
+                assert!(Arc::ptr_eq(
+                    &router.worker_registry.get_by_url(url).unwrap(),
+                    &worker
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dp_removal_only_removes_requested_role_from_shared_prefix() {
+        for remove_prefill in [true, false] {
+            let router = create_test_pd_router_with_dp(5);
+            let base = "http://mixed:8000";
+            let roles = [
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                WorkerType::Decode,
+                WorkerType::Encode,
+                WorkerType::Regular,
+                WorkerType::Prefill {
+                    bootstrap_port: Some(1234),
+                },
+            ];
+            let workers: Vec<Arc<dyn Worker>> = roles
+                .into_iter()
+                .enumerate()
+                .map(|(rank, role)| {
+                    let worker: Arc<dyn Worker> =
+                        Arc::new(DPAwareWorker::new(base.into(), rank, 5, role));
+                    if matches!(
+                        worker.worker_type(),
+                        WorkerType::Prefill { .. } | WorkerType::Decode
+                    ) {
+                        router.register_and_notify(worker.clone());
+                    } else {
+                        router.worker_registry.register(worker.clone());
+                    }
+                    worker
+                })
+                .collect();
+            let remove = || async {
+                if remove_prefill {
+                    router.remove_prefill_server(base).await
+                } else {
+                    router.remove_decode_server(base).await
+                }
+            };
+            assert!(remove().await.is_ok());
+            for worker in workers {
+                let expected_removed = if remove_prefill {
+                    matches!(worker.worker_type(), WorkerType::Prefill { .. })
+                } else {
+                    worker.worker_type() == WorkerType::Decode
+                };
+                let current = router.worker_registry.get_by_url(worker.url());
+                if expected_removed {
+                    assert!(current.is_none());
+                } else {
+                    assert!(Arc::ptr_eq(&current.unwrap(), &worker));
+                }
+            }
+            assert_eq!(
+                router
+                    .worker_registry
+                    .get_by_type(&WorkerType::Encode)
+                    .len(),
+                1
+            );
+            assert_eq!(
+                router.policy_registry.get_worker_counts().get("unknown"),
+                Some(&if remove_prefill { 1 } else { 2 }),
+            );
+            let revision = router.worker_registry.revision();
+            assert!(matches!(
+                remove().await,
+                Err(PDRouterError::WorkerNotFound { .. })
+            ));
+            assert_eq!(router.worker_registry.revision(), revision);
+        }
     }
 
     #[test]
@@ -2014,7 +2178,7 @@ mod tests {
             Some(&2)
         );
         router
-            .remove_dp_expanded_workers("http://prefill:8000", "prefill")
+            .remove_dp_expanded_workers("http://prefill:8000", Stage::Prefill)
             .unwrap();
         assert!(router.worker_registry.get_pd_workers().is_empty());
         assert!(router
@@ -2972,7 +3136,7 @@ mod tests {
         assert_eq!(router.worker_registry.get_prefill_workers().len(), 4);
 
         // Remove by bare URL prefix
-        let result = router.remove_dp_expanded_workers(bare_url, "prefill");
+        let result = router.remove_dp_expanded_workers(bare_url, Stage::Prefill);
         assert!(result.is_ok());
         assert_eq!(router.worker_registry.get_prefill_workers().len(), 0);
     }
@@ -2980,7 +3144,7 @@ mod tests {
     #[test]
     fn test_remove_dp_expanded_workers_not_found() {
         let router = create_test_pd_router_with_dp(4);
-        let result = router.remove_dp_expanded_workers("http://nonexistent:8000", "prefill");
+        let result = router.remove_dp_expanded_workers("http://nonexistent:8000", Stage::Prefill);
         assert!(result.is_err());
     }
 
@@ -3058,7 +3222,7 @@ mod tests {
         assert_eq!(workers.len(), 8, "2 hosts × 4 ranks = 8 workers");
 
         // Remove one host's workers
-        let result = router.remove_dp_expanded_workers("http://10.0.0.1:8000", "prefill");
+        let result = router.remove_dp_expanded_workers("http://10.0.0.1:8000", Stage::Prefill);
         assert!(result.is_ok());
         assert_eq!(
             router.worker_registry.get_prefill_workers().len(),

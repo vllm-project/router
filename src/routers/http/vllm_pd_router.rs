@@ -3276,22 +3276,35 @@ impl VllmPDRouter {
         self.pd_router.add_decode_server(url).await
     }
 
+    fn has_worker_for_removal_target(&self, url: &str) -> bool {
+        let prefix = format!("{}@", url);
+        self.worker_registry().get_all().iter().any(|worker| {
+            worker.url() == url || (!url.contains('@') && worker.url().starts_with(&prefix))
+        })
+    }
+
     /// Remove a prefill server from the router
     /// Delegates to the underlying PdRouterBase
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
         let result = self.pd_router.remove_prefill_server(url).await;
         // Evict after registry removal so a late response cannot republish
-        // the old identity between eviction and removal. Clear on errors too.
-        self.evict_nixl_info(url);
-        self.grpc_frontend.remove_worker(url);
+        // the old identity between eviction and removal. Clear orphaned state
+        // on errors too, but preserve a registered worker with another role.
+        if result.is_ok() || !self.has_worker_for_removal_target(url) {
+            self.evict_nixl_info(url);
+            self.grpc_frontend.remove_worker(url);
+        }
         result
     }
 
     /// Remove a decode server from the router
     /// Delegates to the underlying PdRouterBase
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
-        self.grpc_frontend.remove_worker(url);
-        self.pd_router.remove_decode_server(url).await
+        let result = self.pd_router.remove_decode_server(url).await;
+        if result.is_ok() || !self.has_worker_for_removal_target(url) {
+            self.grpc_frontend.remove_worker(url);
+        }
+        result
     }
 
     /// Get a reference to the underlying PdRouterBase's worker registry
@@ -4139,6 +4152,63 @@ mod tests {
     #[tokio::test]
     async fn single_router_nixl_prefill_remove_rejects_late_identity() {
         check_single_router_nixl_removal("prefill").await;
+    }
+
+    #[tokio::test]
+    async fn role_mismatch_preserves_registered_worker_and_nixl_state() {
+        let router = test_vllm_pd_router().await;
+        let url = "http://worker:8000";
+        for role in [WorkerType::Encode, WorkerType::Regular, WorkerType::Decode] {
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url.into(), role.clone()));
+            router.worker_registry().register(worker.clone());
+            // Stand in for cached state belonging to the retained URL.
+            router.store_nixl_info(url, None, IgwNixlFixture::identity(0), None);
+            assert!(matches!(
+                router.remove_prefill_server(url).await,
+                Err(PDRouterError::WorkerNotFound { .. })
+            ));
+            if role != WorkerType::Decode {
+                assert!(matches!(
+                    router.remove_decode_server(url).await,
+                    Err(PDRouterError::WorkerNotFound { .. })
+                ));
+            }
+            assert!(Arc::ptr_eq(
+                &router.worker_registry().get_by_url(url).unwrap(),
+                &worker
+            ));
+            assert_eq!(
+                router.get_nixl_info(url, None),
+                Some(IgwNixlFixture::identity(0))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prefill_removal_error_preserves_dp_rank_state_for_other_role() {
+        let router = test_vllm_pd_router().await;
+        let base = "http://decode:8000";
+        let worker: Arc<dyn Worker> = Arc::new(crate::core::DPAwareWorker::new(
+            base.into(),
+            0,
+            2,
+            WorkerType::Decode,
+        ));
+        router.worker_registry().register(worker.clone());
+        router.store_nixl_info(base, Some(0), IgwNixlFixture::identity(0), None);
+
+        assert!(matches!(
+            router.remove_prefill_server(base).await,
+            Err(PDRouterError::WorkerNotFound { .. })
+        ));
+        assert!(Arc::ptr_eq(
+            &router.worker_registry().get_by_url(worker.url()).unwrap(),
+            &worker
+        ));
+        assert_eq!(
+            router.get_nixl_info(base, Some(0)),
+            Some(IgwNixlFixture::identity(0))
+        );
     }
 
     #[tokio::test]

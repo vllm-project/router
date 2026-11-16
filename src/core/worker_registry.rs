@@ -219,9 +219,25 @@ impl WorkerRegistry {
 
     /// Remove a worker by URL in the same transaction as its index cleanup.
     pub fn remove_by_url(&self, url: &str) -> Option<Arc<dyn Worker>> {
+        self.remove_by_url_if(url, |_| true)
+    }
+
+    /// Remove a worker by URL only if it still matches the predicate.
+    ///
+    /// The predicate runs while holding the topology write lock, so the
+    /// checked worker cannot be replaced between validation and removal.
+    /// It must not call back into the registry or block on other operations.
+    pub fn remove_by_url_if<F>(&self, url: &str, predicate: F) -> Option<Arc<dyn Worker>>
+    where
+        F: FnOnce(&dyn Worker) -> bool,
+    {
         let _topology = self.topology.write();
-        // Clone and drop the map guard before remove_unlocked mutates this map.
+        // Drop the map guards before remove_unlocked mutates the indices.
         let worker_id = self.url_to_id.get(url).map(|id| id.clone())?;
+        let worker = self.get_unlocked(&worker_id)?;
+        if !predicate(worker.as_ref()) {
+            return None;
+        }
         self.remove_unlocked(&worker_id)
     }
 
@@ -772,6 +788,99 @@ mod tests {
         }
         assert!(registry.get_decode_workers().is_empty());
         assert!(registry.get_by_connection(&ConnectionMode::Grpc).is_empty());
+    }
+
+    #[test]
+    fn conditional_removal_preserves_replacement_and_indices_on_role_mismatch() {
+        let registry = WorkerRegistry::new();
+        let url = "http://worker";
+        let id = registry.register(registry_worker(
+            url,
+            "prefill-model",
+            WorkerType::Prefill {
+                bootstrap_port: Some(1234),
+            },
+            ConnectionMode::Grpc,
+        ));
+        let encoder = registry_worker(
+            url,
+            "encode-model",
+            WorkerType::Encode,
+            ConnectionMode::Http,
+        );
+        assert_eq!(registry.register(encoder.clone()), id);
+        let revision = registry.revision();
+
+        let removed = registry.remove_by_url_if(url, |worker| {
+            matches!(worker.worker_type(), WorkerType::Prefill { .. })
+        });
+        assert!(removed.is_none());
+        assert_eq!(registry.revision(), revision);
+        assert!(Arc::ptr_eq(&registry.get(&id).unwrap(), &encoder));
+        assert!(Arc::ptr_eq(&registry.get_by_url(url).unwrap(), &encoder));
+        for workers in [
+            registry.get_all(),
+            registry.get_by_model("encode-model"),
+            registry.get_by_model_fast("encode-model"),
+            registry.get_by_type(&WorkerType::Encode),
+            registry.get_by_connection(&ConnectionMode::Http),
+        ] {
+            assert_eq!(workers.len(), 1);
+            assert!(Arc::ptr_eq(&workers[0], &encoder));
+        }
+
+        assert!(Arc::ptr_eq(
+            &registry
+                .remove_by_url_if(url, |worker| worker.worker_type() == WorkerType::Encode)
+                .unwrap(),
+            &encoder,
+        ));
+        assert!(registry.revision() > revision);
+        assert!(registry.get_all().is_empty());
+        assert!(registry.get_by_type(&WorkerType::Encode).is_empty());
+        assert!(registry.get_by_connection(&ConnectionMode::Http).is_empty());
+        assert!(!registry.has_model("encode-model"));
+    }
+
+    #[test]
+    fn conditional_removal_checks_current_role_during_concurrent_replacement() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let writer_registry = registry.clone();
+        let writer_barrier = barrier.clone();
+        let writer = std::thread::spawn(move || {
+            writer_barrier.wait();
+            for _ in 0..500 {
+                for role in [
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                    WorkerType::Encode,
+                ] {
+                    writer_registry.register(registry_worker(
+                        "http://worker",
+                        "model",
+                        role,
+                        ConnectionMode::Http,
+                    ));
+                }
+            }
+        });
+        barrier.wait();
+        for _ in 0..1000 {
+            if let Some(removed) = registry.remove_by_url_if("http://worker", |worker| {
+                matches!(worker.worker_type(), WorkerType::Prefill { .. })
+            }) {
+                assert!(matches!(removed.worker_type(), WorkerType::Prefill { .. }));
+            }
+        }
+        writer.join().unwrap();
+        assert_eq!(
+            registry.get_by_url("http://worker").unwrap().worker_type(),
+            WorkerType::Encode
+        );
+        assert_eq!(registry.get_by_type(&WorkerType::Encode).len(), 1);
+        assert_eq!(registry.get_by_model_fast("model").len(), 1);
     }
 
     #[test]
