@@ -97,6 +97,7 @@ pub fn grpc_socket_addr(url: &str) -> Result<String, String> {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

@@ -48,7 +48,7 @@ CPU steps keep `medium_cpu_queue_premerge` inline. Their command lives in the Do
 The Rust unit and integration jobs in `test-nightly.yml`
 run through [`scripts/rust_coverage.sh`](scripts/rust_coverage.sh), using
 [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov/tree/v0.6.21)
-0.6.21 and the active toolchain's `llvm-tools-preview` component. Each job
+0.6.21 and pinned `nightly-2026-04-15` with its `llvm-tools-preview` component. Each job
 runs its existing `cpu,ready` test targets once with coverage instrumentation.
 Instrumentation is limited to the host target so nested WASM component builds
 do not inherit unsupported coverage flags.
@@ -63,12 +63,17 @@ Each job uploads one machine-readable LCOV file from the mounted checkout:
 | --- | --- | --- |
 | LCOV data | `target/coverage/rust-unit/lcov.info` | `target/coverage/rust-integration/lcov.info` |
 
-Reports measure production
-Rust code, excluding `tests/` and `benches/`. These are separate coverage
+Reports exclude `tests/` and `benches/` files as well as inline test modules
+and test-only helpers marked with `#[cfg_attr(coverage_nightly, coverage(off))]`.
+The nightly toolchain enables this unstable attribute; ordinary stable builds
+do not enable it. Add the same marker to new test modules and test-only helpers.
+These are separate coverage
 measurements for each test group; their percentages must not be added or
 averaged to obtain total coverage. Python tests, doctests, ignored tests, and
 nightly-only branch coverage are outside this measurement. No minimum
 coverage threshold is enforced.
+Each run cleans workspace coverage artifacts so reports cannot include stale
+binaries from another toolchain or test group; dependency builds remain cached.
 
 Tests retain a failing job status when they fail. Report generation is
 attempted after test failures, but compilation failures or missing profiles
@@ -88,7 +93,8 @@ docker run --rm -v "$PWD:/workdir" -w /workdir rust:1.95.0-bookworm \
 On a Linux development host with Rust, rustup, and the `rust` apt dependency
 set already installed, use `bash .buildkite/scripts/rust_coverage.sh unit`
 or `bash .buildkite/scripts/rust_coverage.sh integration`. The script installs
-the pinned coverage tool and LLVM component, so it also needs network access.
+the pinned nightly toolchain, coverage tool, and LLVM component, so it also
+needs network access.
 
 ### `release-pipeline.yml`
 Release pipeline for tagged versions, nightly Docker images, and versioned

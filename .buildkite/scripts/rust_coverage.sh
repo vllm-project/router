@@ -14,14 +14,20 @@ fi
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
-# Keep LLVM tools matched to the active Rust toolchain.
-rustup component add llvm-tools-preview
+# coverage(off) is unstable. Pin nightly only for coverage; ordinary CI stays stable.
+coverage_toolchain="nightly-2026-04-15"
+rustup toolchain install "${coverage_toolchain}" --profile minimal --no-self-update \
+  --component llvm-tools-preview
+export RUSTUP_TOOLCHAIN="${coverage_toolchain}"
 cargo install cargo-llvm-cov --version 0.6.21 --locked
 
 report_dir="target/coverage/rust-$1"
 mkdir -p "${report_dir}"
 
-# llvm-cov cleans old profiles by default. Never reuse another run's coverage.
+# Remove stale workspace binaries as well as profiles, including other toolchains
+# and test groups. Dependencies remain cached.
+cargo llvm-cov clean --workspace
+
 # Preserve test failure while still attempting to report completed tests.
 # Target-specific flags keep instrumentation out of nested WASM builds.
 host_target="$(rustc -vV | sed -n 's/^host: //p')"
