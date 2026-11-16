@@ -1329,7 +1329,6 @@ impl VllmPDRouter {
             candidates.retain(|worker| &PdEndpoint::for_worker(worker.as_ref()) == pin);
         }
     }
-
     /// Charge the decode stage chosen against live occupancy.
     ///
     /// Runs after the Prefill response has been parsed and before the decode
@@ -5786,20 +5785,16 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
         use tokio::sync::{mpsc, Semaphore};
-
         type Pricing = (mpsc::UnboundedSender<()>, Arc<Semaphore>, Arc<AtomicUsize>);
-
         async fn render(State((entered, gate, _)): State<Pricing>) -> Json<Value> {
             entered.send(()).unwrap();
             gate.acquire().await.unwrap().forget();
             Json(json!({"token_ids": [1, 2, 3]}))
         }
-
         async fn generate(State((_, _, generations)): State<Pricing>) -> Json<Value> {
             generations.fetch_add(1, Ordering::SeqCst);
             Json(json!({"choices": [{"text": "removed worker answered"}]}))
         }
-
         let prefill_app = Router::new()
             .route("/health", get(|| async { "ok" }))
             .route(
@@ -5822,7 +5817,6 @@ mod tests {
             );
         let p = spawn_test_server(prefill_app).await;
         let bootstrap_port = p.rsplit(':').next().unwrap().parse().unwrap();
-
         let (entered, mut events) = mpsc::unbounded_channel();
         let gate = Arc::new(Semaphore::new(0));
         let generations = Arc::new(AtomicUsize::new(0));
@@ -5832,7 +5826,6 @@ mod tests {
             .route("/v1/completions", post(generate))
             .with_state((entered, gate.clone(), generations.clone()));
         let d = spawn_test_server(decode_app).await;
-
         let publisher_context = zmq::Context::new();
         let publisher = publisher_context.socket(zmq::PUB).unwrap();
         publisher.bind("tcp://127.0.0.1:*").unwrap();
@@ -5894,7 +5887,6 @@ mod tests {
                 )
                 .await
         });
-
         tokio::time::timeout(Duration::from_secs(5), events.recv())
             .await
             .unwrap()
@@ -5913,7 +5905,6 @@ mod tests {
         );
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
-
     /// A push-addressed Prefill sent its KV to the provisional Decode: the
     /// commitment must stay there even when live load prefers another worker.
     #[test]

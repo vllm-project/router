@@ -582,6 +582,35 @@ impl PdKvState {
         inputs.decode_policy = Some(policy.clone());
     }
 
+    /// Remove a worker from the policy and this state's registration cache, so
+    /// a re-added URL cannot reuse a stale signature.
+    pub(super) async fn unregister_worker(&self, url: &str, policy: &dyn KvAwareOps) {
+        let _guard = self.bind_lock.lock().await;
+        policy.unregister_worker(url);
+        self.targets.lock().await.remove(url);
+        let base = super::dp_utils::parse_worker_url(url).0;
+        let mut inputs = self.refresh_inputs.lock().await;
+        let without = |pool: &Arc<[Arc<dyn Worker>]>| -> Arc<[Arc<dyn Worker>]> {
+            pool.iter()
+                .filter(|worker| worker.url() != url)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into()
+        };
+        inputs.prefill = without(&inputs.prefill);
+        inputs.decode = without(&inputs.decode);
+        let base_still_live = inputs
+            .prefill
+            .iter()
+            .chain(inputs.decode.iter())
+            .any(|worker| worker.base_url() == base);
+        drop(inputs);
+        if !base_still_live {
+            self.bindings.lock().await.remove(&base);
+            self.supervisor.on_worker_removed(&base);
+        }
+    }
+
     /// One snapshot of which bases may be credited, keyed by base URL.
     async fn credit_by_base(&self, request: &Value) -> HashMap<String, bool> {
         let bindings = self.bindings.lock().await;
@@ -1010,7 +1039,6 @@ mod kv_input_tests {
             .await
             .0
     }
-
     #[tokio::test]
     async fn unsupported_inputs_fall_back_without_control_or_tokenization_requests() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1324,15 +1352,23 @@ mod kv_input_tests {
             assert_eq!(probe_outcome(Some(&binding), None), ProbeOutcome::Keep);
         }
     }
-
+    async fn models_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::get, Json, Router};
+        let models = || async { Json(json!({"data":[{"id":"m","parent":null}]})) };
+        let app = Router::new()
+            .route("/p/v1/models", get(models))
+            .route("/d/v1/models", get(models));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, task)
+    }
     #[tokio::test]
     async fn start_registers_and_prices_both_pools_before_any_request() {
-        // A Decode pool recorded lazily from the request path has no binding for
-        // one refresh tick, and a burst admitted inside that tick loses the
-        // credit its configuration asked for. Assert the pricing gate, not just
-        // the recorded pool sizes.
-        let p_base = "http://127.0.0.1:1".to_owned();
-        let d_base = "http://127.0.0.1:2".to_owned();
+        // Lazy request-path binding would leave a burst unpriced for one tick.
+        let (base, server) = models_server().await;
+        let p_base = format!("{base}/p");
+        let d_base = format!("{base}/d");
         let sources = |port: u16| crate::config::types::PdKvEventSources {
             endpoints: vec![format!("tcp://127.0.0.1:{port}")],
             replay_endpoints: None,
@@ -1358,19 +1394,50 @@ mod kv_input_tests {
                 (d_base.clone(), sources(5558)),
             ]),
             (prefill.clone(), Some(policy.clone())),
-            (decode.clone(), Some(policy)),
+            (decode.clone(), Some(policy.clone())),
         )
         .await;
         let credit = state.credit_by_base(&json!({"model":"m"})).await;
         assert_eq!(credit.get(&p_base), Some(&true));
         assert_eq!(credit.get(&d_base), Some(&true));
         assert!(state.all_priceable(&prefill, None, &credit).await);
+        let prompts: Arc<[Vec<u32>]> = Arc::from(vec![vec![1, 2, 3]]);
+        let request = json!({"model":"m","prompt":[1,2,3]});
         assert!(
-            state.all_priceable(&decode, None, &credit).await,
-            "Decode must be priceable before the first request"
+            state
+                .prepare_decode_context(
+                    &decode,
+                    &policy,
+                    &request,
+                    "/v1/completions",
+                    None,
+                    Some(&prompts),
+                )
+                .await
+                .is_some(),
+            "Decode must be priced before the first request"
         );
+        // Re-adding the same URL must re-register it, not reuse a stale signature.
+        let kv = kv_aware_ops(policy.as_ref()).unwrap();
+        state.unregister_worker(decode[0].url(), kv).await;
+        state.record_decode_pool(&decode, &policy).await;
+        state.bind(&decode, kv).await;
+        assert!(
+            state
+                .prepare_decode_context(
+                    &decode,
+                    &policy,
+                    &request,
+                    "/v1/completions",
+                    None,
+                    Some(&prompts),
+                )
+                .await
+                .is_some(),
+            "re-added Decode worker must be registered and priceable again"
+        );
+        server.abort();
     }
-
     #[tokio::test]
     async fn failed_refresh_probes_keep_healthy_binding_until_consecutive_limit() {
         use axum::{routing::get, Json, Router};

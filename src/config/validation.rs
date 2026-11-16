@@ -901,24 +901,15 @@ impl ConfigValidator {
             } = &config.mode
             {
                 for (url, sources) in &config.pd_kv_event_sources {
-                    // Static sources are keyed by `Worker::base_url()`. A base
-                    // may name both stages when their DP ranks are disjoint;
-                    // the binding is shared, so any KV-aware stage serving it
-                    // consumes the source.
-                    let mut owning = Vec::new();
-                    if prefill_urls
+                    // Sources are keyed by base URL; any KV-aware stage serving
+                    // a base with disjoint P/D ranks consumes its events.
+                    let prefill_keyed = prefill_urls
                         .iter()
-                        .any(|(prefill, _)| base_url_without_rank(prefill) == url)
-                    {
-                        owning.push(("prefill", config.mode.get_prefill_policy(&config.policy)));
-                    }
-                    if decode_urls
+                        .any(|(prefill, _)| base_url_without_rank(prefill) == url);
+                    let decode_keyed = decode_urls
                         .iter()
-                        .any(|decode| base_url_without_rank(decode) == url)
-                    {
-                        owning.push(("decode", config.mode.get_decode_policy(&config.policy)));
-                    }
-                    if owning.is_empty() {
+                        .any(|decode| base_url_without_rank(decode) == url);
+                    if !prefill_keyed && !decode_keyed {
                         return Err(ConfigError::IncompatibleConfig {
                             reason: format!(
                                 "pd_kv_event_sources key '{url}' is not a configured prefill or \
@@ -926,18 +917,25 @@ impl ConfigValidator {
                             ),
                         });
                     }
-                    if !owning
-                        .iter()
-                        .any(|(_, policy)| matches!(policy, PolicyConfig::KvAware { .. }))
-                    {
-                        let stages = owning
-                            .iter()
-                            .map(|(stage, _)| *stage)
-                            .collect::<Vec<_>>()
-                            .join(" and ");
+                    let prefill_kv = prefill_keyed
+                        && matches!(
+                            config.mode.get_prefill_policy(&config.policy),
+                            PolicyConfig::KvAware { .. }
+                        );
+                    let decode_kv = decode_keyed
+                        && matches!(
+                            config.mode.get_decode_policy(&config.policy),
+                            PolicyConfig::KvAware { .. }
+                        );
+                    if !prefill_kv && !decode_kv {
+                        let stage = match (prefill_keyed, decode_keyed) {
+                            (true, true) => "prefill and decode",
+                            (true, false) => "prefill",
+                            _ => "decode",
+                        };
                         return Err(ConfigError::IncompatibleConfig {
                             reason: format!(
-                                "pd_kv_event_sources['{url}'] belongs to the {stages} stage(s), \
+                                "pd_kv_event_sources['{url}'] belongs to the {stage} stage, \
                                  whose policy is not kv_aware; its subscribers would never start"
                             ),
                         });
@@ -1884,9 +1882,7 @@ mod tests {
 
     #[test]
     fn test_pd_kv_event_sources_accepts_a_decode_owned_base_on_disjoint_ranks() {
-        // A bare source key is shared by both stages when the same base names
-        // different DP ranks. The Decode policy consumes the events, so the
-        // count-based Prefill policy must not decide ownership for the base.
+        // Disjoint ranks share the base, and only Decode consumes the events.
         let base = "http://host:8000";
         let mut config = RouterConfig::new(
             RoutingMode::VllmPrefillDecode {
@@ -1915,7 +1911,6 @@ mod tests {
         );
         ConfigValidator::validate(&config).unwrap();
     }
-
     #[test]
     fn test_pd_kv_event_sources_rejects_a_source_whose_stage_is_not_kv_aware() {
         // A Decode-keyed source with a count-based Decode policy would never be

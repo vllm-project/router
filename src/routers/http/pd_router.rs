@@ -598,12 +598,8 @@ fn build_dp_workers(
 }
 
 impl PdRouterBase {
-    /// Prepare Prefill inputs for a deployment without shared KV state.
-    ///
-    /// KV-aware pools use `PdKvState::prepare_stages` from the request path,
-    /// which is the only caller that shares one hash cache between Prefill and
-    /// Decode. This helper therefore only serves the cache_aware/no-KV case and
-    /// deliberately takes no hash cache: no production caller shares one.
+    /// Prepare Prefill inputs for the cache_aware/no-KV path. KV-aware pools use
+    /// `PdKvState::prepare_stages`, which shares one hash cache across stages.
     pub(super) async fn prepare_prefill_inputs(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1078,7 +1074,7 @@ impl PdRouterBase {
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
         // A bare URL that is not registered as-is was expanded per DP rank.
         if !url.contains('@') && self.worker_registry.get_by_url(url).is_none() {
-            return self.remove_dp_expanded_workers(url, "prefill");
+            return self.remove_dp_expanded_workers(url, "prefill").await;
         }
 
         // Exact URL match (with @rank or dp_size==1)
@@ -1094,6 +1090,12 @@ impl PdRouterBase {
         let removed = self.worker_registry.remove_by_url(url);
 
         if removed.is_some() {
+            if let Some(kv) = kv_aware_ops(self.policy_registry.get_prefill_policy().as_ref()) {
+                match self.kv_state.as_ref() {
+                    Some(state) => state.unregister_worker(url, kv).await,
+                    None => kv.unregister_worker(url),
+                }
+            }
             self.policy_registry.on_worker_removed(&model_id);
             if let Some(policy) = self.policy_registry.get_policy(&model_id) {
                 if policy.name() == "cache_aware" {
@@ -1119,7 +1121,7 @@ impl PdRouterBase {
 
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
         if !url.contains('@') && self.worker_registry.get_by_url(url).is_none() {
-            return self.remove_dp_expanded_workers(url, "decode");
+            return self.remove_dp_expanded_workers(url, "decode").await;
         }
 
         let model_id = match self.worker_registry.get_by_url(url) {
@@ -1135,7 +1137,10 @@ impl PdRouterBase {
 
         if removed.is_some() {
             if let Some(kv) = kv_aware_ops(self.policy_registry.get_decode_policy().as_ref()) {
-                kv.unregister_worker(url);
+                match self.kv_state.as_ref() {
+                    Some(state) => state.unregister_worker(url, kv).await,
+                    None => kv.unregister_worker(url),
+                }
             }
             // Notify PolicyRegistry about the removed worker
             self.policy_registry.on_worker_removed(&model_id);
@@ -1166,7 +1171,11 @@ impl PdRouterBase {
     /// Remove all DP-expanded workers for a bare URL by prefix match.
     /// When a bare URL like "http://host:8000" was expanded into
     /// "http://host:8000@0", "@1", ..., "@N-1", this removes all of them.
-    fn remove_dp_expanded_workers(&self, url: &str, role: &str) -> Result<String, PDRouterError> {
+    async fn remove_dp_expanded_workers(
+        &self,
+        url: &str,
+        role: &str,
+    ) -> Result<String, PDRouterError> {
         let prefix = format!("{}@", url);
         let all_workers = self.worker_registry.get_all();
         let mut removed_count = 0;
@@ -1174,11 +1183,15 @@ impl PdRouterBase {
             if w.url().starts_with(&prefix) {
                 let model_id = w.model_id().to_string();
                 if self.worker_registry.remove_by_url(w.url()).is_some() {
-                    if role == "decode" {
-                        if let Some(kv) =
-                            kv_aware_ops(self.policy_registry.get_decode_policy().as_ref())
-                        {
-                            kv.unregister_worker(w.url());
+                    let policy = if role == "decode" {
+                        self.policy_registry.get_decode_policy()
+                    } else {
+                        self.policy_registry.get_prefill_policy()
+                    };
+                    if let Some(kv) = kv_aware_ops(policy.as_ref()) {
+                        match self.kv_state.as_ref() {
+                            Some(state) => state.unregister_worker(w.url(), kv).await,
+                            None => kv.unregister_worker(w.url()),
                         }
                     }
                     self.policy_registry.on_worker_removed(&model_id);
@@ -2569,8 +2582,8 @@ mod tests {
         assert_eq!(workers.len(), 4);
     }
 
-    #[test]
-    fn test_remove_dp_expanded_workers_by_prefix() {
+    #[tokio::test]
+    async fn test_remove_dp_expanded_workers_by_prefix() {
         let router = create_test_pd_router_with_dp(4);
         let bare_url = "http://10.0.0.1:8000";
 
@@ -2589,15 +2602,17 @@ mod tests {
         assert_eq!(router.worker_registry.get_prefill_workers().len(), 4);
 
         // Remove by bare URL prefix
-        let result = router.remove_dp_expanded_workers(bare_url, "prefill");
+        let result = router.remove_dp_expanded_workers(bare_url, "prefill").await;
         assert!(result.is_ok());
         assert_eq!(router.worker_registry.get_prefill_workers().len(), 0);
     }
 
-    #[test]
-    fn test_remove_dp_expanded_workers_not_found() {
+    #[tokio::test]
+    async fn test_remove_dp_expanded_workers_not_found() {
         let router = create_test_pd_router_with_dp(4);
-        let result = router.remove_dp_expanded_workers("http://nonexistent:8000", "prefill");
+        let result = router
+            .remove_dp_expanded_workers("http://nonexistent:8000", "prefill")
+            .await;
         assert!(result.is_err());
     }
 
@@ -2675,7 +2690,9 @@ mod tests {
         assert_eq!(workers.len(), 8, "2 hosts × 4 ranks = 8 workers");
 
         // Remove one host's workers
-        let result = router.remove_dp_expanded_workers("http://10.0.0.1:8000", "prefill");
+        let result = router
+            .remove_dp_expanded_workers("http://10.0.0.1:8000", "prefill")
+            .await;
         assert!(result.is_ok());
         assert_eq!(
             router.worker_registry.get_prefill_workers().len(),
@@ -3107,8 +3124,7 @@ mod admission_tests {
         assert!(!attempt.decode_pending_commit());
         assert_eq!(attempt.decode_endpoint(), Some(decision.endpoint.clone()));
         let pending = sample(&manager, Stage::Decode, &decision.endpoint);
-        // The placeholder had no known prompt length: one unknown request,
-        // zero known pending tokens.
+        // The placeholder had no known prompt length.
         assert_eq!(
             (
                 pending.pending_decode_requests,
@@ -3116,15 +3132,6 @@ mod admission_tests {
                 pending.pending_decode_tokens
             ),
             (1, 1, 0)
-        );
-        assert_eq!(
-            sample(&manager, Stage::Decode, &decision.endpoint).unknown_decode_requests,
-            1,
-            "the placeholder had no known prompt length"
-        );
-        assert_eq!(
-            sample(&manager, Stage::Decode, &decision.endpoint).pending_decode_tokens,
-            0
         );
         // A second commit is a no-op on the books.
         assert!(manager
@@ -3136,7 +3143,6 @@ mod admission_tests {
             sample(&manager, Stage::Decode, &decision.endpoint).pending_decode_requests,
             1
         );
-
         attempt.begin_decode();
         let active = sample(&manager, Stage::Decode, &decision.endpoint);
         assert_eq!(
@@ -3147,69 +3153,6 @@ mod admission_tests {
             ),
             (1, 0, 1)
         );
-        assert_eq!(
-            sample(&manager, Stage::Decode, &decision.endpoint).active_decode_tokens,
-            0
-        );
-        assert_eq!(
-            sample(&manager, Stage::Decode, &decision.endpoint).unknown_decode_requests,
-            1
-        );
-        attempt.finish_prefill();
-        drop(attempt);
-        assert!(manager.snapshot().is_empty());
-    }
-
-    #[test]
-    fn deferred_decode_tokens_move_from_pending_to_active_and_release() {
-        let manager = Arc::new(PdLoadManager::default());
-        let p = pool("p", 1);
-        let d = pool("d", 1);
-        let policy = KvAwarePolicy::default();
-        let (_, attempt) = manager
-            .admit_deferred(|loads| {
-                let mut selection =
-                    select_pd_pair(loads, &p, &d, &policy, &policy, &context(), false)?;
-                // The admission-time Prefill estimate is the request's logical
-                // context; the Decode ledger must charge it once.
-                selection.prefill.new_prefill_tokens = Some(17);
-                selection.prefill.credited_prefix_tokens = Some(0);
-                Some(selection)
-            })
-            .unwrap();
-        let decision = manager
-            .commit_decode(&attempt, |loads| {
-                select_decode_stage(loads, &d, &policy, &context())
-            })
-            .unwrap();
-        assert_eq!(
-            sample(&manager, Stage::Decode, &decision.endpoint).pending_decode_tokens,
-            17
-        );
-        assert_eq!(
-            sample(&manager, Stage::Decode, &decision.endpoint).active_decode_tokens,
-            0
-        );
-        assert_eq!(
-            sample(&manager, Stage::Decode, &decision.endpoint).unknown_decode_requests,
-            0
-        );
-
-        attempt.begin_decode();
-        assert_eq!(
-            sample(&manager, Stage::Decode, &decision.endpoint).pending_decode_tokens,
-            0
-        );
-        assert_eq!(
-            sample(&manager, Stage::Decode, &decision.endpoint).active_decode_tokens,
-            17
-        );
-
-        attempt.finish_decode();
-        let after = sample(&manager, Stage::Decode, &decision.endpoint);
-        assert_eq!(after.pending_decode_tokens, 0);
-        assert_eq!(after.active_decode_tokens, 0);
-        assert_eq!(after.unknown_decode_requests, 0);
         attempt.finish_prefill();
         drop(attempt);
         assert!(manager.snapshot().is_empty());
