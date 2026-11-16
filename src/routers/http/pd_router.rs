@@ -3106,9 +3106,16 @@ mod admission_tests {
             .unwrap();
         assert!(!attempt.decode_pending_commit());
         assert_eq!(attempt.decode_endpoint(), Some(decision.endpoint.clone()));
+        let pending = sample(&manager, Stage::Decode, &decision.endpoint);
+        // The placeholder had no known prompt length: one unknown request,
+        // zero known pending tokens.
         assert_eq!(
-            sample(&manager, Stage::Decode, &decision.endpoint).pending_decode_requests,
-            1
+            (
+                pending.pending_decode_requests,
+                pending.unknown_decode_requests,
+                pending.pending_decode_tokens
+            ),
+            (1, 1, 0)
         );
         assert_eq!(
             sample(&manager, Stage::Decode, &decision.endpoint).unknown_decode_requests,
@@ -3131,9 +3138,14 @@ mod admission_tests {
         );
 
         attempt.begin_decode();
+        let active = sample(&manager, Stage::Decode, &decision.endpoint);
         assert_eq!(
-            sample(&manager, Stage::Decode, &decision.endpoint).active_decode_requests,
-            1
+            (
+                active.active_decode_requests,
+                active.active_decode_tokens,
+                active.unknown_decode_requests
+            ),
+            (1, 0, 1)
         );
         assert_eq!(
             sample(&manager, Stage::Decode, &decision.endpoint).active_decode_tokens,
@@ -3694,6 +3706,23 @@ mod admission_tests {
         assert_eq!(
             sample(&manager, Stage::Prefill, &selection.prefill.endpoint).active_prefill_tokens,
             31
+        );
+        let decode = sample(&manager, Stage::Decode, &selection.decode.endpoint);
+        assert_eq!(
+            (decode.pending_decode_tokens, decode.active_decode_tokens),
+            (48, 0)
+        );
+        a.begin_decode();
+        let decode = sample(&manager, Stage::Decode, &selection.decode.endpoint);
+        assert_eq!(
+            (decode.pending_decode_tokens, decode.active_decode_tokens),
+            (31, 17)
+        );
+        a.finish_decode();
+        let decode = sample(&manager, Stage::Decode, &selection.decode.endpoint);
+        assert_eq!(
+            (decode.pending_decode_tokens, decode.active_decode_tokens),
+            (31, 0)
         );
         drop((a, b));
         assert!(manager.snapshot().is_empty());

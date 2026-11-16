@@ -1331,34 +1331,25 @@ mod kv_input_tests {
         // one refresh tick, and a burst admitted inside that tick loses the
         // credit its configuration asked for. Pool sizes alone cannot prove the
         // bind finished, so assert the pricing gate the request path uses.
-        use axum::{routing::get, Json, Router};
-
-        async fn serve_models() -> (String, tokio::task::JoinHandle<()>) {
-            let app = Router::new().route(
-                "/v1/models",
-                get(|| async { Json(json!({"data":[{"id":"m","parent":null}]})) }),
-            );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let base = format!("http://{}", listener.local_addr().unwrap());
-            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            (base, task)
-        }
-
         let publisher_context = zmq::Context::new();
-        let publisher_p = publisher_context.socket(zmq::PUB).unwrap();
-        publisher_p.bind("tcp://127.0.0.1:*").unwrap();
-        let endpoint_p = publisher_p.get_last_endpoint().unwrap().unwrap();
-        let publisher_d = publisher_context.socket(zmq::PUB).unwrap();
-        publisher_d.bind("tcp://127.0.0.1:*").unwrap();
-        let endpoint_d = publisher_d.get_last_endpoint().unwrap().unwrap();
+        let mut endpoints = Vec::new();
+        let mut _publishers = Vec::new();
+        for _ in 0..2 {
+            let publisher = publisher_context.socket(zmq::PUB).unwrap();
+            publisher.bind("tcp://127.0.0.1:*").unwrap();
+            endpoints.push(publisher.get_last_endpoint().unwrap().unwrap());
+            _publishers.push(publisher);
+        }
+        // No /v1/models server: the static source supplies the cache identity,
+        // so the binding must be priceable without any request-time probe.
+        let p_base = "http://127.0.0.1:1".to_owned();
+        let d_base = "http://127.0.0.1:2".to_owned();
         let sources = |endpoint: String| crate::config::types::PdKvEventSources {
             endpoints: vec![endpoint],
             replay_endpoints: None,
             block_size: 16,
             model: Some("m".to_owned()),
         };
-        let (p_base, p_task) = serve_models().await;
-        let (d_base, d_task) = serve_models().await;
         let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
         let prefill: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
             p_base.clone(),
@@ -1374,8 +1365,8 @@ mod kv_input_tests {
             reqwest::Client::new(),
             None,
             HashMap::from([
-                (p_base.clone(), sources(endpoint_p)),
-                (d_base.clone(), sources(endpoint_d)),
+                (p_base.clone(), sources(endpoints[0].clone())),
+                (d_base.clone(), sources(endpoints[1].clone())),
             ]),
             (prefill.clone(), Some(policy.clone())),
             (decode.clone(), Some(policy)),
@@ -1389,8 +1380,6 @@ mod kv_input_tests {
             state.all_priceable(&decode, None, &credit).await,
             "Decode must be priceable before the first request"
         );
-        p_task.abort();
-        d_task.abort();
     }
 
     #[tokio::test]
