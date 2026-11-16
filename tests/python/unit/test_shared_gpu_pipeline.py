@@ -42,6 +42,7 @@ class SharedGpuPipelineTest(unittest.TestCase):
                     actual["timeout_in_minutes"], original["timeout_in_minutes"]
                 )
                 self.assertNotIn("shared_gpu_count", actual)
+                self.assertNotIn("shared_gpu_timeout_in_minutes", actual)
                 self.assertNotIn("shared_gpu_queue", actual)
 
     def test_opt_in_changes_only_annotated_functional_steps(self):
@@ -69,6 +70,39 @@ class SharedGpuPipelineTest(unittest.TestCase):
                 self.assertEqual(after["artifact_paths"], before["artifact_paths"])
             self.assertEqual(len(changed), 1, changed)
         self.assertIn("devices", presets["mi300_2"]["plugins"][0]["docker#v5.14.0"])
+
+    def test_execution_budget_excludes_exclusive_host_lease_wait(self):
+        for name in ("test-merge.yml", "test-nightly.yml"):
+            doc = yaml.safe_load((ROOT / ".buildkite" / name).read_text())
+            step = next(s for s in leaves(doc["steps"]) if "shared_gpu_count" in s)
+            # #508 expands the exclusive timeout to include its host lease wait.
+            step["timeout_in_minutes"] = 450
+            actual = uploader.expand_steps(
+                [step], uploader.load_presets(), rocm_shared=True
+            )[0]
+            self.assertEqual(actual["timeout_in_minutes"], 450)
+            self.assertIn("3600 bash", actual["command"])
+            self.assertNotIn("shared_gpu_timeout_in_minutes", actual)
+
+    def test_rejects_invalid_execution_budget(self):
+        for minutes in (0, -1, True, "60"):
+            with self.subTest(minutes=minutes), self.assertRaises(SystemExit):
+                uploader.expand_steps(
+                    [
+                        {
+                            "mirror_hardwares": "mi300_2",
+                            "shared_gpu_count": 2,
+                            "shared_gpu_timeout_in_minutes": minutes,
+                            "command": "true",
+                        }
+                    ],
+                    uploader.load_presets(),
+                    rocm_shared=True,
+                )
+        with self.assertRaises(SystemExit):
+            uploader.expand_steps(
+                [{"command": "true", "shared_gpu_timeout_in_minutes": 60}], {}
+            )
 
     def test_resource_request_is_independent_of_test_and_preset_names(self):
         preset = copy.deepcopy(uploader.load_presets()["mi300_2"])

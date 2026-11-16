@@ -107,7 +107,9 @@ def _prepend_hf_token_export(merged: dict[str, Any]) -> None:
         merged[key] = [CUDA_HF_TOKEN_EXPORT, existing]
 
 
-def shared_rocm_step(merged: dict[str, Any], count: int, queue: str) -> None:
+def shared_rocm_step(
+    merged: dict[str, Any], count: int, queue: str, execution_minutes: int
+) -> None:
     """Opt-in client of the host's GPU lease hook; never allocate in a PR script."""
     plugins = merged.get("plugins", [])
     if len(plugins) != 1 or set(plugins[0]) != {"docker#v5.14.0"}:
@@ -133,14 +135,13 @@ def shared_rocm_step(merged: dict[str, Any], count: int, queue: str) -> None:
         raise SystemExit("shared GPU step requires a non-empty command")
     # Preserve the original execution budget separately from the six-hour
     # shared-resource wait. The host supervisor also bounds lease lifetime.
-    minutes = merged.get("timeout_in_minutes", 60)
-    merged["timeout_in_minutes"] = minutes + 390
+    merged["timeout_in_minutes"] = execution_minutes + 390
     merged["command"] = (
         ': "$${AMD_CI_GPU_LEASE_ID:?shared GPU admission hook is missing}"\n'
         "python3 -c 'import os; from pathlib import Path; "
         'assert len(list(Path("/dev/dri").glob("renderD*"))) == '
         'int(os.environ["AMD_CI_GPU_COUNT"])\'\n'
-        f"timeout --signal=TERM --kill-after=60s {minutes * 60} "
+        f"timeout --signal=TERM --kill-after=60s {execution_minutes * 60} "
         f"bash -euo pipefail -c {shlex.quote(command)}"
     )
 
@@ -158,6 +159,16 @@ def expand_steps(
         if isinstance(nested, list):
             step["steps"] = expand_steps(nested, presets, rocm_shared=rocm_shared)
         shared_count = step.pop("shared_gpu_count", None)
+        execution_minutes = step.pop("shared_gpu_timeout_in_minutes", None)
+        if execution_minutes is not None and (
+            type(execution_minutes) is not int
+            or execution_minutes < 1
+            or shared_count is None
+        ):
+            raise SystemExit(
+                "shared_gpu_timeout_in_minutes must be a positive integer "
+                "on a shared_gpu_count step"
+            )
         if shared_count is not None and (
             type(shared_count) is not int
             or shared_count < 1
@@ -197,7 +208,13 @@ def expand_steps(
         if "retry" in step:
             merged["retry"] = step["retry"]
         if rocm_shared and shared_count is not None:
-            shared_rocm_step(merged, shared_count, shared_queue)
+            if execution_minutes is None:
+                execution_minutes = merged.get("timeout_in_minutes", 60)
+            if type(execution_minutes) is not int or execution_minutes < 1:
+                raise SystemExit(
+                    "shared GPU execution timeout must be a positive integer"
+                )
+            shared_rocm_step(merged, shared_count, shared_queue, execution_minutes)
         expanded.append(merged)
     return expanded
 

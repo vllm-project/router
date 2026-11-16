@@ -67,8 +67,11 @@ render-device count before running tests, using only Python's standard library.
 It uses private IPC/network namespaces;
 test device IDs are local to the container. No allocator is installed by PR code.
 
-The Buildkite timeout includes a six-hour resource wait plus startup allowance;
-an inner timeout preserves the original test execution budget. Missing admission
+The Buildkite timeout includes a six-hour resource wait plus startup allowance.
+`shared_gpu_timeout_in_minutes` sets the inner test execution budget; the two
+xGMI steps keep 60 minutes even when their exclusive-lane timeout includes a
+host lease wait. This metadata is stripped before upload. Other callers default
+to their step timeout (or 60 minutes when omitted). Missing admission
 fails the step. Keep the new queue separate from legacy exclusive registrations.
 Disable the flag and drain shared runners to roll back. A live concurrent canary
 and cancellation test are required before enabling; CPU expansion tests alone
