@@ -83,6 +83,12 @@ pub struct HoldGate {
 }
 
 impl HoldGate {
+    pub fn hold_all() -> Self {
+        let gate = Self::new(1);
+        gate.seen.store(1, Ordering::SeqCst);
+        gate
+    }
+
     pub fn new(hold_after: usize) -> Self {
         let (released, _) = watch::channel(false);
         Self {
