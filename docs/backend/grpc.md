@@ -22,7 +22,7 @@ Support status of the OpenAI HTTP surface when the worker pool is `grpc://`:
 | API | Status | Behavior |
 |---|---|---|
 | `/v1/chat/completions` | Supported | The router renders the chat template and tokenizes, then sends `TokenIds`. |
-| `/v1/completions` | Supported, token-id prompts only | `prompt` must be `list[int]`; ids go straight to the wire. Text prompts and fields the chat shape cannot express (`suffix`, `best_of`, `n > 1`, `json_schema`, `logprobs`, `echo`, `return_hidden_states`, `documents`) are rejected with `400`. |
+| `/v1/completions` | Supported, single prompt | `prompt` may be `str`, `list[str]`, `list[int]`, or `list[list[int]]`; a text prompt is tokenized once with the model tokenizer (`add_special_tokens` defaults to `true`) and ids go straight to the wire. Batched prompts and fields the chat shape cannot express (`suffix`, `best_of`, `n > 1`, `json_schema`, `logprobs`, `echo`, `return_hidden_states`, `documents`) are rejected with `400`. |
 | `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/generate`, `/inference/v1/generate` | Not supported | Rejected with `400` before dispatch, so they are client errors and never reach a worker. |
 | `/v1/models`, `/health` | Supported | Answered through the gRPC control/health services. |
 | `/health_generate` | Not supported | Returns `501`; use `/health` for gRPC readiness. |
@@ -32,11 +32,13 @@ listed under [Capability Boundaries](#capability-boundaries).
 
 ### `/v1/completions` on a gRPC pool
 
-A gRPC pool also serves `/v1/completions` with token-id prompts only:
+A gRPC pool also serves `/v1/completions` with single prompts:
 `prompt: [int]` skips the chat template (step 2 above) and the client's ids go
-straight to the worker. Text and nested prompts return 400. Routing honors
-`session_params.session_id` like chat; without one, token-id prompts create no
-prefix-cache affinity (cache_aware balances them on load alone).
+straight to the worker, and `prompt: "text"` is tokenized once with the model
+tokenizer (`add_special_tokens` defaults to `true`, like chat). Batched prompts
+(`list[str]`, `list[list[int]]` with more than one entry) return 400 for now.
+Routing honors `session_params.session_id` like chat; without one, token-id
+prompts create no prefix-cache affinity (cache_aware balances them on load alone).
 
 The reply is shaped for completion clients — `text_completion` chunks and body
 with `choices[].text`, `cmpl-` ids — while reusing the chat pipeline internally.

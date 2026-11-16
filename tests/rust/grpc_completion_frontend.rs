@@ -5,7 +5,7 @@ mod common;
 mod fixture;
 
 use serde_json::json;
-use vllm_router_rs::backend::{prepare_grpc_completion, EngineFrontend};
+use vllm_router_rs::backend::EngineFrontend;
 use vllm_router_rs::protocols::spec::CompletionRequest;
 
 #[tokio::test]
@@ -48,20 +48,21 @@ async fn grpc_prefix_selection_uses_the_ids_actually_dispatched() {
         json!({"messages":[{"role":"user","content":"call f"},{"role":"assistant","content":"calling","tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c","content":"done"}]}),
         json!({"messages":[{"role":"user","content":"a longer chat to truncate"}],"truncate_prompt_tokens":6}),
     ];
-    for mut body in bodies.into_iter().chain(std::iter::once(
-        json!({"prompt":[1,2,3,4,5,6,7,8],"truncate_prompt_tokens":6}),
-    )) {
+    for mut body in bodies.into_iter().chain(
+        [
+            json!({"prompt":[1,2,3,4,5,6,7,8],"truncate_prompt_tokens":6}),
+            json!({"prompt": "hello prefix"}),
+            json!({"prompt": "a longer text to truncate", "truncate_prompt_tokens": 6}),
+        ]
+        .into_iter(),
+    ) {
         body["model"] = json!(model.path().to_str().unwrap());
         let completion = body.get("prompt").is_some();
         let expected = if completion {
             let request: CompletionRequest = serde_json::from_value(body.clone()).unwrap();
-            let lowered = prepare_grpc_completion(&request).unwrap();
-            frontend
-                .prepare_token_ids(lowered.chat, lowered.token_ids, false)
-                .await
-                .unwrap()
-                .tokenized
-                .token_ids
+            let mut prepared = frontend.prepare_completions(&request).await.unwrap();
+            assert_eq!(prepared.len(), 1);
+            prepared.pop().unwrap().tokenized.token_ids
         } else {
             frontend
                 .prepare(serde_json::from_value(body.clone()).unwrap())
@@ -125,4 +126,30 @@ async fn grpc_prefix_selection_uses_the_ids_actually_dispatched() {
         assert_eq!(warm.captured().last().unwrap().token_ids, expected.as_ref());
         assert_eq!(warm_worker.load(), 1);
     }
+}
+
+#[tokio::test]
+async fn grpc_completion_text_prompt_is_encoded_with_special_tokens_by_default() {
+    let model = fixture::model_fixture();
+    let frontend = EngineFrontend::new();
+    let mut request: CompletionRequest = serde_json::from_value(json!({
+        "model": model.path().to_str().unwrap(),
+        "prompt": "hello prefix",
+    }))
+    .unwrap();
+    let prepared = frontend.prepare_completions(&request).await.unwrap();
+    assert_eq!(prepared.len(), 1);
+    let ids = &prepared[0].tokenized.token_ids;
+    assert!(!ids.is_empty());
+    // The fixture adds a BOS post-processor, so the default encode starts
+    // with <s> (290).
+    assert_eq!(ids[0], 290);
+
+    request
+        .other
+        .insert("add_special_tokens".to_string(), json!(false));
+    let prepared = frontend.prepare_completions(&request).await.unwrap();
+    let ids = &prepared[0].tokenized.token_ids;
+    assert!(!ids.is_empty());
+    assert_ne!(ids[0], 290);
 }

@@ -80,7 +80,7 @@ async fn start_router(servers: &[MockVllmRsServer], policy: PolicyConfig) -> Rou
         .await
         .expect("grpc workers should pass grpc.health.v1");
     // Completions already carry token ids. Pinning skips the Hugging Face
-    // tokenizer lookup that `prepare_token_ids` still performs for sampling defaults.
+    // tokenizer lookup that `prepare_completions` still performs for sampling defaults.
     router.pin_test_token_ids(vec![1]);
     router
 }

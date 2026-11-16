@@ -1720,16 +1720,21 @@ impl Router {
                 Some(crate::backend::WorkerPoolKind::Grpc),
                 Some(GrpcRequestRef::Completion(completion)),
             ) if route == "/v1/completions" => {
-                let lowered = match crate::backend::prepare_grpc_completion(completion) {
-                    Ok(lowered) => lowered,
-                    Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
-                };
-                match self
-                    .frontend
-                    .prepare_token_ids(lowered.chat, lowered.token_ids, lowered.emit_token_ids)
-                    .await
-                {
-                    Ok(prepared) => Some(prepared),
+                // Text prompts are tokenized once in `prepare_completions`
+                // (outside policy and retry). Batched prompts lower to one
+                // prepared request per prompt; dispatching more than one is
+                // Stage 3's fan-out, so they fail fast here for now.
+                match self.frontend.prepare_completions(completion).await {
+                    Ok(mut prepared) => {
+                        if prepared.len() != 1 {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                "gRPC /v1/completions does not support batched prompts yet",
+                            )
+                                .into_response();
+                        }
+                        Some(prepared.pop().unwrap())
+                    }
                     Err(error) => {
                         return (prepare_error_status(&error), error.to_string()).into_response();
                     }
