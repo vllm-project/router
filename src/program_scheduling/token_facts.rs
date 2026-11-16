@@ -152,7 +152,7 @@ pub struct ArrivalTokenFacts {
     /// Whether settlement can observe the Engine's own prompt count for this
     /// request. A streaming HTTP client that does not request
     /// `stream_options.include_usage` gets no wire usage, so a prepared fact
-    /// could never be verified and `exact_when_verified` must keep the estimate.
+    /// could never be verified and `exact` must keep the estimate.
     observable: bool,
 }
 
@@ -232,7 +232,7 @@ impl fmt::Display for TokenFactFallback {
 
 /// Token-count source selection mode.
 ///
-/// `ExactWhenVerified` is the default: it estimates during probation and falls
+/// `Exact` is the default: it estimates during probation and falls
 /// back when prepared facts cannot be trusted. `Estimated` remains a supported
 /// compatibility override. `Shadow` is an advanced diagnostic; deployments do
 /// not need to pass through it before using exact counts.
@@ -246,7 +246,8 @@ pub enum TokenCountMode {
     Shadow,
     /// Apply the prepared count once its fingerprint is allowed and verified.
     #[default]
-    ExactWhenVerified,
+    #[serde(alias = "exact_when_verified")]
+    Exact,
 }
 
 impl TokenCountMode {
@@ -254,7 +255,7 @@ impl TokenCountMode {
         match self {
             Self::Estimated => "estimated",
             Self::Shadow => "shadow",
-            Self::ExactWhenVerified => "exact_when_verified",
+            Self::Exact => "exact",
         }
     }
 
@@ -422,9 +423,7 @@ pub fn resolve_context_tokens(
     let estimated = ContextTokens::estimated(arrival.estimated_tokens());
     let Some(prepared) = arrival.prepared() else {
         return match mode {
-            TokenCountMode::ExactWhenVerified => {
-                estimated.with_fallback(TokenFactFallback::NoPreparedFact)
-            }
+            TokenCountMode::Exact => estimated.with_fallback(TokenFactFallback::NoPreparedFact),
             _ => estimated,
         };
     };
@@ -438,7 +437,7 @@ pub fn resolve_context_tokens(
                 estimated
             }
         }
-        TokenCountMode::ExactWhenVerified => {
+        TokenCountMode::Exact => {
             if !allowed {
                 return estimated.with_fallback(TokenFactFallback::PoolNotAllowed);
             }
@@ -463,7 +462,7 @@ pub fn resolve_context_tokens(
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
-    use TokenCountMode::{Estimated, ExactWhenVerified, Shadow};
+    use TokenCountMode::{Estimated, Exact, Shadow};
 
     fn fingerprint() -> TokenizerFingerprint {
         TokenizerFingerprint::from_parts(&["model-a", "{}", "vllm-tokenizer"])
@@ -473,14 +472,14 @@ mod tests {
     fn unobservable_stream_keeps_the_estimate() {
         let prepared = TokenFacts::prepared_token_ids(100, fingerprint());
         let unobservable = ArrivalTokenFacts::new(50, Some(prepared)).with_observability(false);
-        let context = resolve_context_tokens(ExactWhenVerified, unobservable, true, false, true);
+        let context = resolve_context_tokens(Exact, unobservable, true, false, true);
         assert_eq!(context.tokens(), 50);
         assert_eq!(
             context.fallback(),
             Some(TokenFactFallback::UnobservableStream)
         );
         let observable = ArrivalTokenFacts::new(50, Some(prepared));
-        let context = resolve_context_tokens(ExactWhenVerified, observable, true, false, true);
+        let context = resolve_context_tokens(Exact, observable, true, false, true);
         assert_eq!(context.tokens(), 100);
         assert_eq!(context.source(), TokenFactSource::PreparedTokenIds);
     }
@@ -489,14 +488,14 @@ mod tests {
     fn exact_mode_probation_keeps_estimate_until_verified() {
         let prepared = TokenFacts::prepared_token_ids(98_304, fingerprint());
         let arrival = ArrivalTokenFacts::new(4, Some(prepared));
-        let pending = resolve_context_tokens(ExactWhenVerified, arrival, true, false, false);
+        let pending = resolve_context_tokens(Exact, arrival, true, false, false);
         assert_eq!(pending.tokens(), 4);
         assert_eq!(pending.shadow_tokens(), Some(98_304));
         assert_eq!(
             pending.fallback(),
             Some(TokenFactFallback::FingerprintUnverified)
         );
-        let verified = resolve_context_tokens(ExactWhenVerified, arrival, true, false, true);
+        let verified = resolve_context_tokens(Exact, arrival, true, false, true);
         assert_eq!(verified.tokens(), 98_304);
         assert_eq!(verified.fallback(), None);
     }
@@ -536,7 +535,7 @@ mod tests {
     fn exact_mode_applies_prepared_count_when_allowed() {
         let arrival =
             ArrivalTokenFacts::new(4, Some(TokenFacts::client_token_ids(98_304, fingerprint())));
-        let context = resolve_context_tokens(ExactWhenVerified, arrival, true, false, true);
+        let context = resolve_context_tokens(Exact, arrival, true, false, true);
         assert_eq!(context.tokens(), 98_304);
         assert_eq!(context.source(), TokenFactSource::ClientTokenIds);
         assert_eq!(context.fallback(), None);
@@ -546,13 +545,13 @@ mod tests {
     fn exact_mode_falls_back_when_pool_not_allowed_or_revoked() {
         let arrival =
             ArrivalTokenFacts::new(4, Some(TokenFacts::client_token_ids(98_304, fingerprint())));
-        let not_allowed = resolve_context_tokens(ExactWhenVerified, arrival, false, false, true);
+        let not_allowed = resolve_context_tokens(Exact, arrival, false, false, true);
         assert_eq!(not_allowed.tokens(), 4);
         assert_eq!(
             not_allowed.fallback(),
             Some(TokenFactFallback::PoolNotAllowed)
         );
-        let revoked = resolve_context_tokens(ExactWhenVerified, arrival, true, true, true);
+        let revoked = resolve_context_tokens(Exact, arrival, true, true, true);
         assert_eq!(revoked.tokens(), 4);
         assert_eq!(
             revoked.fallback(),
@@ -563,7 +562,7 @@ mod tests {
     #[test]
     fn exact_mode_labels_missing_prepared_fact() {
         let context = resolve_context_tokens(
-            ExactWhenVerified,
+            Exact,
             ArrivalTokenFacts::estimated_only(512),
             true,
             false,

@@ -162,7 +162,7 @@ impl ProgramScheduler {
     ///
     /// In `estimated` mode this returns the legacy byte estimate unchanged. In
     /// `shadow` mode it also records the prepared counterfactual without
-    /// changing any decision. In `exact_when_verified` mode it applies the
+    /// changing any decision. In `exact` mode it applies the
     /// prepared count unless the model pool is not allowlisted or the
     /// fingerprint was revoked after an Engine disagreement.
     pub fn resolve_arrival_tokens(
@@ -273,7 +273,7 @@ impl ProgramScheduler {
     /// Record one matching Engine settlement for a fingerprint.
     ///
     /// `token_count_verification_settlements` matching settlements are required
-    /// before `exact_when_verified` applies a count; `0` disables probation.
+    /// before `exact` applies a count; `0` disables probation.
     fn mark_fingerprint_verified(
         &self,
         state: &mut ProgramSchedulerState,
@@ -500,7 +500,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_mode_admits_with_engine_scale_demand() {
-        let mut config = config(TokenCountMode::ExactWhenVerified, 100_000);
+        let mut config = config(TokenCountMode::Exact, 100_000);
         config.token_count_verification_settlements = 0;
         let scheduler = ProgramScheduler::new(config);
         let fingerprint = TokenizerFingerprint::from_parts(&["model", "client"]);
@@ -571,7 +571,7 @@ mod tests {
         // Eviction would make an old known-bad fingerprint trusted again; the
         // bound must fail closed for every prepared fact until restart.
         let config = ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_mode: TokenCountMode::Exact,
             token_count_verification_settlements: 0,
             ..ProgramSchedulerConfig::default()
         };
@@ -758,7 +758,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_mode_applies_only_after_a_matching_settlement() {
-        let config = config(TokenCountMode::ExactWhenVerified, 1_000_000);
+        let config = config(TokenCountMode::Exact, 1_000_000);
         // Default probation is one matching settlement.
         assert_eq!(config.token_count_verification_settlements, 1);
         let scheduler = ProgramScheduler::new(config);
@@ -805,7 +805,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_mode_mismatch_keeps_the_fingerprint_on_probation() {
-        let config = config(TokenCountMode::ExactWhenVerified, 1_000_000);
+        let config = config(TokenCountMode::Exact, 1_000_000);
         let scheduler = ProgramScheduler::new(config);
         let fingerprint = TokenizerFingerprint::from_parts(&["model", "mismatch"]);
         let arrival =
@@ -843,7 +843,7 @@ mod tests {
     #[test]
     fn prepared_token_pool_allowlist_gates_pools() {
         let mut config = ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_mode: TokenCountMode::Exact,
             ..ProgramSchedulerConfig::default()
         };
         config.token_count_model_pools = vec!["program:model:a".to_string(), "model-c".to_string()];
@@ -864,7 +864,7 @@ mod tests {
     #[test]
     fn exact_text_endpoints_are_gated_by_mode_and_allowlist() {
         let mut config = ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_mode: TokenCountMode::Exact,
             ..ProgramSchedulerConfig::default()
         };
         config.exact_text_endpoints = vec!["/v1/chat/completions".to_string()];
@@ -910,7 +910,7 @@ mod tests {
     #[tokio::test]
     async fn exact_mode_queues_a_program_the_estimate_would_admit() {
         let fingerprint = TokenizerFingerprint::from_parts(&["model", "queue"]);
-        let mut exact_config = config(TokenCountMode::ExactWhenVerified, 150_000);
+        let mut exact_config = config(TokenCountMode::Exact, 150_000);
         exact_config.token_count_verification_settlements = 0;
         let exact_scheduler = ProgramScheduler::new(exact_config);
         let exact_context = exact_scheduler.resolve_arrival_tokens(
@@ -971,7 +971,7 @@ mod tests {
 
     #[tokio::test]
     async fn revocation_falls_back_to_estimation() {
-        let config = config(TokenCountMode::ExactWhenVerified, 100_000);
+        let config = config(TokenCountMode::Exact, 100_000);
         let scheduler = ProgramScheduler::new(config);
         let fingerprint = TokenizerFingerprint::from_parts(&["model", "client"]);
         {
@@ -1035,7 +1035,7 @@ mod revocation_tests {
     #[tokio::test]
     async fn failed_and_duplicate_settlements_do_not_trip_missing_usage_breaker() {
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_mode: TokenCountMode::Exact,
             ..Default::default()
         });
         let fingerprint = TokenizerFingerprint::from_parts(&["missing-usage"]);
@@ -1073,7 +1073,7 @@ mod revocation_tests {
     #[tokio::test]
     async fn missing_usage_breaker_resets_partial_streaks_and_downgrades_retained_facts() {
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_mode: TokenCountMode::Exact,
             token_count_verification_settlements: 0,
             ..Default::default()
         });
@@ -1138,7 +1138,7 @@ mod revocation_tests {
     #[test]
     fn missing_usage_tracking_is_bounded_and_fails_closed() {
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_mode: TokenCountMode::Exact,
             ..Default::default()
         });
         let mut state = scheduler.state.lock();
@@ -1162,7 +1162,7 @@ mod revocation_tests {
     #[tokio::test]
     async fn claimed_dispatch_keeps_its_facts_but_queued_successor_is_revoked() {
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_mode: TokenCountMode::Exact,
             token_count_verification_settlements: 0,
             ..Default::default()
         });
@@ -1212,7 +1212,7 @@ mod revocation_tests {
     #[tokio::test]
     async fn revocation_between_resolution_and_retention_uses_the_original_estimate() {
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_mode: TokenCountMode::Exact,
             token_count_verification_settlements: 0,
             ..Default::default()
         });
@@ -1254,7 +1254,7 @@ mod revocation_tests {
         for global_queue in [false, true] {
             for saturate in [false, true] {
                 let mut config = ProgramSchedulerConfig {
-                    token_count_mode: TokenCountMode::ExactWhenVerified,
+                    token_count_mode: TokenCountMode::Exact,
                     token_count_verification_settlements: 0,
                     global_queue,
                     ..Default::default()
@@ -1363,7 +1363,7 @@ mod revocation_tests {
     #[tokio::test]
     async fn queued_request_must_stop_using_a_revoked_fact() {
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_mode: TokenCountMode::Exact,
             max_active_programs_per_target: 1,
             ..Default::default()
         });
@@ -1419,7 +1419,7 @@ mod revocation_tests {
     #[tokio::test]
     async fn duplicate_settlement_cannot_complete_probation() {
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_mode: TokenCountMode::Exact,
             token_count_verification_settlements: 2,
             ..Default::default()
         });
@@ -1463,7 +1463,7 @@ mod revocation_tests {
     #[tokio::test]
     async fn duplicate_settlement_cannot_revoke_a_fingerprint() {
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
-            token_count_mode: TokenCountMode::ExactWhenVerified,
+            token_count_mode: TokenCountMode::Exact,
             ..Default::default()
         });
         let fp = TokenizerFingerprint::from_parts(&["review-stale"]);

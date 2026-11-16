@@ -1124,7 +1124,7 @@ impl RouterMetrics {
     }
 
     pub fn set_agent_aware_context_token_mode(mode: &'static str) {
-        for candidate in ["estimated", "shadow", "exact_when_verified"] {
+        for candidate in ["estimated", "shadow", "exact"] {
             gauge!(
                 "vllm_router_agent_aware_context_token_mode",
                 "mode" => candidate

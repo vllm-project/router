@@ -166,7 +166,7 @@ For JSON fields, defaults and request opt-in behavior, see
 [Program scheduling](program_scheduling/program-scheduling.md). The JSON option configures the
 feature; it does not enable it on its own.
 
-No JSON override is needed for the `exact_when_verified` default. To select the
+No JSON override is needed for the `exact` default. To select the
 supported `estimated` compatibility mode, both CLIs accept the same override:
 
 ```bash

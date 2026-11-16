@@ -50,7 +50,7 @@ vllm-router \
 
 The enable flag selects `ProgramSchedulingConfig` with every field defaulted; omitting the flag disables Program scheduling. The JSON option is configuration only: pass it together with the enable flag for overrides, and the Router reports a configuration error if JSON is supplied without explicit enablement. The defaults use the Program-count guard because token capacity is unset and emit a calibration warning because the built-in performance coefficients are reference values. For a production deployment, save the calibrated configuration above as `program-scheduling.json`, compact it into one CLI argument, and start the Router with the backend API endpoints. One Worker URL may expose multiple internal DP Ranks; `--intra-node-data-parallel-size` is the number of internal Ranks behind each Worker URL.
 
-Input-token counting defaults to `exact_when_verified`: available prepared
+Input-token counting defaults to `exact`: available prepared
 counts are verified against Engine usage before use, with estimation as the
 fallback. No token-count override is required. HTTP chat tokenization remains
 a separate opt-in. Use `"token_count_mode": "estimated"` for the supported
@@ -101,9 +101,9 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 | `binding_strategy` | `consistent_hash` | Selects the initial home Rank for each new Program generation. Supported values are `consistent_hash`, `program_round_robin`, `least_program_count`, `reasoning_token_balance`, and `cache_aware`; it does not replace admission or resume decisions. |
 | `hash_virtual_nodes` | `160` | Sets the number of virtual nodes used by `consistent_hash` initial binding. It has no effect on the other binding strategies. |
 | `token_capacity_per_dp_rank` | `null` | Supplies the logical KV-token capacity of each concrete DP Rank. A value enables token-based admission, growth reserve, capacity repair, and cross-Rank headroom checks; `null` falls back to the Program-count guard. `reasoning_token_balance` requires this value. The deprecated input alias `token_capacity_per_target` is accepted but is never emitted when the configuration is serialized. |
-| `token_count_mode` | `exact_when_verified` | Apply available prepared counts after matching Engine settlements, otherwise estimate. `estimated` is a supported compatibility override, not deprecated. `shadow` is an advanced diagnostic that keeps estimated decisions and records prepared counterfactuals even after verification. See [Input-token facts](#input-token-facts). |
+| `token_count_mode` | `exact` | Apply available prepared counts after matching Engine settlements, otherwise estimate. `estimated` is a supported compatibility override, not deprecated. `shadow` is an advanced diagnostic that keeps estimated decisions and records prepared counterfactuals even after verification. See [Input-token facts](#input-token-facts). |
 | `token_count_model_pools` | `[]` | Model pools allowed to apply prepared exact counts. Empty allows every pool; entries may be plain model names (`model-a`) or internal pool keys (`program:model:model-a`, `program:all`, `program:fallback:unlabeled`). Unknown-looking entries are not validated against live pools, so check `vllm_router_agent_aware_context_token_fallbacks_total{reason="pool_not_allowed"}` after enabling. |
-| `token_count_verification_settlements` | `1` | Matching Engine settlements a fingerprint needs before `exact_when_verified` applies it (probation). The first settlement of a new class uses the estimate and only counts as verification; a mismatch revokes the class until Router restart. After correcting the mismatch, restart to begin fresh probation. `0` restores legacy trust-on-first-use. |
+| `token_count_verification_settlements` | `1` | Matching Engine settlements a fingerprint needs before `exact` applies it (probation). The first settlement of a new class uses the estimate and only counts as verification; a mismatch revokes the class until Router restart. After correcting the mismatch, restart to begin fresh probation. `0` restores legacy trust-on-first-use. |
 | `metrics_base_urls` | `{}` | Maps a Program target base URL to the HTTP `/metrics` endpoint of the same Engine/DP rank. Required for `grpc://` targets: without a mapping the target keeps reporting a missing observation, and a stale sample is never promoted to live capacity. Keys are matched literally against the configured target base URL, including any trailing slash; values must be `http(s)://` URLs (config validation rejects anything else). |
 | `exact_text_endpoints` | `[]` | Text endpoints allowed to use a Router-tokenized exact count (for example `["/v1/chat/completions"]`). Only consulted when `token_count_mode` is not `estimated`; configuration validation rejects routes that are not `/v1/chat/completions` or `/v1/completions`, so a typo fails at startup instead of silently never matching. Enable it only after the Router renderer and tokenizer are verified equal to the Engine's; set `VLLM_ROUTER_TOKENIZER` to the deployed model directory, and watch `vllm_router_agent_aware_context_token_observation_delta_ratio` plus revocations for drift. |
 | `max_active_programs_per_target` | `64` | Limits active Programs on one Rank as a coarse concurrency guard. It is the primary capacity guard when token capacity is absent and remains a count guard when token capacity is configured; forced resume may override it. |
@@ -171,11 +171,17 @@ Program admission, context-growth accounting, and Progress-TTL cost all consume 
 ### Default and compatibility override
 
 Leave token-count fields out of the deployment JSON to use
-`exact_when_verified`. Program scheduling itself stays disabled unless
+`exact`. Program scheduling itself stays disabled unless
 explicitly enabled. In the colocated Prefill/Decode path, the default reuses
 available token IDs, estimates during verification, and falls back when a
 prepared count is unavailable or cannot be trusted. HTTP chat text still uses
 the estimator unless its extra tokenization is explicitly enabled below.
+
+The former configuration value `exact_when_verified` is accepted as an input
+alias for `exact`. Serialized configuration, diagnostics, and the
+`vllm_router_agent_aware_context_token_mode{mode="exact"}` metric use the new
+name; update dashboards that selected the old mode label. Verification and
+estimation fallback are unchanged by the rename.
 
 This changes the previous `estimated` default for enabled Program deployments:
 eligible token-ID and gRPC requests may make different admission decisions after
@@ -215,7 +221,7 @@ After that check, HTTP chat deployments can opt into the additional work with:
 
 ```json
 {
-  "token_count_mode": "exact_when_verified",
+  "token_count_mode": "exact",
   "exact_text_endpoints": ["/v1/chat/completions"]
 }
 ```

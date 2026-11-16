@@ -8033,7 +8033,7 @@ mod tests {
         let mut router = router_pointing_at(address);
         router.frontend.pin_test_token_ids(vec![1; 10]);
         router.program_scheduler = Some(Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
-            token_count_mode: crate::program_scheduling::TokenCountMode::ExactWhenVerified,
+            token_count_mode: crate::program_scheduling::TokenCountMode::Exact,
             exact_text_endpoints: vec!["/v1/chat/completions".into()],
             ..Default::default()
         })));
@@ -8124,7 +8124,7 @@ mod tests {
             None,
             Some(TokenCountMode::Estimated),
             Some(TokenCountMode::Shadow),
-            Some(TokenCountMode::ExactWhenVerified),
+            Some(TokenCountMode::Exact),
         ] {
             for (identified, client_usage) in
                 [(false, false), (false, true), (true, false), (true, true)]
@@ -8217,7 +8217,7 @@ mod tests {
         };
         for prompt_info in [None, Some(10), Some(12)] {
             let scheduler = Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
-                token_count_mode: TokenCountMode::ExactWhenVerified,
+                token_count_mode: TokenCountMode::Exact,
                 ..Default::default()
             }));
             let fp = TokenizerFingerprint::from_parts(&["prompt-info"]);
@@ -8276,7 +8276,7 @@ mod tests {
         for mode in [
             TokenCountMode::Estimated,
             TokenCountMode::Shadow,
-            TokenCountMode::ExactWhenVerified,
+            TokenCountMode::Exact,
         ] {
             for identified in [false, true] {
                 let ids = vec![1, 2, 3, 4, 5, 6];
@@ -8327,7 +8327,7 @@ mod tests {
             None,
             Some(TokenCountMode::Estimated),
             Some(TokenCountMode::Shadow),
-            Some(TokenCountMode::ExactWhenVerified),
+            Some(TokenCountMode::Exact),
         ] {
             let (address, server) = spawn_header_echo_backend().await;
             let mut router = create_test_regular_router();
@@ -8369,8 +8369,7 @@ mod tests {
             if exact {
                 Arc::get_mut(&mut fixture.router).unwrap().program_scheduler =
                     Some(Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
-                        token_count_mode:
-                            crate::program_scheduling::TokenCountMode::ExactWhenVerified,
+                        token_count_mode: crate::program_scheduling::TokenCountMode::Exact,
                         ..Default::default()
                     })));
             }
@@ -8411,7 +8410,7 @@ mod tests {
             let mut fixture = completion_response_fixture().await;
             Arc::get_mut(&mut fixture.router).unwrap().program_scheduler =
                 Some(Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
-                    token_count_mode: crate::program_scheduling::TokenCountMode::ExactWhenVerified,
+                    token_count_mode: crate::program_scheduling::TokenCountMode::Exact,
                     ..Default::default()
                 })));
             let request: CompletionRequest = serde_json::from_value(serde_json::json!({
@@ -8498,8 +8497,7 @@ mod tests {
             if exact {
                 router.program_scheduler =
                     Some(Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
-                        token_count_mode:
-                            crate::program_scheduling::TokenCountMode::ExactWhenVerified,
+                        token_count_mode: crate::program_scheduling::TokenCountMode::Exact,
                         exact_text_endpoints: vec!["/v1/chat/completions".into()],
                         ..Default::default()
                     })));

@@ -399,7 +399,7 @@ pub struct ProgramSchedulingConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_capacity_per_dp_rank: Option<usize>,
     /// Input-token fact source used for admission, growth, and TTL cost.
-    /// Defaults to `exact_when_verified` with automatic verification and
+    /// Defaults to `exact` with automatic verification and
     /// estimation fallback. `estimated` is a supported compatibility override;
     /// `shadow` records counterfactuals without applying prepared counts.
     #[serde(default)]
@@ -419,7 +419,7 @@ pub struct ProgramSchedulingConfig {
     #[serde(default = "default_token_count_verification_settlements")]
     pub token_count_verification_settlements: usize,
     /// Optional text endpoints allowed to use Router-tokenized facts.
-    /// Empty by default, including in `exact_when_verified` mode, to avoid
+    /// Empty by default, including in `exact` mode, to avoid
     /// adding HTTP text tokenization unless the deployment explicitly opts in.
     ///
     /// Exactness for HTTP text requires verified tokenizer/template
@@ -1536,12 +1536,12 @@ mod tests {
     }
 
     #[test]
-    fn program_token_count_mode_parses_and_defaults_to_exact_when_verified() {
+    fn program_token_count_mode_parses_and_defaults_to_exact() {
         for input in [None, Some("{}")] {
             let default = ProgramSchedulingConfig::resolve(true, input)
                 .unwrap()
                 .unwrap();
-            assert_eq!(default.token_count_mode, TokenCountMode::ExactWhenVerified);
+            assert_eq!(default.token_count_mode, TokenCountMode::Exact);
             assert_eq!(default.token_count_verification_settlements, 1);
             assert!(default.token_count_model_pools.is_empty());
             assert!(default.exact_text_endpoints.is_empty());
@@ -1553,17 +1553,23 @@ mod tests {
                 .unwrap();
         assert_eq!(estimated.token_count_mode, TokenCountMode::Estimated);
 
-        let configured = ProgramSchedulingConfig::resolve(
-            true,
-            Some(r#"{"token_count_mode":"exact_when_verified","token_count_model_pools":["model-a"]}"#),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            configured.token_count_mode,
-            TokenCountMode::ExactWhenVerified
-        );
-        assert_eq!(configured.token_count_model_pools, vec!["model-a"]);
+        for mode in ["exact", "exact_when_verified"] {
+            let input = serde_json::json!({
+                "token_count_mode": mode,
+                "token_count_model_pools": ["model-a"]
+            })
+            .to_string();
+            let configured = ProgramSchedulingConfig::resolve(true, Some(&input))
+                .unwrap()
+                .unwrap();
+            assert_eq!(configured.token_count_mode, TokenCountMode::Exact);
+            assert_eq!(configured.token_count_mode.as_str(), "exact");
+            assert_eq!(
+                serde_json::to_value(&configured).unwrap()["token_count_mode"],
+                "exact"
+            );
+            assert_eq!(configured.token_count_model_pools, vec!["model-a"]);
+        }
 
         let shadow =
             ProgramSchedulingConfig::resolve(true, Some(r#"{"token_count_mode":"shadow"}"#))
