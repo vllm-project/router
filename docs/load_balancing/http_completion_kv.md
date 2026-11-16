@@ -32,3 +32,9 @@ Observed placement estimates are not actual APC hit counts or complete
 bootstrap/generation/recovery guarantees. See
 [the HTTP consumer RFC](https://github.com/vllm-project/router/issues/405) for the
 real-Worker acceptance requirements.
+
+### Optional prefix history
+
+Add `--kv-aware-completion-history` to a Regular `--policy kv_aware --router-temperature 0` invocation (off by default). With no usable session binding or positive event credit, a recently observed whole-block token prefix can break a load tie. This is a preference, not evidence that KV is still resident.
+
+It requires a registered single-rank worker with a verified model, block size and KV source, and one plain prompt with backend-effective IDs. HTTP and gRPC workers support plain Chat; gRPC Completion requires token IDs. HTTP also supports single-prompt Completion, stateless text Responses and model-qualified native token generation. Unsupported inputs keep ordinary routing.

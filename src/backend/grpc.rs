@@ -543,7 +543,7 @@ async fn stream_openai(
         request_timeout,
         mut stages,
         t_req,
-        on_first_output: _,
+        on_first_output,
         fail_on_abort: _,
         abort,
     } = reply;
@@ -559,6 +559,7 @@ async fn stream_openai(
                 .map(|t| decode_stream(&**t, prompt_ids.as_ref(), skip_special));
             let mut first = true;
             let mut first_token_logged = false;
+            let mut first_output_seen = false;
             let mut prompt_tokens = n_prompt_tokens as u32;
             let mut completion_tokens = 0u32;
             loop {
@@ -657,6 +658,14 @@ async fn stream_openai(
                                 break;
                             }
                             first = false;
+                        }
+                        if !tx.is_closed() {
+                            notify_first_output(
+                                &msg,
+                                &text,
+                                &mut first_output_seen,
+                                on_first_output.as_ref(),
+                            );
                         }
                         if finish.is_some() {
                             if include_usage {
@@ -868,7 +877,12 @@ fn notify_first_output(
     first_output_seen: &mut bool,
     callback: Option<&FirstOutputCallback>,
 ) {
-    if !*first_output_seen && has_generated_output(msg, text) {
+    let aborted = msg
+        .outputs
+        .as_ref()
+        .and_then(|output| output.finish_info.as_ref())
+        .is_some_and(|finish| finish.finish_reason == FinishReason::Aborted as i32);
+    if !*first_output_seen && !aborted && has_generated_output(msg, text) {
         *first_output_seen = true;
         if let Some(callback) = callback {
             callback();
@@ -963,6 +977,21 @@ mod tests {
         assert!(has_generated_output(&output, ""));
         notify_first_output(&output, "", &mut first_output_seen, Some(&callback));
         notify_first_output(&output, "", &mut first_output_seen, Some(&callback));
+        assert_eq!(decode_started.load(Ordering::Relaxed), 1);
+
+        let aborted = GenerateResponse {
+            outputs: Some(SequenceOutput {
+                finish_info: Some(super::super::pb::FinishInfo {
+                    finish_reason: FinishReason::Aborted as i32,
+                    ..Default::default()
+                }),
+                ..output.outputs.unwrap()
+            }),
+            prompt_info: None,
+        };
+        first_output_seen = false;
+        notify_first_output(&aborted, "", &mut first_output_seen, Some(&callback));
+        assert!(!first_output_seen);
         assert_eq!(decode_started.load(Ordering::Relaxed), 1);
     }
 
