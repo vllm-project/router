@@ -30,7 +30,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Once, RwLock};
 use std::time::Instant;
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use tracing::{debug, error, info, warn};
@@ -43,6 +43,8 @@ type ProgramPrefillCandidate = (String, Arc<dyn Worker>);
 struct MooncakePrefillInfo {
     bootstrap_addr: String,
     dp_engine_ids: HashMap<usize, String>,
+    /// Share diagnostic suppression across clones; bootstrap values stay immutable.
+    fallback_warning: Arc<Once>,
 }
 
 /// Request-scoped facts threaded into decode-response handling: the route,
@@ -766,12 +768,24 @@ impl VllmPDRouter {
             .dp_engine_ids
             .iter()
             .min_by_key(|(rank, _)| *rank)?;
-        warn!(
-            prefill_url,
-            requested_dp_rank = rank,
-            fallback_dp_rank = fallback_rank,
-            "Mooncake DP rank missing; using the lowest available rank"
-        );
+        let mut first_fallback = false;
+        prefill_info.fallback_warning.call_once(|| {
+            first_fallback = true;
+            warn!(
+                prefill_url,
+                requested_dp_rank = rank,
+                fallback_dp_rank = fallback_rank,
+                "Mooncake DP rank missing; using the lowest available rank; further fallbacks for this prefill are logged at debug"
+            );
+        });
+        if !first_fallback {
+            debug!(
+                prefill_url,
+                requested_dp_rank = rank,
+                fallback_dp_rank = fallback_rank,
+                "Mooncake DP rank missing; using the lowest available rank"
+            );
+        }
         Some((&prefill_info.bootstrap_addr, engine_id))
     }
 
@@ -3114,6 +3128,7 @@ impl VllmPDRouter {
                                 MooncakePrefillInfo {
                                     bootstrap_addr,
                                     dp_engine_ids,
+                                    fallback_warning: Arc::new(Once::new()),
                                 },
                             );
                         }
@@ -3733,6 +3748,7 @@ mod tests {
                         (0, "engine-0".to_string()),
                         (1, "engine-1".to_string()),
                     ]),
+                    fallback_warning: Arc::new(Once::new()),
                 },
             ),
             (
@@ -3743,6 +3759,7 @@ mod tests {
                         (0, "grpc-engine-0".to_string()),
                         (1, "grpc-engine-1".to_string()),
                     ]),
+                    fallback_warning: Arc::new(Once::new()),
                 },
             ),
             (
@@ -3750,6 +3767,7 @@ mod tests {
                 MooncakePrefillInfo {
                     bootstrap_addr: "http://empty:8998".to_string(),
                     dp_engine_ids: HashMap::new(),
+                    fallback_warning: Arc::new(Once::new()),
                 },
             ),
         ]));
@@ -3828,6 +3846,7 @@ mod tests {
                         .into_iter()
                         .map(|rank| (rank, format!("engine-{rank}")))
                         .collect(),
+                    fallback_warning: Arc::new(Once::new()),
                 },
             );
             for rank in [None, Some(99)] {
@@ -3841,6 +3860,77 @@ mod tests {
                 Some(("http://fallback:8998", "engine-9"))
             );
         }
+    }
+
+    #[test]
+    fn mooncake_rank_fallback_warns_once_per_prefill_under_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::{layer::Context, prelude::*, Layer};
+
+        #[derive(Clone, Default)]
+        struct Counts {
+            warnings: Arc<AtomicUsize>,
+            debug: Arc<AtomicUsize>,
+        }
+        impl<S: tracing::Subscriber> Layer<S> for Counts {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    self.warnings.fetch_add(1, Ordering::Relaxed);
+                } else if *event.metadata().level() == tracing::Level::DEBUG {
+                    self.debug.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let router = Arc::new(mooncake_test_router());
+        let counts = Counts::default();
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(counts.clone()));
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert_eq!(
+                router.get_mooncake_info("http://prefill:8000", Some(1)),
+                Some(("http://prefill:8998", "engine-1"))
+            );
+        });
+        assert_eq!(counts.warnings.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.debug.load(Ordering::Relaxed), 0);
+
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let router = router.clone();
+                let barrier = barrier.clone();
+                let dispatch = &dispatch;
+                scope.spawn(move || {
+                    tracing::dispatcher::with_default(dispatch, || {
+                        barrier.wait();
+                        for j in 0..16 {
+                            let url = [
+                                "http://prefill:8000",
+                                "http://prefill",
+                                "http://prefill:8000/v1",
+                            ][(i + j) % 3];
+                            assert_eq!(
+                                router.get_mooncake_info(url, Some(99)),
+                                Some(("http://prefill:8998", "engine-0"))
+                            );
+                        }
+                    });
+                });
+            }
+        });
+        assert_eq!(counts.warnings.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.debug.load(Ordering::Relaxed), 127);
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            for _ in 0..2 {
+                assert_eq!(
+                    router.get_mooncake_info("grpc://prefill:8000", Some(99)),
+                    Some(("http://prefill:8998", "grpc-engine-0"))
+                );
+            }
+        });
+        assert_eq!(counts.warnings.load(Ordering::Relaxed), 2);
+        assert_eq!(counts.debug.load(Ordering::Relaxed), 128);
     }
 
     #[test]
