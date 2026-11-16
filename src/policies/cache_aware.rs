@@ -451,17 +451,28 @@ impl CacheAwarePolicy {
         Self::pick_least_loaded(healthy.iter().map(|&idx| (idx, workers[idx].load())))
     }
 
-    /// Picks uniformly among the `(id, load)` candidates with the lowest load.
+    /// Picks uniformly among the `(id, load)` candidates with the lowest load
+    /// and returns the `id` of the chosen candidate.
+    ///
+    /// The caller decides what an `id` is.
+    /// - `least_loaded()` passes indices into `workers`.
+    /// - `select_prepared()` passes indices into `healthy`, so it must map
+    ///   the result through `healthy` to get a worker index.
+    ///
     /// Each load is read once so that concurrent updates cannot change
     /// which candidates count as tied.
     fn pick_least_loaded(candidates: impl Iterator<Item = (usize, usize)>) -> Option<usize> {
-        let candidates: Vec<(usize, usize)> = candidates.collect();
-        let min_load = candidates.iter().map(|&(_, load)| load).min()?;
-        let tied: Vec<usize> = candidates
-            .iter()
-            .filter(|&&(_, load)| load == min_load)
-            .map(|&(id, _)| id)
-            .collect();
+        let mut min_load = usize::MAX;
+        let mut tied = Vec::new();
+        for (id, load) in candidates {
+            if load < min_load {
+                min_load = load;
+                tied.clear();
+            }
+            if load == min_load {
+                tied.push(id);
+            }
+        }
         pick_tied(&tied)
     }
 
@@ -1157,8 +1168,14 @@ mod tests {
             .unwrap()
     }
 
-    /// Selects 64 times and records which workers were chosen. A fair two-way
-    /// tie misses one candidate with probability 2^-63.
+    /// Selects 64 times and records which workers were chosen.
+    ///
+    /// With two tied workers, A and B,
+    /// the probability that A is never chosen in 64 rounds is 2^-64,
+    /// and the same is true for B.
+    ///
+    /// Either case can happen, but not both in one run, so a check that
+    /// both workers are chosen fails with probability 2^-64 + 2^-64 = 2^-63.
     fn reached(worker_count: usize, mut select: impl FnMut(u32) -> usize) -> Vec<bool> {
         let mut seen = vec![false; worker_count];
         for round in 0..64 {
