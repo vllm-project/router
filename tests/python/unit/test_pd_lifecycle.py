@@ -13,7 +13,7 @@ from ..helpers.pd_lifecycle import probe
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
-async def exercise(fault=None, output=None, cli=False):
+async def exercise(fault=None, output=None, cli=False, fragment=None):
     calls = []
 
     async def handler(request):
@@ -66,7 +66,15 @@ async def exercise(fault=None, output=None, cli=False):
                 if fault == "buffered_done":
                     await asyncio.sleep(0.02)  # terminal SSE buffered before HTTP EOF
                 return response
-            await chunk("blue", "stop" if fault == "already_done" else None)
+            if fragment is not None:
+                first = b'data: {"choices":[{"text":"blue","finish_reason":null}]}\n\n'
+                following = 'data: {"choices":[{"text":"蓝","finish_reason":null}]}\n\n'.encode()
+                cut = following.index(fragment) + len(fragment)
+                await response.write(first + following[:cut])
+                await asyncio.sleep(0.02)
+                await response.write(following[cut:])
+            else:
+                await chunk("blue", "stop" if fault == "already_done" else None)
             if fault == "truncated":
                 return response
             # Ensure disconnect can happen while the response is unfinished.
@@ -138,8 +146,9 @@ async def exercise(fault=None, output=None, cli=False):
         await runner.cleanup()
 
 
-def test_success_and_progress_after_disconnect():
-    result, calls = asyncio.run(exercise())
+@pytest.mark.parametrize("fragment", [None, b"da", b'{"choices":', b"\xe8"])
+def test_success_and_progress_after_disconnect(fragment):
+    result, calls = asyncio.run(exercise(fragment=fragment))
     assert result["passed"]
     assert len(calls) == 12
     assert (

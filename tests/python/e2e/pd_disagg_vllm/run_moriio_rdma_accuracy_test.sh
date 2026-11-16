@@ -48,6 +48,10 @@ PREFILL_NOTIFY_PORT=${PREFILL_NOTIFY_PORT:-61005}
 DECODE_NOTIFY_PORT=${DECODE_NOTIFY_PORT:-62005}
 LOG_DIR=${LOG_DIR:-"${REPO_ROOT}/target/ci-logs/moriio-rdma-${MORIIO_READ_MODE}"}
 
+# A failure before the probe must not publish a previous invocation's report.
+# Clear it even when this invocation disables the probe or fails validation.
+rm -f -- "${LOG_DIR}/pd-lifecycle.json" "${LOG_DIR}/pd-lifecycle.json.tmp"
+
 PREFILL_CONTAINER="vllm-router-mori-rdma-prefill"
 DECODE_CONTAINER="vllm-router-mori-rdma-decode"
 EVAL_CONTAINER="vllm-router-mori-rdma-eval"

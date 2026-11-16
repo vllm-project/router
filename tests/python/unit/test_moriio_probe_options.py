@@ -1,4 +1,4 @@
-"""Invalid probe options must fail before contacting Docker or the worker."""
+"""Preflight failures must not contact hosts or retain stale probe results."""
 
 import os
 import shutil
@@ -21,6 +21,10 @@ SCRIPT = "tests/python/e2e/pd_disagg_vllm/run_moriio_rdma_accuracy_test.sh"
         ({"PD_PROBE_CONCURRENCY": "1 1 1 1 1 1 1 1 1"}, "at most eight"),
         ({"PD_PROBE_ROUNDS": "0"}, "rounds must be"),
         ({"PD_PROBE_TIMEOUT": "601"}, "timeout 1..600"),
+        (
+            {"RUN_PD_LIFECYCLE": "false", "ROUTER_BIN": "/nonexistent-router"},
+            "ROUTER_BIN is not executable",
+        ),
     ],
 )
 def test_invalid_options_do_not_touch_hosts(tmp_path, pytestconfig, options, message):
@@ -28,6 +32,14 @@ def test_invalid_options_do_not_touch_hosts(tmp_path, pytestconfig, options, mes
     if not bash:
         pytest.skip("bash is required to test the shell entrypoint")
     marker = tmp_path / "host-command-called"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    report = log_dir / "pd-lifecycle.json"
+    checkpoint = log_dir / "pd-lifecycle.json.tmp"
+    report.write_text('{"status":"passed","passed":true}')
+    checkpoint.write_text('{"status":"running","passed":false}')
+    unrelated = log_dir / "prefill.log"
+    unrelated.write_text("previous server log")
     for name in ("docker", "ssh", "curl"):
         command = tmp_path / name
         command.write_text('#!/bin/sh\nprintf called > "$PROBE_TEST_MARKER"\nexit 99\n')
@@ -36,6 +48,7 @@ def test_invalid_options_do_not_touch_hosts(tmp_path, pytestconfig, options, mes
         **os.environ,
         "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
         "PROBE_TEST_MARKER": str(marker),
+        "LOG_DIR": str(log_dir),
         "RUN_PD_LIFECYCLE": "true",
         "SMOKE_ONLY": "false",
         "PD_PROBE_CONCURRENCY": "1 2",
@@ -54,3 +67,6 @@ def test_invalid_options_do_not_touch_hosts(tmp_path, pytestconfig, options, mes
     assert result.returncode == 2, result.stderr
     assert message in result.stderr
     assert not marker.exists()
+    assert not report.exists()
+    assert not checkpoint.exists()
+    assert unrelated.read_text() == "previous server log"

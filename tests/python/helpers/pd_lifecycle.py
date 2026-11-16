@@ -73,13 +73,15 @@ async def request(session, url, model, mode, sequence):
                 if response.content.is_eof():
                     raise ValueError("response already at EOF; cancellation untested")
                 buffered = response.content.read_nowait()
-                for pending in buffered.splitlines():
+                # Only inspect complete lines. The final fragment may end inside
+                # JSON or a UTF-8 character; we close without waiting for it.
+                for pending in buffered.split(b"\n")[:-1]:
                     pending = pending.strip()
                     if not pending or pending.startswith(b":"):
                         continue
                     if not pending.startswith(b"data:"):
                         raise ValueError(
-                            "buffered SSE is incomplete; cancellation untested"
+                            "invalid buffered SSE line; cancellation untested"
                         )
                     data = pending[5:].strip()
                     if data == b"[DONE]":
