@@ -152,7 +152,11 @@ def perf_settings(perf_case, perf_stack, bench_mod, perf_output_dir, run_idx):
         bench_max_tokens=perf_case.bench_max_tokens,
         bench_timeout=perf_case.bench_timeout,
     )
-    settings["output_dir"] = str(Path(perf_output_dir) / f"run{run_idx}")
+    settings["output_dir"] = (
+        str(Path(perf_output_dir) / f"run{run_idx}")
+        if _repeat_count() > 1
+        else perf_output_dir
+    )
     return settings
 
 
@@ -166,9 +170,13 @@ def _wave_params(case) -> tuple[list[tuple], list[str]]:
     return values, ids
 
 
+def _repeat_count() -> int:
+    return max(1, int(os.environ.get("RUNS", "1")))
+
+
 def pytest_generate_tests(metafunc):
     if "run_idx" in metafunc.fixturenames:
-        runs = max(1, int(os.environ.get("RUNS", "1")))
+        runs = _repeat_count()
         metafunc.parametrize("run_idx", range(1, runs + 1))
 
     if "hit_rate" not in metafunc.fixturenames:
