@@ -330,29 +330,36 @@ fn select_stage(
             );
         }
     }
+    let mut decode_prices_used = false;
     let (picked, affinity_outcome, affinity_binding) = if stage == Stage::Decode && kv_aware {
         // Decode never queries placement or applies the P temperature:
         // deterministic minimum occupancy with rotating equal-load ties, and
         // the optional decode session binding on top.
         let kv = kv_aware_ops(policy)?;
+        // Marginal credit is only usable when the price table covers every candidate
+        // that is eligible right now. A worker that was unavailable when the prices were
+        // taken and recovered since has no entry, and `select_decode` would read the
+        // missing price as zero - making the recovered worker look free.
+        //
+        // The table is keyed by `Worker::url()`, not `base_url()`: DP ranks of one
+        // engine have independent KV caches, so rank `@0` must not consume rank
+        // `@1`'s price (or a missing rank's zero).
+        let decode_prices = if !decode_tokens_known {
+            None
+        } else {
+            context.decode_context.filter(|prices| {
+                projected
+                    .iter()
+                    .all(|worker| prices.contains_key(worker.url()))
+            })
+        };
+        decode_prices_used = decode_prices.is_some();
         let pick = kv.select_decode(
             &projected,
             context.affinity_key.as_ref(),
             context.lora_name,
             context.cache_salt,
-            // Marginal credit is only usable when the price table covers every candidate
-            // that is eligible right now. A worker that was unavailable when the prices were
-            // taken and recovered since has no entry, and `select_decode` would read the
-            // missing price as zero - making the recovered worker look free.
-            if !decode_tokens_known {
-                None
-            } else {
-                context.decode_context.filter(|prices| {
-                    projected
-                        .iter()
-                        .all(|worker| prices.contains_key(worker.base_url()))
-                })
-            },
+            decode_prices,
         )?;
         (
             pick.index,
@@ -408,7 +415,10 @@ fn select_stage(
         } else if stage == Stage::Prefill {
             "load_fallback"
         } else {
-            match (decode_tokens_known, context.decode_context.is_some()) {
+            // Report what the selector actually used, not whether a table merely
+            // existed: a table that failed the completeness filter above fell back
+            // to occupancy even though `context.decode_context` was `Some`.
+            match (decode_tokens_known, decode_prices_used) {
                 (true, true) => "context_tokens_marginal",
                 (true, false) => "context_tokens",
                 (false, _) => "occupancy_unknown_tokens",
@@ -2842,6 +2852,80 @@ mod admission_tests {
         let selection = select_pd_pair(&loads, &p, &d, &policy, &policy, &context, true).unwrap();
         assert_eq!(selection.prefill.worker_index, 0); // Token backlog outweighs warm residency.
         assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
+    }
+
+    #[test]
+    fn dp_rank_decode_prices_are_matched_by_worker_url() {
+        let p = pool("p", 1);
+        let d: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|rank| {
+                Arc::new(DPAwareWorker::new(
+                    "http://d:8000".to_string(),
+                    rank,
+                    2,
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        assert_eq!(d[0].base_url(), d[1].base_url());
+        assert_ne!(d[0].url(), d[1].url());
+
+        let mut loads = Loads::new();
+        loads.insert(
+            (Stage::Decode, PdEndpoint::for_worker(d[0].as_ref())),
+            PdLoadSample {
+                active_decode_tokens: 100,
+                ..Default::default()
+            },
+        );
+        loads.insert(
+            (Stage::Decode, PdEndpoint::for_worker(d[1].as_ref())),
+            PdLoadSample {
+                active_decode_tokens: 60,
+                ..Default::default()
+            },
+        );
+        let policy = KvAwarePolicy::default();
+
+        // Without prices the less occupied rank wins.
+        let baseline = select_pd_pair(&loads, &p, &d, &policy, &policy, &context(), true).unwrap();
+        assert_eq!(
+            baseline.decode.endpoint,
+            PdEndpoint::for_worker(d[1].as_ref())
+        );
+
+        // A fully cached prefix on @0 (0 new tokens) beats @1's 50-token gap.
+        // Both keys are `Worker::url()`; keying by `base_url()` would collapse
+        // the two ranks and leave the whole table unusable.
+        let prices = HashMap::from([
+            (d[0].url().to_owned(), 0u64),
+            (d[1].url().to_owned(), 50u64),
+        ]);
+        let priced = PdRequestContext {
+            decode_context: Some(&prices),
+            ..context()
+        };
+        let selection = select_pd_pair(&loads, &p, &d, &policy, &policy, &priced, true).unwrap();
+        assert_eq!(
+            selection.decode.endpoint,
+            PdEndpoint::for_worker(d[0].as_ref()),
+            "prefix credit on @0 must change the Decode choice"
+        );
+
+        // Missing one rank makes the table incomplete: the selector must ignore
+        // the price of the other rank and fall back to occupancy, where @1 wins.
+        let partial = HashMap::from([(d[0].url().to_owned(), 0u64)]);
+        let partial_context = PdRequestContext {
+            decode_context: Some(&partial),
+            ..context()
+        };
+        let fallback =
+            select_pd_pair(&loads, &p, &d, &policy, &policy, &partial_context, true).unwrap();
+        assert_eq!(
+            fallback.decode.endpoint,
+            PdEndpoint::for_worker(d[1].as_ref()),
+            "a price table missing one DP rank must not credit the others"
+        );
     }
 
     #[test]

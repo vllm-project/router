@@ -670,15 +670,13 @@ impl PdKvState {
                 }
             },
         );
-        // The index mixes the adapter name into the block hash, so hashing as the base
-        // model cannot match a cached LoRA prefix.
-        let lora_name = request
-            .get(crate::backend::preprocess::NAMED_LORA_FIELD)
-            .and_then(Value::as_str);
+        // One hash cache for the request, shared by both stages. Prefix credit
+        // requires an empty LoRA adapter: `http_cache_identity` refuses any
+        // other request, so both estimates hash the base model's blocks.
         let mut hashes = PromptHashes::new();
         let mut prepared = Self::build_prefill_inputs(request, &allow_credit, prefill_results);
         if let Some(kv) = kv_aware_ops(prefill_policy.as_ref()) {
-            Self::attach_prefill_work(kv, prefill_workers, &mut prepared, lora_name, &mut hashes);
+            Self::attach_prefill_work(kv, prefill_workers, &mut prepared, &mut hashes);
         }
         // One eligibility decision for both stages, so the two cannot diverge.
 
@@ -689,7 +687,6 @@ impl PdKvState {
                 decode_workers,
                 &allow_credit,
                 &decode_results,
-                lora_name,
                 &mut hashes,
             )
         } else {
@@ -766,7 +763,6 @@ impl PdKvState {
         kv: &dyn KvAwareOps,
         workers: &[Arc<dyn Worker>],
         prepared: &mut HashMap<String, PdPrefillInput>,
-        lora_name: Option<&str>,
         hashes: &mut PromptHashes,
     ) {
         let inputs: Vec<_> = workers
@@ -782,7 +778,7 @@ impl PdKvState {
             .collect();
         let work: Vec<_> = inputs
             .iter()
-            .zip(kv.estimate_prefill_work_with_lora(&inputs, lora_name, hashes))
+            .zip(kv.estimate_prefill_work(&inputs, hashes))
             .map(|((worker, _, _), estimate)| {
                 (worker.base_url().to_owned(), worker.dp_rank(), estimate)
             })
@@ -804,7 +800,6 @@ impl PdKvState {
         workers: &[Arc<dyn Worker>],
         allow_credit: &HashMap<String, bool>,
         results: &HashMap<String, Result<crate::backend::preprocess::HttpTokenInput, &'static str>>,
-        lora_name: Option<&str>,
         hashes: &mut PromptHashes,
     ) -> Option<HashMap<String, u64>> {
         let inputs: Vec<_> = workers
@@ -831,7 +826,7 @@ impl PdKvState {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unpriced");
             return None;
         }
-        let work = kv.estimate_decode_work_with_lora(&inputs, lora_name, hashes);
+        let work = kv.estimate_decode_work(&inputs, hashes);
         let mut context = HashMap::with_capacity(work.len());
         for ((worker, _, _), estimate) in inputs.iter().zip(work) {
             context.insert(worker.url().to_owned(), estimate.additional_tokens?);
@@ -859,9 +854,6 @@ impl PdKvState {
         // stands now, so this owns its cache. The admission path shares one cache across both
         // stages through `prepare_stages`.
         let hashes = &mut PromptHashes::new();
-        let lora_name = request
-            .get(crate::backend::preprocess::NAMED_LORA_FIELD)
-            .and_then(Value::as_str);
         let kv = kv_aware_ops(policy.as_ref())?;
         let allow_credit = self.credit_by_base(request).await;
         // A salted request must not be credited with unsalted blocks: the same rule
@@ -883,7 +875,7 @@ impl PdKvState {
         let results = self
             .tokenize(bases, request, route, headers, router_prompts)
             .await;
-        Self::decode_context_from_results(kv, workers, &allow_credit, &results, lora_name, hashes)
+        Self::decode_context_from_results(kv, workers, &allow_credit, &results, hashes)
     }
 
     /// `router_prompts` are the router's own token ids for `grpc://` pools;
@@ -941,10 +933,7 @@ impl PdKvState {
             .await;
         let mut prepared = Self::build_prefill_inputs(request, &allow_credit, results);
         if let Some(kv) = kv_aware_ops(policy.as_ref()) {
-            let lora_name = request
-                .get(crate::backend::preprocess::NAMED_LORA_FIELD)
-                .and_then(Value::as_str);
-            Self::attach_prefill_work(kv, workers, &mut prepared, lora_name, hashes);
+            Self::attach_prefill_work(kv, workers, &mut prepared, hashes);
         }
         metrics::histogram!("vllm_router_pd_kv_prepare_seconds")
             .record(started.elapsed().as_secs_f64());
