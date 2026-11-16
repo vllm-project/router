@@ -248,6 +248,8 @@ Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyon
 
 HTTP Completion uses the existing [Direct/Worker input preparation](http_completion_kv.md), without local tokenizer assets. Unmodeled identities and unqualified targets stay routable without cache credit.
 
+With `--kv-transfer-mode shadow` or `active`, `kv_aware` also plans peer KV fetches for colocated routing. See [KV transfer planning](kv_transfer.md).
+
 ```bash
 vllm-router --policy kv_aware \
   --worker-urls grpc://worker1:8000 grpc://worker2:8000

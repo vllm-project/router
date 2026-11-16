@@ -13,7 +13,7 @@ use rand::Rng;
 use sha2::{Digest as _, Sha256};
 
 use super::kv_transfer::{
-    PeerEndpoint, PeerFetchGrant, PeerFetchLimiter, TransferCapability, TransferOutcome,
+    PeerEndpoint, PeerFetchGrant, PeerFetchLimiter, PeerInput, TransferCapability, TransferOutcome,
     TransferPlan, TransferPlanner, TransferPlannerInput, TransferSkip,
 };
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
@@ -477,21 +477,17 @@ pub struct CostDecision {
 
 /// Result of an admitted KV-aware selection. Worker load is already reserved;
 /// the router owns its release together with the optional request slot.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct KvSelectionReceipt {
     pub worker_index: usize,
     pub new_prefill_tokens: u64,
     pub decision: CostDecision,
     pub slot: Option<KvRequestSlot>,
-    /// Shadow-mode transfer plan: what fetching the prefix from a busier peer
-    /// would have looked like. Reported only; routing and the slot charge are
-    /// unaffected. `None` when no planner is configured or no plan was made.
-    pub transfer: Option<TransferPlan>,
-    /// Active mode only: where the destination should fetch `transfer` from,
+    /// Active mode only: where the destination should fetch the transfer from,
     /// with the source's in-flight slot. `None` in shadow mode, when there is
     /// no plan, or when the plan could not be acted on (no source address, or
     /// the source is at its in-flight cap).
-    pub peer_fetch: Option<PeerFetchGrant>,
+    pub(crate) peer_fetch: Option<PeerFetchGrant>,
 }
 
 /// Fixed bound of the affinity table shared by every policy instance.
@@ -732,7 +728,14 @@ pub trait Picker: Send + Sync + std::fmt::Debug {
 /// Device prefix plus one external continuation, matching vLLM's two-segment
 /// reuse rule. The return value is in tokens and can be fractional because a
 /// transfer penalty is a credit ratio.
-fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
+///
+/// `extra_device_prefix` is a device prefix `[0, n)` counted on top of the
+/// candidate's own matches without materializing a match for it (0 = none).
+fn credited_tokens(
+    candidate: &CandidateView<'_>,
+    params: &CostParams,
+    extra_device_prefix: u32,
+) -> f64 {
     let device_blocks = candidate
         .matches
         .iter()
@@ -742,6 +745,7 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
         .map(|(_, end)| end)
         .max()
         .unwrap_or(0)
+        .max(extra_device_prefix)
         // vLLM must recompute the last prompt token to obtain logits. Local
         // GPU prefix reuse is block-aligned, so never credit its final block
         // when that block ends at the prompt boundary.
@@ -782,12 +786,24 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
 }
 
 pub(super) fn request_prefill_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> u64 {
+    request_prefill_tokens_with_device_prefix(candidate, params, 0)
+}
+
+/// [`request_prefill_tokens`] as if the candidate also held device blocks
+/// `[0, extra_device_prefix)`.
+pub(super) fn request_prefill_tokens_with_device_prefix(
+    candidate: &CandidateView<'_>,
+    params: &CostParams,
+    extra_device_prefix: u32,
+) -> u64 {
     if let Some(tokens) = candidate.prefill_tokens {
         return tokens;
     }
     // Round remaining work up: a fractional transfer credit never erases a
     // whole token of compute that was not fully credited.
-    ((candidate.input_tokens as f64 - credited_tokens(candidate, params)).max(0.0)).ceil() as u64
+    ((candidate.input_tokens as f64 - credited_tokens(candidate, params, extra_device_prefix))
+        .max(0.0))
+    .ceil() as u64
 }
 
 pub fn cost_components(candidate: &CandidateView<'_>, params: &CostParams) -> CostComponents {
@@ -959,14 +975,17 @@ pub struct KvAwarePolicy {
     affinity: Arc<KvAffinityTable>,
     /// Serializes load sampling, selection, and reservation.
     selection_lock: Mutex<()>,
+    /// Test-only: the plan of the latest successful selection.
+    #[cfg(test)]
+    last_transfer_plan: Mutex<Option<TransferPlan>>,
     /// Every registration gets a new generation, including load-only targets.
     next_generation: AtomicU64,
-    /// Opt-in shadow-mode transfer planner; `None` leaves selection untouched.
+    /// Opt-in transfer planner; `None` leaves selection untouched.
     transfer_planner: Option<Arc<dyn TransferPlanner>>,
     /// Declared transfer capabilities, keyed by worker URL.
     transfer_capabilities: DashMap<String, TransferCapability>,
     /// Peer fetch addresses reported by engines, keyed by worker URL. A
-    /// capability without an entry here is shadow-only.
+    /// capability without an entry here can be planned but not fetched.
     peer_endpoints: DashMap<String, PeerEndpoint>,
     /// Workers whose `transfer_capabilities` entry came from an engine record
     /// rather than static config. Only these are removed when re-discovery
@@ -1034,6 +1053,8 @@ impl KvAwarePolicy {
             decode_tie_cursor: AtomicU64::new(0),
             affinity: Arc::new(KvAffinityTable::new()),
             selection_lock: Mutex::new(()),
+            #[cfg(test)]
+            last_transfer_plan: Mutex::new(None),
             next_generation: AtomicU64::new(1),
             transfer_planner: None,
             transfer_capabilities: DashMap::new(),
@@ -1085,9 +1106,9 @@ impl KvAwarePolicy {
             .map_or(0, |state| state.limiter.inflight(source_url))
     }
 
-    /// Enable shadow-mode transfer planning. Plans are attached to receipts
+    /// Enable transfer planning. Plans are attached to receipts
     /// but never change routing.
-    pub fn with_transfer_planner(mut self, planner: Arc<dyn TransferPlanner>) -> Self {
+    pub(crate) fn with_transfer_planner(mut self, planner: Arc<dyn TransferPlanner>) -> Self {
         self.transfer_planner = Some(planner);
         self
     }
@@ -1098,8 +1119,9 @@ impl KvAwarePolicy {
         self.transfer_planner.is_some()
     }
 
-    /// Declare what a worker can do for KV transfer. Replaced on re-register
-    /// and dropped by `unregister_target`.
+    /// Declare what a worker can do for KV transfer. Replaced on re-register.
+    /// Survives `unregister_target`: only engine-reported capabilities are
+    /// dropped when a worker is removed.
     pub fn register_transfer_capability(
         &self,
         worker_url: impl Into<String>,
@@ -1160,8 +1182,8 @@ impl KvAwarePolicy {
     }
 
     /// Where `worker_url` accepts peer KV fetches, if its engine reported a
-    /// valid record. A capability without an address is shadow-only; active
-    /// mode must require this on the source.
+    /// valid record. A capability without an address can be planned but not
+    /// fetched; active mode requires this on the source.
     pub fn peer_endpoint(&self, worker_url: &str) -> Option<PeerEndpoint> {
         self.peer_endpoints
             .get(worker_url)
@@ -1217,8 +1239,11 @@ impl KvAwarePolicy {
 
     pub fn unregister_target(&self, worker_url: &str) {
         let _guard = self.selection_lock.lock();
-        self.transfer_capabilities.remove(worker_url);
-        self.engine_capabilities.remove(worker_url);
+        // Static capabilities are operator config and outlive the worker; only
+        // an engine-reported one is dropped with it.
+        if self.engine_capabilities.remove(worker_url).is_some() {
+            self.transfer_capabilities.remove(worker_url);
+        }
         self.peer_endpoints.remove(worker_url);
         if let Some((_, binding)) = self.targets.remove(worker_url) {
             if let Some(slot_manager) = &self.slot_manager {
@@ -1533,21 +1558,9 @@ impl KvAwarePolicy {
                 used_binding,
                 "KV prefix decision"
             );
-            let transfer = self.transfer_planner.as_deref().and_then(|planner| {
-                self.shadow_transfer_plan(
-                    planner,
-                    workers,
-                    &plan,
-                    &candidates,
-                    position,
-                    used_binding,
-                    &excluded,
-                )
-            });
-            let peer_fetch = transfer
-                .as_ref()
-                .and_then(|transfer| self.peer_fetch_grant(workers, &plan, transfer));
             // Reserve the actual target's slot and worker load before unlocking.
+            // This is all the routing state the selection changes, so it is the
+            // only work that must stay serialized with the pick above.
             let slot = self.slot_manager.as_ref().map(|manager| {
                 manager.begin_prefill(&target, new_prefill_tokens);
                 KvRequestSlot::new(manager.clone(), target, new_prefill_tokens, record.take())
@@ -1561,12 +1574,35 @@ impl KvAwarePolicy {
             if let Some(worker) = workers.get(worker_index) {
                 worker.increment_load();
             }
+            drop(guard);
+            // Planning and the grant read only the snapshot (`plan`,
+            // `candidates`) plus self-synchronized state (`DashMap`s, the
+            // limiter, an atomic id), so they run outside the lock. If the
+            // source unregisters in between, the grant finds no endpoint and
+            // the request goes out unchanged.
+            let transfer = self.transfer_planner.as_deref().and_then(|planner| {
+                self.plan_transfer_for_pick(
+                    planner,
+                    workers,
+                    &plan,
+                    &candidates,
+                    position,
+                    used_binding,
+                    &excluded,
+                )
+            });
+            #[cfg(test)]
+            {
+                *self.last_transfer_plan.lock() = transfer.clone();
+            }
+            let peer_fetch = transfer
+                .as_ref()
+                .and_then(|transfer| self.peer_fetch_grant(workers, &plan, transfer));
             return Some(KvSelectionReceipt {
                 worker_index,
                 new_prefill_tokens,
                 decision,
                 slot,
-                transfer,
                 peer_fetch,
             });
         }
@@ -1575,7 +1611,9 @@ impl KvAwarePolicy {
 
     /// Active mode: turn a plan into a fetch address and an in-flight slot.
     /// `None` (counted) when the source has no reported address or is at the
-    /// cap; `None` (not counted) in shadow mode. Caller holds `selection_lock`.
+    /// cap; `None` (not counted) in shadow mode. Does not need `selection_lock`: it
+    /// reads the selection snapshot, `peer_endpoints` and the limiter, which
+    /// synchronize themselves.
     fn peer_fetch_grant(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1586,15 +1624,23 @@ impl KvAwarePolicy {
             .peer_fetch
             .as_ref()
             .filter(|state| state.enabled.load(Ordering::Acquire))?;
+        // The HTTP send path cannot add fetch params for a gRPC destination,
+        // so a slot taken here would be held for nothing.
+        let worker_url_for = |target: &RoutableTarget| {
+            plan.bindings
+                .iter()
+                .position(|binding| &binding.target == target)
+                .and_then(|position| plan.healthy.get(position))
+                .and_then(|&index| workers.get(index))
+                .map(|worker| worker.url())
+        };
+        if worker_url_for(&transfer.destination).is_some_and(crate::backend::is_grpc_url) {
+            crate::metrics::RouterMetrics::record_kv_transfer_request("grpc_destination");
+            return None;
+        }
         // The plan names its source by target; peer addresses are keyed by
         // worker URL, so go through the same snapshot the plan was made from.
-        let source_url = plan
-            .bindings
-            .iter()
-            .position(|binding| binding.target == transfer.source)
-            .and_then(|position| plan.healthy.get(position))
-            .and_then(|&index| workers.get(index))
-            .map(|worker| worker.url());
+        let source_url = worker_url_for(&transfer.source);
         let Some((source_url, endpoint)) = source_url.and_then(|url| {
             self.peer_endpoints
                 .get(url)
@@ -1610,11 +1656,13 @@ impl KvAwarePolicy {
         Some(PeerFetchGrant { endpoint, permit })
     }
 
-    /// Ask the planner what a peer fetch would have looked like for the picked
-    /// position. Pure computation over the selection snapshot (the caller holds
-    /// `selection_lock`); records the outcome and never touches routing.
+    /// Ask the planner whether a peer fetch is worth it for the picked
+    /// position. Pure computation over the selection snapshot (needs no
+    /// `selection_lock`); records the outcome and never touches routing. In
+    /// shadow mode the plan is only reported; in active mode the caller turns it
+    /// into a fetch grant.
     #[allow(clippy::too_many_arguments)]
-    fn shadow_transfer_plan(
+    fn plan_transfer_for_pick(
         &self,
         planner: &dyn TransferPlanner,
         workers: &[Arc<dyn Worker>],
@@ -1630,34 +1678,29 @@ impl KvAwarePolicy {
             // Also covers the load-only fallback attempt.
             TransferOutcome::skip(TransferSkip::MissingTokens)
         } else {
-            let capabilities: Vec<Option<TransferCapability>> = plan
+            // Hold the map refs for the call instead of cloning each
+            // capability. DashMap shard locks admit new readers while a writer
+            // waits, so taking several refs cannot deadlock; a concurrent
+            // register or unregister just waits until planning returns.
+            let capabilities: Vec<
+                Option<dashmap::mapref::one::Ref<'_, String, TransferCapability>>,
+            > = plan
                 .healthy
                 .iter()
-                .map(|&index| {
-                    self.transfer_capabilities
-                        .get(workers[index].url())
-                        .map(|entry| entry.value().clone())
+                .map(|&index| self.transfer_capabilities.get(workers[index].url()))
+                .collect();
+            let peers: Vec<PeerInput<'_>> = candidates
+                .iter()
+                .enumerate()
+                .map(|(i, candidate)| PeerInput {
+                    candidate,
+                    cache_key: plan.bindings[i].cache_key.as_ref(),
+                    capability: capabilities[i].as_deref(),
+                    excluded: excluded(i),
                 })
                 .collect();
-            let capability_refs: Vec<Option<&TransferCapability>> =
-                capabilities.iter().map(Option::as_ref).collect();
-            let cache_keys: Vec<Option<&CacheKey>> = plan
-                .bindings
-                .iter()
-                .map(|binding| binding.cache_key.as_ref())
-                .collect();
-            let block_sizes: Vec<u32> = plan
-                .bindings
-                .iter()
-                .map(|binding| binding.block_size)
-                .collect();
-            let excluded: Vec<bool> = (0..candidates.len()).map(excluded).collect();
             planner.plan(&TransferPlannerInput {
-                candidates,
-                cache_keys: &cache_keys,
-                block_sizes: &block_sizes,
-                capabilities: &capability_refs,
-                excluded: &excluded,
+                peers: &peers,
                 picked: position,
                 destination_hits: plan.peer_hits[position].as_deref(),
                 cost_params: &self.params,
@@ -1685,13 +1728,13 @@ impl KvAwarePolicy {
                     source = %transfer.source.instance_id,
                     destination = %transfer.destination.instance_id,
                     credited_tokens = transfer.credited_tokens,
-                    "KV transfer plan (shadow)"
+                    "KV transfer plan"
                 );
                 Some(transfer)
             }
             Err(skip) => {
                 crate::metrics::RouterMetrics::record_kv_transfer_plan(skip.label());
-                tracing::debug!(skip = skip.label(), "KV transfer plan skipped (shadow)");
+                tracing::debug!(skip = skip.label(), "KV transfer plan skipped");
                 None
             }
         }
@@ -2354,6 +2397,14 @@ impl KvAwareOps for KvAwarePolicy {
     }
 }
 
+#[cfg(test)]
+impl KvAwarePolicy {
+    /// Plan of the latest successful selection (`None` when none was made).
+    fn last_transfer_plan(&self) -> Option<TransferPlan> {
+        self.last_transfer_plan.lock().clone()
+    }
+}
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
@@ -2764,7 +2815,7 @@ mod tests {
                 input_tokens: tokens,
             };
             assert_eq!(
-                credited_tokens(&candidate, &params),
+                credited_tokens(&candidate, &params, 0),
                 cached as f64,
                 "tokens={tokens}"
             );
@@ -4392,7 +4443,7 @@ mod tests {
             .collect()
     }
 
-    // Shadow-mode transfer planning ------------------------------------
+    // Transfer planning ------------------------------------
 
     struct FixedLoad(HashMap<RoutableTarget, LoadSample>);
     impl LoadProvider for FixedLoad {
@@ -4414,7 +4465,7 @@ mod tests {
             min_prefix_blocks: 4,
             require_capability: false,
             transfer_fixed_ms: 0.0,
-            ..Default::default()
+            ..crate::config::types::KvTransferConfig::default().transfer_policy()
         }
     }
 
@@ -4433,7 +4484,14 @@ mod tests {
     fn transfer_fixture(
         planner: bool,
     ) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>, Vec<RoutableTarget>) {
-        let workers: Vec<Arc<dyn Worker>> = ["http://a", "http://b"]
+        transfer_fixture_with_urls(planner, ["http://a", "http://b"])
+    }
+
+    fn transfer_fixture_with_urls(
+        planner: bool,
+        urls: [&str; 2],
+    ) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>, Vec<RoutableTarget>) {
+        let workers: Vec<Arc<dyn Worker>> = urls
             .iter()
             .map(|url| {
                 Arc::new(BasicWorker::new((*url).into(), WorkerType::Regular)) as Arc<dyn Worker>
@@ -4496,7 +4554,7 @@ mod tests {
             .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
             .unwrap();
         assert_eq!(receipt.worker_index, 1);
-        assert!(receipt.transfer.is_none());
+        assert!(policy.last_transfer_plan().is_none());
     }
 
     #[test]
@@ -4515,17 +4573,17 @@ mod tests {
         assert_eq!(receipt.worker_index, expected.worker_index);
         assert_eq!(receipt.new_prefill_tokens, expected.new_prefill_tokens);
         assert_eq!(receipt.decision, expected.decision);
-        let plan = receipt.transfer.as_ref().expect("shadow plan");
+        let plan = policy.last_transfer_plan().expect("plan");
         assert_eq!(plan.source, targets[0]);
         assert_eq!(plan.destination, targets[1]);
         assert_eq!(plan.blocks, (0, 16));
         assert_eq!(plan.credited_tokens, 32);
         assert_eq!(plan.plan_id, 1);
         release_receipt(&workers, &receipt);
-        let again = policy
+        let _again = policy
             .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
             .unwrap();
-        assert_eq!(again.transfer.unwrap().plan_id, 2);
+        assert_eq!(policy.last_transfer_plan().unwrap().plan_id, 2);
     }
 
     fn peer_endpoint(engine_id: &str, port: u16) -> PeerEndpoint {
@@ -4562,10 +4620,24 @@ mod tests {
     fn active_mode_grants_the_sources_address_for_a_plan() {
         let (policy, workers, _) = active_fixture(4);
         let receipt = select(&policy, &workers);
-        assert!(receipt.transfer.is_some());
+        assert!(policy.last_transfer_plan().is_some());
         let grant = receipt.peer_fetch.as_ref().expect("grant");
         assert_eq!(grant.endpoint, peer_endpoint("engine-a", 5600));
         assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
+    }
+
+    #[test]
+    fn grpc_destination_plans_but_takes_no_slot() {
+        let (policy, workers, _) = transfer_fixture_with_urls(true, ["http://a", "grpc://b"]);
+        let policy = policy.with_peer_fetch(4);
+        policy
+            .peer_endpoints
+            .insert("http://a".to_owned(), peer_endpoint("engine-a", 5600));
+        let receipt = select(&policy, &workers);
+        assert_eq!(receipt.worker_index, 1, "grpc worker is the destination");
+        assert!(policy.last_transfer_plan().is_some());
+        assert!(receipt.peer_fetch.is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
     }
 
     #[test]
@@ -4575,7 +4647,7 @@ mod tests {
             .peer_endpoints
             .insert("http://a".to_owned(), peer_endpoint("engine-a", 5600));
         let receipt = select(&policy, &workers);
-        assert!(receipt.transfer.is_some());
+        assert!(policy.last_transfer_plan().is_some());
         assert!(receipt.peer_fetch.is_none());
         assert!(!policy.peer_fetch_enabled());
         assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
@@ -4586,8 +4658,42 @@ mod tests {
         let (policy, workers, _) = active_fixture(4);
         policy.peer_endpoints.remove("http://a");
         let receipt = select(&policy, &workers);
-        assert!(receipt.transfer.is_some());
+        assert!(policy.last_transfer_plan().is_some());
         assert!(receipt.peer_fetch.is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+    }
+
+    /// Selection plans outside the lock, so the source can unregister between
+    /// the snapshot and the grant. Driving that interleaving deterministically
+    /// is impractical, so this calls the grant directly on a plan made earlier,
+    /// after the source was unregistered: no grant, no limiter slot.
+    #[test]
+    fn grant_without_a_source_endpoint_takes_no_slot() {
+        let (policy, workers, _) = active_fixture(4);
+        let ids = transfer_ids();
+        let first = select(&policy, &workers);
+        let transfer = policy.last_transfer_plan().expect("plan");
+        assert!(first.peer_fetch.is_some());
+        drop(first);
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+
+        let plan = policy
+            .prepare_selection(
+                &workers,
+                QualifiedKvInput {
+                    tokens: KvRequestTokens::Shared(Some(&ids)),
+                    eligibility: None,
+                },
+                None,
+                None,
+            )
+            .expect("snapshot");
+        // The source goes away after the snapshot was taken.
+        policy.unregister_target("http://a");
+
+        assert!(policy
+            .peer_fetch_grant(&workers, &plan, &transfer)
+            .is_none());
         assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
     }
 
@@ -4619,7 +4725,7 @@ mod tests {
 
         // Over the cap: still planned, but no grant.
         let second = select(&policy, &workers);
-        assert!(second.transfer.is_some());
+        assert!(policy.last_transfer_plan().is_some());
         assert!(second.peer_fetch.is_none());
         assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
 
@@ -4636,7 +4742,7 @@ mod tests {
 
         assert!(!policy.set_peer_fetch_enabled(false));
         let receipt = select(&policy, &workers);
-        assert!(receipt.transfer.is_some(), "shadow planning continues");
+        assert!(policy.last_transfer_plan().is_some(), "planning continues");
         assert!(receipt.peer_fetch.is_none());
         assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
 
@@ -4732,7 +4838,11 @@ mod tests {
     fn per_worker_transfer(
         a_prompt: Vec<u32>,
         b_prompt: Option<Vec<u32>>,
-    ) -> (KvSelectionReceipt, Vec<RoutableTarget>) {
+    ) -> (
+        KvSelectionReceipt,
+        Vec<RoutableTarget>,
+        Option<TransferPlan>,
+    ) {
         let (policy, workers, targets) = per_worker_transfer_fixture(&a_prompt);
         let mut inputs = WorkerTokenInputs::new();
         inputs.insert(workers[0].base_url().into(), Arc::from(vec![a_prompt]));
@@ -4749,36 +4859,36 @@ mod tests {
                 &[],
             )
             .unwrap();
-        (receipt, targets)
+        (receipt, targets, policy.last_transfer_plan())
     }
 
     #[test]
     fn per_worker_plan_credits_only_the_shared_part_of_the_destination_prompt() {
         // `a` caches its whole 20-block prompt; `b`'s prompt shares 6 blocks.
-        let (receipt, targets) = per_worker_transfer(transfer_ids(), Some(diverging_ids(12)));
+        let (receipt, targets, plan) = per_worker_transfer(transfer_ids(), Some(diverging_ids(12)));
         assert_eq!(receipt.worker_index, 1);
-        let plan = receipt.transfer.as_ref().expect("shared part is planned");
+        let plan = plan.expect("shared part is planned");
         assert_eq!(plan.source, targets[0]);
         assert_eq!(plan.destination, targets[1]);
         assert_eq!(plan.blocks, (0, 6));
         assert_eq!(plan.credited_tokens, 12);
 
         // Only 3 shared blocks: below `min_prefix_blocks`, so no plan.
-        let (receipt, _) = per_worker_transfer(transfer_ids(), Some(diverging_ids(6)));
+        let (receipt, _, plan) = per_worker_transfer(transfer_ids(), Some(diverging_ids(6)));
         assert_eq!(receipt.worker_index, 1);
-        assert!(receipt.transfer.is_none());
+        assert!(plan.is_none());
 
         // Fully disjoint prompts: nothing to fetch.
-        let (receipt, _) = per_worker_transfer(transfer_ids(), Some(diverging_ids(0)));
+        let (receipt, _, plan) = per_worker_transfer(transfer_ids(), Some(diverging_ids(0)));
         assert_eq!(receipt.worker_index, 1);
-        assert!(receipt.transfer.is_none());
+        assert!(plan.is_none());
     }
 
     #[test]
     fn per_worker_identical_prompts_plan_like_shared_tokens() {
-        let (receipt, targets) = per_worker_transfer(transfer_ids(), Some(transfer_ids()));
+        let (receipt, targets, plan) = per_worker_transfer(transfer_ids(), Some(transfer_ids()));
         assert_eq!(receipt.worker_index, 1);
-        let plan = receipt.transfer.as_ref().expect("plan");
+        let plan = plan.expect("plan");
         assert_eq!(plan.source, targets[0]);
         assert_eq!(plan.blocks, (0, 20));
         assert_eq!(plan.credited_tokens, 39);
@@ -4786,9 +4896,9 @@ mod tests {
 
     #[test]
     fn per_worker_destination_without_a_prompt_gets_no_plan() {
-        let (receipt, _) = per_worker_transfer(transfer_ids(), None);
+        let (receipt, _, plan) = per_worker_transfer(transfer_ids(), None);
         assert_eq!(receipt.worker_index, 1);
-        assert!(receipt.transfer.is_none());
+        assert!(plan.is_none());
     }
 
     #[test]
@@ -4804,7 +4914,7 @@ mod tests {
         let receipt = policy
             .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
             .unwrap();
-        assert!(receipt.transfer.is_none());
+        assert!(policy.last_transfer_plan().is_none());
         release_receipt(&workers, &receipt);
 
         policy.register_transfer_capability("http://a", capability("x"));
@@ -4812,19 +4922,61 @@ mod tests {
         let receipt = policy
             .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
             .unwrap();
-        assert!(receipt.transfer.is_some());
+        assert!(policy.last_transfer_plan().is_some());
         release_receipt(&workers, &receipt);
 
         policy.register_transfer_capability("http://b", capability("y"));
         let receipt = policy
             .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
             .unwrap();
-        assert!(receipt.transfer.is_none());
+        assert!(policy.last_transfer_plan().is_none());
         release_receipt(&workers, &receipt);
+
+        // Static capabilities are operator config and survive unregister.
+        policy.unregister_target("http://a");
+        assert!(policy.transfer_capabilities.get("http://a").is_some());
+        assert!(policy.transfer_capabilities.get("http://b").is_some());
+    }
+
+    #[test]
+    fn static_capability_survives_unregister_and_reregister() {
+        let policy = KvAwarePolicy::default();
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://a".into(), WorkerType::Regular));
+        KvAwareOps::register_worker(&policy, worker.as_ref(), None, None);
+        policy.register_transfer_capability("http://a", capability("static"));
+
+        policy.unregister_target("http://a");
+        assert_eq!(
+            &*policy
+                .transfer_capabilities
+                .get("http://a")
+                .unwrap()
+                .layout_fingerprint,
+            "static"
+        );
+
+        KvAwareOps::register_worker(&policy, worker.as_ref(), None, None);
+        assert!(policy.transfer_capabilities.get("http://a").is_some());
+        assert!(policy.engine_capabilities.is_empty());
+    }
+
+    #[test]
+    fn engine_capability_is_removed_on_unregister() {
+        let policy = KvAwarePolicy::default();
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://a".into(), WorkerType::Regular));
+        KvAwareOps::register_worker(
+            &policy,
+            worker.as_ref(),
+            Some(&peer_info(&[(0, peer_record("engine", 5600))])),
+            None,
+        );
+        assert!(policy.transfer_capabilities.get("http://a").is_some());
 
         policy.unregister_target("http://a");
         assert!(policy.transfer_capabilities.get("http://a").is_none());
-        assert!(policy.transfer_capabilities.get("http://b").is_some());
+        assert!(policy.engine_capabilities.is_empty());
     }
 
     #[test]
@@ -4835,19 +4987,19 @@ mod tests {
         let first = policy
             .select_worker_with_receipt(&workers, Some(&ids), None, None, Some(&key), &[])
             .unwrap();
-        assert!(first.transfer.is_some());
+        assert!(policy.last_transfer_plan().is_some());
         release_receipt(&workers, &first);
         let second = policy
             .select_worker_with_receipt(&workers, Some(&ids), None, None, Some(&key), &[])
             .unwrap();
         assert_eq!(second.worker_index, first.worker_index);
-        assert!(second.transfer.is_none());
+        assert!(policy.last_transfer_plan().is_none());
         release_receipt(&workers, &second);
 
         let load_only = policy
             .select_worker_with_receipt(&workers, None, None, None, None, &[])
             .unwrap();
-        assert!(load_only.transfer.is_none());
+        assert!(policy.last_transfer_plan().is_none());
         release_receipt(&workers, &load_only);
     }
 
@@ -4952,7 +5104,7 @@ mod tests {
                     receipt.worker_index,
                     receipt.new_prefill_tokens,
                     receipt.decision.clone(),
-                    receipt.transfer.is_some(),
+                    policy.last_transfer_plan().is_some(),
                 ));
                 release_receipt(&workers, &receipt);
             }

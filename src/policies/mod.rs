@@ -36,11 +36,10 @@ pub use kv_aware::{
     MultiplicativeScorer, Picker, PrefillWorkEstimate, Scorer, SelectionError, SlotManager,
     StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits, WorkerTokenInputs,
 };
-pub use kv_transfer::{
-    plan_transfer, CostEstimate, CostRuleTransferPlanner, PeerEndpoint, PeerFetchGrant,
-    PeerFetchLimiter, PeerFetchPermit, TransferCapability, TransferOutcome, TransferPlan,
-    TransferPlanner, TransferPlannerInput, TransferPolicy, TransferSkip,
-};
+#[cfg(test)]
+pub(crate) use kv_transfer::PeerFetchLimiter;
+pub(crate) use kv_transfer::{CostRuleTransferPlanner, PeerFetchPermit};
+pub use kv_transfer::{PeerEndpoint, TransferCapability, TransferPolicy};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;

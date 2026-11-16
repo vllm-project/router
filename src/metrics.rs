@@ -85,20 +85,21 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "vllm_router_kv_transfer_plans_total",
-        "Shadow-mode KV transfer planner outcomes (planned or the reason no plan was made)"
+        "KV transfer planner outcomes (planned or the reason no plan was made)"
     );
     describe_counter!(
         "vllm_router_kv_transfer_requests_total",
         "Active-mode KV transfer requests: sent with peer fetch params, or why not \
-         (no_peer_endpoint, inflight_cap, client_params_present, invalid_body)"
+         (no_peer_endpoint, inflight_cap, grpc_destination, client_params_present, \
+         invalid_body)"
     );
     describe_histogram!(
         "vllm_router_kv_transfer_estimated_saved_ms",
-        "Shadow-mode estimated prefill milliseconds saved by a planned KV transfer"
+        "Estimated prefill milliseconds saved by a planned KV transfer"
     );
     describe_histogram!(
         "vllm_router_kv_transfer_estimated_cost_ms",
-        "Shadow-mode estimated milliseconds of the fetch and wait paths when the transfer cost rule was evaluated"
+        "Estimated milliseconds of the fetch and wait paths when the transfer cost rule was evaluated"
     );
     describe_counter!(
         "vllm_router_policy_decisions_total",

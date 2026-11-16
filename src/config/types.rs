@@ -1085,9 +1085,10 @@ pub enum KvTransferMode {
     Active,
 }
 
-/// Settings for the KV transfer planner. Defaults equal `TransferPolicy::default()`
-/// (apart from `enabled`, which is derived from `mode`, and `require_capability`,
-/// which is `false` here so shadow measurement works without declared capabilities).
+/// Settings for the KV transfer planner. `transfer_policy()` is the only way to
+/// build a `TransferPolicy`: `enabled` is derived from `mode`, and
+/// `require_capability` defaults to `false` so shadow measurement works without
+/// declared capabilities.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct KvTransferConfig {
@@ -2525,26 +2526,18 @@ mod tests {
         let defaults: KvTransferConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(defaults, KvTransferConfig::default());
         assert_eq!(defaults.mode, KvTransferMode::Off);
-        let derived = defaults.transfer_policy();
-        let reference = TransferPolicy::default();
-        assert!(!derived.enabled);
         assert_eq!(
-            (
-                derived.min_prefix_blocks,
-                derived.source_load_threshold,
-                derived.prefill_us_per_token,
-                derived.transfer_fixed_ms,
-                derived.transfer_us_per_token,
-                derived.margin
-            ),
-            (
-                reference.min_prefix_blocks,
-                reference.source_load_threshold,
-                reference.prefill_us_per_token,
-                reference.transfer_fixed_ms,
-                reference.transfer_us_per_token,
-                reference.margin
-            )
+            defaults.transfer_policy(),
+            TransferPolicy {
+                enabled: false,
+                min_prefix_blocks: 64,
+                source_load_threshold: 1,
+                require_capability: false,
+                prefill_us_per_token: 50.0,
+                transfer_fixed_ms: 5.0,
+                transfer_us_per_token: 5.0,
+                margin: 0.8,
+            }
         );
 
         let json = r#"{"type":"kv_aware","kv_transfer":{"mode":"shadow","min_prefix_blocks":8,

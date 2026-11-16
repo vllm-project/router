@@ -79,7 +79,7 @@ impl PolicyFactory {
         }
     }
 
-    /// Install the shadow transfer planner and static capabilities when the
+    /// Install the transfer planner and static capabilities when the
     /// config asks for it. Shared by the factory and the registry. With no
     /// block or `mode: off` the policy is returned untouched.
     pub(crate) fn apply_kv_transfer(

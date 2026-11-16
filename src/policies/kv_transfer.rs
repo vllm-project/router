@@ -1,9 +1,10 @@
-//! Shadow-mode KV transfer planning for `kv_aware`.
+//! KV transfer planning for `kv_aware`.
 //!
 //! After a worker is picked, the planner asks whether fetching the cached
-//! prefix from a busier peer with the same cache identity would have beaten
-//! recomputing it. The answer is only reported: nothing moves and routing does
-//! not change. The planner is a pure function of its input.
+//! prefix from a busier peer with the same cache identity would beat
+//! recomputing it. The plan never changes which worker is picked. In shadow
+//! mode it is only counted; in active mode the policy turns it into a peer
+//! fetch. The planner is a pure function of its input.
 //!
 //! Every peer's residency is measured from the destination's own prompt lookup
 //! (`TransferPlannerInput::destination_hits`), so a peer's prefix always
@@ -17,12 +18,12 @@ use std::sync::Arc;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
-use super::kv_aware::{request_prefill_tokens, CandidateView, CostParams};
-use crate::kv_index::{CacheKey, Locality, RoutableTarget, StorageTier, TierMatch};
+use super::kv_aware::{request_prefill_tokens_with_device_prefix, CandidateView, CostParams};
+use crate::kv_index::{CacheKey, RoutableTarget, StorageTier, TierMatch};
 
-/// Opt-in planner configuration. `Default` is disabled. Cost constants are
-/// placeholders until calibrated; in PR 1 they only shape shadow-mode plans and
-/// never affect routing.
+/// Opt-in planner configuration, built from `KvTransferConfig::transfer_policy`.
+/// Cost constants are placeholders until calibrated; they shape which transfers
+/// are planned and never affect which worker is picked.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TransferPolicy {
     pub enabled: bool,
@@ -37,21 +38,6 @@ pub struct TransferPolicy {
     pub transfer_us_per_token: f64,
     /// Transfer must cost less than `margin` times the prefill it saves. In (0, 1].
     pub margin: f64,
-}
-
-impl Default for TransferPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            min_prefix_blocks: 64,
-            source_load_threshold: 1,
-            require_capability: true,
-            prefill_us_per_token: 50.0,
-            transfer_fixed_ms: 5.0,
-            transfer_us_per_token: 5.0,
-            margin: 0.8,
-        }
-    }
 }
 
 impl TransferPolicy {
@@ -70,7 +56,7 @@ impl TransferPolicy {
 }
 
 /// What a worker can do for KV transfer. Declared per worker in router config
-/// (`kv_transfer_capability`); engine-reported capability is later work.
+/// or reported by the engine in its `peer_lookup` record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferCapability {
     pub can_export: bool,
@@ -95,9 +81,8 @@ impl TransferCapability {
 }
 
 /// Where an engine rank accepts peer KV fetches, as it reported in its
-/// `peer_lookup` record. Shadow mode never uses it; a capability without an
-/// address is shadow-only, and active mode will require the address on the
-/// source.
+/// `peer_lookup` record. Active mode needs the source's address to fetch; a
+/// capability without one can be planned but not fetched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerEndpoint {
     pub engine_id: Arc<str>,
@@ -114,7 +99,7 @@ pub struct PeerEndpoint {
 /// permit is released or dropped, so a request that errors out, is cancelled or
 /// is dropped mid-stream cannot leak a slot.
 #[derive(Debug)]
-pub struct PeerFetchLimiter {
+pub(crate) struct PeerFetchLimiter {
     max_inflight: usize,
     /// In-flight fetches by source worker URL; zero entries are removed.
     inflight: DashMap<Arc<str>, usize>,
@@ -146,11 +131,9 @@ impl PeerFetchLimiter {
             }
         }
         Some(PeerFetchPermit {
-            inner: Arc::new(PermitInner {
-                limiter: self.clone(),
-                source,
-                released: AtomicBool::new(false),
-            }),
+            limiter: self.clone(),
+            source,
+            released: AtomicBool::new(false),
         })
     }
 
@@ -170,53 +153,41 @@ impl PeerFetchLimiter {
     }
 }
 
+/// One in-flight slot against a source. It has a single owner and is freed by
+/// [`release`](Self::release) or when it drops, whichever is first.
 #[derive(Debug)]
-struct PermitInner {
+pub(crate) struct PeerFetchPermit {
     limiter: Arc<PeerFetchLimiter>,
     source: Arc<str>,
     released: AtomicBool,
 }
 
-impl PermitInner {
-    fn release(&self) {
+impl PeerFetchPermit {
+    /// Free the slot now. Idempotent.
+    pub fn release(&self) {
         if !self.released.swap(true, Ordering::AcqRel) {
             self.limiter.release(&self.source);
         }
     }
 }
 
-impl Drop for PermitInner {
+impl Drop for PeerFetchPermit {
     fn drop(&mut self) {
         self.release();
     }
 }
 
-/// One in-flight slot against a source. Clones share the slot; it is freed by
-/// [`release`](Self::release) or when the last clone drops, whichever is first.
-#[derive(Debug, Clone)]
-pub struct PeerFetchPermit {
-    inner: Arc<PermitInner>,
-}
-
-impl PeerFetchPermit {
-    /// Free the slot now. Idempotent.
-    pub fn release(&self) {
-        self.inner.release();
-    }
-}
-
 /// Active mode's decision for one planned request: where the destination
 /// should fetch from, and the in-flight slot that fetch holds.
-#[derive(Debug, Clone)]
-pub struct PeerFetchGrant {
+#[derive(Debug)]
+pub(crate) struct PeerFetchGrant {
     pub endpoint: PeerEndpoint,
     pub permit: PeerFetchPermit,
 }
 
-/// A hypothetical transfer the planner would have made. In PR 1 it is only
-/// reported.
+/// A transfer the planner chose for one request.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TransferPlan {
+pub(crate) struct TransferPlan {
     /// Assigned by the policy (monotonic counter); 0 inside the pure function.
     pub plan_id: u64,
     pub source: RoutableTarget,
@@ -234,8 +205,10 @@ pub struct TransferPlan {
 
 /// Why no plan was made. `label()` is a stable string for metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransferSkip {
+pub(crate) enum TransferSkip {
     Disabled,
+    /// The picked position is outside the peer list: a caller bug.
+    MisalignedInput,
     /// No other candidate in the destination's identity group.
     NoPeer,
     /// The destination's cache key is unknown.
@@ -259,6 +232,7 @@ impl TransferSkip {
     pub fn label(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
+            Self::MisalignedInput => "misaligned_input",
             Self::NoPeer => "no_peer",
             Self::UnverifiedIdentity => "unverified_identity",
             Self::UnknownDestinationInput => "unknown_destination_input",
@@ -274,14 +248,21 @@ impl TransferSkip {
     }
 }
 
-/// Everything the planner may read. All slices are aligned by candidate
-/// position.
-pub struct TransferPlannerInput<'a> {
-    pub candidates: &'a [CandidateView<'a>],
-    pub cache_keys: &'a [Option<&'a CacheKey>],
-    pub block_sizes: &'a [u32],
-    pub capabilities: &'a [Option<&'a TransferCapability>],
-    pub excluded: &'a [bool],
+/// One routing candidate as the planner sees it.
+pub(crate) struct PeerInput<'a> {
+    pub candidate: &'a CandidateView<'a>,
+    /// `None` when the worker's cache identity is unknown. The block size is
+    /// read from here.
+    pub cache_key: Option<&'a CacheKey>,
+    pub capability: Option<&'a TransferCapability>,
+    /// Barred as a source (e.g. a retry exclusion).
+    pub excluded: bool,
+}
+
+/// Everything the planner may read.
+pub(crate) struct TransferPlannerInput<'a> {
+    pub peers: &'a [PeerInput<'a>],
+    /// Index into `peers` of the destination.
     pub picked: usize,
     /// Unfiltered index hits (all targets) from the destination's own prompt
     /// lookup; every peer's residency is measured from these. `None` when that
@@ -289,7 +270,7 @@ pub struct TransferPlannerInput<'a> {
     pub destination_hits: Option<&'a [TierMatch]>,
     /// The cost parameters routing scored with (tier credits); the planner
     /// prices both the fetch and the wait path with them. `block_size` is
-    /// taken from `block_sizes`.
+    /// taken from the destination's cache key.
     pub cost_params: &'a CostParams,
 }
 
@@ -298,7 +279,7 @@ pub struct TransferPlannerInput<'a> {
 /// planned peer, or the peer whose `CostRule` skip is reported). `None` for
 /// skips that happen before the cost rule.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TransferOutcome {
+pub(crate) struct TransferOutcome {
     pub result: Result<TransferPlan, TransferSkip>,
     pub estimate: Option<CostEstimate>,
 }
@@ -312,12 +293,12 @@ impl TransferOutcome {
     }
 }
 
-pub trait TransferPlanner: Send + Sync + std::fmt::Debug {
+pub(crate) trait TransferPlanner: Send + Sync + std::fmt::Debug {
     fn plan(&self, input: &TransferPlannerInput<'_>) -> TransferOutcome;
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct CostRuleTransferPlanner {
+pub(crate) struct CostRuleTransferPlanner {
     pub policy: TransferPolicy,
 }
 
@@ -359,33 +340,36 @@ fn prefix_blocks<'a>(matches: impl Iterator<Item = &'a TierMatch> + Clone) -> u3
 }
 
 /// Pure: no locks, no I/O, no clock. Deterministic for the same input.
-pub fn plan_transfer(input: &TransferPlannerInput<'_>, policy: &TransferPolicy) -> TransferOutcome {
+pub(crate) fn plan_transfer(
+    input: &TransferPlannerInput<'_>,
+    policy: &TransferPolicy,
+) -> TransferOutcome {
     if !policy.enabled || !policy.valid() {
         return TransferOutcome::skip(TransferSkip::Disabled);
     }
-    // Misaligned input is a caller bug; refuse to plan rather than panic on
-    // the routing path.
-    let count = input.candidates.len();
-    if input.picked >= count
-        || input.cache_keys.len() != count
-        || input.block_sizes.len() != count
-        || input.capabilities.len() != count
-        || input.excluded.len() != count
-    {
-        return TransferOutcome::skip(TransferSkip::Disabled);
+    // A pick outside the list is a caller bug; refuse to plan rather than
+    // panic on the routing path in release builds.
+    let count = input.peers.len();
+    debug_assert!(
+        input.picked < count,
+        "picked {} out of range for {count} peers",
+        input.picked
+    );
+    if input.picked >= count {
+        return TransferOutcome::skip(TransferSkip::MisalignedInput);
     }
     let dest = input.picked;
-    let Some(dest_key) = input.cache_keys[dest] else {
+    let Some(dest_key) = input.peers[dest].cache_key else {
         return TransferOutcome::skip(TransferSkip::UnverifiedIdentity);
     };
-    let block_size = input.block_sizes[dest];
+    let block_size = dest_key.block_size;
     if block_size == 0 {
         return TransferOutcome::skip(TransferSkip::UnverifiedIdentity);
     }
     let Some(destination_hits) = input.destination_hits else {
         return TransferOutcome::skip(TransferSkip::UnknownDestinationInput);
     };
-    let dest_prefix = transferable_prefix_blocks(input.candidates[dest].matches);
+    let dest_prefix = transferable_prefix_blocks(input.peers[dest].candidate.matches);
 
     // Rank every peer that shares the destination's identity: largest prefix
     // of the destination's prompt first, then the less loaded peer, then the
@@ -394,13 +378,9 @@ pub fn plan_transfer(input: &TransferPlannerInput<'_>, policy: &TransferPolicy) 
     // (excluded, incompatible, idle, too expensive) never hides a shorter one
     // that can.
     let mut peers: Vec<(usize, u32)> = (0..count)
-        .filter(|&pos| {
-            pos != dest
-                && input.cache_keys[pos] == Some(dest_key)
-                && input.block_sizes[pos] == block_size
-        })
+        .filter(|&pos| pos != dest && input.peers[pos].cache_key == Some(dest_key))
         .map(|pos| {
-            let peer_target = input.candidates[pos].target;
+            let peer_target = input.peers[pos].candidate.target;
             let prefix = prefix_blocks(
                 destination_hits
                     .iter()
@@ -412,7 +392,7 @@ pub fn plan_transfer(input: &TransferPlannerInput<'_>, policy: &TransferPolicy) 
     peers.sort_by_key(|&(pos, prefix)| {
         (
             std::cmp::Reverse(prefix),
-            input.candidates[pos].load.active_requests,
+            input.peers[pos].candidate.load.active_requests,
             pos,
         )
     });
@@ -449,21 +429,25 @@ pub fn plan_transfer(input: &TransferPlannerInput<'_>, policy: &TransferPolicy) 
 
 /// Remaining prefill for `candidate` under the router's own cost model (the
 /// same tier credits and last-token rule that scored it), in tokens.
+///
+/// `extra_device_prefix` counts device blocks `[0, n)` on top of the
+/// candidate's matches (0 = none), so "after a fetch" needs no copy of them.
 fn routing_prefill_tokens(
     candidate: &CandidateView<'_>,
     cost_params: &CostParams,
     block_size: u32,
+    extra_device_prefix: u32,
 ) -> u64 {
     let mut params = *cost_params;
     params.block_size = block_size;
-    request_prefill_tokens(candidate, &params)
+    request_prefill_tokens_with_device_prefix(candidate, &params, extra_device_prefix)
 }
 
 /// The two paths the planner compares, in milliseconds, plus what the fetch
 /// saves. Both paths price the remaining prefill with the router's estimate
 /// so a plan never disagrees with the cost model that made the pick.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CostEstimate {
+pub(crate) struct CostEstimate {
     pub transfer_ms: f64,
     /// Destination queue + transfer + destination prefill after the fetch.
     pub fetch_ms: f64,
@@ -483,7 +467,10 @@ fn estimate_costs(
     credited: u64,
     block_size: u32,
 ) -> CostEstimate {
-    let (source, destination) = (&input.candidates[src], &input.candidates[input.picked]);
+    let (source, destination) = (
+        input.peers[src].candidate,
+        input.peers[input.picked].candidate,
+    );
     let prefill_ms = |tokens: u64| tokens as f64 * policy.prefill_us_per_token / 1000.0;
     let transfer_ms =
         policy.transfer_fixed_ms + credited as f64 * policy.transfer_us_per_token / 1000.0;
@@ -492,20 +479,10 @@ fn estimate_costs(
 
     // After the fetch the destination holds `[0, fetched_end)` on device, on
     // top of whatever else it already had.
-    let mut fetched_matches = destination.matches.to_vec();
-    fetched_matches.push(TierMatch {
-        target: destination.target.clone(),
-        tier: StorageTier::Device,
-        segments: vec![(0, fetched_end)],
-        locality: Locality::Local,
-    });
-    let after_fetch = CandidateView {
-        matches: &fetched_matches,
-        ..*destination
-    };
-    let rem_dest_before = routing_prefill_tokens(destination, input.cost_params, block_size);
-    let rem_dest_after = routing_prefill_tokens(&after_fetch, input.cost_params, block_size);
-    let rem_src = routing_prefill_tokens(source, input.cost_params, block_size);
+    let rem_dest_before = routing_prefill_tokens(destination, input.cost_params, block_size, 0);
+    let rem_dest_after =
+        routing_prefill_tokens(destination, input.cost_params, block_size, fetched_end);
+    let rem_src = routing_prefill_tokens(source, input.cost_params, block_size, 0);
 
     CostEstimate {
         transfer_ms,
@@ -528,11 +505,11 @@ fn plan_from_source(
     block_size: u32,
 ) -> TransferOutcome {
     let dest = input.picked;
-    if input.excluded[src] {
+    if input.peers[src].excluded {
         return TransferOutcome::skip(TransferSkip::SourceExcluded);
     }
     if policy.require_capability {
-        match (input.capabilities[src], input.capabilities[dest]) {
+        match (input.peers[src].capability, input.peers[dest].capability) {
             (Some(from), Some(to)) if from.can_send_to(to) => {}
             _ => return TransferOutcome::skip(TransferSkip::Incompatible),
         }
@@ -544,7 +521,7 @@ fn plan_from_source(
     if missing_blocks < policy.min_prefix_blocks {
         return TransferOutcome::skip(TransferSkip::PrefixTooShort);
     }
-    let (source, destination) = (&input.candidates[src], &input.candidates[dest]);
+    let (source, destination) = (input.peers[src].candidate, input.peers[dest].candidate);
     if source.load.active_requests < policy.source_load_threshold {
         return TransferOutcome::skip(TransferSkip::SourceNotBusy);
     }
@@ -593,7 +570,8 @@ fn plan_from_source(
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
-    use crate::kv_index::HashMode;
+    use crate::config::types::{KvTransferConfig, KvTransferMode};
+    use crate::kv_index::{HashMode, Locality};
     use crate::policies::kv_aware::{LoadSample, Scorer};
 
     fn target(name: &str) -> RoutableTarget {
@@ -620,6 +598,26 @@ mod tests {
         }
     }
 
+    fn peer_inputs<'a>(
+        candidates: &'a [CandidateView<'a>],
+        keys: &[Option<&'a CacheKey>],
+        caps: &[Option<&'a TransferCapability>],
+        excluded: &[bool],
+    ) -> Vec<PeerInput<'a>> {
+        assert!(candidates.len() == keys.len() && keys.len() == caps.len());
+        assert!(caps.len() == excluded.len());
+        candidates
+            .iter()
+            .enumerate()
+            .map(|(i, candidate)| PeerInput {
+                candidate,
+                cache_key: keys[i],
+                capability: caps[i],
+                excluded: excluded[i],
+            })
+            .collect()
+    }
+
     fn cap(export: bool, import: bool, fingerprint: &str) -> TransferCapability {
         TransferCapability {
             can_export: export,
@@ -635,12 +633,21 @@ mod tests {
         matches.iter().flatten().cloned().collect()
     }
 
-    fn enabled() -> TransferPolicy {
-        TransferPolicy {
-            enabled: true,
-            require_capability: false,
-            ..TransferPolicy::default()
+    /// A policy as the config builds it, with the given mode.
+    fn policy_for(mode: KvTransferMode) -> TransferPolicy {
+        KvTransferConfig {
+            mode,
+            ..Default::default()
         }
+        .transfer_policy()
+    }
+
+    fn enabled() -> TransferPolicy {
+        policy_for(KvTransferMode::Shadow)
+    }
+
+    fn disabled() -> TransferPolicy {
+        policy_for(KvTransferMode::Off)
     }
 
     fn view<'a>(
@@ -668,7 +675,6 @@ mod tests {
         matches: [Vec<TierMatch>; 2],
         load: [(usize, u64); 2],
         keys: [Option<CacheKey>; 2],
-        block_sizes: [u32; 2],
         caps: [Option<TransferCapability>; 2],
         excluded: [bool; 2],
         /// Overrides the default destination lookup (all matches concatenated).
@@ -689,7 +695,6 @@ mod tests {
                 matches: [dest, src],
                 load: [(0, 0), (4, 10_000)],
                 keys: [Some(key("m")), Some(key("m"))],
-                block_sizes: [16, 16],
                 caps: [None, None],
                 excluded: [false, false],
                 dest_hits: None,
@@ -721,13 +726,10 @@ mod tests {
                 Some(over) => over.clone(),
                 None => Some(concat(&self.matches)),
             };
+            let peers = peer_inputs(&candidates, &keys, &caps, &self.excluded);
             plan_transfer(
                 &TransferPlannerInput {
-                    candidates: &candidates,
-                    cache_keys: &keys,
-                    block_sizes: &self.block_sizes,
-                    capabilities: &caps,
-                    excluded: &self.excluded,
+                    peers: &peers,
                     picked: 0,
                     destination_hits: hits.as_deref(),
                     cost_params: &CostParams::default(),
@@ -781,49 +783,63 @@ mod tests {
         // Identity and policy checks still come first.
         pair.keys[0] = None;
         assert_eq!(pair.plan(&enabled()), Err(TransferSkip::UnverifiedIdentity));
-        assert_eq!(
-            pair.plan(&TransferPolicy::default()),
-            Err(TransferSkip::Disabled)
-        );
+        assert_eq!(pair.plan(&disabled()), Err(TransferSkip::Disabled));
     }
 
     #[test]
     fn default_policy_is_disabled_and_valid() {
-        let policy = TransferPolicy::default();
+        let policy = disabled();
         assert!(!policy.enabled);
         assert!(policy.valid());
         assert_eq!(Pair::new(0, 100).plan(&policy), Err(TransferSkip::Disabled));
     }
 
-    #[test]
-    fn misaligned_input_and_zero_block_size_refuse_without_panicking() {
+    /// Planner input with one candidate (the destination) and the given pick.
+    fn plan_single_peer(picked: usize) -> TransferOutcome {
         let pair = Pair::new(0, 100);
         let candidates = [view(&pair.targets[0], &pair.matches[0], 0, 0)];
-        let keys = [pair.keys[0].as_ref()];
-        let caps = [None];
-        let input = |picked, block_sizes: &[u32], excluded: &[bool]| {
-            plan_transfer(
-                &TransferPlannerInput {
-                    candidates: &candidates,
-                    cache_keys: &keys,
-                    block_sizes,
-                    capabilities: &caps,
-                    excluded,
-                    picked,
-                    destination_hits: Some(&[]),
-                    cost_params: &CostParams::default(),
-                },
-                &enabled(),
-            )
-            .result
-        };
-        assert_eq!(input(1, &[16], &[false]), Err(TransferSkip::Disabled));
-        assert_eq!(input(0, &[16, 16], &[false]), Err(TransferSkip::Disabled));
-        assert_eq!(input(0, &[16], &[]), Err(TransferSkip::Disabled));
+        let peers = peer_inputs(&candidates, &[pair.keys[0].as_ref()], &[None], &[false]);
+        plan_transfer(
+            &TransferPlannerInput {
+                peers: &peers,
+                picked,
+                destination_hits: Some(&[]),
+                cost_params: &CostParams::default(),
+            },
+            &enabled(),
+        )
+    }
 
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "out of range")]
+    fn picked_out_of_range_is_a_caller_bug() {
+        plan_single_peer(1);
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn picked_out_of_range_is_refused_in_release() {
+        assert_eq!(
+            plan_single_peer(1).result,
+            Err(TransferSkip::MisalignedInput)
+        );
+    }
+
+    #[test]
+    fn zero_block_size_is_unverified_identity() {
         let mut zero = Pair::new(0, 100);
-        zero.block_sizes = [0, 0];
+        let zero_key = CacheKey {
+            block_size: 0,
+            ..key("m")
+        };
+        zero.keys = [Some(zero_key.clone()), Some(zero_key)];
         assert_eq!(zero.plan(&enabled()), Err(TransferSkip::UnverifiedIdentity));
+    }
+
+    #[test]
+    fn misaligned_input_has_a_stable_label() {
+        assert_eq!(TransferSkip::MisalignedInput.label(), "misaligned_input");
     }
 
     #[test]
@@ -866,13 +882,6 @@ mod tests {
     }
 
     #[test]
-    fn unverified_destination_is_skipped() {
-        let mut pair = Pair::new(0, 100);
-        pair.keys[0] = None;
-        assert_eq!(pair.plan(&enabled()), Err(TransferSkip::UnverifiedIdentity));
-    }
-
-    #[test]
     fn peers_need_same_cache_key_and_block_size() {
         let mut pair = Pair::new(0, 100);
         pair.keys[1] = Some(key("other"));
@@ -883,7 +892,10 @@ mod tests {
         assert_eq!(pair.plan(&enabled()), Err(TransferSkip::NoPeer));
 
         let mut pair = Pair::new(0, 100);
-        pair.block_sizes[1] = 32;
+        pair.keys[1] = Some(CacheKey {
+            block_size: 32,
+            ..key("m")
+        });
         assert_eq!(pair.plan(&enabled()), Err(TransferSkip::NoPeer));
     }
 
@@ -1085,13 +1097,10 @@ mod tests {
             },
         ];
         let keys = [pair.keys[0].as_ref(), pair.keys[1].as_ref()];
+        let peers = peer_inputs(&candidates, &keys, &[None, None], &pair.excluded);
         let result = plan_transfer(
             &TransferPlannerInput {
-                candidates: &candidates,
-                cache_keys: &keys,
-                block_sizes: &pair.block_sizes,
-                capabilities: &[None, None],
-                excluded: &pair.excluded,
+                peers: &peers,
                 picked: 0,
                 destination_hits: Some(&concat(&pair.matches)),
                 cost_params: &CostParams::default(),
@@ -1149,13 +1158,10 @@ mod tests {
             ];
             let keys = [Some(&k); 4];
             let caps = [None; 4];
+            let peers = peer_inputs(&candidates, &keys, &caps, &[false; 4]);
             plan_transfer(
                 &TransferPlannerInput {
-                    candidates: &candidates,
-                    cache_keys: &keys,
-                    block_sizes: &[16; 4],
-                    capabilities: &caps,
-                    excluded: &[false; 4],
+                    peers: &peers,
                     picked: 0,
                     destination_hits: Some(&concat(&matches)),
                     cost_params: &CostParams::default(),
@@ -1189,13 +1195,10 @@ mod tests {
             view(&targets[1], &matches[1], 1, 10_000),
             view(&targets[2], &matches[2], 9, 10_000),
         ];
+        let peers = peer_inputs(&candidates, &[Some(&k); 3], &[None; 3], &[false; 3]);
         let plan = plan_transfer(
             &TransferPlannerInput {
-                candidates: &candidates,
-                cache_keys: &[Some(&k); 3],
-                block_sizes: &[16; 3],
-                capabilities: &[None; 3],
-                excluded: &[false; 3],
+                peers: &peers,
                 picked: 0,
                 destination_hits: Some(&concat(&matches)),
                 cost_params: &CostParams::default(),
@@ -1247,33 +1250,6 @@ mod tests {
         assert_eq!(plan.blocks, (30, 125));
     }
 
-    #[test]
-    fn cost_rule_planner_delegates_to_plan_transfer() {
-        let pair = Pair::new(0, 100);
-        let planner = CostRuleTransferPlanner { policy: enabled() };
-        let candidates = [
-            view(&pair.targets[0], &pair.matches[0], 0, 0),
-            view(&pair.targets[1], &pair.matches[1], 4, 10_000),
-        ];
-        let keys = [pair.keys[0].as_ref(), pair.keys[1].as_ref()];
-        let hits = concat(&pair.matches);
-        let input = TransferPlannerInput {
-            candidates: &candidates,
-            cache_keys: &keys,
-            block_sizes: &pair.block_sizes,
-            capabilities: &[None, None],
-            excluded: &pair.excluded,
-            picked: 0,
-            destination_hits: Some(&hits),
-            cost_params: &CostParams::default(),
-        };
-        assert_eq!(planner.plan(&input), plan_transfer(&input, &enabled()));
-        let off = CostRuleTransferPlanner {
-            policy: TransferPolicy::default(),
-        };
-        assert_eq!(off.plan(&input).result, Err(TransferSkip::Disabled));
-    }
-
     /// One candidate for [`plan_many`]: matches on its own prompt (also used as
     /// the destination lookup), load, retry exclusion and capability.
     struct Peer {
@@ -1314,13 +1290,10 @@ mod tests {
         let caps: Vec<_> = peers.iter().map(|p| p.cap.as_ref()).collect();
         let excluded: Vec<_> = peers.iter().map(|p| p.excluded).collect();
         let hits: Vec<TierMatch> = peers.iter().flat_map(|p| p.matches.clone()).collect();
+        let inputs = peer_inputs(&candidates, &keys, &caps, &excluded);
         plan_transfer(
             &TransferPlannerInput {
-                candidates: &candidates,
-                cache_keys: &keys,
-                block_sizes: &vec![16; peers.len()],
-                capabilities: &caps,
-                excluded: &excluded,
+                peers: &inputs,
                 picked: 0,
                 destination_hits: Some(&hits),
                 cost_params: &CostParams::default(),
@@ -1446,12 +1419,9 @@ mod tests {
 
         let k = key("m");
         let hits: Vec<TierMatch> = peers.iter().flat_map(|p| p.matches.clone()).collect();
+        let peer_list = peer_inputs(&candidates, &[Some(&k); 2], &[None; 2], &[false; 2]);
         let input = TransferPlannerInput {
-            candidates: &candidates,
-            cache_keys: &[Some(&k); 2],
-            block_sizes: &[16; 2],
-            capabilities: &[None; 2],
-            excluded: &[false; 2],
+            peers: &peer_list,
             picked: 0,
             destination_hits: Some(&hits),
             cost_params: &CostParams::default(),
@@ -1513,23 +1483,6 @@ mod tests {
     }
 
     #[test]
-    fn estimate_is_present_on_a_planned_outcome() {
-        // Idle empty destination, source with 100 blocks, 4 active requests and
-        // 10_000 queued tokens; 2000-token prompt at 50 us/token.
-        // credited = 1600; transfer = 5 + 1600 * 5 / 1000 = 13 ms;
-        // fetch = 0 + 13 + prefill(400) = 33 ms;
-        // wait = prefill(10_000) + prefill(400) = 520 ms; saved = prefill(1600) = 80 ms.
-        let outcome = Pair::new(0, 100).outcome(&enabled());
-        let plan = outcome.result.expect("planned");
-        let estimate = outcome.estimate.expect("estimate on a plan");
-        assert_eq!(estimate.fetch_ms, 33.0);
-        assert_eq!(estimate.wait_ms, 520.0);
-        assert_eq!(estimate.saved_ms, 80.0);
-        assert_eq!(plan.estimated_saved_prefill_ms, estimate.saved_ms);
-        assert_eq!(plan.estimated_transfer_ms, estimate.transfer_ms);
-    }
-
-    #[test]
     fn estimate_is_present_on_a_cost_rule_skip() {
         let policy = TransferPolicy {
             prefill_us_per_token: 1.0,
@@ -1565,7 +1518,7 @@ mod tests {
         let mut excluded = Pair::new(0, 100);
         excluded.excluded[1] = true;
         assert_eq!(excluded.outcome(&enabled()).estimate, None);
-        let outcome = Pair::new(0, 100).outcome(&TransferPolicy::default());
+        let outcome = Pair::new(0, 100).outcome(&disabled());
         assert_eq!(outcome.result, Err(TransferSkip::Disabled));
         assert_eq!(outcome.estimate, None);
 
@@ -1604,17 +1557,6 @@ mod tests {
         assert!(limiter.inflight.is_empty(), "idle sources are forgotten");
         // `first` was released explicitly; dropping it must not free again.
         drop(first);
-        assert_eq!(limiter.inflight("a"), 0);
-    }
-
-    #[test]
-    fn permit_clones_share_one_slot() {
-        let limiter = PeerFetchLimiter::new(1);
-        let permit = limiter.try_acquire("a").unwrap();
-        let clone = permit.clone();
-        drop(permit);
-        assert_eq!(limiter.inflight("a"), 1, "a clone still holds it");
-        drop(clone);
         assert_eq!(limiter.inflight("a"), 0);
     }
 

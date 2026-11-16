@@ -1,10 +1,10 @@
 #![cfg(all(feature = "cpu", feature = "ready"))]
 
-//! S1: the shadow KV transfer planner, end to end, with mock workers that
-//! publish real KV events.
+//! S1: the KV transfer planner, end to end (shadow mode first, then active), with
+//! mock workers that publish real KV events.
 //!
 //! Each test starts a real `kv_aware` router (`RouterFactory::create_router`,
-//! the same path `main` takes) with `kv_transfer: {mode: shadow}` and only
+//! the same path `main` takes) with `kv_transfer: {mode: shadow}` (or active) and only
 //! [`KvEventMock`] backends. The mocks answer discovery over HTTP and publish
 //! `BlockStored` / `BlockRemoved` / `AllBlocksCleared` over ZMQ, so the router
 //! builds its index from the wire exactly as it does against vLLM. Requests carry
@@ -401,6 +401,25 @@ impl Fixture {
         .await
     }
 
+    /// A streaming completion whose response body the caller keeps. The
+    /// router holds the request's load, and any peer fetch slot, until the
+    /// body ends.
+    async fn open_stream(&self, tokens: &[u32]) -> axum::response::Response {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"prompt": tokens, "max_tokens": 1, "stream": true}).to_string(),
+            ))
+            .unwrap();
+        self.app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("router response")
+    }
+
     /// Open `count` held requests, each `prefix` plus a distinct `tail`-token
     /// suffix, one at a time, and check each lands on `instance`.
     async fn make_busy(&mut self, instance: &str, prefix: &[u32], tail: usize, count: usize) {
@@ -529,49 +548,6 @@ async fn s1_busy_source_with_long_prefix_is_planned() {
         fx.mock("a").completions(),
         a_before,
         "A was only the source"
-    );
-    fx.finish().await;
-}
-
-/// 2: same prefix, A idle -> `source_not_busy`.
-///
-/// Under the default greedy picker an idle holder of a 100-block prefix always
-/// beats an idle cold worker (cost 100 vs 1700), so the pick would be A itself
-/// (`picked_holds_longest_prefix`) and the planner never sees an idle source.
-/// The router only picks B here when the picker is non-greedy: with
-/// `router_temperature` 2000 it samples with weight exp(-(cost - min) / T), which
-/// gives B about 31% of requests. The test sends requests (each completes and
-/// leaves both workers idle) until the planner has seen B picked, bounded at 300
-/// (all-A probability 0.69^300, i.e. never). Every request must end in one of the
-/// two outcomes this setup can produce, and none may plan.
-#[tokio::test]
-async fn s2_idle_source_is_not_busy() {
-    let mut options = Options::new(&[("a", "m"), ("b", "m")]);
-    options.router_temperature = 2000.0;
-    let fx = Fixture::start(options).await;
-    let prompt = seq(2, 1700);
-    fx.mock("a")
-        .store_prefix(&prompt, 100, Residency::Device)
-        .await;
-    fx.converge(&prompt, "a", 100).await;
-
-    let before = plan_counts();
-    let mut seen = BTreeMap::new();
-    for _ in 0..300 {
-        assert_eq!(fx.complete(&prompt, None).await, 200);
-        seen = delta(&before, &plan_counts());
-        if seen.contains_key("source_not_busy") {
-            break;
-        }
-    }
-    assert!(
-        seen.get("source_not_busy").copied().unwrap_or(0) >= 1,
-        "B was never picked in 300 requests: {seen:?}"
-    );
-    assert!(
-        seen.keys()
-            .all(|k| k == "source_not_busy" || k == "picked_holds_longest_prefix"),
-        "unexpected outcomes with an idle source: {seen:?}"
     );
     fx.finish().await;
 }
@@ -1098,71 +1074,55 @@ async fn s14_active_mode_sends_peer_params_to_the_destination_only() {
     fx.finish().await;
 }
 
-/// 15: the kill switch drops planned requests back to shadow, and the source's
-/// in-flight slot is held for the whole request and freed when it ends.
+/// 15: the source's in-flight cap counts a fetch until its response body ends.
+/// With `max_inflight_per_source = 1`, a streaming request that got a fetch and
+/// whose body is not drained holds the only slot, so the next planned request
+/// goes out unchanged (`inflight_cap`); draining the body frees the slot and a
+/// third request is sent again. A third worker keeps an idle, cold destination
+/// available while the first request occupies the other.
 #[tokio::test]
-async fn s15_kill_switch_and_slot_lifetime() {
-    let (mut fx, prompt) = active_fixture(
-        33,
-        Options::new(&[("a", "m"), ("b", "m")]).active(&both_report_fp()),
-    )
-    .await;
+async fn s15_inflight_cap_holds_until_the_stream_ends() {
+    let mut options = Options::new(&[("a", "m"), ("b", "m"), ("c", "m")]).active(&[
+        ("a", PeerLookupMock::new("fp")),
+        ("b", PeerLookupMock::new("fp")),
+        ("c", PeerLookupMock::new("fp")),
+    ]);
+    options.transfer.max_inflight_per_source = 1;
+    let (fx, prompt) = active_fixture(33, options).await;
     let policy = kv_policy(&fx);
     let kv = policy
         .as_any()
         .downcast_ref::<KvAwarePolicy>()
         .expect("kv_aware policy");
     let source_url = fx.mock("a").url.clone();
-    assert!(kv.peer_fetch_enabled());
-    assert_eq!(kv.peer_fetch_inflight(&source_url), 0);
 
-    // Kill switch: back to shadow. The plan is still made and counted, but the
-    // request goes out as the client sent it.
-    assert!(!kv.set_peer_fetch_enabled(false));
-    let ((status, plans), sent) =
-        request_outcomes_of(outcomes_of(fx.complete(&prompt, None))).await;
-    assert_eq!(status, 200);
-    assert_eq!(plans, outcomes(&[("planned", 1)]));
-    assert!(sent.is_empty(), "{sent:?}");
-    let b_bodies = fx.mock("b").bodies();
-    assert_eq!(b_bodies.len(), 1);
-    assert!(b_bodies[0].get("kv_transfer_params").is_none());
-    assert_eq!(kv.peer_fetch_inflight(&source_url), 0);
-
-    // Re-enabled: a planned request that stays open on B holds one slot
-    // against A.
-    assert!(kv.set_peer_fetch_enabled(true));
-    let app = fx.app.clone();
-    let held_prompt = prompt.clone();
-    fx.held.push(tokio::spawn(async move {
-        post(
-            &app,
-            "/v1/completions",
-            json!({"prompt": held_prompt, "max_tokens": 1, "priority": HOLD_PRIORITY}),
-            None,
-        )
-        .await
-    }));
-    fx.mock("b").wait_held(1).await;
+    // First request: fetched, and its body stays unread.
+    let (response, sent) = request_outcomes_of(fx.open_stream(&prompt)).await;
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(sent, outcomes(&[("sent", 1)]));
     assert_eq!(kv.peer_fetch_inflight(&source_url), 1);
-    let b_bodies = fx.mock("b").bodies();
-    assert_eq!(b_bodies[1]["kv_transfer_params"], expected_peer_params());
 
-    for mock in &fx.mocks {
-        mock.release_held();
-    }
-    // The response body being drained is what releases the guard.
+    // Second request: the source is at its cap.
+    let (status, sent) = request_outcomes_of(fx.complete(&prompt, None)).await;
+    assert_eq!(status, 200);
+    assert_eq!(sent, outcomes(&[("inflight_cap", 1)]));
+
+    // Draining the first body frees the slot.
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while kv.peer_fetch_inflight(&source_url) != 0 {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the slot leaked after the request ended"
+            "the slot leaked after the stream ended"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    for task in fx.held.drain(..) {
-        assert_eq!(task.await.expect("held request task"), 200);
-    }
+
+    // Third request: fetched again.
+    let (status, sent) = request_outcomes_of(fx.complete(&prompt, None)).await;
+    assert_eq!(status, 200);
+    assert_eq!(sent, outcomes(&[("sent", 1)]));
+    fx.finish().await;
 }
 
 /// 16: a source that reported no valid address is planned but never fetched

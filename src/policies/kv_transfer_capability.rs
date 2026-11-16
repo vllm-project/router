@@ -1,7 +1,7 @@
 //! Declaring a worker's [`TransferCapability`] in router config.
 //!
-//! Until engines report their own capability (later work), the operator
-//! states it per worker URL. Nothing here is verified against the engine: a
+//! Besides engine-reported capabilities, the operator can state one per worker
+//! URL. Nothing here is verified against the engine: a
 //! wrong entry makes the planner's `Incompatible` check wrong, so a fingerprint
 //! must be identical on workers with the same model, KV dtype, TP/PP shape,
 //! block size and quantization, and different otherwise. Shadow mode does not
