@@ -250,18 +250,17 @@ has tracing support.
 | `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key for the router's own requests to workers, including HTTP health checks; see below. |
 | `--api-key-validation-urls` | `string [0..] (repeatable)` | `[]` | — | — | Validation URLs; an empty list falls back to comma-separated `API_KEY_VALIDATION_URLS` from the environment or `.env`. |
 
-The regular router sends `--api-key` on the requests it makes on its own:
-HTTP health checks, and the worker queries of KV-aware routing and EPD. On
-proxied requests it depends on the route. Typed routes such as
-`/v1/completions` forward the client's `Authorization` header and do not add
-the key. The transparent route, which serves `/v1/responses`, EPD chat
-completions and paths without a typed handler, sends the key in place of the
-client's header.
-
-`/flush_cache` and `/get_load` requests to workers do not carry the key. gRPC
-workers receive no credential, and PD and `--enable-igw` worker health checks
-do not carry the key yet. One key applies to all workers and is read at
-startup, so changing it takes a restart.
+The regular router sends `--api-key` on its own requests to HTTP workers:
+health checks, and the worker queries of KV-aware routing, EPD and Program
+scheduling. Proxied inference requests keep the client's `Authorization`
+header, except on the transparent route, where the key replaces it. The key is
+not sent yet on `/flush_cache` and `/get_load` requests
+([#586](https://github.com/vllm-project/router/issues/586)), to gRPC workers
+([#587](https://github.com/vllm-project/router/issues/587)), or on PD and
+`--enable-igw` health checks
+([#578](https://github.com/vllm-project/router/issues/578)). See
+[Worker authentication](worker_authentication.md) for the header each request
+carries.
 
 The startup wait and `add_worker` always probe `/health`, regardless of
 `--health-check-endpoint`.
