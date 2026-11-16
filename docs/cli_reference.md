@@ -247,20 +247,14 @@ has tracing support.
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key for the router's own requests to workers, including HTTP health checks; see below. |
+| `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key for the router's own requests to workers, including HTTP health checks. |
 | `--api-key-validation-urls` | `string [0..] (repeatable)` | `[]` | — | — | Validation URLs; an empty list falls back to comma-separated `API_KEY_VALIDATION_URLS` from the environment or `.env`. |
 
-The regular router sends `--api-key` on its own requests to HTTP workers:
-health checks, and the worker queries of KV-aware routing, EPD and Program
-scheduling. Proxied inference requests keep the client's `Authorization`
-header, except on the transparent route, where the key replaces it. The key is
-not sent yet on `/flush_cache` and `/get_load` requests
-([#586](https://github.com/vllm-project/router/issues/586)), to gRPC workers
-([#587](https://github.com/vllm-project/router/issues/587)), or on PD and
-`--enable-igw` health checks
-([#578](https://github.com/vllm-project/router/issues/578)). See
-[Worker authentication](worker_authentication.md) for the header each request
-carries.
+The key is the bearer token the router sends on its own requests to HTTP
+workers, including health checks; clients authenticate to the router
+separately with `--api-key-validation-urls`. It is not sent yet on
+`/flush_cache`, `/get_load`, gRPC requests, or PD and `--enable-igw` health
+checks.
 
 The startup wait and `add_worker` always probe `/health`, regardless of
 `--health-check-endpoint`.
