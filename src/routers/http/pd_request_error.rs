@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use std::fmt;
 
 pub(super) const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
+const ERROR_BODY_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum PdPhase {
@@ -55,6 +56,7 @@ pub(super) fn pd_error_description(error: &reqwest::Error) -> &'static str {
 pub(super) enum ErrorBodyState {
     Complete,
     LimitExceeded,
+    CaptureTimedOut,
     ReadFailed { kind: TransportErrorKind },
 }
 impl ErrorBodyState {
@@ -62,6 +64,7 @@ impl ErrorBodyState {
         match self {
             Self::Complete => "complete",
             Self::LimitExceeded => "limit_exceeded",
+            Self::CaptureTimedOut => "capture_timeout",
             Self::ReadFailed { .. } => "read_failed",
         }
     }
@@ -296,7 +299,15 @@ where
 {
     futures_util::pin_mut!(stream);
     let mut body = BytesMut::new();
-    while let Some(chunk) = stream.next().await {
+    let deadline = tokio::time::Instant::now() + ERROR_BODY_CAPTURE_TIMEOUT;
+    loop {
+        // One deadline for the whole capture, including EOF at the exact limit.
+        // The upstream request timeout remains active and may expire sooner.
+        let chunk = match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => return (body.freeze(), ErrorBodyState::Complete),
+            Err(_) => return (body.freeze(), ErrorBodyState::CaptureTimedOut),
+        };
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(kind) => return (body.freeze(), ErrorBodyState::ReadFailed { kind }),
@@ -308,7 +319,6 @@ where
             return (body.freeze(), ErrorBodyState::LimitExceeded);
         }
     }
-    (body.freeze(), ErrorBodyState::Complete)
 }
 
 pub(super) async fn capture_upstream_error(
@@ -330,8 +340,8 @@ pub(super) async fn capture_upstream_error(
     {
         headers.insert(header::RETRY_AFTER, value.clone());
     }
-    // reqwest's configured total timeout covers the body, including the wait
-    // for EOF after exactly 64 KiB; do not reset that deadline per chunk.
+    // Bound error diagnostics independently of a potentially long request
+    // timeout. Capture failure never replaces the already-received status.
     let (body, body_state) = capture_body(
         response
             .bytes_stream()
@@ -490,6 +500,36 @@ mod tests {
         assert!(std::str::from_utf8(&body).is_err());
     }
     #[tokio::test]
+    async fn capture_deadline_bounds_stalls_and_does_not_reset_per_chunk() {
+        for size in [0, MAX_UPSTREAM_ERROR_BODY_BYTES] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let prefix = Chunks {
+                chunks: [Ok(Bytes::from(vec![b'x'; size]))].into(),
+                polls: Arc::default(),
+                drops: drops.clone(),
+            };
+            let source = prefix.chain(futures_util::stream::pending());
+            let (body, state) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), capture_body(source))
+                    .await
+                    .expect("capture must not wait for the request timeout");
+            assert_eq!(body.len(), size);
+            assert_eq!(state, ErrorBodyState::CaptureTimedOut);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+        let source = futures_util::stream::unfold(0, |n| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            Some((Ok(Bytes::from_static(b"x")), n + 1))
+        });
+        let (body, state) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), capture_body(source))
+                .await
+                .expect("incoming chunks must not extend the deadline");
+        assert!(!body.is_empty());
+        assert_eq!(state, ErrorBodyState::CaptureTimedOut);
+    }
+
+    #[tokio::test]
     async fn read_failure_keeps_prefix() {
         for kind in [
             TransportErrorKind::Timeout,
@@ -637,6 +677,7 @@ mod tests {
         }
         for body_state in [
             ErrorBodyState::LimitExceeded,
+            ErrorBodyState::CaptureTimedOut,
             ErrorBodyState::ReadFailed {
                 kind: TransportErrorKind::Timeout,
             },

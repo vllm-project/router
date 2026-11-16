@@ -118,13 +118,18 @@ The upstream `Content-Type` is used to validate 4xx diagnostics; the router
 generates its own JSON content type. Other upstream error headers, including
 `Content-Encoding`, `Set-Cookie`, and `WWW-Authenticate`, are not forwarded.
 
-Error-body capture saves at most 64 KiB incrementally. It uses the existing total
-request timeout, without a separate error-body timeout or a deadline reset per
-chunk. At exactly 64 KiB the router can still wait for EOF or the request
-deadline to distinguish a complete body from an oversized or incomplete one.
-A stalled non-2xx body can therefore delay delivery of an already-known error
-until the remaining total request timeout expires, while preserving its original
-HTTP status. There is no separate error-body capture deadline.
+Error-body capture saves at most 64 KiB incrementally and has a dedicated
+one-second deadline starting when capture begins. The existing upstream request
+timeout remains active, so whichever expires first stops the read. The capture
+deadline is not reset per chunk and also bounds the wait for EOF at exactly
+64 KiB. On expiry, the router drops the upstream body and returns its fallback
+JSON envelope with the original HTTP status and validated `Retry-After`.
+Incomplete diagnostics are not appended or previewed, even if their saved
+prefix parses as JSON. Normal completion still requires EOF.
+
+The one-second budget covers body capture only. Failure-side profiling cleanup
+can separately take up to two seconds before capture begins; local Decode
+cancellation and load release happen before either wait.
 
 Other non-2xx statuses (including 3xx) are defensive cases; this change does not
 alter redirect handling. HTTP semantics still apply: a 304 has no response body.
@@ -176,7 +181,7 @@ Internal error classifications remain separate from public `error.type` values:
 `vllm_router_pd_phase_errors_total` records the returned primary failure with
 `phase` and internal `error_type` labels; internal failures use `phase=router`.
 `vllm_router_pd_error_body_total` records capture outcomes as `complete`,
-`limit_exceeded`, or `read_failed`. `vllm_router_pd_response_body_errors_total`
+`limit_exceeded`, `capture_timeout`, or `read_failed`. `vllm_router_pd_response_body_errors_total`
 records transport failures after response commitment.
 
 When DEBUG logging is enabled, a completely captured upstream error body can

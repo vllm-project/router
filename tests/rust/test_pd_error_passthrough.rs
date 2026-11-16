@@ -340,3 +340,30 @@ async fn received_http_error_survives_body_timeout_at_router_boundary() {
         f.assert_no_load();
     }
 }
+
+#[tokio::test]
+async fn dedicated_error_capture_deadline_precedes_long_request_timeout() {
+    for discovery in [false, true] {
+        for phase in ["p", "d"] {
+            let f = Fixture::new(Duration::from_secs(10), discovery).await;
+            f.warmup().await;
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                f.request(
+                    "/v1/chat/completions",
+                    &format!("{phase}-error-body-timeout"),
+                    false,
+                ),
+            )
+            .await
+            .expect("known HTTP errors must not wait for the ten-second request timeout");
+            assert_error(
+                response,
+                if phase == "p" { 503 } else { 429 },
+                if phase == "p" { "prefill" } else { "decode" },
+            )
+            .await;
+            f.assert_no_load();
+        }
+    }
+}
