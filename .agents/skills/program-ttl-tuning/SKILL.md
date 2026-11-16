@@ -55,9 +55,9 @@ record the result as a non-regression case rather than a failed experiment.
 1. The automatic acting TTL is bounded by
    `min(max_acting_ttl_seconds, cache_miss_impact_seconds)`, where the impact is
    the calibrated cold-prefill cost for the uncached prefix multiplied by
-   `(2 - decode_throughput_alpha)`. Once the continuity window is mature, the
-   interval fit selects the TTL with the best estimated utility within that
-   bound; it can select a smaller TTL or zero even when the bound is positive.
+   `(2 - prefill_cost_model.decode_throughput_alpha)`. Once the continuity window
+   is mature, the interval fit selects the TTL with the best estimated utility
+   within that bound; it can select a smaller TTL or zero even when the bound is positive.
    Raising `max_acting_ttl_seconds` alone has no effect while the impact cap
    binds, and a higher cap does not guarantee a longer selected TTL.
 2. Before `stats_window_size` samples accumulate, the automatic TTL is `0` and
@@ -195,9 +195,10 @@ either acceptable if recorded in the report:
 - fit the coefficients from a baseline-arm request log (the Program arm's Router
   queue time contaminates client-side TTFT, so it must not be the source).
 
-`decode_throughput_alpha` is configured separately and is not produced by
-calibration. Keep 0.15 unless a single sweep of 0.10 / 0.15 / 0.25 is part of
-the experiment.
+`prefill_cost_model.decode_throughput_alpha` is configured within
+`prefill_cost_model`, separately from the fitted coefficients, and is not
+produced by calibration. Keep 0.15 unless a single sweep of 0.10 / 0.15 / 0.25
+is part of the experiment.
 
 ### 3.5 Pressure point
 
@@ -239,7 +240,7 @@ changes dominate everything.
 | `max_acting_ttl_seconds` | `10` | Only a bound. Change it after, not before, the cost model is trustworthy |
 | `stats_window_size` | `100` | Lower it for short experiments; otherwise the first minutes run with TTL = 0 |
 | `prefill_cost_model.*` | reference values | Calibrated values determine cache-miss impact; a non-zero TTL also requires a mature interval window and a useful fitted candidate |
-| `decode_throughput_alpha` | `0.15` | Lower values increase cache-miss impact and may extend the fitted TTL; check the selected TTL rather than assuming it increases |
+| `prefill_cost_model.decode_throughput_alpha` | `0.15` | Lower values increase cache-miss impact and may extend the fitted TTL; check the selected TTL rather than assuming it increases |
 | request-level `kv_retention_ttl_seconds` | unset | Overrides the computed TTL without the impact cap on this internal-DP path. Use for the controlled retention diagnostic in section 5; measure queueing and end-to-end cost before keeping an override |
 
 ### 4.4 Placement
@@ -344,12 +345,23 @@ the deployment.
 |---|---|---|
 | A | feature disabled | baseline |
 | B | `binding_only: true` | Program-to-Rank affinity alone |
-| C | full configuration | affinity plus retention |
+| C0 | same full configuration as C, `binding_only: false`, with request-level `kv_retention_ttl_seconds: 0` on every request | full scheduler without post-request TTL retention; admission, pause/resume, and fairness remain enabled |
+| C | full configuration, `binding_only: false`, with the candidate TTL policy | full scheduler including post-request TTL retention |
 
 Run each direction-finding arm on a small task subset; keep the full task set
-for the paired baseline/candidate rounds. Report affinity and retention
-separately, otherwise a threshold change and a scheduling change cannot be
-distinguished.
+for the paired baseline/candidate rounds. Report B minus A as the affinity
+delta and C minus B as the full-scheduler delta: `binding_only` bypasses
+RequestPool admission, Progress-TTL pause/resume scheduling, and fairness, so
+C minus B cannot establish a retention-only gain.
+
+Before attributing a change to retention, compare C with C0, holding the workload,
+placement policy, admission thresholds, fairness settings, and all other
+configuration fixed. Only the request-level TTL override differs: C0 overrides
+every request to zero, while C uses the candidate automatic TTL or explicit
+override. Verify the armed TTL and pause reasons as in section 5; if C also
+selects zero TTL, the pair has not exercised different retention. Report this
+controlled TTL-policy delta separately from the full-scheduler delta, including
+queueing, task completion, and end-to-end cost.
 
 ## 9. Anti-patterns
 
