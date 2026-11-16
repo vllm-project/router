@@ -1315,9 +1315,8 @@ impl VllmPDRouter {
         )
     }
 
-    /// Keep only workers the commitment may actually dispatch to: live,
-    /// available, serving the request model, and (for a push-addressed
-    /// Prefill) the one Decode the KV was sent to.
+    /// Keep only workers the commitment may dispatch to: live, available,
+    /// serving the request model, and the push-pinned Decode when one exists.
     fn retain_commit_candidates(
         candidates: &mut Vec<Arc<dyn Worker>>,
         model_id: Option<&str>,
@@ -1371,16 +1370,13 @@ impl VllmPDRouter {
         // preparation budget while a healthy Decode is ready.
         let mut tokens = input.decode_tokens.clone();
         if let Some(tokens) = tokens.as_mut() {
-            loop {
-                let missing: Vec<_> = candidates
-                    .iter()
-                    .filter(|worker| !tokens.contains_key(worker.base_url()))
-                    .cloned()
-                    .collect();
-                if missing.is_empty() {
-                    break;
-                }
-                let Some(new_tokens) = self
+            let missing: Vec<_> = candidates
+                .iter()
+                .filter(|worker| !tokens.contains_key(worker.base_url()))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                if let Some(new_tokens) = self
                     .pd_router
                     .prepare_decode_inputs(
                         &missing,
@@ -1390,16 +1386,11 @@ impl VllmPDRouter {
                         input.router_prompts.as_ref(),
                     )
                     .await
-                else {
-                    break;
-                };
-                let before = tokens.len();
-                tokens.extend(new_tokens);
-                if tokens.len() == before {
-                    break;
+                {
+                    tokens.extend(new_tokens);
                 }
                 // The pool can change while that await runs: re-read it and
-                // reapply every filter, not just the pin.
+                // reapply the same health/model/pin filters used above.
                 candidates = self.live_decode_candidates(input.pool);
                 Self::retain_commit_candidates(&mut candidates, input.model_id.as_deref(), pin);
             }
@@ -1437,12 +1428,8 @@ impl VllmPDRouter {
                 .await
         }
         .await;
-        // Pricing renders the request against every candidate and can wait on a
-        // slow backend. The pool may have changed meanwhile: a removed worker
-        // must not be committed from the stale list, and a newly registered one
-        // has no price yet. Re-read and reapply the filters; the completeness
-        // check in `select_stage` then falls back to occupancy when the new
-        // candidate is missing from `decode_context`.
+        // Pricing can wait on a slow backend. Re-read the pool so a removed
+        // worker cannot be committed and a new one has no stale price.
         candidates = self.live_decode_candidates(input.pool);
         Self::retain_commit_candidates(&mut candidates, input.model_id.as_deref(), pin);
         let context = PdRequestContext {
@@ -5787,9 +5774,6 @@ mod tests {
         );
     }
 
-    /// Pricing renders the prompt against every Decode candidate. A worker
-    /// removed during that render is absent from the registry by the time the
-    /// decision is charged, so it must not receive the generation request.
     #[tokio::test]
     async fn removed_decode_during_pricing_is_not_committed() {
         use crate::config::{KvConnector, PolicyConfig, RouterConfig, RoutingMode};
@@ -5803,21 +5787,16 @@ mod tests {
         use std::time::Duration;
         use tokio::sync::{mpsc, Semaphore};
 
-        #[derive(Clone)]
-        struct DecodePricing {
-            entered: mpsc::UnboundedSender<()>,
-            gate: Arc<Semaphore>,
-            generations: Arc<AtomicUsize>,
-        }
+        type Pricing = (mpsc::UnboundedSender<()>, Arc<Semaphore>, Arc<AtomicUsize>);
 
-        async fn render(State(state): State<DecodePricing>) -> Json<Value> {
-            state.entered.send(()).unwrap();
-            state.gate.acquire().await.unwrap().forget();
+        async fn render(State((entered, gate, _)): State<Pricing>) -> Json<Value> {
+            entered.send(()).unwrap();
+            gate.acquire().await.unwrap().forget();
             Json(json!({"token_ids": [1, 2, 3]}))
         }
 
-        async fn generate(State(state): State<DecodePricing>) -> Json<Value> {
-            state.generations.fetch_add(1, Ordering::SeqCst);
+        async fn generate(State((_, _, generations)): State<Pricing>) -> Json<Value> {
+            generations.fetch_add(1, Ordering::SeqCst);
             Json(json!({"choices": [{"text": "removed worker answered"}]}))
         }
 
@@ -5849,17 +5828,9 @@ mod tests {
         let generations = Arc::new(AtomicUsize::new(0));
         let decode_app = Router::new()
             .route("/health", get(|| async { "ok" }))
-            .route(
-                "/v1/models",
-                get(|| async { Json(json!({"data": [{"id": "m", "parent": null}]})) }),
-            )
             .route("/v1/completions/render", post(render))
             .route("/v1/completions", post(generate))
-            .with_state(DecodePricing {
-                entered,
-                gate: gate.clone(),
-                generations: generations.clone(),
-            });
+            .with_state((entered, gate.clone(), generations.clone()));
         let d = spawn_test_server(decode_app).await;
 
         let publisher_context = zmq::Context::new();

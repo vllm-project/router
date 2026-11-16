@@ -1329,23 +1329,12 @@ mod kv_input_tests {
     async fn start_registers_and_prices_both_pools_before_any_request() {
         // A Decode pool recorded lazily from the request path has no binding for
         // one refresh tick, and a burst admitted inside that tick loses the
-        // credit its configuration asked for. Pool sizes alone cannot prove the
-        // bind finished, so assert the pricing gate the request path uses.
-        let publisher_context = zmq::Context::new();
-        let mut endpoints = Vec::new();
-        let mut _publishers = Vec::new();
-        for _ in 0..2 {
-            let publisher = publisher_context.socket(zmq::PUB).unwrap();
-            publisher.bind("tcp://127.0.0.1:*").unwrap();
-            endpoints.push(publisher.get_last_endpoint().unwrap().unwrap());
-            _publishers.push(publisher);
-        }
-        // No /v1/models server: the static source supplies the cache identity,
-        // so the binding must be priceable without any request-time probe.
+        // credit its configuration asked for. Assert the pricing gate, not just
+        // the recorded pool sizes.
         let p_base = "http://127.0.0.1:1".to_owned();
         let d_base = "http://127.0.0.1:2".to_owned();
-        let sources = |endpoint: String| crate::config::types::PdKvEventSources {
-            endpoints: vec![endpoint],
+        let sources = |port: u16| crate::config::types::PdKvEventSources {
+            endpoints: vec![format!("tcp://127.0.0.1:{port}")],
             replay_endpoints: None,
             block_size: 16,
             model: Some("m".to_owned()),
@@ -1365,8 +1354,8 @@ mod kv_input_tests {
             reqwest::Client::new(),
             None,
             HashMap::from([
-                (p_base.clone(), sources(endpoints[0].clone())),
-                (d_base.clone(), sources(endpoints[1].clone())),
+                (p_base.clone(), sources(5557)),
+                (d_base.clone(), sources(5558)),
             ]),
             (prefill.clone(), Some(policy.clone())),
             (decode.clone(), Some(policy)),

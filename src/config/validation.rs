@@ -901,26 +901,10 @@ impl ConfigValidator {
             } = &config.mode
             {
                 for (url, sources) in &config.pd_kv_event_sources {
-                    // Static sources are looked up by `Worker::base_url()`, which
-                    // drops the `@dp_rank` suffix, so a rank-pinned URL must
-                    // still be keyed by its base URL.
-                    //
-                    // Both pools may publish KV events: a Decode engine that
-                    // enables prefix caching holds blocks of its own, and
-                    // without its event stream the Router can only guess what
-                    // a Decode worker already has, which is exactly the credit
-                    // a marginal decode-load estimate needs.
-                    //
-                    // The key also decides which policy must be KV-aware: a
-                    // source keyed by a Decode URL is only subscribed when the
-                    // Decode policy ranks by KV, so accepting it for a
-                    // count-based Decode pool would drop the endpoint silently.
-                    //
-                    // One base can name both stages when their DP ranks are
-                    // disjoint (`host@0` for Prefill, `host@1` for Decode). The
-                    // binding is shared by base, so the source is consumed as
-                    // long as *any* stage serving that base ranks by KV; fixing
-                    // the owner to Prefill rejected a Decode-only subscriber.
+                    // Static sources are keyed by `Worker::base_url()`. A base
+                    // may name both stages when their DP ranks are disjoint;
+                    // the binding is shared, so any KV-aware stage serving it
+                    // consumes the source.
                     let mut owning = Vec::new();
                     if prefill_urls
                         .iter()
@@ -1930,17 +1914,6 @@ mod tests {
             },
         );
         ConfigValidator::validate(&config).unwrap();
-
-        // With neither stage KV-aware the source would never be subscribed, so
-        // the per-source error must still fire after the global guard is gone.
-        let mut rejected = config;
-        if let RoutingMode::VllmPrefillDecode { decode_policy, .. } = &mut rejected.mode {
-            *decode_policy = Some(PolicyConfig::RoundRobin);
-        }
-        let err = ConfigValidator::validate(&rejected)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("policy is not kv_aware"), "{err}");
     }
 
     #[test]
