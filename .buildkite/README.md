@@ -67,6 +67,9 @@ Reports exclude `tests/` and `benches/` files as well as inline test modules
 and test-only helpers marked with `#[cfg_attr(coverage_nightly, coverage(off))]`.
 The nightly toolchain enables this unstable attribute; ordinary stable builds
 do not enable it. Add the same marker to new test modules and test-only helpers.
+The existing `check-mark` pre-commit hook checks each test-only module,
+function and impl declaration under `src/` for this marker, including
+file-based `mod tests;` declarations.
 These are separate coverage
 measurements for each test group; their percentages must not be added or
 averaged to obtain total coverage. Python tests, doctests, ignored tests, and
@@ -93,7 +96,8 @@ docker run --rm -v "$PWD:/workdir" -w /workdir rust:1.95.0-bookworm \
 On a Linux development host with Rust, rustup, and the `rust` apt dependency
 set already installed, use `bash .buildkite/scripts/rust_coverage.sh unit`
 or `bash .buildkite/scripts/rust_coverage.sh integration`. The script installs
-the pinned nightly toolchain, coverage tool, and LLVM component, so it also
+the pinned nightly toolchain, precompiled coverage tool from GitHub releases,
+and LLVM component, so it also
 needs network access.
 
 ### `release-pipeline.yml`

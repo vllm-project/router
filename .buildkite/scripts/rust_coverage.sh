@@ -19,7 +19,15 @@ coverage_toolchain="nightly-2026-04-15"
 rustup toolchain install "${coverage_toolchain}" --profile minimal --no-self-update \
   --component llvm-tools-preview
 export RUSTUP_TOOLCHAIN="${coverage_toolchain}"
-cargo install cargo-llvm-cov --version 0.6.21 --locked
+host_target="$(rustc -vV | sed -n 's/^host: //p')"
+coverage_version="0.6.21"
+cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+mkdir -p "${cargo_bin}"
+curl --fail --silent --show-error --location --connect-timeout 15 --retry 3 \
+  "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${coverage_version}/cargo-llvm-cov-${host_target}.tar.gz" \
+  | tar -xz -C "${cargo_bin}" cargo-llvm-cov
+export PATH="${cargo_bin}:${PATH}"
+cargo llvm-cov --version
 
 report_dir="target/coverage/rust-$1"
 mkdir -p "${report_dir}"
@@ -30,7 +38,6 @@ cargo llvm-cov clean --workspace
 
 # Preserve test failure while still attempting to report completed tests.
 # Target-specific flags keep instrumentation out of nested WASM builds.
-host_target="$(rustc -vV | sed -n 's/^host: //p')"
 test_status=0
 cargo llvm-cov --locked --features cpu,ready --no-report \
   --target "${host_target}" --coverage-target-only \
