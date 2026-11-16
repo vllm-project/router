@@ -565,6 +565,7 @@ def print_wave_summary(
     wave: dict[str, Any],
     *,
     backend: str | None = None,
+    run_idx: int | None = None,
     hit_rate: float | None = None,
     concurrency: int | None = None,
     requests: int | None = None,
@@ -578,6 +579,8 @@ def print_wave_summary(
     tags: list[str] = []
     if backend:
         tags.append(backend)
+    if run_idx is not None:
+        tags.append(f"run={run_idx}")
     if hit_rate is not None:
         tags.append(f"hit={hit_rate:g}")
     if concurrency is not None:

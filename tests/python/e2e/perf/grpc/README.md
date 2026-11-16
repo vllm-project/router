@@ -35,7 +35,7 @@ Model path or HF id: set `"model"` in `cases/<name>.json`, or `export MODEL=...`
 export MODEL=/path/to/model   # required unless case JSON defines model
 export VLLM_RS=/path/to/vllm-rs          # rust_grpc
 export ROUTER_BIN=$PWD/target/release/vllm-router   # optional
-# results JSON (always saved, dir created at run time): tests/python/e2e/results/perf/grpc/<backend>_<YYYYMMDD_HHMMSS>/hit<rate>_c<concurrency>_r<requests>.json
+# results JSON (always saved, dir created at run time): tests/python/e2e/results/perf/grpc/<backend>_<YYYYMMDD_HHMMSS>/run<N>/hit<rate>_c<concurrency>_r<requests>.json
 
 pytest tests/python/e2e/perf/grpc --perf-case=rust_grpc
 pytest tests/python/e2e/perf/grpc --perf-case=rust_http
@@ -123,6 +123,15 @@ Override bench via env: `PERF_TOKENS`, `PERF_MAX_TOKENS`, `PERF_TIMEOUT`.
 Each wave prints a **`perf summary`** block to stderr after the test (use `-sv`).
 Set `PERF_QUIET=1` to disable terminal summary. Wave JSON is written under
 `tests/python/e2e/results/perf/grpc/` for every run.
+
+`RUNS` repeats every hit-rate/concurrency/request-count combination (default: 1).
+For example, `RUNS=3 pytest tests/python/e2e/perf/grpc --perf-case=rust_grpc -sv`
+collects three samples per combination, each with the usual cold stack start
+unless using an external router. Results are saved under
+`<backend>_<YYYYMMDD_HHMMSS>/run1/`, `run2/`, and `run3/`, including `run1/`
+when `RUNS` is unset. Filenames are unchanged, and summaries include the run index.
+The dashboard must read the per-run subdirectories; nightly's `**/*.json` glob
+already includes them.
 
 One wave equals:
 

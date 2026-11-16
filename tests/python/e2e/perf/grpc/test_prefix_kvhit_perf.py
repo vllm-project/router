@@ -33,6 +33,7 @@ def test_prefix_kvhit_waves(
     perf_stack,
     perf_settings,
     perf_case,
+    run_idx: int,
     hit_rate: float,
     concurrency: int,
     requests: int,
@@ -47,6 +48,7 @@ def test_prefix_kvhit_waves(
     bench_mod.print_wave_summary(
         payload["wave"],
         backend=perf_case.backend,
+        run_idx=run_idx,
         hit_rate=hit_rate,
         concurrency=concurrency,
         requests=requests,

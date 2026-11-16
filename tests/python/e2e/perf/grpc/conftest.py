@@ -145,14 +145,14 @@ def perf_stack(perf_case, request):
 
 
 @pytest.fixture(scope="function")
-def perf_settings(perf_case, perf_stack, bench_mod, perf_output_dir):
+def perf_settings(perf_case, perf_stack, bench_mod, perf_output_dir, run_idx):
     settings = bench_mod.read_perf_settings(
         backend_label=perf_case.backend,
         bench_tokens=perf_case.bench_tokens,
         bench_max_tokens=perf_case.bench_max_tokens,
         bench_timeout=perf_case.bench_timeout,
     )
-    settings["output_dir"] = perf_output_dir
+    settings["output_dir"] = str(Path(perf_output_dir) / f"run{run_idx}")
     return settings
 
 
@@ -167,6 +167,10 @@ def _wave_params(case) -> tuple[list[tuple], list[str]]:
 
 
 def pytest_generate_tests(metafunc):
+    if "run_idx" in metafunc.fixturenames:
+        runs = max(1, int(os.environ.get("RUNS", "1")))
+        metafunc.parametrize("run_idx", range(1, runs + 1))
+
     if "hit_rate" not in metafunc.fixturenames:
         return
     if metafunc.definition.name != "test_prefix_kvhit_waves":
