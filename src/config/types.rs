@@ -399,9 +399,9 @@ pub struct ProgramSchedulingConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_capacity_per_dp_rank: Option<usize>,
     /// Input-token fact source used for admission, growth, and TTL cost.
-    /// Omit for compatible estimated counts; opt into `exact_when_verified`
-    /// for automatic verification and fallback. `shadow` is an advanced
-    /// diagnostic option that never applies prepared counts to decisions.
+    /// Defaults to `exact_when_verified` with automatic verification and
+    /// estimation fallback. `estimated` is a supported compatibility override;
+    /// `shadow` records counterfactuals without applying prepared counts.
     #[serde(default)]
     pub token_count_mode: TokenCountMode,
     /// Model pools allowed to apply prepared exact counts. Empty means all.
@@ -1536,12 +1536,22 @@ mod tests {
     }
 
     #[test]
-    fn program_token_count_mode_parses_and_defaults_to_estimated() {
-        let default = ProgramSchedulingConfig::resolve(true, None)
-            .unwrap()
-            .unwrap();
-        assert_eq!(default.token_count_mode, TokenCountMode::Estimated);
-        assert!(default.token_count_model_pools.is_empty());
+    fn program_token_count_mode_parses_and_defaults_to_exact_when_verified() {
+        for input in [None, Some("{}")] {
+            let default = ProgramSchedulingConfig::resolve(true, input)
+                .unwrap()
+                .unwrap();
+            assert_eq!(default.token_count_mode, TokenCountMode::ExactWhenVerified);
+            assert_eq!(default.token_count_verification_settlements, 1);
+            assert!(default.token_count_model_pools.is_empty());
+            assert!(default.exact_text_endpoints.is_empty());
+        }
+
+        let estimated =
+            ProgramSchedulingConfig::resolve(true, Some(r#"{"token_count_mode":"estimated"}"#))
+                .unwrap()
+                .unwrap();
+        assert_eq!(estimated.token_count_mode, TokenCountMode::Estimated);
 
         let configured = ProgramSchedulingConfig::resolve(
             true,

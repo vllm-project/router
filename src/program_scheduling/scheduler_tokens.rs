@@ -1435,11 +1435,12 @@ mod revocation_tests {
             .acquire(identity("same"), context, &targets, None)
             .await
             .unwrap();
-        let _second = scheduler
+        let second = scheduler
             .acquire(identity("same"), context, &targets, None)
             .await
             .unwrap();
         scheduler.complete(&first, true, false, Some(10), None);
+        assert_eq!(scheduler.diagnostics().verified_token_fingerprints, 0);
         assert_eq!(
             scheduler.resolve_arrival_tokens("model", arrival).source(),
             TokenFactSource::Estimated
@@ -1450,6 +1451,13 @@ mod revocation_tests {
             TokenFactSource::Estimated,
             "one real completion plus its duplicate must not satisfy a two-settlement probation"
         );
+        assert_eq!(scheduler.diagnostics().verified_token_fingerprints, 0);
+        scheduler.complete(&second, true, false, Some(10), None);
+        assert_eq!(scheduler.diagnostics().verified_token_fingerprints, 1);
+        assert!(scheduler
+            .resolve_arrival_tokens("model", arrival)
+            .source()
+            .is_prepared());
     }
 
     #[tokio::test]

@@ -103,10 +103,10 @@ class Router:
         health_check_timeout_secs: Timeout in seconds for health check requests. Default: 5
         health_check_interval_secs: Interval in seconds between runtime health checks. Default: 60
         health_check_endpoint: Health check endpoint path. Default: '/health'
-        enable_program_scheduling: Enable Program-level scheduling with estimated input-token counts. Default: False
+        enable_program_scheduling: Enable Program-level scheduling with verified exact counts and estimation fallback. Default: False
         program_scheduling_config_json: Optional JSON object overriding Program-level scheduling defaults.
-            Requires enable_program_scheduling. Use {"token_count_mode":"exact_when_verified"}
-            to opt into verified exact input counts; HTTP chat tokenization requires a separate
+            Requires enable_program_scheduling. Use {"token_count_mode":"estimated"}
+            for compatible byte-estimated counts; HTTP chat tokenization requires a separate
             exact_text_endpoints opt-in. Default: None
     """
 

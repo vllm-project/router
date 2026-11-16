@@ -124,13 +124,13 @@ struct CliArgs {
     policy: String,
 
     /// Enable Program-level scheduling independently of the request-level
-    /// load-balancing policy. Uses estimated input-token counts by default.
+    /// load-balancing policy. Defaults to verified exact counts with estimation fallback.
     #[arg(long, default_value_t = false)]
     enable_program_scheduling: bool,
 
     /// Optional JSON object overriding Program-level scheduling defaults.
-    /// Requires --enable-program-scheduling. To opt into verified exact input
-    /// counts, use {"token_count_mode":"exact_when_verified"}.
+    /// Requires --enable-program-scheduling. Use {"token_count_mode":"estimated"}
+    /// for compatible byte-estimated counts; HTTP text tokenization is opt-in.
     #[arg(long)]
     program_scheduling_config_json: Option<String>,
 

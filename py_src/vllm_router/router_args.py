@@ -147,7 +147,7 @@ class RouterArgs:
             f"--{prefix}enable-program-scheduling",
             action="store_true",
             default=False,
-            help="Enable Program-level scheduling (uses estimated input-token counts by default)",
+            help="Enable Program-level scheduling (defaults to verified exact counts with estimation fallback)",
         )
 
         parser.add_argument(
@@ -156,7 +156,7 @@ class RouterArgs:
             default=None,
             help=(
                 "JSON object overriding Program-level scheduling defaults (requires the enable flag). "
-                'To opt into verified exact input counts, use {"token_count_mode":"exact_when_verified"}'
+                'For compatible byte-estimated counts, use {"token_count_mode":"estimated"}; HTTP text tokenization is opt-in'
             ),
         )
 

@@ -592,7 +592,11 @@ impl ProgramScheduler {
             token_count_model_pools: self.config.token_count_model_pools.clone(),
             exact_text_endpoints: self.config.exact_text_endpoints.clone(),
             revoked_token_fingerprints: state.revoked_token_fingerprints.len(),
-            verified_token_fingerprints: state.verified_token_fingerprints.len(),
+            verified_token_fingerprints: state
+                .verified_token_fingerprints
+                .values()
+                .filter(|(count, _)| *count >= self.config.token_count_verification_settlements)
+                .count(),
             saturated_model_pools: state
                 .token_fingerprint_saturated_pools
                 .iter()

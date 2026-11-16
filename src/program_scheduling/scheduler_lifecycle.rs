@@ -87,6 +87,13 @@ impl ProgramScheduler {
         if runtime_before.placement.as_deref() != Some(dispatch.target_id.as_str()) {
             return;
         }
+        // Zero prompt usage is missing evidence, as in fingerprint verification.
+        // Normalize it before runtime, capacity and TTL accounting so it cannot
+        // erase a retained context reservation or become a zero-size sample.
+        let usage = ProgramUsageObservation {
+            prompt_tokens: usage.prompt_tokens.filter(|tokens| *tokens > 0),
+            ..usage
+        };
         let target_id = dispatch.target_id.clone();
         let observed_prompt_tokens = usage.prompt_tokens.unwrap_or(dispatch.context_tokens());
         // Reconcile the prepared fact the attempt carried. In shadow mode the
@@ -1096,6 +1103,60 @@ mod tests {
         let state = scheduler.state.lock();
         let deadline = state.decisions[dispatch.program()].ttl_deadline.unwrap();
         assert!(deadline.saturating_duration_since(Instant::now()) > Duration::from_secs(6));
+    }
+
+    #[tokio::test]
+    async fn zero_prompt_usage_preserves_retained_context_and_capacity() {
+        use crate::program_scheduling::{ArrivalTokenFacts, TokenFacts, TokenizerFingerprint};
+
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
+            token_count_verification_settlements: 0,
+            ..Default::default()
+        });
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: None,
+        };
+        let identity = ProgramIdentity::from_request(
+            None,
+            Some(&json!({"vllm_xargs":{"agentic_context":{
+                "program_id":"zero-usage", "expected_resume":true,
+                "kv_retention_ttl_seconds":7.0
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap();
+        let context = scheduler.resolve_arrival_tokens(
+            "model",
+            ArrivalTokenFacts::new(
+                2000,
+                Some(TokenFacts::prepared_token_ids(
+                    1000,
+                    TokenizerFingerprint::from_parts(&["zero-usage"]),
+                )),
+            ),
+        );
+        let dispatch = scheduler
+            .acquire(identity, context, &[target], None)
+            .await
+            .unwrap();
+        assert!(dispatch.context_token_source().is_prepared());
+        let reserved_before = scheduler.diagnostics().ranks[0].router_estimated_used_tokens;
+        scheduler.complete(&dispatch, true, false, Some(0), Some(0.1));
+
+        let snapshot = scheduler.diagnostics();
+        assert_eq!(snapshot.ranks[0].programs[0].status, "acting");
+        assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 1000);
+        assert_eq!(
+            snapshot.ranks[0].router_estimated_used_tokens,
+            reserved_before
+        );
+        let state = scheduler.state.lock();
+        let decision = &state.decisions[dispatch.program()];
+        assert_eq!(decision.last_context_tokens, Some(1000));
+        assert!(decision.last_cache_miss_impact_seconds > 0.0);
     }
 
     #[tokio::test]

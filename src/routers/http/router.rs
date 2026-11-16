@@ -407,6 +407,7 @@ impl SseUsageStripper {
 /// removed. A backend that also attaches `usage` (possibly `null`) to ordinary
 /// deltas, or emits usage alongside non-empty `choices`, must keep those
 /// frames: dropping them would lose content, tool calls and finish reasons.
+/// Error frames must also survive, even when they include usage.
 fn is_usage_sse_line(line: &[u8]) -> bool {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -416,6 +417,11 @@ fn is_usage_sse_line(line: &[u8]) -> bool {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(data.trim_ascii()) else {
         return false;
     };
+    if value.get("error").is_some_and(|error| !error.is_null())
+        || value.get("object").and_then(serde_json::Value::as_str) == Some("error")
+    {
+        return false;
+    }
     let has_usage = value.get("usage").is_some_and(|usage| !usage.is_null());
     let choices_empty = value
         .get("choices")
@@ -1219,7 +1225,7 @@ impl Router {
         model_pool: &str,
         endpoint: &str,
     ) -> Option<TokenFacts> {
-        // Default `estimated` mode and excluded pools discard the fact, so do
+        // Explicit `estimated` mode and excluded pools discard the fact, so do
         // not pay for canonical JSON + SHA-256 (or env lookups) to build it.
         let Some(scheduler) = &self.program_scheduler else {
             return None;
@@ -1776,15 +1782,7 @@ impl Router {
         } else {
             None
         };
-        let inject_include_usage = matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
-            && typed_req.is_stream()
-            && !typed_req.settlement_reports_usage()
-            && resolved_identity.is_some();
-        let settlement_observable = !matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
-            || typed_req.settlement_reports_usage()
-            || inject_include_usage;
-        // A resolved identity already passed the HTTP/mode/pool gates above;
-        // settlement is observable either directly or through injected usage.
+        // A resolved identity already passed the HTTP/mode/pool gates above.
         let exact_text_chat = resolved_identity.is_some()
             && route == "/v1/chat/completions"
             && self
@@ -1854,6 +1852,24 @@ impl Router {
             _ => None,
         };
 
+        // Build the token fact once per request, not per retry attempt. Only
+        // request extra Engine usage when there is an actual fact to verify;
+        // failed optional preparation must leave the HTTP stream untouched.
+        let prepared_facts = self.prepared_token_facts(
+            typed_req.exact_input_token_count(),
+            prepared.as_ref(),
+            model_id,
+            &model_pool.scheduler_key,
+            route,
+        );
+        let inject_include_usage = matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
+            && typed_req.is_stream()
+            && !typed_req.settlement_reports_usage()
+            && resolved_identity.is_some()
+            && prepared_facts.is_some();
+        let settlement_observable = !matches!(pool, Some(crate::backend::WorkerPoolKind::Http))
+            || typed_req.settlement_reports_usage()
+            || inject_include_usage;
         let injected_body = if inject_include_usage {
             // Completion requests retain their original JSON, including fields
             // unknown to the typed schema and explicit nulls.
@@ -1886,14 +1902,6 @@ impl Router {
             _ => typed_req.extract_text_for_routing(),
         };
         let text = &text;
-        // Build the token fact once per request, not per retry attempt.
-        let prepared_facts = self.prepared_token_facts(
-            typed_req.exact_input_token_count(),
-            prepared.as_ref(),
-            model_id,
-            &model_pool.scheduler_key,
-            route,
-        );
         let prepared = &prepared;
         let injected_body = &injected_body;
         let completion = completion.as_ref();
@@ -5985,6 +5993,17 @@ mod tests {
             stripper.push(usage_with_choices).unwrap().as_deref(),
             Some(&usage_with_choices[..])
         );
+        // Failure information is never a usage-only event. Cover both error
+        // envelopes, including a final line without a newline.
+        for error in [
+            &b"data: {\"error\":{\"message\":\"failed\"},\"usage\":{\"prompt_tokens\":3}}\n\n"[..],
+            &b"data: {\"object\":\"error\",\"message\":\"failed\",\"choices\":[],\"usage\":{\"prompt_tokens\":3}}\r\n\r\n"[..],
+        ] {
+            assert_eq!(stripper.push(error).unwrap().as_deref(), Some(error));
+            let unterminated = error.trim_ascii_end();
+            assert!(stripper.push(unterminated).unwrap().is_none());
+            assert_eq!(stripper.finish().as_deref(), Some(unterminated));
+        }
         // The final usage-only frame is dropped even when split across chunks.
         let part_a = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3";
         let part_b = b"}}\n\n";
@@ -8045,6 +8064,56 @@ mod tests {
         let diagnostic = router.program_scheduler.as_ref().unwrap().diagnostics();
         assert_eq!(diagnostic.usage_unavailable_model_pools.len(), 1);
         assert_eq!(diagnostic.verified_token_fingerprints, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_http_token_preparation_does_not_inject_or_filter_usage() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let capture = captured.clone();
+        let sse = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10}}\n\ndata: [DONE]\n\n";
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                capture.lock().push(body);
+                async move {
+                    Response::builder()
+                        .header(CONTENT_LENGTH, sse.len())
+                        .body(Body::from(sse))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut router = router_pointing_at(address);
+        router.frontend.pin_test_token_ids(vec![1; 10]);
+        router.program_scheduler = Some(Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+            exact_text_endpoints: vec!["/v1/chat/completions".into()],
+            ..Default::default()
+        })));
+        // Count preparation rejects this truncation option; the HTTP proxy
+        // still forwards it to the Engine without needing a tokenizer asset.
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"m", "messages":[{"role":"user","content":"hello"}],
+            "stream":true, "truncate_prompt_tokens":-1,
+            "vllm_xargs":{"agentic_context":{"program_id":"p","expected_resume":false}}
+        }))
+        .unwrap();
+        for _ in 0..4 {
+            let response = router
+                .route_typed_request(None, &request, "/v1/chat/completions", None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[CONTENT_LENGTH], sse.len().to_string());
+            let bytes = to_bytes(response.into_body(), 10000).await.unwrap();
+            assert_eq!(bytes.as_ref(), sse.as_bytes());
+        }
+        for body in captured.lock().iter() {
+            assert!(body.pointer("/stream_options/include_usage").is_none());
+            assert_eq!(body["truncate_prompt_tokens"], -1);
+        }
         server.abort();
     }
 
