@@ -1315,6 +1315,22 @@ impl VllmPDRouter {
         )
     }
 
+    /// Keep only workers the commitment may actually dispatch to: live,
+    /// available, serving the request model, and (for a push-addressed
+    /// Prefill) the one Decode the KV was sent to.
+    fn retain_commit_candidates(
+        candidates: &mut Vec<Arc<dyn Worker>>,
+        model_id: Option<&str>,
+        pin: Option<&PdEndpoint>,
+    ) {
+        candidates.retain(|worker| {
+            worker.is_available() && super::pd_router::model_eligible(worker.as_ref(), model_id)
+        });
+        if let Some(pin) = pin {
+            candidates.retain(|worker| &PdEndpoint::for_worker(worker.as_ref()) == pin);
+        }
+    }
+
     /// Charge the decode stage chosen against live occupancy.
     ///
     /// Runs after the Prefill response has been parsed and before the decode
@@ -1344,44 +1360,27 @@ impl VllmPDRouter {
         // Subscriptions follow the live pool, not this request's filtered view: a model
         // filter or a push pin must not unbind the other registered Decode workers.
         let pool_for_subscriptions = candidates.clone();
+        let pin = pin_to_provisional.then_some(&input.provisional_endpoint);
         // Price only what could actually be selected: an unavailable member of the live
         // pool made the whole pool refuse credit, because pricing requires every candidate
         // to succeed.
-        candidates.retain(|worker| worker.is_available());
-        // Pricing requires every candidate to succeed, so a worker that selection would
-        // discard must not be priced: a model-mismatched one used to drop the whole pool's
-        // credit and add a render round trip.
-        let priced_model = input.model_id.as_deref();
-        candidates.retain(|worker| match priced_model {
-            Some(model) => worker.model_id() == "unknown" || worker.model_id() == model,
-            None => true,
-        });
-        // A push-addressed Prefill already sent its KV to the provisional
-        // Decode, so that worker is the only one that can serve the request.
-        if pin_to_provisional {
-            candidates.retain(|worker| {
-                PdEndpoint::for_worker(worker.as_ref()) == input.provisional_endpoint
-            });
-        }
+        Self::retain_commit_candidates(&mut candidates, input.model_id.as_deref(), pin);
         // Tokenize only new, eligible endpoints; refresh prefix hits for every
         // live candidate immediately before selecting against the current
         // loads. An unavailable or model-mismatched worker must not consume the
         // preparation budget while a healthy Decode is ready.
         let mut tokens = input.decode_tokens.clone();
         if let Some(tokens) = tokens.as_mut() {
-            let missing: Vec<_> = candidates
-                .iter()
-                .filter(|worker| {
-                    !tokens.contains_key(worker.base_url())
-                        && worker.is_available()
-                        && input.model_id.as_deref().is_none_or(|model| {
-                            worker.model_id() == "unknown" || worker.model_id() == model
-                        })
-                })
-                .cloned()
-                .collect();
-            if !missing.is_empty() {
-                if let Some(new_tokens) = self
+            loop {
+                let missing: Vec<_> = candidates
+                    .iter()
+                    .filter(|worker| !tokens.contains_key(worker.base_url()))
+                    .cloned()
+                    .collect();
+                if missing.is_empty() {
+                    break;
+                }
+                let Some(new_tokens) = self
                     .pd_router
                     .prepare_decode_inputs(
                         &missing,
@@ -1391,17 +1390,18 @@ impl VllmPDRouter {
                         input.router_prompts.as_ref(),
                     )
                     .await
-                {
-                    tokens.extend(new_tokens);
+                else {
+                    break;
+                };
+                let before = tokens.len();
+                tokens.extend(new_tokens);
+                if tokens.len() == before {
+                    break;
                 }
-                // The pool can change while that await runs: re-read it so the
-                // selection and the cache scoring see the same live set.
+                // The pool can change while that await runs: re-read it and
+                // reapply every filter, not just the pin.
                 candidates = self.live_decode_candidates(input.pool);
-                if pin_to_provisional {
-                    candidates.retain(|worker| {
-                        PdEndpoint::for_worker(worker.as_ref()) == input.provisional_endpoint
-                    });
-                }
+                Self::retain_commit_candidates(&mut candidates, input.model_id.as_deref(), pin);
             }
         }
         let decode_cache = tokens.as_ref().and_then(|tokens| {
@@ -1437,6 +1437,14 @@ impl VllmPDRouter {
                 .await
         }
         .await;
+        // Pricing renders the request against every candidate and can wait on a
+        // slow backend. The pool may have changed meanwhile: a removed worker
+        // must not be committed from the stale list, and a newly registered one
+        // has no price yet. Re-read and reapply the filters; the completeness
+        // check in `select_stage` then falls back to occupancy when the new
+        // candidate is missing from `decode_context`.
+        candidates = self.live_decode_candidates(input.pool);
+        Self::retain_commit_candidates(&mut candidates, input.model_id.as_deref(), pin);
         let context = PdRequestContext {
             prefill_inputs: None,
             model_id: input.model_id.as_deref(),
@@ -5777,6 +5785,162 @@ mod tests {
             d0_rx.try_recv().is_err(),
             "the pinned Decode is gone, so nothing else may serve the push"
         );
+    }
+
+    /// Pricing renders the prompt against every Decode candidate. A worker
+    /// removed during that render is absent from the registry by the time the
+    /// decision is charged, so it must not receive the generation request.
+    #[tokio::test]
+    async fn removed_decode_during_pricing_is_not_committed() {
+        use crate::config::{KvConnector, PolicyConfig, RouterConfig, RoutingMode};
+        use axum::{
+            extract::State,
+            http::{Method, StatusCode},
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::sync::{mpsc, Semaphore};
+
+        #[derive(Clone)]
+        struct DecodePricing {
+            entered: mpsc::UnboundedSender<()>,
+            gate: Arc<Semaphore>,
+            generations: Arc<AtomicUsize>,
+        }
+
+        async fn render(State(state): State<DecodePricing>) -> Json<Value> {
+            state.entered.send(()).unwrap();
+            state.gate.acquire().await.unwrap().forget();
+            Json(json!({"token_ids": [1, 2, 3]}))
+        }
+
+        async fn generate(State(state): State<DecodePricing>) -> Json<Value> {
+            state.generations.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"choices": [{"text": "removed worker answered"}]}))
+        }
+
+        let prefill_app = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/query",
+                get(|| async { Json(json!({"0": {"engine_id": "P"}})) }),
+            )
+            .route(
+                "/v1/completions/render",
+                post(|| async { Json(json!({"token_ids": [1, 2, 3]})) }),
+            )
+            .route(
+                "/v1/completions",
+                post(|| async {
+                    Json(json!({"kv_transfer_params": {
+                        "transfer_id": "t",
+                        "remote_engine_id": "P",
+                        "remote_bootstrap_addr": "127.0.0.1:1234",
+                    }}))
+                }),
+            );
+        let p = spawn_test_server(prefill_app).await;
+        let bootstrap_port = p.rsplit(':').next().unwrap().parse().unwrap();
+
+        let (entered, mut events) = mpsc::unbounded_channel();
+        let gate = Arc::new(Semaphore::new(0));
+        let generations = Arc::new(AtomicUsize::new(0));
+        let decode_app = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/v1/models",
+                get(|| async { Json(json!({"data": [{"id": "m", "parent": null}]})) }),
+            )
+            .route("/v1/completions/render", post(render))
+            .route("/v1/completions", post(generate))
+            .with_state(DecodePricing {
+                entered,
+                gate: gate.clone(),
+                generations: generations.clone(),
+            });
+        let d = spawn_test_server(decode_app).await;
+
+        let publisher_context = zmq::Context::new();
+        let publisher = publisher_context.socket(zmq::PUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let config = RouterConfig {
+            kv_connector: KvConnector::Mooncake,
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(p.clone(), Some(bootstrap_port))],
+                decode_urls: vec![d.clone()],
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: Some(PolicyConfig::KvAware {
+                    router_temperature: 0.0,
+                    kv_penalty_host: 0.8,
+                    kv_penalty_external: 0.6,
+                    kv_penalty_disk: 0.3,
+                    static_kv_event_sources: Default::default(),
+                }),
+                discovery_address: None,
+            },
+            policy: PolicyConfig::RoundRobin,
+            pd_kv_event_sources: HashMap::from([(
+                d.clone(),
+                crate::config::types::PdKvEventSources {
+                    endpoints: vec![endpoint],
+                    replay_endpoints: None,
+                    block_size: 16,
+                    model: Some("m".to_owned()),
+                },
+            )]),
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+        let ctx = Arc::new(
+            crate::server::AppContext::new(config, reqwest::Client::new(), 64, None, vec![])
+                .unwrap(),
+        );
+        ctx.policy_registry
+            .set_prefill_policy(Arc::new(crate::policies::RoundRobinPolicy::new()));
+        ctx.policy_registry
+            .set_decode_policy(Arc::new(crate::policies::KvAwarePolicy::default()));
+        let router = Arc::new(
+            VllmPDRouter::new(
+                vec![(p.clone(), Some(bootstrap_port))],
+                vec![d.clone()],
+                None,
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        let runner = router.clone();
+        let request = tokio::spawn(async move {
+            runner
+                .route_transparent(
+                    None,
+                    "/v1/completions",
+                    &Method::POST,
+                    json!({"model": "m", "prompt": "hello", "stream": false, "max_tokens": 2}),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        router.remove_decode_server(&d).await.unwrap();
+        assert!(ctx.worker_registry.get_decode_workers().is_empty());
+        gate.add_permits(1);
+        let response = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            generations.load(Ordering::SeqCst),
+            0,
+            "a removed Decode worker received the generation request"
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// A push-addressed Prefill sent its KV to the provisional Decode: the

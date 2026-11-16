@@ -581,12 +581,6 @@ impl PdKvState {
         inputs.decode_policy = Some(policy.clone());
     }
 
-    #[cfg(test)]
-    pub(super) async fn pool_sizes(&self) -> (usize, usize) {
-        let inputs = self.refresh_inputs.lock().await;
-        (inputs.prefill.len(), inputs.decode.len())
-    }
-
     /// One snapshot of which bases may be credited, keyed by base URL.
     async fn credit_by_base(&self, request: &Value) -> HashMap<String, bool> {
         let bindings = self.bindings.lock().await;
@@ -834,9 +828,6 @@ impl PdKvState {
         Some(context)
     }
 
-    /// Same, with a hash cache the caller may share with the Prefill estimate so one
-    /// request hashes its prompt once.
-    #[allow(clippy::too_many_arguments)]
     /// Marginal Decode context per candidate, priced against the KV index.
     /// `hashes` is the caller's cache: the admission path shares it with the
     /// Prefill estimate, while the deferred commit starts a fresh one because it
@@ -876,68 +867,6 @@ impl PdKvState {
             .tokenize(bases, request, route, headers, router_prompts)
             .await;
         Self::decode_context_from_results(kv, workers, &allow_credit, &results, hashes)
-    }
-
-    /// `router_prompts` are the router's own token ids for `grpc://` pools;
-    /// HTTP pools pass `None` and render through each backend.
-    /// Kept for callers that prepare one stage on its own; the request path uses
-    /// [`Self::prepare_with`] so both stages share one hash cache.
-    #[allow(dead_code)]
-    pub(super) async fn prepare(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        policy: &Arc<dyn LoadBalancingPolicy>,
-        request: &Value,
-        route: &str,
-        headers: Option<&HeaderMap>,
-        router_prompts: Option<&Arc<[Vec<u32>]>>,
-    ) -> HashMap<String, PdPrefillInput> {
-        self.prepare_with(
-            workers,
-            policy,
-            request,
-            route,
-            headers,
-            router_prompts,
-            &mut PromptHashes::new(),
-        )
-        .await
-    }
-
-    /// Same, with a hash cache the caller may share with the Decode estimate so one
-    /// request hashes its prompt once.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn prepare_with(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        policy: &Arc<dyn LoadBalancingPolicy>,
-        request: &Value,
-        route: &str,
-        headers: Option<&HeaderMap>,
-        router_prompts: Option<&Arc<[Vec<u32>]>>,
-        hashes: &mut PromptHashes,
-    ) -> HashMap<String, PdPrefillInput> {
-        let started = Instant::now();
-        {
-            let mut inputs = self.refresh_inputs.lock().await;
-            inputs.prefill = workers.iter().cloned().collect();
-            inputs.prefill_policy = Some(policy.clone());
-        }
-        let allow_credit = self.credit_by_base(request).await;
-        let bases = workers
-            .iter()
-            .map(|worker| worker.base_url().to_owned())
-            .collect();
-        let results = self
-            .tokenize(bases, request, route, headers, router_prompts)
-            .await;
-        let mut prepared = Self::build_prefill_inputs(request, &allow_credit, results);
-        if let Some(kv) = kv_aware_ops(policy.as_ref()) {
-            Self::attach_prefill_work(kv, workers, &mut prepared, hashes);
-        }
-        metrics::histogram!("vllm_router_pd_kv_prepare_seconds")
-            .record(started.elapsed().as_secs_f64());
-        prepared
     }
 }
 
@@ -1055,6 +984,32 @@ mod kv_input_tests {
     use reqwest::Client;
     use serde_json::json;
 
+    /// Exercise the same preparation entry point as the request path. Decode is
+    /// deferred so these prefill-only tests need no Decode pool.
+    async fn prepare_prefill(
+        state: &PdKvState,
+        workers: &[Arc<dyn Worker>],
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+    ) -> HashMap<String, PdPrefillInput> {
+        state
+            .prepare_stages(
+                workers,
+                policy,
+                &[],
+                policy,
+                request,
+                route,
+                headers,
+                None,
+                true,
+            )
+            .await
+            .0
+    }
+
     #[tokio::test]
     async fn unsupported_inputs_fall_back_without_control_or_tokenization_requests() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1090,9 +1045,7 @@ mod kv_input_tests {
                 json!({"model":"m","input":"hello","previous_response_id":"resp_1"}),
             ),
         ] {
-            let prepared = state
-                .prepare(&workers, &policy, &request, route, None, None)
-                .await;
+            let prepared = prepare_prefill(&state, &workers, &policy, &request, route, None).await;
             let input = &prepared[&base];
             assert!(input.prompts.is_none());
             assert!(input.work_by_rank.is_empty());
@@ -1163,16 +1116,15 @@ mod kv_input_tests {
             state
                 .bind(&workers, kv_aware_ops(policy.as_ref()).unwrap())
                 .await;
-            let inputs = state
-                .prepare(
-                    &workers,
-                    &policy,
-                    &json!({"model":"m","prompt":"hello"}),
-                    "/v1/completions",
-                    Some(&headers),
-                    None,
-                )
-                .await;
+            let inputs = prepare_prefill(
+                &state,
+                &workers,
+                &policy,
+                &json!({"model":"m","prompt":"hello"}),
+                "/v1/completions",
+                Some(&headers),
+            )
+            .await;
             assert_eq!(
                 inputs[&base].prompts.as_deref(),
                 Some([vec![7, 8, 9]].as_slice())
@@ -1268,9 +1220,8 @@ mod kv_input_tests {
                 probes.load(Ordering::Relaxed),
                 if static_source { 0 } else { 2 }
             );
-            let initial = state
-                .prepare(&workers, &policy, &request, "/v1/completions", None, None)
-                .await;
+            let initial =
+                prepare_prefill(&state, &workers, &policy, &request, "/v1/completions", None).await;
             assert_eq!(initial[&base].work_by_rank[&None].new_prefill_tokens, 33);
             assert!(initial[&base].work_by_rank[&None].placement_verified);
             let payload = rmp_serde::to_vec(&(
@@ -1301,9 +1252,8 @@ mod kv_input_tests {
             })
             .await
             .expect("subscriber should ingest the warm prefix");
-            let warm = state
-                .prepare(&workers, &policy, &request, "/v1/completions", None, None)
-                .await;
+            let warm =
+                prepare_prefill(&state, &workers, &policy, &request, "/v1/completions", None).await;
             assert_eq!(warm[&base].work_by_rank[&None].new_prefill_tokens, 1);
             assert!(warm[&base].work_by_rank[&None].placement_verified);
             if !static_source {
@@ -1327,9 +1277,9 @@ mod kv_input_tests {
                 assert!(state.supervisor.match_provider_for_worker(&base).is_some());
                 assert_eq!(provider.find_tiered_matches(&query).len(), 1);
                 assert!(state.bindings.lock().await[&base].info.is_none());
-                let fallback = state
-                    .prepare(&workers, &policy, &request, "/v1/completions", None, None)
-                    .await;
+                let fallback =
+                    prepare_prefill(&state, &workers, &policy, &request, "/v1/completions", None)
+                        .await;
                 assert_eq!(fallback[&base].work_by_rank[&None].new_prefill_tokens, 33);
                 assert!(!fallback[&base].work_by_rank[&None].placement_verified);
                 assert_eq!(probes.load(Ordering::Relaxed), 4);
@@ -1375,31 +1325,71 @@ mod kv_input_tests {
     }
 
     #[tokio::test]
-    async fn start_registers_the_decode_pool_before_any_request() {
+    async fn start_registers_and_prices_both_pools_before_any_request() {
         // A Decode pool recorded lazily from the request path has no binding for
         // one refresh tick, and a burst admitted inside that tick loses the
-        // credit its configuration asked for. Both pools must be present from
-        // construction.
+        // credit its configuration asked for. Pool sizes alone cannot prove the
+        // bind finished, so assert the pricing gate the request path uses.
+        use axum::{routing::get, Json, Router};
+
+        async fn serve_models() -> (String, tokio::task::JoinHandle<()>) {
+            let app = Router::new().route(
+                "/v1/models",
+                get(|| async { Json(json!({"data":[{"id":"m","parent":null}]})) }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (base, task)
+        }
+
+        let publisher_context = zmq::Context::new();
+        let publisher_p = publisher_context.socket(zmq::PUB).unwrap();
+        publisher_p.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint_p = publisher_p.get_last_endpoint().unwrap().unwrap();
+        let publisher_d = publisher_context.socket(zmq::PUB).unwrap();
+        publisher_d.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint_d = publisher_d.get_last_endpoint().unwrap().unwrap();
+        let sources = |endpoint: String| crate::config::types::PdKvEventSources {
+            endpoints: vec![endpoint],
+            replay_endpoints: None,
+            block_size: 16,
+            model: Some("m".to_owned()),
+        };
+        let (p_base, p_task) = serve_models().await;
+        let (d_base, d_task) = serve_models().await;
         let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
         let prefill: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
-            "http://p0".to_owned(),
+            p_base.clone(),
             WorkerType::Prefill {
                 bootstrap_port: None,
             },
         ))];
         let decode: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
-            "http://d0".to_owned(),
+            d_base.clone(),
             WorkerType::Decode,
         ))];
         let state = PdKvState::start(
             reqwest::Client::new(),
             None,
-            HashMap::new(),
-            (prefill, Some(policy.clone())),
-            (decode, Some(policy)),
+            HashMap::from([
+                (p_base.clone(), sources(endpoint_p)),
+                (d_base.clone(), sources(endpoint_d)),
+            ]),
+            (prefill.clone(), Some(policy.clone())),
+            (decode.clone(), Some(policy)),
         )
         .await;
-        assert_eq!(state.pool_sizes().await, (1, 1));
+        let credit = state.credit_by_base(&json!({"model":"m"})).await;
+        assert_eq!(credit.get(&p_base), Some(&true));
+        assert_eq!(credit.get(&d_base), Some(&true));
+        assert!(state.all_priceable(&prefill, None, &credit).await);
+        assert!(
+            state.all_priceable(&decode, None, &credit).await,
+            "Decode must be priceable before the first request"
+        );
+        p_task.abort();
+        d_task.abort();
     }
 
     #[tokio::test]
@@ -1464,9 +1454,8 @@ mod kv_input_tests {
 
         // First bind: discovery succeeds and installs a binding with info.
         state.bind(&workers, ops).await;
-        let inputs = state
-            .prepare(&workers, &policy, &request, "/v1/completions", None, None)
-            .await;
+        let inputs =
+            prepare_prefill(&state, &workers, &policy, &request, "/v1/completions", None).await;
         assert!(inputs[&base].allow_credit);
         {
             let bindings = state.bindings.lock().await;
@@ -1480,9 +1469,8 @@ mod kv_input_tests {
         for expected_failures in 1..MAX_PROBE_FAILURES {
             rewind(&state, &base).await;
             state.bind(&workers, ops).await;
-            let inputs = state
-                .prepare(&workers, &policy, &request, "/v1/completions", None, None)
-                .await;
+            let inputs =
+                prepare_prefill(&state, &workers, &policy, &request, "/v1/completions", None).await;
             assert!(
                 inputs[&base].allow_credit,
                 "retained binding keeps credit authority"
@@ -1499,9 +1487,8 @@ mod kv_input_tests {
         // and tears the subscriber down.
         rewind(&state, &base).await;
         state.bind(&workers, ops).await;
-        let inputs = state
-            .prepare(&workers, &policy, &request, "/v1/completions", None, None)
-            .await;
+        let inputs =
+            prepare_prefill(&state, &workers, &policy, &request, "/v1/completions", None).await;
         assert!(!inputs[&base].allow_credit);
         let bindings = state.bindings.lock().await;
         let binding = bindings

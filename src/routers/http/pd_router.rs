@@ -598,11 +598,12 @@ fn build_dp_workers(
 }
 
 impl PdRouterBase {
-    /// `router_prompts` are the router's token ids for `grpc://` pools. HTTP
-    /// pools pass `None` and each backend renders the request itself.
-    /// Kept for callers that prepare Prefill on its own; the request path uses
-    /// [`Self::prepare_prefill_inputs_with`] so both stages share one hash cache.
-    #[allow(dead_code)]
+    /// Prepare Prefill inputs for a deployment without shared KV state.
+    ///
+    /// KV-aware pools use `PdKvState::prepare_stages` from the request path,
+    /// which is the only caller that shares one hash cache between Prefill and
+    /// Decode. This helper therefore only serves the cache_aware/no-KV case and
+    /// deliberately takes no hash cache: no production caller shares one.
     pub(super) async fn prepare_prefill_inputs(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -611,46 +612,8 @@ impl PdRouterBase {
         headers: Option<&HeaderMap>,
         router_prompts: Option<&Arc<[Vec<u32>]>>,
     ) -> Option<HashMap<String, super::pd_types::PdPrefillInput>> {
-        self.prepare_prefill_inputs_with(
-            workers,
-            request,
-            route,
-            headers,
-            router_prompts,
-            &mut crate::policies::PromptHashes::new(),
-        )
-        .await
-    }
-
-    /// Same, with a hash cache the caller may share with the Decode estimate.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn prepare_prefill_inputs_with(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        request: &Value,
-        route: &str,
-        headers: Option<&HeaderMap>,
-        router_prompts: Option<&Arc<[Vec<u32>]>>,
-        hashes: &mut crate::policies::PromptHashes,
-    ) -> Option<HashMap<String, super::pd_types::PdPrefillInput>> {
         let policy = self.policy_registry.get_prefill_policy();
-        if kv_aware_ops(policy.as_ref()).is_some() {
-            return Some(
-                self.kv_state
-                    .as_ref()?
-                    .prepare_with(
-                        workers,
-                        &policy,
-                        request,
-                        route,
-                        headers,
-                        router_prompts,
-                        hashes,
-                    )
-                    .await,
-            );
-        }
-        if policy.name() != "cache_aware" {
+        if kv_aware_ops(policy.as_ref()).is_some() || policy.name() != "cache_aware" {
             return None;
         }
         let results = self
@@ -3139,6 +3102,15 @@ mod admission_tests {
             sample(&manager, Stage::Decode, &decision.endpoint).pending_decode_requests,
             1
         );
+        assert_eq!(
+            sample(&manager, Stage::Decode, &decision.endpoint).unknown_decode_requests,
+            1,
+            "the placeholder had no known prompt length"
+        );
+        assert_eq!(
+            sample(&manager, Stage::Decode, &decision.endpoint).pending_decode_tokens,
+            0
+        );
         // A second commit is a no-op on the books.
         assert!(manager
             .commit_decode(&attempt, |loads| {
@@ -3155,6 +3127,69 @@ mod admission_tests {
             sample(&manager, Stage::Decode, &decision.endpoint).active_decode_requests,
             1
         );
+        assert_eq!(
+            sample(&manager, Stage::Decode, &decision.endpoint).active_decode_tokens,
+            0
+        );
+        assert_eq!(
+            sample(&manager, Stage::Decode, &decision.endpoint).unknown_decode_requests,
+            1
+        );
+        attempt.finish_prefill();
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn deferred_decode_tokens_move_from_pending_to_active_and_release() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d = pool("d", 1);
+        let policy = KvAwarePolicy::default();
+        let (_, attempt) = manager
+            .admit_deferred(|loads| {
+                let mut selection =
+                    select_pd_pair(loads, &p, &d, &policy, &policy, &context(), false)?;
+                // The admission-time Prefill estimate is the request's logical
+                // context; the Decode ledger must charge it once.
+                selection.prefill.new_prefill_tokens = Some(17);
+                selection.prefill.credited_prefix_tokens = Some(0);
+                Some(selection)
+            })
+            .unwrap();
+        let decision = manager
+            .commit_decode(&attempt, |loads| {
+                select_decode_stage(loads, &d, &policy, &context())
+            })
+            .unwrap();
+        assert_eq!(
+            sample(&manager, Stage::Decode, &decision.endpoint).pending_decode_tokens,
+            17
+        );
+        assert_eq!(
+            sample(&manager, Stage::Decode, &decision.endpoint).active_decode_tokens,
+            0
+        );
+        assert_eq!(
+            sample(&manager, Stage::Decode, &decision.endpoint).unknown_decode_requests,
+            0
+        );
+
+        attempt.begin_decode();
+        assert_eq!(
+            sample(&manager, Stage::Decode, &decision.endpoint).pending_decode_tokens,
+            0
+        );
+        assert_eq!(
+            sample(&manager, Stage::Decode, &decision.endpoint).active_decode_tokens,
+            17
+        );
+
+        attempt.finish_decode();
+        let after = sample(&manager, Stage::Decode, &decision.endpoint);
+        assert_eq!(after.pending_decode_tokens, 0);
+        assert_eq!(after.active_decode_tokens, 0);
+        assert_eq!(after.unknown_decode_requests, 0);
         attempt.finish_prefill();
         drop(attempt);
         assert!(manager.snapshot().is_empty());
