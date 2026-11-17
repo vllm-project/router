@@ -763,6 +763,7 @@ impl Drop for CacheAwarePolicy {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};

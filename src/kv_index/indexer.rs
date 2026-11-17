@@ -49,6 +49,7 @@ std::thread_local! {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn after_anchor_clone() {
     let hook = AFTER_ANCHOR_CLONE.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
@@ -57,6 +58,7 @@ fn after_anchor_clone() {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn after_query_edge() {
     let hook = AFTER_QUERY_EDGE.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
@@ -579,6 +581,7 @@ impl KvBlockIndexer {
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn source_generation_for_test(&self) -> u64 {
         self.source_generation.load(Ordering::Acquire)
     }
@@ -614,6 +617,7 @@ impl crate::policies::TieredMatchProvider for KvBlockIndexer {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::{cell::Cell, rc::Rc};
 
