@@ -2390,6 +2390,15 @@ impl Router {
 
     pub fn remove_worker(&self, worker_url: &str) {
         if self.intra_node_data_parallel_size > 1 {
+            if let Some(removed_worker) = self
+                .worker_registry
+                .remove_by_url_if(worker_url, |w| w.worker_type() == WorkerType::Encode)
+            {
+                self.frontend.remove_worker(worker_url);
+                info!("Removed Encode worker: {}", removed_worker.url());
+                return;
+            }
+
             // remove dp-aware workers in a prefix-matching fashion
             // without contacting the remote worker
             let mut removed_workers: Vec<String> = Vec::new();

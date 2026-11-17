@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 use vllm_router_rs::{
     config::{ConfigValidator, EpdConfig, PolicyConfig, RouterConfig, RoutingMode},
+    core::WorkerType,
     policies::{CacheAwareCandidate, CacheAwarePolicy, LoadBalancingPolicy},
     routers::{
         router_manager::{RouterId, RouterManager},
@@ -151,6 +152,131 @@ async fn assert_epd_list_to_detail(pd: bool) {
 #[tokio::test]
 async fn regular_epd_workers_list_to_detail() {
     assert_epd_list_to_detail(false).await;
+}
+
+#[tokio::test]
+async fn regular_epd_dp_http_delete_removes_exact_encode_worker() {
+    let backend = Router::new().fallback(|| async { "ok" });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+
+    let consumer_url = format!("{base}/pd");
+    let encoder_url = format!("{base}/e");
+    let retained_encoder_url = format!("{base}/e2");
+    let config = RouterConfig {
+        mode: RoutingMode::Regular {
+            worker_urls: vec![consumer_url.clone()],
+        },
+        policy: PolicyConfig::RoundRobin,
+        intra_node_data_parallel_size: 2,
+        epd: Some(EpdConfig {
+            encoder_urls: vec![encoder_url.clone(), retained_encoder_url.clone()],
+            encode_policy: Some(PolicyConfig::RoundRobin),
+            consumer_zmq_addrs: Default::default(),
+        }),
+        worker_startup_timeout_secs: 5,
+        ..RouterConfig::default()
+    };
+    ConfigValidator::validate(&config).unwrap();
+    let context =
+        Arc::new(AppContext::new(config, reqwest::Client::new(), 64, None, vec![]).unwrap());
+    let router: Arc<dyn RouterTrait> =
+        Arc::from(RouterFactory::create_router(&context).await.unwrap());
+    let mut consumer_urls = router.get_worker_urls();
+    consumer_urls.sort();
+    assert_eq!(
+        consumer_urls,
+        vec![format!("{consumer_url}@0"), format!("{consumer_url}@1")]
+    );
+
+    let initial_counts = context.policy_registry.get_worker_counts();
+    let app = build_app_with_request_tracing(
+        Arc::new(AppState {
+            router: router.clone(),
+            context: context.clone(),
+            concurrency_queue_tx: None,
+            router_manager: None,
+        }),
+        1024 * 1024,
+        vec![],
+        vec![],
+        false,
+        false,
+    );
+
+    let encoded_url: String =
+        url::form_urlencoded::byte_serialize(encoder_url.as_bytes()).collect();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/workers/{encoded_url}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let deletion: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
+    assert_eq!(deletion["success"], true);
+
+    assert!(context.worker_registry.get_by_url(&encoder_url).is_none());
+    assert!(context
+        .worker_registry
+        .get_by_url(&retained_encoder_url)
+        .is_some());
+    assert_eq!(context.policy_registry.get_worker_counts(), initial_counts);
+    assert_eq!(router.get_worker_urls(), consumer_urls);
+
+    let encode_pool = context.worker_registry.get_by_type(&WorkerType::Encode);
+    assert_eq!(encode_pool.len(), 1);
+    let selected_index = context
+        .policy_registry
+        .get_encode_policy()
+        .unwrap()
+        .select_worker(&encode_pool, None)
+        .unwrap();
+    assert_eq!(encode_pool[selected_index].url(), retained_encoder_url);
+
+    let list_response = app
+        .clone()
+        .oneshot(Request::get("/workers").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let list: Value =
+        serde_json::from_slice(&to_bytes(list_response.into_body(), 16384).await.unwrap()).unwrap();
+    assert_eq!(list["stats"]["encode_count"], 1);
+    assert!(list["workers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|worker| worker["url"] != encoder_url));
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/workers/{encoded_url}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), StatusCode::NOT_FOUND);
+
+    let encoded_consumer: String =
+        url::form_urlencoded::byte_serialize(consumer_url.as_bytes()).collect();
+    let response = app
+        .oneshot(
+            Request::delete(format!("/workers/{encoded_consumer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(router.get_worker_urls().is_empty());
+    server.abort();
 }
 
 #[tokio::test]
