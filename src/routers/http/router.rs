@@ -1,6 +1,6 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
-use super::kv_observation::{observe_json_response, observe_json_stream, observe_unavailable};
 use super::program_adapter::ProgramCompletion;
+use super::response_usage::{observe_json_response, observe_json_stream, observe_unavailable};
 use crate::backend::health::check_grpc_health_within;
 use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
 use crate::backend::{

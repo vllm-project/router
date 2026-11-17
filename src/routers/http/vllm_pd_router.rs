@@ -1,11 +1,11 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
-use super::kv_observation::{observe_merged_json, observe_unavailable, SseUsageObservation};
 use super::logprobs_merge;
 use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext};
+use super::response_usage::{observe_merged_json, observe_unavailable, SseUsageObservation};
 use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
 use super::usage_stream;

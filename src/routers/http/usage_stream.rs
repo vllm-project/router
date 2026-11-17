@@ -1,7 +1,7 @@
 //! One bounded SSE framer for transparent observation and P/D reconciliation.
 
 use super::{
-    kv_observation::SseUsageObservation,
+    response_usage::SseUsageObservation,
     sse::{sse_lines, FrameScanner},
     usage_merge,
 };

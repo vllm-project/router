@@ -4,7 +4,10 @@ use crate::metrics::RouterMetrics;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// Shared budget for JSON observation and SSE framing/reconciliation.
+/// Shared limit for the retained JSON observation body, the SSE frame
+/// accumulator, and the post-reconciliation SSE frame size check. JSON overflow
+/// discards the sample; SSE overflow makes the frame unavailable for observation
+/// (accumulator overflow also switches that frame to passthrough).
 pub(crate) const MAX_USAGE_BYTES: usize = 1024 * 1024;
 
 /// Multi-prompt usage cannot carry a comparable aggregate count under the
@@ -57,7 +60,7 @@ impl KvRouteAttempt {
             .map(Self::new)
     }
 
-    pub(crate) fn record_once(&self, observation: CacheObservation) {
+    pub(crate) fn record_once(&self, observation: Result<u64, UnavailableReason>) {
         if self
             .finished
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -73,9 +76,7 @@ impl KvRouteAttempt {
 
 impl Drop for KvRouteAttempt {
     fn drop(&mut self) {
-        self.record_once(CacheObservation::Unavailable(
-            UnavailableReason::AttemptCancelled,
-        ));
+        self.record_once(Err(UnavailableReason::AttemptCancelled));
     }
 }
 
@@ -94,6 +95,8 @@ pub(crate) enum UnavailableReason {
     IncompleteSseFrame,
     InvalidUsage,
     MalformedUsage,
+    /// SSE did not reach a clean EOF: either the upstream body failed or the
+    /// downstream client cancelled. Both use the `stream_error` metric label.
     StreamError,
     PdUsageNotComparable,
 }
@@ -120,41 +123,18 @@ impl UnavailableReason {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CacheObservation {
-    Observed(u64),
-    Unavailable(UnavailableReason),
-}
-
-// All exported reason labels come from this closed set, including success.
-enum OutcomeReason {
-    None,
-    Unavailable(UnavailableReason),
-}
-impl OutcomeReason {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Unavailable(reason) => reason.as_str(),
-        }
-    }
-}
-
-fn record_observation(prediction: &KvRoutePrediction, observation: CacheObservation) {
-    let observation = if matches!(prediction, KvRoutePrediction::MultiPrompt { .. })
-        && matches!(observation, CacheObservation::Observed(_))
-    {
-        CacheObservation::Unavailable(UnavailableReason::MultiPromptUsageNotAggregate)
-    } else {
-        observation
-    };
+fn record_observation(prediction: &KvRoutePrediction, observation: Result<u64, UnavailableReason>) {
+    let observation =
+        if matches!(prediction, KvRoutePrediction::MultiPrompt { .. }) && observation.is_ok() {
+            Err(UnavailableReason::MultiPromptUsageNotAggregate)
+        } else {
+            observation
+        };
     let (status, reason, actual_cached_tokens) = match observation {
-        CacheObservation::Observed(tokens) => ("observed", OutcomeReason::None, Some(tokens)),
-        CacheObservation::Unavailable(reason) => {
-            ("unavailable", OutcomeReason::Unavailable(reason), None)
-        }
+        Ok(tokens) => ("observed", None, Some(tokens)),
+        Err(reason) => ("unavailable", Some(reason), None),
     };
-    let reason = reason.as_str();
+    let reason = reason.map_or("none", UnavailableReason::as_str);
     RouterMetrics::record_kv_route_outcome(
         status,
         reason,
@@ -218,7 +198,7 @@ mod tests {
                     };
                     let attempt = KvRouteAttempt::new(prediction);
                     if let Some(actual) = actual {
-                        attempt.record_once(CacheObservation::Observed(actual));
+                        attempt.record_once(Ok(actual));
                     }
                 });
                 let reason = if actual.is_none() {
@@ -253,7 +233,7 @@ mod tests {
     fn accuracy_pairs_preserve_error_direction() {
         let metrics = render(|| {
             for actual in [16, 32, 48] {
-                KvRouteAttempt::new(prediction()).record_once(CacheObservation::Observed(actual));
+                KvRouteAttempt::new(prediction()).record_once(Ok(actual));
             }
         });
         for kind in ["predicted", "actual"] {
@@ -272,12 +252,10 @@ mod tests {
         let metrics = render(|| {
             let attempt = KvRouteAttempt::new(prediction());
             let clone = attempt.clone();
-            attempt.record_once(CacheObservation::Unavailable(
-                UnavailableReason::RequestError,
-            ));
-            clone.record_once(CacheObservation::Observed(32));
+            attempt.record_once(Err(UnavailableReason::RequestError));
+            clone.record_once(Ok(32));
             assert!(attempt.is_finished());
-            KvRouteAttempt::new(prediction()).record_once(CacheObservation::Observed(32));
+            KvRouteAttempt::new(prediction()).record_once(Ok(32));
         });
         assert!(
             has_outcome(&metrics, "unavailable", "request_error"),

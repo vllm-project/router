@@ -1,6 +1,6 @@
 //! HTTP adapters for the shared attempt accounting kernel.
 use super::usage_merge;
-use crate::kv_observation::{CacheObservation, KvRouteAttempt, UnavailableReason, MAX_USAGE_BYTES};
+use crate::kv_observation::{KvRouteAttempt, UnavailableReason, MAX_USAGE_BYTES};
 use bytes::Bytes;
 use futures_util::{stream, Stream, StreamExt};
 use http::StatusCode;
@@ -23,17 +23,13 @@ fn http_failure(status: StatusCode) -> Option<UnavailableReason> {
 /// Program-tracked responses already buffer their body for completion accounting.
 pub(super) fn observe_json_response(attempt: &KvRouteAttempt, status: StatusCode, body: &[u8]) {
     let observation = if let Some(reason) = http_failure(status) {
-        CacheObservation::Unavailable(reason)
+        Err(reason)
     } else if body.len() > MAX_USAGE_BYTES {
-        CacheObservation::Unavailable(UnavailableReason::OversizedJson)
+        Err(UnavailableReason::OversizedJson)
     } else {
         match serde_json::from_slice::<Value>(body) {
-            Ok(value) => usage_merge::cached_tokens(&value)
-                .map(CacheObservation::Observed)
-                .unwrap_or(CacheObservation::Unavailable(
-                    UnavailableReason::MissingUsage,
-                )),
-            Err(_) => CacheObservation::Unavailable(UnavailableReason::MalformedJson),
+            Ok(value) => usage_merge::cached_tokens(&value).ok_or(UnavailableReason::MissingUsage),
+            Err(_) => Err(UnavailableReason::MalformedJson),
         }
     };
     attempt.record_once(observation);
@@ -128,11 +124,7 @@ impl Drop for JsonUsageObservation {
 }
 
 pub(super) fn observe_merged_json(attempt: &KvRouteAttempt, merged: &Value) {
-    let observation = usage_merge::cached_tokens(merged)
-        .map(CacheObservation::Observed)
-        .unwrap_or(CacheObservation::Unavailable(
-            UnavailableReason::MissingUsage,
-        ));
+    let observation = usage_merge::cached_tokens(merged).ok_or(UnavailableReason::MissingUsage);
     attempt.record_once(observation);
 }
 
@@ -146,7 +138,7 @@ pub(super) fn observe_unavailable(
     } else {
         http_failure(status).unwrap_or(reason)
     };
-    attempt.record_once(CacheObservation::Unavailable(reason));
+    attempt.record_once(Err(reason));
 }
 
 /// Receives parsed values from the one HTTP SSE framer. Only KvRouteAttempt's
@@ -208,15 +200,15 @@ impl SseUsageObservation {
             return;
         }
         let observation = if let Some(reason) = http_failure(self.status).or(self.fallback_reason) {
-            CacheObservation::Unavailable(reason)
+            Err(reason)
         } else if self.incomplete {
-            CacheObservation::Unavailable(UnavailableReason::IncompleteSseFrame)
+            Err(UnavailableReason::IncompleteSseFrame)
         } else if !succeeded {
-            CacheObservation::Unavailable(UnavailableReason::StreamError)
+            Err(UnavailableReason::StreamError)
         } else if let Some(tokens) = self.observed_cached_tokens {
-            CacheObservation::Observed(tokens)
+            Ok(tokens)
         } else {
-            CacheObservation::Unavailable(UnavailableReason::MissingUsage)
+            Err(UnavailableReason::MissingUsage)
         };
         self.attempt.record_once(observation);
     }

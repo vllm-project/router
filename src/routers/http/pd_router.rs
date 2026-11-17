@@ -3007,7 +3007,7 @@ mod admission_tests {
 
     #[test]
     fn deferred_decode_commit_retains_the_admitted_prefill_observation() {
-        use crate::kv_observation::{test_helpers::*, CacheObservation};
+        use crate::kv_observation::test_helpers::*;
         let metrics = render(|| {
             let manager = Arc::new(PdLoadManager::default());
             let p = pool("p", 2);
@@ -3031,7 +3031,7 @@ mod admission_tests {
                 })
                 .unwrap();
             assert!(Arc::ptr_eq(&observation, attempt.kv_observation().unwrap()));
-            observation.record_once(CacheObservation::Observed(32));
+            observation.record_once(Ok(32));
             drop(attempt);
             drop(observation);
             assert!(manager.snapshot().is_empty());
