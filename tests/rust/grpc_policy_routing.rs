@@ -342,6 +342,107 @@ async fn cache_aware_prefix_overrides_load() {
     );
 }
 
+fn long_prompt(tokens: usize, extra: Value) -> Value {
+    let ids: Vec<i32> = (0..tokens).map(|i| (i % 7) as i32 + 1).collect();
+    prompt(&ids, extra)
+}
+
+/// Send a probe and report which worker took it, without draining a body that
+/// the mocks keep open.
+async fn probe_target(router: &Router, servers: &[MockVllmRsServer], body: Value) -> usize {
+    let before = hits(servers);
+    let request: CompletionRequest = serde_json::from_value(body).expect("completion request");
+    let response = router.route_completion(None, &request, None).await;
+    assert!(response.status().is_success());
+    wait_for_hit(servers, &before).await;
+    let target = grew(&before, &hits(servers));
+    drop(response);
+    target
+}
+
+/// A report has to move the routing, and a cancelled stream has to stop weighing on
+/// it. The charge itself is checked by the unit case, not here.
+#[tokio::test]
+async fn a_report_moves_the_routing_and_a_cancel_removes_its_weight() {
+    // `a` starts cheap and then reports far more work than it was admitted with;
+    // `b` holds a stream that owes exactly what it was admitted with.
+    let a = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        progress: vec![1500],
+        progress_hold: Duration::from_secs(30),
+        ..MockVllmRs::default()
+    })
+    .await;
+    let b = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        progress: vec![1000],
+        progress_hold: Duration::from_secs(30),
+        ..MockVllmRs::default()
+    })
+    .await;
+    let servers = vec![a, b];
+    let router = Arc::new(start_router(&servers, kv_aware()).await);
+
+    // Idle workers tie, so ask until `b` takes the 1000-token stream it keeps.
+    let mut held_b = None;
+    for _ in 0..40 {
+        let before = hits(&servers);
+        let request: CompletionRequest =
+            serde_json::from_value(long_prompt(1000, json!({ "stream": true })))
+                .expect("completion request");
+        let response = router.route_completion(None, &request, None).await;
+        assert!(response.status().is_success());
+        wait_for_hit(&servers, &before).await;
+        if grew(&before, &hits(&servers)) == 1 {
+            held_b = Some(response);
+            break;
+        }
+        drop(response);
+    }
+    let held_b = held_b.expect("b takes a request of its own");
+
+    // `a` is admitted at 100 tokens and then reports 1500 left, so it becomes the
+    // more expensive worker. Without the report, or without the callback, `a`
+    // would still look cheapest.
+    let before = hits(&servers);
+    let streamed: CompletionRequest =
+        serde_json::from_value(long_prompt(100, json!({ "stream": true }))).expect("request");
+    let streamed = router.route_completion(None, &streamed, None).await;
+    assert!(streamed.status().is_success());
+    wait_for_hit(&servers, &before).await;
+    assert_eq!(
+        grew(&before, &hits(&servers)),
+        0,
+        "a takes the streamed request"
+    );
+
+    // 1500 against 1000: routing has to avoid `a` now.
+    let mut routed_to_b = false;
+    for _ in 0..60 {
+        if probe_target(&router, &servers, prompt(&[9], json!({ "stream": true }))).await == 1 {
+            routed_to_b = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        routed_to_b,
+        "the reported prefill should make `a` the more expensive worker"
+    );
+
+    // Cancelling `a` takes its weight out of the routing. This does not isolate the
+    // charge it reported: the score also weighs request counts, so the ledger case
+    // is the one that pins the release.
+    drop(streamed);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for _ in 0..10 {
+        assert_eq!(
+            probe_target(&router, &servers, prompt(&[10], json!({ "stream": true }))).await,
+            0,
+            "the cancelled stream must stop weighing on the routing"
+        );
+    }
+    drop(held_b);
+}
+
 #[tokio::test]
 async fn kv_aware_prefers_the_less_loaded_worker() {
     // Equal-cost cold requests are no longer pinned to one worker, so a run

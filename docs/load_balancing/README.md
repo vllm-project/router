@@ -345,3 +345,7 @@ This allows optimizing each stage independently:
 warns at startup when a worker reports an older `engine_version`, and
 `power_of_two` uses the router's local load counts for them. See
 [gRPC P/D disaggregation](../backend/grpc.md#pd-disaggregation).
+
+### Prefill progress
+
+The router prices a running prefill from the progress its worker reports. Requires the vLLM Rust frontend with `--enable-prefill-progress`; Python `http://` workers do not report progress.

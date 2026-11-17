@@ -203,18 +203,26 @@ impl EngineFrontend {
 
     /// Convert + GenerateStream + detok on the selected worker URL.
     pub async fn dispatch(&self, worker_url: &str, prepared: PreparedRequest) -> Response {
-        self.dispatch_with_first_output(worker_url, prepared, None)
-            .await
+        self.dispatch_with(worker_url, prepared, None, None).await
     }
 
-    pub(crate) async fn dispatch_with_first_output(
+    /// The single colocated entry: the first-output and progress callbacks are
+    /// both optional, so callers that need neither pass `None`.
+    pub(crate) async fn dispatch_with(
         &self,
         worker_url: &str,
         prepared: PreparedRequest,
         on_first_output: Option<FirstOutputCallback>,
+        on_progress: Option<Box<dyn FnMut(u64) + Send>>,
     ) -> Response {
         self.grpc
-            .dispatch_prepared(worker_url, prepared, on_first_output, KvHandoff::default())
+            .dispatch_prepared(
+                worker_url,
+                prepared,
+                on_first_output,
+                on_progress,
+                KvHandoff::default(),
+            )
             .await
     }
 
@@ -224,6 +232,7 @@ impl EngineFrontend {
 
     /// P/D prefill leg: one sampled token on `worker_url`. Returns the
     /// engine's `kv_transfer_params` for the decode leg, if it sent any.
+    #[allow(clippy::result_large_err)]
     pub async fn prefill(
         &self,
         worker_url: &str,
@@ -233,6 +242,27 @@ impl EngineFrontend {
     ) -> Result<Option<serde_json::Value>, Response> {
         self.grpc
             .prefill_prepared(worker_url, prepared, engine_request_id, kv_transfer_params)
+            .await
+    }
+
+    /// P/D prefill leg as a stream, reporting each prefill progress update.
+    #[allow(clippy::result_large_err)]
+    pub async fn prefill_streaming(
+        &self,
+        worker_url: &str,
+        prepared: &PreparedRequest,
+        engine_request_id: String,
+        kv_transfer_params: &serde_json::Value,
+        on_progress: impl FnMut(u64),
+    ) -> Result<Option<serde_json::Value>, Response> {
+        self.grpc
+            .prefill_prepared_streaming(
+                worker_url,
+                prepared,
+                engine_request_id,
+                kv_transfer_params,
+                on_progress,
+            )
             .await
     }
 
@@ -250,7 +280,7 @@ impl EngineFrontend {
             kv_transfer_params,
         };
         self.grpc
-            .dispatch_prepared(worker_url, prepared, None, handoff)
+            .dispatch_prepared(worker_url, prepared, None, None, handoff)
             .await
     }
 }
