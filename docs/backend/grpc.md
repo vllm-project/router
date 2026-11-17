@@ -34,9 +34,12 @@ listed under [Capability Boundaries](#capability-boundaries).
 
 A gRPC pool also serves `/v1/completions` with single prompts:
 `prompt: [int]` skips the chat template (step 2 above) and the client's ids go
-straight to the worker, and `prompt: "text"` is tokenized once with the model
-tokenizer (`add_special_tokens` defaults to `true`, like chat). Batched prompts
-(`list[str]`, `list[list[int]]` with more than one entry) return 400 for now.
+straight to the worker, and `prompt: "text"` is tokenized once through the
+same encoding cache chat uses (`add_special_tokens` defaults to `true`; chat
+defaults to `false`). Batched prompts (`list[str]`, `list[list[int]]` with
+more than one entry) are rejected with 400 before any tokenization: lowering
+produces one prepared request per prompt sequence, and dispatching more than
+one is Stage 3's fan-out.
 Routing honors `session_params.session_id` like chat; without one, token-id
 prompts create no prefix-cache affinity (cache_aware balances them on load alone).
 
@@ -287,7 +290,7 @@ not report them.
 |---|---|
 | `src/backend/mod.rs` | Shared backend exports and `pb` aliases for `vllm-proto` |
 | `src/backend/detect.rs` | Scheme detection, pool-kind locking, DP rank stripping, tonic URI conversion |
-| `src/backend/frontend.rs` | `EngineFrontend`: `prepare(chat)`, `prepare_token_ids(chat, ids)`, and `dispatch` |
+| `src/backend/frontend.rs` | `EngineFrontend`: `prepare(chat)`, `prepare_completions(completion)`, `prepare_token_ids(chat, ids)` (token-id-only legacy path, no production callers), and `dispatch` |
 | `src/backend/health.rs` | gRPC health checks for startup and worker probes |
 | `src/backend/preprocess.rs` | Tokenizer/model cache and chat render/encode |
 | `src/backend/vllm_frontend.rs` | Adapter around `vllm-chat`, `vllm-tokenizer`, and `vllm-text` |

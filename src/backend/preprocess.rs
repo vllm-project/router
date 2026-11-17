@@ -760,7 +760,9 @@ pub fn tokenize_chat_request_for_count_timed(
     }
 }
 
-/// Tokenize one `/v1/completions` text prompt with the model tokenizer.
+/// Tokenize one `/v1/completions` text prompt through the same `PromptEncoder`
+/// chat uses, so the L0/L1 encoding caches apply and `cached_tokens` is
+/// populated instead of staying 0. No chat template is applied.
 ///
 /// Test pins return their ids unchanged, exactly like chat prompts do, so the
 /// completion tests do not need model assets.
@@ -768,18 +770,35 @@ pub fn tokenize_completion_text(
     frontend: &FrontendHandle,
     text: &str,
     add_special_tokens: bool,
-) -> anyhow::Result<Vec<u32>> {
+    cache_salt: Option<&str>,
+) -> anyhow::Result<TokenizeOut> {
     match &frontend.0 {
         Frontend::TestIds(ids) => {
             if ids.is_empty() {
                 return Err(anyhow!("pinned test token_ids are empty"));
             }
-            Ok(ids.clone())
+            Ok(TokenizeOut {
+                token_ids: Arc::from(ids.clone()),
+                adapt_ms: 0.0,
+                template_ms: 0.0,
+                encode_ms: 0.0,
+                encode_backend: "test-pin",
+                cached_tokens: 0,
+            })
         }
-        Frontend::Vllm(vllm) => vllm
-            .tokenizer()
-            .encode(text, add_special_tokens)
-            .map_err(|error| anyhow!("completion tokenization failed: {error}")),
+        Frontend::Vllm(vllm) => {
+            let (token_ids, cached_tokens, encode_ms) = vllm
+                .text_tokenize_timed(text, add_special_tokens, cache_salt)
+                .map_err(|error| anyhow!("completion tokenization failed: {error}"))?;
+            Ok(TokenizeOut {
+                token_ids,
+                adapt_ms: 0.0,
+                template_ms: 0.0,
+                encode_ms,
+                encode_backend: "vllm-tokenizer",
+                cached_tokens,
+            })
+        }
     }
 }
 

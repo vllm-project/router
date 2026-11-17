@@ -11,7 +11,7 @@ use vllm_chat::{
     ChatToolChoice, GenerationPromptMode, LoadModelBackendsOptions, LoadedModelBackends,
     ReasoningEffort, ResolvedToolContext, SamplingParams,
 };
-use vllm_text::TextDecodeOptions;
+use vllm_text::{Prompt, TextDecodeOptions};
 
 use super::encode_cache::{FrontendCache, PromptEncoder};
 use super::l1_encode_cache::{load_boundary_matcher, L1Cache, L1Encoder};
@@ -116,6 +116,30 @@ impl VllmFrontend {
             .map_err(|error| vllm_chat::Error::ChatTemplate(error.to_string()))?;
         let encode_ms = t1.elapsed().as_secs_f64() * 1000.0;
         Ok((encoded.ids, encoded.cached_tokens, template_ms, encode_ms))
+    }
+
+    /// Encode one plain-text `/v1/completions` prompt through the same
+    /// `PromptEncoder` chat uses (L0 exact match, then L1 prefix reuse),
+    /// so the L0/L1 switches and `cached_tokens` apply to completion text
+    /// exactly as they do to chat. No chat template is applied.
+    /// Returns IDs, cached token count, and encode ms.
+    pub fn text_tokenize_timed(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+        cache_salt: Option<&str>,
+    ) -> vllm_chat::Result<(Arc<[u32]>, usize, f64)> {
+        let t0 = Instant::now();
+        let encoded = self
+            .encoder
+            .encode_detailed(
+                Prompt::Text(text.to_string()),
+                add_special_tokens,
+                cache_salt,
+            )
+            .map_err(|error| vllm_chat::Error::ChatTemplate(error.to_string()))?;
+        let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        Ok((encoded.ids, encoded.cached_tokens, encode_ms))
     }
 }
 

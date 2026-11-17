@@ -200,10 +200,12 @@ impl EngineFrontend {
     /// Wire adapter path for `/v1/completions` on the gRPC pool.
     ///
     /// Accepts every prompt form. Text is tokenized once here (outside policy
-    /// and retry) with the model tokenizer; client ids pass through untouched.
-    /// One `PreparedRequest` comes back per prompt sequence, in client order.
-    /// Callers that can only dispatch one sequence take the first; fanning
-    /// out batched prompts is Stage 3.
+    /// and retry) through the same `PromptEncoder` chat uses, so the L0/L1
+    /// encoding caches apply; client ids pass through untouched. One
+    /// `PreparedRequest` comes back per prompt sequence, in client order —
+    /// that is the fan-out unit Stage 3 will dispatch. The HTTP route serves
+    /// exactly one sequence and rejects a batch with 400 before any
+    /// tokenization happens; fanning out batched prompts is Stage 3.
     pub async fn prepare_completions(
         &self,
         request: &CompletionRequest,
@@ -221,36 +223,39 @@ impl EngineFrontend {
             })?,
         };
         let (handle, t_req, resolve_ms) = self.resolve_with_defaults(&mut chat).await?;
+        // Same cache salt chat uses, so L0 entries are salted identically.
+        let cache_salt = chat
+            .other
+            .get("cache_salt")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         let chat = Arc::new(chat);
         let mut prepared = Vec::with_capacity(prompts.len());
         for prompt in prompts {
-            let (token_ids, encode_ms, encode_backend): (Vec<u32>, f64, &'static str) = match prompt
-            {
-                CompletionPrompt::Ids(ids) => (ids, 0.0, "completions-token-ids"),
-                CompletionPrompt::Text(text) => {
-                    let started = Instant::now();
-                    let ids = tokenize_completion_text(&handle, &text, add_special_tokens)
-                        .map_err(|error| PrepareError::Unavailable(error.to_string()))?;
-                    (
-                        ids,
-                        started.elapsed().as_secs_f64() * 1000.0,
-                        "vllm-tokenizer",
-                    )
-                }
+            let mut tokenized = match prompt {
+                CompletionPrompt::Ids(ids) => TokenizeOut {
+                    token_ids: Arc::from(ids),
+                    adapt_ms: 0.0,
+                    template_ms: 0.0,
+                    encode_ms: 0.0,
+                    encode_backend: "completions-token-ids",
+                    cached_tokens: 0,
+                },
+                CompletionPrompt::Text(text) => tokenize_completion_text(
+                    &handle,
+                    &text,
+                    add_special_tokens,
+                    cache_salt.as_deref(),
+                )
+                // The tokenizer is already resolved at this point, so an
+                // encode failure is the client's input, not an outage: 400.
+                .map_err(|error| PrepareError::Invalid(error.to_string()))?,
             };
-            if token_ids.is_empty() {
+            if tokenized.token_ids.is_empty() {
                 return Err(PrepareError::Invalid(
                     "completion prompt produced no token ids".to_string(),
                 ));
             }
-            let mut tokenized = TokenizeOut {
-                token_ids: Arc::from(token_ids),
-                adapt_ms: 0.0,
-                template_ms: 0.0,
-                encode_ms,
-                encode_backend,
-                cached_tokens: 0,
-            };
             truncate_grpc_prompt(chat.as_ref(), &mut tokenized)?;
             prepared.push(PreparedRequest {
                 request: chat.clone(),
@@ -446,5 +451,20 @@ mod tests {
             ])),
             ["VLLM_ROUTER_L0_CACHE", "VLLM_ROUTER_L1_CACHE"]
         );
+    }
+
+    #[tokio::test]
+    async fn completion_tokenize_failure_is_a_client_error() {
+        // The tokenizer is already resolved by the time text is encoded, so
+        // an encode failure is the client's input, not an outage: 400,
+        // like chat's tokenize failures — not 503.
+        let frontend = EngineFrontend::new();
+        frontend.pin_test_token_ids(Vec::new());
+        let request: CompletionRequest =
+            serde_json::from_value(serde_json::json!({"prompt": "hello"})).unwrap();
+        match frontend.prepare_completions(&request).await {
+            Ok(_) => panic!("empty test pin must fail text encode"),
+            Err(error) => assert!(matches!(error, PrepareError::Invalid(_)), "{error}"),
+        }
     }
 }

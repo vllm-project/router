@@ -1720,19 +1720,29 @@ impl Router {
                 Some(crate::backend::WorkerPoolKind::Grpc),
                 Some(GrpcRequestRef::Completion(completion)),
             ) if route == "/v1/completions" => {
-                // Text prompts are tokenized once in `prepare_completions`
-                // (outside policy and retry). Batched prompts lower to one
-                // prepared request per prompt; dispatching more than one is
-                // Stage 3's fan-out, so they fail fast here for now.
+                // Lower first and reject a batch before any tokenization:
+                // dispatching more than one sequence is Stage 3's fan-out,
+                // and encoding every prompt only to throw the batch away
+                // wastes work and lets a tokenizer error mask the 400.
+                // `prepare_completions` below lowers the same request again
+                // and encodes the single remaining prompt once (outside
+                // policy and retry).
+                let prompts = match crate::backend::prepare_grpc_completion(completion) {
+                    Ok(lowered) => lowered.prompts.len(),
+                    Err(error) => {
+                        return (StatusCode::BAD_REQUEST, error).into_response();
+                    }
+                };
+                if prompts != 1 {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "gRPC /v1/completions does not support batched prompts yet",
+                    )
+                        .into_response();
+                }
                 match self.frontend.prepare_completions(completion).await {
                     Ok(mut prepared) => {
-                        if prepared.len() != 1 {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                "gRPC /v1/completions does not support batched prompts yet",
-                            )
-                                .into_response();
-                        }
+                        // The count check above guarantees exactly one.
                         Some(prepared.pop().unwrap())
                     }
                     Err(error) => {
