@@ -246,13 +246,23 @@ pub fn shutdown_otel() {
     }
 }
 
-/// Extract the incoming W3C trace context, including level-2 trace flags.
+/// Extract incoming W3C trace context, accepting the level-2 `03` flags.
 ///
-/// The OpenTelemetry 0.27 propagator rejects otherwise valid v00 traceparent
-/// headers when non-sampling flag bits are set (for example 03). Preserve
-/// the sampled bit during extraction so the incoming trace identity remains
-/// intact; the propagator continues to validate all remaining fields.
+/// The pinned OpenTelemetry SDK 0.27.1 rejects v00 traceparent when the
+/// entire flags byte is greater than 0x02 (also true in SDK 0.31.0).
+/// See #482. Values `00`, `01`, and `02` already work; only `03` is
+/// normalized to `01` to preserve the inbound trace identity. Other flag
+/// combinations are left for the SDK to validate rather than widened here.
+///
+/// This fixes inbound extraction only. The SDK models the sampling bit but
+/// not the level-2 random-trace-id hint, so outgoing injection with the same
+/// trace-id sends `01`, not the incoming `03`. Full level-2 propagation
+/// requires per-request hint state outside the SDK.
 pub fn extract_trace_context_http(headers: &HeaderMap) -> opentelemetry::Context {
+    if !is_otel_enabled() {
+        return opentelemetry::Context::current();
+    }
+
     let normalized = headers
         .get("traceparent")
         .and_then(|value| value.to_str().ok())
@@ -270,14 +280,15 @@ pub fn extract_trace_context_http(headers: &HeaderMap) -> opentelemetry::Context
             {
                 return None;
             }
-            let flags = u8::from_str_radix(flags, 16).ok()?;
-            if flags & !1 == 0 {
+            // Only 03 requires a compatibility shim: SDK accepts 00/01/02.
+            // Keep 04/09/ff (reserved flags) subject to SDK validation.
+            if flags != "03" {
                 return None;
             }
             let mut normalized = headers.clone();
             normalized.insert(
                 "traceparent",
-                HeaderValue::from_str(&format!("{prefix}-{:02x}", flags & 1)).ok()?,
+                HeaderValue::from_str(&format!("{prefix}-01")).ok()?,
             );
             Some(normalized)
         });

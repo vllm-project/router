@@ -217,11 +217,25 @@ fn test_otel_distributed_tracing() {
 
         let mut request_span = RequestSpan;
         let span = request_span.make_span(&request);
-        {
+        let outgoing_headers = {
             let _enter = span.enter();
-        }
+            let mut headers = HeaderMap::new();
+            otel_trace::inject_trace_context_http(&mut headers);
+            headers
+        };
         drop(span);
         provider.force_flush();
+
+        let outgoing_tp = outgoing_headers
+            .get("traceparent")
+            .expect("expected outgoing traceparent")
+            .to_str()
+            .unwrap();
+        let outgoing_parts: Vec<&str> = outgoing_tp.split('-').collect();
+        assert_eq!(outgoing_parts.len(), 4);
+        assert_eq!(outgoing_parts[1], upstream_trace_id);
+        // The current SDK preserves sampling, but drops the level-2 random hint.
+        assert_eq!(outgoing_parts[3], "01");
 
         let spans = exporter.get_finished_spans().unwrap();
         assert!(!spans.is_empty(), "expected a traced server span");
@@ -262,8 +276,7 @@ fn test_otel_distributed_tracing() {
             ("00", false),
             ("01", true),
             ("02", false),
-            ("03", true),
-            ("ff", true),
+            ("03", true), // level-2 sampled with random-trace-id hint
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -280,6 +293,20 @@ fn test_otel_distributed_tracing() {
             assert_eq!(parent.trace_id(), TraceId::from_hex(trace_id).unwrap());
             assert_eq!(parent.span_id(), SpanId::from_hex(span_id).unwrap());
             assert_eq!(parent.is_sampled(), sampled);
+        }
+        // Keep reserved flags invalid to avoid diverging from neighboring
+        // services that use the same SDK and would restart the trace.
+        for flags in ["04", "09", "ff"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "traceparent",
+                HeaderValue::from_str(&format!("00-{trace_id}-{span_id}-{flags}")).unwrap(),
+            );
+            let context = otel_trace::extract_trace_context_http(&headers);
+            assert!(
+                !context.span().span_context().is_valid(),
+                "reserved flags {flags} must remain rejected"
+            );
         }
     }
 
