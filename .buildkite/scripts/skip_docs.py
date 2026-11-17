@@ -24,9 +24,6 @@ def git(*args: str) -> str:
 
 
 def is_doc(path: str) -> bool:
-    # TEMP: remove after verifying docs-only skipping in CI.
-    if path.startswith((".buildkite/", "tests/")):
-        return True
     return path.startswith("docs/") or path.endswith(".md") or path == "mkdocs.yml"
 
 
