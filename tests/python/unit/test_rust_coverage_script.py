@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -116,6 +117,9 @@ def test_only_complete_current_reports_are_published(
     report = reports[mode]
     if publishes_report:
         assert report.read_text() == NEW_REPORT
+        if os.name == "posix":
+            # The host Buildkite agent may have a different UID from Docker.
+            assert stat.S_IMODE(report.stat().st_mode) == 0o644
     else:
         assert not report.exists()
     assert list(report.parent.glob(".lcov.info.*")) == []

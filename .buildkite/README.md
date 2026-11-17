@@ -85,6 +85,8 @@ fail the job.
 The previous report is removed before tool installation. A new report is
 written to a temporary file and renamed to `lcov.info` only after generation
 succeeds, so failed runs cannot publish stale or partially written reports.
+The completed report is set to mode `0644` before publication so the host
+Buildkite agent can read it even when the container runs as root.
 
 To reproduce with the same Rust image and dependency set as CI, run from the
 repository root (requires Docker and network access):
