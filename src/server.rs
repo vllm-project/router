@@ -28,6 +28,7 @@ use axum::{
     serve::{Listener, ListenerExt},
     Json, Router,
 };
+use metrics_exporter_prometheus::PrometheusHandle;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -114,6 +115,7 @@ pub struct AppState {
     pub context: Arc<AppContext>,
     pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
+    pub metrics_handle: Option<PrometheusHandle>,
 }
 
 // Fallback handler for unmatched routes
@@ -223,6 +225,26 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
     }
 
     state.router.get_model_info(req).await
+}
+
+/// Without this route the transparent-proxy fallback sends a scrape to one
+/// worker through the routing policy, which counts it as a routed request.
+async fn router_metrics(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    match &state.metrics_handle {
+        Some(handle) => (
+            [(
+                http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            handle.render(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 // Generation endpoints
@@ -919,7 +941,8 @@ pub fn build_app_with_wasm_middleware(
         .route("/health_generate", get(health_generate))
         .route("/v1/models", get(v1_models))
         .route("/get_model_info", get(get_model_info))
-        .route("/get_server_info", get(get_server_info));
+        .route("/get_server_info", get(get_server_info))
+        .route("/metrics", get(router_metrics));
 
     let admin_routes = Router::new()
         .route("/add_worker", post(add_worker))
@@ -1011,9 +1034,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Initialize prometheus metrics exporter
     println!("DEBUG: Initializing Prometheus metrics");
-    if let Some(prometheus_config) = config.prometheus_config {
-        metrics::start_prometheus(prometheus_config);
-    }
+    let metrics_handle = config.prometheus_config.map(metrics::start_prometheus);
     println!("DEBUG: Prometheus metrics initialized");
 
     info!(
@@ -1159,6 +1180,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         context: app_context.clone(),
         concurrency_queue_tx: limiter.queue_tx.clone(),
         router_manager,
+        metrics_handle,
     });
     let router_arc = Arc::clone(&app_state.router);
 
@@ -1509,6 +1531,7 @@ mod tests {
                 context,
                 concurrency_queue_tx: None,
                 router_manager: None,
+                metrics_handle: None,
             }),
             128,
             Vec::new(),
@@ -1590,6 +1613,103 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), status);
         }
+        backend.abort();
+        let _ = backend.await;
+    }
+
+    // current_thread keeps the routing policy on this thread, so any counter it
+    // records lands in the local recorder.
+    #[tokio::test(flavor = "current_thread")]
+    async fn metrics_route_serves_router_registry_without_routing() {
+        use axum::body::{to_bytes, Body};
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        use std::sync::atomic::AtomicUsize;
+        use tower::ServiceExt;
+
+        let scrapes = Arc::new(AtomicUsize::new(0));
+        let worker_scrapes = scrapes.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_url = format!("http://{}", listener.local_addr().unwrap());
+        let backend = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/metrics",
+                    get(move || {
+                        worker_scrapes.fetch_add(1, Ordering::Relaxed);
+                        async { "vllm:num_requests_running 0\n" }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = ::metrics::set_default_local_recorder(&recorder);
+
+        let context = Arc::new(
+            AppContext::new(RouterConfig::default(), Client::new(), 32, None, vec![]).unwrap(),
+        );
+        let router: Arc<dyn RouterTrait> = Arc::new(
+            crate::routers::http::router::Router::new(Vec::new(), &context)
+                .await
+                .unwrap(),
+        );
+        context
+            .worker_registry
+            .register(Arc::new(crate::core::BasicWorker::new(
+                worker_url.clone(),
+                WorkerType::Regular,
+            )));
+        let scrape = |metrics_handle| {
+            let app = build_app_with_request_tracing(
+                Arc::new(AppState {
+                    router: router.clone(),
+                    context: context.clone(),
+                    concurrency_queue_tx: None,
+                    router_manager: None,
+                    metrics_handle,
+                }),
+                1024,
+                Vec::new(),
+                Vec::new(),
+                true,
+                false,
+            );
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .uri("/metrics")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                (status, String::from_utf8(body.to_vec()).unwrap())
+            }
+        };
+
+        let (status, body) = scrape(Some(handle.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        let health = format!("vllm_router_worker_health{{worker=\"{worker_url}\"}} 1");
+        assert!(body.contains(&health), "{body}");
+        let (status, _) = scrape(None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let registry = handle.render();
+        assert_eq!(
+            scrapes.load(Ordering::Relaxed),
+            0,
+            "a scrape reached the worker:\n{registry}"
+        );
+        assert!(
+            !registry.contains("vllm_router_policy_decisions_total"),
+            "a scrape went through the routing policy:\n{registry}"
+        );
         backend.abort();
         let _ = backend.await;
     }
