@@ -12,7 +12,7 @@ use crate::kv_index::admit::{validate_full_attention_batch, FullAttentionBatchRe
 use crate::kv_index::binding::SourceLease;
 use crate::kv_index::indexer::KvBlockIndexer;
 use crate::kv_index::types::{
-    ClearScope, ResidencyOwner, SourceId, SourceRecoveryReason, StorageTier,
+    ClearScope, RecoveryBoundary, ResidencyOwner, SourceId, SourceRecoveryReason, StorageTier,
 };
 use crate::kv_index::wire::{ExternalBlockHash, KVEvent, KVEventBatch};
 use crate::kv_index::{decode_batch, IngestionSignal};
@@ -329,7 +329,6 @@ fn spawn_inner(
                                 to_seq: to,
                             },
                         );
-                        let replay_started = Instant::now();
                         let result = if let Some(ep) = replay_endpoint.as_deref() {
                             let recovery = replay(
                                 ep,
@@ -359,6 +358,8 @@ fn spawn_inner(
                             )
                             .await
                         } else {
+                            debug!(source = %source_id, rank = dp_rank, endpoint_configured = false,
+                                "kv_index replay unavailable: no endpoint configured");
                             ReplayOutcome::Failed
                         };
                         #[cfg(test)]
@@ -372,9 +373,7 @@ fn spawn_inner(
                             barrier.wait().await;
                             barrier.wait().await;
                         }
-                        let failure = if replay_endpoint.is_none() {
-                            Some(SourceRecoveryReason::ReplayUnavailable)
-                        } else if !matches!(result, ReplayOutcome::Complete(_)) {
+                        let failure = if !matches!(result, ReplayOutcome::Complete(_)) {
                             Some(SourceRecoveryReason::ReplayFailed)
                         } else {
                             None
@@ -402,10 +401,7 @@ fn spawn_inner(
                         } else {
                             "success"
                         };
-                        RouterMetrics::record_kv_replay_outcome(
-                            outcome,
-                            replay_endpoint.as_ref().map(|_| replay_started.elapsed()),
-                        );
+                        RouterMetrics::record_kv_replay_outcome(outcome);
                         if current.is_none() || result == ReplayOutcome::Stopped {
                             break;
                         }
@@ -465,22 +461,23 @@ fn spawn_inner(
                                     }
                                     retries.loss_recorded = false;
                                     let initial_boundary = last_seq == -1 && seq == 0;
-                                    if initial_boundary {
-                                        retries.reset();
-                                        indexer.resume_initial_sequence(
-                                            &source_id,
-                                            dp_rank,
-                                            strict_recovery,
-                                        );
+                                    let boundary = if initial_boundary {
+                                        Some(RecoveryBoundary::Initial)
                                     } else if clear_barrier {
-                                        retries.reset();
-                                        indexer.resume_after_worker_clear(
+                                        Some(RecoveryBoundary::Clear)
+                                    } else {
+                                        (!strict_recovery).then_some(RecoveryBoundary::Observed)
+                                    };
+                                    if let Some(boundary) = boundary {
+                                        if boundary != RecoveryBoundary::Observed {
+                                            retries.reset();
+                                        }
+                                        indexer.resume_boundary(
                                             &source_id,
                                             dp_rank,
+                                            boundary,
                                             strict_recovery,
                                         );
-                                    } else if !strict_recovery {
-                                        indexer.resume_observed_source(&source_id, dp_rank);
                                     }
                                     true
                                 }
@@ -488,9 +485,10 @@ fn spawn_inner(
                                     let initial_boundary = last_seq == -1 && seq == 0;
                                     if initial_boundary {
                                         retries.reset();
-                                        indexer.resume_initial_sequence(
+                                        indexer.resume_boundary(
                                             &source_id,
                                             dp_rank,
+                                            RecoveryBoundary::Initial,
                                             strict_recovery,
                                         );
                                     }
@@ -919,7 +917,7 @@ async fn replay(
                 }
                 let batch = decode(&frames[frames.len() - 1])?;
                 let accepted = with_binding(binding, |strict| {
-                    indexer.with_current_replay(source_id, dp_rank, attempt, |_| {
+                    indexer.with_current_replay(source_id, dp_rank, attempt, || {
                         match batch_rank(batch.data_parallel_rank, dp_rank, strict) {
                             BatchRank::Owned => {
                                 if let Err(rejection) = apply_batch(
@@ -3345,7 +3343,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_clear_only_restores_credit_in_its_domain() {
-        use crate::kv_index::SourceRecoveryState::{Cold, Exact, Fallback, Observed, WorkerExact};
+        use crate::kv_index::SourceRecoveryState::{Exact, Fallback, Observed, WorkerExact};
         let old = [1, 2, 3, 4];
         let fresh = [5, 6, 7, 8];
         let local = [9, 10, 11, 12];
@@ -3377,7 +3375,7 @@ mod tests {
             assert_eq!(
                 f.indexer.source_recovery_status(&source, 0),
                 Some(crate::kv_index::SourceRecoveryStatus {
-                    state: Cold,
+                    state: Fallback,
                     reason: SourceRecoveryReason::Registered,
                 })
             );
@@ -3604,7 +3602,7 @@ mod tests {
             // Give the old generation a known full baseline. The new generation
             // does not re-announce the surviving pool block.
             f.indexer
-                .resume_source_for(&source, 0, SourceRecoveryReason::ReplayApplied);
+                .resume_boundary(&source, 0, RecoveryBoundary::Initial, false);
             assert_eq!(f.indexer.find_matches(&pool_query(&old_pool)).len(), 1);
             let initial = [pool_store(101, &new_pool), store_event(200, &new_local)];
             let reason = if let Some(server) = &f.replay_server {
@@ -3734,14 +3732,7 @@ mod tests {
                     "strict={strict}, replay_available={replay_available}"
                 );
                 if strict {
-                    assert_eq!(
-                        status.reason,
-                        if replay_available {
-                            SourceRecoveryReason::ReplayFailed
-                        } else {
-                            SourceRecoveryReason::ReplayUnavailable
-                        }
-                    );
+                    assert_eq!(status.reason, SourceRecoveryReason::ReplayFailed);
                 }
                 assert_eq!(hits(&f.indexer, &[1, 2, 3, 4]).len(), usize::from(!strict));
                 if !replay_available {

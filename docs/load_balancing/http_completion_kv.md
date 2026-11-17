@@ -33,5 +33,5 @@ bootstrap/generation/recovery guarantees. See
 [the HTTP consumer RFC](https://github.com/vllm-project/router/issues/405) for the
 real-Worker acceptance requirements.
 
-For compatibility versus opt-in strict event recovery, retry limits, metrics,
-and operational alerts, see [KV event recovery](kv_event_recovery.md).
+For compatibility versus opt-in strict event recovery, see
+[`--kv-event-strict-recovery`](../cli_reference.md#workers-and-backend).

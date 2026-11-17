@@ -3,14 +3,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::{Mutex, RwLock};
 
 use crate::kv_index::types::{
-    ClearScope, Locality, ResidencyOwner, RoutableTarget, SourceId, SourceRecoveryReason,
-    SourceRecoveryState, SourceRecoveryStatus, StorageTier,
+    ClearScope, Locality, RecoveryBoundary, ResidencyOwner, RoutableTarget, SourceId,
+    SourceRecoveryReason, SourceRecoveryState, SourceRecoveryStatus, StorageTier,
 };
 use crate::metrics::RouterMetrics;
 
@@ -510,7 +509,6 @@ pub struct KvBlockIndexer {
 #[derive(Debug, Clone, Copy)]
 struct SourceRecoveryRecord {
     status: SourceRecoveryStatus,
-    recovery_started: Option<Instant>,
     attempt: u64,
     replay_state: SourceRecoveryState,
 }
@@ -527,7 +525,7 @@ impl KvBlockIndexer {
     }
 
     /// Register a source before its subscriber can publish observations.
-    /// Cold sources remain hidden until the subscriber establishes an
+    /// Newly registered sources remain hidden until the subscriber establishes an
     /// authoritative sequence or clear boundary.
     pub(crate) fn register_source(&self, source: &SourceId, dp_rank: u32) {
         let _guard = self.source_mutations.lock();
@@ -535,7 +533,7 @@ impl KvBlockIndexer {
         self.transition_source(
             source,
             dp_rank,
-            SourceRecoveryState::Cold,
+            SourceRecoveryState::Fallback,
             SourceRecoveryReason::Registered,
         );
     }
@@ -547,52 +545,28 @@ impl KvBlockIndexer {
         state: SourceRecoveryState,
         reason: SourceRecoveryReason,
     ) {
-        let now = Instant::now();
         let key = (source.clone(), dp_rank);
         let status = SourceRecoveryStatus { state, reason };
-        let (previous, recovery_duration) = match self.source_states.entry(key) {
+        let previous = match self.source_states.entry(key) {
             Entry::Occupied(mut entry) => {
-                let previous = *entry.get();
-                if previous.status == status {
+                let previous = entry.get().status;
+                if previous == status {
                     return;
                 }
-                let recovery_duration = if Self::visible_state(state) {
-                    previous
-                        .recovery_started
-                        .map(|started| now.saturating_duration_since(started))
-                } else {
-                    None
-                };
-                let recovery_started = match state {
-                    SourceRecoveryState::Degraded | SourceRecoveryState::Fallback => {
-                        previous.recovery_started.or(Some(now))
-                    }
-                    SourceRecoveryState::Cold
-                    | SourceRecoveryState::WorkerExact
-                    | SourceRecoveryState::Exact
-                    | SourceRecoveryState::Observed => None,
-                };
                 entry.insert(SourceRecoveryRecord {
                     status,
-                    recovery_started,
                     attempt: self.recovery_attempt.fetch_add(1, Ordering::Relaxed),
                     replay_state: SourceRecoveryState::Observed,
                 });
-                (Some(previous.status), recovery_duration)
+                Some(previous)
             }
             Entry::Vacant(entry) => {
-                let recovery_started = matches!(
-                    state,
-                    SourceRecoveryState::Degraded | SourceRecoveryState::Fallback
-                )
-                .then_some(now);
                 entry.insert(SourceRecoveryRecord {
                     status,
-                    recovery_started,
                     attempt: self.recovery_attempt.fetch_add(1, Ordering::Relaxed),
                     replay_state: SourceRecoveryState::Observed,
                 });
-                (None, None)
+                None
             }
         };
         tracing::debug!(source = %source, rank = dp_rank,
@@ -603,7 +577,6 @@ impl KvBlockIndexer {
             previous.map(|status| (status.state.as_str(), status.reason.as_str())),
             state.as_str(),
             reason.as_str(),
-            recovery_duration,
         );
     }
 
@@ -756,10 +729,10 @@ impl KvBlockIndexer {
         source: &SourceId,
         dp_rank: u32,
         attempt: u64,
-        operation: impl FnOnce(SourceRecoveryState) -> T,
+        operation: impl FnOnce() -> T,
     ) -> Option<T> {
         let _guard = self.source_mutations.lock();
-        let replay_state = {
+        {
             let record = self.source_states.get(&(source.clone(), dp_rank))?;
             if record.attempt != attempt
                 || record.status.state != SourceRecoveryState::Degraded
@@ -767,9 +740,8 @@ impl KvBlockIndexer {
             {
                 return None;
             }
-            record.replay_state
-        };
-        Some(operation(replay_state))
+        }
+        Some(operation())
     }
 
     pub(crate) fn finish_replay_if_current(
@@ -779,19 +751,14 @@ impl KvBlockIndexer {
         attempt: u64,
         failure: Option<SourceRecoveryReason>,
     ) -> bool {
-        self.with_current_replay(source, dp_rank, attempt, |replay_state| {
-            if let Some(reason) = failure {
+        if let Some(reason) = failure {
+            self.with_current_replay(source, dp_rank, attempt, || {
                 self.invalidate_source_locked(source, dp_rank, reason);
-            } else {
-                self.resume_source_locked(
-                    source,
-                    dp_rank,
-                    replay_state,
-                    SourceRecoveryReason::ReplayApplied,
-                );
-            }
-        })
-        .is_some()
+            })
+            .is_some()
+        } else {
+            self.resume_boundary(source, dp_rank, RecoveryBoundary::Replay { attempt }, false)
+        }
     }
 
     fn visible_state(state: SourceRecoveryState) -> bool {
@@ -803,84 +770,55 @@ impl KvBlockIndexer {
         )
     }
 
-    pub(crate) fn resume_observed_source(&self, source: &SourceId, dp_rank: u32) {
-        let _guard = self.source_mutations.lock();
-        if self
-            .source_states
-            .get(&(source.clone(), dp_rank))
-            .is_some_and(|r| {
-                matches!(
-                    r.status.state,
-                    SourceRecoveryState::Exact | SourceRecoveryState::WorkerExact
-                )
-            })
-        {
-            return;
-        }
-        self.resume_source_locked(
-            source,
-            dp_rank,
-            SourceRecoveryState::Observed,
-            SourceRecoveryReason::FreshObservation,
-        );
-    }
-
-    /// A worker clear leaves CacheOwner pools intact. It preserves full trust
-    /// on a contiguous exact stream, but cannot repair missing pool history.
-    pub(crate) fn resume_after_worker_clear(&self, source: &SourceId, dp_rank: u32, strict: bool) {
-        let _guard = self.source_mutations.lock();
-        let exact = self
-            .source_states
-            .get(&(source.clone(), dp_rank))
-            .is_some_and(|r| r.status.state == SourceRecoveryState::Exact);
-        let state = if exact {
-            SourceRecoveryState::Exact
-        } else if strict {
-            SourceRecoveryState::WorkerExact
-        } else {
-            SourceRecoveryState::Observed
-        };
-        self.resume_source_locked(source, dp_rank, state, SourceRecoveryReason::ClearBarrier);
-    }
-
-    pub(super) fn resume_initial_sequence(&self, source: &SourceId, dp_rank: u32, strict: bool) {
-        let _guard = self.source_mutations.lock();
-        let state = if strict {
-            SourceRecoveryState::WorkerExact
-        } else {
-            SourceRecoveryState::Exact
-        };
-        self.resume_source_locked(
-            source,
-            dp_rank,
-            state,
-            SourceRecoveryReason::InitialSequence,
-        );
-    }
-
-    #[cfg(test)]
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    pub(crate) fn resume_source_for(
+    /// Map each evidence boundary to its credit scope under the mutation fence.
+    /// Worker clears cannot repair missing pool history; replay retains only the
+    /// scope captured by its still-current attempt.
+    pub(super) fn resume_boundary(
         &self,
         source: &SourceId,
         dp_rank: u32,
-        reason: SourceRecoveryReason,
-    ) {
+        boundary: RecoveryBoundary,
+        strict: bool,
+    ) -> bool {
         let _guard = self.source_mutations.lock();
-        self.resume_source_locked(source, dp_rank, SourceRecoveryState::Exact, reason);
-    }
-
-    fn resume_source_locked(
-        &self,
-        source: &SourceId,
-        dp_rank: u32,
-        state: SourceRecoveryState,
-        reason: SourceRecoveryReason,
-    ) {
-        let previous = self
+        let record = self
             .source_states
             .get(&(source.clone(), dp_rank))
-            .map(|record| record.status.state);
+            .map(|record| *record);
+        let previous = record.map(|record| record.status.state);
+        use SourceRecoveryState::{Exact, Observed, WorkerExact};
+        let (state, reason) = match boundary {
+            RecoveryBoundary::Initial => (
+                if strict { WorkerExact } else { Exact },
+                SourceRecoveryReason::InitialSequence,
+            ),
+            RecoveryBoundary::Clear => (
+                if previous == Some(Exact) {
+                    Exact
+                } else if strict {
+                    WorkerExact
+                } else {
+                    Observed
+                },
+                SourceRecoveryReason::ClearBarrier,
+            ),
+            RecoveryBoundary::Observed => {
+                if matches!(previous, Some(Exact | WorkerExact)) {
+                    return true;
+                }
+                (Observed, SourceRecoveryReason::FreshObservation)
+            }
+            RecoveryBoundary::Replay { attempt } => {
+                let Some(record) = record.filter(|record| {
+                    record.attempt == attempt
+                        && record.status.state == SourceRecoveryState::Degraded
+                        && record.status.reason == SourceRecoveryReason::SequenceGap
+                }) else {
+                    return false;
+                };
+                (record.replay_state, SourceRecoveryReason::ReplayApplied)
+            }
+        };
         if previous.is_some_and(|s| !Self::visible_state(s))
             || (previous == Some(SourceRecoveryState::WorkerExact))
                 != (state == SourceRecoveryState::WorkerExact)
@@ -888,6 +826,7 @@ impl KvBlockIndexer {
             self.source_generation.fetch_add(1, Ordering::AcqRel);
         }
         self.transition_source(source, dp_rank, state, reason);
+        true
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -919,7 +858,6 @@ impl KvBlockIndexer {
             RouterMetrics::clear_kv_source_recovery_state(
                 record.status.state.as_str(),
                 record.status.reason.as_str(),
-                record.recovery_started.map(|started| started.elapsed()),
             );
         }
     }
@@ -1041,10 +979,10 @@ mod tests {
         let source = SourceId::from("a");
         let generation = idx.source_generation_for_test();
         for _ in 0..3 {
-            idx.resume_source_for(&source, 0, SourceRecoveryReason::ReplayApplied);
+            idx.resume_boundary(&source, 0, RecoveryBoundary::Initial, false);
         }
         assert_eq!(idx.source_generation_for_test(), generation);
-        idx.suspend_source(&source, 0);
+        let (_, attempt) = idx.begin_replay(&source, 0, 0, false);
         assert_eq!(idx.source_generation_for_test(), generation + 1);
         for group in [0, 1] {
             let hits = idx.find_matches(&query_group(group, &["x"], &tiers));
@@ -1054,14 +992,14 @@ mod tests {
                 .all(|hit| hit.target.instance_id != source || hit.target.dp_rank != 0));
         }
         // Complete replay may resume credit without forgetting still-valid claims.
-        idx.resume_source_for(&source, 0, SourceRecoveryReason::ReplayApplied);
+        assert!(idx.resume_boundary(&source, 0, RecoveryBoundary::Replay { attempt }, false));
         assert_eq!(idx.source_generation_for_test(), generation + 2);
         assert_eq!(idx.find_matches(&query(&["x"], &tiers)).len(), 5);
-        idx.resume_source_for(&source, 0, SourceRecoveryReason::ReplayApplied);
+        idx.resume_boundary(&source, 0, RecoveryBoundary::Initial, false);
         assert_eq!(idx.source_generation_for_test(), generation + 2);
         idx.invalidate_source(&source, 0);
         assert_eq!(idx.source_generation_for_test(), generation + 3);
-        idx.resume_source_for(&source, 0, SourceRecoveryReason::ReplayApplied);
+        idx.resume_boundary(&source, 0, RecoveryBoundary::Initial, false);
         assert_eq!(idx.source_generation_for_test(), generation + 4);
         for group in [0, 1] {
             assert_eq!(
@@ -1112,7 +1050,7 @@ mod tests {
         let indexer = KvBlockIndexer::new();
         let source = SourceId::from("w0");
         indexer.register_source(&source, 0);
-        indexer.resume_observed_source(&source, 0);
+        indexer.resume_boundary(&source, 0, RecoveryBoundary::Observed, false);
         let (start, attempt) = indexer.begin_replay(&source, 0, 20, false);
         assert_eq!(start, 20);
         assert!(indexer.finish_replay_if_current(&source, 0, attempt, None));
@@ -1124,13 +1062,14 @@ mod tests {
         assert_eq!(start, -1);
         assert!(indexer.finish_replay_if_current(&source, 0, attempt, None));
         // Fresh observations must not widen worker-only trust to external pools.
-        indexer.resume_observed_source(&source, 0);
+        indexer.resume_boundary(&source, 0, RecoveryBoundary::Observed, false);
         assert_eq!(
             indexer.source_recovery_status(&source, 0).unwrap().state,
             SourceRecoveryState::WorkerExact
         );
-        // A full-domain checkpoint is a precondition, not something seq=0 supplies.
-        indexer.resume_source_for(&source, 0, SourceRecoveryReason::ReplayApplied);
+        // Compatibility mode preserves the legacy full-domain baseline. Strict
+        // suffix replay must retain its scope without upgrading worker-only trust.
+        indexer.resume_boundary(&source, 0, RecoveryBoundary::Initial, false);
         indexer.store(
             0,
             pool("shared", "w0"),
@@ -1157,9 +1096,9 @@ mod tests {
         let indexer = KvBlockIndexer::new();
         let source = SourceId::from("w0");
         indexer.register_source(&source, 0);
-        indexer.resume_source_for(&source, 0, SourceRecoveryReason::InitialSequence);
+        indexer.resume_boundary(&source, 0, RecoveryBoundary::Initial, false);
         let generation = indexer.source_generation_for_test();
-        indexer.resume_after_worker_clear(&source, 0, true);
+        indexer.resume_boundary(&source, 0, RecoveryBoundary::Clear, true);
         assert_eq!(generation, indexer.source_generation_for_test());
         assert_eq!(
             indexer.source_recovery_status(&source, 0).unwrap().reason,
@@ -1176,7 +1115,7 @@ mod tests {
         for i in 0..100 {
             let source = SourceId::from(format!("churn-{i}"));
             indexer.register_source(&source, i);
-            indexer.resume_source_for(&source, i, SourceRecoveryReason::InitialSequence);
+            indexer.resume_boundary(&source, i, RecoveryBoundary::Initial, false);
             indexer.forget_source(&source, i);
         }
         let rendered = handle.render();
@@ -1209,17 +1148,14 @@ mod tests {
         assert_eq!(
             indexer.source_recovery_status(&source, 2),
             Some(SourceRecoveryStatus {
-                state: SourceRecoveryState::Cold,
+                state: SourceRecoveryState::Fallback,
                 reason: SourceRecoveryReason::Registered,
             })
         );
         indexer.suspend_source_for(&source, 2, SourceRecoveryReason::SequenceGap);
         indexer.invalidate_source_for(&source, 2, SourceRecoveryReason::ReplayFailed);
-        RouterMetrics::record_kv_replay_outcome(
-            "failed",
-            Some(std::time::Duration::from_millis(5)),
-        );
-        indexer.resume_after_worker_clear(&source, 2, true);
+        RouterMetrics::record_kv_replay_outcome("failed");
+        indexer.resume_boundary(&source, 2, RecoveryBoundary::Clear, true);
 
         assert_eq!(
             indexer.source_recovery_status(&source, 2),
@@ -1251,17 +1187,7 @@ mod tests {
             " 1"
         ));
         assert!(has_line(
-            "vllm_router_kv_source_recovery_duration_seconds_count",
-            &["outcome=\"worker_exact\""],
-            " 1"
-        ));
-        assert!(has_line(
             "vllm_router_kv_replay_outcomes_total",
-            &["outcome=\"failed\"",],
-            " 1"
-        ));
-        assert!(has_line(
-            "vllm_router_kv_replay_duration_seconds_count",
             &["outcome=\"failed\"",],
             " 1"
         ));
@@ -1305,11 +1231,7 @@ mod tests {
         let resuming = idx.clone();
         AFTER_QUERY_EDGE.with(|slot| {
             *slot.borrow_mut() = Some(Box::new(move || {
-                resuming.resume_source_for(
-                    &SourceId::from("a"),
-                    0,
-                    SourceRecoveryReason::ReplayApplied,
-                );
+                resuming.resume_boundary(&SourceId::from("a"), 0, RecoveryBoundary::Initial, false);
             }));
         });
         let hits = idx.find_matches(&query(&["x"], &[StorageTier::Device]));
@@ -1332,7 +1254,7 @@ mod tests {
             *slot.borrow_mut() = Some(Box::new(move || {
                 let source = SourceId::from("a");
                 invalidating.invalidate_source(&source, 0);
-                invalidating.resume_source_for(&source, 0, SourceRecoveryReason::ReplayApplied);
+                invalidating.resume_boundary(&source, 0, RecoveryBoundary::Initial, false);
             }));
         });
         assert!(idx

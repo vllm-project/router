@@ -133,7 +133,6 @@ pub enum ClearScope {
 /// that the publisher's complete history has been reconstructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SourceRecoveryState {
-    Cold,
     /// Worker history is complete; the external pool has no proven baseline.
     WorkerExact,
     Exact,
@@ -145,7 +144,6 @@ pub(crate) enum SourceRecoveryState {
 impl SourceRecoveryState {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::Cold => "cold",
             Self::WorkerExact => "worker_exact",
             Self::Exact => "exact",
             Self::Observed => "observed",
@@ -163,7 +161,6 @@ pub(crate) enum SourceRecoveryReason {
     SequenceGap,
     ReplayApplied,
     RetryExhausted,
-    ReplayUnavailable,
     ReplayFailed,
     IncarnationReset,
     RankScopeChanged,
@@ -180,7 +177,6 @@ impl SourceRecoveryReason {
             Self::SequenceGap => "sequence_gap",
             Self::ReplayApplied => "replay_applied",
             Self::RetryExhausted => "retry_exhausted",
-            Self::ReplayUnavailable => "replay_unavailable",
             Self::ReplayFailed => "replay_failed",
             Self::IncarnationReset => "incarnation_reset",
             Self::RankScopeChanged => "rank_scope_changed",
@@ -189,6 +185,15 @@ impl SourceRecoveryReason {
             Self::FreshObservation => "fresh_observation",
         }
     }
+}
+
+/// Evidence boundary that can restore placement credit for one source/rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecoveryBoundary {
+    Initial,
+    Clear,
+    Observed,
+    Replay { attempt: u64 },
 }
 
 /// Current externally observable recovery status for one source/rank.
