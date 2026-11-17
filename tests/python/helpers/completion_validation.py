@@ -1,4 +1,4 @@
-"""Validate one non-streaming smoke completion: exit 1 if invalid, 3 if unreadable."""
+"""Validate one non-streaming smoke completion: exit 1 if invalid, 2 for CLI errors, 3 if unreadable."""
 
 import argparse
 import json
