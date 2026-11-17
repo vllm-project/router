@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use lru::LruCache;
 use parking_lot::Mutex;
 use rand::Rng;
@@ -982,19 +982,33 @@ pub struct KvAwarePolicy {
     next_generation: AtomicU64,
     /// Opt-in transfer planner; `None` leaves selection untouched.
     transfer_planner: Option<Arc<dyn TransferPlanner>>,
-    /// Declared transfer capabilities, keyed by worker URL.
-    transfer_capabilities: DashMap<String, TransferCapability>,
-    /// Peer fetch addresses reported by engines, keyed by worker URL. A
-    /// capability without an entry here can be planned but not fetched.
-    peer_endpoints: DashMap<String, PeerEndpoint>,
-    /// Workers whose `transfer_capabilities` entry came from an engine record
-    /// rather than static config. Only these are removed when re-discovery
-    /// finds no record.
-    engine_capabilities: DashSet<String>,
+    /// Peer KV transfer registration per worker URL. Writers replace the whole
+    /// `Arc` under `selection_lock`; readers clone it and see one consistent
+    /// capability/endpoint pair. A capability without an endpoint can be
+    /// planned but not fetched.
+    peer_regs: DashMap<String, Arc<PeerRegistration>>,
+    /// Source of `PeerRegistration::epoch`; starts at 1.
+    next_peer_epoch: AtomicU64,
     /// Source of `TransferPlan::plan_id`; starts at 1 so 0 means unassigned.
     next_transfer_plan_id: AtomicU64,
     /// Active-mode peer fetch; `None` unless the policy was built active.
     peer_fetch: Option<PeerFetchState>,
+}
+
+/// Everything the router knows about a worker's peer KV transfer ability,
+/// replaced as a whole so a reader sees one consistent registration.
+#[derive(Debug, Clone)]
+struct PeerRegistration {
+    /// Changes only when the contents change; from `next_peer_epoch`. Nothing
+    /// reads it yet; it identifies a registration for later consumers.
+    #[allow(dead_code)]
+    epoch: u64,
+    capability: Option<TransferCapability>,
+    endpoint: Option<PeerEndpoint>,
+    /// `capability` came from an engine record, not static config. Only such
+    /// a capability is dropped when re-discovery finds no record or the
+    /// worker is unregistered.
+    engine_owned: bool,
 }
 
 /// Active-mode state: the per-source cap and the runtime kill switch.
@@ -1057,9 +1071,8 @@ impl KvAwarePolicy {
             last_transfer_plan: Mutex::new(None),
             next_generation: AtomicU64::new(1),
             transfer_planner: None,
-            transfer_capabilities: DashMap::new(),
-            peer_endpoints: DashMap::new(),
-            engine_capabilities: DashSet::new(),
+            peer_regs: DashMap::new(),
+            next_peer_epoch: AtomicU64::new(1),
             next_transfer_plan_id: AtomicU64::new(1),
             peer_fetch: None,
         }
@@ -1119,7 +1132,41 @@ impl KvAwarePolicy {
         self.transfer_planner.is_some()
     }
 
-    /// Declare what a worker can do for KV transfer. Replaced on re-register.
+    /// Replace `worker_url`'s registration with the given contents. Both parts
+    /// empty removes it; unchanged contents keep the existing `Arc` and epoch.
+    /// The caller holds `selection_lock`.
+    fn store_peer_reg_locked(
+        &self,
+        worker_url: &str,
+        capability: Option<TransferCapability>,
+        endpoint: Option<PeerEndpoint>,
+        engine_owned: bool,
+    ) {
+        if capability.is_none() && endpoint.is_none() {
+            self.peer_regs.remove(worker_url);
+            return;
+        }
+        if let Some(current) = self.peer_regs.get(worker_url) {
+            if current.capability == capability
+                && current.endpoint == endpoint
+                && current.engine_owned == engine_owned
+            {
+                return;
+            }
+        }
+        self.peer_regs.insert(
+            worker_url.to_owned(),
+            Arc::new(PeerRegistration {
+                epoch: self.next_peer_epoch.fetch_add(1, Ordering::AcqRel),
+                capability,
+                endpoint,
+                engine_owned,
+            }),
+        );
+    }
+
+    /// Declare what a worker can do for KV transfer. Replaced on re-register;
+    /// the worker's reported endpoint is kept.
     /// Survives `unregister_target`: only engine-reported capabilities are
     /// dropped when a worker is removed.
     pub fn register_transfer_capability(
@@ -1128,9 +1175,13 @@ impl KvAwarePolicy {
         capability: TransferCapability,
     ) {
         let worker_url = worker_url.into();
+        let _guard = self.selection_lock.lock();
+        let endpoint = self
+            .peer_regs
+            .get(&worker_url)
+            .and_then(|reg| reg.endpoint.clone());
         // An explicit declaration is never engine-sourced.
-        self.engine_capabilities.remove(&worker_url);
-        self.transfer_capabilities.insert(worker_url, capability);
+        self.store_peer_reg_locked(&worker_url, Some(capability), endpoint, false);
     }
 
     /// Apply (or clear, with `None`) the engine's validated peer-lookup record
@@ -1143,51 +1194,57 @@ impl KvAwarePolicy {
     /// engine-sourced capability is removed.
     pub fn apply_peer_lookup(&self, worker_url: &str, record: Option<&PeerLookupRecord>) {
         let _guard = self.selection_lock.lock();
+        self.apply_peer_lookup_locked(worker_url, record);
+    }
+
+    /// `apply_peer_lookup` for a caller that holds `selection_lock`.
+    fn apply_peer_lookup_locked(&self, worker_url: &str, record: Option<&PeerLookupRecord>) {
         if !self.targets.contains_key(worker_url) {
             return;
         }
+        let current = self.peer_regs.get(worker_url).map(|reg| Arc::clone(&reg));
+        let (current_capability, engine_owned) = match current.as_deref() {
+            Some(reg) => (reg.capability.clone(), reg.engine_owned),
+            None => (None, false),
+        };
         let Some(record) = record else {
-            self.peer_endpoints.remove(worker_url);
-            if self.engine_capabilities.remove(worker_url).is_some() {
-                self.transfer_capabilities.remove(worker_url);
-            }
+            let capability = if engine_owned {
+                None
+            } else {
+                current_capability
+            };
+            self.store_peer_reg_locked(worker_url, capability, None, false);
             return;
         };
-        self.peer_endpoints.insert(
-            worker_url.to_owned(),
-            PeerEndpoint {
-                engine_id: Arc::from(record.engine_id.as_str()),
-                host: Arc::from(record.side_channel_host.as_str()),
-                port: record.side_channel_port,
-                tp_size: record.tp_size,
-                dcp_size: record.dcp_size,
-                pp_size: record.pp_size,
-            },
-        );
-        let engine_owned = self.engine_capabilities.contains(worker_url);
-        if self.transfer_capabilities.contains_key(worker_url) && !engine_owned {
+        let endpoint = PeerEndpoint {
+            engine_id: Arc::from(record.engine_id.as_str()),
+            host: Arc::from(record.side_channel_host.as_str()),
+            port: record.side_channel_port,
+            tp_size: record.tp_size,
+            dcp_size: record.dcp_size,
+            pp_size: record.pp_size,
+        };
+        if current_capability.is_some() && !engine_owned {
+            self.store_peer_reg_locked(worker_url, current_capability, Some(endpoint), false);
             return;
         }
-        self.transfer_capabilities.insert(
-            worker_url.to_owned(),
-            TransferCapability {
-                can_export: true,
-                can_import: true,
-                connector: Arc::from(record.connector.as_str()),
-                connector_version: Arc::from(record.connector_version.as_str()),
-                layout_fingerprint: Arc::from(record.layout_fingerprint.as_str()),
-            },
-        );
-        self.engine_capabilities.insert(worker_url.to_owned());
+        let capability = TransferCapability {
+            can_export: true,
+            can_import: true,
+            connector: Arc::from(record.connector.as_str()),
+            connector_version: Arc::from(record.connector_version.as_str()),
+            layout_fingerprint: Arc::from(record.layout_fingerprint.as_str()),
+        };
+        self.store_peer_reg_locked(worker_url, Some(capability), Some(endpoint), true);
     }
 
     /// Where `worker_url` accepts peer KV fetches, if its engine reported a
     /// valid record. A capability without an address can be planned but not
     /// fetched; active mode requires this on the source.
     pub fn peer_endpoint(&self, worker_url: &str) -> Option<PeerEndpoint> {
-        self.peer_endpoints
+        self.peer_regs
             .get(worker_url)
-            .map(|endpoint| endpoint.clone())
+            .and_then(|reg| reg.endpoint.clone())
     }
 
     /// Register a pre-validated capability table (see
@@ -1204,8 +1261,13 @@ impl KvAwarePolicy {
 
     pub fn register_target(&self, worker_url: impl Into<String>, target: RoutableTarget) {
         let _guard = self.selection_lock.lock();
+        self.register_target_locked(worker_url.into(), target);
+    }
+
+    /// `register_target` for a caller that holds `selection_lock`.
+    fn register_target_locked(&self, worker_url: String, target: RoutableTarget) {
         self.targets.insert(
-            worker_url.into(),
+            worker_url,
             TargetBinding {
                 target,
                 generation: self.next_generation.fetch_add(1, Ordering::AcqRel),
@@ -1224,9 +1286,26 @@ impl KvAwarePolicy {
         matches: Arc<dyn TieredMatchProvider>,
     ) {
         let _guard = self.selection_lock.lock();
+        self.register_target_with_cache_identity_locked(
+            worker_url.into(),
+            target,
+            cache_key,
+            matches,
+        );
+    }
+
+    /// `register_target_with_cache_identity` for a caller that holds
+    /// `selection_lock`.
+    fn register_target_with_cache_identity_locked(
+        &self,
+        worker_url: String,
+        target: RoutableTarget,
+        cache_key: CacheKey,
+        matches: Arc<dyn TieredMatchProvider>,
+    ) {
         let block_size = cache_key.block_size;
         self.targets.insert(
-            worker_url.into(),
+            worker_url,
             TargetBinding {
                 target,
                 generation: self.next_generation.fetch_add(1, Ordering::AcqRel),
@@ -1241,10 +1320,13 @@ impl KvAwarePolicy {
         let _guard = self.selection_lock.lock();
         // Static capabilities are operator config and outlive the worker; only
         // an engine-reported one is dropped with it.
-        if self.engine_capabilities.remove(worker_url).is_some() {
-            self.transfer_capabilities.remove(worker_url);
-        }
-        self.peer_endpoints.remove(worker_url);
+        let kept = self
+            .peer_regs
+            .get(worker_url)
+            .map(|reg| Arc::clone(&reg))
+            .filter(|reg| !reg.engine_owned)
+            .and_then(|reg| reg.capability.clone());
+        self.store_peer_reg_locked(worker_url, kept, None, false);
         if let Some((_, binding)) = self.targets.remove(worker_url) {
             if let Some(slot_manager) = &self.slot_manager {
                 slot_manager.unregister_target(&binding.target);
@@ -1612,7 +1694,7 @@ impl KvAwarePolicy {
     /// Active mode: turn a plan into a fetch address and an in-flight slot.
     /// `None` (counted) when the source has no reported address or is at the
     /// cap; `None` (not counted) in shadow mode. Does not need `selection_lock`: it
-    /// reads the selection snapshot, `peer_endpoints` and the limiter, which
+    /// reads the selection snapshot, `peer_regs` and the limiter, which
     /// synchronize themselves.
     fn peer_fetch_grant(
         &self,
@@ -1642,9 +1724,10 @@ impl KvAwarePolicy {
         // worker URL, so go through the same snapshot the plan was made from.
         let source_url = worker_url_for(&transfer.source);
         let Some((source_url, endpoint)) = source_url.and_then(|url| {
-            self.peer_endpoints
+            self.peer_regs
                 .get(url)
-                .map(|endpoint| (url, endpoint.clone()))
+                .and_then(|reg| reg.endpoint.clone())
+                .map(|endpoint| (url, endpoint))
         }) else {
             crate::metrics::RouterMetrics::record_kv_transfer_request("no_peer_endpoint");
             return None;
@@ -1678,16 +1761,17 @@ impl KvAwarePolicy {
             // Also covers the load-only fallback attempt.
             TransferOutcome::skip(TransferSkip::MissingTokens)
         } else {
-            // Hold the map refs for the call instead of cloning each
-            // capability. DashMap shard locks admit new readers while a writer
-            // waits, so taking several refs cannot deadlock; a concurrent
-            // register or unregister just waits until planning returns.
-            let capabilities: Vec<
-                Option<dashmap::mapref::one::Ref<'_, String, TransferCapability>>,
-            > = plan
+            // Clone each registration's `Arc` so no map ref is held while
+            // planning; writers replace whole records, so each peer's
+            // capability is read from one consistent snapshot.
+            let registrations: Vec<Option<Arc<PeerRegistration>>> = plan
                 .healthy
                 .iter()
-                .map(|&index| self.transfer_capabilities.get(workers[index].url()))
+                .map(|&index| {
+                    self.peer_regs
+                        .get(workers[index].url())
+                        .map(|reg| Arc::clone(&reg))
+                })
                 .collect();
             let peers: Vec<PeerInput<'_>> = candidates
                 .iter()
@@ -1695,7 +1779,9 @@ impl KvAwarePolicy {
                 .map(|(i, candidate)| PeerInput {
                     candidate,
                     cache_key: plan.bindings[i].cache_key.as_ref(),
-                    capability: capabilities[i].as_deref(),
+                    capability: registrations[i]
+                        .as_deref()
+                        .and_then(|reg| reg.capability.as_ref()),
                     excluded: excluded(i),
                 })
                 .collect();
@@ -2340,16 +2426,23 @@ impl KvAwareOps for KvAwarePolicy {
             ),
             dp_rank: worker.dp_rank().unwrap_or(0) as u32,
         };
-        match (info.and_then(|info| info.cache_key.clone()), matches) {
-            (Some(cache_key), Some(matches)) => {
-                self.register_target_with_cache_identity(worker.url(), target, cache_key, matches);
-            }
-            _ => self.register_target(worker.url(), target),
-        }
         // Each registered worker is one (URL, DP rank): attach the record whose
         // rank matches, rank 0 for a worker without a dp_rank.
         let rank = worker.dp_rank().unwrap_or(0) as u32;
-        self.apply_peer_lookup(
+        // One lock acquisition covers the target and its peer registration.
+        let _guard = self.selection_lock.lock();
+        match (info.and_then(|info| info.cache_key.clone()), matches) {
+            (Some(cache_key), Some(matches)) => {
+                self.register_target_with_cache_identity_locked(
+                    worker.url().to_owned(),
+                    target,
+                    cache_key,
+                    matches,
+                );
+            }
+            _ => self.register_target_locked(worker.url().to_owned(), target),
+        }
+        self.apply_peer_lookup_locked(
             worker.url(),
             info.and_then(|info| info.peer_lookup.get(&rank)),
         );
@@ -4597,6 +4690,39 @@ mod tests {
         }
     }
 
+    /// The capability recorded for `url`, whatever its source.
+    fn capability_of(policy: &KvAwarePolicy, url: &str) -> Option<TransferCapability> {
+        policy
+            .peer_regs
+            .get(url)
+            .and_then(|reg| reg.capability.clone())
+    }
+
+    /// Whether any worker's capability came from an engine record.
+    fn any_engine_owned(policy: &KvAwarePolicy) -> bool {
+        policy.peer_regs.iter().any(|reg| reg.engine_owned)
+    }
+
+    /// Replace only the endpoint of `url`'s record, with a new `Arc` and epoch.
+    fn set_endpoint(policy: &KvAwarePolicy, url: &str, endpoint: Option<PeerEndpoint>) {
+        let current = policy.peer_regs.get(url).map(|reg| Arc::clone(&reg));
+        let capability = current.as_ref().and_then(|reg| reg.capability.clone());
+        let engine_owned = current.as_ref().is_some_and(|reg| reg.engine_owned);
+        if capability.is_none() && endpoint.is_none() {
+            policy.peer_regs.remove(url);
+            return;
+        }
+        policy.peer_regs.insert(
+            url.to_owned(),
+            Arc::new(PeerRegistration {
+                epoch: policy.next_peer_epoch.fetch_add(1, Ordering::AcqRel),
+                capability,
+                endpoint,
+                engine_owned,
+            }),
+        );
+    }
+
     /// `transfer_fixture` with the planner and active mode on, and `a` (the
     /// source) reporting a peer address.
     fn active_fixture(
@@ -4604,9 +4730,7 @@ mod tests {
     ) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>, Vec<RoutableTarget>) {
         let (policy, workers, targets) = transfer_fixture(true);
         let policy = policy.with_peer_fetch(max_inflight);
-        policy
-            .peer_endpoints
-            .insert("http://a".to_owned(), peer_endpoint("engine-a", 5600));
+        set_endpoint(&policy, "http://a", Some(peer_endpoint("engine-a", 5600)));
         (policy, workers, targets)
     }
 
@@ -4630,9 +4754,7 @@ mod tests {
     fn grpc_destination_plans_but_takes_no_slot() {
         let (policy, workers, _) = transfer_fixture_with_urls(true, ["http://a", "grpc://b"]);
         let policy = policy.with_peer_fetch(4);
-        policy
-            .peer_endpoints
-            .insert("http://a".to_owned(), peer_endpoint("engine-a", 5600));
+        set_endpoint(&policy, "http://a", Some(peer_endpoint("engine-a", 5600)));
         let receipt = select(&policy, &workers);
         assert_eq!(receipt.worker_index, 1, "grpc worker is the destination");
         assert!(policy.last_transfer_plan().is_some());
@@ -4643,9 +4765,7 @@ mod tests {
     #[test]
     fn shadow_mode_never_grants_even_with_an_address() {
         let (policy, workers, _) = transfer_fixture(true);
-        policy
-            .peer_endpoints
-            .insert("http://a".to_owned(), peer_endpoint("engine-a", 5600));
+        set_endpoint(&policy, "http://a", Some(peer_endpoint("engine-a", 5600)));
         let receipt = select(&policy, &workers);
         assert!(policy.last_transfer_plan().is_some());
         assert!(receipt.peer_fetch.is_none());
@@ -4656,7 +4776,7 @@ mod tests {
     #[test]
     fn active_mode_without_a_source_address_plans_but_does_not_grant() {
         let (policy, workers, _) = active_fixture(4);
-        policy.peer_endpoints.remove("http://a");
+        set_endpoint(&policy, "http://a", None);
         let receipt = select(&policy, &workers);
         assert!(policy.last_transfer_plan().is_some());
         assert!(receipt.peer_fetch.is_none());
@@ -4700,9 +4820,7 @@ mod tests {
     #[test]
     fn the_endpoint_is_the_sources_not_the_destinations() {
         let (policy, workers, _) = active_fixture(4);
-        policy
-            .peer_endpoints
-            .insert("http://b".to_owned(), peer_endpoint("engine-b", 5700));
+        set_endpoint(&policy, "http://b", Some(peer_endpoint("engine-b", 5700)));
         let receipt = select(&policy, &workers);
         assert_eq!(receipt.worker_index, 1, "b is the destination");
         assert_eq!(
@@ -4934,8 +5052,8 @@ mod tests {
 
         // Static capabilities are operator config and survive unregister.
         policy.unregister_target("http://a");
-        assert!(policy.transfer_capabilities.get("http://a").is_some());
-        assert!(policy.transfer_capabilities.get("http://b").is_some());
+        assert!(capability_of(&policy, "http://a").is_some());
+        assert!(capability_of(&policy, "http://b").is_some());
     }
 
     #[test]
@@ -4948,17 +5066,15 @@ mod tests {
 
         policy.unregister_target("http://a");
         assert_eq!(
-            &*policy
-                .transfer_capabilities
-                .get("http://a")
+            &*capability_of(&policy, "http://a")
                 .unwrap()
                 .layout_fingerprint,
             "static"
         );
 
         KvAwareOps::register_worker(&policy, worker.as_ref(), None, None);
-        assert!(policy.transfer_capabilities.get("http://a").is_some());
-        assert!(policy.engine_capabilities.is_empty());
+        assert!(capability_of(&policy, "http://a").is_some());
+        assert!(!any_engine_owned(&policy));
     }
 
     #[test]
@@ -4972,11 +5088,11 @@ mod tests {
             Some(&peer_info(&[(0, peer_record("engine", 5600))])),
             None,
         );
-        assert!(policy.transfer_capabilities.get("http://a").is_some());
+        assert!(capability_of(&policy, "http://a").is_some());
 
         policy.unregister_target("http://a");
-        assert!(policy.transfer_capabilities.get("http://a").is_none());
-        assert!(policy.engine_capabilities.is_empty());
+        assert!(capability_of(&policy, "http://a").is_none());
+        assert!(!any_engine_owned(&policy));
     }
 
     #[test]
@@ -5075,7 +5191,7 @@ mod tests {
             block.capabilities = capabilities.clone();
             let policy = built_policy(&kv_aware_config(Some(block)));
             let policy = policy.as_any().downcast_ref::<KvAwarePolicy>().unwrap();
-            let registered = policy.transfer_capabilities.get("http://a");
+            let registered = capability_of(policy, "http://a");
             assert_eq!(registered.is_some(), expected);
             if let Some(capability) = registered {
                 assert!(capability.can_export && !capability.can_import);
@@ -5158,7 +5274,7 @@ mod tests {
             KvAwareOps::register_worker(&policy, worker.as_ref(), Some(&info), None);
         }
         for (worker, fingerprint, port) in [(&rank0, "fp0", 5600), (&rank1, "fp1", 5601)] {
-            let capability = policy.transfer_capabilities.get(worker.url()).unwrap();
+            let capability = capability_of(&policy, worker.url()).unwrap();
             assert!(capability.can_export && capability.can_import);
             assert_eq!(&*capability.connector, "nixl");
             assert_eq!(&*capability.connector_version, "1");
@@ -5179,9 +5295,7 @@ mod tests {
         ));
         KvAwareOps::register_worker(&policy, plain.as_ref(), Some(&info), None);
         assert_eq!(
-            &*policy
-                .transfer_capabilities
-                .get("http://p:8000")
+            &*capability_of(&policy, "http://p:8000")
                 .unwrap()
                 .layout_fingerprint,
             "fp0"
@@ -5194,7 +5308,7 @@ mod tests {
         ));
         KvAwareOps::register_worker(&policy, missing.as_ref(), Some(&info), None);
         assert!(policy.peer_endpoint(missing.url()).is_none());
-        assert!(policy.transfer_capabilities.get(missing.url()).is_none());
+        assert!(capability_of(&policy, missing.url()).is_none());
     }
 
     #[test]
@@ -5206,9 +5320,7 @@ mod tests {
         let info = peer_info(&[(0, peer_record("engine", 5600))]);
         KvAwareOps::register_worker(&policy, worker.as_ref(), Some(&info), None);
         assert_eq!(
-            &*policy
-                .transfer_capabilities
-                .get("http://a")
+            &*capability_of(&policy, "http://a")
                 .unwrap()
                 .layout_fingerprint,
             "static"
@@ -5218,9 +5330,7 @@ mod tests {
         // Re-discovery without a record leaves the static entry alone.
         KvAwareOps::register_worker(&policy, worker.as_ref(), None, None);
         assert_eq!(
-            &*policy
-                .transfer_capabilities
-                .get("http://a")
+            &*capability_of(&policy, "http://a")
                 .unwrap()
                 .layout_fingerprint,
             "static"
@@ -5232,7 +5342,7 @@ mod tests {
         KvAwareOps::register_worker(&engine_first, worker.as_ref(), Some(&info), None);
         engine_first.register_transfer_capability("http://a", capability("static"));
         KvAwareOps::register_worker(&engine_first, worker.as_ref(), None, None);
-        assert!(engine_first.transfer_capabilities.get("http://a").is_some());
+        assert!(capability_of(&engine_first, "http://a").is_some());
     }
 
     #[test]
@@ -5242,15 +5352,13 @@ mod tests {
             Arc::new(BasicWorker::new("http://a".into(), WorkerType::Regular));
         let info = peer_info(&[(0, peer_record("one", 5600))]);
         KvAwareOps::register_worker(&policy, worker.as_ref(), Some(&info), None);
-        assert!(policy.transfer_capabilities.get("http://a").is_some());
+        assert!(capability_of(&policy, "http://a").is_some());
 
         // A changed record replaces the engine-sourced capability.
         let changed = peer_info(&[(0, peer_record("two", 5700))]);
         KvAwareOps::register_worker(&policy, worker.as_ref(), Some(&changed), None);
         assert_eq!(
-            &*policy
-                .transfer_capabilities
-                .get("http://a")
+            &*capability_of(&policy, "http://a")
                 .unwrap()
                 .layout_fingerprint,
             "two"
@@ -5262,7 +5370,7 @@ mod tests {
             KvAwareOps::register_worker(&policy, worker.as_ref(), Some(&changed), None);
             assert!(policy.peer_endpoint("http://a").is_some());
             KvAwareOps::register_worker(&policy, worker.as_ref(), info.as_ref(), None);
-            assert!(policy.transfer_capabilities.get("http://a").is_none());
+            assert!(capability_of(&policy, "http://a").is_none());
             assert!(policy.peer_endpoint("http://a").is_none());
         }
     }
@@ -5282,13 +5390,13 @@ mod tests {
         assert!(policy.peer_endpoint("http://a").is_some());
 
         policy.unregister_target("http://a");
-        assert!(policy.transfer_capabilities.get("http://a").is_none());
+        assert!(capability_of(&policy, "http://a").is_none());
         assert!(policy.peer_endpoint("http://a").is_none());
 
         // A discovery result that lands after removal must not resurrect them.
         policy.apply_peer_lookup("http://a", Some(&record));
-        assert!(policy.transfer_capabilities.get("http://a").is_none());
+        assert!(capability_of(&policy, "http://a").is_none());
         assert!(policy.peer_endpoint("http://a").is_none());
-        assert!(policy.engine_capabilities.is_empty());
+        assert!(!any_engine_owned(&policy));
     }
 }
