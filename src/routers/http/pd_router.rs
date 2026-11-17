@@ -774,6 +774,8 @@ impl PdRouterBase {
             &[url.to_string()],
             self.worker_startup_timeout_secs,
             self.worker_startup_check_interval_secs,
+            // PD health checks do not send the API key yet.
+            None,
         )
         .await
         .map_err(|_| PDRouterError::HealthCheckFailed {
@@ -1180,6 +1182,10 @@ impl PdRouterBase {
             window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
+        if ctx.router_config.api_key.is_some() {
+            warn!("--api-key is not applied to P/D worker health checks yet");
+        }
+
         // Workers must be up before they can report their engine count.
         let prefill_base_urls: Vec<String> =
             prefill_urls.iter().map(|(url, _)| url.clone()).collect();
@@ -1189,6 +1195,8 @@ impl PdRouterBase {
                     urls,
                     ctx.router_config.worker_startup_timeout_secs,
                     ctx.router_config.worker_startup_check_interval_secs,
+                    // PD health checks do not send the API key yet.
+                    None,
                 )
                 .await?;
             }
@@ -1822,6 +1830,7 @@ impl PdRouterBase {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerFactory, WorkerType};
@@ -2611,6 +2620,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod admission_tests {
     use super::super::pd_types::PdLoadSample;
     use super::*;

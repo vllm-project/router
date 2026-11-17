@@ -94,6 +94,7 @@ fn event_has_output(event: &[u8]) -> bool {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

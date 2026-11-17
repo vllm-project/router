@@ -486,6 +486,7 @@ impl ServiceRegistry {
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn register_test_instance(
         &self,
         http_address: String,
@@ -551,6 +552,7 @@ impl Drop for ServiceRegistry {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

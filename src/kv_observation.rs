@@ -167,6 +167,7 @@ fn record_observation(prediction: &KvRoutePrediction, observation: CacheObservat
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod test_helpers {
     use super::*;
     pub(crate) fn prediction() -> KvRoutePrediction {
@@ -195,6 +196,7 @@ pub(crate) mod test_helpers {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::test_helpers::*;
     use super::*;
