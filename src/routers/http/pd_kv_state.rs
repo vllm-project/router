@@ -403,15 +403,18 @@ impl PdKvState {
             let signature = binding
                 .map(|binding| format!("{}:{:?}", binding.signature, binding.info))
                 .unwrap_or_default();
-            let previous = targets.get(worker.url()).cloned();
-            let same = previous.as_ref().is_some_and(|registration| {
+            let previous = targets.get(worker.url());
+            let same = previous.is_some_and(|registration| {
                 registration.signature == signature && registration.decode == decode
             });
             if same {
                 continue;
             }
-            if let Some(previous) = previous.filter(|registration| registration.decode != decode) {
-                if let Some(policy) = self.policy(previous.decode) {
+            let old_decode = previous
+                .filter(|registration| registration.decode != decode)
+                .map(|registration| registration.decode);
+            if let Some(old_decode) = old_decode {
+                if let Some(policy) = self.policy(old_decode) {
                     if let Some(kv) = kv_aware_ops(policy.as_ref()) {
                         kv.unregister_worker(worker.url());
                     }
@@ -1344,12 +1347,11 @@ mod kv_input_tests {
                 .is_some(),
             "Decode must be priced before the first request"
         );
-        // Prefill refresh removes a deleted Decode worker through the Decode
-        // policy, not its own.
-        let decode_kv = kv_aware_ops(decode_policy.as_ref()).unwrap();
         // The same URL changes role before the next refresh. The cached
         // signature matches, but the owner changed, so the Decode policy must
         // be registered rather than skipped.
+        let prefill_kv = kv_aware_ops(prefill_policy.as_ref()).unwrap();
+        let decode_kv = kv_aware_ops(decode_policy.as_ref()).unwrap();
         let old_prefill = prefill[0].clone();
         registry.remove_by_url(old_prefill.url());
         let decode_role: Arc<dyn Worker> =
@@ -1364,6 +1366,15 @@ mod kv_input_tests {
             .additional_tokens
             .is_some(),
             "a role change must register the new owning policy"
+        );
+        assert_eq!(
+            prefill_kv.estimate_decode_work(
+                &[(decode_role.as_ref(), &[vec![1, 2, 3]], true)],
+                &mut PromptHashes::new(),
+            )[0]
+            .additional_tokens,
+            None,
+            "the old Prefill policy target must be removed"
         );
         // Prefill refresh removes a deleted Decode worker through the Decode
         // policy, not its own.
