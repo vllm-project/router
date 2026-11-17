@@ -587,8 +587,6 @@ impl RouterMetrics {
     }
 
     pub fn record_kv_source_recovery_transition(
-        _source: &str,
-        _dp_rank: u32,
         previous: Option<(&'static str, &'static str)>,
         state: &'static str,
         reason: &'static str,
@@ -617,8 +615,6 @@ impl RouterMetrics {
     }
 
     pub fn clear_kv_source_recovery_state(
-        _source: &str,
-        _dp_rank: u32,
         state: &'static str,
         reason: &'static str,
         recovery_duration: Option<Duration>,
@@ -639,12 +635,7 @@ impl RouterMetrics {
         }
     }
 
-    pub fn record_kv_replay_outcome(
-        _source: &str,
-        _dp_rank: u32,
-        outcome: &'static str,
-        duration: Option<Duration>,
-    ) {
+    pub fn record_kv_replay_outcome(outcome: &'static str, duration: Option<Duration>) {
         counter!("vllm_router_kv_replay_outcomes_total",
             "outcome" => outcome)
         .increment(1);

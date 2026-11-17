@@ -91,11 +91,6 @@ pub(crate) fn record_signal_loss() {
 /// `EXACT`/`DEGRADED`/`FALLBACK` state machine is the trust arbiter's contract.
 #[derive(Debug, Clone)]
 pub enum IngestionSignal {
-    Invalidated {
-        source: SourceId,
-        dp_rank: u32,
-        reason: &'static str,
-    },
     Advance {
         source: SourceId,
         last_seq: i64,

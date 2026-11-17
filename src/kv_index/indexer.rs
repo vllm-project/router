@@ -598,8 +598,6 @@ impl KvBlockIndexer {
             to = state.as_str(), reason = reason.as_str(),
             "kv_index source recovery transition");
         RouterMetrics::record_kv_source_recovery_transition(
-            source,
-            dp_rank,
             previous.map(|status| (status.state.as_str(), status.reason.as_str())),
             state.as_str(),
             reason.as_str(),
@@ -840,14 +838,6 @@ impl KvBlockIndexer {
         self.resume_source_locked(source, dp_rank, state, SourceRecoveryReason::ClearBarrier);
     }
 
-    /// Enable observations only after an authoritative initial, replay, or
-    /// clear boundary.
-    /// Already-active sources must not invalidate concurrent query snapshots.
-    #[cfg(test)]
-    pub(super) fn resume_source(&self, source: &SourceId, dp_rank: u32) {
-        self.resume_source_for(source, dp_rank, SourceRecoveryReason::ReplayApplied);
-    }
-
     pub(super) fn resume_initial_sequence(&self, source: &SourceId, dp_rank: u32, strict: bool) {
         let _guard = self.source_mutations.lock();
         let state = if strict {
@@ -920,8 +910,6 @@ impl KvBlockIndexer {
         if let Entry::Occupied(entry) = entry {
             let record = entry.remove();
             RouterMetrics::clear_kv_source_recovery_state(
-                source,
-                dp_rank,
                 record.status.state.as_str(),
                 record.status.reason.as_str(),
                 record.recovery_started.map(|started| started.elapsed()),
@@ -1044,7 +1032,7 @@ mod tests {
         let source = SourceId::from("a");
         let generation = idx.source_generation_for_test();
         for _ in 0..3 {
-            idx.resume_source(&source, 0);
+            idx.resume_source_for(&source, 0, SourceRecoveryReason::ReplayApplied);
         }
         assert_eq!(idx.source_generation_for_test(), generation);
         idx.suspend_source(&source, 0);
@@ -1057,14 +1045,14 @@ mod tests {
                 .all(|hit| hit.target.instance_id != source || hit.target.dp_rank != 0));
         }
         // Complete replay may resume credit without forgetting still-valid claims.
-        idx.resume_source(&source, 0);
+        idx.resume_source_for(&source, 0, SourceRecoveryReason::ReplayApplied);
         assert_eq!(idx.source_generation_for_test(), generation + 2);
         assert_eq!(idx.find_matches(&query(&["x"], &tiers)).len(), 5);
-        idx.resume_source(&source, 0);
+        idx.resume_source_for(&source, 0, SourceRecoveryReason::ReplayApplied);
         assert_eq!(idx.source_generation_for_test(), generation + 2);
         idx.invalidate_source(&source, 0);
         assert_eq!(idx.source_generation_for_test(), generation + 3);
-        idx.resume_source(&source, 0);
+        idx.resume_source_for(&source, 0, SourceRecoveryReason::ReplayApplied);
         assert_eq!(idx.source_generation_for_test(), generation + 4);
         for group in [0, 1] {
             assert_eq!(
@@ -1133,7 +1121,7 @@ mod tests {
             SourceRecoveryState::WorkerExact
         );
         // A full-domain checkpoint is a precondition, not something seq=0 supplies.
-        indexer.resume_source(&source, 0);
+        indexer.resume_source_for(&source, 0, SourceRecoveryReason::ReplayApplied);
         indexer.store(
             0,
             pool("shared", "w0"),
@@ -1219,8 +1207,6 @@ mod tests {
         indexer.suspend_source_for(&source, 2, SourceRecoveryReason::SequenceGap);
         indexer.invalidate_source_for(&source, 2, SourceRecoveryReason::ReplayFailed);
         RouterMetrics::record_kv_replay_outcome(
-            &source,
-            2,
             "failed",
             Some(std::time::Duration::from_millis(5)),
         );
@@ -1310,7 +1296,11 @@ mod tests {
         let resuming = idx.clone();
         AFTER_QUERY_EDGE.with(|slot| {
             *slot.borrow_mut() = Some(Box::new(move || {
-                resuming.resume_source(&SourceId::from("a"), 0);
+                resuming.resume_source_for(
+                    &SourceId::from("a"),
+                    0,
+                    SourceRecoveryReason::ReplayApplied,
+                );
             }));
         });
         let hits = idx.find_matches(&query(&["x"], &[StorageTier::Device]));
@@ -1333,7 +1323,7 @@ mod tests {
             *slot.borrow_mut() = Some(Box::new(move || {
                 let source = SourceId::from("a");
                 invalidating.invalidate_source(&source, 0);
-                invalidating.resume_source(&source, 0);
+                invalidating.resume_source_for(&source, 0, SourceRecoveryReason::ReplayApplied);
             }));
         });
         assert!(idx

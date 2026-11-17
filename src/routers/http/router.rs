@@ -3436,16 +3436,24 @@ mod tests {
         }
     }
 
-    async fn completion_response_fixture() -> CompletionResponseFixture {
+    struct CompletionBackend {
+        worker: Arc<dyn Worker>,
+        responses: tokio::sync::mpsc::UnboundedSender<Response>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    // A controllable HTTP backend shared by raw-completion and recovery tests.
+    async fn completion_backend<T: Send + 'static>(
+        metadata: impl FnOnce(&str) -> axum::Router,
+        captured: tokio::sync::mpsc::UnboundedSender<T>,
+        capture: impl Fn(bytes::Bytes) -> T + Clone + Send + Sync + 'static,
+    ) -> CompletionBackend {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            format!("http://{}", listener.local_addr().unwrap()),
-            WorkerType::Regular,
-        ));
-        let (captured, requests) = tokio::sync::mpsc::unbounded_channel();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url.clone(), WorkerType::Regular));
         let (responses, pending) = tokio::sync::mpsc::unbounded_channel::<Response>();
         let pending = Arc::new(tokio::sync::Mutex::new(pending));
-        let app = axum::Router::new()
+        let app = metadata(&url)
             .route(
                 "/v1/completions/render",
                 axum::routing::post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
@@ -3453,23 +3461,35 @@ mod tests {
             .route(
                 "/v1/completions",
                 axum::routing::post(move |body: bytes::Bytes| {
-                    let (captured, pending) = (captured.clone(), pending.clone());
+                    let (captured, pending, capture) =
+                        (captured.clone(), pending.clone(), capture.clone());
                     async move {
-                        captured.send(body).unwrap();
+                        assert!(captured.send(capture(body)).is_ok());
                         pending.lock().await.recv().await.unwrap()
                     }
                 }),
             );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        CompletionBackend {
+            worker,
+            responses,
+            server,
+        }
+    }
+
+    async fn completion_response_fixture() -> CompletionResponseFixture {
+        let (captured, requests) = tokio::sync::mpsc::unbounded_channel();
+        let backend =
+            completion_backend(|_| axum::Router::new(), captured, std::convert::identity).await;
         let mut router = create_test_kv_router();
-        router.worker_registry.register(worker.clone());
+        router.worker_registry.register(backend.worker.clone());
         router.retry_config.max_retries = 0;
         CompletionResponseFixture {
             router: Arc::new(router),
-            worker,
+            worker: backend.worker,
             requests,
-            responses,
-            server,
+            responses: backend.responses,
+            server: backend.server,
         }
     }
 
@@ -4427,19 +4447,15 @@ mod tests {
         publishers: Vec<zmq::Socket>,
         replay: zmq::Socket,
         signals: tokio::sync::mpsc::Receiver<crate::kv_index::IngestionSignal>,
-        requests: tokio::sync::mpsc::UnboundedReceiver<(
-            usize,
-            bytes::Bytes,
-            tokio::sync::oneshot::Sender<()>,
-        )>,
-        servers: Vec<tokio::task::JoinHandle<()>>,
+        requests: tokio::sync::mpsc::UnboundedReceiver<(usize, bytes::Bytes)>,
+        backends: Vec<CompletionBackend>,
     }
 
     impl Drop for RecoveryCompletionFixture {
         fn drop(&mut self) {
             self.router.kv_index_supervisor.as_ref().unwrap().shutdown();
-            for server in &self.servers {
-                server.abort();
+            for backend in &self.backends {
+                backend.server.abort();
             }
         }
     }
@@ -4463,38 +4479,29 @@ mod tests {
             let (captured, requests) = tokio::sync::mpsc::unbounded_channel();
             let mut workers = Vec::new();
             let mut publishers = Vec::new();
-            let mut servers = Vec::new();
+            let mut backends = Vec::new();
             for index in 0..2 {
                 let publisher = context.socket(zmq::XPUB).unwrap();
                 publisher.bind("tcp://127.0.0.1:*").unwrap();
                 let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let url = format!("http://{}", listener.local_addr().unwrap());
-                let source = url.clone();
                 let replay_endpoint = (index == 0).then(|| replay_endpoint.clone());
-                let captured = captured.clone();
-                let app = axum::Router::new()
-                    .route("/get_server_info", axum::routing::get(move || {
-                        let source = source.clone();
-                        async move { Json(serde_json::json!({"model_id":"qwen3","instance_id":source,"kv_block_size":16})) }
-                    }))
-                    .route("/kv_event_sources", axum::routing::get(move || {
-                        let (endpoint, replay_endpoint) = (endpoint.clone(), replay_endpoint.clone());
-                        async move { Json(serde_json::json!({"0":{"endpoint":endpoint,"replay_endpoint":replay_endpoint,"publisher":"zmq","encoding":"msgpack","schema_version":1,"enable_kv_cache_events":true}})) }
-                    }))
-                    .route("/v1/completions", axum::routing::post(move |body: bytes::Bytes| {
-                        let captured = captured.clone();
-                        async move {
-                            let (release, wait) = tokio::sync::oneshot::channel();
-                            captured.send((index, body, release)).unwrap();
-                            wait.await.unwrap();
-                            Json(serde_json::json!({"choices":[{"text":"ok","finish_reason":"stop"}]}))
-                        }
-                    }));
-                servers.push(tokio::spawn(async move {
-                    axum::serve(listener, app).await.unwrap()
-                }));
-                let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, WorkerType::Regular));
+                let backend = completion_backend(
+                    move |url| {
+                        let source = url.to_owned();
+                        axum::Router::new()
+                            .route("/get_server_info", axum::routing::get(move || {
+                                let source = source.clone();
+                                async move { Json(serde_json::json!({"model_id":"qwen3","instance_id":source,"kv_block_size":16})) }
+                            }))
+                            .route("/kv_event_sources", axum::routing::get(move || {
+                                let (endpoint, replay_endpoint) = (endpoint.clone(), replay_endpoint.clone());
+                                async move { Json(serde_json::json!({"0":{"endpoint":endpoint,"replay_endpoint":replay_endpoint,"publisher":"zmq","encoding":"msgpack","schema_version":1,"enable_kv_cache_events":true}})) }
+                            }))
+                    },
+                    captured.clone(),
+                    move |body| (index, body),
+                ).await;
+                let worker = backend.worker.clone();
                 router.worker_registry.register(worker.clone());
                 let info = supervisor.on_worker_added(worker.url()).await.unwrap();
                 let policy = router.policy_registry.get_default_policy();
@@ -4519,6 +4526,7 @@ mod tests {
                 .expect("subscriber handshake");
                 workers.push(worker);
                 publishers.push(publisher);
+                backends.push(backend);
             }
             router.kv_index_supervisor = Some(supervisor);
             Self {
@@ -4528,7 +4536,7 @@ mod tests {
                 replay,
                 signals,
                 requests,
-                servers,
+                backends,
             }
         }
 
@@ -4675,7 +4683,7 @@ mod tests {
                 let raw = raw.clone();
                 async move { router.route_completion_raw(None, request, raw, None).await }
             });
-            let (backend, body, release) =
+            let (backend, body) =
                 tokio::time::timeout(Duration::from_secs(5), self.requests.recv())
                     .await
                     .unwrap()
@@ -4683,7 +4691,13 @@ mod tests {
             let during = manager.sample(&a);
             let b_during = manager.sample(&b);
             let loads = (self.workers[0].load(), self.workers[1].load());
-            release.send(()).unwrap();
+            self.backends[backend]
+                .responses
+                .send(
+                    Json(serde_json::json!({"choices":[{"text":"ok","finish_reason":"stop"}]}))
+                        .into_response(),
+                )
+                .unwrap();
             let response = tokio::time::timeout(Duration::from_secs(5), dispatch)
                 .await
                 .unwrap()

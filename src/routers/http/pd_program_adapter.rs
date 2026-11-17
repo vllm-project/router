@@ -110,18 +110,15 @@ impl PdProgramRuntime {
                             use crate::kv_index::IngestionSignal;
                             if let Some(warm_remote) = &kv_warm_remote {
                                 let invalidation = match signal {
-                                    IngestionSignal::Invalidated {
-                                        source, dp_rank, ..
-                                    } => Some((source, Some(dp_rank as usize))),
                                     IngestionSignal::Gap { source, .. }
                                     | IngestionSignal::IncarnationReset { source, .. } => {
-                                        Some((source, None))
+                                        Some(source)
                                     }
                                     _ => None,
                                 };
-                                if let Some((source, rank)) = invalidation {
+                                if let Some(source) = invalidation {
                                     for url in supervisor.worker_urls_for_source(&source) {
-                                        warm_remote.invalidate_target(&url, rank);
+                                        warm_remote.invalidate_target(&url, None);
                                     }
                                 }
                             }
