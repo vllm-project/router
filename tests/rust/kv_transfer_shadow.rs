@@ -1256,3 +1256,91 @@ async fn s17_rediscovered_source_record_replaces_the_old_address() {
     assert_ne!(params["remote_port"], peer_port(0));
     fx.finish().await;
 }
+
+// ---------------------------------------------------------------------------
+// Kill switch: POST /kv_transfer/peer_fetch flips active mode at runtime.
+// ---------------------------------------------------------------------------
+
+const PEER_FETCH_GAUGE: &str = "vllm_router_kv_transfer_peer_fetch_enabled";
+
+/// POST `{"enabled": enabled}` to the kill switch; returns status and body.
+async fn set_peer_fetch(app: &Router, enabled: bool) -> (u16, serde_json::Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/kv_transfer/peer_fetch")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "enabled": enabled }).to_string()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.expect("router response");
+    let status = response.status().as_u16();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    (status, serde_json::from_slice(&body).expect("JSON body"))
+}
+
+/// The kill switch gauge's current value, if it has been set.
+fn peer_fetch_gauge() -> Option<f64> {
+    metrics().render().lines().find_map(|line| {
+        line.strip_prefix(PEER_FETCH_GAUGE)
+            .and_then(|rest| rest.strip_prefix(' '))
+            .and_then(|value| value.parse().ok())
+    })
+}
+
+/// 18: disabling the switch keeps routing and planning (`planned` is still
+/// counted) but the planned request goes out without `kv_transfer_params`
+/// and is not counted on the requests counter; enabling it sends again.
+#[tokio::test]
+async fn s18_kill_switch_endpoint_stops_and_resumes_peer_fetch() {
+    let (fx, prompt) = active_fixture(
+        61,
+        Options::new(&[("a", "m"), ("b", "m")]).active(&both_report_fp()),
+    )
+    .await;
+
+    // Enabled: the planned request is fetched.
+    let ((status, plans), sent) =
+        request_outcomes_of(outcomes_of(fx.complete(&prompt, None))).await;
+    assert_eq!(status, 200);
+    assert_eq!(plans, outcomes(&[("planned", 1)]));
+    assert_eq!(sent, outcomes(&[("sent", 1)]));
+    assert!(fx.mock("b").bodies()[0].get("kv_transfer_params").is_some());
+
+    // Disable.
+    let (status, body) = set_peer_fetch(&fx.app, false).await;
+    assert_eq!(status, 200);
+    // One entry: the default policy, which every worker's model maps to (the
+    // model id is whatever the router derives for these mocks).
+    assert_eq!(body["enabled"], json!(false));
+    let policies = body["policies"].as_array().expect("policies list");
+    assert_eq!(policies.len(), 1, "{body}");
+    assert_eq!(policies[0]["default"], json!(true));
+    assert_eq!(policies[0]["enabled"], json!(false));
+    assert_eq!(peer_fetch_gauge(), Some(0.0));
+
+    // Disabled: still planned, but nothing sent and no params reach B.
+    let ((status, plans), sent) =
+        request_outcomes_of(outcomes_of(fx.complete(&prompt, None))).await;
+    assert_eq!(status, 200);
+    assert_eq!(plans, outcomes(&[("planned", 1)]));
+    assert!(sent.is_empty(), "{sent:?}");
+    let b_bodies = fx.mock("b").bodies();
+    assert_eq!(b_bodies.len(), 2);
+    assert!(b_bodies[1].get("kv_transfer_params").is_none());
+
+    // Enable again: sent.
+    let (status, body) = set_peer_fetch(&fx.app, true).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["enabled"], json!(true));
+    assert_eq!(peer_fetch_gauge(), Some(1.0));
+    let ((status, plans), sent) =
+        request_outcomes_of(outcomes_of(fx.complete(&prompt, None))).await;
+    assert_eq!(status, 200);
+    assert_eq!(plans, outcomes(&[("planned", 1)]));
+    assert_eq!(sent, outcomes(&[("sent", 1)]));
+    let b_bodies = fx.mock("b").bodies();
+    assert_eq!(b_bodies.len(), 3);
+    assert_eq!(b_bodies[2]["kv_transfer_params"], expected_peer_params());
+    fx.finish().await;
+}

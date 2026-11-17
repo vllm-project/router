@@ -635,6 +635,73 @@ async fn finish_session(
     Json(json!({ "status": "ok", "session_id": session_id })).into_response()
 }
 
+#[derive(Deserialize)]
+struct PeerFetchRequest {
+    enabled: bool,
+}
+
+/// GET /kv_transfer/peer_fetch
+///
+/// Reports the active-mode peer fetch kill switch and each active-mode
+/// `kv_aware` policy it covers. `policies` is empty when none is active.
+async fn get_peer_fetch(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    Json(state.context.policy_registry.peer_fetch_status()).into_response()
+}
+
+/// POST /kv_transfer/peer_fetch with `{"enabled": bool}`
+///
+/// Runtime kill switch for active-mode peer KV fetch. Flips every active-mode
+/// `kv_aware` policy at once; takes effect for selections after the call.
+/// The body is parsed after authorization so an unauthorized caller never
+/// learns anything from body errors. 400 on a bad body, 409 when no policy is
+/// in active mode (the flag is left unchanged).
+async fn set_peer_fetch(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    // serde would also accept `[true]` for a struct; require an object.
+    let request = serde_json::from_slice::<serde_json::Value>(&body).and_then(|value| {
+        if value.is_object() {
+            serde_json::from_value::<PeerFetchRequest>(value)
+        } else {
+            Err(serde::de::Error::custom("the body must be a JSON object"))
+        }
+    });
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("expected a JSON body {{\"enabled\": bool}}: {error}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // The active-policy check, the store, the gauge and the log are one
+    // locked step in the registry.
+    let registry = &state.context.policy_registry;
+    let Some(status) = registry.set_peer_fetch_enabled_if_active(request.enabled) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "no policy in active mode" })),
+        )
+            .into_response();
+    };
+    Json(status).into_response()
+}
+
 // ---------- Worker management endpoints (RESTful) ----------
 
 /// POST /workers - Add a new worker with full configuration
@@ -928,7 +995,11 @@ pub fn build_app_with_wasm_middleware(
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
         .route("/scheduling/diagnostics", get(scheduling_diagnostics))
-        .route("/finish_session", post(finish_session));
+        .route("/finish_session", post(finish_session))
+        .route(
+            "/kv_transfer/peer_fetch",
+            get(get_peer_fetch).post(set_peer_fetch),
+        );
 
     // Worker management routes
     let worker_routes = Router::new()
@@ -1054,6 +1125,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.api_key_validation_urls.clone(),
     )?;
     println!("DEBUG: AppContext created");
+
+    // Export the kill switch state before any call to /kv_transfer/peer_fetch
+    // when the main policy is in active mode.
+    let peer_fetch = app_context.policy_registry.peer_fetch_status();
+    if peer_fetch.policies.iter().any(|policy| policy.default) {
+        metrics::RouterMetrics::set_kv_transfer_peer_fetch_enabled(peer_fetch.enabled);
+    }
 
     let app_context = Arc::new(app_context);
 
@@ -1593,6 +1671,162 @@ mod tests {
         }
         backend.abort();
         let _ = backend.await;
+    }
+
+    /// The real app over a router with no workers, for admin route tests.
+    async fn admin_test_app(
+        policy: crate::config::PolicyConfig,
+        api_key_urls: Vec<String>,
+    ) -> Router {
+        let config = RouterConfig {
+            policy,
+            ..Default::default()
+        };
+        let context =
+            Arc::new(AppContext::new(config, Client::new(), 32, None, api_key_urls).unwrap());
+        let router = crate::routers::http::router::Router::new(Vec::new(), &context)
+            .await
+            .unwrap();
+        build_app_with_request_tracing(
+            Arc::new(AppState {
+                router: Arc::new(router),
+                context,
+                concurrency_queue_tx: None,
+                router_manager: None,
+            }),
+            1024,
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+    }
+
+    fn kv_aware_policy(mode: crate::config::types::KvTransferMode) -> crate::config::PolicyConfig {
+        crate::config::PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.3,
+            kv_penalty_external: 0.05,
+            kv_penalty_disk: 0.01,
+            static_kv_event_sources: Default::default(),
+            kv_transfer: Some(Box::new(crate::config::types::KvTransferConfig {
+                mode,
+                ..Default::default()
+            })),
+        }
+    }
+
+    async fn call(
+        app: &Router,
+        method: &str,
+        body: &'static str,
+    ) -> (StatusCode, serde_json::Value) {
+        use axum::body::{to_bytes, Body};
+        use tower::ServiceExt;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/kv_transfer/peer_fetch")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn peer_fetch_get_reports_active_policies() {
+        use crate::config::types::KvTransferMode;
+
+        let app = admin_test_app(kv_aware_policy(KvTransferMode::Active), Vec::new()).await;
+        let (status, body) = call(&app, "GET", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "enabled": true,
+                "policies": [{"models": [], "default": true, "enabled": true}],
+            })
+        );
+
+        for policy in [
+            kv_aware_policy(KvTransferMode::Shadow),
+            crate::config::PolicyConfig::RoundRobin,
+        ] {
+            let app = admin_test_app(policy, Vec::new()).await;
+            let (status, body) = call(&app, "GET", "").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, json!({"enabled": true, "policies": []}));
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_fetch_post_sets_the_flag_and_rejects_bad_bodies() {
+        use crate::config::types::KvTransferMode;
+
+        let app = admin_test_app(kv_aware_policy(KvTransferMode::Active), Vec::new()).await;
+        for body in ["", "{", "{}", r#"{"enabled": "no"}"#, "[true]"] {
+            let (status, response) = call(&app, "POST", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(response["error"].is_string(), "{body}: {response}");
+        }
+        // Bad bodies left the flag alone.
+        assert_eq!(call(&app, "GET", "").await.1["enabled"], json!(true));
+
+        let (status, response) = call(&app, "POST", r#"{"enabled": false}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response,
+            json!({
+                "enabled": false,
+                "policies": [{"models": [], "default": true, "enabled": false}],
+            })
+        );
+        assert_eq!(call(&app, "GET", "").await.1, response);
+    }
+
+    #[tokio::test]
+    async fn peer_fetch_post_without_an_active_policy_is_a_conflict() {
+        use crate::config::types::KvTransferMode;
+
+        for policy in [
+            kv_aware_policy(KvTransferMode::Shadow),
+            crate::config::PolicyConfig::RoundRobin,
+        ] {
+            let app = admin_test_app(policy, Vec::new()).await;
+            let (status, response) = call(&app, "POST", r#"{"enabled": false}"#).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(response, json!({"error": "no policy in active mode"}));
+            // The flag did not change.
+            assert_eq!(call(&app, "GET", "").await.1["enabled"], json!(true));
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_fetch_post_authorizes_before_reading_the_body() {
+        use crate::config::types::KvTransferMode;
+
+        let app = admin_test_app(
+            kv_aware_policy(KvTransferMode::Active),
+            vec!["http://unused.invalid".into()],
+        )
+        .await;
+        for body in ["{", r#"{"enabled": false}"#] {
+            let (status, _) = call(&app, "POST", body).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        }
+        let (status, _) = call(&app, "GET", "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

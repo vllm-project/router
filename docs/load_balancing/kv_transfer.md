@@ -145,12 +145,99 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 | Otherwise | `sent` |
 
 **Where capabilities come from.**
-- *Engine-reported:* a worker's `peer_lookup` record on `/kv_event_sources` gives both a capability and a peer address (host, port, engine id, TP/DCP/PP sizes).
+- *Engine-reported:* a worker's `peer_lookup` record on `/kv_event_sources` gives both a capability and a peer address (host, port, engine id, TP/DCP/PP sizes). The record is described below.
 - *Static:* `kv_transfer.capabilities` in the router config gives a capability only. It has no address, so a statically declared source can be planned in shadow mode but always ends as `no_peer_endpoint` in active mode. A static entry wins over the engine's capability for the same worker; the engine's address is still stored.
+
+**The `peer_lookup` record.** `/kv_event_sources` returns a JSON object keyed by DP rank as a string (`"0"`, `"1"`, ...). A key that is not a number is skipped without a warning. Each rank's entry may carry a `peer_lookup` object. The router attaches to a worker the record of the worker's own DP rank, or of rank `"0"` when the worker has no DP rank.
+
+```json
+{
+  "0": {
+    "endpoint": "tcp://*:5557",
+    "topic": "",
+    "peer_lookup": {
+      "enabled": true,
+      "engine_id": "engine-0",
+      "side_channel_host": "10.0.0.5",
+      "side_channel_port": 5600,
+      "tp_size": 2,
+      "dcp_size": 1,
+      "pp_size": 1,
+      "connector": "nixl",
+      "connector_version": "1",
+      "layout_fingerprint": "qwen3-8b-bf16-tp2"
+    }
+  }
+}
+```
+
+| Field | Type | Valid value | What the router does with it |
+|---|---|---|---|
+| `enabled` | bool | `true` | A record with `false` is dropped |
+| `engine_id` | string | not blank | Sent to the destination as `remote_engine_id` |
+| `side_channel_host` | string | not blank | Sent as `remote_host` |
+| `side_channel_port` | integer | 1 to 65535 | Sent as `remote_port` |
+| `tp_size` | integer | 1 or more | Sent as `tp_size` |
+| `dcp_size` | integer | 1 or more | Sent as `dcp_size` |
+| `pp_size` | integer | 1 or more | Sent as `pp_size` |
+| `connector` | string | not blank | Capability: must equal the other worker's when capabilities are required (always in `active`) |
+| `connector_version` | string | not blank | Capability: must equal the other worker's when capabilities are required (always in `active`) |
+| `layout_fingerprint` | string | not blank | Capability: must equal the other worker's when capabilities are required (always in `active`) |
+
+- Every field is required. A missing field reads as `false`, `""` or `0` and fails validation.
+- Strings are compared and sent exactly as reported; the router does not trim them.
+- An engine record gives the worker a capability that can both export and import.
+- The address fields are passed through to the destination's `kv_transfer_params`, together with `"do_remote_prefill": true` and `"peer_lookup": true`. The router does not interpret the sizes.
+- Unknown keys are ignored. A `null` or absent `peer_lookup` means no record.
+- A record that fails a check above is dropped with a warning naming the worker, the rank and the reason.
+- A `peer_lookup` value that is not an object, or that has any field of the wrong type, is read as an empty record. It is dropped like any record that fails the checks, and the warning gives the reason `not enabled`, whichever field was wrong.
+- A dropped record never fails discovery. The rest of the response, and the worker's other ranks, are still used.
+- Discovery reads the record when a worker is added. When it finds no valid record, the worker gets no address and any engine-reported capability it had is removed. A static capability is kept.
+- A changed record is picked up only when the worker is removed and added again.
 
 **Registration binding.** The planner checks a source's layout against the record it read. Discovery can replace a worker's record (new engine id, port or layout) for the same URL after the planner read it. So the grant fetches only if both the source and the destination still have the record and registration the planner saw, and it uses the address from that record. Otherwise the outcome is `registration_changed` and the request is sent unchanged, never with the old cache credit. Re-polling an identical record does not count as a change.
 
-**Kill switch.** `KvAwarePolicy::set_peer_fetch_enabled(false)` makes an active-mode router behave as shadow for requests selected from then on. In-flight fetches finish normally. There is no HTTP endpoint for it yet.
+**Kill switch.** `POST /kv_transfer/peer_fetch` with `{"enabled": false}` stops peer fetches on every active-mode `kv_aware` policy of the router at once; `{"enabled": true}` resumes them.
+- Routing, planning and the `planned` count on `vllm_router_kv_transfer_plans_total` continue as before. A planned request is sent without `kv_transfer_params` and is not counted on `vllm_router_kv_transfer_requests_total`, as in shadow mode.
+- It takes effect for selections made after the call. Fetches already in flight finish normally.
+- The state is held in memory only. A restart returns to the configured mode.
+- It covers one router instance. With several router replicas, call each one.
+- It is a manual switch, not a circuit breaker: the router never flips it by itself.
+- It uses the same authorization as the other admin routes. Any key accepted by one of the `api_key_validation_urls` can flip it, and when none are configured the endpoint is open.
+
+`GET /kv_transfer/peer_fetch` returns the current state. `POST /kv_transfer/peer_fetch` takes a JSON object with one boolean field:
+
+```json
+{"enabled": false}
+```
+
+Both return the state after the call:
+
+```json
+{
+  "enabled": false,
+  "policies": [
+    {"models": ["my-model"], "default": true, "enabled": false}
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `enabled` | The switch: `true` lets active-mode policies fetch, `false` stops them |
+| `policies` | Each active-mode `kv_aware` policy instance the switch covers; empty when no policy is in active mode |
+| `policies[].models` | Model ids routed by this instance, sorted. Empty until a worker registers |
+| `policies[].default` | Whether this instance is the router's main policy |
+| `policies[].enabled` | Whether this instance fetches now; always equal to the top-level `enabled` |
+
+| Status | When |
+|---|---|
+| 200 | `GET`, or a `POST` that set the state |
+| 400 | The `POST` body is not a JSON object with a boolean `enabled`; the body is `{"error": "..."}` |
+| 401 | API keys are configured and the request has no accepted key. Checked before the body is read |
+| 409 | No policy is in active mode: `{"error": "no policy in active mode"}`. The state is not changed |
+
+Each successful `POST` is logged at `WARN` with the new state and sets `vllm_router_kv_transfer_peer_fetch_enabled`.
 
 **Not supported.**
 - Prefill/decode (PD) routing: any mode other than `off` is rejected at startup.
@@ -164,3 +251,4 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 | `vllm_router_kv_transfer_requests_total` | `outcome` | Active mode only, one per planned request: `sent`, `grpc_destination`, `registration_changed`, `no_peer_endpoint`, `inflight_cap`, `client_params_present`, `invalid_body` |
 | `vllm_router_kv_transfer_estimated_saved_ms` | none | `saved_ms` of each planned transfer |
 | `vllm_router_kv_transfer_estimated_cost_ms` | `path` = `fetch` or `wait` | Both estimates, whenever the cost rule was evaluated |
+| `vllm_router_kv_transfer_peer_fetch_enabled` | none | Gauge: 1 while the kill switch lets active-mode policies fetch, 0 while it stops them. Set at startup when the main policy is in active mode, and on each successful `POST /kv_transfer/peer_fetch` |

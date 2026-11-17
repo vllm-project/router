@@ -9,6 +9,7 @@ use super::{
 };
 use crate::config::types::{KvTransferConfig, KvTransferMode};
 use crate::config::PolicyConfig;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 /// Factory for creating policy instances
@@ -67,7 +68,11 @@ impl PolicyFactory {
                 if let Some(table) = kv_affinity_table {
                     policy = policy.with_shared_affinity(Arc::clone(table));
                 }
-                Arc::new(Self::apply_kv_transfer(policy, kv_transfer.as_deref()))
+                Arc::new(Self::apply_kv_transfer(
+                    policy,
+                    kv_transfer.as_deref(),
+                    None,
+                ))
             }
             PolicyConfig::ConsistentHash { virtual_nodes: _ } => {
                 // Note: virtual_nodes parameter is available but not currently used
@@ -82,9 +87,14 @@ impl PolicyFactory {
     /// Install the transfer planner and static capabilities when the
     /// config asks for it. Shared by the factory and the registry. With no
     /// block or `mode: off` the policy is returned untouched.
+    ///
+    /// In active mode, `peer_fetch_enabled` is the kill switch flag to share
+    /// (the registry passes its own so one switch covers every policy it
+    /// builds); `None` gives the policy a flag of its own.
     pub(crate) fn apply_kv_transfer(
         policy: KvAwarePolicy,
         config: Option<&KvTransferConfig>,
+        peer_fetch_enabled: Option<&Arc<AtomicBool>>,
     ) -> KvAwarePolicy {
         let Some(config) = config.filter(|c| c.mode != KvTransferMode::Off) else {
             return policy;
@@ -103,7 +113,12 @@ impl PolicyFactory {
         }));
         policy.register_static_capabilities(capabilities);
         if config.mode == KvTransferMode::Active {
-            return policy.with_peer_fetch(config.max_inflight_per_source);
+            return match peer_fetch_enabled {
+                Some(flag) => {
+                    policy.with_shared_peer_fetch(config.max_inflight_per_source, Arc::clone(flag))
+                }
+                None => policy.with_peer_fetch(config.max_inflight_per_source),
+            };
         }
         policy
     }

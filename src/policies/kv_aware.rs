@@ -1029,7 +1029,9 @@ struct PlannedPeer<'a> {
 #[derive(Debug)]
 struct PeerFetchState {
     limiter: Arc<PeerFetchLimiter>,
-    enabled: AtomicBool,
+    /// Kill switch. Policies built by a `PolicyRegistry` share the
+    /// registry's flag, so one store flips all of them.
+    enabled: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for KvAwarePolicy {
@@ -1095,12 +1097,29 @@ impl KvAwarePolicy {
     /// Build the policy in active mode: planned requests get a peer fetch
     /// grant, at most `max_inflight_per_source` at a time per source worker.
     /// Starts enabled; see [`set_peer_fetch_enabled`](Self::set_peer_fetch_enabled).
-    pub fn with_peer_fetch(mut self, max_inflight_per_source: usize) -> Self {
+    pub fn with_peer_fetch(self, max_inflight_per_source: usize) -> Self {
+        self.with_shared_peer_fetch(max_inflight_per_source, Arc::new(AtomicBool::new(true)))
+    }
+
+    /// [`with_peer_fetch`](Self::with_peer_fetch) with a kill switch flag
+    /// owned by the caller. Every policy built with the same flag is enabled
+    /// and disabled together; the flag's current value applies from the start.
+    pub(crate) fn with_shared_peer_fetch(
+        mut self,
+        max_inflight_per_source: usize,
+        enabled: Arc<AtomicBool>,
+    ) -> Self {
         self.peer_fetch = Some(PeerFetchState {
             limiter: PeerFetchLimiter::new(max_inflight_per_source),
-            enabled: AtomicBool::new(true),
+            enabled,
         });
         self
+    }
+
+    /// Whether the policy was built in active mode, whatever the current
+    /// state of its kill switch.
+    pub fn is_peer_fetch_active_mode(&self) -> bool {
+        self.peer_fetch.is_some()
     }
 
     /// Whether planned requests are currently acted on (active mode) rather
@@ -1113,9 +1132,12 @@ impl KvAwarePolicy {
 
     /// Runtime kill switch: `false` drops back to shadow mode for requests
     /// selected from now on (in-flight fetches finish normally); `true`
-    /// re-enables active mode. Returns the resulting state. A policy that was
-    /// not built active stays shadow, because its planner was not built with
-    /// the capability requirement active mode forces.
+    /// re-enables active mode. Returns the resulting state. The flag may be
+    /// shared: a policy built by a `PolicyRegistry` stores to the registry's
+    /// flag, which flips every active policy that registry built (see
+    /// `PolicyRegistry::set_peer_fetch_enabled`). A policy that was not built
+    /// active stays shadow, because its planner was not built with the
+    /// capability requirement active mode forces.
     pub fn set_peer_fetch_enabled(&self, enabled: bool) -> bool {
         match &self.peer_fetch {
             Some(state) => {
@@ -5454,6 +5476,7 @@ mod tests {
             let policy = crate::policies::PolicyFactory::apply_kv_transfer(
                 base,
                 Some(&transfer_block(mode)),
+                None,
             );
             let mut sequence = Vec::new();
             for _ in 0..3 {

@@ -93,6 +93,11 @@ pub fn init_metrics() {
          (no_peer_endpoint, inflight_cap, grpc_destination, registration_changed, \
          client_params_present, invalid_body)"
     );
+    describe_gauge!(
+        "vllm_router_kv_transfer_peer_fetch_enabled",
+        "Active-mode peer KV fetch kill switch: 1 when enabled, 0 when disabled \
+         through /kv_transfer/peer_fetch"
+    );
     describe_histogram!(
         "vllm_router_kv_transfer_estimated_saved_ms",
         "Estimated prefill milliseconds saved by a planned KV transfer"
@@ -600,6 +605,10 @@ impl RouterMetrics {
     /// `invalid_body`.
     pub fn record_kv_transfer_request(outcome: &'static str) {
         counter!("vllm_router_kv_transfer_requests_total", "outcome" => outcome).increment(1);
+    }
+    /// State of the active-mode peer fetch kill switch (1 enabled, 0 disabled).
+    pub fn set_kv_transfer_peer_fetch_enabled(enabled: bool) {
+        gauge!("vllm_router_kv_transfer_peer_fetch_enabled").set(if enabled { 1.0 } else { 0.0 });
     }
     /// Estimated prefill milliseconds saved by a planned transfer.
     pub fn record_kv_transfer_estimated_saved_ms(saved_ms: f64) {
