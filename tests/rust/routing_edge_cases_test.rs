@@ -14,11 +14,9 @@ use common::routing_edge::{
     ascii_fork, branch, cache_aware_cases, rendezvous_pair, session_headers, workers,
     CacheAwareFixture, BASE_LOADS, FIRST_HEALTHY, MIN_LOAD, TENANT, WORKERS, WORKER_COUNTS,
 };
-use std::sync::Arc;
 use tower::ServiceExt;
 use vllm_router_rs::config::{RouterConfig, RoutingMode};
 use vllm_router_rs::policies::{LoadBalancingPolicy, RendezvousHashPolicy, RequestHeaders};
-use vllm_router_rs::routers::{RouterFactory, RouterTrait};
 use vllm_router_rs::tree::Tree;
 
 /// Check character counts and branch selection, both before and after reset.
@@ -160,13 +158,7 @@ async fn body_at_the_payload_limit_is_routed_and_one_byte_more_is_rejected() {
         worker_startup_check_interval_secs: 1,
         ..Default::default()
     };
-    let context = common::create_test_context(config.clone());
-    let router: Arc<dyn RouterTrait> = Arc::from(
-        RouterFactory::create_router(&context)
-            .await
-            .expect("router"),
-    );
-    let app = common::test_app::create_test_app(router, reqwest::Client::new(), &config);
+    let app = common::test_app::create_test_app_from_config(&config).await;
 
     for (len, expected) in [
         (LIMIT, StatusCode::OK),

@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use pyo3::prelude::*;
 pub mod backend;
 pub mod config;
@@ -34,6 +36,7 @@ pub enum PolicyType {
     KvAware,
     PowerOfTwo,
     ConsistentHash,
+    StickyLeastLoaded,
 }
 
 #[pyclass]
@@ -155,6 +158,7 @@ impl Router {
                 PolicyType::ConsistentHash => ConfigPolicyConfig::ConsistentHash {
                     virtual_nodes: 160, // Default value
                 },
+                PolicyType::StickyLeastLoaded => ConfigPolicyConfig::StickyLeastLoaded,
             }
         };
 

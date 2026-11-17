@@ -16,7 +16,6 @@ if str(_PERF_DIR) not in sys.path:
 
 from case_loader import (  # noqa: E402
     PERF_MODEL_ENV,
-    WaveSpec,
     apply_case_env,
     perf_model,
     perf_case_selected,
@@ -83,8 +82,8 @@ def _perf_save_results_enabled() -> bool:
     return True
 
 
-def _perf_waves_for_collection() -> tuple[WaveSpec, ...] | None:
-    """Resolve wave matrix at collection time (does not require MODEL).
+def _perf_case_for_collection():
+    """Resolve the case at collection time (does not require MODEL).
 
     Parametrize before runtime env is complete so ``-k hit99-c16-r32`` works;
     missing MODEL still skips at test time via ``test_prefix_kvhit_waves`` skipif.
@@ -92,7 +91,7 @@ def _perf_waves_for_collection() -> tuple[WaveSpec, ...] | None:
     if not perf_case_selected():
         return None
     try:
-        return resolve_perf_case().waves
+        return resolve_perf_case()
     except (OSError, ValueError, RuntimeError, FileNotFoundError) as exc:
         raise _perf_case_error(exc) from exc
 
@@ -172,9 +171,13 @@ def perf_settings(perf_case, perf_stack, bench_mod, perf_output_dir):
     return settings
 
 
-def _wave_params(waves: tuple[WaveSpec, ...]) -> tuple[list[tuple], list[str]]:
-    values = [(w.hit_rate, w.concurrency, w.requests) for w in waves]
-    ids = [wave_case_id(w.hit_rate, w.concurrency, w.requests) for w in waves]
+def _wave_params(case) -> tuple[list[tuple], list[str]]:
+    values = []
+    ids = []
+    for hit_rate in case.hit_rates:
+        for wave in case.waves:
+            values.append((hit_rate, wave.concurrency, wave.requests))
+            ids.append(wave_case_id(hit_rate, wave.concurrency, wave.requests))
     return values, ids
 
 
@@ -202,11 +205,11 @@ def pytest_generate_tests(metafunc):
         )
         return
 
-    waves = _perf_waves_for_collection()
-    if not waves:
+    case = _perf_case_for_collection()
+    if case is None or not case.waves:
         return
 
-    values, ids = _wave_params(waves)
+    values, ids = _wave_params(case)
     if not values:
         return
     metafunc.parametrize(

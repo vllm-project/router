@@ -97,9 +97,9 @@ and the Rust OpenAI backend use different configuration paths. See
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, rendezvous_hash` | `cache_aware` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash` | `cache_aware` | Request-level routing policy; also the fallback for both PD stages. |
-| `--prefill-policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash` | `unset` | PD prefill policy; unset inherits `--policy`. |
-| `--decode-policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash` | `unset` | PD decode policy; unset inherits `--policy`. |
+| `--policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, rendezvous_hash` | `cache_aware` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded` | `cache_aware` | Request-level routing policy; also the fallback for both PD stages. |
+| `--prefill-policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded` | `unset` | PD prefill policy; unset inherits `--policy`. |
+| `--decode-policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded` | `unset` | PD decode policy; unset inherits `--policy`. |
 | `--router-temperature` | `f64` | `0.0` | `float` | `0.0` | KV-aware selection temperature for regular routing and PD prefill; zero selects the lowest-cost worker. |
 | `--kv-penalty-host` | `f64` | `0.8` | `float` | `0.8` | Host-tier KV transfer credit for kv_aware. |
 | `--kv-penalty-external` | `f64` | `0.6` | `float` | `0.6` | External-tier KV transfer credit for kv_aware. |
@@ -247,8 +247,17 @@ has tracing support.
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key used for requests to workers. |
+| `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key for the router's own requests to workers, including HTTP health checks. |
 | `--api-key-validation-urls` | `string [0..] (repeatable)` | `[]` | — | — | Validation URLs; an empty list falls back to comma-separated `API_KEY_VALIDATION_URLS` from the environment or `.env`. |
+
+The key is the bearer token the router sends on its own requests to HTTP
+workers, including health checks; clients authenticate to the router
+separately with `--api-key-validation-urls`. It is not sent yet on
+`/flush_cache`, `/get_load`, gRPC requests, or PD and `--enable-igw` health
+checks.
+
+The startup wait and `add_worker` always probe `/health`, regardless of
+`--health-check-endpoint`.
 
 ## WASM middleware
 

@@ -35,7 +35,6 @@ class StackConfig:
 
 @dataclass(frozen=True)
 class WaveSpec:
-    hit_rate: float
     concurrency: int
     requests: int
 
@@ -43,6 +42,7 @@ class WaveSpec:
 @dataclass(frozen=True)
 class BackendCaseFile:
     backend: str
+    hit_rates: tuple[float, ...]
     waves: tuple[WaveSpec, ...]
     path: Path
     stack: StackConfig
@@ -58,35 +58,58 @@ def wave_case_id(hit_rate: float, concurrency: int, requests: int) -> str:
     return f"hit{int(round(hit_rate * 100)):02d}-c{concurrency}-r{requests}"
 
 
+def _section(data: dict[str, Any], name: str, path: Path) -> dict[str, Any]:
+    raw = data.get(name)
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: {name} must be an object")
+    return raw
+
+
+def _parse_hit_rates(raw: Any, *, where: str) -> tuple[float, ...]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"{where}: bench.hit_rates must be a non-empty array")
+    rates: list[float] = []
+    for item in raw:
+        try:
+            hit_rate = float(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid hit rate in {where}: {item!r}") from exc
+        if not 0.0 <= hit_rate <= 1.0:
+            raise ValueError(f"invalid hit rate in {where}: {item!r}")
+        rates.append(hit_rate)
+    return tuple(rates)
+
+
 def _parse_wave(raw: dict[str, Any], *, where: str) -> WaveSpec:
     try:
-        hit_rate = float(raw["hit_rate"])
         concurrency = int(raw["concurrency"])
         requests = int(raw.get("requests", raw.get("tasks")))
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid wave in {where}: {raw!r}") from exc
     if concurrency < 1 or requests < 1:
         raise ValueError(f"invalid wave in {where}: {raw!r}")
-    return WaveSpec(hit_rate=hit_rate, concurrency=concurrency, requests=requests)
+    return WaveSpec(concurrency=concurrency, requests=requests)
 
 
-def _parse_waves(data: dict[str, Any], path: Path) -> tuple[WaveSpec, ...]:
-    block = data.get("waves")
-    if block is None and isinstance(data.get("matrix"), list):
-        block = data["matrix"]
-    if not isinstance(block, list):
-        raise ValueError(f"{path}: missing or invalid 'waves' array")
-    return tuple(_parse_wave(item, where=f"{path.name}:waves") for item in block)
+def _parse_waves(bench: dict[str, Any], path: Path) -> tuple[WaveSpec, ...]:
+    block = bench.get("waves")
+    if not isinstance(block, list) or not block:
+        raise ValueError(f"{path}: bench.waves must be a non-empty array")
+    return tuple(_parse_wave(item, where=f"{path.name}:bench.waves") for item in block)
 
 
-def _parse_stack(data: dict[str, Any], path: Path, backend: str) -> StackConfig:
-    stack = data.get("stack") if isinstance(data.get("stack"), dict) else {}
-    host = str(stack.get("host", "127.0.0.1"))
-    router_port = int(stack.get("router_port", 16002))
-    worker_http_port = int(stack.get("worker_http_port", 18002))
-    prom = stack.get("prometheus_port")
+def _parse_stack(
+    env: dict[str, Any],
+    router: dict[str, Any],
+    worker: dict[str, Any],
+    backend: str,
+) -> StackConfig:
+    host = str(env.get("host", "127.0.0.1"))
+    router_port = int(router.get("port", 16002))
+    worker_http_port = int(worker.get("http_port", 18002))
+    prom = router.get("prometheus_port")
     prometheus_port = int(prom) if prom is not None else None
-    grpc_raw = stack.get("worker_grpc_port")
+    grpc_raw = worker.get("grpc_port")
     if grpc_raw is not None:
         worker_grpc_port = int(grpc_raw)
     elif backend == "rust_grpc":
@@ -105,8 +128,8 @@ def _parse_stack(data: dict[str, Any], path: Path, backend: str) -> StackConfig:
         worker_http_port=worker_http_port,
         worker_grpc_port=worker_grpc_port,
         prometheus_port=prometheus_port,
-        router_bin=_optional_str(stack.get("router_bin")),
-        vllm_rs_bin=_optional_str(stack.get("vllm_rs_bin")),
+        router_bin=_optional_str(router.get("bin")),
+        vllm_rs_bin=_optional_str(worker.get("bin")),
     )
 
 
@@ -165,14 +188,17 @@ def load_case_file(path: Path) -> BackendCaseFile:
     backend = data.get("backend") or path.stem
     if not isinstance(backend, str) or not backend:
         raise ValueError(f"{path}: backend must be a non-empty string")
-    worker = data.get("worker") if isinstance(data.get("worker"), dict) else {}
-    bench = data.get("bench") if isinstance(data.get("bench"), dict) else {}
+    env = _section(data, "env", path)
+    router = _section(data, "router", path)
+    worker = _section(data, "worker", path)
+    bench = _section(data, "bench", path)
     model, model_dir = _parse_model_fields(data, worker)
     return BackendCaseFile(
         backend=backend,
-        waves=_parse_waves(data, path),
+        hit_rates=_parse_hit_rates(bench.get("hit_rates"), where=path.name),
+        waves=_parse_waves(bench, path),
         path=path,
-        stack=_parse_stack(data, path, backend),
+        stack=_parse_stack(env, router, worker, backend),
         worker_cli=_parse_worker_cli(worker, path=path),
         model=model,
         model_dir=model_dir,

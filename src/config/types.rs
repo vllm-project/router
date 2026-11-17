@@ -110,7 +110,8 @@ fn default_profile_timeout_secs() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct EpdConfig {
     pub encoder_urls: Vec<String>,
-    /// Mooncake consumer control addresses, keyed by the P or combined PD HTTP URL.
+    /// Mooncake consumer control addresses, keyed by the P or combined PD HTTP URL
+    /// with an `@rank` suffix for DP replicas.
     /// Omit for pull-based NIXL or the shared-file example connector.
     #[serde(default)]
     pub consumer_zmq_addrs: HashMap<String, String>,
@@ -1052,6 +1053,14 @@ pub enum PolicyConfig {
         virtual_nodes: u32,
     },
 
+    /// Session-aware routing that combines session stickiness with load
+    /// balancing: existing sessions stick to their assigned replica, new
+    /// sessions are routed to the least-loaded replica (ties broken by
+    /// consistent hashing). Session expiry is configured via the
+    /// `VLLM_ROUTER_SLL_SESSION_EXPIRATION_IN_S` environment variable.
+    #[serde(rename = "sticky_least_loaded")]
+    StickyLeastLoaded,
+
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
 }
@@ -1086,6 +1095,7 @@ impl PolicyConfig {
             PolicyConfig::KvAware { .. } => "kv_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
+            PolicyConfig::StickyLeastLoaded => "sticky_least_loaded",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
         }
     }
@@ -1388,6 +1398,7 @@ impl RouterConfig {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

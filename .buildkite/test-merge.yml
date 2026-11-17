@@ -15,6 +15,7 @@ env:
 
 steps:
   # L2 smoke: one read_mode and LM_EVAL_LIMIT=20. Full read+write is test-nightly.yml.
+  # GSM8K lower bound is the model baseline or LM_EVAL_BASELINE, minus 0.03.
   # This queue is intentionally separate from the shared amd_mi300_* queues.
   # Those agents run --no-plugins, while this lane needs the Docker plugin
   # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host.
@@ -39,6 +40,7 @@ steps:
           bash -euo pipefail <<'BASH'
           export MORIIO_READ_MODE=true
           export LM_EVAL_LIMIT=20
+          export LM_EVAL_BASELINE=0.38
           export MORIIO_BACKEND=xgmi
           export MODEL_NAMES=Qwen/Qwen3-0.6B
           export ROUTER_BIN=/workdir/target/release/vllm-router

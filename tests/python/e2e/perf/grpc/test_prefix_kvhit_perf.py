@@ -59,7 +59,7 @@ def test_prefix_kvhit_waves(
         hit_rate=hit_rate,
         concurrency=concurrency,
         requests=requests,
-        payload={**payload, "backend": perf_case.backend},
+        payload=payload,
     )
     if result_path is not None:
         print(

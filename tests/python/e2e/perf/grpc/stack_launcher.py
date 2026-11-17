@@ -2,181 +2,60 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import shutil
-import subprocess
 import sys
-import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import requests
+from tests.python.e2e.perf.binaries import (
+    preflight_router_bin as _preflight_router_bin,
+)
+from tests.python.e2e.perf.binaries import (
+    router_bin as _shared_router_bin,
+)
+from tests.python.e2e.perf.binaries import (
+    vllm_rs_bin as _shared_vllm_rs_bin,
+)
+from tests.python.e2e.perf.process import (
+    RunningProc,
+    launch_router,
+    launch_worker,
+    router_cmd,
+    vllm_rs_serve_cmd,
+    vllm_serve_cmd,
+)
 
 if TYPE_CHECKING:
     from case_loader import BackendCaseFile
-
-logger = logging.getLogger(__name__)
-
-# File is ``tests/python/e2e/perf/grpc/stack_launcher.py`` → repo root is parents[5].
-REPO_ROOT = Path(__file__).resolve().parents[5]
 
 
 def _progress(msg: str) -> None:
     print(f"[perf stack] {msg}", file=sys.stderr, flush=True)
 
 
-def _pipe_process_output(proc: subprocess.Popen, label: str) -> None:
-    """Avoid PIPE deadlock and surface worker/router logs under pytest -s."""
-
-    def _reader() -> None:
-        stream = proc.stdout
-        if stream is None:
-            return
-        for line in stream:
-            print(f"[{label}] {line}", end="", file=sys.stderr, flush=True)
-
-    threading.Thread(target=_reader, daemon=True).start()
-
-
 @dataclass
 class PerfStack:
+    """Worker and router started for one gRPC scenario."""
+
     router_url: str
-    worker_proc: subprocess.Popen
-    router_proc: subprocess.Popen
+    worker: RunningProc
+    router: RunningProc
 
     def stop(self, timeout: float = 120.0) -> None:
-        for proc in (self.router_proc, self.worker_proc):
-            _graceful_stop(proc, timeout)
-
-
-def _graceful_stop(proc: subprocess.Popen, timeout: float) -> None:
-    if proc.poll() is not None:
-        return
-    proc.terminate()
-    start = time.monotonic()
-    while proc.poll() is None and time.monotonic() - start < timeout:
-        time.sleep(1)
-    if proc.poll() is None:
-        proc.kill()
-
-
-def _proc_exit_error(proc: subprocess.Popen, label: str) -> RuntimeError:
-    out = proc.stdout.read() if proc.stdout else ""
-    return RuntimeError(f"{label} exited early (code={proc.returncode}): {out[-4000:]}")
-
-
-def _wait_router_health(
-    base_url: str, timeout: float, *, proc: subprocess.Popen | None = None
-) -> None:
-    start = time.monotonic()
-    url = base_url.rstrip("/") + "/health"
-    last_log = start
-    with requests.Session() as session:
-        while time.monotonic() - start < timeout:
-            if proc is not None:
-                if proc.poll() is not None:
-                    raise _proc_exit_error(proc, "router")
-            try:
-                r = session.get(url, timeout=5)
-                if r.status_code == 200:
-                    _progress(
-                        f"router healthy at {url} ({time.monotonic() - start:.0f}s)"
-                    )
-                    return
-            except requests.RequestException:
-                pass
-            now = time.monotonic()
-            if now - last_log >= 30:
-                _progress(
-                    f"waiting for {url} ({now - start:.0f}s / {timeout:.0f}s timeout)…"
-                )
-                last_log = now
-            time.sleep(2)
-    raise TimeoutError(f"router not healthy at {url} within {timeout}s")
-
-
-def _resolve_bin_path(raw: str) -> str | None:
-    """Resolve case JSON path (absolute, repo-relative, or PATH name)."""
-    text = raw.strip()
-    if not text:
-        return None
-    candidate = Path(text).expanduser()
-    if not candidate.is_absolute():
-        candidate = (REPO_ROOT / candidate).resolve()
-    if candidate.is_file():
-        return str(candidate)
-    found = shutil.which(text)
-    if found:
-        return found
-    return None
+        self.router.stop(timeout)
+        self.worker.stop(timeout)
 
 
 def _router_bin(case: BackendCaseFile | None = None) -> str:
-    if raw := os.environ.get("ROUTER_BIN", "").strip():
-        return raw
-    if case and case.stack.router_bin:
-        if resolved := _resolve_bin_path(case.stack.router_bin):
-            return resolved
-    hint = REPO_ROOT / "target" / "release" / "vllm-router"
-    if hint.is_file():
-        return str(hint)
-    found = shutil.which("vllm-router")
-    if found:
-        return found
-    tried = [str(hint)]
-    if case and case.stack.router_bin:
-        tried.insert(0, case.stack.router_bin)
-    raise FileNotFoundError(
-        f"vllm-router not found (repo root={REPO_ROOT}, tried {tried!r}); "
-        "set ROUTER_BIN, stack.router_bin in case JSON, or build target/release/vllm-router"
-    )
-
-
-def _preflight_router_bin(router_bin: str) -> None:
-    """Fail before starting GPU workers if the router binary cannot run."""
-    path = Path(router_bin)
-    if path.is_file() and not os.access(path, os.X_OK):
-        raise PermissionError(f"vllm-router not executable: {router_bin}")
-    try:
-        proc = subprocess.run(
-            [router_bin, "--help"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-    except OSError as exc:
-        raise RuntimeError(
-            f"vllm-router preflight failed ({router_bin!r}): {exc}"
-        ) from exc
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()[-2000:]
-        raise RuntimeError(
-            f"vllm-router preflight failed ({router_bin} --help exit "
-            f"{proc.returncode}): {detail}"
-        )
+    case_bin = case.stack.router_bin if case is not None else None
+    return _shared_router_bin(case_bin)
 
 
 def _vllm_rs_bin(case: BackendCaseFile | None = None) -> str:
-    if raw := os.environ.get("VLLM_RS", "").strip():
-        return raw
-    if case and case.stack.vllm_rs_bin:
-        if resolved := _resolve_bin_path(case.stack.vllm_rs_bin):
-            return resolved
-    found = shutil.which("vllm-rs")
-    if found:
-        return found
-    import importlib.util
-
-    spec = importlib.util.find_spec("vllm")
-    if spec and spec.origin:
-        candidate = Path(spec.origin).parent / "vllm-rs"
-        if candidate.exists():
-            return str(candidate)
-    raise FileNotFoundError("vllm-rs not found; set VLLM_RS (vLLM 0.29 rust wheel)")
+    case_bin = case.stack.vllm_rs_bin if case is not None else None
+    return _shared_vllm_rs_bin(case_bin)
 
 
 def _vllm_cli() -> str:
@@ -184,20 +63,6 @@ def _vllm_cli() -> str:
     if not found:
         raise FileNotFoundError("vllm not on PATH")
     return found
-
-
-def _popen(cmd: list[str], *, env: dict | None = None) -> subprocess.Popen:
-    logger.info("launch: %s", " ".join(cmd))
-    merged = os.environ.copy()
-    if env:
-        merged.update(env)
-    return subprocess.Popen(
-        cmd,
-        env=merged,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
 
 
 def _router_env(model: str) -> dict[str, str]:
@@ -230,95 +95,60 @@ def launch_stack(case: BackendCaseFile, model: str) -> PerfStack:
     if backend == "rust_grpc":
         gp = case.stack.worker_grpc_port
         if gp is None:
-            raise ValueError(f"{case.path}: rust_grpc requires stack.worker_grpc_port")
-        rs = _vllm_rs_bin(case)
-        worker_cmd = [
-            rs,
-            "serve",
+            raise ValueError(f"{case.path}: rust_grpc requires worker.grpc_port")
+        worker_cmd = vllm_rs_serve_cmd(
+            _vllm_rs_bin(case),
             model,
-            "--host",
-            host,
-            "--port",
-            str(wp),
-            "--grpc-port",
-            str(gp),
-            *cli,
-        ]
-        _progress(
-            f"starting vllm-rs worker (model load may take 10–30+ min): {' '.join(worker_cmd)}"
+            host=host,
+            port=wp,
+            grpc_port=gp,
+            cli=cli,
         )
-        worker_proc = _popen(worker_cmd)
-        _pipe_process_output(worker_proc, "vllm-rs")
-        time.sleep(sleep_s)
+        worker_label = "vllm-rs"
+        worker_env = None
         worker_url = f"grpc://{host}:{gp}"
     elif backend == "rust_http":
-        worker_cmd = [
-            _vllm_cli(),
-            "serve",
-            model,
-            "--host",
-            host,
-            "--port",
-            str(wp),
-            *cli,
-        ]
-        _progress(f"starting rust-http worker: {' '.join(worker_cmd)}")
-        worker_proc = _popen(worker_cmd, env={"VLLM_USE_RUST_FRONTEND": "1"})
-        _pipe_process_output(worker_proc, "vllm-rust-http")
-        time.sleep(sleep_s)
+        worker_cmd = vllm_serve_cmd(_vllm_cli(), model, host=host, port=wp, cli=cli)
+        worker_label = "vllm-rust-http"
+        worker_env = {"VLLM_USE_RUST_FRONTEND": "1"}
         worker_url = f"http://{host}:{wp}"
     elif backend == "python_http":
-        worker_cmd = [
-            _vllm_cli(),
-            "serve",
-            model,
-            "--host",
-            host,
-            "--port",
-            str(wp),
-            *cli,
-        ]
-        _progress(f"starting python-http worker: {' '.join(worker_cmd)}")
-        worker_proc = _popen(worker_cmd, env={"VLLM_USE_RUST_FRONTEND": "0"})
-        _pipe_process_output(worker_proc, "vllm-python-http")
-        time.sleep(sleep_s)
+        worker_cmd = vllm_serve_cmd(_vllm_cli(), model, host=host, port=wp, cli=cli)
+        worker_label = "vllm-python-http"
+        worker_env = {"VLLM_USE_RUST_FRONTEND": "0"}
         worker_url = f"http://{host}:{wp}"
     else:
         raise ValueError(f"unknown backend {backend!r} in {case.path}")
 
-    if worker_proc.poll() is not None:
-        raise _proc_exit_error(worker_proc, "worker")
-
-    router_cmd = [
+    router_argv = router_cmd(
         router_bin,
-        "--host",
-        host,
-        "--port",
-        str(rp),
-        "--worker-urls",
-        worker_url,
-        "--worker-startup-timeout-secs",
-        str(worker_startup_timeout),
-    ]
-    if case.stack.prometheus_port is not None:
-        router_cmd.extend(["--prometheus-port", str(case.stack.prometheus_port)])
+        host=host,
+        port=rp,
+        worker_urls=worker_url,
+        worker_startup_timeout_secs=worker_startup_timeout,
+        prometheus_port=case.stack.prometheus_port,
+    )
 
     router_url = f"http://{host}:{rp}"
-    _progress(f"starting vllm-router: {' '.join(router_cmd)}")
+    _progress("starting worker (model load may take 10–30+ min)")
+    worker = launch_worker(
+        worker_cmd,
+        label=worker_label,
+        env=worker_env,
+        sleep_s=sleep_s,
+        timeout=timeout,
+        log_prefix="perf stack",
+    )
     try:
-        router_proc = _popen(router_cmd, env=_router_env(model))
+        _progress("starting router")
+        router = launch_router(
+            router_argv,
+            router_url=router_url,
+            env=_router_env(model),
+            timeout=timeout,
+            log_prefix="perf stack",
+        )
     except Exception:
-        _graceful_stop(worker_proc, 120.0)
+        worker.stop()
         raise
-    _pipe_process_output(router_proc, "vllm-router")
-    try:
-        _wait_router_health(router_url, timeout, proc=router_proc)
-    except Exception:
-        PerfStack(router_url, worker_proc, router_proc).stop()
-        raise
-
-    if router_proc.poll() is not None:
-        PerfStack(router_url, worker_proc, router_proc).stop()
-        raise _proc_exit_error(router_proc, "router")
-
-    return PerfStack(router_url, worker_proc, router_proc)
+    return PerfStack(router_url=router_url, worker=worker, router=router)

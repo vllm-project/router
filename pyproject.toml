@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-router"
-version = "0.1.16"
+version = "0.1.17"
 description = "High-performance Rust-based load balancer for VLLM with multiple routing algorithms and prefill-decode disaggregation support"
 authors = [{name = "Byron Hsu", email = "byronhsu1230@gmail.com"}]
 requires-python = ">=3.8"
@@ -30,6 +30,11 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
+    "grpcio-tools>=1.60",
+    "grpcio-health-checking>=1.60",
+    "pyzmq>=25",
+    "msgpack>=1.0",
+    "tomli>=1.1; python_version < '3.11'",
 ]
 
 [project.scripts]
