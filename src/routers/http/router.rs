@@ -239,6 +239,7 @@ impl Drop for LoadTrackedBody {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn hold_load_until_body_done(
     response: Response,
     worker: Arc<dyn Worker>,
@@ -3580,6 +3581,7 @@ impl RouterTrait for Router {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::collections::HashMap;

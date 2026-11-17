@@ -963,6 +963,7 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     #[test]
     fn router_tokens_refuse_adapter_cache_identities() {

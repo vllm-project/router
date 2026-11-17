@@ -1130,6 +1130,7 @@ fn base_url_without_rank(url: &str) -> &str {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

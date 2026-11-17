@@ -3651,6 +3651,7 @@ impl WorkerManagement for VllmPDRouter {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     async fn finalize_decode_response(
         response: reqwest::Response,
