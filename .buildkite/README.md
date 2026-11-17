@@ -12,7 +12,19 @@ pip install pre-commit && pre-commit install
 
 ## Pipeline Files
 
-`pipeline.yml` builds the release binary and wheel, pushes the NVIDIA CI image, then uploads L1, L2, and L3.
+`pipeline.yml` runs a lightweight CPU bootstrap, following
+[vllm-omni's diff-aware bootstrap](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py).
+For PRs where every changed path is under `docs/`, ends in `.md`, or is
+`mkdocs.yml`, it succeeds without uploading build or test jobs. This includes
+documentation additions and deletions. Mixed code/documentation changes run CI.
+The bootstrap fetches the PR target branch and compares its merge base with
+`HEAD`; renames include both the old and new paths. Empty or unresolved diffs
+run CI. Pushes (including merge queues), scheduled builds, and `NIGHTLY=1`
+also run CI. GitHub Actions quality/security checks and release publishing
+remain enabled. Unlike Omni, pytest skip-mark changes do not qualify.
+
+Otherwise the bootstrap uploads `bootstrap-upload-steps.yml`, which builds the release
+binary and wheel, pushes the NVIDIA CI image, then uploads L1, L2, and L3.
 Those uploads depend on the build step, not on each other. Jobs in each uploaded file depend on that upload step. The L1 and L3 NVIDIA P/D jobs, and the L3 gRPC perf job, also wait for `image-build`. `NIGHTLY=1` on this test pipeline selects tests. `NIGHTLY=1`
 on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 
