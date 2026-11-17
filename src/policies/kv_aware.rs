@@ -999,9 +999,8 @@ pub struct KvAwarePolicy {
 /// replaced as a whole so a reader sees one consistent registration.
 #[derive(Debug, Clone)]
 struct PeerRegistration {
-    /// Changes only when the contents change; from `next_peer_epoch`. Nothing
-    /// reads it yet; it identifies a registration for later consumers.
-    #[allow(dead_code)]
+    /// Changes only when the contents change; from `next_peer_epoch`. The
+    /// grant compares it with the planned registration's to detect a change.
     epoch: u64,
     capability: Option<TransferCapability>,
     endpoint: Option<PeerEndpoint>,
@@ -1009,6 +1008,21 @@ struct PeerRegistration {
     /// a capability is dropped when re-discovery finds no record or the
     /// worker is unregistered.
     engine_owned: bool,
+}
+
+/// The registrations a transfer plan was checked against. The grant
+/// revalidates them so a fetch never targets a worker the planner did not see.
+struct PlannedPeers<'a> {
+    source: PlannedPeer<'a>,
+    destination: PlannedPeer<'a>,
+}
+
+/// One worker as the planner saw it.
+struct PlannedPeer<'a> {
+    url: &'a str,
+    /// The worker's `TargetBinding::generation` in the plan's snapshot.
+    generation: u64,
+    registration: Option<Arc<PeerRegistration>>,
 }
 
 /// Active-mode state: the per-source cap and the runtime kill switch.
@@ -1675,11 +1689,12 @@ impl KvAwarePolicy {
             });
             #[cfg(test)]
             {
-                *self.last_transfer_plan.lock() = transfer.clone();
+                *self.last_transfer_plan.lock() =
+                    transfer.as_ref().map(|(transfer, _)| transfer.clone());
             }
             let peer_fetch = transfer
                 .as_ref()
-                .and_then(|transfer| self.peer_fetch_grant(workers, &plan, transfer));
+                .and_then(|(transfer, planned)| self.peer_fetch_grant(transfer, planned));
             return Some(KvSelectionReceipt {
                 worker_index,
                 new_prefill_tokens,
@@ -1692,15 +1707,16 @@ impl KvAwarePolicy {
     }
 
     /// Active mode: turn a plan into a fetch address and an in-flight slot.
-    /// `None` (counted) when the source has no reported address or is at the
-    /// cap; `None` (not counted) in shadow mode. Does not need `selection_lock`: it
-    /// reads the selection snapshot, `peer_regs` and the limiter, which
-    /// synchronize themselves.
+    /// `None` (counted) when the source or destination registration changed
+    /// since planning (`registration_changed`), the source has no reported
+    /// address, or it is at the cap; `None` (not counted) in shadow mode. The
+    /// endpoint comes from the registration the planner checked, never a fresh
+    /// lookup. Does not need `selection_lock`: it reads `peer_regs`, `targets`
+    /// and the limiter, which synchronize themselves.
     fn peer_fetch_grant(
         &self,
-        workers: &[Arc<dyn Worker>],
-        plan: &SelectionPlan,
         transfer: &TransferPlan,
+        planned: &PlannedPeers<'_>,
     ) -> Option<PeerFetchGrant> {
         let state = self
             .peer_fetch
@@ -1708,53 +1724,78 @@ impl KvAwarePolicy {
             .filter(|state| state.enabled.load(Ordering::Acquire))?;
         // The HTTP send path cannot add fetch params for a gRPC destination,
         // so a slot taken here would be held for nothing.
-        let worker_url_for = |target: &RoutableTarget| {
-            plan.bindings
-                .iter()
-                .position(|binding| &binding.target == target)
-                .and_then(|position| plan.healthy.get(position))
-                .and_then(|&index| workers.get(index))
-                .map(|worker| worker.url())
-        };
-        if worker_url_for(&transfer.destination).is_some_and(crate::backend::is_grpc_url) {
+        if crate::backend::is_grpc_url(planned.destination.url) {
             crate::metrics::RouterMetrics::record_kv_transfer_request("grpc_destination");
             return None;
         }
-        // The plan names its source by target; peer addresses are keyed by
-        // worker URL, so go through the same snapshot the plan was made from.
-        let source_url = worker_url_for(&transfer.source);
-        let Some((source_url, endpoint)) = source_url.and_then(|url| {
-            self.peer_regs
-                .get(url)
-                .and_then(|reg| reg.endpoint.clone())
-                .map(|endpoint| (url, endpoint))
-        }) else {
+        // Discovery or unregistration may have replaced either worker's
+        // record after the planner checked it. Skip rather than fetch from or
+        // into a worker the plan did not cover.
+        for (side, peer) in [
+            ("source", &planned.source),
+            ("destination", &planned.destination),
+        ] {
+            if !self.planned_peer_is_current(peer) {
+                crate::metrics::RouterMetrics::record_kv_transfer_request("registration_changed");
+                tracing::debug!(
+                    plan_id = transfer.plan_id,
+                    changed = side,
+                    "KV transfer skipped: registration changed since planning"
+                );
+                return None;
+            }
+        }
+        let Some(endpoint) = planned
+            .source
+            .registration
+            .as_ref()
+            .and_then(|reg| reg.endpoint.clone())
+        else {
             crate::metrics::RouterMetrics::record_kv_transfer_request("no_peer_endpoint");
             return None;
         };
-        let Some(permit) = state.limiter.try_acquire(source_url) else {
+        let Some(permit) = state.limiter.try_acquire(planned.source.url) else {
             crate::metrics::RouterMetrics::record_kv_transfer_request("inflight_cap");
             return None;
         };
         Some(PeerFetchGrant { endpoint, permit })
     }
 
+    /// Whether the worker's registration epoch and target generation still
+    /// match what the planner saw. Both absent counts as unchanged, and a
+    /// never-registered worker (generation 0) must still be unregistered.
+    fn planned_peer_is_current(&self, peer: &PlannedPeer<'_>) -> bool {
+        let epoch_matches = match (self.peer_regs.get(peer.url), &peer.registration) {
+            (None, None) => true,
+            (Some(current), Some(planned)) => current.epoch == planned.epoch,
+            _ => false,
+        };
+        epoch_matches
+            && self
+                .targets
+                .get(peer.url)
+                .map_or(peer.generation == 0, |binding| {
+                    binding.generation == peer.generation
+                })
+    }
+
     /// Ask the planner whether a peer fetch is worth it for the picked
     /// position. Pure computation over the selection snapshot (needs no
     /// `selection_lock`); records the outcome and never touches routing. In
     /// shadow mode the plan is only reported; in active mode the caller turns it
-    /// into a fetch grant.
+    /// into a fetch grant, revalidating the returned `PlannedPeers`.
     #[allow(clippy::too_many_arguments)]
-    fn plan_transfer_for_pick(
+    fn plan_transfer_for_pick<'w>(
         &self,
         planner: &dyn TransferPlanner,
-        workers: &[Arc<dyn Worker>],
+        workers: &'w [Arc<dyn Worker>],
         plan: &SelectionPlan,
         candidates: &[CandidateView<'_>],
         position: usize,
         used_binding: bool,
         excluded: &dyn Fn(usize) -> bool,
-    ) -> Option<TransferPlan> {
+    ) -> Option<(TransferPlan, PlannedPeers<'w>)> {
+        let mut registrations: Vec<Option<Arc<PeerRegistration>>> = Vec::new();
         let outcome = if used_binding {
             TransferOutcome::skip(TransferSkip::SessionBinding)
         } else if !plan.has_tokens {
@@ -1764,7 +1805,7 @@ impl KvAwarePolicy {
             // Clone each registration's `Arc` so no map ref is held while
             // planning; writers replace whole records, so each peer's
             // capability is read from one consistent snapshot.
-            let registrations: Vec<Option<Arc<PeerRegistration>>> = plan
+            registrations = plan
                 .healthy
                 .iter()
                 .map(|&index| {
@@ -1816,7 +1857,25 @@ impl KvAwarePolicy {
                     credited_tokens = transfer.credited_tokens,
                     "KV transfer plan"
                 );
-                Some(transfer)
+                // Record what the planner saw for the two ends, by position.
+                let planned_peer = |target: &RoutableTarget| {
+                    let position = plan
+                        .bindings
+                        .iter()
+                        .position(|binding| &binding.target == target)?;
+                    Some(PlannedPeer {
+                        url: workers[*plan.healthy.get(position)?].url(),
+                        generation: plan.bindings[position].generation,
+                        registration: registrations.get(position)?.clone(),
+                    })
+                };
+                let planned = planned_peer(&transfer.source)
+                    .zip(planned_peer(&transfer.destination))
+                    .map(|(source, destination)| PlannedPeers {
+                        source,
+                        destination,
+                    });
+                planned.map(|planned| (transfer, planned))
             }
             Err(skip) => {
                 crate::metrics::RouterMetrics::record_kv_transfer_plan(skip.label());
@@ -4808,12 +4867,27 @@ mod tests {
                 None,
             )
             .expect("snapshot");
+        let planned_peer = |target: &RoutableTarget| {
+            let position = plan
+                .bindings
+                .iter()
+                .position(|binding| &binding.target == target)
+                .expect("planned target");
+            let url = workers[plan.healthy[position]].url();
+            PlannedPeer {
+                url,
+                generation: plan.bindings[position].generation,
+                registration: policy.peer_regs.get(url).map(|reg| Arc::clone(&reg)),
+            }
+        };
+        let planned = PlannedPeers {
+            source: planned_peer(&transfer.source),
+            destination: planned_peer(&transfer.destination),
+        };
         // The source goes away after the snapshot was taken.
         policy.unregister_target("http://a");
 
-        assert!(policy
-            .peer_fetch_grant(&workers, &plan, &transfer)
-            .is_none());
+        assert!(policy.peer_fetch_grant(&transfer, &planned).is_none());
         assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
     }
 
