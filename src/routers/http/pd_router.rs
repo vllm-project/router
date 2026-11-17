@@ -465,11 +465,22 @@ fn select_stage(
         credited_prefix_tokens: selected_tokens.map(|_| 0),
         worker_index,
         endpoint: endpoints[worker_index].clone(),
-        // Unknown P token work falls back to occupancy; D includes the
-        // incoming request, which does not change candidate ranking.
+        // Unknown P token work falls back to occupancy; Decode records the
+        // occupancy plus the same marginal context the selector compared.
         score: kv_aware.then_some(match stage {
             Stage::Prefill => worker.load() as f64,
-            Stage::Decode => (worker.load() + 1) as f64,
+            Stage::Decode => {
+                let additional = if decode_prices_used {
+                    context
+                        .decode_context
+                        .and_then(|prices| prices.get(worker.url()))
+                        .copied()
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                (worker.load() as u64).saturating_add(additional) as f64
+            }
         }),
         new_prefill_tokens: selected_tokens,
         affinity_outcome,
@@ -3753,7 +3764,7 @@ mod admission_tests {
             .admit(|loads| select_pd_pair(loads, &p, &d, &rr, &kv, &context(), true))
             .unwrap();
         assert_eq!(second.prefill.score, None);
-        assert_eq!(second.decode.score, Some(2.0));
+        assert_eq!(second.decode.score, Some(1.0));
         drop((a, b));
     }
 

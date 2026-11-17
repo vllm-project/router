@@ -43,7 +43,6 @@ struct Discovery {
 /// One policy registration owned by this state, tagged with the role that
 /// installed it so a shared target table can unregister through the right
 /// policy.
-#[derive(Clone)]
 struct TargetRegistration {
     signature: String,
     decode: bool,
