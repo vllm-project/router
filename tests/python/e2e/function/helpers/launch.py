@@ -245,11 +245,10 @@ def popen_launch_vllm_rs_grpc_worker(
     kind, prefix = resolve_worker_serve_launch(prefer_vllm_serve=prefer_vllm_serve)
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(base_gpu_id)
-    # Inherited ROCm masks must match the narrowed CUDA mask. Callers supply
-    # physical GPU indices in the same device namespace.
-    for name in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"):
-        if name in env:
-            env[name] = str(base_gpu_id)
+    # HIP and CUDA index the agent list already filtered by ROCR. Keep an
+    # inherited ROCR mask intact, but align HIP with the narrowed CUDA index.
+    if "HIP_VISIBLE_DEVICES" in env:
+        env["HIP_VISIBLE_DEVICES"] = str(base_gpu_id)
     serve_tail = list(extra_argv or [])
     if kv_events_zmq_port is not None and "--kv-events-config" not in serve_tail:
         serve_tail = [

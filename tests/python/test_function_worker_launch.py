@@ -47,5 +47,5 @@ def test_worker_gpu_masks(monkeypatch, hip_mask, rocr_mask, gpu_id):
     if rocr_mask is None:
         assert "ROCR_VISIBLE_DEVICES" not in child_env
     else:
-        assert child_env["ROCR_VISIBLE_DEVICES"] == str(gpu_id)
+        assert child_env["ROCR_VISIBLE_DEVICES"] == rocr_mask
     assert dict(os.environ) == parent_env
