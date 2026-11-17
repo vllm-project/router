@@ -24,8 +24,8 @@ covering the complete PR for merge commits and squash merges. For rebase merges
 or multi-commit pushes, this comparison covers only the final commit.
 Renames include both the old and new paths. Empty or unresolved diffs run CI.
 Scheduled builds and `NIGHTLY=1` always run CI.
-The `nightly-test` label bypasses docs-only detection and uploads
-the full pipeline even for documentation-only PRs.
+PR labels `ready`, `merge-test`, and `nightly-test` do not override docs-only
+skipping; they select test levels only when the full pipeline is uploaded.
 GitHub Actions quality/security checks and release publishing
 remain enabled. Unlike Omni, pytest skip-mark changes do not qualify.
 

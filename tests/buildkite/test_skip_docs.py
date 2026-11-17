@@ -15,25 +15,15 @@ import skip_docs  # noqa: E402
 
 
 class BootstrapRoutingTests(unittest.TestCase):
-    def test_nightly_label_bypasses_docs_detection(self):
+    def test_all_labels_use_docs_detection(self):
         root = Path(__file__).resolve().parents[2]
         pipeline = yaml.safe_load((root / ".buildkite/pipeline.yml").read_text())
-        docs_step, nightly_step = pipeline["steps"]
-        # Buildkite evaluates these complementary gates before running commands.
-        label_gate = 'build.pull_request.labels includes "nightly-test"'
-        self.assertEqual(docs_step["if"], f"!({label_gate})")
-        self.assertEqual(nightly_step["if"], label_gate)
-        self.assertIn("skip_docs.py", docs_step["command"])
+        self.assertEqual(len(pipeline["steps"]), 1)
+        docs_step = pipeline["steps"][0]
+        self.assertNotIn("if", docs_step)
         self.assertEqual(
-            nightly_step["command"].split(),
-            [
-                "buildkite-agent",
-                "pipeline",
-                "upload",
-                ".buildkite/bootstrap-upload-steps.yml",
-            ],
+            docs_step["command"], "python3 .buildkite/scripts/skip_docs.py"
         )
-        self.assertTrue((root / nightly_step["command"].split()[-1]).is_file())
 
 
 class DocsOnlyPRTests(unittest.TestCase):
@@ -163,14 +153,21 @@ class DocsOnlyPRTests(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 self.assertFalse(skip_docs.docs_only_change(self.main_env(**overrides)))
 
-    def test_merge_test_docs_pr_skips(self):
+    def test_all_test_labels_docs_pr_skips(self):
         self.write("README.md", "documentation\n")
         self.commit()
-        self.assertTrue(
-            skip_docs.docs_only_change(
-                {**self.env, "BUILDKITE_PULL_REQUEST_LABELS": "merge-test"}
-            )
-        )
+        for labels in (
+            "ready",
+            "merge-test",
+            "nightly-test",
+            "ready,merge-test,nightly-test",
+        ):
+            with self.subTest(labels=labels):
+                self.assertTrue(
+                    skip_docs.docs_only_change(
+                        {**self.env, "BUILDKITE_PULL_REQUEST_LABELS": labels}
+                    )
+                )
 
     def test_merge_base_excludes_target_only_changes(self):
         self.git("checkout", "main")
