@@ -137,6 +137,7 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 | Check | Outcome |
 |---|---|
 | Destination is a gRPC worker | `grpc_destination` |
+| Source or destination registration changed since planning | `registration_changed` |
 | Source has no engine-reported peer address | `no_peer_endpoint` |
 | Source already has `max_inflight_per_source` fetches in flight | `inflight_cap` |
 | Client sent its own `kv_transfer_params` | `client_params_present` |
@@ -146,6 +147,8 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 **Where capabilities come from.**
 - *Engine-reported:* a worker's `peer_lookup` record on `/kv_event_sources` gives both a capability and a peer address (host, port, engine id, TP/DCP/PP sizes).
 - *Static:* `kv_transfer.capabilities` in the router config gives a capability only. It has no address, so a statically declared source can be planned in shadow mode but always ends as `no_peer_endpoint` in active mode. A static entry wins over the engine's capability for the same worker; the engine's address is still stored.
+
+**Registration binding.** The planner checks a source's layout against the record it read. Discovery can replace a worker's record (new engine id, port or layout) for the same URL after the planner read it. So the grant fetches only if both the source and the destination still have the record and registration the planner saw, and it uses the address from that record. Otherwise the outcome is `registration_changed` and the request is sent unchanged, never with the old cache credit. Re-polling an identical record does not count as a change.
 
 **Kill switch.** `KvAwarePolicy::set_peer_fetch_enabled(false)` makes an active-mode router behave as shadow for requests selected from then on. In-flight fetches finish normally. There is no HTTP endpoint for it yet.
 
@@ -158,6 +161,6 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 | Metric | Labels | Meaning |
 |---|---|---|
 | `vllm_router_kv_transfer_plans_total` | `outcome` | One per selection: `planned` or a skip label from the tables above |
-| `vllm_router_kv_transfer_requests_total` | `outcome` | Active mode only, one per planned request: `sent`, `grpc_destination`, `no_peer_endpoint`, `inflight_cap`, `client_params_present`, `invalid_body` |
+| `vllm_router_kv_transfer_requests_total` | `outcome` | Active mode only, one per planned request: `sent`, `grpc_destination`, `registration_changed`, `no_peer_endpoint`, `inflight_cap`, `client_params_present`, `invalid_body` |
 | `vllm_router_kv_transfer_estimated_saved_ms` | none | `saved_ms` of each planned transfer |
 | `vllm_router_kv_transfer_estimated_cost_ms` | `path` = `fetch` or `wait` | Both estimates, whenever the cost rule was evaluated |
