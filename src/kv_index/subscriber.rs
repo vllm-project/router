@@ -986,6 +986,7 @@ fn hex(b: &[u8]) -> String {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3396,6 +3397,7 @@ mod tests {
             );
             assert_eq!(hits(&f.indexer, &initial).len(), 1);
             if gap {
+                let gap_events = [store_event(104, &hidden)];
                 tokio::join!(
                     publish_until_advanced(
                         &f.publisher,
@@ -3403,7 +3405,7 @@ mod tests {
                         b"kv",
                         2,
                         0.0,
-                        &[store_event(104, &hidden)],
+                        &gap_events,
                         Some(0)
                     ),
                     async {
@@ -3695,6 +3697,24 @@ mod tests {
                         }
                     },
                 );
+                let expected = if strict {
+                    crate::kv_index::SourceRecoveryState::Fallback
+                } else {
+                    crate::kv_index::SourceRecoveryState::Observed
+                };
+                assert_eq!(
+                    f.indexer
+                        .source_recovery_status(&SourceId::from("w0"), 0)
+                        .unwrap()
+                        .state,
+                    expected,
+                    "after seq 20: strict={strict}, replay_available={replay_available}"
+                );
+                assert_eq!(
+                    hits(&f.indexer, &[1, 2, 3, 4]).len(),
+                    usize::from(!strict),
+                    "after seq 20: strict={strict}, replay_available={replay_available}"
+                );
                 publish_until_advanced(
                     &f.publisher,
                     &mut f.signals,
@@ -3710,12 +3730,7 @@ mod tests {
                     .source_recovery_status(&SourceId::from("w0"), 0)
                     .unwrap();
                 assert_eq!(
-                    status.state,
-                    if strict {
-                        crate::kv_index::SourceRecoveryState::Fallback
-                    } else {
-                        crate::kv_index::SourceRecoveryState::Observed
-                    },
+                    status.state, expected,
                     "strict={strict}, replay_available={replay_available}"
                 );
                 if strict {
@@ -3828,6 +3843,7 @@ mod tests {
             .get_last_endpoint()
             .unwrap()
             .unwrap();
+        let (progress, mut advances) = mpsc::channel(1);
         let replay_future = replay(
             &endpoint,
             -1,
@@ -3838,7 +3854,7 @@ mod tests {
             &source,
             0,
             0,
-            None,
+            Some(progress),
             Some(4),
             "kv",
             &mut reported,
@@ -3863,6 +3879,13 @@ mod tests {
         .await
         .expect("configured replay deadline did not terminate recovery");
         assert!(result.is_none());
+        assert!(
+            matches!(
+                advances.try_recv(),
+                Ok(IngestionSignal::Advance { last_seq: 0, .. })
+            ),
+            "deadline test must apply a partial batch before cleanup"
+        );
         assert!(f.indexer.finish_replay_if_current(
             &source,
             0,

@@ -2,8 +2,9 @@
 
 use super::pd_types::PdPrefillInput;
 use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs};
+use crate::core::worker::worker_get;
 use crate::core::Worker;
-use crate::kv_index::discovery::{worker_get, WorkerDiscovery};
+use crate::kv_index::discovery::WorkerDiscovery;
 use crate::kv_index::{HashMode, KvIndexSupervisor, WorkerKvInfo};
 use crate::policies::{kv_aware_ops, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy};
 use axum::http::HeaderMap;
@@ -150,6 +151,7 @@ impl PdKvState {
     /// Test-only constructor; production always passes the configured
     /// `pd_kv_event_sources` via `new_with_statics`.
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn new(client: reqwest::Client) -> Self {
         Self::new_with_statics(client, HashMap::new())
     }
@@ -527,6 +529,7 @@ impl Drop for PdKvState {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod kv_input_tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};

@@ -52,6 +52,7 @@ std::thread_local! {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn after_anchor_clone() {
     let hook = AFTER_ANCHOR_CLONE.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
@@ -60,6 +61,7 @@ fn after_anchor_clone() {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn after_query_edge() {
     let hook = AFTER_QUERY_EDGE.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
@@ -650,11 +652,13 @@ impl KvBlockIndexer {
     /// Hide a source's observations while contiguous replay repairs its state.
     /// Correctness does not depend on delivery of advisory ingestion signals.
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn suspend_source(&self, source: &SourceId, dp_rank: u32) {
         self.suspend_source_for(source, dp_rank, SourceRecoveryReason::SequenceGap);
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn suspend_source_for(
         &self,
         source: &SourceId,
@@ -716,6 +720,7 @@ impl KvBlockIndexer {
 
     /// Stop crediting a lossy source and discard all its old observations.
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn invalidate_source(&self, source: &SourceId, dp_rank: u32) {
         self.invalidate_source_for(source, dp_rank, SourceRecoveryReason::ValidationFailed);
     }
@@ -854,6 +859,7 @@ impl KvBlockIndexer {
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn resume_source_for(
         &self,
         source: &SourceId,
@@ -885,6 +891,7 @@ impl KvBlockIndexer {
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn source_recovery_status(
         &self,
         source: &SourceId,
@@ -917,7 +924,8 @@ impl KvBlockIndexer {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn source_generation_for_test(&self) -> u64 {
         self.source_generation.load(Ordering::Acquire)
     }
@@ -956,6 +964,7 @@ impl crate::policies::TieredMatchProvider for KvBlockIndexer {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::{cell::Cell, rc::Rc};
 

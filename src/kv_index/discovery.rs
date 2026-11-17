@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::StaticKvEventSources;
+use crate::core::worker::worker_get;
 use crate::kv_index::indexer::KvBlockIndexer;
 use crate::kv_index::subscriber::{EventSource, SubscriberHandle};
 use crate::kv_index::{HashMode, IngestionSignal, SourceId, SourceRecoveryReason};
@@ -1116,18 +1117,6 @@ pub(crate) async fn query_pd_kv_event_sources(
     Ok(sources)
 }
 
-pub(crate) fn worker_get(
-    client: &reqwest::Client,
-    url: &str,
-    api_key: Option<&str>,
-) -> reqwest::RequestBuilder {
-    let request = client.get(url);
-    match api_key {
-        Some(key) => request.bearer_auth(key),
-        None => request,
-    }
-}
-
 /// Rewrite a ZMQ bind host before validating the TCP connect endpoint.
 /// `tcp://*:5557` → `tcp://10.0.0.5:5557`.
 fn resolve_endpoint(endpoint: &str, worker_host: &str) -> Result<String, String> {
@@ -1265,6 +1254,7 @@ mod metrics_meta {
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     mod tests {
         use super::*;
 
@@ -1338,6 +1328,7 @@ vllm:cache_config_info{block_size="32",engine="1"} 1.0
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::kv_index::{MatchQuery, StorageTier};
@@ -1379,26 +1370,6 @@ mod tests {
                 .worker_origin
                 .is_none());
             supervisor.on_worker_removed(worker_url);
-        }
-    }
-
-    #[test]
-    fn worker_auth_uses_only_the_configured_key() {
-        let client = reqwest::Client::new();
-        for (key, expected) in [
-            (None, None),
-            (Some("backend-key"), Some("Bearer backend-key")),
-        ] {
-            let request = worker_get(&client, "https://worker/v1/models", key)
-                .build()
-                .unwrap();
-            assert_eq!(
-                request
-                    .headers()
-                    .get("authorization")
-                    .map(|value| value.to_str().unwrap()),
-                expected
-            );
         }
     }
 
