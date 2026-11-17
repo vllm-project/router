@@ -328,14 +328,16 @@ fn spawn_inner(
                                 &topic,
                                 &mut pending_live,
                                 MAX_PENDING_LIVE_BYTES,
+                                &mut shutdown_rx,
+                                binding.as_ref(),
                             )
                             .await
                         } else {
-                            None
+                            ReplayOutcome::Failed
                         };
                         #[cfg(test)]
                         if let Some(barrier) = binding.as_ref().and_then(|binding| {
-                            if result.is_some() {
+                            if matches!(result, ReplayOutcome::Complete(_)) {
                                 binding.replay_commit_barrier.as_ref()
                             } else {
                                 binding.replay_cleanup_barrier.as_ref()
@@ -346,7 +348,7 @@ fn spawn_inner(
                         }
                         let failure = if replay_endpoint.is_none() {
                             Some(SourceRecoveryReason::ReplayUnavailable)
-                        } else if result.is_none() {
+                        } else if !matches!(result, ReplayOutcome::Complete(_)) {
                             Some(SourceRecoveryReason::ReplayFailed)
                         } else {
                             None
@@ -356,14 +358,20 @@ fn spawn_inner(
                                 &source_id,
                                 dp_rank,
                                 attempt,
-                                failure.map(|reason| retries.failure_reason(reason)),
+                                failure.map(|reason| {
+                                    if result == ReplayOutcome::Failed {
+                                        retries.failure_reason(reason)
+                                    } else {
+                                        reason
+                                    }
+                                }),
                             )
                         });
-                        let outcome = if current != Some(true) {
+                        let outcome = if current != Some(true) || result == ReplayOutcome::Stopped {
                             "superseded"
                         } else if replay_endpoint.is_none() {
                             "unavailable"
-                        } else if result.is_none() {
+                        } else if !matches!(result, ReplayOutcome::Complete(_)) {
                             "failed"
                         } else {
                             "success"
@@ -374,11 +382,10 @@ fn spawn_inner(
                             outcome,
                             replay_endpoint.as_ref().map(|_| replay_started.elapsed()),
                         );
-                        if current.is_none() {
+                        if current.is_none() || result == ReplayOutcome::Stopped {
                             break;
                         }
-                        if current == Some(true) && failure.is_none() {
-                            let high = result.unwrap();
+                        if let (Some(true), ReplayOutcome::Complete(high)) = (current, result) {
                             last_seq = high;
                             retries.reset();
                             emit(
@@ -392,8 +399,11 @@ fn spawn_inner(
                             continue;
                         }
                         if current == Some(true) {
-                            // finish_replay_if_current already discarded any partial replay.
-                            retries.failed(Instant::now());
+                            // A local queue limit still clears partial recovery, but
+                            // must not exhaust retries against the publisher.
+                            if result == ReplayOutcome::Failed {
+                                retries.failed(Instant::now());
+                            }
                             retries.note_loss();
                         }
                     }
@@ -515,25 +525,42 @@ fn spawn_inner(
 const MAX_PENDING_LIVE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_LIVE_FRAMES: usize = 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayOutcome {
+    Complete(i64),
+    Failed,
+    BufferFull,
+    Stopped,
+}
+
 async fn buffer_live_during_replay(
     recovery: impl Future<Output = Option<i64>>,
     sub: &mut zmq::Socket,
     topic: &str,
     pending: &mut VecDeque<Vec<Vec<u8>>>,
     byte_limit: usize,
-) -> Option<i64> {
+    shutdown: &mut broadcast::Receiver<()>,
+    binding: Option<&SubscriberBinding>,
+) -> ReplayOutcome {
     tokio::pin!(recovery);
     let mut bytes: usize = pending.iter().flatten().map(Vec::len).sum();
     loop {
+        if binding.is_some_and(|binding| !binding.lease.is_active()) {
+            return ReplayOutcome::Stopped;
+        }
         tokio::select! {
             biased;
-            result = &mut recovery => return result,
+            _ = shutdown.recv() => return ReplayOutcome::Stopped,
+            result = &mut recovery => return match result {
+                Some(high) => ReplayOutcome::Complete(high),
+                None => ReplayOutcome::Failed,
+            },
             _ = tokio::time::sleep(Duration::from_millis(1)) => {
                 // Bound work per poll so replay can progress under a busy publisher.
                 for _ in 0..64 {
                     if pending.len() >= MAX_PENDING_LIVE_FRAMES || bytes >= byte_limit {
                         warn!("kv_index live recovery buffer full; aborting replay before resuming ingestion");
-                        return None;
+                        return ReplayOutcome::BufferFull;
                     }
                     match sub.recv_multipart(zmq::DONTWAIT) {
                         Ok(frames) => {
@@ -547,13 +574,13 @@ async fn buffer_live_during_replay(
                             pending.push_back(frames);
                             if bytes >= byte_limit {
                                 warn!("kv_index live recovery byte budget reached; aborting replay");
-                                return None;
+                                return ReplayOutcome::BufferFull;
                             }
                         }
                         Err(zmq::Error::EAGAIN) => break,
                         Err(error) => {
                             warn!(%error, "kv_index live receive failed during replay");
-                            return None;
+                            return ReplayOutcome::Failed;
                         }
                     }
                 }
@@ -2978,6 +3005,7 @@ mod tests {
         ];
         sender.send_multipart(&frames, 0).unwrap();
         let mut pending = VecDeque::new();
+        let (_shutdown, mut shutdown) = broadcast::channel(1);
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             buffer_live_during_replay(
@@ -2986,13 +3014,241 @@ mod tests {
                 "kv",
                 &mut pending,
                 64,
+                &mut shutdown,
+                None,
             ),
         )
         .await
         .unwrap();
-        assert_eq!(result, None);
+        assert_eq!(result, ReplayOutcome::BufferFull);
         assert_eq!(pending.pop_front(), Some(frames));
         assert!(pending.is_empty());
+    }
+
+    async fn wait_for_advance(signals: &mut mpsc::Receiver<IngestionSignal>, expected: i64) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(signal) = signals.recv().await {
+                if matches!(signal, IngestionSignal::Advance { last_seq, .. } if last_seq == expected) {
+                    return;
+                }
+            }
+            panic!("subscriber stopped before sequence {expected}");
+        }).await.expect("subscriber did not advance");
+    }
+
+    #[tokio::test]
+    async fn unbound_shutdown_interrupts_replay_and_clears_partial_history() {
+        for drop_handle in [false, true] {
+            let mut f = fixture_with_block_size(true, Some(4));
+            let old = [1, 2, 3, 4];
+            let partial = [5, 6, 7, 8];
+            publish_until_advanced(
+                &f.publisher,
+                &mut f.signals,
+                b"kv",
+                0,
+                0.0,
+                &[store_event(100, &old)],
+                Some(0),
+            )
+            .await;
+            f.publisher
+                .send_multipart(
+                    [
+                        b"kv".as_slice(),
+                        &3i64.to_be_bytes(),
+                        &batch_payload(&[], 0),
+                    ],
+                    0,
+                )
+                .unwrap();
+            let server = f.replay_server.as_ref().unwrap();
+            let request = replay_request(server).await;
+            send_replay_replies(
+                server,
+                &request,
+                &[(
+                    1,
+                    b"kv".as_slice(),
+                    batch_payload(&[store_event(101, &partial)], 0),
+                )],
+            );
+            wait_for_advance(&mut f.signals, 1).await;
+            if drop_handle {
+                drop(f._handle);
+            } else {
+                f._handle.shutdown();
+            }
+            tokio::time::timeout(Duration::from_millis(500), async {
+                while f.signals.recv().await.is_some() {}
+            })
+            .await
+            .expect("shutdown waited for the five-second replay deadline");
+            assert!(hits(&f.indexer, &old).is_empty());
+            assert!(hits(&f.indexer, &partial).is_empty());
+            assert_eq!(
+                f.indexer
+                    .source_recovery_status(&SourceId::from("w0"), 0)
+                    .unwrap()
+                    .state,
+                crate::kv_index::SourceRecoveryState::Fallback
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_lease_interrupts_the_live_replay_wait() {
+        let ctx = zmq::Context::new();
+        let sender = ctx.socket(zmq::PAIR).unwrap();
+        sender.bind("inproc://replay-retired-lease").unwrap();
+        let mut receiver = ctx.socket(zmq::PAIR).unwrap();
+        receiver.connect("inproc://replay-retired-lease").unwrap();
+        let active = Arc::new(AtomicBool::new(true));
+        let binding = SubscriberBinding {
+            lease: SourceLease {
+                strict_rank: Arc::new(Mutex::new(false)),
+                active: active.clone(),
+            },
+            replay_cleanup_barrier: None,
+            replay_commit_barrier: None,
+        };
+        let (_shutdown, mut shutdown) = broadcast::channel(1);
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let recovery = async {
+            entered.send(()).unwrap();
+            std::future::pending().await
+        };
+        let retire = async {
+            started.await.unwrap();
+            active.store(false, Ordering::Release);
+        };
+        let mut pending = VecDeque::new();
+        let (result, ()) = tokio::time::timeout(Duration::from_millis(500), async {
+            tokio::join!(
+                buffer_live_during_replay(
+                    recovery,
+                    &mut receiver,
+                    "kv",
+                    &mut pending,
+                    MAX_PENDING_LIVE_BYTES,
+                    &mut shutdown,
+                    Some(&binding)
+                ),
+                retire,
+            )
+        })
+        .await
+        .expect("retired lease did not cancel the replay wait");
+        assert_eq!(result, ReplayOutcome::Stopped);
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queue_full_abort_preserves_retry_budget_and_clears_partial_recovery() {
+        let cleanup = Arc::new(tokio::sync::Barrier::new(2));
+        let mut f = fixture_with_receive_limit(
+            true,
+            Some(4),
+            Some(SubscriberBinding {
+                lease: SourceLease {
+                    strict_rank: Arc::new(Mutex::new(false)),
+                    active: Arc::new(AtomicBool::new(true)),
+                },
+                replay_cleanup_barrier: Some(cleanup.clone()),
+                replay_commit_barrier: None,
+            }),
+            false,
+            Some(4096),
+        );
+        let old = [1, 2, 3, 4];
+        let partial = [5, 6, 7, 8];
+        let fresh = [9, 10, 11, 12];
+        publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            0,
+            0.0,
+            &[store_event(100, &old)],
+            Some(0),
+        )
+        .await;
+        f.publisher
+            .send_multipart(
+                [
+                    b"kv".as_slice(),
+                    &2i64.to_be_bytes(),
+                    &batch_payload(&[], 0),
+                ],
+                0,
+            )
+            .unwrap();
+        let server = f.replay_server.as_ref().unwrap();
+        let first = replay_request(server).await;
+        send_replay_replies(
+            server,
+            &first,
+            &[(
+                1,
+                b"kv".as_slice(),
+                batch_payload(&[store_event(101, &partial)], 0),
+            )],
+        );
+        wait_for_advance(&mut f.signals, 1).await;
+        // Fill the frame limit using small valid events, without a 64 MiB allocation.
+        let last = 2 + MAX_PENDING_LIVE_FRAMES as i64;
+        for seq in 3..=last {
+            f.publisher
+                .send_multipart(
+                    [b"kv".as_slice(), &seq.to_be_bytes(), &batch_payload(&[], 0)],
+                    0,
+                )
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), cleanup.wait())
+            .await
+            .expect("the live frame queue did not cancel replay");
+        cleanup.wait().await;
+        wait_for_advance(&mut f.signals, last).await;
+        assert!(hits(&f.indexer, &old).is_empty());
+        assert!(hits(&f.indexer, &partial).is_empty());
+        // A genuine gap must be retryable immediately, rather than on a 2 s cooldown.
+        let next = last + 2;
+        f.publisher
+            .send_multipart(
+                [
+                    b"kv".as_slice(),
+                    &next.to_be_bytes(),
+                    &batch_payload(&[], 0),
+                ],
+                0,
+            )
+            .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(1), replay_request(server))
+            .await
+            .expect("a local queue abort consumed the publisher retry budget");
+        assert_eq!(read_seq(request.last().unwrap()), last + 1);
+        send_replay_replies(
+            server,
+            &request,
+            &[
+                (last + 1, b"kv".as_slice(), batch_payload(&[], 0)),
+                (
+                    next,
+                    b"kv".as_slice(),
+                    batch_payload(&[store_event(102, &fresh)], 0),
+                ),
+            ],
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(signal) = f.signals.recv().await {
+                if matches!(signal, IngestionSignal::ReplayApplied { replay_seq, .. } if replay_seq == next) {
+                    return;
+                }
+            }
+            panic!("subscriber stopped before replay completed");
+        }).await.expect("retry did not complete");
+        assert_eq!(hits(&f.indexer, &fresh).len(), 1);
     }
 
     #[tokio::test]

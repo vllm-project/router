@@ -83,9 +83,24 @@ under the same attempt fence and resumes normal ingestion. Queued frames are
 retained, not silently discarded. This avoids unbounded buffering without
 claiming recovery can keep up with every publisher rate.
 
+These limits apply to each subscriber, and there is one subscriber per
+`(worker, rank)`. With N subscribers buffering during replay, frame data can
+therefore occupy up to N × 64 MiB, plus one already-received crossing frame per
+subscriber. There is no process-wide shared byte cap; transport queues and frame
+container overhead add further memory. For example, 100 simultaneously buffering
+sources can approach 6.25 GiB before those additional allocations. The 1,024-frame
+limit usually binds earlier for small events.
+
 ## Retry and lifecycle rules
 
 A failed or unavailable replay consumes one of three attempts per subscriber.
+A replay cancelled because its local live-frame queue is full still discards
+partial recovery and retains queued frames, but does not consume a publisher
+retry attempt or escalate the reason to `retry_exhausted`. It still records a
+`failed` replay outcome. A shutdown signal,
+handle drop, or retired source lease also interrupts the replay wait promptly;
+partial recovery is cleaned up before an active subscriber exits, and a retired
+lease cannot mutate its replacement.
 The first two failures impose delays of 2 and 4 seconds before another attempt;
 a subsequent gap or rejected frame drives the retry. After the third failure
 the source falls back with reason `retry_exhausted`. A superseded attempt
@@ -127,8 +142,11 @@ series for every worker incarnation. Source/rank details belong in logs.
 `reason` describes the latest accepted state transition/boundary. An Exact clear
 updates it to `clear_barrier` without invalidating queries merely for a reason
 change. Replay is recorded once after commit validation. `superseded` means
-another invalidation or lifecycle change won; it is neither successful recovery
-nor a transport failure. Its existing invalidation reason is preserved.
+another invalidation or subscriber lifecycle change ended the attempt, including
+shutdown; it is neither successful recovery nor a transport failure. An external
+invalidation keeps its existing reason. Shutdown of a still-active subscriber
+clears its partial replay with `replay_failed` before exit without spending a
+retry attempt.
 
 Example alert expressions (choose windows and severity for the deployment):
 
