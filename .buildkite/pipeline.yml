@@ -24,6 +24,35 @@ steps:
     key: "build"
     steps:
       - label: ":rust: Build Rust (Release)"
+        if: |
+          build.env("NIGHTLY") != "1" &&
+          !(build.pull_request.labels includes "nightly-test")
+        plugins:
+          - docker#v5.11.0:
+              image: "$RUST_IMAGE"
+              workdir: /workdir
+              volumes:
+                - ".:/workdir"
+              environment:
+                - "CARGO_INCREMENTAL=0"
+                - "RUST_BACKTRACE=1"
+                - "CARGO_PROFILE_RELEASE_LTO=false"
+                - "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16"
+              command:
+                - bash
+                - -c
+                - |
+                  bash .buildkite/scripts/install_packages.sh rust
+                  cargo build --release
+        artifact_paths:
+          - "target/release/vllm-router"
+        agents:
+          queue: "medium_cpu_queue_premerge"
+
+      - label: ":rust: Build Rust (Release, full optimization)"
+        if: |
+          build.env("NIGHTLY") == "1" ||
+          build.pull_request.labels includes "nightly-test"
         plugins:
           - docker#v5.11.0:
               image: "$RUST_IMAGE"
@@ -45,6 +74,36 @@ steps:
           queue: "medium_cpu_queue_premerge"
 
       - label: ":python: Build Python Wheel"
+        if: |
+          build.env("NIGHTLY") != "1" &&
+          !(build.pull_request.labels includes "nightly-test")
+        plugins:
+          - docker#v5.11.0:
+              image: "$RUST_IMAGE"
+              workdir: /workdir
+              volumes:
+                - ".:/workdir"
+              environment:
+                - "CARGO_INCREMENTAL=0"
+                - "RUST_BACKTRACE=1"
+                - "CARGO_PROFILE_RELEASE_LTO=false"
+                - "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16"
+              command:
+                - bash
+                - -c
+                - |
+                  source .buildkite/scripts/install_packages.sh python-wheel
+                  python -m build
+        artifact_paths:
+          - "dist/*.whl"
+          - "dist/*.tar.gz"
+        agents:
+          queue: "medium_cpu_queue_premerge"
+
+      - label: ":python: Build Python Wheel (full optimization)"
+        if: |
+          build.env("NIGHTLY") == "1" ||
+          build.pull_request.labels includes "nightly-test"
         plugins:
           - docker#v5.11.0:
               image: "$RUST_IMAGE"

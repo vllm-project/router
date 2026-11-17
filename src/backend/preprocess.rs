@@ -65,6 +65,13 @@ fn token_prompts(value: &serde_json::Value) -> Result<Arc<[Vec<u32>]>, &'static 
     Ok(Arc::from(prompts))
 }
 
+pub(crate) const NAMED_LORA_FIELD: &str = "lora_name";
+
+/// Explicit adapters shared by input-credit and session-binding admission.
+/// Each caller decides which identities its own contract can model.
+pub(crate) const ADAPTER_FIELDS: [&str; 3] =
+    [NAMED_LORA_FIELD, "lora_path", "prompt_adapter_request"];
+
 fn http_cache_identity(
     fields: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), &'static str> {
@@ -77,10 +84,10 @@ fn http_cache_identity(
         "input_embeds",
         "input_embeddings",
         "multi_modal_data",
-        "lora_path",
-        "lora_name",
-        "prompt_adapter_request",
-    ] {
+    ]
+    .into_iter()
+    .chain(ADAPTER_FIELDS)
+    {
         if fields.get(field).is_some_and(|value| !value.is_null()) {
             return Err("unsupported_cache_identity");
         }

@@ -619,6 +619,18 @@ async fn local_prefix(
 
 /// Fully separate from native PD: unsupported exact-token/capability requests use
 /// the native two-stage path.
+///
+/// `None` hands the turn back to the caller *unconsumed*: the caller then
+/// dispatches the prefill it already selected. Every `None` exit therefore has
+/// to stay above `claim()`, `pd_load.admit_bound()` and
+/// `runtime.reserve_prefill()`; an early `None` after any of those points would
+/// let the caller claim, charge and reserve twice for one turn. This is checked
+/// by `cold_fallback_consumes_one_prefill_selection_per_turn` only indirectly
+/// (`round_robin` alternation), so keep the exits grouped at the top.
+///
+/// `prefills` carries the target and the worker it charges together: both are
+/// derived from `policy_prefill`, so a caller cannot pass a target whose
+/// capacity is charged to a different worker.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute(
     runtime: &PdProgramRuntime,
@@ -628,11 +640,10 @@ pub(super) async fn execute(
     request: &Value,
     path: &str,
     headers: Option<&HeaderMap>,
-    prefills: &[ProgramTarget],
+    prefills: &[(ProgramTarget, Arc<dyn Worker>)],
     targets: &[ProgramTarget],
     policy_prefill: usize,
     pd_load: &Arc<super::pd_types::PdLoadManager>,
-    prefill_worker: Arc<dyn Worker>,
     decode_worker: Arc<dyn Worker>,
 ) -> Option<Result<(Response, Option<PdResponseContext>), String>> {
     // Discovery lacks a registration incarnation fence for this protocol.
@@ -652,7 +663,7 @@ pub(super) async fn execute(
     };
     let mut dispatch = completion.dispatch().clone();
     let d = targets.iter().find(|t| t.id == dispatch.target_id)?;
-    let p = prefills.get(policy_prefill)?;
+    let (p, prefill_worker) = prefills.get(policy_prefill)?;
     // Capability failure is a conservative fallback to the native path, never a
     // warm/local guess.
     let (de, pe) = match tokio::join!(
@@ -812,7 +823,7 @@ pub(super) async fn execute(
     // the published PD occupancy metrics see Program traffic too.
     // admit_bound charges PdLoadManager and attaches the workers itself, so
     // do not attach again: finish/Drop decrement exactly once.
-    let attempt = pd_load.admit_bound(prefill_worker, decode_worker);
+    let attempt = pd_load.admit_bound(prefill_worker.clone(), decode_worker);
     let result = async {
         let d_params = if route == PdPath::LocalAppend {
             attempt.finish_prefill();

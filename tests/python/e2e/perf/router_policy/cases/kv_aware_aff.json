@@ -1,0 +1,46 @@
+{
+  "id": "kv_aware_aff",
+  "runtime": {
+    "perf_work_root": "test-results/router_policy",
+    "model": "Qwen/Qwen3-4B-Instruct-2507",
+    "trace_path": "tests/python/e2e/perf/router_policy/data/tracelab-ci-uniform-28.jsonl",
+    "trace_type": "tracelab",
+    "endpoint": "/v1/chat/completions"
+  },
+  "benchmark_params": {
+    "task-num": 8,
+    "max-concurrency": [8, 16, 32],
+    "gap_scale": 1.0,
+    "max_inflight": 1,
+    "task_stagger": 0
+  },
+  "workers": {
+    "count": 4,
+    "protocol": "grpc",
+    "per_worker": {
+      "tensor_parallel_size": 1,
+      "max_model_len": 32768,
+      "max_num_seqs": 16,
+      "max_num_batched_tokens": 8192,
+      "kv_cache_memory_bytes": 12884901888,
+      "cpu_kv_bytes": 0,
+      "dtype": "bfloat16",
+      "enable_prefix_caching": true,
+      "kv_cache_metrics": true,
+      "kv_cache_metrics_sample": 0.01
+    }
+  },
+  "router_params": {
+    "protocol": "grpc",
+    "router_temperature": 0,
+    "cache_threshold": 0.3,
+    "balance_abs_threshold": 5,
+    "balance_rel_threshold": 1.5,
+    "kv_penalty_host": 0.8,
+    "kv_penalty_external": 0.6,
+    "kv_penalty_disk": 0.3,
+    "worker_startup_timeout_secs": 60,
+    "policy": "kv_aware_aff",
+    "kv_aware_session_affinity_ttl_secs": 1800
+  }
+}

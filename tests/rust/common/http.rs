@@ -1,4 +1,4 @@
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, ORIGIN};
 use axum::http::{HeaderValue, Request};
 use serde_json::json;
@@ -19,6 +19,17 @@ pub fn post(path: &str, body: String) -> Request<Body> {
         .header(CONTENT_TYPE, "application/json")
         .header(CONTENT_LENGTH, body.len())
         .body(Body::from(body))
+        .expect("request")
+}
+
+/// A JSON `POST` to `path` with a streamed body: no `Content-Length` and an
+/// unknown size hint, like a chunked upload.
+pub fn post_stream(path: &str, chunks: Vec<std::io::Result<Bytes>>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(futures_util::stream::iter(chunks)))
         .expect("request")
 }
 

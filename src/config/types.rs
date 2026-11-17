@@ -110,7 +110,8 @@ fn default_profile_timeout_secs() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct EpdConfig {
     pub encoder_urls: Vec<String>,
-    /// Mooncake consumer control addresses, keyed by the P or combined PD HTTP URL.
+    /// Mooncake consumer control addresses, keyed by the P or combined PD HTTP URL
+    /// with an `@rank` suffix for DP replicas.
     /// Omit for pull-based NIXL or the shared-file example connector.
     #[serde(default)]
     pub consumer_zmq_addrs: HashMap<String, String>,
