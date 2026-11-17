@@ -4842,20 +4842,191 @@ mod tests {
         assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
     }
 
+    /// An engine record for `fingerprint` reachable at `engine_id`:`port`.
+    fn engine_record(engine_id: &str, fingerprint: &str, port: u16) -> PeerLookupRecord {
+        PeerLookupRecord {
+            engine_id: engine_id.into(),
+            ..peer_record(fingerprint, port)
+        }
+    }
+
+    /// Active policy whose source `a` and destination `b` both hold engine
+    /// records, applied through the public API.
+    fn planned_grant_fixture() -> (KvAwarePolicy, Vec<Arc<dyn Worker>>) {
+        let (policy, workers, _) = transfer_fixture(true);
+        let policy = policy.with_peer_fetch(4);
+        policy.apply_peer_lookup("http://a", Some(&engine_record("engine-a", "fp", 5600)));
+        policy.apply_peer_lookup("http://b", Some(&engine_record("engine-b", "fp", 5700)));
+        (policy, workers)
+    }
+
+    /// Plan the picked destination (`b`) through the production planner and
+    /// return the plan with the registrations it saw.
+    fn plan_for_grant<'w>(
+        policy: &KvAwarePolicy,
+        workers: &'w [Arc<dyn Worker>],
+    ) -> (TransferPlan, PlannedPeers<'w>) {
+        let ids = transfer_ids();
+        let plan = policy
+            .prepare_selection(
+                workers,
+                QualifiedKvInput {
+                    tokens: KvRequestTokens::Shared(Some(&ids)),
+                    eligibility: None,
+                },
+                None,
+                None,
+            )
+            .expect("snapshot");
+        let candidates = policy.candidate_views(workers, &plan);
+        let position = plan
+            .healthy
+            .iter()
+            .position(|&index| workers[index].url() == "http://b")
+            .expect("destination");
+        policy
+            .plan_transfer_for_pick(
+                policy.transfer_planner.as_deref().expect("planner"),
+                workers,
+                &plan,
+                &candidates,
+                position,
+                false,
+                &|_| false,
+            )
+            .expect("plan")
+    }
+
+    /// `registration_changed` count in a rendered Prometheus exposition.
+    fn registration_changed_count(handle: &metrics_exporter_prometheus::PrometheusHandle) -> u64 {
+        handle
+            .render()
+            .lines()
+            .find(|line| {
+                line.starts_with("vllm_router_kv_transfer_requests_total")
+                    && line.contains("outcome=\"registration_changed\"")
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .map_or(0, |value| value.parse().expect("counter value"))
+    }
+
+    /// The grant must refuse: no grant, no slot on `a`, and exactly one
+    /// `registration_changed` count.
+    fn assert_grant_refused_as_changed(
+        policy: &KvAwarePolicy,
+        transfer: &TransferPlan,
+        planned: &PlannedPeers<'_>,
+    ) {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        assert_eq!(registration_changed_count(&handle), 0);
+        assert!(policy.peer_fetch_grant(transfer, planned).is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+        assert_eq!(registration_changed_count(&handle), 1);
+    }
+
+    #[test]
+    fn grant_skips_when_source_endpoint_changed_after_planning() {
+        let (policy, workers) = planned_grant_fixture();
+        let (transfer, planned) = plan_for_grant(&policy, &workers);
+        // The engine restarted: new engine id and port, same layout.
+        policy.apply_peer_lookup("http://a", Some(&engine_record("a-rank0", "fp", 5601)));
+        assert_grant_refused_as_changed(&policy, &transfer, &planned);
+    }
+
+    #[test]
+    fn grant_skips_when_source_capability_changed_after_planning() {
+        let (policy, workers) = planned_grant_fixture();
+        let (transfer, planned) = plan_for_grant(&policy, &workers);
+        policy.register_transfer_capability("http://a", capability("other-layout"));
+        assert_grant_refused_as_changed(&policy, &transfer, &planned);
+    }
+
+    #[test]
+    fn grant_skips_when_source_was_reregistered_after_planning() {
+        let (policy, workers) = planned_grant_fixture();
+        let (transfer, planned) = plan_for_grant(&policy, &workers);
+        let epoch = policy.peer_regs.get("http://a").unwrap().epoch;
+        let generation = policy.targets.get("http://a").unwrap().generation;
+        // Same target, same record: only the generation moves.
+        policy.register_target("http://a", transfer.source.clone());
+        assert_eq!(policy.peer_regs.get("http://a").unwrap().epoch, epoch);
+        assert!(policy.targets.get("http://a").unwrap().generation > generation);
+        assert_grant_refused_as_changed(&policy, &transfer, &planned);
+    }
+
+    #[test]
+    fn grant_skips_when_destination_record_changed_after_planning() {
+        let (policy, workers) = planned_grant_fixture();
+        let (transfer, planned) = plan_for_grant(&policy, &workers);
+        policy.apply_peer_lookup("http://b", Some(&engine_record("b-new", "fp-new", 5800)));
+        assert_grant_refused_as_changed(&policy, &transfer, &planned);
+    }
+
     /// Selection plans outside the lock, so the source can unregister between
     /// the snapshot and the grant. Driving that interleaving deterministically
     /// is impractical, so this calls the grant directly on a plan made earlier,
     /// after the source was unregistered: no grant, no limiter slot.
     #[test]
-    fn grant_without_a_source_endpoint_takes_no_slot() {
-        let (policy, workers, _) = active_fixture(4);
-        let ids = transfer_ids();
-        let first = select(&policy, &workers);
-        let transfer = policy.last_transfer_plan().expect("plan");
-        assert!(first.peer_fetch.is_some());
-        drop(first);
-        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+    fn grant_skips_when_source_unregistered_after_planning() {
+        let (policy, workers) = planned_grant_fixture();
+        let (transfer, planned) = plan_for_grant(&policy, &workers);
+        policy.unregister_target("http://a");
+        assert_grant_refused_as_changed(&policy, &transfer, &planned);
+    }
 
+    #[test]
+    fn grant_uses_the_planned_endpoint_when_nothing_changed() {
+        let (policy, workers) = planned_grant_fixture();
+        let (transfer, planned) = plan_for_grant(&policy, &workers);
+        let grant = policy.peer_fetch_grant(&transfer, &planned).expect("grant");
+        assert_eq!(&*grant.endpoint.engine_id, "engine-a");
+        assert_eq!(grant.endpoint.port, 5600);
+        assert_eq!(
+            Some(grant.endpoint.clone()),
+            planned
+                .source
+                .registration
+                .as_ref()
+                .and_then(|reg| reg.endpoint.clone())
+        );
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
+    }
+
+    #[test]
+    fn grant_survives_an_identical_record_being_reapplied() {
+        let (policy, workers) = planned_grant_fixture();
+        let (transfer, planned) = plan_for_grant(&policy, &workers);
+        let epoch = policy.peer_regs.get("http://a").unwrap().epoch;
+        policy.apply_peer_lookup("http://a", Some(&engine_record("engine-a", "fp", 5600)));
+        assert_eq!(policy.peer_regs.get("http://a").unwrap().epoch, epoch);
+        let grant = policy.peer_fetch_grant(&transfer, &planned).expect("grant");
+        assert_eq!(&*grant.endpoint.engine_id, "engine-a");
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
+    }
+
+    #[test]
+    fn register_worker_binds_generation_and_record_together() {
+        let (policy, workers, targets) = transfer_fixture(true);
+        let policy = policy.with_peer_fetch(4);
+        let mut info = peer_info(&[(0, engine_record("engine-a", "fp", 5600))]);
+        info.cache_key = Some(CacheKey {
+            model: Arc::from("m"),
+            hash_mode: crate::kv_index::HashMode::Sha256,
+            block_size: 2,
+        });
+        KvAwareOps::register_worker(
+            &policy,
+            workers[0].as_ref(),
+            Some(&info),
+            Some(Arc::new(FixedMatches(vec![tier_match(
+                &targets[0],
+                StorageTier::Device,
+                &[(0, 16)],
+            )]))),
+        );
+        let ids = transfer_ids();
         let plan = policy
             .prepare_selection(
                 &workers,
@@ -4867,28 +5038,27 @@ mod tests {
                 None,
             )
             .expect("snapshot");
-        let planned_peer = |target: &RoutableTarget| {
-            let position = plan
-                .bindings
-                .iter()
-                .position(|binding| &binding.target == target)
-                .expect("planned target");
-            let url = workers[plan.healthy[position]].url();
-            PlannedPeer {
-                url,
-                generation: plan.bindings[position].generation,
-                registration: policy.peer_regs.get(url).map(|reg| Arc::clone(&reg)),
-            }
-        };
-        let planned = PlannedPeers {
-            source: planned_peer(&transfer.source),
-            destination: planned_peer(&transfer.destination),
-        };
-        // The source goes away after the snapshot was taken.
-        policy.unregister_target("http://a");
-
-        assert!(policy.peer_fetch_grant(&transfer, &planned).is_none());
-        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+        let position = plan
+            .healthy
+            .iter()
+            .position(|&index| workers[index].url() == "http://a")
+            .expect("registered worker");
+        assert_eq!(
+            plan.bindings[position].generation,
+            policy.targets.get("http://a").unwrap().generation
+        );
+        let current = Arc::clone(&policy.peer_regs.get("http://a").expect("record"));
+        assert_eq!(&*current.endpoint.as_ref().unwrap().engine_id, "engine-a");
+        // The planner clones the same Arc the registration stored.
+        let (_, planned) = plan_for_grant(&policy, &workers);
+        assert_eq!(
+            planned.source.generation,
+            policy.targets.get("http://a").unwrap().generation
+        );
+        assert!(Arc::ptr_eq(
+            planned.source.registration.as_ref().expect("planned"),
+            &current
+        ));
     }
 
     #[test]

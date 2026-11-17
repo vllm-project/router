@@ -1175,3 +1175,84 @@ async fn s16_source_without_an_address_is_not_fetched_from() {
     assert!(b_bodies[0].get("kv_transfer_params").is_none());
     fx.finish().await;
 }
+
+/// 17: the fetch address follows the source's current record. The source first
+/// reports R1 and a planned request is sent with R1's engine id and port. The
+/// engine then reports R2 (new engine id and port, same layout fingerprint) and
+/// the router rediscovers it by dropping and re-adding the worker. The next
+/// planned request must carry R2, never R1.
+///
+/// A race between planning and the grant inside one request cannot be forced
+/// from outside; the unit tests in `kv_aware.rs` cover that interleaving.
+#[tokio::test]
+async fn s17_rediscovered_source_record_replaces_the_old_address() {
+    const R2_ENGINE: &str = "a-rank0-restarted";
+    const R2_PORT: u16 = 5650;
+    let (mut fx, prompt) = active_fixture(
+        35,
+        Options::new(&[("a", "m"), ("b", "m")]).active(&both_report_fp()),
+    )
+    .await;
+
+    // R1.
+    let ((status, plans), sent) =
+        request_outcomes_of(outcomes_of(fx.complete(&prompt, None))).await;
+    assert_eq!(status, 200);
+    assert_eq!(plans, outcomes(&[("planned", 1)]));
+    assert_eq!(sent, outcomes(&[("sent", 1)]));
+    let first = fx.mock("b").bodies();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0]["kv_transfer_params"], expected_peer_params());
+
+    // Drain A's held requests so the router can drop and re-add it cleanly.
+    fx.mock("a").release_held();
+    for task in fx.held.drain(..) {
+        assert_eq!(task.await.expect("held request task"), 200);
+    }
+    fx.mock("a").rearm_held();
+
+    // The engine now reports R2; rediscovery runs on re-adding the worker.
+    let url = fx.mock("a").url.clone();
+    fx.mock("a")
+        .set_peer_lookup(PeerLookupMock::new("fp").at(R2_ENGINE, R2_PORT));
+    fx.mock("a").reset_subscribed();
+    for route in ["remove_worker", "add_worker"] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/{route}?url={url}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = fx.app.clone().oneshot(request).await.expect("response");
+        assert_eq!(response.status(), 200, "{route}");
+    }
+    let rediscovered = peer_endpoint_of(&fx, "a").expect("source address registered");
+    assert_eq!(&*rediscovered.engine_id, R2_ENGINE);
+    assert_eq!(rediscovered.port, R2_PORT);
+    fx.mock("a").wait_subscribed().await;
+
+    // R2: same setup on a fresh prompt.
+    let prompt = seq(36, 1700);
+    fx.mock("a")
+        .store_prefix(&prompt, 100, Residency::Device)
+        .await;
+    fx.converge(&prompt, "a", 100).await;
+    fx.make_busy("a", &prompt[..1600], 300, 2).await;
+    let ((status, plans), sent) =
+        request_outcomes_of(outcomes_of(fx.complete(&prompt, None))).await;
+    assert_eq!(status, 200);
+    assert_eq!(plans, outcomes(&[("planned", 1)]));
+    assert_eq!(sent, outcomes(&[("sent", 1)]));
+    let second: Vec<_> = fx
+        .mock("b")
+        .bodies()
+        .into_iter()
+        .filter(|body| body["prompt"] == json!(prompt))
+        .collect();
+    assert_eq!(second.len(), 1);
+    let params = &second[0]["kv_transfer_params"];
+    assert_eq!(params["remote_engine_id"], R2_ENGINE);
+    assert_eq!(params["remote_port"], R2_PORT);
+    assert_ne!(params["remote_engine_id"], "a-rank0");
+    assert_ne!(params["remote_port"], peer_port(0));
+    fx.finish().await;
+}

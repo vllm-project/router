@@ -87,6 +87,9 @@ pub struct PeerLookupMock {
     pub enabled: bool,
     /// Report `side_channel_port: 0`, which the router must drop.
     pub invalid: bool,
+    /// Report this engine id and side-channel port instead of the defaults
+    /// (`<instance>-rank<rank>` and [`peer_port`]).
+    pub address: Option<(String, u16)>,
 }
 
 impl PeerLookupMock {
@@ -95,7 +98,14 @@ impl PeerLookupMock {
             layout_fingerprint: layout_fingerprint.to_owned(),
             enabled: true,
             invalid: false,
+            address: None,
         }
+    }
+
+    /// Report `engine_id` and `port`, as an engine that restarted would.
+    pub fn at(mut self, engine_id: &str, port: u16) -> Self {
+        self.address = Some((engine_id.to_owned(), port));
+        self
     }
 
     pub fn disabled(mut self) -> Self {
@@ -151,6 +161,8 @@ impl KvEventMockConfig {
 
 struct MockState {
     config: KvEventMockConfig,
+    /// The `peer_lookup` record served now; starts as `config.peer_lookup`.
+    peer_lookup: Mutex<Option<PeerLookupMock>>,
     endpoint: String,
     /// `false` while held requests must wait; `true` releases them.
     release: watch::Sender<bool>,
@@ -202,6 +214,7 @@ impl KvEventMock {
         let (release, _) = watch::channel(false);
         let state = Arc::new(MockState {
             config: config.clone(),
+            peer_lookup: Mutex::new(config.peer_lookup.clone()),
             endpoint,
             release,
             held_inflight: AtomicUsize::new(0),
@@ -250,6 +263,17 @@ impl KvEventMock {
 
     pub fn config(&self) -> &KvEventMockConfig {
         &self.state.config
+    }
+
+    /// Change the `peer_lookup` record `/kv_event_sources` reports from now on.
+    pub fn set_peer_lookup(&self, record: PeerLookupMock) {
+        *self.state.peer_lookup.lock().unwrap() = Some(record);
+    }
+
+    /// Forget that the router subscribed, so `wait_subscribed` waits for the
+    /// next subscription (after the router drops and re-adds this worker).
+    pub fn reset_subscribed(&self) {
+        self.subscribed.store(false, Ordering::Release);
     }
 
     pub fn block_size(&self) -> u32 {
@@ -390,6 +414,11 @@ impl KvEventMock {
         self.state.fail_next.store(count, Ordering::Release);
     }
 
+    /// Make later held requests wait again, after `release_held`.
+    pub fn rearm_held(&self) {
+        self.state.release.send_replace(false);
+    }
+
     /// Let every held request finish.
     pub fn release_held(&self) {
         self.state.release.send_replace(true);
@@ -478,13 +507,20 @@ async fn kv_event_sources(State(state): State<Arc<MockState>>) -> Json<Value> {
         "schema_version": 1,
         "enable_kv_cache_events": true,
     });
-    if let Some(peer) = &state.config.peer_lookup {
+    let peer_lookup = state.peer_lookup.lock().unwrap().clone();
+    if let Some(peer) = &peer_lookup {
         let rank = state.config.dp_rank;
+        let (engine_id, port) = peer.address.clone().unwrap_or_else(|| {
+            (
+                format!("{}-rank{rank}", state.config.instance_id),
+                peer_port(rank),
+            )
+        });
         entry["peer_lookup"] = json!({
             "enabled": peer.enabled,
-            "engine_id": format!("{}-rank{rank}", state.config.instance_id),
+            "engine_id": engine_id,
             "side_channel_host": PEER_HOST,
-            "side_channel_port": if peer.invalid { 0 } else { u32::from(peer_port(rank)) },
+            "side_channel_port": if peer.invalid { 0 } else { u32::from(port) },
             "tp_size": 1, "dcp_size": 1, "pp_size": 1,
             "connector": "nixl",
             "connector_version": "1",
