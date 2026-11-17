@@ -20,7 +20,9 @@ documentation additions and deletions. Mixed code/documentation changes run CI.
 The bootstrap fetches the PR target branch and compares its merge base with
 `HEAD`; renames include both the old and new paths. Empty or unresolved diffs
 run CI. Pushes (including merge queues), scheduled builds, and `NIGHTLY=1`
-also run CI. GitHub Actions quality/security checks and release publishing
+also run CI. The `nightly-test` label bypasses docs-only detection and uploads
+the full pipeline even for documentation-only PRs.
+GitHub Actions quality/security checks and release publishing
 remain enabled. Unlike Omni, pytest skip-mark changes do not qualify.
 
 Otherwise the bootstrap uploads `bootstrap-upload-steps.yml`, which builds the release

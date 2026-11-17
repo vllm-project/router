@@ -7,9 +7,33 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "scripts"))
 
 import skip_docs  # noqa: E402
+
+
+class BootstrapRoutingTests(unittest.TestCase):
+    def test_nightly_label_bypasses_docs_detection(self):
+        root = Path(__file__).resolve().parents[2]
+        pipeline = yaml.safe_load((root / ".buildkite/pipeline.yml").read_text())
+        docs_step, nightly_step = pipeline["steps"]
+        # Buildkite evaluates these complementary gates before running commands.
+        label_gate = 'build.pull_request.labels includes "nightly-test"'
+        self.assertEqual(docs_step["if"], f"!({label_gate})")
+        self.assertEqual(nightly_step["if"], label_gate)
+        self.assertIn("skip_docs.py", docs_step["command"])
+        self.assertEqual(
+            nightly_step["command"].split(),
+            [
+                "buildkite-agent",
+                "pipeline",
+                "upload",
+                ".buildkite/bootstrap-upload-steps.yml",
+            ],
+        )
+        self.assertTrue((root / nightly_step["command"].split()[-1]).is_file())
 
 
 class DocsOnlyPRTests(unittest.TestCase):
