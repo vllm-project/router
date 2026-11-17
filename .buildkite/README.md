@@ -1,5 +1,7 @@
 # Buildkite CI/CD Configuration
 
+<!-- TEMP: docs-only CI skip verification; remove after debugging. -->
+
 This directory contains the Buildkite pipeline configurations for the vLLM Router project.
 
 Formatting, Clippy, Black, Ruff, and spelling are not Buildkite jobs. They run
