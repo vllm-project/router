@@ -3,7 +3,7 @@
 //! P/D disaggregation over `grpc://` prefill and decode pools.
 //!
 //! Two in-process `Inference` mocks stand in for vLLM Rust workers. The
-//! router must send P a unary one-token `Generate` with the connector's
+//! router must send P a streaming one-token `Generate` with the connector's
 //! `kv_transfer_params`, then send D a `GenerateStream` that carries P's
 //! `FinishInfo.kv_transfer_params`. No GPU or KV connector is involved.
 //!
@@ -26,7 +26,7 @@ use vllm_router_rs::config::{
     KvConnector, PdKvEventSources, PolicyConfig, RouterConfig, RoutingMode,
 };
 use vllm_router_rs::policies::PolicyFactory;
-use vllm_router_rs::protocols::spec::ChatCompletionRequest;
+use vllm_router_rs::protocols::spec::{ChatCompletionRequest, CompletionRequest};
 use vllm_router_rs::routers::http::vllm_pd_router::VllmPDRouter;
 use vllm_router_rs::routers::RouterTrait;
 
@@ -136,6 +136,68 @@ fn chat(stream: bool) -> ChatCompletionRequest {
     .unwrap()
 }
 
+fn completion(prompt: Value, stream: bool) -> CompletionRequest {
+    serde_json::from_value(json!({
+        "model": "test-model",
+        "prompt": prompt,
+        "max_tokens": 8,
+        "stream": stream,
+    }))
+    .unwrap()
+}
+
+/// Replay harnesses send token ids, so the router must accept them without a
+/// tokenizer round trip on either leg and answer in the completion shape.
+#[tokio::test]
+async fn grpc_pd_completion_passes_client_token_ids_to_both_legs() {
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        finish_kv_transfer_params: Some(prefill_kv()),
+        ..Default::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router(&prefill, &decode).await;
+    // Must not be used: the ids come from the client.
+    router.pin_test_token_ids(vec![9]);
+
+    let response = router
+        .route_completion(None, &completion(json!([11, 12, 13, 14]), false), None)
+        .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["object"], "text_completion", "{json}");
+    assert!(json["choices"][0].get("message").is_none(), "{json}");
+    assert!(
+        json["id"].as_str().unwrap_or_default().starts_with("cmpl-"),
+        "{json}"
+    );
+
+    assert_eq!(prefill.captured()[0].token_ids, vec![11, 12, 13, 14]);
+    assert_eq!(decode.captured()[0].token_ids, vec![11, 12, 13, 14]);
+}
+
+/// A prompt the gRPC wire cannot carry is rejected before any worker is used.
+#[tokio::test]
+async fn grpc_pd_completion_rejects_text_prompts() {
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        finish_kv_transfer_params: Some(prefill_kv()),
+        ..Default::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router(&prefill, &decode).await;
+
+    let response = router
+        .route_completion(None, &completion(json!("hello"), false), None)
+        .await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert!(prefill.captured().is_empty());
+    assert!(decode.captured().is_empty());
+}
+
 #[tokio::test]
 async fn grpc_pd_hands_prefill_kv_params_to_decode() {
     let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
@@ -163,7 +225,7 @@ async fn grpc_pd_hands_prefill_kv_params_to_decode() {
     let d = decode.captured();
     assert_eq!((p.len(), d.len()), (2, 2));
     for (p, d) in p.iter().zip(&d) {
-        assert!(p.unary, "prefill must be unary Generate");
+        assert!(!p.unary, "prefill streams so it can report progress");
         assert_eq!((p.max_new_tokens, p.min_new_tokens), (1, 1));
         let sent = p.kv_transfer_params.as_ref().expect("prefill kv params");
         assert_eq!(sent["do_remote_decode"], true);
@@ -367,6 +429,25 @@ async fn grpc_pd_aborted_prefill_skips_decode() {
     let response = router.route_chat(None, &chat(false), None).await;
     assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
     assert!(decode.captured().is_empty());
+    assert_eq!(
+        worker_counter("vllm_router_pd_prefill_errors_total", &prefill.grpc_url),
+        1.0
+    );
+}
+
+#[tokio::test]
+async fn grpc_pd_prefill_that_only_reports_progress_fails_the_request() {
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        progress: vec![64, 32],
+        omit_finish: true,
+        ..Default::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router(&prefill, &decode).await;
+
+    let response = router.route_chat(None, &chat(false), None).await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
     assert_eq!(
         worker_counter("vllm_router_pd_prefill_errors_total", &prefill.grpc_url),
         1.0
@@ -710,7 +791,7 @@ async fn grpc_pd_nixl_push_dispatches_both_legs_once_identity_is_cached() {
     let (p, d) = (prefill.captured(), decode.captured());
     assert_eq!((p.len(), d.len()), (3, 3));
     for (i, (p, d)) in p.iter().zip(&d).enumerate() {
-        assert!(p.unary);
+        assert!(!p.unary);
         assert_eq!(p.request_id, d.request_id);
         assert_eq!(
             d.kv_transfer_params.as_ref(),
@@ -1273,7 +1354,7 @@ async fn grpc_pd_encoding_caches_keep_token_ids_on_both_legs() {
     let d = decode.captured();
     assert_eq!((p.len(), d.len()), (3, 3));
     for (p, d) in p.iter().zip(&d) {
-        assert!(p.unary);
+        assert!(!p.unary);
         assert_eq!((p.max_new_tokens, p.min_new_tokens), (1, 1));
         assert_eq!(
             p.kv_transfer_params.as_ref().unwrap()["do_remote_decode"],
@@ -1313,4 +1394,84 @@ async fn send_chat(
         p.last().unwrap().token_ids.clone(),
         d.last().unwrap().token_ids.clone(),
     )
+}
+
+fn long_completion(stream: bool) -> CompletionRequest {
+    let ids: Vec<u32> = (0..4096).collect();
+    completion(json!(ids), stream)
+}
+
+async fn wait_gauge(prefill: &MockVllmRsServer, want: f64) {
+    for _ in 0..300 {
+        if gauge(prefill).await == want {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!(
+        "the ledger never reached {want}, last {}",
+        gauge(prefill).await
+    );
+}
+
+async fn gauge(prefill: &MockVllmRsServer) -> f64 {
+    // The series carries `worker` and `rank`, and the worker's HTTP base may
+    // differ from its gRPC URL, so match on the port.
+    let port = prefill
+        .grpc_url
+        .rsplit(':')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    metrics()
+        .render()
+        .lines()
+        .filter(|line| line.starts_with("vllm_router_pd_active_prefill_tokens{"))
+        .find(|line| line.contains(&format!(":{port}\"")))
+        .and_then(|line| line.rsplit(' ').next()?.parse().ok())
+        .unwrap_or(0.0)
+}
+
+#[tokio::test]
+async fn grpc_pd_reports_the_ledger_while_progress_grows() {
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        progress: vec![1000, 2500],
+        progress_hold: std::time::Duration::from_millis(600),
+        ..Default::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router(&prefill, &decode).await;
+
+    let body = long_completion(false);
+    let request = router.route_completion(None, &body, None);
+    let probe = wait_gauge(&prefill, 2500.0);
+    let (response, ()) = tokio::join!(request, probe);
+    assert!(response.status().is_success());
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(gauge(&prefill).await, 0.0, "nothing stays charged");
+}
+
+#[tokio::test]
+async fn grpc_pd_releases_prefill_charge_when_the_stream_is_cancelled() {
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        progress: vec![2000],
+        progress_hold: std::time::Duration::from_secs(30),
+        ..Default::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router(&prefill, &decode).await;
+
+    let body = long_completion(false);
+    let mut request = Box::pin(router.route_completion(None, &body, None));
+    tokio::select! {
+        _ = &mut request => panic!("the request should still be in flight"),
+        _ = wait_gauge(&prefill, 2000.0) => {}
+    }
+
+    drop(request);
+    wait_gauge(&prefill, 0.0).await;
 }
