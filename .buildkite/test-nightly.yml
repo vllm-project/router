@@ -34,7 +34,9 @@ steps:
                 - -c
                 - |
                   bash .buildkite/scripts/install_packages.sh rust
-                  cargo test --features cpu,ready --lib --bins
+                  bash .buildkite/scripts/rust_coverage.sh unit
+        artifact_paths:
+          - "target/coverage/rust-unit/lcov.info"
         agents:
           queue: "medium_cpu_queue_premerge"
 
@@ -53,7 +55,9 @@ steps:
                 - -c
                 - |
                   bash .buildkite/scripts/install_packages.sh rust
-                  cargo test --features cpu,ready --test '*'
+                  bash .buildkite/scripts/rust_coverage.sh integration
+        artifact_paths:
+          - "target/coverage/rust-integration/lcov.info"
         agents:
           queue: "medium_cpu_queue_premerge"
 

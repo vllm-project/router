@@ -63,6 +63,68 @@ shell. A build-level `HF_TOKEN` would override a pod env entry of the same name.
 
 CPU steps keep `medium_cpu_queue_premerge` inline. Their command lives in the Docker plugin, so they do not use a preset. Dependency sets live in `ci_apt_packages.conf` and `scripts/install_packages.sh`. `rust` and `nvidia_pd` install apt packages. `router-bin` downloads the release binary and checks it. `lm-eval` installs the ROCm accuracy harness. A sourced `python` call downloads the binary and installs `.[dev]` into `/tmp/venv`. `python-wheel` uses that apt set and venv for `python -m build`.
 
+### Rust coverage artifacts
+
+The Rust unit and integration jobs in `test-nightly.yml`
+run through [`scripts/rust_coverage.sh`](scripts/rust_coverage.sh), using
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov/tree/v0.6.21)
+0.6.21 and pinned `nightly-2026-04-15` with its `llvm-tools-preview` component. Each job
+runs its existing `cpu,ready` test targets once with coverage instrumentation.
+Instrumentation is limited to the host target so nested WASM component builds
+do not inherit unsupported coverage flags.
+This adds tool installation and instrumented compilation time to those jobs.
+`test-ready.yml` runs ordinary Rust tests without coverage instrumentation.
+The nightly Rust jobs keep their existing scheduling condition, so a PR
+also labeled `ready` skips them and does not produce Rust coverage artifacts.
+
+Each job uploads one machine-readable LCOV file from the mounted checkout:
+
+| Artifact | Unit job | Integration job |
+| --- | --- | --- |
+| LCOV data | `target/coverage/rust-unit/lcov.info` | `target/coverage/rust-integration/lcov.info` |
+
+Reports exclude `tests/` and `benches/` files as well as inline test modules
+and test-only helpers marked with `#[cfg_attr(coverage_nightly, coverage(off))]`.
+The nightly toolchain enables this unstable attribute; ordinary stable builds
+do not enable it. Add the same marker to new test modules and test-only helpers.
+The existing `check-mark` pre-commit hook checks each test-only module,
+function and impl declaration under `src/` for this marker, including
+file-based `mod tests;` declarations.
+These are separate coverage
+measurements for each test group; their percentages must not be added or
+averaged to obtain total coverage. Python tests, doctests, ignored tests, and
+nightly-only branch coverage are outside this measurement. No minimum
+coverage threshold is enforced.
+Each run cleans workspace coverage artifacts so reports cannot include stale
+binaries from another toolchain or test group; dependency builds remain cached.
+
+Tests retain a failing job status when they fail. Report generation is
+attempted after test failures, but compilation failures or missing profiles
+may prevent reports from being generated. Report generation failures also
+fail the job.
+The previous report is removed before tool installation. A new report is
+written to a temporary file and renamed to `lcov.info` only after generation
+succeeds, so failed runs cannot publish stale or partially written reports.
+The completed report is set to mode `0644` before publication so the host
+Buildkite agent can read it even when the container runs as root.
+
+To reproduce with the same Rust image and dependency set as CI, run from the
+repository root (requires Docker and network access):
+
+```bash
+docker run --rm -v "$PWD:/workdir" -w /workdir rust:1.95.0-bookworm \
+  bash -euc 'bash .buildkite/scripts/install_packages.sh rust; bash .buildkite/scripts/rust_coverage.sh unit'
+docker run --rm -v "$PWD:/workdir" -w /workdir rust:1.95.0-bookworm \
+  bash -euc 'bash .buildkite/scripts/install_packages.sh rust; bash .buildkite/scripts/rust_coverage.sh integration'
+```
+
+On a Linux development host with Rust, rustup, and the `rust` apt dependency
+set already installed, use `bash .buildkite/scripts/rust_coverage.sh unit`
+or `bash .buildkite/scripts/rust_coverage.sh integration`. The script installs
+the pinned nightly toolchain, precompiled coverage tool from GitHub releases,
+and LLVM component, so it also
+needs network access.
+
 ### `release-pipeline.yml`
 Release pipeline for tagged versions, nightly Docker images, and versioned
 Docker releases.
