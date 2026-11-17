@@ -466,12 +466,11 @@ impl VllmPDRouter {
             .host()
             .ok_or_else(|| format!("Prefill URL '{}' has no host", prefill_url))?
             .to_string();
-        let base_url = format!(
-            "{}://{}:{}",
-            parsed.scheme(),
-            host,
-            parsed.port().unwrap_or(8000)
-        );
+        // Preserve omitted ports: HTTP's default endpoint is distinct from :8000.
+        let base_url = match parsed.port() {
+            Some(port) => format!("{}://{}:{}", parsed.scheme(), host, port),
+            None => format!("{}://{}", parsed.scheme(), host),
+        };
         let bootstrap_addr = format!("http://{}:{}", host, bootstrap_port.unwrap_or(8998));
         Ok((base_url, bootstrap_addr))
     }
@@ -3814,9 +3813,9 @@ mod tests {
     fn mooncake_decode_metadata_normalizes_prefill_urls() {
         let router = mooncake_test_router();
         for (prefill, engine) in [
-            ("http://prefill", "engine-1"),
+            ("http://prefill:8000/", "engine-1"),
             ("http://prefill:8000/v1", "engine-1"),
-            ("grpc://prefill", "grpc-engine-1"),
+            ("grpc://prefill:8000/", "grpc-engine-1"),
             ("grpc://prefill:8000/v1", "grpc-engine-1"),
         ] {
             let params = router
@@ -3831,6 +3830,57 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing metadata for {prefill}"));
             assert_eq!(params["remote_engine_id"], engine);
             assert_eq!(params["remote_bootstrap_addr"], "http://prefill:8998");
+        }
+    }
+
+    #[test]
+    fn mooncake_metadata_keeps_omitted_and_explicit_worker_ports_distinct() {
+        let mut router = mooncake_test_router();
+        for scheme in ["http", "https", "grpc"] {
+            let workers = [
+                (format!("{scheme}://prefill"), 8998, "default-port-engine"),
+                (format!("{scheme}://prefill:8000"), 9998, "port-8000-engine"),
+            ];
+            for order in [[0, 1], [1, 0]] {
+                let mut metadata = HashMap::new();
+                for index in order {
+                    let (prefill, bootstrap_port, engine) = &workers[index];
+                    let (key, bootstrap_addr) =
+                        VllmPDRouter::mooncake_prefill_target(prefill, Some(*bootstrap_port))
+                            .unwrap();
+                    metadata.insert(
+                        key,
+                        MooncakePrefillInfo {
+                            bootstrap_addr,
+                            dp_engine_ids: HashMap::from([(0, engine.to_string())]),
+                            fallback_warning: Arc::new(Once::new()),
+                        },
+                    );
+                }
+                router.mooncake_prefill_info = Arc::new(metadata);
+                assert_eq!(router.mooncake_prefill_info.len(), 2, "{scheme} {order:?}");
+                for (prefill, bootstrap_port, engine) in &workers {
+                    for suffix in ["", "/v1"] {
+                        let url = format!("{prefill}{suffix}");
+                        let params = router
+                            .build_decode_kv_transfer_params(
+                                &url,
+                                None,
+                                Some("xfer-test"),
+                                Some(1),
+                                Some(0),
+                                None,
+                            )
+                            .unwrap_or_else(|| panic!("missing metadata for {url}"));
+                        assert_eq!(params["remote_engine_id"], *engine, "{url} {order:?}");
+                        assert_eq!(
+                            params["remote_bootstrap_addr"],
+                            format!("http://prefill:{bootstrap_port}"),
+                            "{url} {order:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -3906,7 +3956,7 @@ mod tests {
                         for j in 0..16 {
                             let url = [
                                 "http://prefill:8000",
-                                "http://prefill",
+                                "http://prefill:8000/",
                                 "http://prefill:8000/v1",
                             ][(i + j) % 3];
                             assert_eq!(
@@ -3939,7 +3989,25 @@ mod tests {
             (
                 "http://prefill",
                 None,
-                "http://prefill:8000",
+                "http://prefill",
+                "http://prefill:8998",
+            ),
+            (
+                "http://prefill:80/v1",
+                None,
+                "http://prefill",
+                "http://prefill:8998",
+            ),
+            (
+                "https://prefill:443/v1",
+                None,
+                "https://prefill",
+                "http://prefill:8998",
+            ),
+            (
+                "grpc://prefill",
+                None,
+                "grpc://prefill",
                 "http://prefill:8998",
             ),
             (
