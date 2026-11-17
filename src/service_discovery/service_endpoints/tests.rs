@@ -4,8 +4,8 @@ use super::*;
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions};
 use serde_json::{json, Value};
 
-fn service() -> Service {
-    serde_json::from_value(json!({
+fn service_json() -> Value {
+    json!({
         "metadata": {
             "name": "chat", "namespace": "inference", "uid": "svc-1",
             "annotations": {
@@ -14,8 +14,11 @@ fn service() -> Service {
             }
         },
         "spec": {"selector": {"app": "vllm"}, "ports": [{"name": "http", "port": 80}]}
-    }))
-    .unwrap()
+    })
+}
+
+fn service() -> Service {
+    serde_json::from_value(service_json()).unwrap()
 }
 
 fn endpoint(uid: &str, ip: &str) -> Endpoint {
@@ -26,7 +29,7 @@ fn endpoint(uid: &str, ip: &str) -> Endpoint {
     .unwrap()
 }
 
-fn slice(name: &str) -> EndpointSlice {
+fn slice(name: &str, port: u16, endpoints: Vec<Endpoint>) -> EndpointSlice {
     serde_json::from_value(json!({
         "metadata": {
             "name": name, "namespace": "inference",
@@ -36,7 +39,7 @@ fn slice(name: &str) -> EndpointSlice {
             },
             "ownerReferences": [{"apiVersion": "v1", "kind": "Service", "name": "chat", "uid": "svc-1"}]
         },
-        "addressType": "IPv4", "ports": [{"name": "http", "port": 8000}], "endpoints": []
+        "addressType": "IPv4", "ports": [{"name": "http", "port": port}], "endpoints": endpoints
     })).unwrap()
 }
 
@@ -48,291 +51,476 @@ fn resolve(slices: &[EndpointSlice]) -> EndpointResolution {
     )
 }
 
-#[test]
-fn resolves_backend_port_and_preserves_model_and_service_identity() {
-    let mut a = slice("a");
-    a.endpoints.push(endpoint("pod-1", "10.0.0.1"));
-    let result = resolve(&[a]);
-    assert!(result.diagnostics.is_empty());
-    assert_eq!(result.endpoints.len(), 1);
-    let target = &result.endpoints[0];
-    assert_eq!(target.address, "10.0.0.1:8000".parse().unwrap());
-    assert_eq!(target.pod_uid, "pod-1");
-    assert_eq!(target.service, parse_service(&service()).unwrap());
-
-    let mut other_model = service();
-    other_model
-        .metadata
-        .annotations
-        .as_mut()
-        .unwrap()
-        .insert(MODEL_ID_ANNOTATION.into(), "model-b".into());
-    assert_eq!(parse_service(&other_model).unwrap().model_id, "model-b");
-}
-
-#[test]
-fn rejects_invalid_service_fields_with_resource_and_field() {
-    let cases: &[(&str, Value, &str)] = &[
-        ("/metadata/name", json!(""), "metadata.name"),
-        ("/metadata/namespace", Value::Null, "metadata.namespace"),
-        ("/metadata/uid", Value::Null, "metadata.uid"),
-        (
-            "/metadata/annotations/router.vllm.ai~1model-id",
-            json!(" "),
-            "metadata.annotations[router.vllm.ai/model-id]",
-        ),
-        (
-            "/metadata/annotations/router.vllm.ai~1inference-port",
-            json!(""),
-            "metadata.annotations[router.vllm.ai/inference-port]",
-        ),
-        (
-            "/metadata/annotations",
-            Value::Null,
-            "metadata.annotations[router.vllm.ai/model-id]",
-        ),
-        ("/spec", Value::Null, "spec"),
-        ("/spec/selector", json!({}), "spec.selector"),
-        (
-            "/spec/publishNotReadyAddresses",
-            json!(true),
-            "spec.publishNotReadyAddresses",
-        ),
-        ("/spec/ports", json!([]), "spec.ports"),
-        ("/spec/ports/0/name", json!("grpc"), "spec.ports"),
-        ("/spec/ports/0/port", json!(0), "spec.ports"),
-        ("/spec/ports/0/port", json!(65536), "spec.ports"),
-    ];
-    for (pointer, value, field) in cases {
-        let mut input = serde_json::to_value(service()).unwrap();
-        // Optional fields may be absent after serialization.
-        if *pointer == "/spec/publishNotReadyAddresses" {
-            input["spec"]["publishNotReadyAddresses"] = value.clone();
-        } else {
-            *input.pointer_mut(pointer).unwrap() = value.clone();
-        }
-        let error = parse_service(&serde_json::from_value(input).unwrap()).unwrap_err();
-        assert_eq!(error.field, *field, "{pointer}");
-        assert!(error.resource.starts_with("Service "), "{pointer}");
-        assert!(error.resource.contains('/'), "{pointer}");
+fn expected_endpoint(uid: &str, address: &str, model_id: &str) -> DiscoveredEndpoint {
+    DiscoveredEndpoint {
+        service: ServiceBinding {
+            namespace: "inference".into(),
+            name: "chat".into(),
+            uid: "svc-1".into(),
+            model_id: model_id.into(),
+            port_name: "http".into(),
+        },
+        pod_uid: uid.into(),
+        address: address.parse().unwrap(),
     }
-    let mut input = service();
-    let ports = input.spec.as_mut().unwrap().ports.as_mut().unwrap();
-    ports.push(ports[0].clone());
-    assert_eq!(parse_service(&input).unwrap_err().field, "spec.ports");
-    let mut input = service();
-    input.spec.as_mut().unwrap().ports.as_mut().unwrap()[0].protocol = Some("UDP".into());
-    assert_eq!(parse_service(&input).unwrap_err().field, "spec.ports");
 }
 
-#[test]
-fn duplicate_slices_are_order_independent_and_one_copy_can_be_removed() {
-    let mut a = slice("a");
-    a.endpoints = vec![endpoint("pod-1", "10.0.0.1"), endpoint("pod-2", "10.0.0.2")];
-    let mut b = a.clone();
-    b.metadata.name = Some("b".into());
-    assert_eq!(
-        resolve(&[a.clone(), b.clone()]),
-        resolve(&[b.clone(), a.clone()])
-    );
-    assert_eq!(resolve(&[a, b.clone()]), resolve(&[b]));
+fn assert_diagnostics(result: &EndpointResolution, expected: &[(&str, &str)]) {
+    let actual: Vec<_> = result
+        .diagnostics
+        .iter()
+        .map(|error| (error.resource.as_str(), error.field.as_str()))
+        .collect();
+    assert_eq!(actual, expected);
 }
 
-#[test]
-fn same_pod_on_different_ports_remains_distinct() {
-    let mut a = slice("a");
-    a.endpoints.push(endpoint("pod-1", "10.0.0.1"));
-    let mut b = a.clone();
-    b.metadata.name = Some("b".into());
-    b.ports.as_mut().unwrap()[0].port = Some(9000);
-    let result = resolve(&[a, b]);
-    assert!(result.diagnostics.is_empty());
-    assert_eq!(
-        result
-            .endpoints
-            .iter()
-            .map(|e| e.address.port())
-            .collect::<Vec<_>>(),
-        vec![8000, 9000]
-    );
-}
+mod service_contract {
+    use super::*;
 
-#[test]
-fn checks_all_nullable_condition_combinations() {
-    for ready in [None, Some(false), Some(true)] {
-        for serving in [None, Some(false), Some(true)] {
-            for terminating in [None, Some(false), Some(true)] {
-                let mut a = slice("a");
-                let mut target = endpoint("pod-1", "10.0.0.1");
-                target.conditions = Some(EndpointConditions {
-                    ready,
-                    serving,
-                    terminating,
-                });
-                a.endpoints.push(target);
-                let expected = ready.unwrap_or(true)
-                    && serving.unwrap_or(true)
-                    && !terminating.unwrap_or(false);
-                let result = resolve(&[a]);
-                assert!(result.diagnostics.is_empty());
-                assert_eq!(
-                    result.endpoints.len(),
-                    usize::from(expected),
-                    "{ready:?}/{serving:?}/{terminating:?}"
-                );
+    #[test]
+    fn requires_service_name_namespace_and_uid() {
+        for field in ["name", "namespace", "uid"] {
+            for value in [Value::Null, json!("")] {
+                let mut input = service_json();
+                input["metadata"][field] = value;
+                let error = parse_service(&serde_json::from_value(input).unwrap()).unwrap_err();
+                assert_eq!(error.field, format!("metadata.{field}"));
             }
         }
     }
+
+    #[test]
+    fn requires_model_id_and_named_port_annotations() {
+        for key in [MODEL_ID_ANNOTATION, INFERENCE_PORT_ANNOTATION] {
+            for value in [None, Some(""), Some(" ")] {
+                let mut input = service();
+                let annotations = input.metadata.annotations.as_mut().unwrap();
+                match value {
+                    Some(value) => {
+                        annotations.insert(key.into(), value.into());
+                    }
+                    None => {
+                        annotations.remove(key);
+                    }
+                }
+                let error = parse_service(&input).unwrap_err();
+                assert_eq!(error.resource, "Service inference/chat");
+                assert_eq!(error.field, format!("metadata.annotations[{key}]"));
+            }
+        }
+    }
+
+    #[test]
+    fn requires_a_selector_and_rejects_publish_not_ready_addresses() {
+        for (field, value) in [
+            ("selector", Value::Null),
+            ("selector", json!({})),
+            ("publishNotReadyAddresses", json!(true)),
+        ] {
+            let mut input = service_json();
+            input["spec"][field] = value;
+            let error = parse_service(&serde_json::from_value(input).unwrap()).unwrap_err();
+            assert_eq!(error.resource, "Service inference/chat");
+            assert_eq!(error.field, format!("spec.{field}"));
+        }
+        let mut input = service();
+        input.spec = None;
+        assert_eq!(parse_service(&input).unwrap_err().field, "spec");
+    }
+
+    #[test]
+    fn requires_exactly_one_valid_named_tcp_service_port() {
+        for ports in [
+            json!([]),
+            json!([{"name": "metrics", "port": 80}]),
+            json!([{"name": "http", "port": 80}, {"name": "http", "port": 81}]),
+            json!([{"name": "http", "port": 80, "protocol": "UDP"}]),
+            json!([{"name": "http", "port": 0}]),
+            json!([{"name": "http", "port": -1}]),
+            json!([{"name": "http", "port": 65536}]),
+        ] {
+            let mut input = service_json();
+            input["spec"]["ports"] = ports.clone();
+            let error = parse_service(&serde_json::from_value(input).unwrap()).unwrap_err();
+            assert_eq!(error.field, "spec.ports", "{ports}");
+        }
+    }
 }
 
-#[test]
-fn conflicting_readiness_excludes_only_the_affected_target() {
-    let mut a = slice("a");
-    a.endpoints = vec![endpoint("pod-1", "10.0.0.1"), endpoint("pod-2", "10.0.0.2")];
-    let mut b = slice("b");
-    let mut unready = endpoint("pod-1", "10.0.0.1");
-    unready.conditions = Some(EndpointConditions {
-        ready: Some(false),
-        ..Default::default()
-    });
-    b.endpoints.push(unready);
-    let result = resolve(&[a.clone(), b.clone()]);
-    assert_eq!(result.endpoints.len(), 1);
-    assert_eq!(result.endpoints[0].pod_uid, "pod-2");
-    assert_eq!(result.diagnostics.len(), 2);
-    assert!(result
-        .diagnostics
-        .iter()
-        .all(|error| error.field == "conditions"));
-    assert_eq!(result, resolve(&[b, a]));
+mod endpoint_resolution {
+    use super::*;
+
+    #[test]
+    fn returns_pod_addresses_and_the_declared_model_and_service_identity() {
+        for model_id in ["model-a", "model-b"] {
+            let mut input = service();
+            input
+                .metadata
+                .annotations
+                .as_mut()
+                .unwrap()
+                .insert(MODEL_ID_ANNOTATION.into(), model_id.into());
+            let slices = [slice(
+                "a",
+                8000,
+                vec![endpoint("pod-1", "10.0.0.1"), endpoint("pod-2", "10.0.0.2")],
+            )];
+            let result = resolve_endpoints(
+                &parse_service(&input).unwrap(),
+                &slices,
+                AddressFamily::Ipv4,
+            );
+            assert_eq!(
+                result.endpoints,
+                vec![
+                    expected_endpoint("pod-1", "10.0.0.1:8000", model_id),
+                    expected_endpoint("pod-2", "10.0.0.2:8000", model_id),
+                ]
+            );
+            assert_diagnostics(&result, &[]);
+        }
+    }
+
+    #[test]
+    fn uses_each_slices_named_backend_port_and_keeps_distinct_ports() {
+        let mut a = slice("a", 8000, vec![endpoint("pod-1", "10.0.0.1")]);
+        let mut metrics = a.ports.as_ref().unwrap()[0].clone();
+        metrics.name = Some("metrics".into());
+        metrics.port = Some(9090);
+        a.ports.as_mut().unwrap().insert(0, metrics);
+        let b = slice("b", 9000, vec![endpoint("pod-1", "10.0.0.1")]);
+        let result = resolve(&[a, b]);
+        assert_eq!(
+            result.endpoints,
+            vec![
+                expected_endpoint("pod-1", "10.0.0.1:8000", "model-a"),
+                expected_endpoint("pod-1", "10.0.0.1:9000", "model-a"),
+            ]
+        );
+        assert_diagnostics(&result, &[]);
+    }
+
+    #[test]
+    fn merges_slices_into_a_sorted_deduplicated_list_regardless_of_input_order() {
+        let a = slice(
+            "a",
+            8000,
+            vec![endpoint("pod-2", "10.0.0.2"), endpoint("pod-1", "10.0.0.1")],
+        );
+        let b = slice(
+            "b",
+            8000,
+            vec![endpoint("pod-3", "10.0.0.3"), endpoint("pod-1", "10.0.0.1")],
+        );
+        let result = resolve(&[a.clone(), b.clone()]);
+        assert_eq!(
+            result.endpoints,
+            vec![
+                expected_endpoint("pod-1", "10.0.0.1:8000", "model-a"),
+                expected_endpoint("pod-2", "10.0.0.2:8000", "model-a"),
+                expected_endpoint("pod-3", "10.0.0.3:8000", "model-a"),
+            ]
+        );
+        assert_diagnostics(&result, &[]);
+        assert_eq!(result, resolve(&[b, a]));
+    }
+
+    #[test]
+    fn removing_one_duplicate_slice_keeps_the_remaining_endpoint() {
+        let a = slice("a", 8000, vec![endpoint("pod-1", "10.0.0.1")]);
+        let b = slice("b", 8000, vec![endpoint("pod-1", "10.0.0.1")]);
+        let expected = vec![expected_endpoint("pod-1", "10.0.0.1:8000", "model-a")];
+        assert_eq!(resolve(&[a, b.clone()]).endpoints, expected);
+        assert_eq!(resolve(&[b]).endpoints, expected);
+    }
+
+    #[test]
+    fn requires_exactly_one_valid_named_tcp_slice_port() {
+        for ports in [
+            json!([]),
+            json!([{"name": "metrics", "port": 8000}]),
+            json!([{"name": "http", "port": 8000}, {"name": "http", "port": 9000}]),
+            json!([{"name": "http", "port": 8000, "protocol": "UDP"}]),
+            json!([{"name": "http"}]),
+            json!([{"name": "http", "port": 0}]),
+            json!([{"name": "http", "port": -1}]),
+            json!([{"name": "http", "port": 65536}]),
+        ] {
+            let mut input = slice("invalid-port", 8000, vec![endpoint("pod-1", "10.0.0.1")]);
+            input.ports = Some(serde_json::from_value(ports.clone()).unwrap());
+            let result = resolve(&[input]);
+            assert!(result.endpoints.is_empty(), "{ports}");
+            assert_diagnostics(
+                &result,
+                &[("EndpointSlice inference/invalid-port", "ports")],
+            );
+        }
+    }
 }
 
-#[test]
-fn rejects_stale_or_missing_owner_and_unsupported_controller() {
-    let mut a = slice("a");
-    a.endpoints.push(endpoint("pod-1", "10.0.0.1"));
-    for owners in [None, Some(vec![]), {
-        let mut owners = a.metadata.owner_references.clone().unwrap();
-        owners[0].uid = "old-service".into();
-        Some(owners)
-    }] {
-        let mut invalid = a.clone();
-        invalid.metadata.owner_references = owners;
-        let result = resolve(&[invalid]);
+mod readiness {
+    use super::*;
+
+    #[test]
+    fn filters_all_27_nullable_condition_combinations() {
+        let eligible = [
+            (None, None, None),
+            (None, None, Some(false)),
+            (None, Some(true), None),
+            (None, Some(true), Some(false)),
+            (Some(true), None, None),
+            (Some(true), None, Some(false)),
+            (Some(true), Some(true), None),
+            (Some(true), Some(true), Some(false)),
+        ];
+        for ready in [None, Some(false), Some(true)] {
+            for serving in [None, Some(false), Some(true)] {
+                for terminating in [None, Some(false), Some(true)] {
+                    let mut target = endpoint("pod-1", "10.0.0.1");
+                    target.conditions = Some(EndpointConditions {
+                        ready,
+                        serving,
+                        terminating,
+                    });
+                    let result = resolve(&[slice("a", 8000, vec![target])]);
+                    let expected = if eligible.contains(&(ready, serving, terminating)) {
+                        vec![expected_endpoint("pod-1", "10.0.0.1:8000", "model-a")]
+                    } else {
+                        vec![]
+                    };
+                    assert_eq!(
+                        result.endpoints, expected,
+                        "{ready:?}/{serving:?}/{terminating:?}"
+                    );
+                    assert_diagnostics(&result, &[]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conflicting_readiness_excludes_only_the_conflicting_target_in_either_order() {
+        let a = slice(
+            "a",
+            8000,
+            vec![endpoint("pod-1", "10.0.0.1"), endpoint("pod-2", "10.0.0.2")],
+        );
+        let mut unready = endpoint("pod-1", "10.0.0.1");
+        unready.conditions = Some(EndpointConditions {
+            ready: Some(false),
+            ..Default::default()
+        });
+        let b = slice("b", 8000, vec![unready]);
+        let result = resolve(&[a.clone(), b.clone()]);
+        assert_eq!(
+            result.endpoints,
+            vec![expected_endpoint("pod-2", "10.0.0.2:8000", "model-a")]
+        );
+        assert_diagnostics(
+            &result,
+            &[
+                ("EndpointSlice inference/a:endpoints[0]", "conditions"),
+                ("EndpointSlice inference/b:endpoints[0]", "conditions"),
+            ],
+        );
+        assert_eq!(result, resolve(&[b, a]));
+    }
+}
+
+mod ownership_and_pod_identity {
+    use super::*;
+
+    #[test]
+    fn rejects_missing_or_stale_service_owners() {
+        for uid in [None, Some("old-service")] {
+            let mut input = slice("stale", 8000, vec![endpoint("pod-1", "10.0.0.1")]);
+            match uid {
+                Some(uid) => input.metadata.owner_references.as_mut().unwrap()[0].uid = uid.into(),
+                None => input.metadata.owner_references = None,
+            }
+            let result = resolve(&[input]);
+            assert!(result.endpoints.is_empty());
+            assert_diagnostics(
+                &result,
+                &[("EndpointSlice inference/stale", "metadata.ownerReferences")],
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_slices_from_unsupported_controllers() {
+        let mut input = slice("custom", 8000, vec![endpoint("pod-1", "10.0.0.1")]);
+        input
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(MANAGED_BY_LABEL.into(), "custom-controller".into());
+        let result = resolve(&[input]);
         assert!(result.endpoints.is_empty());
-        assert_eq!(result.diagnostics[0].field, "metadata.ownerReferences");
+        assert_diagnostics(
+            &result,
+            &[(
+                "EndpointSlice inference/custom",
+                "metadata.labels[endpointslice.kubernetes.io/managed-by]",
+            )],
+        );
     }
-    a.metadata
-        .labels
-        .as_mut()
-        .unwrap()
-        .insert(MANAGED_BY_LABEL.into(), "custom-controller".into());
-    assert!(resolve(&[a]).diagnostics[0].field.contains("managed-by"));
+
+    #[test]
+    fn ignores_slices_for_other_namespaces_or_services() {
+        let mut other_namespace = slice("a", 8000, vec![endpoint("pod-1", "10.0.0.1")]);
+        other_namespace.metadata.namespace = Some("other".into());
+        let mut other_service = slice("b", 8000, vec![endpoint("pod-2", "10.0.0.2")]);
+        other_service
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(SERVICE_NAME_LABEL.into(), "other".into());
+        assert_eq!(
+            resolve(&[other_namespace, other_service]),
+            EndpointResolution::default()
+        );
+    }
+
+    #[test]
+    fn requires_a_pod_uid_in_the_service_namespace() {
+        for (field, value) in [
+            ("uid", Value::Null),
+            ("uid", json!("")),
+            ("kind", json!("Node")),
+            ("namespace", json!("other")),
+            ("apiVersion", json!("apps/v1")),
+        ] {
+            let mut target = serde_json::to_value(endpoint("pod-1", "10.0.0.1")).unwrap();
+            target["targetRef"][field] = value;
+            let result = resolve(&[slice(
+                "invalid-pod",
+                8000,
+                vec![serde_json::from_value(target).unwrap()],
+            )]);
+            assert!(result.endpoints.is_empty(), "{field}");
+            assert_diagnostics(
+                &result,
+                &[(
+                    "EndpointSlice inference/invalid-pod",
+                    "endpoints[0].targetRef",
+                )],
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_implicit_pod_namespace_and_api_version() {
+        let mut target = endpoint("pod-1", "10.0.0.1");
+        let reference = target.target_ref.as_mut().unwrap();
+        reference.namespace = None;
+        reference.api_version = None;
+        let result = resolve(&[slice("a", 8000, vec![target])]);
+        assert_eq!(
+            result.endpoints,
+            vec![expected_endpoint("pod-1", "10.0.0.1:8000", "model-a")]
+        );
+        assert_diagnostics(&result, &[]);
+    }
+
+    #[test]
+    fn preserves_the_new_pod_uid_when_an_address_is_reused_between_snapshots() {
+        for uid in ["old-pod", "new-pod"] {
+            let result = resolve(&[slice("a", 8000, vec![endpoint(uid, "10.0.0.1")])]);
+            assert_eq!(
+                result.endpoints,
+                vec![expected_endpoint(uid, "10.0.0.1:8000", "model-a")]
+            );
+            assert_diagnostics(&result, &[]);
+        }
+    }
+
+    #[test]
+    fn excludes_addresses_claimed_by_different_pod_uids_but_keeps_other_targets() {
+        let a = slice(
+            "a",
+            8000,
+            vec![
+                endpoint("old-pod", "10.0.0.1"),
+                endpoint("unrelated", "10.0.0.2"),
+            ],
+        );
+        let b = slice("b", 8000, vec![endpoint("new-pod", "10.0.0.1")]);
+        let result = resolve(&[a.clone(), b.clone()]);
+        assert_eq!(
+            result.endpoints,
+            vec![expected_endpoint("unrelated", "10.0.0.2:8000", "model-a")]
+        );
+        assert_diagnostics(
+            &result,
+            &[
+                ("EndpointSlice inference/a:endpoints[0]", "targetRef.uid"),
+                ("EndpointSlice inference/b:endpoints[0]", "targetRef.uid"),
+            ],
+        );
+        assert_eq!(result, resolve(&[b, a]));
+    }
 }
 
-#[test]
-fn ignores_slices_for_other_namespaces_and_services() {
-    let mut a = slice("a");
-    a.endpoints.push(endpoint("pod-1", "10.0.0.1"));
-    let mut b = a.clone();
-    a.metadata.namespace = Some("other".into());
-    b.metadata
-        .labels
-        .as_mut()
-        .unwrap()
-        .insert(SERVICE_NAME_LABEL.into(), "other".into());
-    assert_eq!(resolve(&[a, b]), EndpointResolution::default());
-}
+mod address_families {
+    use super::*;
 
-#[test]
-fn rejects_invalid_slice_ports() {
-    for port in [None, Some(0), Some(-1), Some(65536)] {
-        let mut a = slice("a");
-        a.ports.as_mut().unwrap()[0].port = port;
-        assert_eq!(resolve(&[a]).diagnostics[0].field, "ports");
+    #[test]
+    fn selects_one_family_and_formats_ipv6_with_brackets() {
+        let v4 = slice("v4", 8000, vec![endpoint("pod-1", "10.0.0.1")]);
+        let mut v6 = slice("v6", 8000, vec![endpoint("pod-1", "2001:db8::1")]);
+        v6.address_type = "IPv6".into();
+        let binding = parse_service(&service()).unwrap();
+        for (family, address) in [
+            (AddressFamily::Ipv4, "10.0.0.1:8000"),
+            (AddressFamily::Ipv6, "[2001:db8::1]:8000"),
+        ] {
+            let result = resolve_endpoints(&binding, &[v4.clone(), v6.clone()], family);
+            assert_eq!(
+                result.endpoints,
+                vec![expected_endpoint("pod-1", address, "model-a")]
+            );
+            assert_eq!(
+                format!("http://{}", result.endpoints[0].address),
+                format!("http://{address}")
+            );
+            assert_diagnostics(&result, &[]);
+        }
     }
-    for ports in [None, Some(vec![]), {
-        let port = slice("a").ports.unwrap()[0].clone();
-        Some(vec![port.clone(), port])
-    }] {
-        let mut a = slice("a");
-        a.ports = ports;
-        assert_eq!(resolve(&[a]).diagnostics[0].field, "ports");
-    }
-    let mut a = slice("a");
-    a.ports.as_mut().unwrap()[0].protocol = Some("UDP".into());
-    assert_eq!(resolve(&[a]).diagnostics[0].field, "ports");
-}
 
-#[test]
-fn requires_a_same_namespace_pod_uid_but_accepts_implicit_namespace() {
-    for (field, value) in [
-        ("uid", Value::Null),
-        ("uid", json!("")),
-        ("kind", json!("Node")),
-        ("namespace", json!("other")),
-        ("apiVersion", json!("apps/v1")),
-    ] {
-        let mut a = slice("a");
-        let mut target = serde_json::to_value(endpoint("pod-1", "10.0.0.1")).unwrap();
-        target["targetRef"][field] = value;
-        a.endpoints.push(serde_json::from_value(target).unwrap());
-        let result = resolve(&[a]);
+    #[test]
+    fn reports_invalid_or_wrong_family_addresses_without_dropping_valid_targets() {
+        let input = slice(
+            "mixed",
+            8000,
+            vec![
+                endpoint("pod-1", "not-an-ip"),
+                endpoint("pod-2", "::1"),
+                endpoint("pod-3", "10.0.0.3"),
+            ],
+        );
+        let result = resolve(&[input]);
+        assert_eq!(
+            result.endpoints,
+            vec![expected_endpoint("pod-3", "10.0.0.3:8000", "model-a")]
+        );
+        assert_diagnostics(
+            &result,
+            &[
+                ("EndpointSlice inference/mixed", "endpoints[0].addresses[0]"),
+                ("EndpointSlice inference/mixed", "endpoints[1].addresses[0]"),
+            ],
+        );
+    }
+
+    #[test]
+    fn rejects_fqdn_slices() {
+        let mut input = slice("fqdn", 8000, vec![endpoint("pod-1", "example.com")]);
+        input.address_type = "FQDN".into();
+        let result = resolve(&[input]);
         assert!(result.endpoints.is_empty());
-        assert_eq!(result.diagnostics[0].field, "endpoints[0].targetRef");
+        assert_diagnostics(&result, &[("EndpointSlice inference/fqdn", "addressType")]);
     }
-    let mut a = slice("a");
-    let mut target = endpoint("pod-1", "10.0.0.1");
-    let reference = target.target_ref.as_mut().unwrap();
-    reference.namespace = None;
-    reference.api_version = None;
-    a.endpoints.push(target);
-    assert_eq!(resolve(&[a]).endpoints.len(), 1);
-}
-
-#[test]
-fn handles_dual_stack_and_reports_invalid_addresses() {
-    let mut v4 = slice("v4");
-    v4.endpoints.push(endpoint("pod-1", "10.0.0.1"));
-    let mut v6 = slice("v6");
-    v6.address_type = "IPv6".into();
-    v6.endpoints.push(endpoint("pod-1", "2001:db8::1"));
-    let binding = parse_service(&service()).unwrap();
-    let result = resolve_endpoints(&binding, &[v4.clone(), v6.clone()], AddressFamily::Ipv6);
-    assert!(result.diagnostics.is_empty());
-    assert_eq!(result.endpoints.len(), 1);
-    assert_eq!(
-        format!("http://{}", result.endpoints[0].address),
-        "http://[2001:db8::1]:8000"
-    );
-    assert_eq!(resolve(&[v4.clone(), v6]), resolve(&[v4]));
-    let mut invalid = slice("invalid");
-    invalid.endpoints = vec![
-        endpoint("pod-1", "not-an-ip"),
-        endpoint("pod-2", "::1"),
-        endpoint("pod-3", "10.0.0.3"),
-    ];
-    let result = resolve(&[invalid.clone()]);
-    assert_eq!(result.endpoints.len(), 1);
-    assert_eq!(result.diagnostics.len(), 2);
-    invalid.address_type = "FQDN".into();
-    assert_eq!(resolve(&[invalid]).diagnostics[0].field, "addressType");
-}
-
-#[test]
-fn detects_address_reuse_without_losing_pod_identity() {
-    let mut old = slice("old");
-    old.endpoints.push(endpoint("old-pod", "10.0.0.1"));
-    let mut new = slice("new");
-    new.endpoints.push(endpoint("new-pod", "10.0.0.1"));
-    assert_eq!(resolve(&[old.clone()]).endpoints[0].pod_uid, "old-pod");
-    assert_eq!(resolve(&[new.clone()]).endpoints[0].pod_uid, "new-pod");
-    let conflicting = resolve(&[old.clone(), new.clone()]);
-    assert!(conflicting.endpoints.is_empty());
-    assert_eq!(conflicting.diagnostics.len(), 2);
-    assert!(conflicting
-        .diagnostics
-        .iter()
-        .all(|error| error.field == "targetRef.uid"));
-    assert_eq!(conflicting, resolve(&[new, old]));
 }
