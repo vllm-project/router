@@ -162,6 +162,7 @@ def _start_replay(
         text=True,
         bufsize=1,
     )
+    run.replay_proc = proc
     run.replay_stream = stream_process(
         proc, label="replay", log_path=log, log_prefix="router_policy"
     )

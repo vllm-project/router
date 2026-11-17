@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import re
 import statistics
 from contextlib import redirect_stdout
@@ -12,14 +11,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from case_loader import router_policy_result_path
+from case_loader import cell_run_suffix, router_policy_result_path
 from tests.python.e2e.perf.result_metadata import add_missing_metadata
 
 if TYPE_CHECKING:
     from stack_launcher import RouterPolicyStack
 
 METRIC = re.compile(r"^([a-zA-Z0-9_:]+)(\{[^}]*\})?\s+([0-9.eE+-]+)$")
-RUN_SUFFIX_ENV = "AGENTX_RUN_SUFFIX"
 
 
 def print_artifacts(
@@ -57,7 +55,7 @@ def _write_results_summary_from_calibration(out: Path) -> list[tuple[str, Path]]
         stats["router_policy"],
         stats["concurrency"],
         stats["task_num"],
-        os.environ.get(RUN_SUFFIX_ENV, ""),
+        cell_run_suffix(),
     )
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(cal.read_text(encoding="utf-8"), encoding="utf-8")
