@@ -119,25 +119,22 @@ impl VllmFrontend {
     }
 
     /// Encode one plain-text `/v1/completions` prompt through the same
-    /// `PromptEncoder` chat uses (L0 exact match, then L1 prefix reuse),
-    /// so the L0/L1 switches and `cached_tokens` apply to completion text
-    /// exactly as they do to chat. No chat template is applied.
+    /// `PromptEncoder` chat uses. L0 always applies; L1 prefix reuse is
+    /// skipped when `add_special_tokens` is true, so with the completion
+    /// default only L0 applies. No chat template is applied.
     /// Returns IDs, cached token count, and encode ms.
     pub fn text_tokenize_timed(
         &self,
         text: &str,
         add_special_tokens: bool,
         cache_salt: Option<&str>,
-    ) -> vllm_chat::Result<(Arc<[u32]>, usize, f64)> {
+    ) -> vllm_tokenizer::Result<(Arc<[u32]>, usize, f64)> {
         let t0 = Instant::now();
-        let encoded = self
-            .encoder
-            .encode_detailed(
-                Prompt::Text(text.to_string()),
-                add_special_tokens,
-                cache_salt,
-            )
-            .map_err(|error| vllm_chat::Error::ChatTemplate(error.to_string()))?;
+        let encoded = self.encoder.encode_detailed(
+            Prompt::Text(text.to_string()),
+            add_special_tokens,
+            cache_salt,
+        )?;
         let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
         Ok((encoded.ids, encoded.cached_tokens, encode_ms))
     }

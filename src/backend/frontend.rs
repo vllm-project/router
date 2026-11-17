@@ -200,9 +200,9 @@ impl EngineFrontend {
     /// Wire adapter path for `/v1/completions` on the gRPC pool.
     ///
     /// Accepts every prompt form. Text is tokenized once here (outside policy
-    /// and retry) through the same `PromptEncoder` chat uses, so the L0/L1
-    /// encoding caches apply; client ids pass through untouched. One
-    /// `PreparedRequest` comes back per prompt sequence, in client order —
+    /// and retry) through the same `PromptEncoder` chat uses, so L0 applies
+    /// (L1 prefix reuse only when `add_special_tokens` is false); client ids
+    /// pass through untouched. One `PreparedRequest` comes back per prompt sequence, in client order —
     /// that is the fan-out unit Stage 3 will dispatch. The HTTP route serves
     /// exactly one sequence and rejects a batch with 400 before any
     /// tokenization happens; fanning out batched prompts is Stage 3.

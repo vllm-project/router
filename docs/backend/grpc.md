@@ -35,8 +35,9 @@ listed under [Capability Boundaries](#capability-boundaries).
 A gRPC pool also serves `/v1/completions` with single prompts:
 `prompt: [int]` skips the chat template (step 2 above) and the client's ids go
 straight to the worker, and `prompt: "text"` is tokenized once through the
-same encoding cache chat uses (`add_special_tokens` defaults to `true`; chat
-defaults to `false`). Batched prompts (`list[str]`, `list[list[int]]` with
+same encoding cache chat uses — L0 always applies, while L1 prefix reuse
+applies only when `add_special_tokens` is false (`add_special_tokens` defaults
+to `true`; chat defaults to `false`). Batched prompts (`list[str]`, `list[list[int]]` with
 more than one entry) are rejected with 400 before any tokenization: lowering
 produces one prepared request per prompt sequence, and dispatching more than
 one is Stage 3's fan-out.

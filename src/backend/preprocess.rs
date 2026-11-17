@@ -761,8 +761,9 @@ pub fn tokenize_chat_request_for_count_timed(
 }
 
 /// Tokenize one `/v1/completions` text prompt through the same `PromptEncoder`
-/// chat uses, so the L0/L1 encoding caches apply and `cached_tokens` is
-/// populated instead of staying 0. No chat template is applied.
+/// chat uses. L0 always applies and `cached_tokens` is populated instead of
+/// staying 0; L1 prefix reuse applies only when `add_special_tokens` is false.
+/// No chat template is applied.
 ///
 /// Test pins return their ids unchanged, exactly like chat prompts do, so the
 /// completion tests do not need model assets.
