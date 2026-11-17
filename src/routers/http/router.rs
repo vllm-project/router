@@ -1,5 +1,5 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
-use super::kv_observation::{observe_json_response, observe_unavailable};
+use super::kv_observation::{observe_json_response, observe_json_stream, observe_unavailable};
 use super::program_adapter::ProgramCompletion;
 use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
 use crate::backend::{
@@ -3368,11 +3368,9 @@ impl RouterTrait for Router {
                     }
                 }
 
-                // Use the existing complete JSON path for either Program tracking or
-                // KV observation. Both now have identical buffering and observation caps.
-                if Self::should_proxy_transparent_directly(
-                    program_completion.is_some() || kv_attempt.is_some(),
-                ) {
+                // Only Program completion needs a full JSON buffer. Ordinary KV
+                // observation stays on the forwarding stream with a bounded copy.
+                if Self::should_proxy_transparent_directly(program_completion.is_some()) {
                     let stream: Pin<
                         Box<
                             dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>
@@ -3385,11 +3383,7 @@ impl RouterTrait for Router {
                             status,
                         )
                     } else {
-                        Box::pin(
-                            response
-                                .bytes_stream()
-                                .map(|chunk| chunk.map_err(std::io::Error::other)),
-                        )
+                        observe_json_stream(response.bytes_stream(), kv_attempt.clone(), status)
                     };
                     response_builder
                         .body(Body::from_stream(stream))
@@ -3402,7 +3396,7 @@ impl RouterTrait for Router {
                         })
                 } else if Self::should_buffer_transparent_response(
                     is_stream,
-                    program_completion.is_some() || kv_attempt.is_some(),
+                    program_completion.is_some(),
                 ) {
                     match response.bytes().await {
                         Ok(bytes) => {
@@ -3458,11 +3452,7 @@ impl RouterTrait for Router {
                             status,
                         )
                     } else {
-                        Box::pin(
-                            response
-                                .bytes_stream()
-                                .map(|chunk| chunk.map_err(std::io::Error::other)),
-                        )
+                        observe_json_stream(response.bytes_stream(), kv_attempt.clone(), status)
                     };
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let completion = status.is_success().then_some(program_completion).flatten();
@@ -4872,6 +4862,7 @@ mod tests {
         calls: Arc<Mutex<Vec<(usize, String, serde_json::Value)>>>,
         loads: Arc<Mutex<Vec<(usize, crate::policies::LoadSample)>>>,
         fail_first: Arc<AtomicBool>,
+        hold_json_open: Arc<AtomicBool>,
     }
 
     impl Drop for HttpKvFixture {
@@ -4897,17 +4888,20 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let loads = Arc::new(Mutex::new(Vec::new()));
         let fail_first = Arc::new(AtomicBool::new(false));
+        let hold_json_open = Arc::new(AtomicBool::new(false));
         let mut servers = Vec::new();
         let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
         for (worker_index, prompts) in inputs.iter().cloned().enumerate() {
             let captured = calls.clone();
             let dispatch_loads = loads.clone();
             let fail_first = fail_first.clone();
+            let hold_json_open = hold_json_open.clone();
             let policy = router.policy_registry.get_default_policy();
             let app = axum::Router::new().fallback(post(move |OriginalUri(uri): OriginalUri, Json(body): Json<serde_json::Value>| {
                 let prompts = prompts.clone(); let captured = captured.clone();
                 let (dispatch_loads, policy) = (dispatch_loads.clone(), policy.clone());
                 let fail_first = fail_first.clone();
+                let hold_json_open = hold_json_open.clone();
                 async move {
                     let path = uri.path().to_string();
                     let streaming = body.get("stream").and_then(serde_json::Value::as_bool).unwrap_or(false)
@@ -4933,6 +4927,11 @@ mod tests {
                     let response = serde_json::json!({"worker": worker_index, "choices": [], "usage": {"prompt_tokens_details": {"cached_tokens": 4}}});
                     if streaming {
                         return ([("content-type", "text/event-stream")], format!("data: {response}\n\ndata: [DONE]\n\n")).into_response();
+                    }
+                    if hold_json_open.load(Ordering::SeqCst) {
+                        let source = futures_util::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from(serde_json::to_vec(&response).unwrap()))])
+                            .chain(futures_util::stream::pending());
+                        return ([("content-type", "application/json")], Body::from_stream(source)).into_response();
                     }
                     Json(response).into_response()
                 }
@@ -4990,6 +4989,7 @@ mod tests {
             calls,
             loads,
             fail_first,
+            hold_json_open,
         }
     }
 
@@ -5441,6 +5441,50 @@ mod tests {
                 assert!(!metrics.contains("vllm_router_kv_cached_token_absolute_error"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn transparent_kv_json_forwards_without_waiting_for_backend_eof() {
+        use crate::kv_observation::test_helpers::has_outcome;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let ids = vec![1, 2, 3, 4, 5, 6];
+        let fixture = http_kv_fixture([vec![ids.clone()], vec![ids.clone()]], 0, true).await;
+        fixture.hold_json_open.store(true, Ordering::SeqCst);
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            fixture.router.route_transparent(
+                None,
+                "/v1/completions",
+                &Method::POST,
+                serde_json::json!({"prompt": ids}),
+            ),
+        )
+        .await
+        .expect("response headers must not wait for the complete backend body");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let bytes = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .expect("forward the first JSON chunk before backend EOF")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["usage"]
+                ["prompt_tokens_details"]["cached_tokens"],
+            4
+        );
+        assert!(!handle
+            .render()
+            .contains("vllm_router_kv_actual_cached_tokens_count"));
+        drop(body);
+        let metrics = handle.render();
+        assert!(
+            has_outcome(&metrics, "unavailable", "attempt_cancelled"),
+            "{metrics}"
+        );
+        assert!(!metrics.contains("vllm_router_kv_actual_cached_tokens_count"));
     }
 
     #[tokio::test]

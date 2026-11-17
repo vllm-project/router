@@ -373,11 +373,7 @@ fn finalize_decode_stream(
         if status.is_success() && usage_stream::is_supported_path(path) && is_sse && !is_encoded {
             let cached = prefill_response_json.and_then(usage_merge::cached_tokens);
             let observer = match (observation, cached) {
-                (Some(attempt), Some(count)) => Some(SseUsageObservation::new(
-                    attempt.clone(),
-                    status,
-                    Some(count),
-                )),
+                (Some(attempt), Some(_)) => Some(SseUsageObservation::new(attempt.clone(), status)),
                 (Some(attempt), None) => {
                     observe_unavailable(attempt, status, UnavailableReason::MissingUsage);
                     None
@@ -462,8 +458,8 @@ fn finalize_decode_body(
             Ok(rewritten) => {
                 changed |= rewritten;
                 if let Some(attempt) = observation {
-                    if let Some(count) = cached {
-                        observe_merged_json(attempt, &json, count);
+                    if cached.is_some() {
+                        observe_merged_json(attempt, &json);
                     } else {
                         observe_unavailable(attempt, status, UnavailableReason::MissingUsage);
                     }

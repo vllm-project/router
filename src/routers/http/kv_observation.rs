@@ -1,8 +1,12 @@
 //! HTTP adapters for the shared attempt accounting kernel.
 use super::usage_merge;
 use crate::kv_observation::{CacheObservation, KvRouteAttempt, UnavailableReason, MAX_USAGE_BYTES};
+use bytes::Bytes;
+use futures_util::{stream, Stream, StreamExt};
 use http::StatusCode;
 use serde_json::Value;
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
 
 fn http_failure(status: StatusCode) -> Option<UnavailableReason> {
@@ -16,7 +20,7 @@ fn http_failure(status: StatusCode) -> Option<UnavailableReason> {
 }
 
 /// All colocated JSON forwarding paths use this same observation budget.
-/// The existing non-streaming body buffer still returns every response byte.
+/// Program-tracked responses already buffer their body for completion accounting.
 pub(super) fn observe_json_response(attempt: &KvRouteAttempt, status: StatusCode, body: &[u8]) {
     let observation = if let Some(reason) = http_failure(status) {
         CacheObservation::Unavailable(reason)
@@ -35,25 +39,101 @@ pub(super) fn observe_json_response(attempt: &KvRouteAttempt, status: StatusCode
     attempt.record_once(observation);
 }
 
-pub(super) fn observe_merged_json(attempt: &KvRouteAttempt, merged: &Value, prefill: u64) {
+/// Forward each JSON fragment immediately, retaining only the observation budget.
+pub(super) fn observe_json_stream<S, E>(
+    source: S,
+    attempt: Option<Arc<KvRouteAttempt>>,
+    status: StatusCode,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let Some(attempt) = attempt else {
+        return Box::pin(source.map(|item| item.map_err(io::Error::other)));
+    };
+    let observation = JsonUsageObservation {
+        attempt,
+        status,
+        buffer: Some(Vec::new()),
+    };
+    Box::pin(stream::unfold(
+        (Box::pin(source), observation),
+        |(mut source, mut observation)| async move {
+            match source.next().await {
+                Some(Ok(bytes)) => {
+                    observation.push(&bytes);
+                    Some((Ok(bytes), (source, observation)))
+                }
+                Some(Err(error)) => {
+                    observe_unavailable(
+                        &observation.attempt,
+                        observation.status,
+                        UnavailableReason::ResponseError,
+                    );
+                    Some((Err(io::Error::other(error)), (source, observation)))
+                }
+                None => {
+                    if let Some(buffer) = &observation.buffer {
+                        observe_json_response(&observation.attempt, observation.status, buffer);
+                    } else {
+                        observe_unavailable(
+                            &observation.attempt,
+                            observation.status,
+                            UnavailableReason::OversizedJson,
+                        );
+                    }
+                    None
+                }
+            }
+        },
+    ))
+}
+
+struct JsonUsageObservation {
+    attempt: Arc<KvRouteAttempt>,
+    status: StatusCode,
+    // None means the response exceeded the observation budget.
+    buffer: Option<Vec<u8>>,
+}
+
+impl JsonUsageObservation {
+    fn push(&mut self, bytes: &[u8]) {
+        let Some(buffer) = &mut self.buffer else {
+            return;
+        };
+        if bytes.len() > MAX_USAGE_BYTES - buffer.len() {
+            self.buffer = None;
+            return;
+        }
+        let needed = buffer.len() + bytes.len();
+        if needed > buffer.capacity() {
+            let capacity = needed
+                .max(buffer.capacity().saturating_mul(2))
+                .min(MAX_USAGE_BYTES);
+            buffer.reserve_exact(capacity - buffer.len());
+        }
+        buffer.extend_from_slice(bytes);
+    }
+}
+
+impl Drop for JsonUsageObservation {
+    fn drop(&mut self) {
+        observe_unavailable(
+            &self.attempt,
+            self.status,
+            UnavailableReason::AttemptCancelled,
+        );
+    }
+}
+
+pub(super) fn observe_merged_json(attempt: &KvRouteAttempt, merged: &Value) {
     let observation = usage_merge::cached_tokens(merged)
         .map(CacheObservation::Observed)
         .unwrap_or(CacheObservation::Unavailable(
             UnavailableReason::MissingUsage,
         ));
-    attempt.record_once(check_merged_usage(observation, Some(prefill)));
-}
-
-fn check_merged_usage(observation: CacheObservation, expected: Option<u64>) -> CacheObservation {
-    // Reconciliation can leave a frame unchanged (for example an incompatible
-    // usage dialect). Its count is then the original Decode value, not the
-    // selected Prefill's reuse. Do not count that passthrough as a prediction error.
-    match (observation, expected) {
-        (CacheObservation::Observed(actual), Some(prefill)) if actual != prefill => {
-            CacheObservation::Unavailable(UnavailableReason::PdUsageNotComparable)
-        }
-        _ => observation,
-    }
+    attempt.record_once(observation);
 }
 
 pub(super) fn observe_unavailable(
@@ -72,7 +152,6 @@ pub(super) fn observe_unavailable(
 /// Receives parsed values from the one HTTP SSE framer. Only KvRouteAttempt's
 /// atomic finalization flag owns completion; parsing state is not a second receipt.
 pub(super) struct SseUsageObservation {
-    merged_prefill: Option<u64>,
     attempt: Arc<KvRouteAttempt>,
     status: StatusCode,
     observed_cached_tokens: Option<u64>,
@@ -81,13 +160,8 @@ pub(super) struct SseUsageObservation {
 }
 
 impl SseUsageObservation {
-    pub(super) fn new(
-        attempt: Arc<KvRouteAttempt>,
-        status: StatusCode,
-        merged_prefill: Option<u64>,
-    ) -> Self {
+    pub(super) fn new(attempt: Arc<KvRouteAttempt>, status: StatusCode) -> Self {
         Self {
-            merged_prefill,
             attempt,
             status,
             observed_cached_tokens: None,
@@ -137,15 +211,14 @@ impl SseUsageObservation {
             CacheObservation::Unavailable(reason)
         } else if self.incomplete {
             CacheObservation::Unavailable(UnavailableReason::IncompleteSseFrame)
-        } else if let Some(tokens) = self.observed_cached_tokens {
-            CacheObservation::Observed(tokens)
         } else if !succeeded {
             CacheObservation::Unavailable(UnavailableReason::StreamError)
+        } else if let Some(tokens) = self.observed_cached_tokens {
+            CacheObservation::Observed(tokens)
         } else {
             CacheObservation::Unavailable(UnavailableReason::MissingUsage)
         };
-        self.attempt
-            .record_once(check_merged_usage(observation, self.merged_prefill));
+        self.attempt.record_once(observation);
     }
 }
 impl Drop for SseUsageObservation {
@@ -226,27 +299,124 @@ mod tests {
             );
         }
     }
-
     #[test]
-    fn passthrough_pd_count_must_still_belong_to_prefill() {
-        for (actual, reason) in [(32, "none"), (16, "pd_usage_not_comparable")] {
+    fn json_stream_forwards_before_eof_and_rejects_failure_or_cancellation() {
+        use futures_util::FutureExt;
+        let body =
+            Bytes::from_static(br#"{"usage":{"prompt_tokens_details":{"cached_tokens":32}}}"#);
+        for (ending, reason) in [
+            ("eof", "none"),
+            ("error", "response_error"),
+            ("drop", "attempt_cancelled"),
+        ] {
             let metrics = render(|| {
-                observe_merged_json(
-                    &KvRouteAttempt::new(prediction()),
-                    &serde_json::json!({"usage":{"prompt_tokens_details":{"cached_tokens":actual}}}),
-                    32,
-                )
+                let source = stream::iter([Ok::<_, io::Error>(body.clone())]);
+                let source: Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>> =
+                    match ending {
+                        "error" => Box::pin(
+                            source.chain(stream::iter([Err(io::Error::other("backend failed"))])),
+                        ),
+                        "drop" => Box::pin(source.chain(stream::pending())),
+                        _ => Box::pin(source),
+                    };
+                let attempt = KvRouteAttempt::new(prediction());
+                let mut output = observe_json_stream(source, Some(attempt.clone()), StatusCode::OK);
+                assert_eq!(
+                    output.next().now_or_never().unwrap().unwrap().unwrap(),
+                    body
+                );
+                assert!(
+                    !attempt.is_finished(),
+                    "a complete usage object is provisional until EOF"
+                );
+                match ending {
+                    "error" => assert!(output.next().now_or_never().unwrap().unwrap().is_err()),
+                    "drop" => assert!(output.next().now_or_never().is_none()),
+                    _ => assert!(output.next().now_or_never().unwrap().is_none()),
+                }
+                drop(output);
+                assert!(attempt.is_finished());
             });
             assert!(
                 has_outcome(
                     &metrics,
-                    if actual == 32 {
+                    if reason == "none" {
                         "observed"
                     } else {
                         "unavailable"
                     },
                     reason
                 ),
+                "{ending}: {metrics}"
+            );
+            assert_eq!(
+                metrics.contains("vllm_router_kv_actual_cached_tokens_count 1"),
+                reason == "none",
+                "{metrics}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_stream_budget_bounds_allocation_and_preserves_oversized_bodies() {
+        use futures_util::FutureExt;
+        for size in [MAX_USAGE_BYTES - 1, MAX_USAGE_BYTES, MAX_USAGE_BYTES + 1] {
+            let mut body = br#"{"usage":{"prompt_tokens_details":{"cached_tokens":32}}}"#.to_vec();
+            body.resize(size, b' ');
+            let mut observation = JsonUsageObservation {
+                attempt: KvRouteAttempt::new(prediction()),
+                status: StatusCode::OK,
+                buffer: Some(Vec::new()),
+            };
+            for chunk in body.chunks(17_000) {
+                observation.push(chunk);
+                assert!(observation
+                    .buffer
+                    .as_ref()
+                    .is_none_or(|buffer| buffer.capacity() <= MAX_USAGE_BYTES));
+            }
+            assert_eq!(observation.buffer.is_some(), size <= MAX_USAGE_BYTES);
+            drop(observation);
+            let metrics = render(|| {
+                let source = stream::iter(
+                    body.chunks(17_000)
+                        .map(Bytes::copy_from_slice)
+                        .map(Ok::<_, io::Error>)
+                        .collect::<Vec<_>>(),
+                );
+                let output = observe_json_stream(
+                    source,
+                    Some(KvRouteAttempt::new(prediction())),
+                    StatusCode::OK,
+                );
+                let received = output
+                    .collect::<Vec<_>>()
+                    .now_or_never()
+                    .unwrap()
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(received.concat(), body);
+            });
+            assert!(
+                has_outcome(
+                    &metrics,
+                    if size <= MAX_USAGE_BYTES {
+                        "observed"
+                    } else {
+                        "unavailable"
+                    },
+                    if size <= MAX_USAGE_BYTES {
+                        "none"
+                    } else {
+                        "oversized_json"
+                    }
+                ),
+                "size={size}: {metrics}"
+            );
+            assert_eq!(
+                metrics.contains("vllm_router_kv_actual_cached_tokens_count 1"),
+                size <= MAX_USAGE_BYTES,
                 "{metrics}"
             );
         }

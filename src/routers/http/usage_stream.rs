@@ -81,7 +81,7 @@ pub(super) fn reconcile_usage(
 fn rewrite_frame(
     frame: &[u8],
     mode: &UsageMode,
-    observation: Option<&mut SseUsageObservation>,
+    mut observation: Option<&mut SseUsageObservation>,
     limit: usize,
 ) -> Option<Bytes> {
     if !frame.contains(&b'\\')
@@ -123,7 +123,12 @@ fn rewrite_frame(
         .is_some_and(|value| usage_merge::merge_pd_usage(value, &mut json));
     match reconcile_usage(&mut json, *cached, prefill.as_ref()) {
         Ok(rewritten) => changed |= rewritten,
-        Err(reason) => tracing::warn!("Cannot rewrite PD SSE usage: {}", reason),
+        Err(reason) => {
+            if let Some(obs) = observation.as_deref_mut() {
+                obs.reject(UnavailableReason::PdUsageNotComparable);
+            }
+            tracing::warn!("Cannot rewrite PD SSE usage: {}", reason);
+        }
     }
     if !changed {
         if let Some(obs) = observation {
@@ -225,7 +230,7 @@ where
             source,
             UsageMode::Keep,
             MAX_USAGE_BYTES,
-            Some(SseUsageObservation::new(attempt, status, None)),
+            Some(SseUsageObservation::new(attempt, status)),
         )),
         None => Box::pin(source.map(|item| item.map_err(io::Error::other))),
     }
@@ -1022,6 +1027,12 @@ mod tests {
         for (input, cached, limit, reason) in [
             ("data: {\"usage\":invalid}\n\n", 32, 256, "malformed_usage"),
             (
+                "data: {\"usage\":{\"input_tokens\":64,\"input_tokens_details\":[],\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n\n",
+                32,
+                256,
+                "pd_usage_not_comparable",
+            ),
+            (
                 "data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n\n",
                 32,
                 0,
@@ -1036,11 +1047,8 @@ mod tests {
         ] {
             let limit = if limit == 0 { input.len() } else { limit };
             let metrics = render(|| {
-                let mut obs = SseUsageObservation::new(
-                    KvRouteAttempt::new(prediction()),
-                    StatusCode::OK,
-                    Some(cached),
-                );
+                let mut obs =
+                    SseUsageObservation::new(KvRouteAttempt::new(prediction()), StatusCode::OK);
                 let output = rewrite_frame(
                     input.as_bytes(),
                     &UsageMode::Reconcile {
@@ -1067,6 +1075,61 @@ mod tests {
                     },
                     reason
                 ),
+                "{metrics}"
+            );
+        }
+    }
+
+    #[test]
+    fn reconciled_usage_is_provisional_until_clean_eof() {
+        use crate::kv_observation::test_helpers::*;
+        use futures_util::FutureExt;
+        let input = Bytes::from_static(
+            b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n\n",
+        );
+        for ending in ["eof", "error", "drop"] {
+            let metrics = render(|| {
+                let source = stream::iter([Ok::<_, io::Error>(input.clone())]);
+                let source: Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>> =
+                    match ending {
+                        "error" => Box::pin(
+                            source.chain(stream::iter([Err(io::Error::other("backend failed"))])),
+                        ),
+                        "drop" => Box::pin(source.chain(stream::pending())),
+                        _ => Box::pin(source),
+                    };
+                let attempt = KvRouteAttempt::new(prediction());
+                let mut output = Box::pin(rewrite_sse_stream(
+                    source,
+                    Some(32),
+                    None,
+                    Some(SseUsageObservation::new(attempt.clone(), StatusCode::OK)),
+                ));
+                let first = output.next().now_or_never().unwrap().unwrap().unwrap();
+                assert!(std::str::from_utf8(&first)
+                    .unwrap()
+                    .contains("\"cached_tokens\":32"));
+                assert!(!attempt.is_finished());
+                match ending {
+                    "error" => assert!(output.next().now_or_never().unwrap().unwrap().is_err()),
+                    "drop" => assert!(output.next().now_or_never().is_none()),
+                    _ => assert!(output.next().now_or_never().unwrap().is_none()),
+                }
+                drop(output);
+                assert!(attempt.is_finished());
+            });
+            let success = ending == "eof";
+            assert!(
+                has_outcome(
+                    &metrics,
+                    if success { "observed" } else { "unavailable" },
+                    if success { "none" } else { "stream_error" }
+                ),
+                "{ending}: {metrics}"
+            );
+            assert_eq!(
+                metrics.contains("vllm_router_kv_actual_cached_tokens_count 1"),
+                success,
                 "{metrics}"
             );
         }
@@ -1129,7 +1192,6 @@ mod tests {
                             Some(SseUsageObservation::new(
                                 KvRouteAttempt::new(prediction()),
                                 StatusCode::OK,
-                                None,
                             )),
                         ));
                         let mut received = Vec::new();
@@ -1153,6 +1215,11 @@ mod tests {
                         assert_eq!(received, input, "{ending}/{reason}");
                         drop(output);
                     });
+                let reason = if reason == "none" && ending != "eof" {
+                    "stream_error"
+                } else {
+                    reason
+                };
                 assert!(
                     has_outcome(
                         &metrics,
