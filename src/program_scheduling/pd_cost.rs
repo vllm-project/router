@@ -228,6 +228,7 @@ pub fn bounded_pd_duration(seconds: f64) -> Duration {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::config::types::PdProgramSchedulingConfig;
