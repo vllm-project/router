@@ -52,7 +52,7 @@ trap 'rm -f -- "${report_tmp}"' EXIT
 cargo llvm-cov report --target "${host_target}" \
   --ignore-filename-regex '(^|/)(tests|benches)/' --lcov \
   --output-path "${report_tmp}"
-# mktemp creates a root-owned 0600 file in CI; the host agent needs read access.
+# Allow the host agent to read the report before publishing the final artifact.
 chmod 0644 -- "${report_tmp}"
 mv -- "${report_tmp}" "${report_dir}/lcov.info"
 
