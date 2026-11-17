@@ -2,8 +2,9 @@
 
 use super::pd_types::PdPrefillInput;
 use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs};
+use crate::core::worker::worker_get;
 use crate::core::Worker;
-use crate::kv_index::discovery::{worker_get, WorkerDiscovery};
+use crate::kv_index::discovery::WorkerDiscovery;
 use crate::kv_index::{HashMode, KvIndexSupervisor, WorkerKvInfo};
 use crate::policies::{kv_aware_ops, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy};
 use axum::http::HeaderMap;
