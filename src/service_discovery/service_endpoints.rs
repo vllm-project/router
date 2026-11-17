@@ -148,8 +148,11 @@ pub fn parse_service(service: &Service) -> Result<ServiceBinding, DiscoveryError
     })
 }
 
-/// Recompute from the full snapshot, not a single watch event. Errors exclude only
-/// the affected Slice/endpoint; duplicate readiness conflicts exclude that target.
+/// Resolve endpoints from the complete current EndpointSlice set for a Service.
+/// Do not pass only the Slice changed by a watch event.
+///
+/// Report invalid resources and conflicting targets in diagnostics,
+/// excluding them from the result while retaining unrelated valid endpoints.
 pub fn resolve_endpoints(
     service: &ServiceBinding,
     slices: &[EndpointSlice],
