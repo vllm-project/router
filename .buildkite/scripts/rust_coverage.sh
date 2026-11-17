@@ -14,6 +14,10 @@ fi
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
+# Never leave a previous run's report at the artifact path if setup fails.
+report_dir="target/coverage/rust-$1"
+rm -f -- "${report_dir}/lcov.info"
+
 # coverage(off) is unstable. Pin nightly only for coverage; ordinary CI stays stable.
 coverage_toolchain="nightly-2026-04-15"
 rustup toolchain install "${coverage_toolchain}" --profile minimal --no-self-update \
@@ -29,7 +33,6 @@ curl --fail --silent --show-error --location --connect-timeout 15 --retry 3 \
 export PATH="${cargo_bin}:${PATH}"
 cargo llvm-cov --version
 
-report_dir="target/coverage/rust-$1"
 mkdir -p "${report_dir}"
 
 # Remove stale workspace binaries as well as profiles, including other toolchains
@@ -44,8 +47,11 @@ cargo llvm-cov --locked --features cpu,ready --no-report \
   --no-fail-fast "${targets[@]}" || test_status=$?
 
 # Measure production Rust code rather than test and benchmark harnesses.
+report_tmp="$(mktemp "${report_dir}/.lcov.info.XXXXXX")"
+trap 'rm -f -- "${report_tmp}"' EXIT
 cargo llvm-cov report --target "${host_target}" \
   --ignore-filename-regex '(^|/)(tests|benches)/' --lcov \
-  --output-path "${report_dir}/lcov.info"
+  --output-path "${report_tmp}"
+mv -- "${report_tmp}" "${report_dir}/lcov.info"
 
 exit "${test_status}"
