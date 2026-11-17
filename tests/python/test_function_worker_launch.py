@@ -10,14 +10,21 @@ from tests.python.e2e.function.helpers import launch
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize("hip_mask", [None, "", "0,1"])
+@pytest.mark.parametrize(
+    "hip_mask,rocr_mask",
+    [(None, None), ("", ""), ("0,1", "0,1"), (None, "4,5"), ("4,5", None)],
+)
 @pytest.mark.parametrize("gpu_id", [0, 1])
-def test_worker_gpu_masks(monkeypatch, hip_mask, gpu_id):
+def test_worker_gpu_masks(monkeypatch, hip_mask, rocr_mask, gpu_id):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     if hip_mask is None:
         monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
     else:
         monkeypatch.setenv("HIP_VISIBLE_DEVICES", hip_mask)
+    if rocr_mask is None:
+        monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("ROCR_VISIBLE_DEVICES", rocr_mask)
     parent_env = os.environ.copy()
 
     monkeypatch.setattr(
@@ -37,4 +44,8 @@ def test_worker_gpu_masks(monkeypatch, hip_mask, gpu_id):
         assert "HIP_VISIBLE_DEVICES" not in child_env
     else:
         assert child_env["HIP_VISIBLE_DEVICES"] == str(gpu_id)
+    if rocr_mask is None:
+        assert "ROCR_VISIBLE_DEVICES" not in child_env
+    else:
+        assert child_env["ROCR_VISIBLE_DEVICES"] == str(gpu_id)
     assert dict(os.environ) == parent_env

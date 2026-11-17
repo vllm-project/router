@@ -211,8 +211,10 @@ The 450-minute job timeout covers 360 minutes of host lease acquisition plus
 90 minutes of setup/execution headroom. The host `pre-command` hook invokes
 `vllm-router-rocm-hold-cluster-lease` after the agent accepts the job; this is
 inside Buildkite's step timer, not a wait before dispatch. Existing lanes have
-hit this mismatch: [build 1225](https://buildkite.com/vllm/router/builds/1225)
-timed out in the hook before the test command started. #508 aligns those lanes.
+timed out in the hook before the test command started. #508 aligns those lanes
+with the same 360-minute lease budget. Each attempt may hold its agent step for
+up to 7.5 hours: at most six hours waiting for the lease and 90 minutes after
+acquisition. A manual retry starts another independently bounded attempt.
 Artifact installation and Python dependency installation each have a ten-minute
 bound; pytest has a separate 30-minute bound. On forced termination, container
 teardown remains the final cleanup boundary for workers.
