@@ -78,32 +78,99 @@ class DocsOnlyPRTests(unittest.TestCase):
         self.write("mkdocs.yml", "site_name: router\n")
         (self.root / "README.md").unlink()
         self.commit()
-        self.assertTrue(skip_docs.docs_only_pr(self.env))
+        self.assertTrue(skip_docs.docs_only_change(self.env))
 
     def test_mixed_change(self):
         self.write("README.md", "updated\n")
         self.write("src/main.rs", 'fn main() { println!("hi"); }\n')
         self.commit()
-        self.assertFalse(skip_docs.docs_only_pr(self.env))
+        self.assertFalse(skip_docs.docs_only_change(self.env))
 
     def test_code_renamed_into_docs(self):
         self.git("mv", "src/main.rs", "example.md")
         self.commit()
-        self.assertFalse(skip_docs.docs_only_pr(self.env))
+        self.assertFalse(skip_docs.docs_only_change(self.env))
 
     def test_empty_diff(self):
-        self.assertFalse(skip_docs.docs_only_pr(self.env))
+        self.assertFalse(skip_docs.docs_only_change(self.env))
 
     def test_push_and_nightly(self):
         self.write("README.md", "updated\n")
         self.commit()
         for overrides in ({"BUILDKITE_PULL_REQUEST": "false"}, {"NIGHTLY": "1"}):
             with self.subTest(overrides=overrides):
-                self.assertFalse(skip_docs.docs_only_pr({**self.env, **overrides}))
+                self.assertFalse(skip_docs.docs_only_change({**self.env, **overrides}))
 
     def test_unknown_base(self):
         self.env["BUILDKITE_PULL_REQUEST_BASE_BRANCH"] = "missing"
-        self.assertFalse(skip_docs.docs_only_pr(self.env))
+        self.assertFalse(skip_docs.docs_only_change(self.env))
+
+    def main_env(self, **overrides):
+        return {
+            "BUILDKITE_PULL_REQUEST": "false",
+            "BUILDKITE_BRANCH": "main",
+            "BUILDKITE_PIPELINE_DEFAULT_BRANCH": "main",
+            **overrides,
+        }
+
+    def test_main_squash_docs(self):
+        self.git("checkout", "main")
+        self.write("README.md", "squashed documentation\n")
+        self.commit()
+        self.assertTrue(skip_docs.docs_only_change(self.main_env()))
+
+    def test_main_merge_includes_all_pr_commits(self):
+        self.write("src/main.rs", "// code change in earlier commit\n")
+        self.commit()
+        self.write("README.md", "final docs commit\n")
+        self.commit()
+        self.git("checkout", "main")
+        self.git("merge", "--no-ff", "feature", "-m", "Merge PR")
+        self.assertFalse(skip_docs.docs_only_change(self.main_env()))
+
+    def test_main_docs_merge(self):
+        self.write("README.md", "documentation\n")
+        self.commit()
+        self.git("checkout", "main")
+        self.git("merge", "--no-ff", "feature", "-m", "Merge PR")
+        self.assertTrue(skip_docs.docs_only_change(self.main_env()))
+
+    def test_merge_queue_docs_and_code(self):
+        base = self.git("rev-parse", "HEAD").decode().strip()
+        env = {
+            "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
+            "BUILDKITE_MERGE_QUEUE_BASE_COMMIT": base,
+        }
+        self.write("README.md", "documentation\n")
+        self.commit()
+        self.assertTrue(skip_docs.docs_only_change(env))
+        self.write("src/main.rs", "// queue contains code too\n")
+        self.commit()
+        self.assertFalse(skip_docs.docs_only_change(env))
+
+    def test_merge_queue_missing_base_runs(self):
+        self.write("README.md", "documentation\n")
+        self.commit()
+        self.assertFalse(
+            skip_docs.docs_only_change({"BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main"})
+        )
+
+    def test_nightly_and_schedule_on_main_run(self):
+        self.git("checkout", "main")
+        self.write("README.md", "documentation\n")
+        self.commit()
+        for overrides in ({"NIGHTLY": "1"}, {"BUILDKITE_SOURCE": "schedule"}):
+            with self.subTest(overrides=overrides):
+                self.assertFalse(skip_docs.docs_only_change(self.main_env(**overrides)))
+
+    def test_merge_test_docs_pr_skips(self):
+        self.write("README.md", "documentation\n")
+        self.commit()
+        self.assertTrue(
+            skip_docs.docs_only_change(
+                {**self.env, "BUILDKITE_PULL_REQUEST_LABELS": "merge-test"}
+            )
+        )
 
     def test_merge_base_excludes_target_only_changes(self):
         self.git("checkout", "main")
@@ -112,12 +179,12 @@ class DocsOnlyPRTests(unittest.TestCase):
         self.git("checkout", "feature")
         self.write("README.md", "updated\n")
         self.commit()
-        self.assertTrue(skip_docs.docs_only_pr(self.env))
+        self.assertTrue(skip_docs.docs_only_change(self.env))
 
     def test_upload_only_when_needed(self):
         for docs_only in (True, False):
             with self.subTest(docs_only=docs_only), patch.object(
-                skip_docs, "docs_only_pr", return_value=docs_only
+                skip_docs, "docs_only_change", return_value=docs_only
             ), patch.object(skip_docs.subprocess, "run") as upload:
                 skip_docs.main()
                 self.assertEqual(upload.call_count, int(not docs_only))

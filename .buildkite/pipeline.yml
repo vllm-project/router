@@ -1,6 +1,6 @@
-# Resolve docs-only PRs before scheduling builds or tests.
+# Resolve docs-only changes before scheduling builds or tests.
 steps:
-  - label: ":pipeline: Check docs-only PR and upload CI"
+  - label: ":pipeline: Check docs-only changes and upload CI"
     if: '!(build.pull_request.labels includes "nightly-test")'
     command: python3 .buildkite/scripts/skip_docs.py
     agents:

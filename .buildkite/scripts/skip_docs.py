@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Skip Buildkite builds/tests for docs-only PRs, following vllm-omni's bootstrap.
+"""Skip Buildkite builds/tests for documentation-only changes.
 
-Only PRs qualify. Pushes, schedules and unresolved diffs run the full pipeline.
+PRs, merge queues and default-branch commits qualify. Nightly and scheduled
+builds always run, as do unresolved diffs.
 Use a merge-base diff and disable rename detection so moving code into docs
 cannot hide the deletion of a source file.
 """
@@ -23,34 +24,48 @@ def git(*args: str) -> str:
 
 
 def is_doc(path: str) -> bool:
-    # TEMP: remove after verifying docs-only skipping in CI.
-    if path.startswith((".buildkite/", "tests/")):
-        return True
     return path.startswith("docs/") or path.endswith(".md") or path == "mkdocs.yml"
 
 
-def docs_only_pr(env: Mapping[str, str]) -> bool:
+def docs_only_change(env: Mapping[str, str]) -> bool:
     pr = env.get("BUILDKITE_PULL_REQUEST", "false")
     base = env.get("BUILDKITE_PULL_REQUEST_BASE_BRANCH", "")
     # Explicit nightly requests should still exercise the full pipeline.
-    if not pr.isdecimal() or not base or env.get("NIGHTLY") == "1":
+    if env.get("NIGHTLY") == "1" or env.get("BUILDKITE_SOURCE") == "schedule":
         return False
     try:
-        git("check-ref-format", "--branch", base)
-        # Always fetch the target: origin/<base> can be missing or stale on agents.
-        git("fetch", "--no-tags", "origin", f"refs/heads/{base}")
-        ancestor = git("merge-base", "FETCH_HEAD", "HEAD")
+        if env.get("BUILDKITE_MERGE_QUEUE_BASE_BRANCH"):
+            ancestor = env.get("BUILDKITE_MERGE_QUEUE_BASE_COMMIT", "")
+            if not ancestor:
+                return False
+            # Confirm the recorded queue base belongs to the proposed merge.
+            ancestor = git("rev-parse", "--verify", f"{ancestor}^{{commit}}")
+            git("merge-base", "--is-ancestor", ancestor, "HEAD")
+        elif pr.isdecimal() and base:
+            git("check-ref-format", "--branch", base)
+            # Always fetch the target: agent refs can be missing or stale.
+            git("fetch", "--no-tags", "origin", f"refs/heads/{base}")
+            ancestor = git("merge-base", "FETCH_HEAD", "HEAD")
+        elif (
+            not pr.isdecimal()
+            and env.get("BUILDKITE_PIPELINE_DEFAULT_BRANCH")
+            and env.get("BUILDKITE_BRANCH") == env["BUILDKITE_PIPELINE_DEFAULT_BRANCH"]
+        ):
+            # First-parent diff captures the entire merged PR, or squash commit.
+            ancestor = git("rev-parse", "--verify", "HEAD^1")
+        else:
+            return False
         changed = git("diff", "--name-only", "--no-renames", "-z", ancestor, "HEAD")
         files = [path for path in changed.split("\0") if path]
         return bool(files) and all(is_doc(path) for path in files)
     except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
-        print(f"Cannot resolve PR diff; running full CI: {exc}", flush=True)
+        print(f"Cannot resolve change diff; running full CI: {exc}", flush=True)
         return False
 
 
 def main() -> None:
-    if docs_only_pr(os.environ):
-        print("Docs-only PR: skipping Buildkite builds and tests.", flush=True)
+    if docs_only_change(os.environ):
+        print("Docs-only change: skipping Buildkite builds and tests.", flush=True)
         return
     subprocess.run(
         [

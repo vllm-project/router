@@ -1,7 +1,5 @@
 # Buildkite CI/CD Configuration
 
-<!-- TEMP: docs-only CI skip verification; remove after debugging. -->
-
 This directory contains the Buildkite pipeline configurations for the vLLM Router project.
 
 Formatting, Clippy, Black, Ruff, and spelling are not Buildkite jobs. They run
@@ -16,13 +14,17 @@ pip install pre-commit && pre-commit install
 
 `pipeline.yml` runs a lightweight CPU bootstrap, following
 [vllm-omni's diff-aware bootstrap](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py).
-For PRs where every changed path is under `docs/`, ends in `.md`, or is
+When every changed path is under `docs/`, ends in `.md`, or is
 `mkdocs.yml`, it succeeds without uploading build or test jobs. This includes
 documentation additions and deletions. Mixed code/documentation changes run CI.
-The bootstrap fetches the PR target branch and compares its merge base with
-`HEAD`; renames include both the old and new paths. Empty or unresolved diffs
-run CI. Pushes (including merge queues), scheduled builds, and `NIGHTLY=1`
-also run CI. The `nightly-test` label bypasses docs-only detection and uploads
+For PRs (including `merge-test`), the bootstrap fetches the target branch and
+compares its merge base with `HEAD`. Merge queues compare against Buildkite's
+recorded queue base commit. Default-branch builds compare `HEAD^1` to `HEAD`,
+covering the complete PR for merge commits and squash merges. For rebase merges
+or multi-commit pushes, this comparison covers only the final commit.
+Renames include both the old and new paths. Empty or unresolved diffs run CI.
+Scheduled builds and `NIGHTLY=1` always run CI.
+The `nightly-test` label bypasses docs-only detection and uploads
 the full pipeline even for documentation-only PRs.
 GitHub Actions quality/security checks and release publishing
 remain enabled. Unlike Omni, pytest skip-mark changes do not qualify.
@@ -39,7 +41,9 @@ on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 | `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), router_policy TraceLab c16 on 4× L4 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA |
 | `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
 
-A pull request labeled `ready` uploads `test-ready.yml`, including forks.
+A pull request labeled `ready` uploads `test-ready.yml`, including forks,
+unless the bootstrap skips it as documentation-only. The same exception applies
+to `merge-test` and default-branch/merge-queue L2 uploads.
 `test-merge.yml` has no per-job `if`. In `test-ready.yml` and `test-nightly.yml`, a job whose gate is narrower than the upload keeps its own `if`.
 
 GPU machine presets are in [`ci_mirror_hardwares.yml`](ci_mirror_hardwares.yml).
