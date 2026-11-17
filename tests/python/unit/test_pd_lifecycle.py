@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from aiohttp import web
 
+from ..helpers import pd_lifecycle
 from ..helpers.pd_lifecycle import probe
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
@@ -177,7 +178,12 @@ def test_success_and_progress_after_disconnect(fragment):
 def test_fail_closed_without_escalating_concurrency(fault):
     result, _ = asyncio.run(exercise(fault))
     assert not result["passed"]
-    assert result["results"][-1]["outcome"] == "failed"
+    expected = (
+        "untested"
+        if fault in ("already_done", "buffered_eof", "buffered_done")
+        else "failed"
+    )
+    assert result["results"][-1]["outcome"] == expected
     assert all(r["concurrency"] == 1 for r in result["results"])
     if fault == "empty":
         assert result["results"][-1]["detail"] == "completion text is empty or invalid"
@@ -185,6 +191,39 @@ def test_fail_closed_without_escalating_concurrency(fault):
         assert "cancellation untested" in result["results"][-1]["detail"]
     if fault in ("http", "malformed", "stall"):
         assert "detail" not in result["results"][-1]
+
+
+def test_disconnect_wave_allows_partial_untested(monkeypatch):
+    async def mixed_request(_session, _url, _model, mode, sequence):
+        if mode == "disconnect" and sequence.endswith("-0"):
+            raise pd_lifecycle.DisconnectUntested(
+                "completion buffered; cancellation untested"
+            )
+        return "disconnected_after_text" if mode == "disconnect" else "completed"
+
+    monkeypatch.setattr(pd_lifecycle, "request", mixed_request)
+    result = asyncio.run(probe("http://unused", "test", [2], 1, 2))
+    assert result["passed"]
+    disconnects = [r for r in result["results"] if r["phase"] == "disconnect"]
+    assert [r["outcome"] for r in disconnects] == [
+        "untested",
+        "disconnected_after_text",
+    ]
+
+
+def test_unexpected_request_exception_is_reported(monkeypatch, tmp_path):
+    async def fail_request(*_args):
+        raise RuntimeError("transport implementation failed")
+
+    monkeypatch.setattr(pd_lifecycle, "request", fail_request)
+    output = tmp_path / "probe.json"
+    result = asyncio.run(probe("http://unused", "test", [1], 1, 2, output))
+    assert not result["passed"]
+    assert result["status"] == "failed"
+    assert result["results"][0]["outcome"] == "failed"
+    assert result["results"][0]["error_type"] == "RuntimeError"
+    assert "detail" not in result["results"][0]
+    assert json.loads(output.read_text()) == result
 
 
 @pytest.mark.parametrize("levels", [[], [0], [-1], [33], [True], [1] * 9])

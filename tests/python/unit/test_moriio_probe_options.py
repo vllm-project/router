@@ -17,6 +17,10 @@ SCRIPT = "tests/python/e2e/pd_disagg_vllm/run_moriio_rdma_accuracy_test.sh"
         ({"SMOKE_ONLY": "true"}, "requires SMOKE_ONLY=false"),
         ({"PD_PROBE_CONCURRENCY": "0"}, "space-separated integers"),
         ({"PD_PROBE_CONCURRENCY": "1; touch BAD"}, "space-separated integers"),
+        (
+            {"RUN_PD_LIFECYCLE": "false", "PD_PROBE_CONCURRENCY": "1; touch BAD"},
+            "space-separated integers",
+        ),
         ({"PD_PROBE_CONCURRENCY": "33"}, "must not exceed 32"),
         ({"PD_PROBE_CONCURRENCY": "1 1 1 1 1 1 1 1 1"}, "at most eight"),
         ({"PD_PROBE_ROUNDS": "0"}, "rounds must be"),
@@ -69,4 +73,5 @@ def test_invalid_options_do_not_touch_hosts(tmp_path, pytestconfig, options, mes
     assert not marker.exists()
     assert not report.exists()
     assert not checkpoint.exists()
+    assert "Removing stale lifecycle report:" in result.stdout
     assert unrelated.read_text() == "previous server log"

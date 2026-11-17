@@ -19,6 +19,10 @@ else:  # The harness invokes this file directly, without installing a tests pack
     from completion_validation import validate_single_completion
 
 
+class DisconnectUntested(ValueError):
+    """The response finished before the client could disconnect it."""
+
+
 async def request(session, url, model, mode, sequence):
     payload = {
         "model": model,
@@ -66,12 +70,14 @@ async def request(session, url, model, mode, sequence):
                 finished = True
             if mode == "disconnect" and text_seen:
                 if finished:
-                    raise ValueError(
+                    raise DisconnectUntested(
                         "first text already finished; cancellation untested"
                     )
                 # is_eof includes unread buffered bytes, unlike at_eof().
                 if response.content.is_eof():
-                    raise ValueError("response already at EOF; cancellation untested")
+                    raise DisconnectUntested(
+                        "response already at EOF; cancellation untested"
+                    )
                 buffered = response.content.read_nowait()
                 # Only inspect complete lines. The final fragment may end inside
                 # JSON or a UTF-8 character; we close without waiting for it.
@@ -85,7 +91,7 @@ async def request(session, url, model, mode, sequence):
                         )
                     data = pending[5:].strip()
                     if data == b"[DONE]":
-                        raise ValueError(
+                        raise DisconnectUntested(
                             "completion already buffered; cancellation untested"
                         )
                     event = json.loads(data)
@@ -97,7 +103,7 @@ async def request(session, url, model, mode, sequence):
                     ):
                         raise ValueError("invalid buffered SSE choices")
                     if any(c.get("finish_reason") is not None for c in choices):
-                        raise ValueError(
+                        raise DisconnectUntested(
                             "completion already buffered; cancellation untested"
                         )
                 # Closing an unfinished response disconnects the HTTP client. This
@@ -160,6 +166,10 @@ async def probe(url, model, levels=(1, 2, 4, 8), rounds=2, timeout=60, output=No
                     mode,
                     f"{level}-{iteration}-{phase}-{slot}",
                 )
+            except DisconnectUntested as exc:
+                result["outcome"] = "untested"
+                result["error_type"] = type(exc).__name__
+                result["detail"] = str(exc)
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
                 result["outcome"] = "failed"
                 # Avoid URLs (which may contain credentials) and response bodies.
@@ -170,6 +180,11 @@ async def probe(url, model, levels=(1, 2, 4, 8), rounds=2, timeout=60, output=No
                     result["detail"] = str(exc)
                 if isinstance(exc, aiohttp.ClientResponseError):
                     result["http_status"] = exc.status
+            except Exception as exc:
+                # CancelledError and process-level interrupts inherit BaseException
+                # and still propagate; unexpected request errors become evidence.
+                result["outcome"] = "failed"
+                result["error_type"] = type(exc).__name__
             result["elapsed_seconds"] = round(time.monotonic() - start, 4)
             return result
 
@@ -185,7 +200,11 @@ async def probe(url, model, levels=(1, 2, 4, 8), rounds=2, timeout=60, output=No
                         *(one(phase, mode, level, iteration, i) for i in range(level))
                     )
                     report["results"].extend(batch)
-                    if any(r["outcome"] == "failed" for r in batch):
+                    failed = any(r["outcome"] == "failed" for r in batch)
+                    disconnect_untested = phase == "disconnect" and all(
+                        r["outcome"] == "untested" for r in batch
+                    )
+                    if failed or disconnect_untested:
                         report["status"] = "failed"
                         save_report(report, output)
                         return report  # no automatic retry or higher load after failure

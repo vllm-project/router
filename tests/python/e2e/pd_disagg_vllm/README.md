@@ -231,10 +231,14 @@ The tests run on a 4-GPU (L4) queue with a 30-minute timeout:
 On an allocated two-host pair, use the normal shared host lease and launcher:
 
 ```bash
-HSA_NO_SCRATCH_RECLAIM=0 MORIIO_READ_MODE=true \
+HSA_NO_SCRATCH_RECLAIM=0 VLLM_ROCM_USE_SKINNY_GEMM=0 MORIIO_READ_MODE=true \
 RUN_PD_LIFECYCLE=true SMOKE_ONLY=false \
 bash tests/python/e2e/pd_disagg_vllm/run_moriio_rdma_accuracy_test.sh
 ```
+
+The current pinned image needs `VLLM_ROCM_USE_SKINNY_GEMM=0` for the validated
+read-mode path; the launcher forwards this override only when the caller sets it.
+It does not change the engine default. Write mode was validated without it.
 
 The existing eval container runs completion, full-stream, active-client-disconnect,
 and recovery waves, before the normal accuracy evaluation. Defaults are
@@ -251,9 +255,10 @@ For a manual default-branch build, also set `RUN_ROCM_RDMA=1` and `NIGHTLY=1`.
 `LOG_DIR/pd-lifecycle.json` records each phase, outcome, and HTTP error status,
 with an atomic checkpoint after each wave. `status=running` means incomplete,
 not passed. Full streams need non-empty text, a normal finish reason, and
-`[DONE]`. Disconnects must occur before the observed stream finishes, followed
-by successful recovery requests. The existing RDMA artifact glob includes the
-report alongside P/D/router logs.
+`[DONE]`. Each disconnect wave must observe at least one live disconnect;
+requests that finish before disconnection are recorded as `untested`. Successful
+recovery requests follow each wave. The existing RDMA artifact glob includes
+the report alongside P/D/router logs.
 
 A pass demonstrates client-visible progress after disconnects, not engine abort
 propagation, KV reclamation, absence of leaks, or semantic accuracy. Inspect
