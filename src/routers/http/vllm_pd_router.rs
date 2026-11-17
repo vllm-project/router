@@ -2101,7 +2101,7 @@ impl VllmPDRouter {
             )
         });
         let response = self
-            .process_grpc_two_stage_chat(
+            .process_grpc_two_stage(
                 prepared,
                 prefill_worker,
                 decode_worker,
@@ -2534,14 +2534,14 @@ impl VllmPDRouter {
         .map_err(|message| PDRouterError::NetworkError { message })
     }
 
-    /// P/D chat on `grpc://` pools. The connector JSON is the same as on the
+    /// P/D dispatch on `grpc://` pools for chat and token-id completions. The connector JSON is the same as on the
     /// HTTP path; it travels in `GenerateRequest.kv.kv_transfer_params` and
     /// comes back in `FinishInfo.kv_transfer_params`. P finishes before D
     /// starts, except in NIXL push mode once P's push identity is cached.
     /// Admission already reserved both legs in `attempt`; a deferred
     /// commitment replaces the decode target once Prefill returns.
     #[allow(clippy::too_many_arguments)]
-    async fn process_grpc_two_stage_chat(
+    async fn process_grpc_two_stage(
         &self,
         prepared: crate::backend::PreparedRequest,
         prefill_worker: Arc<dyn Worker>,
@@ -2579,7 +2579,7 @@ impl VllmPDRouter {
             {
                 let decode_params = Self::build_nixl_push_decode_params(&identity, &request_id);
                 return self
-                    .process_grpc_concurrent_chat(
+                    .process_grpc_concurrent(
                         prepared,
                         prefill_worker,
                         decode_worker,
@@ -2689,7 +2689,7 @@ impl VllmPDRouter {
     /// blocks D allocates for `request_id`. A failed leg cancels the other,
     /// so neither worker waits for a transfer that never comes.
     #[allow(clippy::too_many_arguments)]
-    async fn process_grpc_concurrent_chat(
+    async fn process_grpc_concurrent(
         &self,
         prepared: crate::backend::PreparedRequest,
         prefill_worker: Arc<dyn Worker>,
