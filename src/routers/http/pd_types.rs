@@ -708,11 +708,6 @@ mod tests {
     use super::*;
     use std::fmt;
 
-    /// A count-based Prefill policy reports no token estimate. The request path knows the
-    /// prompt it rendered, so the Decode charge must still be in tokens - otherwise the
-    /// whole pool falls back to request counts for as long as one such request is in
-    /// flight, which disables the credit this change adds.
-
     // Simple custom error for testing error chains
     #[derive(Debug)]
     struct TestError {

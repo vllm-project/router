@@ -43,6 +43,7 @@ struct Discovery {
 /// One policy registration owned by this state, tagged with the role that
 /// installed it so a shared target table can unregister through the right
 /// policy.
+#[derive(Clone)]
 struct TargetRegistration {
     signature: String,
     decode: bool,
@@ -115,13 +116,9 @@ impl std::fmt::Debug for PdKvState {
 }
 
 impl PdKvState {
-    /// `prefill` and `decode` are the pools this state should bind, each paired
-    /// with the policy that ranks it (only when that policy is KV-aware).
-    ///
-    /// Both are registered here rather than on the first request: bindings are
-    /// created by the refresh loop, so a pool recorded from the request path has
-    /// no binding until the next tick, and every request admitted before that
-    /// tick is priced without the credit the configuration asked for.
+    /// `prefill_policy` and `decode_policy` rank the stages that publish KV.
+    /// Worker membership comes from `registry`; startup binds through the same
+    /// entry point as refresh so the two cannot diverge.
     pub(super) async fn start(
         client: reqwest::Client,
         api_key: Option<String>,
@@ -137,17 +134,7 @@ impl PdKvState {
         state.prefill_policy = prefill_policy;
         state.decode_policy = decode_policy;
         let state = Arc::new(state);
-        // Bind during startup; unavailable metadata falls back to load until
-        // refresh. Both pools are bound here so a burst that arrives before the
-        // first refresh tick is still priced with the credit it configured.
-        for (decode, policy) in [
-            (false, state.prefill_policy.clone()),
-            (true, state.decode_policy.clone()),
-        ] {
-            let Some(policy) = policy else { continue };
-            if kv_aware_ops(policy.as_ref()).is_none() {
-                continue;
-            }
+        for decode in [false, true] {
             if tokio::time::timeout(CONTROL_TIMEOUT, state.bind_refresh(decode))
                 .await
                 .is_err()
@@ -223,11 +210,11 @@ impl PdKvState {
         self.bind_locked(workers, policy, decode).await;
     }
 
-    fn policy(&self, decode: bool) -> Option<Arc<dyn LoadBalancingPolicy>> {
+    fn policy(&self, decode: bool) -> Option<&Arc<dyn LoadBalancingPolicy>> {
         if decode {
-            self.decode_policy.clone()
+            self.decode_policy.as_ref()
         } else {
-            self.prefill_policy.clone()
+            self.prefill_policy.as_ref()
         }
     }
 
@@ -416,11 +403,19 @@ impl PdKvState {
             let signature = binding
                 .map(|binding| format!("{}:{:?}", binding.signature, binding.info))
                 .unwrap_or_default();
-            if targets
-                .get(worker.url())
-                .is_some_and(|registration| registration.signature == signature)
-            {
+            let previous = targets.get(worker.url()).cloned();
+            let same = previous.as_ref().is_some_and(|registration| {
+                registration.signature == signature && registration.decode == decode
+            });
+            if same {
                 continue;
+            }
+            if let Some(previous) = previous.filter(|registration| registration.decode != decode) {
+                if let Some(policy) = self.policy(previous.decode) {
+                    if let Some(kv) = kv_aware_ops(policy.as_ref()) {
+                        kv.unregister_worker(worker.url());
+                    }
+                }
             }
             policy.unregister_worker(worker.url());
             let info = binding.and_then(|binding| binding.info.as_ref());
@@ -1352,6 +1347,26 @@ mod kv_input_tests {
         // Prefill refresh removes a deleted Decode worker through the Decode
         // policy, not its own.
         let decode_kv = kv_aware_ops(decode_policy.as_ref()).unwrap();
+        // The same URL changes role before the next refresh. The cached
+        // signature matches, but the owner changed, so the Decode policy must
+        // be registered rather than skipped.
+        let old_prefill = prefill[0].clone();
+        registry.remove_by_url(old_prefill.url());
+        let decode_role: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new(p_base.clone(), WorkerType::Decode));
+        registry.register(decode_role.clone());
+        state.bind_refresh(true).await;
+        assert!(
+            decode_kv.estimate_decode_work(
+                &[(decode_role.as_ref(), &[vec![1, 2, 3]], true)],
+                &mut PromptHashes::new(),
+            )[0]
+            .additional_tokens
+            .is_some(),
+            "a role change must register the new owning policy"
+        );
+        // Prefill refresh removes a deleted Decode worker through the Decode
+        // policy, not its own.
         let removed = decode[0].clone();
         registry.remove_by_url(removed.url());
         state.bind_refresh(false).await;
