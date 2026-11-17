@@ -223,23 +223,11 @@ impl PdKvState {
             loop {
                 interval.tick().await;
                 let Some(state) = weak.upgrade() else { break };
-                let inputs = state.refresh_inputs.lock().await.clone();
-                // One subscriber per configured base, whatever role it serves:
-                // a Decode engine that publishes KV events is bound exactly like
-                // a Prefill one, and its blocks become the credit its own
-                // marginal-context estimate needs.
-                for (workers, policy) in [
-                    (&inputs.prefill, inputs.prefill_policy.as_ref()),
-                    (&inputs.decode, inputs.decode_policy.as_ref()),
-                ] {
-                    let Some(policy) = policy else { continue };
-                    let Some(kv) = kv_aware_ops(policy.as_ref()) else {
-                        continue;
-                    };
-                    if !workers.is_empty() {
-                        state.bind(&workers[..], kv).await;
-                    }
-                }
+                // Each role reads its current pool under bind_lock. A snapshot
+                // taken before the lock could re-register a worker that was
+                // removed while this tick waited.
+                state.bind_refresh(false).await;
+                state.bind_refresh(true).await;
             }
         });
     }
@@ -251,6 +239,27 @@ impl PdKvState {
     /// admission load lock.
     async fn bind(&self, workers: &[Arc<dyn Worker>], policy: &dyn KvAwareOps) {
         let _bind_guard = self.bind_lock.lock().await;
+        self.bind_locked(workers, policy).await;
+    }
+
+    async fn bind_refresh(&self, decode: bool) {
+        let _bind_guard = self.bind_lock.lock().await;
+        let (workers, policy) = {
+            let inputs = self.refresh_inputs.lock().await;
+            if decode {
+                (inputs.decode.clone(), inputs.decode_policy.clone())
+            } else {
+                (inputs.prefill.clone(), inputs.prefill_policy.clone())
+            }
+        };
+        let Some(policy) = policy else { return };
+        let Some(kv) = kv_aware_ops(policy.as_ref()) else {
+            return;
+        };
+        self.bind_locked(&workers, kv).await;
+    }
+
+    async fn bind_locked(&self, workers: &[Arc<dyn Worker>], policy: &dyn KvAwareOps) {
         // Bindings outlive the pool that installed them: another role's pool
         // keeps its base registered, so removal is decided by every live pool
         // rather than by this one.
@@ -1417,11 +1426,26 @@ mod kv_input_tests {
                 .is_some(),
             "Decode must be priced before the first request"
         );
-        // Re-adding the same URL must re-register it, not reuse a stale signature.
+        // A stale refresh snapshot must not revive the removed worker.
         let kv = kv_aware_ops(policy.as_ref()).unwrap();
         state.unregister_worker(decode[0].url(), kv).await;
+        state.bind_refresh(true).await;
+        assert!(
+            state
+                .prepare_decode_context(
+                    &decode,
+                    &policy,
+                    &request,
+                    "/v1/completions",
+                    None,
+                    Some(&prompts),
+                )
+                .await
+                .is_none(),
+            "a stale refresh must not re-register a removed Decode worker"
+        );
         state.record_decode_pool(&decode, &policy).await;
-        state.bind(&decode, kv).await;
+        state.bind_refresh(true).await;
         assert!(
             state
                 .prepare_decode_context(

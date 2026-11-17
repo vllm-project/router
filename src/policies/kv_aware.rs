@@ -1,6 +1,6 @@
 //! Exact KV-placement and live-load aware worker selection.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -169,9 +169,6 @@ pub trait KvAwareOps: Send + Sync {
         cache_salt: Option<&str>,
         affinity_key: &AffinityKey,
     ) -> bool;
-
-    /// Reconcile the complete D pool, before eligibility narrows candidates.
-    fn reconcile_decode_workers(&self, workers: &[Arc<dyn Worker>]);
     /// Select and reserve atomically: the returned receipt already carries the
     /// request slot and worker-load reservation made in the policy's short
     /// critical section, plus any affinity binding reference. Workers in
@@ -1181,13 +1178,12 @@ impl KvAwarePolicy {
     fn hashes_for<'h>(
         cache: &'h mut PromptHashes,
         block_size: u32,
-        prompts: &[Vec<u32>],
-        index: usize,
+        tokens: &[u32],
     ) -> &'h Arc<[Arc<str>]> {
-        let key = (block_size, prompt_fingerprint(&prompts[index]));
+        let key = (block_size, prompt_fingerprint(tokens));
         cache
             .entry(key)
-            .or_insert_with(|| Arc::from(Self::local_hashes(&prompts[index], block_size)))
+            .or_insert_with(|| Arc::from(Self::local_hashes(tokens, block_size)))
     }
 
     /// The index query alone, for callers that already hold the hashes.
@@ -1866,7 +1862,7 @@ impl KvAwareOps for KvAwarePolicy {
                     ..self.params
                 };
                 let mut new_prefill_tokens = 0u64;
-                for (index, tokens) in prompts.iter().enumerate() {
+                for tokens in prompts {
                     let hits = if verified {
                         // Keyed by the prompt content that this backend actually rendered:
                         // two backends can render the same request into different ids, and
@@ -1874,8 +1870,7 @@ impl KvAwareOps for KvAwarePolicy {
                         // query.
                         let key = (binding.cache_key.clone(), prompt_fingerprint(tokens));
                         if !query_cache.contains_key(&key) {
-                            let local =
-                                Self::hashes_for(hashes, binding.block_size, prompts, index);
+                            let local = Self::hashes_for(hashes, binding.block_size, tokens);
                             let found = Self::placement_matches_with(&binding, local);
                             query_cache.insert(key.clone(), found);
                         }
@@ -1947,13 +1942,10 @@ impl KvAwareOps for KvAwarePolicy {
                     ..self.params
                 };
                 let mut additional = 0u64;
-                for (index, tokens) in prompts.iter().enumerate() {
-                    // Content, not position: two backends can render the same request into
-                    // different ids, and a position-only key would reuse the other
-                    // backend's match.
+                for tokens in prompts {
                     let key = (binding.cache_key.clone(), prompt_fingerprint(tokens));
                     if !query_cache.contains_key(&key) {
-                        let local = Self::hashes_for(hashes, binding.block_size, prompts, index);
+                        let local = Self::hashes_for(hashes, binding.block_size, tokens);
                         let found = Self::placement_matches_with(&binding, local);
                         query_cache.insert(key.clone(), found);
                     }
@@ -2177,19 +2169,6 @@ impl KvAwareOps for KvAwarePolicy {
             affinity_key,
             excluded_workers,
         )
-    }
-
-    fn reconcile_decode_workers(&self, workers: &[Arc<dyn Worker>]) {
-        let current: HashSet<_> = workers.iter().map(|worker| worker.url()).collect();
-        let removed: Vec<_> = self
-            .targets
-            .iter()
-            .filter(|entry| !current.contains(entry.key().as_str()))
-            .map(|entry| entry.key().clone())
-            .collect();
-        for url in removed {
-            self.unregister_target(&url);
-        }
     }
 }
 
@@ -3257,10 +3236,6 @@ mod tests {
                 false
             }
 
-            fn reconcile_decode_workers(&self, _workers: &[Arc<dyn Worker>]) {
-                unreachable!("ordinary-only qualification must not enter PD selection")
-            }
-
             fn register_worker(
                 &self,
                 _worker: &dyn Worker,
@@ -4227,7 +4202,7 @@ mod tests {
 
         // The pool shrank to d1: the stale binding must rebind, not fail.
         let shrunk = decode_pool(&["http://d1"]);
-        policy.reconcile_decode_workers(&shrunk);
+        policy.unregister_target("http://d0");
         assert!(!policy.targets.contains_key("http://d0"));
         let rebound = policy
             .select_decode(&shrunk, Some(&key), None, None, None)
@@ -4243,7 +4218,8 @@ mod tests {
             .select_decode(&moved, Some(&key), None, None, None)
             .unwrap();
         assert_eq!((rebind.index, rebind.outcome), (1, "bind"));
-        policy.reconcile_decode_workers(&[]);
+        policy.unregister_target("http://d0");
+        policy.unregister_target("http://d1");
         assert!(policy.targets.is_empty());
     }
 

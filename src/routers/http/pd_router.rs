@@ -735,11 +735,6 @@ impl PdRouterBase {
         let decode_policy = self.policy_registry.get_decode_policy();
         let defer = defer_decode && decode_policy_can_defer(decode_policy.as_ref(), context);
         let select = |loads: &Loads| {
-            if let Some(kv) =
-                kv_aware_ops(decode_policy.as_ref()).filter(|kv| kv.session_affinity_enabled())
-            {
-                kv.reconcile_decode_workers(decode_workers);
-            }
             select_pd_pair(
                 loads,
                 prefill_workers,
@@ -1071,6 +1066,21 @@ impl PdRouterBase {
         }
     }
 
+    async fn unregister_kv_worker(&self, url: &str, decode: bool) {
+        let policy = if decode {
+            self.policy_registry.get_decode_policy()
+        } else {
+            self.policy_registry.get_prefill_policy()
+        };
+        let Some(kv) = kv_aware_ops(policy.as_ref()) else {
+            return;
+        };
+        match self.kv_state.as_ref() {
+            Some(state) => state.unregister_worker(url, kv).await,
+            None => kv.unregister_worker(url),
+        }
+    }
+
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
         // A bare URL that is not registered as-is was expanded per DP rank.
         if !url.contains('@') && self.worker_registry.get_by_url(url).is_none() {
@@ -1090,12 +1100,7 @@ impl PdRouterBase {
         let removed = self.worker_registry.remove_by_url(url);
 
         if removed.is_some() {
-            if let Some(kv) = kv_aware_ops(self.policy_registry.get_prefill_policy().as_ref()) {
-                match self.kv_state.as_ref() {
-                    Some(state) => state.unregister_worker(url, kv).await,
-                    None => kv.unregister_worker(url),
-                }
-            }
+            self.unregister_kv_worker(url, false).await;
             self.policy_registry.on_worker_removed(&model_id);
             if let Some(policy) = self.policy_registry.get_policy(&model_id) {
                 if policy.name() == "cache_aware" {
@@ -1136,12 +1141,7 @@ impl PdRouterBase {
         let removed = self.worker_registry.remove_by_url(url);
 
         if removed.is_some() {
-            if let Some(kv) = kv_aware_ops(self.policy_registry.get_decode_policy().as_ref()) {
-                match self.kv_state.as_ref() {
-                    Some(state) => state.unregister_worker(url, kv).await,
-                    None => kv.unregister_worker(url),
-                }
-            }
+            self.unregister_kv_worker(url, true).await;
             // Notify PolicyRegistry about the removed worker
             self.policy_registry.on_worker_removed(&model_id);
 
@@ -1183,17 +1183,7 @@ impl PdRouterBase {
             if w.url().starts_with(&prefix) {
                 let model_id = w.model_id().to_string();
                 if self.worker_registry.remove_by_url(w.url()).is_some() {
-                    let policy = if role == "decode" {
-                        self.policy_registry.get_decode_policy()
-                    } else {
-                        self.policy_registry.get_prefill_policy()
-                    };
-                    if let Some(kv) = kv_aware_ops(policy.as_ref()) {
-                        match self.kv_state.as_ref() {
-                            Some(state) => state.unregister_worker(w.url(), kv).await,
-                            None => kv.unregister_worker(w.url()),
-                        }
-                    }
+                    self.unregister_kv_worker(w.url(), role == "decode").await;
                     self.policy_registry.on_worker_removed(&model_id);
                     if let Some(policy) = self.policy_registry.get_policy(&model_id) {
                         if policy.name() == "cache_aware" {
