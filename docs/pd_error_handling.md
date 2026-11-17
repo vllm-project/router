@@ -147,8 +147,12 @@ The common failure wrapper releases local load, then attempts both profiling
 stops concurrently with a shared two-second cleanup deadline. Cleanup is best
 effort: request cancellation or a timeout may interrupt a stop request, leaving
 the existing profiling timeout task to retry cleanup. A new profiling session
-supersedes the previous session's timeout. Profiling HTTP operations are
-serialized per worker while their requests are awaited; other workers use
+supersedes the previous session's timeout. Each attempt retains the identifiers
+of the sessions it actually started; successful and failure cleanup stop only
+matching sessions. A sequential Prefill failure cannot stop an unrelated
+Decode profile, and stale cleanup cannot stop a replacement session. Profiling
+HTTP operations are serialized per worker while their requests are awaited;
+other workers use
 independent locks. Neither cleanup nor capture can delay local Decode
 cancellation or resource release. Dropping local HTTP work does not guarantee
 that the remote engine immediately stops computation.

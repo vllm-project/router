@@ -52,6 +52,13 @@ struct ProfilingSession {
 // timeout registered so a later start can still supersede the fallback.
 type ProfilingWorker = Arc<Mutex<Option<ProfilingSession>>>;
 
+/// Sessions actually started by this HTTP attempt; provisional workers own none.
+#[derive(Default)]
+struct RequestProfiling {
+    prefill: Option<Uuid>,
+    decode: Option<Uuid>,
+}
+
 /// Mooncake prefill bootstrap info (engine_id per dp_rank)
 #[derive(Debug, Clone)]
 struct MooncakePrefillInfo {
@@ -66,6 +73,7 @@ struct DecodeResponseContext<'a> {
     prefill_http: &'a str,
     decode_http: &'a str,
     decode_base_url: &'a str,
+    profiling: Option<Uuid>,
     request: &'a Value,
 }
 
@@ -908,9 +916,9 @@ impl VllmPDRouter {
     }
 
     /// Start a new session while fencing the previous timeout with the worker lock.
-    async fn start_profiling(&self, worker_url: &str) {
+    async fn start_profiling(&self, worker_url: &str) -> Option<Uuid> {
         if !self.enable_profiling {
-            return;
+            return None;
         }
         let worker = self.profiling_worker(worker_url).await;
         let mut session = worker.lock().await;
@@ -948,16 +956,23 @@ impl VllmPDRouter {
             generation,
             timeout: task.abort_handle(),
         });
+        Some(generation)
     }
 
     /// Stop once; retain the registered fallback until cleanup completes.
-    async fn stop_profiling(&self, worker_url: &str) {
+    async fn stop_profiling(&self, worker_url: &str, generation: Option<Uuid>) {
         if !self.enable_profiling {
             return;
         }
+        let Some(generation) = generation else {
+            return;
+        };
         let worker = self.profiling_worker(worker_url).await;
         let mut session = worker.lock().await;
-        if session.is_none() {
+        if session
+            .as_ref()
+            .is_none_or(|current| current.generation != generation)
+        {
             return;
         }
         self.pd_router.stop_profiling(worker_url).await;
@@ -1870,6 +1885,7 @@ impl VllmPDRouter {
         response: Result<reqwest::Response, reqwest::Error>,
         base: &str,
         attempt: &PdAttempt,
+        profiling: Option<Uuid>,
     ) -> Result<Bytes, PdDispatchError> {
         let result = async {
             let response =
@@ -1897,7 +1913,7 @@ impl VllmPDRouter {
         attempt.finish_prefill();
         // Failures must reach the race before any slow profiling I/O.
         if result.is_ok() {
-            self.stop_profiling(base).await;
+            self.stop_profiling(base, profiling).await;
         }
         result
     }
@@ -1916,6 +1932,7 @@ impl VllmPDRouter {
             prefill_http,
             decode_http,
             decode_base_url,
+            profiling,
             request,
         } = context;
         request_metrics.record();
@@ -1935,7 +1952,7 @@ impl VllmPDRouter {
             "📥 Decode response headers: {:?}",
             decode_response.headers()
         );
-        self.stop_profiling(decode_base_url).await;
+        self.stop_profiling(decode_base_url, profiling).await;
         let is_streaming = request
             .get("stream")
             .and_then(Value::as_bool)
@@ -2108,6 +2125,7 @@ impl VllmPDRouter {
         commit: Option<&DecodeCommitInput>,
     ) -> Result<Response, PdRequestError> {
         let mut metrics = RequestMetrics::new(path);
+        let mut profiling = RequestProfiling::default();
         match self
             .process_vllm_two_stage_request_inner(
                 request,
@@ -2119,6 +2137,7 @@ impl VllmPDRouter {
                 prefill_permit,
                 commit,
                 &mut metrics,
+                &mut profiling,
             )
             .await
         {
@@ -2135,8 +2154,8 @@ impl VllmPDRouter {
                 // Bound best-effort cleanup independently of error-body capture.
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
                     tokio::join!(
-                        self.stop_profiling(prefill_worker.base_url()),
-                        self.stop_profiling(&decode_base),
+                        self.stop_profiling(prefill_worker.base_url(), profiling.prefill),
+                        self.stop_profiling(&decode_base, profiling.decode),
                     );
                 })
                 .await;
@@ -2162,6 +2181,7 @@ impl VllmPDRouter {
         prefill_permit: Option<OwnedSemaphorePermit>,
         commit: Option<&DecodeCommitInput>,
         request_metrics: &mut RequestMetrics<'_>,
+        profiling: &mut RequestProfiling,
     ) -> Result<Response, PdDispatchError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         if crate::backend::is_grpc_url(prefill_worker.url()) {
@@ -2241,6 +2261,7 @@ impl VllmPDRouter {
                         attempt,
                         prefill_permit,
                         request_metrics,
+                        profiling,
                     )
                     .await;
             }
@@ -2314,7 +2335,7 @@ impl VllmPDRouter {
         );
 
         // Start profiling on prefill server
-        self.start_profiling(&prefill_base_url).await;
+        profiling.prefill = self.start_profiling(&prefill_base_url).await;
 
         let mut prefill_request_builder = self
             .pd_router
@@ -2348,7 +2369,12 @@ impl VllmPDRouter {
         .send()
         .await;
         let finished_prefill = self
-            .finish_prefill_response(prefill_response, &prefill_base_url, &attempt)
+            .finish_prefill_response(
+                prefill_response,
+                &prefill_base_url,
+                &attempt,
+                profiling.prefill,
+            )
             .await;
         // Program permits cover successful Prefill body consumption, not Decode.
         drop(prefill_permit);
@@ -2453,7 +2479,7 @@ impl VllmPDRouter {
         );
 
         // Start profiling on decode server
-        self.start_profiling(&decode_base_url).await;
+        profiling.decode = self.start_profiling(&decode_base_url).await;
 
         let mut decode_request_builder = self
             .pd_router
@@ -2504,6 +2530,7 @@ impl VllmPDRouter {
                 prefill_http: &prefill_base_url,
                 decode_http: &decode_base_url,
                 decode_base_url: &decode_base_url,
+                profiling: profiling.decode,
                 request: &original_request,
             },
             &attempt,
@@ -2844,6 +2871,7 @@ impl VllmPDRouter {
         attempt: PdAttempt,
         prefill_permit: Option<OwnedSemaphorePermit>,
         request_metrics: &mut RequestMetrics<'_>,
+        profiling: &mut RequestProfiling,
     ) -> Result<Response, PdDispatchError> {
         let ConcurrentDispatch {
             prefill_request,
@@ -2874,8 +2902,8 @@ impl VllmPDRouter {
             )
         };
 
-        self.start_profiling(&prefill_base_url).await;
-        self.start_profiling(&decode_base_url).await;
+        profiling.prefill = self.start_profiling(&prefill_base_url).await;
+        profiling.decode = self.start_profiling(&decode_base_url).await;
 
         let prefill_fut = async {
             // Own the Program Prefill permit until its successful body is consumed.
@@ -2894,7 +2922,7 @@ impl VllmPDRouter {
             .send()
             .await;
             let bytes = self
-                .finish_prefill_response(response, &prefill_base_url, &attempt)
+                .finish_prefill_response(response, &prefill_base_url, &attempt, profiling.prefill)
                 .await?;
             // Push identities can make the successful P body optional JSON.
             let prefill_json = serde_json::from_slice::<Value>(&bytes).ok();
@@ -2948,6 +2976,7 @@ impl VllmPDRouter {
                 prefill_http,
                 decode_http,
                 decode_base_url: &decode_base_url,
+                profiling: profiling.decode,
                 request: &decode_request,
             },
             &attempt,
@@ -3750,11 +3779,16 @@ mod tests {
             (Arc::new(router), url, backend)
         }
 
-        async fn cancel_first_stop(router: &Arc<VllmPDRouter>, url: &str, backend: &Backend) {
+        async fn cancel_first_stop(
+            router: &Arc<VllmPDRouter>,
+            url: &str,
+            backend: &Backend,
+            generation: Option<Uuid>,
+        ) {
             let stop = tokio::spawn({
                 let router = router.clone();
                 let url = url.to_owned();
-                async move { router.stop_profiling(&url).await }
+                async move { router.stop_profiling(&url, generation).await }
             });
             tokio::time::timeout(Duration::from_secs(2), backend.stop_entered.notified())
                 .await
@@ -3764,19 +3798,102 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn failed_sequential_prefill_preserves_unstarted_decode_profile() {
+            let (mut router, decode_url, backend) = fixture().await;
+            Arc::get_mut(&mut router).unwrap().kv_connector = KvConnector::Nixl;
+            let _existing_profile = router.start_profiling(&decode_url).await;
+            let prefill_url = spawn_test_server(
+                axum::Router::new()
+                    .fallback(|| async { (StatusCode::SERVICE_UNAVAILABLE, "prefill failed") }),
+            )
+            .await;
+            let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                prefill_url,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ));
+            let decode: Arc<dyn Worker> =
+                Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+            let request = json!({"model":"test", "prompt":"test", "max_tokens":1});
+            let Admission { attempt, .. } = router
+                .admit_pair(
+                    std::slice::from_ref(&prefill),
+                    std::slice::from_ref(&decode),
+                    &request,
+                    "/v1/completions",
+                    None,
+                    false,
+                    false,
+                )
+                .await
+                .unwrap();
+            let error = router
+                .process_vllm_two_stage_request(
+                    request,
+                    prefill.clone(),
+                    decode.clone(),
+                    "/v1/completions",
+                    None,
+                    attempt,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.into_response().status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert_eq!(
+                backend.starts.load(Ordering::SeqCst),
+                1,
+                "this attempt must not start Decode profiling"
+            );
+            assert_eq!(
+                backend.stops.load(Ordering::SeqCst),
+                0,
+                "failed Prefill must leave another request's Decode profile alone"
+            );
+            assert_eq!(prefill.load(), 0);
+            assert_eq!(decode.load(), 0);
+            backend.release_stop.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(2), backend.stop_entered.notified())
+                .await
+                .expect("the existing Decode profile must retain its timeout");
+            assert_eq!(backend.stops.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn stale_attempt_cannot_stop_replacement_profile() {
+            let (router, url, backend) = fixture().await;
+            let stale = router.start_profiling(&url).await;
+            let current = router.start_profiling(&url).await;
+            router.stop_profiling(&url, stale).await;
+            router.stop_profiling(&url, None).await;
+            assert_eq!(backend.stops.load(Ordering::SeqCst), 0);
+            backend.release_stop.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(2), backend.stop_entered.notified())
+                .await
+                .expect("stale cleanup must not cancel the replacement timeout");
+            router.stop_profiling(&url, current).await;
+            assert_eq!(backend.stops.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
         async fn profiling_new_session_supersedes_cancelled_cleanup_fallback() {
             let (mut router, url, backend) = fixture().await;
-            router.start_profiling(&url).await;
-            cancel_first_stop(&router, &url, &backend).await;
+            let generation = router.start_profiling(&url).await;
+            cancel_first_stop(&router, &url, &backend, generation).await;
             // The old fallback expires in one second; the new session must
             // survive that deadline and still perform its own explicit stop.
             Arc::get_mut(&mut router).unwrap().profile_timeout_secs = 60;
-            router.start_profiling(&url).await;
+            let generation = router.start_profiling(&url).await;
             tokio::time::sleep(Duration::from_millis(1100)).await;
             assert_eq!(backend.starts.load(Ordering::SeqCst), 2);
             assert_eq!(backend.stops.load(Ordering::SeqCst), 1);
-            router.stop_profiling(&url).await;
-            router.stop_profiling(&url).await;
+            router.stop_profiling(&url, generation).await;
+            router.stop_profiling(&url, generation).await;
             assert_eq!(backend.stops.load(Ordering::SeqCst), 2);
             backend.release_stop.add_permits(1);
         }
@@ -3784,12 +3901,12 @@ mod tests {
         #[tokio::test]
         async fn profiling_cancelled_cleanup_keeps_timeout_fallback() {
             let (router, url, backend) = fixture().await;
-            router.start_profiling(&url).await;
-            cancel_first_stop(&router, &url, &backend).await;
+            let generation = router.start_profiling(&url).await;
+            cancel_first_stop(&router, &url, &backend, generation).await;
             tokio::time::timeout(Duration::from_secs(2), backend.stop_entered.notified())
                 .await
                 .expect("timeout must retry the cancelled cleanup");
-            router.stop_profiling(&url).await;
+            router.stop_profiling(&url, generation).await;
             assert_eq!(backend.stops.load(Ordering::SeqCst), 2);
             backend.release_stop.add_permits(1);
         }
@@ -3797,7 +3914,7 @@ mod tests {
         #[tokio::test]
         async fn profiling_cancelled_start_keeps_previous_fallback() {
             let (router, url, backend) = fixture().await;
-            router.start_profiling(&url).await;
+            let generation = router.start_profiling(&url).await;
             backend.block_start.store(true, Ordering::SeqCst);
             let start = tokio::spawn({
                 let router = router.clone();
@@ -3813,7 +3930,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), backend.stop_entered.notified())
                 .await
                 .expect("cancelled replacement must retain the previous fallback");
-            router.stop_profiling(&url).await;
+            router.stop_profiling(&url, generation).await;
             assert_eq!(backend.stops.load(Ordering::SeqCst), 1);
             backend.release_start.add_permits(1);
         }
@@ -3822,11 +3939,11 @@ mod tests {
         async fn profiling_serializes_same_worker_without_blocking_other_workers() {
             let (mut router, url, backend) = fixture().await;
             Arc::get_mut(&mut router).unwrap().profile_timeout_secs = 60;
-            router.start_profiling(&url).await;
+            let generation = router.start_profiling(&url).await;
             let stop = tokio::spawn({
                 let router = router.clone();
                 let url = url.clone();
-                async move { router.stop_profiling(&url).await }
+                async move { router.stop_profiling(&url, generation).await }
             });
             tokio::time::timeout(Duration::from_secs(2), backend.stop_entered.notified())
                 .await
@@ -3837,15 +3954,16 @@ mod tests {
                 .is_err());
             assert_eq!(backend.starts.load(Ordering::SeqCst), 1);
             let other = spawn_test_server(axum::Router::new().fallback(|| async { "ok" })).await;
-            tokio::time::timeout(Duration::from_secs(1), router.start_profiling(&other))
-                .await
-                .expect("other workers must not wait for this worker's stop");
-            router.stop_profiling(&other).await;
+            let other_generation =
+                tokio::time::timeout(Duration::from_secs(1), router.start_profiling(&other))
+                    .await
+                    .expect("other workers must not wait for this worker's stop");
+            router.stop_profiling(&other, other_generation).await;
             backend.release_stop.add_permits(1);
             stop.await.unwrap();
-            start.await;
+            let generation = start.await;
             assert_eq!(backend.starts.load(Ordering::SeqCst), 2);
-            router.stop_profiling(&url).await;
+            router.stop_profiling(&url, generation).await;
             assert_eq!(backend.stops.load(Ordering::SeqCst), 2);
         }
     }
@@ -3966,6 +4084,7 @@ mod tests {
                         prefill_http: "prefill",
                         decode_http: "decode",
                         decode_base_url: "decode",
+                        profiling: None,
                         request: &request,
                     },
                     &attempt,
@@ -4049,6 +4168,7 @@ mod tests {
                         prefill_http: "prefill",
                         decode_http: "decode",
                         decode_base_url: "decode",
+                        profiling: None,
                         request: &request,
                     },
                     &attempt,
@@ -4117,6 +4237,7 @@ mod tests {
                         prefill_http: "prefill",
                         decode_http: "decode",
                         decode_base_url: "decode",
+                        profiling: None,
                         request: &request,
                     },
                     &attempt,
