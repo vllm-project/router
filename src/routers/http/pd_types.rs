@@ -286,14 +286,12 @@ impl PdLoadManager {
         &self,
         select: impl FnOnce(&Loads) -> Option<PdSelection>,
         defer_decode: bool,
-        // `n` sequences share one copy of the prompt's blocks.
     ) -> Option<(PdSelection, PdAttempt)> {
         let mut loads = self.loads.lock();
         let selection = select(&loads)?;
         let prefill = &selection.prefill;
         let decode = &selection.decode;
         let prompt = prompt_tokens(prefill);
-        let charged = prompt;
         // Neither stage is charged until both selections have succeeded.
         let p = loads
             .entry((Stage::Prefill, prefill.endpoint.clone()))
@@ -313,7 +311,7 @@ impl PdLoadManager {
                 .entry((Stage::Decode, decode.endpoint.clone()))
                 .or_default();
             d.pending_decode_requests += 1;
-            match charged {
+            match prompt {
                 Some(tokens) => d.pending_decode_tokens += tokens,
                 None => d.unknown_decode_requests += 1,
             }
@@ -333,7 +331,6 @@ impl PdLoadManager {
             decode_worker: Mutex::new(None),
             prefill_tokens: selection.prefill.new_prefill_tokens,
             decode_context: prompt,
-
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: decode_state,

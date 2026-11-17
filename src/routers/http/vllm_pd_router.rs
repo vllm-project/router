@@ -1160,11 +1160,6 @@ impl VllmPDRouter {
         let (prefill_inputs, decode_inputs, decode_context) = match self.pd_router.kv_state.as_ref()
         {
             Some(state) => {
-                if state.publishes_for(decode_workers) {
-                    state
-                        .record_decode_pool(decode_workers, &decode_policy)
-                        .await;
-                }
                 let (stages, decode_inputs) = tokio::join!(
                     state.prepare_stages(
                         prefill_workers,
@@ -1412,9 +1407,6 @@ impl VllmPDRouter {
             if !(state.publishes_for(&pool_for_subscriptions)) {
                 return None;
             }
-            state
-                .record_decode_pool(&pool_for_subscriptions, &decode_policy)
-                .await;
             state
                 .prepare_decode_context(
                     &candidates,

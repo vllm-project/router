@@ -1342,34 +1342,22 @@ impl PdRouterBase {
         // Note: Health checking is now handled centrally by RouterManager
         // Individual routers no longer need to manage health checkers
 
-        // Either stage may be the KV-aware one, and both pools are registered
-        // at construction: a pool recorded lazily has no binding for one refresh
-        // tick, and a burst admitted inside that tick would be priced without
-        // the credit the configuration asked for.
+        // Either stage may be the KV-aware one. Bind at construction through the
+        // same entry point as refresh so startup and periodic reconciliation
+        // cannot disagree about membership.
         let kv_state = if Self::needs_kv_state(prefill_policy.as_ref(), decode_policy.as_ref()) {
-            let prefill_kv = kv_aware_ops(prefill_policy.as_ref()).is_some();
-            let decode_kv = kv_aware_ops(decode_policy.as_ref()).is_some();
             Some(
                 PdKvState::start(
                     ctx.client.clone(),
                     ctx.router_config.api_key.clone(),
                     ctx.router_config.pd_kv_event_sources.clone(),
-                    (
-                        if prefill_kv {
-                            ctx.worker_registry.get_prefill_workers()
-                        } else {
-                            Vec::new()
-                        },
-                        prefill_kv.then(|| prefill_policy.clone()),
-                    ),
-                    (
-                        if decode_kv {
-                            ctx.worker_registry.get_decode_workers()
-                        } else {
-                            Vec::new()
-                        },
-                        decode_kv.then(|| decode_policy.clone()),
-                    ),
+                    Arc::clone(&ctx.worker_registry),
+                    kv_aware_ops(prefill_policy.as_ref())
+                        .is_some()
+                        .then(|| prefill_policy.clone()),
+                    kv_aware_ops(decode_policy.as_ref())
+                        .is_some()
+                        .then(|| decode_policy.clone()),
                 )
                 .await,
             )

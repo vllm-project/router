@@ -40,13 +40,10 @@ struct Discovery {
     worker: WorkerDiscovery,
 }
 
-/// The most recent P and D pools and effective policies seen on the request
-/// path. The background refresh loop binds from them; recording them is a few
-/// Arc clones, so requests never wait for control-plane probes.
+/// Policies that rank each P/D stage. Worker membership comes from the live
+/// `WorkerRegistry`, so an in-flight request cannot restore a removed worker.
 #[derive(Clone, Default)]
 struct RefreshInputs {
-    prefill: Arc<[Arc<dyn Worker>]>,
-    decode: Arc<[Arc<dyn Worker>]>,
     prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
     decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
 }
@@ -93,13 +90,11 @@ fn probe_outcome(existing: Option<&Binding>, signature: Option<&str>) -> ProbeOu
     }
 }
 
-/// A worker pool plus the policy that ranks it, when that policy is KV-aware.
-type PoolInput = (Vec<Arc<dyn Worker>>, Option<Arc<dyn LoadBalancingPolicy>>);
-
 pub(super) struct PdKvState {
     client: reqwest::Client,
     api_key: Option<String>,
     supervisor: KvIndexSupervisor,
+    registry: Option<Arc<crate::core::WorkerRegistry>>,
     bindings: Mutex<HashMap<String, Binding>>,
     targets: Mutex<HashMap<String, String>>,
     // Serializes bind() runs. Discovery and subscriber handshakes run outside
@@ -135,40 +130,34 @@ impl PdKvState {
         client: reqwest::Client,
         api_key: Option<String>,
         sources: HashMap<String, crate::config::types::PdKvEventSources>,
-        prefill: PoolInput,
-        decode: PoolInput,
+        registry: Arc<crate::core::WorkerRegistry>,
+        prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
+        decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
         state.api_key = api_key;
         state.supervisor.set_api_key(state.api_key.clone());
-        let prefill_workers = prefill.0.clone();
-        let decode_workers = decode.0.clone();
+        state.registry = Some(registry);
         state.refresh_inputs = Mutex::new(RefreshInputs {
-            prefill: prefill.0.iter().cloned().collect(),
-            prefill_policy: prefill.1,
-            decode: decode.0.iter().cloned().collect(),
-            decode_policy: decode.1,
+            prefill_policy,
+            decode_policy,
         });
         let state = Arc::new(state);
         // Bind during startup; unavailable metadata falls back to load until
         // refresh. Both pools are bound here so a burst that arrives before the
         // first refresh tick is still priced with the credit it configured.
-        let (prefill_policy, decode_policy) = {
+        for (decode, policy) in {
             let inputs = state.refresh_inputs.lock().await;
-            (inputs.prefill_policy.clone(), inputs.decode_policy.clone())
-        };
-        for (pool, policy) in [
-            (&prefill_workers, prefill_policy),
-            (&decode_workers, decode_policy),
-        ] {
+            [
+                (false, inputs.prefill_policy.clone()),
+                (true, inputs.decode_policy.clone()),
+            ]
+        } {
             let Some(policy) = policy else { continue };
-            let Some(kv) = kv_aware_ops(policy.as_ref()) else {
-                continue;
-            };
-            if pool.is_empty() {
+            if kv_aware_ops(policy.as_ref()).is_none() {
                 continue;
             }
-            if tokio::time::timeout(CONTROL_TIMEOUT, state.bind(pool, kv))
+            if tokio::time::timeout(CONTROL_TIMEOUT, state.bind_refresh(decode))
                 .await
                 .is_err()
             {
@@ -202,6 +191,7 @@ impl PdKvState {
             client,
             supervisor,
             api_key: None,
+            registry: None,
             bindings: Mutex::new(HashMap::new()),
             targets: Mutex::new(HashMap::new()),
             bind_lock: Mutex::new(()),
@@ -212,10 +202,10 @@ impl PdKvState {
         }
     }
 
-    /// Reconcile bindings off the request path. Requests only record their
-    /// pool and policy; they never wait for control-plane probes, so one
-    /// hung P endpoint can no longer delay admission. Until the first
-    /// successful bind, requests see no binding and route with no KV credit.
+    /// Reconcile bindings off the request path. Requests never wait for
+    /// control-plane probes, so one hung P endpoint cannot delay admission.
+    /// Until the first successful bind, requests see no binding and route
+    /// without KV credit.
     fn spawn_refresh(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
@@ -244,12 +234,20 @@ impl PdKvState {
 
     async fn bind_refresh(&self, decode: bool) {
         let _bind_guard = self.bind_lock.lock().await;
-        let (workers, policy) = {
+        let Some(registry) = self.registry.clone() else {
+            return;
+        };
+        let workers = if decode {
+            registry.get_decode_workers()
+        } else {
+            registry.get_prefill_workers()
+        };
+        let policy = {
             let inputs = self.refresh_inputs.lock().await;
             if decode {
-                (inputs.decode.clone(), inputs.decode_policy.clone())
+                inputs.decode_policy.clone()
             } else {
-                (inputs.prefill.clone(), inputs.prefill_policy.clone())
+                inputs.prefill_policy.clone()
             }
         };
         let Some(policy) = policy else { return };
@@ -259,19 +257,26 @@ impl PdKvState {
         self.bind_locked(&workers, kv).await;
     }
 
+    fn live_workers(&self, fallback: &[Arc<dyn Worker>]) -> Vec<Arc<dyn Worker>> {
+        match self.registry.as_ref() {
+            Some(registry) => {
+                let mut workers = registry.get_prefill_workers();
+                workers.extend(registry.get_decode_workers());
+                workers
+            }
+            None => fallback.to_vec(),
+        }
+    }
+
     async fn bind_locked(&self, workers: &[Arc<dyn Worker>], policy: &dyn KvAwareOps) {
         // Bindings outlive the pool that installed them: another role's pool
         // keeps its base registered, so removal is decided by every live pool
         // rather than by this one.
-        let current_bases: HashSet<String> = {
-            let inputs = self.refresh_inputs.lock().await;
-            inputs
-                .prefill
-                .iter()
-                .chain(inputs.decode.iter())
-                .map(|worker| worker.base_url().to_owned())
-                .collect()
-        };
+        let live = self.live_workers(workers);
+        let current_bases: HashSet<String> = live
+            .iter()
+            .map(|worker| worker.base_url().to_owned())
+            .collect();
         let refresh: Vec<String> = {
             let mut bindings = self.bindings.lock().await;
             bindings.retain(|base, _| {
@@ -304,15 +309,7 @@ impl PdKvState {
             let mut targets = self.targets.lock().await;
             // Every live pool, not just this one: one role's bind must not
             // unregister the other role's targets.
-            let current: HashSet<_> = {
-                let inputs = self.refresh_inputs.lock().await;
-                inputs
-                    .prefill
-                    .iter()
-                    .chain(inputs.decode.iter())
-                    .map(|worker| worker.url().to_owned())
-                    .collect()
-            };
+            let current: HashSet<_> = live.iter().map(|worker| worker.url().to_owned()).collect();
             targets.retain(|target, _| {
                 if current.contains(target) {
                     return true;
@@ -577,20 +574,6 @@ impl PdKvState {
         })
     }
 
-    /// Record the Decode pool the request path saw, so the refresh loop binds
-    /// its KV event subscriptions too. A Decode engine that enables prefix
-    /// caching holds blocks of its own; without them the Router cannot price
-    /// what a candidate must newly allocate.
-    pub(super) async fn record_decode_pool(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        policy: &Arc<dyn LoadBalancingPolicy>,
-    ) {
-        let mut inputs = self.refresh_inputs.lock().await;
-        inputs.decode = workers.iter().cloned().collect();
-        inputs.decode_policy = Some(policy.clone());
-    }
-
     /// Remove a worker from the policy and this state's registration cache, so
     /// a re-added URL cannot reuse a stale signature.
     pub(super) async fn unregister_worker(&self, url: &str, policy: &dyn KvAwareOps) {
@@ -598,22 +581,13 @@ impl PdKvState {
         policy.unregister_worker(url);
         self.targets.lock().await.remove(url);
         let base = super::dp_utils::parse_worker_url(url).0;
-        let mut inputs = self.refresh_inputs.lock().await;
-        let without = |pool: &Arc<[Arc<dyn Worker>]>| -> Arc<[Arc<dyn Worker>]> {
-            pool.iter()
-                .filter(|worker| worker.url() != url)
-                .cloned()
-                .collect::<Vec<_>>()
-                .into()
-        };
-        inputs.prefill = without(&inputs.prefill);
-        inputs.decode = without(&inputs.decode);
-        let base_still_live = inputs
-            .prefill
-            .iter()
-            .chain(inputs.decode.iter())
-            .any(|worker| worker.base_url() == base);
-        drop(inputs);
+        let base_still_live = self.registry.as_ref().is_some_and(|registry| {
+            registry
+                .get_prefill_workers()
+                .iter()
+                .chain(registry.get_decode_workers().iter())
+                .any(|worker| worker.base_url() == base)
+        });
         if !base_still_live {
             self.bindings.lock().await.remove(&base);
             self.supervisor.on_worker_removed(&base);
@@ -653,11 +627,6 @@ impl PdKvState {
         Option<HashMap<String, u64>>,
     ) {
         let started = Instant::now();
-        {
-            let mut inputs = self.refresh_inputs.lock().await;
-            inputs.prefill = prefill_workers.iter().cloned().collect();
-            inputs.prefill_policy = Some(prefill_policy.clone());
-        }
         let allow_credit = self.credit_by_base(request).await;
         let cache_salt = request.get("cache_salt").and_then(Value::as_str);
         let bases = |workers: &[Arc<dyn Worker>]| -> Vec<String> {
@@ -1395,6 +1364,10 @@ mod kv_input_tests {
             d_base.clone(),
             WorkerType::Decode,
         ))];
+        let registry = Arc::new(crate::core::WorkerRegistry::new());
+        for worker in prefill.iter().chain(decode.iter()) {
+            registry.register(worker.clone());
+        }
         let state = PdKvState::start(
             reqwest::Client::new(),
             None,
@@ -1402,8 +1375,9 @@ mod kv_input_tests {
                 (p_base.clone(), sources(5557)),
                 (d_base.clone(), sources(5558)),
             ]),
-            (prefill.clone(), Some(policy.clone())),
-            (decode.clone(), Some(policy.clone())),
+            registry.clone(),
+            Some(policy.clone()),
+            Some(policy.clone()),
         )
         .await;
         let credit = state.credit_by_base(&json!({"model":"m"})).await;
@@ -1428,6 +1402,7 @@ mod kv_input_tests {
         );
         // A stale refresh snapshot must not revive the removed worker.
         let kv = kv_aware_ops(policy.as_ref()).unwrap();
+        registry.remove_by_url(decode[0].url());
         state.unregister_worker(decode[0].url(), kv).await;
         state.bind_refresh(true).await;
         assert!(
@@ -1444,7 +1419,7 @@ mod kv_input_tests {
                 .is_none(),
             "a stale refresh must not re-register a removed Decode worker"
         );
-        state.record_decode_pool(&decode, &policy).await;
+        registry.register(decode[0].clone());
         state.bind_refresh(true).await;
         assert!(
             state

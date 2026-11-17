@@ -1864,17 +1864,14 @@ impl KvAwareOps for KvAwarePolicy {
                 let mut new_prefill_tokens = 0u64;
                 for tokens in prompts {
                     let hits = if verified {
-                        // Keyed by the prompt content that this backend actually rendered:
-                        // two backends can render the same request into different ids, and
-                        // a position-only key would hand the second one the first one's
-                        // query.
                         let key = (binding.cache_key.clone(), prompt_fingerprint(tokens));
-                        if !query_cache.contains_key(&key) {
-                            let local = Self::hashes_for(hashes, binding.block_size, tokens);
-                            let found = Self::placement_matches_with(&binding, local);
-                            query_cache.insert(key.clone(), found);
-                        }
-                        query_cache[&key].as_slice()
+                        query_cache
+                            .entry(key)
+                            .or_insert_with(|| {
+                                let local = Self::hashes_for(hashes, binding.block_size, tokens);
+                                Self::placement_matches_with(&binding, local)
+                            })
+                            .as_slice()
                     } else {
                         &[]
                     };
@@ -1944,12 +1941,13 @@ impl KvAwareOps for KvAwarePolicy {
                 let mut additional = 0u64;
                 for tokens in prompts {
                     let key = (binding.cache_key.clone(), prompt_fingerprint(tokens));
-                    if !query_cache.contains_key(&key) {
-                        let local = Self::hashes_for(hashes, binding.block_size, tokens);
-                        let found = Self::placement_matches_with(&binding, local);
-                        query_cache.insert(key.clone(), found);
-                    }
-                    let hits = query_cache[&key].as_slice();
+                    let hits = query_cache
+                        .entry(key)
+                        .or_insert_with(|| {
+                            let local = Self::hashes_for(hashes, binding.block_size, tokens);
+                            Self::placement_matches_with(&binding, local)
+                        })
+                        .as_slice();
                     let matches: Vec<_> = hits
                         .iter()
                         .filter(|hit| hit.target == binding.target)
