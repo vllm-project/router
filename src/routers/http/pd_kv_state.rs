@@ -40,12 +40,12 @@ struct Discovery {
     worker: WorkerDiscovery,
 }
 
-/// Policies that rank each P/D stage. Worker membership comes from the live
-/// `WorkerRegistry`, so an in-flight request cannot restore a removed worker.
-#[derive(Clone, Default)]
-struct RefreshInputs {
-    prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
-    decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
+/// One policy registration owned by this state, tagged with the role that
+/// installed it so a shared target table can unregister through the right
+/// policy.
+struct TargetRegistration {
+    signature: String,
+    decode: bool,
 }
 
 /// Consecutive failed probes before a previously healthy binding is treated as
@@ -95,18 +95,14 @@ pub(super) struct PdKvState {
     api_key: Option<String>,
     supervisor: KvIndexSupervisor,
     registry: Option<Arc<crate::core::WorkerRegistry>>,
+    prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
+    decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
     bindings: Mutex<HashMap<String, Binding>>,
-    targets: Mutex<HashMap<String, String>>,
+    targets: Mutex<HashMap<String, TargetRegistration>>,
     // Serializes bind() runs. Discovery and subscriber handshakes run outside
     // the map locks, so a slow P engine can only delay its own refresh —
     // never the request path's short binding reads.
     bind_lock: Mutex<()>,
-    // The background refresh loop's latest view of the P and D pools.
-    refresh_inputs: Mutex<RefreshInputs>,
-    // Base URLs configured to publish KV events. A pool with no entry has
-    // nothing to subscribe to, and recording it would only churn the policy's
-    // registration epoch — which invalidates live session bindings.
-    published: HashSet<String>,
     signals: tokio::task::JoinHandle<()>,
 }
 
@@ -138,21 +134,16 @@ impl PdKvState {
         state.api_key = api_key;
         state.supervisor.set_api_key(state.api_key.clone());
         state.registry = Some(registry);
-        state.refresh_inputs = Mutex::new(RefreshInputs {
-            prefill_policy,
-            decode_policy,
-        });
+        state.prefill_policy = prefill_policy;
+        state.decode_policy = decode_policy;
         let state = Arc::new(state);
         // Bind during startup; unavailable metadata falls back to load until
         // refresh. Both pools are bound here so a burst that arrives before the
         // first refresh tick is still priced with the credit it configured.
-        for (decode, policy) in {
-            let inputs = state.refresh_inputs.lock().await;
-            [
-                (false, inputs.prefill_policy.clone()),
-                (true, inputs.decode_policy.clone()),
-            ]
-        } {
+        for (decode, policy) in [
+            (false, state.prefill_policy.clone()),
+            (true, state.decode_policy.clone()),
+        ] {
             let Some(policy) = policy else { continue };
             if kv_aware_ops(policy.as_ref()).is_none() {
                 continue;
@@ -181,10 +172,6 @@ impl PdKvState {
         client: reqwest::Client,
         static_sources: HashMap<String, crate::config::types::PdKvEventSources>,
     ) -> Self {
-        // Kept before the map is moved into the supervisor: the request path
-        // asks whether a pool is configured to publish before it records that
-        // pool for binding.
-        let published: HashSet<String> = static_sources.keys().cloned().collect();
         let (supervisor, mut signals) =
             KvIndexSupervisor::new_pd(client.clone(), HashMode::Sha256, static_sources);
         Self {
@@ -192,11 +179,11 @@ impl PdKvState {
             supervisor,
             api_key: None,
             registry: None,
+            prefill_policy: None,
+            decode_policy: None,
             bindings: Mutex::new(HashMap::new()),
             targets: Mutex::new(HashMap::new()),
             bind_lock: Mutex::new(()),
-            refresh_inputs: Mutex::new(RefreshInputs::default()),
-            published,
             // Subscribers enforce trust by suspending/clearing affected sources.
             signals: tokio::spawn(async move { while signals.recv().await.is_some() {} }),
         }
@@ -227,9 +214,21 @@ impl PdKvState {
     /// handshakes run outside every map lock so an unresponsive engine can
     /// only delay its own refresh, never the request path. Never hold the
     /// admission load lock.
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     async fn bind(&self, workers: &[Arc<dyn Worker>], policy: &dyn KvAwareOps) {
         let _bind_guard = self.bind_lock.lock().await;
-        self.bind_locked(workers, policy).await;
+        let decode = workers
+            .first()
+            .is_some_and(|worker| matches!(worker.worker_type(), crate::core::WorkerType::Decode));
+        self.bind_locked(workers, policy, decode).await;
+    }
+
+    fn policy(&self, decode: bool) -> Option<Arc<dyn LoadBalancingPolicy>> {
+        if decode {
+            self.decode_policy.clone()
+        } else {
+            self.prefill_policy.clone()
+        }
     }
 
     async fn bind_refresh(&self, decode: bool) {
@@ -242,19 +241,13 @@ impl PdKvState {
         } else {
             registry.get_prefill_workers()
         };
-        let policy = {
-            let inputs = self.refresh_inputs.lock().await;
-            if decode {
-                inputs.decode_policy.clone()
-            } else {
-                inputs.prefill_policy.clone()
-            }
+        let Some(policy) = self.policy(decode) else {
+            return;
         };
-        let Some(policy) = policy else { return };
         let Some(kv) = kv_aware_ops(policy.as_ref()) else {
             return;
         };
-        self.bind_locked(&workers, kv).await;
+        self.bind_locked(&workers, kv, decode).await;
     }
 
     fn live_workers(&self, fallback: &[Arc<dyn Worker>]) -> Vec<Arc<dyn Worker>> {
@@ -268,7 +261,12 @@ impl PdKvState {
         }
     }
 
-    async fn bind_locked(&self, workers: &[Arc<dyn Worker>], policy: &dyn KvAwareOps) {
+    async fn bind_locked(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        policy: &dyn KvAwareOps,
+        decode: bool,
+    ) {
         // Bindings outlive the pool that installed them: another role's pool
         // keeps its base registered, so removal is decided by every live pool
         // rather than by this one.
@@ -305,18 +303,26 @@ impl PdKvState {
                 .cloned()
                 .collect()
         };
+        let mut removed = Vec::new();
         {
             let mut targets = self.targets.lock().await;
             // Every live pool, not just this one: one role's bind must not
             // unregister the other role's targets.
             let current: HashSet<_> = live.iter().map(|worker| worker.url().to_owned()).collect();
-            targets.retain(|target, _| {
+            targets.retain(|target, registration| {
                 if current.contains(target) {
                     return true;
                 }
-                policy.unregister_worker(target);
+                removed.push((target.clone(), registration.decode));
                 false
             });
+        }
+        for (target, decode) in removed {
+            if let Some(policy) = self.policy(decode) {
+                if let Some(kv) = kv_aware_ops(policy.as_ref()) {
+                    kv.unregister_worker(&target);
+                }
+            }
         }
         // Probe refresh candidates without holding any map lock.
         let probes: Vec<(String, Option<Discovery>)> =
@@ -410,7 +416,10 @@ impl PdKvState {
             let signature = binding
                 .map(|binding| format!("{}:{:?}", binding.signature, binding.info))
                 .unwrap_or_default();
-            if targets.get(worker.url()) == Some(&signature) {
+            if targets
+                .get(worker.url())
+                .is_some_and(|registration| registration.signature == signature)
+            {
                 continue;
             }
             policy.unregister_worker(worker.url());
@@ -427,7 +436,10 @@ impl PdKvState {
                     .flatten()
             });
             policy.register_worker(worker.as_ref(), info, matches);
-            targets.insert(worker.url().to_owned(), signature);
+            targets.insert(
+                worker.url().to_owned(),
+                TargetRegistration { signature, decode },
+            );
         }
     }
 
@@ -545,32 +557,6 @@ impl PdKvState {
                 return false;
             }
             true
-        })
-    }
-
-    /// Whether any of `workers` is configured to publish KV events.
-    ///
-    /// Binding a pool that publishes nothing is not merely wasteful: the bind
-    /// path re-registers each target, which starts a new registration epoch and
-    /// makes every live session binding look stale. So the Decode pool is
-    /// recorded for binding only when it has something to subscribe to.
-    pub(super) fn publishes_for(&self, workers: &[Arc<dyn Worker>]) -> bool {
-        if workers
-            .iter()
-            .any(|worker| self.published.contains(worker.base_url()))
-        {
-            return true;
-        }
-        // A source discovered through the worker's control interface has no static URL.
-        // Ask the bindings that actually exist, or discovery would subscribe, bind, and
-        // still never be priced.
-        let Ok(bindings) = self.bindings.try_lock() else {
-            return false;
-        };
-        workers.iter().any(|worker| {
-            bindings
-                .get(worker.base_url())
-                .is_some_and(|binding| binding.info.is_some())
         })
     }
 
@@ -946,44 +932,6 @@ mod kv_input_tests {
         );
     }
 
-    /// A source discovered through the worker's control interface has no static URL.
-    /// Answering from the static set alone made discovery useless: the subscription
-    /// succeeded, the binding existed, and the request path still skipped Decode pricing.
-    #[tokio::test]
-    async fn bound_decode_source_is_priceable_without_a_static_url() {
-        let state = PdKvState::new(Client::new());
-        let decode = decode_worker("http://d0");
-        assert!(
-            !state.publishes_for(std::slice::from_ref(&decode)),
-            "no static URL and no binding means nothing to price"
-        );
-
-        {
-            let mut bindings = state.bindings.lock().await;
-            bindings.insert(
-                decode.base_url().to_string(),
-                bound(Some(WorkerKvInfo {
-                    instance_id: "i".to_string(),
-                    block_size: Some(16),
-                    ranks: vec![0],
-                    cache_key: None,
-                })),
-            );
-        }
-        assert!(
-            state.publishes_for(std::slice::from_ref(&decode)),
-            "a bound source must be priced even without a static URL"
-        );
-
-        {
-            let mut bindings = state.bindings.lock().await;
-            bindings.insert(decode.base_url().to_string(), bound(None));
-        }
-        assert!(
-            !state.publishes_for(&[decode]),
-            "a binding without cache identity is not priceable"
-        );
-    }
     use crate::core::{BasicWorker, WorkerType};
     use crate::policies::{kv_aware_ops, KvAwarePolicy, PromptHashes};
     use axum::extract::Request;
@@ -1353,7 +1301,8 @@ mod kv_input_tests {
             block_size: 16,
             model: Some("m".to_owned()),
         };
-        let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
+        let prefill_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
+        let decode_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
         let prefill: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
             p_base.clone(),
             WorkerType::Prefill {
@@ -1376,8 +1325,8 @@ mod kv_input_tests {
                 (d_base.clone(), sources(5558)),
             ]),
             registry.clone(),
-            Some(policy.clone()),
-            Some(policy.clone()),
+            Some(prefill_policy.clone()),
+            Some(decode_policy.clone()),
         )
         .await;
         let credit = state.credit_by_base(&json!({"model":"m"})).await;
@@ -1390,7 +1339,7 @@ mod kv_input_tests {
             state
                 .prepare_decode_context(
                     &decode,
-                    &policy,
+                    &decode_policy,
                     &request,
                     "/v1/completions",
                     None,
@@ -1400,16 +1349,32 @@ mod kv_input_tests {
                 .is_some(),
             "Decode must be priced before the first request"
         );
+        // Prefill refresh removes a deleted Decode worker through the Decode
+        // policy, not its own.
+        let decode_kv = kv_aware_ops(decode_policy.as_ref()).unwrap();
+        let removed = decode[0].clone();
+        registry.remove_by_url(removed.url());
+        state.bind_refresh(false).await;
+        assert_eq!(
+            decode_kv.estimate_decode_work(
+                &[(removed.as_ref(), &[vec![1, 2, 3]], true)],
+                &mut PromptHashes::new(),
+            )[0]
+            .additional_tokens,
+            None,
+            "Prefill refresh must unregister the Decode target through Decode policy"
+        );
+        registry.register(removed.clone());
+        state.bind_refresh(true).await;
         // A stale refresh snapshot must not revive the removed worker.
-        let kv = kv_aware_ops(policy.as_ref()).unwrap();
-        registry.remove_by_url(decode[0].url());
-        state.unregister_worker(decode[0].url(), kv).await;
+        registry.remove_by_url(removed.url());
+        state.unregister_worker(removed.url(), decode_kv).await;
         state.bind_refresh(true).await;
         assert!(
             state
                 .prepare_decode_context(
                     &decode,
-                    &policy,
+                    &decode_policy,
                     &request,
                     "/v1/completions",
                     None,
@@ -1425,7 +1390,7 @@ mod kv_input_tests {
             state
                 .prepare_decode_context(
                     &decode,
-                    &policy,
+                    &decode_policy,
                     &request,
                     "/v1/completions",
                     None,

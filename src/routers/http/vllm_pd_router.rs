@@ -1350,9 +1350,6 @@ impl VllmPDRouter {
         // reports its last availability on the admission-time handle, and a
         // replacement registered in the meantime is invisible from it.
         let mut candidates = self.live_decode_candidates(input.pool);
-        // Subscriptions follow the live pool, not this request's filtered view: a model
-        // filter or a push pin must not unbind the other registered Decode workers.
-        let pool_for_subscriptions = candidates.clone();
         let pin = pin_to_provisional.then_some(&input.provisional_endpoint);
         // Price only what could actually be selected: an unavailable member of the live
         // pool made the whole pool refuse credit, because pricing requires every candidate
@@ -1402,23 +1399,21 @@ impl VllmPDRouter {
         // Decode selection until Prefill completes, and the cheap placeholder
         // figure taken then is stale by the time a candidate is actually picked.
         // This runs before the commit so the closure below is pure selection.
-        let decode_context = async {
-            let state = self.pd_router.kv_state.as_ref()?;
-            if !(state.publishes_for(&pool_for_subscriptions)) {
-                return None;
+        let decode_context = match self.pd_router.kv_state.as_ref() {
+            Some(state) => {
+                state
+                    .prepare_decode_context(
+                        &candidates,
+                        &decode_policy,
+                        request,
+                        &input.route,
+                        headers,
+                        input.router_prompts.as_ref(),
+                    )
+                    .await
             }
-            state
-                .prepare_decode_context(
-                    &candidates,
-                    &decode_policy,
-                    request,
-                    &input.route,
-                    headers,
-                    input.router_prompts.as_ref(),
-                )
-                .await
-        }
-        .await;
+            None => None,
+        };
         // Pricing can wait on a slow backend. Re-read the pool so a removed
         // worker cannot be committed and a new one has no stale price.
         candidates = self.live_decode_candidates(input.pool);
