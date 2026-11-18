@@ -250,6 +250,7 @@ impl PdLoadManager {
     /// Both stages are charged here. Callers that dispatch Decode only after
     /// Prefill completes use [`Self::admit_deferred`] instead.
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn admit(
         &self,
         select: impl FnOnce(&Loads) -> Option<PdSelection>,

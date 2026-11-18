@@ -203,6 +203,7 @@ impl PdKvState {
     /// only delay its own refresh, never the request path. Never hold the
     /// admission load lock.
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     async fn bind(&self, workers: &[Arc<dyn Worker>], policy: &dyn KvAwareOps) {
         let _bind_guard = self.bind_lock.lock().await;
         let decode = workers
