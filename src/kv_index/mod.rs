@@ -1,29 +1,47 @@
 //! Multi-tier KV cache placement index, fed by engine events.
 
-mod admit;
-mod binding;
-mod decode;
+mod routing_provider;
+pub(crate) mod source;
+
+pub mod discovery;
+use source::endpoints;
+pub use source::events::{subscriber, wire};
 
 use std::sync::Arc;
 
+/// Local observation ownership only; this is not an authenticated engine epoch.
+/// Both ingestion paths use one allocator so delayed cleanup cannot cross modes.
+/// Stream generations instead fence snapshots across resets of the same owner.
+pub(crate) fn next_owner_incarnation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let value = NEXT.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(value, u64::MAX, "KV owner generation exhausted");
+    value
+}
+
 use sha2::{Digest, Sha256};
-pub mod discovery;
-mod endpoints;
 pub mod index;
 pub use index as indexer;
-mod routing_provider;
-pub mod subscriber;
+pub(crate) mod layout;
 pub mod types;
-pub mod wire;
 
-pub use admit::validate_device_batch;
-pub use decode::decode_batch;
 pub use discovery::{
     CacheKey, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, WorkerKvInfo,
 };
-pub(crate) use endpoints::canonical_endpoint;
-pub use endpoints::{parse_endpoint_mapping, resolve_endpoints};
-pub use indexer::{KvBlockIndexer, MatchQuery, TierMatch};
+pub use index::{KvBlockIndexer, MatchQuery, TierMatch};
+pub use layout::{
+    common_reusable_tokens, AdapterCapability, CacheCapabilities, CacheGroup, GroupCapability,
+    GroupRule, GroupView, RankCapability,
+};
+pub use source::binding::SourceBinding;
+pub(crate) use source::endpoints::canonical_endpoint;
+pub use source::endpoints::{parse_endpoint_mapping, resolve_endpoints};
+pub use source::events::decode::decode_batch;
+pub use source::events::event_stream::{
+    spawn_zmq, EventStream, EventSubscriberHandle, StreamError, StreamLease,
+};
+pub use source::SourceError;
 pub use subscriber::local_hashes;
 pub use types::{
     CacheOwnerId, ClearScope, HashMode, Locality, ResidencyOwner, RoutableTarget, SourceId,
@@ -86,8 +104,8 @@ pub(crate) fn record_signal_loss() {
     SIGNAL_LOSS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
-/// Raw signals ingestion emits; the trust arbiter consumes these. The
-/// `EXACT`/`DEGRADED`/`FALLBACK` state machine is the trust arbiter's contract.
+/// Ingestion progress and continuity signals. Loss also fences the index
+/// synchronously, independently of this advisory channel.
 #[derive(Debug, Clone)]
 pub enum IngestionSignal {
     Invalidated {

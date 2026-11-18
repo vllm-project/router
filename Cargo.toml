@@ -209,10 +209,6 @@ name = "grpc_vs_http_e2e"
 path = "tests/rust/grpc_vs_http_e2e.rs"
 
 [[test]]
-name = "kv_device_consumer"
-path = "tests/rust/kv_device_consumer.rs"
-
-[[test]]
 name = "kv_endpoint_worker_hosts"
 path = "tests/rust/kv_endpoint_worker_hosts.rs"
 

@@ -127,10 +127,11 @@ fn decode_event(event: Value) -> Result<KVEvent, String> {
     for (key, value) in pairs {
         match key.as_str() {
             Some("block_hashes") => {
-                let hashes = value
-                    .as_array()
-                    .filter(|hashes| !hashes.is_empty())
-                    .ok_or("KV event hashes must be a nonempty array")?;
+                // Structure only. vLLM emits an empty list for a Mamba checkpoint
+                // group whose states in a chunk were all skipped, so whether an
+                // empty list is acceptable depends on the group and is decided by
+                // each consumer, not by the shared decoder.
+                let hashes = value.as_array().ok_or("KV event hashes must be an array")?;
                 for hash in hashes {
                     validate_wire_hash(hash)?;
                 }
@@ -185,7 +186,6 @@ fn validate_wire_hash(hash: &Value) -> Result<(), String> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::kv_index::validate_device_batch;
     use crate::kv_index::wire::{BlockStored, ExternalBlockHash};
 
     fn stored() -> Value {
@@ -211,13 +211,13 @@ mod tests {
         rmpv::decode::read_value(&mut Cursor::new(bytes)).unwrap()
     }
 
-    fn encode(events: Vec<Value>, rank: Value) -> Vec<u8> {
+    fn encode(events: Vec<Value>, rank: impl Into<Option<Value>>) -> Vec<u8> {
+        let mut batch = vec![1.25.into(), Value::Array(events)];
+        if let Some(rank) = rank.into() {
+            batch.push(rank);
+        }
         let mut bytes = Vec::new();
-        rmpv::encode::write_value(
-            &mut bytes,
-            &Value::Array(vec![1.25.into(), Value::Array(events), rank]),
-        )
-        .unwrap();
+        rmpv::encode::write_value(&mut bytes, &Value::Array(batch)).unwrap();
         bytes
     }
 
@@ -249,7 +249,7 @@ mod tests {
         ] {
             change(&mut event, key, value);
         }
-        let batch = decode_batch(&encode(vec![event], 3.into())).unwrap();
+        let batch = decode_batch(&encode(vec![event], Value::from(3))).unwrap();
         assert_eq!(batch.ts, 1.25);
         assert_eq!(batch.data_parallel_rank, Some(3));
         let KVEvent::BlockStored(event) = &batch.events[0] else {
@@ -271,26 +271,60 @@ mod tests {
         assert_eq!(event.lora_id, Some(9));
         assert_eq!(event.lora_name.as_deref(), Some("adapter"));
         assert_eq!(event.extra_keys, Some(vec!["salt".into()]));
-        assert!(validate_device_batch(&batch, 2).is_err());
     }
 
     #[test]
-    fn device_admission_is_separate_and_conservative() {
-        let batch = decode_batch(&encode(vec![stored()], Value::Nil)).unwrap();
-        assert!(validate_device_batch(&batch, 2).is_ok());
-        for (key, value) in [
-            ("medium", "CPU".into()),
-            ("medium", Value::Nil),
-            ("ownership", "UNKNOWN".into()),
-            ("locality", "UNKNOWN".into()),
-            ("group_idx", 1.into()),
-            ("token_ids", Value::Array(vec![1.into()])),
-            ("parent_block_hash", Value::Binary(vec![8; 31])),
+    fn event_rank_preserves_absent_nil_zero_and_nonzero() {
+        for event in [
+            stored(),
+            Value::Map(vec![
+                ("type".into(), "BlockRemoved".into()),
+                (
+                    "block_hashes".into(),
+                    Value::Array(vec![Value::Binary(vec![7; 32])]),
+                ),
+                ("medium".into(), "GPU".into()),
+            ]),
+            Value::Map(vec![("type".into(), "AllBlocksCleared".into())]),
+        ] {
+            for rank in [None, Some(Value::Nil), Some(0.into()), Some(7.into())] {
+                let expected = rank
+                    .as_ref()
+                    .and_then(Value::as_u64)
+                    .map(|rank| rank as u32);
+                let batch = decode_batch(&encode(vec![event.clone()], rank)).unwrap();
+                assert_eq!(batch.data_parallel_rank, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn extra_key_shapes_are_preserved_before_admission() {
+        for (wire, expected) in [
+            (None, None),
+            (Some(Value::Nil), None),
+            (Some(Value::Array(vec![Value::Nil])), Some(vec![Value::Nil])),
+            (
+                Some(Value::Array(vec![
+                    Value::Nil,
+                    Value::Binary(vec![0xc1, 0xff]),
+                ])),
+                Some(vec![Value::Nil, Value::Binary(vec![0xc1, 0xff])]),
+            ),
         ] {
             let mut event = stored();
-            change(&mut event, key, value);
-            let batch = decode_batch(&encode(vec![event], 0.into())).unwrap();
-            assert!(validate_device_batch(&batch, 2).is_err(), "{key}");
+            let Value::Map(fields) = &mut event else {
+                unreachable!()
+            };
+            fields.retain(|(key, _)| key.as_str() != Some("extra_keys"));
+            if let Some(wire) = wire {
+                change(&mut event, "extra_keys", wire);
+            }
+            let batch = decode_batch(&encode(vec![event], Value::Nil)).unwrap();
+            let KVEvent::BlockStored(event) = &batch.events[0] else {
+                unreachable!()
+            };
+            assert_eq!(event.extra_keys, expected);
         }
     }
 
@@ -314,7 +348,7 @@ mod tests {
                 Value::Map(vec![("type".into(), "AllBlocksCleared".into())]),
             ),
         ] {
-            assert!(decode_batch(&encode(vec![template.clone()], 0.into())).is_ok());
+            assert!(decode_batch(&encode(vec![template.clone()], Value::from(0))).is_ok());
             for (unknown_keys, expected) in [
                 (&["zzzz", "aaaa"][..], "aaaa"),
                 (&["aaaa", "zzzz"][..], "aaaa"),
@@ -325,7 +359,7 @@ mod tests {
                     change(&mut event, key, Value::Nil);
                 }
                 assert_eq!(
-                    decode_batch(&encode(vec![stored(), event], 0.into())).unwrap_err(),
+                    decode_batch(&encode(vec![stored(), event], Value::from(0))).unwrap_err(),
                     format!("unsupported KV event field: {expected}"),
                     "{kind}: {unknown_keys:?}"
                 );
@@ -361,7 +395,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                decode_batch(&encode(vec![stored(), event], 0.into())).unwrap_err(),
+                decode_batch(&encode(vec![stored(), event], Value::from(0))).unwrap_err(),
                 expected
             );
         }
@@ -373,11 +407,10 @@ mod tests {
                 Value::Array(vec![Value::Binary(vec![7; 32])]),
             ),
         ]);
-        let batch = decode_batch(&encode(vec![removed], 0.into())).unwrap();
+        let batch = decode_batch(&encode(vec![removed], Value::from(0))).unwrap();
         assert!(
             matches!(&batch.events[0], KVEvent::BlockRemoved(event) if event.medium.as_deref() == Some("CPU"))
         );
-        assert!(validate_device_batch(&batch, 2).is_err());
     }
 
     #[test]
@@ -389,9 +422,10 @@ mod tests {
             Value::Array(vec![Value::Binary(vec![0xc1; 32])]),
         );
         change(&mut event, "parent_block_hash", Value::Nil);
-        let mut payload = encode(vec![event], 0.into());
+        let mut payload = encode(vec![event], Value::from(0));
         let batch = decode_batch(&payload).unwrap();
-        assert!(validate_device_batch(&batch, 2).is_ok());
+        assert!(matches!(&batch.events[0], KVEvent::BlockStored(event)
+            if event.block_hashes == [ExternalBlockHash::Bytes(vec![0xc1; 32])]));
 
         let key = b"parent_block_hash";
         let parent = payload
@@ -411,7 +445,7 @@ mod tests {
             "block_hashes",
             Value::Array(vec![Value::Binary(vec![0xff; 32])]),
         );
-        let mut payload = encode(vec![event], 0.into());
+        let mut payload = encode(vec![event], Value::from(0));
         assert!(decode_batch(&payload).is_ok());
         let hash = payload
             .windows(34)
@@ -430,13 +464,12 @@ mod tests {
             let extras = vec![Value::Map(vec![(key, value)])];
             let mut event = stored();
             change(&mut event, "extra_keys", Value::Array(extras.clone()));
-            let mut payload = encode(vec![event], 0.into());
+            let mut payload = encode(vec![event], Value::from(0));
             let batch = decode_batch(&payload).unwrap();
             let KVEvent::BlockStored(event) = &batch.events[0] else {
                 panic!("stored expected")
             };
             assert_eq!(event.extra_keys.as_ref(), Some(&extras));
-            assert!(validate_device_batch(&batch, 2).is_err());
 
             let opaque = payload
                 .windows(34)
@@ -451,8 +484,8 @@ mod tests {
     fn bounded_messagepack_and_trailing_bytes() {
         assert!(decode_batch(&vec![0; MAX_PAYLOAD_BYTES + 1]).is_err());
         let clear = Value::Map(vec![("type".into(), "AllBlocksCleared".into())]);
-        assert!(decode_batch(&encode(vec![clear; 4097], 0.into())).is_err());
-        let mut payload = encode(vec![stored()], 0.into());
+        assert!(decode_batch(&encode(vec![clear; 4097], Value::from(0))).is_err());
+        let mut payload = encode(vec![stored()], Value::from(0));
         payload.push(0);
         assert!(decode_batch(&payload).is_err());
         let mut deep = Value::Nil;
@@ -461,7 +494,7 @@ mod tests {
         }
         let mut event = stored();
         change(&mut event, "extra_keys", deep);
-        assert!(decode_batch(&encode(vec![event], 0.into())).is_err());
+        assert!(decode_batch(&encode(vec![event], Value::from(0))).is_err());
     }
 
     #[test]
@@ -493,7 +526,7 @@ mod tests {
                     let mut event = template.clone();
                     change(&mut event, field, valid);
                     assert!(
-                        decode_batch(&encode(vec![event], 0.into())).is_ok(),
+                        decode_batch(&encode(vec![event], Value::from(0))).is_ok(),
                         "{field}"
                     );
                 }
@@ -507,7 +540,7 @@ mod tests {
                     let mut event = template.clone();
                     change(&mut event, field, invalid.clone());
                     assert!(
-                        decode_batch(&encode(vec![stored(), event], 0.into())).is_err(),
+                        decode_batch(&encode(vec![stored(), event], Value::from(0))).is_err(),
                         "{field}: {invalid:?}"
                     );
                 }
@@ -521,7 +554,7 @@ mod tests {
             let mut event = stored();
             change(&mut event, "block_hashes", Value::Array(vec![hash.clone()]));
             change(&mut event, "parent_block_hash", hash);
-            assert!(decode_batch(&encode(vec![event], 0.into())).is_ok());
+            assert!(decode_batch(&encode(vec![event], Value::from(0))).is_ok());
         }
         for field in ["block_hashes", "parent_block_hash"] {
             let mut event = stored();
@@ -531,7 +564,7 @@ mod tests {
                 (-1).into()
             };
             change(&mut event, field, value);
-            assert!(decode_batch(&encode(vec![event], 0.into())).is_err());
+            assert!(decode_batch(&encode(vec![event], Value::from(0))).is_err());
         }
     }
 
@@ -544,5 +577,18 @@ mod tests {
             nested.extend_from_slice(&payload);
             assert!(decode_batch(&nested).is_err(), "nested marker {marker:#x}");
         }
+    }
+
+    #[test]
+    fn empty_hash_list_decodes_for_consumers_to_judge() {
+        let mut event = stored();
+        change(&mut event, "block_hashes", Value::Array(vec![]));
+        change(&mut event, "extra_keys", Value::Nil);
+        let batch = decode_batch(&encode(vec![event], Value::from(0))).unwrap();
+        assert_eq!(batch.events.len(), 1);
+        // Non-array hashes are still structurally invalid.
+        let mut bad = stored();
+        change(&mut bad, "block_hashes", Value::Nil);
+        assert!(decode_batch(&encode(vec![bad], Value::from(0))).is_err());
     }
 }

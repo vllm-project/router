@@ -33,7 +33,7 @@ use crate::protocols::spec::{
 use crate::request_identity::{resolve_affinity_identity, IdentityFields};
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
-use crate::routers::{RouterTrait, WorkerManagement};
+use crate::routers::{reject_full_report, RouterTrait, WorkerManagement};
 use crate::token_estimator::{MomentumTokenEstimator, TokenEstimateScope};
 use axum::body::to_bytes;
 use axum::{
@@ -1468,6 +1468,22 @@ impl Router {
         model_id: Option<&str>,
         raw_body: Option<axum::body::Bytes>,
     ) -> Response {
+        if self.kv_index_supervisor.is_some() {
+            // Check the bytes actually forwarded by the raw completion path.
+            // Typed requests can borrow their passthrough fields without
+            // serializing long prompts or multimodal payloads.
+            let raw_request = raw_body
+                .as_ref()
+                .and_then(|raw| serde_json::from_slice::<serde_json::Value>(raw).ok());
+            let identity = typed_req.affinity_identity();
+            let args = match raw_request.as_ref() {
+                Some(body) => body.get("vllm_xargs"),
+                None => identity.other.and_then(|other| other.get("vllm_xargs")),
+            };
+            if let Some(response) = reject_full_report(true, args) {
+                return response;
+            }
+        }
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let model_id = model_id
@@ -3031,6 +3047,10 @@ impl RouterTrait for Router {
         .into_response()
     }
 
+    fn monitors_kv_events(&self) -> bool {
+        self.kv_index_supervisor.is_some()
+    }
+
     fn router_type(&self) -> &'static str {
         "regular"
     }
@@ -3070,6 +3090,11 @@ impl RouterTrait for Router {
         method: &Method,
         body: serde_json::Value,
     ) -> Response {
+        if let Some(response) =
+            reject_full_report(self.kv_index_supervisor.is_some(), body.get("vllm_xargs"))
+        {
+            return response;
+        }
         debug!("Transparent proxy: routing {} {} to backend", method, path);
         let start = Instant::now();
 
@@ -3846,6 +3871,32 @@ mod tests {
             })
             .await
             .unwrap();
+            // A bound source first replays existing history before consuming
+            // live events. This fresh mock publisher has no earlier batches.
+            let request = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match replay.recv_multipart(zmq::DONTWAIT) {
+                        Ok(request) => break request,
+                        Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                        Err(error) => panic!("Router startup replay: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(request.last().unwrap(), &0i64.to_be_bytes());
+            replay
+                .send_multipart(
+                    [
+                        request[0].clone(),
+                        vec![],
+                        vec![],
+                        (-1i64).to_be_bytes().to_vec(),
+                        vec![],
+                    ],
+                    0,
+                )
+                .unwrap();
             let payload =
                 |hash: u32, token: u32, block_size: u32| {
                     rmp_serde::to_vec(&(1.0, [json!({
@@ -5508,6 +5559,59 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn monitored_routes_reject_full_before_forwarding() {
+        let mut fixture =
+            http_kv_fixture([vec![vec![1, 2, 3, 4]], vec![vec![1, 2, 3, 4]]], 0, true).await;
+        let (supervisor, _signals) = crate::kv_index::KvIndexSupervisor::new_http_full_attention(
+            reqwest::Client::new(),
+            crate::kv_index::HashMode::Sha256,
+        );
+        fixture.router.kv_index_supervisor = Some(Arc::new(supervisor));
+        let chat = serde_json::json!({
+            "model": "local", "messages": [],
+            "vllm_xargs": {"kv_cache_report_mode": "full"}
+        });
+        let response = fixture
+            .router
+            .route_typed_request(
+                None,
+                &serde_json::from_value::<ChatCompletionRequest>(chat.clone()).unwrap(),
+                "/v1/chat/completions",
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let completion = serde_json::json!({
+            "model": "local", "prompt": [1, 2, 3, 4],
+            "vllm_xargs": {"kv_cache_report_mode": "full"}
+        });
+        let raw = bytes::Bytes::from(serde_json::to_vec(&completion).unwrap());
+        let response = fixture
+            .router
+            .route_completion_raw(
+                None,
+                Arc::new(serde_json::from_slice(&raw).unwrap()),
+                raw,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = fixture
+            .router
+            .route_transparent(None, "/custom", &Method::POST, chat.clone())
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(fixture.calls.lock().is_empty());
+
+        fixture.router.kv_index_supervisor = None;
+        let response = fixture
+            .router
+            .route_transparent(None, "/custom", &Method::POST, chat)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!fixture.calls.lock().is_empty());
+    }
     #[test]
     fn program_targets_cache_tracks_worker_registry_revision() {
         let router = create_test_regular_router();

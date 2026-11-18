@@ -8,6 +8,8 @@ use dashmap::DashMap;
 use crate::kv_hash::SequenceHash;
 use crate::kv_index::{ResidencyOwner, StorageTier};
 
+use super::TIERS;
+
 fn sparse_digest(hash: &SequenceHash) -> [u8; 66] {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut key = [0; 66];
@@ -98,23 +100,70 @@ impl FactKey {
     }
 }
 
+/// Prepare a request's hashes once outside the domain lock and reuse the keys
+/// for every group. Namespace is part of the key, never a query fallback.
+pub(crate) fn prepare_sparse_keys(
+    namespace: Option<&str>,
+    hashes: &[SequenceHash],
+) -> Vec<FactKey> {
+    match namespace {
+        None => hashes.iter().copied().map(FactKey::Digest).collect(),
+        Some(name) => hashes
+            .iter()
+            .map(|hash| FactKey::Text(sparse_key(Some(name), hash)))
+            .collect(),
+    }
+}
+
 /// One fact per owner and sequence hash, with residency tiers as bits.
 pub(super) type ResidencyRecords =
     DashMap<ResidencyOwner, HashMap<FactKey, Residency, foldhash::fast::RandomState>>;
 
+/// One authoritative observation, including native incremental GPU copies.
+/// Keeping the count here avoids a second hash table with a separate lifetime.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(super) struct Residency {
     pub(super) tiers: TierBits,
+    device_copies: u32,
 }
 
 impl Residency {
-    pub(super) fn observe(&mut self, tier: StorageTier) {
-        self.tiers.add(tier);
+    pub(super) fn can_observe(self, incremental: bool) -> bool {
+        !incremental || self.device_copies < u32::MAX
     }
 
-    pub(super) fn withdraw(&mut self, tier: Option<StorageTier>) {
+    pub(super) fn observe(&mut self, tier: StorageTier, incremental: bool) -> bool {
+        if incremental {
+            if tier != StorageTier::Device {
+                return false;
+            }
+            let Some(next) = self.device_copies.checked_add(1) else {
+                return false;
+            };
+            self.device_copies = next;
+        }
+        self.tiers.add(tier);
+        true
+    }
+
+    /// Return only the tiers that actually disappeared, after the last copy.
+    pub(super) fn withdraw(&mut self, tier: Option<StorageTier>, incremental: bool) -> TierBits {
+        if incremental {
+            if tier != Some(StorageTier::Device) {
+                return TierBits::default();
+            }
+            if self.device_copies > 1 {
+                self.device_copies -= 1;
+                return TierBits::default();
+            }
+        }
         let mask = tier.map_or(0b1111, TierBits::bit);
+        if mask & TierBits::bit(StorageTier::Device) != 0 {
+            self.device_copies = 0;
+        }
+        let removed = TierBits(self.tiers.0 & mask);
         self.tiers.0 &= !mask;
+        removed
     }
 
     pub(super) fn contains(self, tier: StorageTier) -> bool {
@@ -137,12 +186,54 @@ impl TierBits {
     pub(super) fn add(&mut self, tier: StorageTier) {
         self.0 |= Self::bit(tier);
     }
+
+    pub(crate) fn best(self) -> Option<StorageTier> {
+        TIERS.into_iter().find(|tier| self.contains(*tier))
+    }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn residency_counts_only_incremental_gpu_copies_and_keeps_other_tiers() {
+        let mut record = Residency::default();
+        for _ in 0..2 {
+            assert!(record.observe(StorageTier::Device, true));
+        }
+        assert!(!record.observe(StorageTier::HostPinned, true));
+        assert!(record.observe(StorageTier::HostPinned, false));
+        assert_eq!(record.withdraw(Some(StorageTier::HostPinned), true).0, 0);
+        assert_eq!(record.withdraw(None, true).0, 0);
+        assert_eq!(record.device_copies, 2);
+        assert_eq!(record.withdraw(Some(StorageTier::Device), true).0, 0);
+        assert!(record.contains(StorageTier::Device));
+        assert_eq!(
+            record.withdraw(Some(StorageTier::Device), true).0,
+            TierBits::bit(StorageTier::Device)
+        );
+        assert!(!record.contains(StorageTier::Device));
+        assert!(record.contains(StorageTier::HostPinned));
+        assert_eq!(record.device_copies, 0);
+        record.withdraw(None, false);
+        assert_eq!(record, Residency::default());
+    }
+
+    #[test]
+    fn replica_overflow_does_not_change_the_observation() {
+        let mut record = Residency {
+            tiers: TierBits(TierBits::bit(StorageTier::Device)),
+            device_copies: u32::MAX,
+        };
+        let before = record;
+        assert!(!record.observe(StorageTier::Device, true));
+        assert_eq!(record, before);
+        assert!(record.observe(StorageTier::HostPinned, false));
+        record.withdraw(None, false);
+        assert_eq!(record, Residency::default());
+    }
 
     #[test]
     fn canonical_digest_decoding_preserves_every_byte_and_rejects_other_text() {

@@ -15,7 +15,7 @@ use crate::protocols::worker_spec::{
     WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse, WorkerInfo, WorkerListResponse,
     WorkerStats, WorkerTypeStats,
 };
-use crate::routers::{RouterTrait, WorkerManagement};
+use crate::routers::{is_full_report, reject_full_report, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -94,6 +94,24 @@ impl RouterManager {
             *default_router = Some(id.clone());
             info!("Set default router to {}", id.as_str());
         }
+    }
+
+    // A publisher may be shared by routers with different policies. Reject
+    // explicit full reports across this manager if any router monitors events.
+    fn reject_shared_full_report(
+        &self,
+        vllm_xargs: Option<&serde_json::Value>,
+    ) -> Option<Response> {
+        // Only explicit full reports require checking subscriber ownership.
+        if !is_full_report(vllm_xargs) {
+            return None;
+        }
+        reject_full_report(
+            self.routers
+                .iter()
+                .any(|router| router.monitors_kv_events()),
+            vllm_xargs,
+        )
     }
 
     /// Set the default router
@@ -610,6 +628,9 @@ impl RouterTrait for RouterManager {
         body: &InferenceGenerateRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        if let Some(response) = self.reject_shared_full_report(body.other.get("vllm_xargs")) {
+            return response;
+        }
         let router = self.select_router_for_request(headers, None);
 
         if let Some(router) = router {
@@ -630,6 +651,9 @@ impl RouterTrait for RouterManager {
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        if let Some(response) = self.reject_shared_full_report(body.other.get("vllm_xargs")) {
+            return response;
+        }
         // Select router based on headers and model.
         // When model is None, select_router_for_request considers all registered
         // routers (including PD routers), so a single-model deployment will still
@@ -655,6 +679,9 @@ impl RouterTrait for RouterManager {
         body: &CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        if let Some(response) = self.reject_shared_full_report(body.other.get("vllm_xargs")) {
+            return response;
+        }
         // Select router based on headers and model.
         // When model is None, select_router_for_request considers all registered
         // routers (including PD routers), so a single-model deployment will still
@@ -680,6 +707,21 @@ impl RouterTrait for RouterManager {
         raw: axum::body::Bytes,
         _model_id: Option<&str>,
     ) -> Response {
+        // A library caller can provide raw bytes different from its typed
+        // request, so check the bytes that the selected router may forward.
+        if self
+            .routers
+            .iter()
+            .any(|router| router.monitors_kv_events())
+        {
+            let actual = serde_json::from_slice::<serde_json::Value>(&raw).ok();
+            if let Some(response) = reject_full_report(
+                true,
+                actual.as_ref().and_then(|body| body.get("vllm_xargs")),
+            ) {
+                return response;
+            }
+        }
         let model_id = body.model.clone();
         if let Some(router) = self.select_router_for_request(headers, model_id.as_deref()) {
             router
@@ -859,6 +901,9 @@ impl RouterTrait for RouterManager {
         method: &Method,
         body: serde_json::Value,
     ) -> Response {
+        if let Some(response) = self.reject_shared_full_report(body.get("vllm_xargs")) {
+            return response;
+        }
         // Select router based on headers (no model info available for transparent proxy)
         let router = self.select_router_for_request(headers, None);
 

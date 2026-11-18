@@ -462,3 +462,15 @@ mod tests {
         assert!(resolve_endpoints(&workers, &mappings, 5557).is_err());
     }
 }
+
+/// One event source for one (worker, rank).
+#[derive(Clone, Debug)]
+pub struct EventSource {
+    pub source: crate::kv_index::SourceId,
+    pub dp_rank: u32,
+    pub pub_endpoint: String,
+    pub replay_endpoint: Option<String>,
+    pub topic: String,
+    /// SUB receive high-water mark; None leaves the ZMQ default.
+    pub hwm: Option<i32>,
+}
