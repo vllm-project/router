@@ -190,30 +190,12 @@ impl KvIndexSupervisor {
             // revoke its siblings.
             let mut indexes: HashMap<u32, SourceBinding> = HashMap::new();
             for source in &event_sources {
-                let Some(rank_capability) = capability.rank_capability(source.dp_rank) else {
-                    warn!(
-                        "kv_index {}: no hybrid capability for rank {}; rank will receive no cache credit",
-                        worker_url, source.dp_rank
-                    );
-                    continue;
-                };
-                if rank_capability.model != model_id {
-                    warn!(
-                        "kv_index {}: hybrid rank {} was captured for model {} but this worker serves {}; rank will receive no cache credit",
-                        worker_url, source.dp_rank, rank_capability.model, model_id
-                    );
-                    continue;
-                }
-                let target = crate::kv_index::RoutableTarget {
-                    instance_id: source_id.clone(),
-                    dp_rank: source.dp_rank,
-                };
-                match capability.index_for_source(source, target, 1_000_000) {
+                match capability.bind_worker_source(source, &model_id, 1_000_000) {
                     Ok(index) => {
                         indexes.insert(source.dp_rank, index);
                     }
                     Err(reason) => warn!(
-                        "kv_index {}: hybrid rank {} not admitted: {reason}; rank will receive no cache credit",
+                        "kv_index {}: hybrid rank {} not admitted for model {model_id}: {reason}; rank will receive no cache credit",
                         worker_url, source.dp_rank
                     ),
                 }

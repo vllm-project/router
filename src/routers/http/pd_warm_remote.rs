@@ -95,13 +95,17 @@ impl PdWarmRemoteRuntime {
             .store(enabled, std::sync::atomic::Ordering::Release);
     }
     fn refresh_loss(&self) {
+        let mut state = self.state.lock();
+        self.refresh_loss_locked(&mut state);
+    }
+    fn refresh_loss_locked(&self, state: &mut WarmRemoteState) {
         use std::sync::atomic::Ordering;
         if !self.event_tracking.load(Ordering::Acquire) {
             return;
         }
         let current = crate::kv_index::signal_loss_epoch();
         if self.loss_epoch.swap(current, Ordering::AcqRel) != current {
-            self.invalidate_all();
+            Self::invalidate_all_locked(state);
         }
     }
     fn count(&self, key: &'static str) {
@@ -166,6 +170,9 @@ impl PdWarmRemoteRuntime {
     }
     pub fn invalidate_all(&self) {
         let mut s = self.state.lock();
+        Self::invalidate_all_locked(&mut s);
+    }
+    fn invalidate_all_locked(s: &mut WarmRemoteState) {
         s.invalidation_revision = s.invalidation_revision.wrapping_add(1);
         s.candidates.clear();
         s.identities.clear();
@@ -173,6 +180,9 @@ impl PdWarmRemoteRuntime {
     }
     fn revision_for(&self, target: &ProgramTarget) -> (u64, u64, u64) {
         let state = self.state.lock();
+        Self::revision_for_locked(&state, target)
+    }
+    fn revision_for_locked(state: &WarmRemoteState, target: &ProgramTarget) -> (u64, u64, u64) {
         (
             state.invalidation_revision,
             *state
@@ -207,8 +217,8 @@ impl PdWarmRemoteRuntime {
         prompt: &[u32],
         identity: [u8; 32],
     ) -> Option<Candidate> {
-        self.refresh_loss();
         let mut s = self.state.lock();
+        self.refresh_loss_locked(&mut s);
         let c = s.candidates.remove(dispatch.program())?;
         let expiry_ok = c.expires
             > Instant::now()
@@ -1528,6 +1538,15 @@ impl PdResponseContext {
             return;
         }
         let mut s = self.runtime.state.lock();
+        // A source may have been invalidated while response metadata was
+        // processed. Check the fence while holding the publication lock.
+        self.runtime.refresh_loss_locked(&mut s);
+        if PdWarmRemoteRuntime::revision_for_locked(&s, &self.source) != self.event_revision {
+            *s.counters
+                .entry("incomplete_candidate_discarded")
+                .or_default() += 1;
+            return;
+        }
         s.candidates.retain(|_, c| c.expires > Instant::now());
         // Bound retained prompt-prefix memory, not only the candidate count.
         let token_budget = self.runtime.config.max_candidate_tokens;
@@ -1737,6 +1756,36 @@ mod tests {
         let before = r.revision_for(&target);
         r.invalidate_all();
         assert_ne!(r.revision_for(&target), before);
+    }
+    #[test]
+    fn event_loss_invalidates_warm_candidate_before_claim() {
+        let (runtime, dispatch) = runtime_with_candidate();
+        runtime.set_event_tracking(true);
+        crate::kv_index::record_signal_loss();
+        assert!(runtime.claim(&dispatch, &[1, 2, 3], [7; 32]).is_none());
+        assert!(runtime.state.lock().candidates.is_empty());
+    }
+    #[test]
+    fn event_loss_changes_revision_before_candidate_publication() {
+        let (runtime, dispatch) = runtime_with_candidate();
+        runtime.set_event_tracking(true);
+        let source = runtime
+            .state
+            .lock()
+            .candidates
+            .get(dispatch.program())
+            .unwrap()
+            .source
+            .clone();
+        let old_revision = runtime.revision_for(&source);
+        crate::kv_index::record_signal_loss();
+        let mut state = runtime.state.lock();
+        runtime.refresh_loss_locked(&mut state);
+        assert_ne!(
+            PdWarmRemoteRuntime::revision_for_locked(&state, &source),
+            old_revision
+        );
+        assert!(state.candidates.is_empty());
     }
     #[test]
     fn no_hot_route_from_text_or_client_metadata() {
