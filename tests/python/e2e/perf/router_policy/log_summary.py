@@ -157,13 +157,10 @@ def _makespan_seconds(ok_rows: list[dict[str, Any]]) -> float | None:
 
 
 def _quantiles(values: list[float]) -> dict[str, Any]:
-    """Linear-interpolation mean / p50 / p95 / p99, same as the orig128 report.
-
-    Request count stays on the cell object (``requests`` / ``success``), not
-    repeated as ``n`` inside each latency block.
-    """
+    """Quantiles and the actual sample count, same as the orig128 report."""
 
     return {
+        "n": len(values),
         "mean": statistics.fmean(values) if values else None,
         "p50": pct(values, 50),
         "p95": pct(values, 95),
@@ -247,7 +244,9 @@ def _jct_quantiles(result_dir: Path, ok_rows: list[dict[str, Any]]) -> dict[str,
                 return float(value)
         return None
 
+    count = precomputed.get("n", precomputed.get("count"))
     return {
+        "n": int(count) if _is_number(count) else None,
         "mean": pick("mean"),
         "p50": pick("p50", "median"),
         "p95": pick("p95"),
