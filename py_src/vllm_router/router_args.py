@@ -6,6 +6,12 @@ from typing import Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _parse_log_user_prompts(value: str) -> bool:
+    if value not in ("true", "false"):
+        raise argparse.ArgumentTypeError("expected 'true' or 'false'")
+    return value == "true"
+
+
 @dataclasses.dataclass
 class RouterArgs:
     # Worker configuration
@@ -51,6 +57,7 @@ class RouterArgs:
     api_key: Optional[str] = None
     log_dir: Optional[str] = None
     log_level: Optional[str] = None
+    log_user_prompts: bool = False
     # Service discovery configuration
     service_discovery: bool = False
     selector: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -393,6 +400,13 @@ class RouterArgs:
             type=str,
             default=None,
             help="Directory to store log files. If not specified, logs are only output to console.",
+        )
+        parser.add_argument(
+            f"--{prefix}log-user-prompts",
+            type=_parse_log_user_prompts,
+            default=RouterArgs.log_user_prompts,
+            metavar="{true,false}",
+            help="Log user text from chat and Messages API requests. May contain sensitive data; disabled by default.",
         )
         parser.add_argument(
             f"--{prefix}log-level",

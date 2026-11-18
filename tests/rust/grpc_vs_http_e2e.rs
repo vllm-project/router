@@ -50,6 +50,7 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
         metrics: None,
         log_dir: None,
         log_level: None,
+        log_user_prompts: false,
         request_id_headers: None,
         max_concurrent_requests: 64,
         queue_size: 0,

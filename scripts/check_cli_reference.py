@@ -33,6 +33,8 @@ def python_options():
     for action in parser._actions:
         if isinstance(action, (argparse._HelpAction, argparse._StoreTrueAction)):
             value = "flag"
+        elif action.type is module._parse_log_user_prompts:
+            value = "true, false"
         elif action.choices:
             value = ", ".join(action.choices)
         else:
@@ -88,7 +90,11 @@ def rust_options():
             value = ", ".join(enums[field_type])
         else:
             if field_type == "bool":
-                value = "flag"
+                value = (
+                    "true, false"
+                    if re.search(r"\baction\s*=\s*ArgAction::Set\b", attributes)
+                    else "flag"
+                )
             elif field_type in ("String", "Option<String>", "Vec<String>"):
                 value = "string"
             elif field_type in ("u16", "u32", "u64", "usize"):

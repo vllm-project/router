@@ -16,6 +16,14 @@ from vllm_router.router import Router, policy_from_str
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_prompt_logging_reaches_native_constructor(enabled):
+    args = RouterArgs(log_user_prompts=enabled)
+    with patch("vllm_router.router._Router") as native_router:
+        Router.from_args(args)
+    assert native_router.call_args.kwargs["log_user_prompts"] is enabled
+
+
 class TestKvLauncherArgs:
     def test_defaults(self):
         args = parse_router_args([])
