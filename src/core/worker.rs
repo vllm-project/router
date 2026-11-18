@@ -29,6 +29,17 @@ pub(crate) fn worker_get(
     }
 }
 
+/// Base model IDs in the OpenAI model list. A LoRA entry names its parent.
+pub(crate) fn served_base_model_ids(body: &serde_json::Value) -> impl Iterator<Item = &str> {
+    body.get("data")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.get("parent").is_none_or(serde_json::Value::is_null))
+        .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
+        .filter(|id| !id.trim().is_empty())
+}
+
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug {
@@ -190,6 +201,23 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .get("model_id")
             .map(|s| s.as_str())
             .unwrap_or("unknown")
+    }
+
+    /// Names this worker serves as base models: the model it registered plus
+    /// the `--served-model-name` aliases the engine reported, when known.
+    fn served_base_models(&self) -> Vec<&str> {
+        let mut served = vec![self.model_id()];
+        if let Some(aliases) = self.metadata().labels.get("served_model_aliases") {
+            served.extend(aliases.split(',').filter(|alias| !alias.is_empty()));
+        }
+        served
+    }
+
+    /// Whether `name` selects this worker's base model rather than one of its
+    /// adapters. vLLM selects an adapter through the request's `model`, and an
+    /// adapter name is neither the model id nor a served alias.
+    fn serves_base_model(&self, name: &str) -> bool {
+        self.served_base_models().contains(&name)
     }
 
     /// Get the priority of this worker (higher value = higher priority)
@@ -576,6 +604,13 @@ impl DPAwareWorker {
     /// Set the API key sent as a bearer token on this worker's HTTP health checks.
     pub fn with_worker_api_key(mut self, api_key: Option<Arc<str>>) -> Self {
         self.base_worker = self.base_worker.with_worker_api_key(api_key);
+        self
+    }
+
+    /// Copy the served-model labels of the base URL onto every DP rank: the
+    /// ranks share one engine, so they serve the same names.
+    pub fn with_labels(mut self, labels: std::collections::HashMap<String, String>) -> Self {
+        self.base_worker = self.base_worker.with_labels(labels);
         self
     }
 }
@@ -1000,6 +1035,22 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn adapter_names_are_not_served_base_models() {
+        let mut worker = BasicWorker::new("http://127.0.0.1:8000".to_string(), WorkerType::Regular);
+        worker
+            .metadata
+            .labels
+            .insert("model_id".to_string(), "qwen35".to_string());
+        worker.metadata.labels.insert(
+            "served_model_aliases".to_string(),
+            "alias-a,alias-b".to_string(),
+        );
+        assert!(worker.serves_base_model("qwen35"));
+        assert!(worker.serves_base_model("alias-a"));
+        assert!(!worker.serves_base_model("lora1"));
+    }
 
     // Test WorkerType
     #[test]
@@ -2009,5 +2060,23 @@ mod tests {
             }
         );
         assert_eq!(workers[5].worker_type(), WorkerType::Decode);
+    }
+
+    #[test]
+    fn dp_aware_workers_keep_their_served_model_labels() {
+        // Every rank of a DP endpoint answers for the same engine, so the
+        // served-model labels probed from the base URL must survive onto each
+        // rank. Without them model_id stays "unknown" and an adapter name in
+        // `model` is mistaken for the base model.
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("model_id".to_string(), "Qwen3.5-4B".to_string());
+        labels.insert("served_model_aliases".to_string(), "qwen".to_string());
+        let worker = DPAwareWorker::new("http://host:8000".to_string(), 1, 2, WorkerType::Regular)
+            .with_labels(labels);
+
+        assert_eq!(worker.model_id(), "Qwen3.5-4B");
+        assert!(worker.serves_base_model("Qwen3.5-4B"));
+        assert!(worker.serves_base_model("qwen"));
+        assert!(!worker.serves_base_model("lora1"));
     }
 }

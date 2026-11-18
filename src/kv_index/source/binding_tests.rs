@@ -1456,23 +1456,3 @@ fn another_dp_rank_never_answers_for_this_rank() {
     assert!(!TieredMatchProvider::matches(&index, &prompt(), 528, None, 0).is_empty());
     assert!(TieredMatchProvider::matches(&index, &prompt(), 528, None, 1).is_empty());
 }
-
-impl SourceBinding {
-    /// Bind an admitted layout to its supervisor's cache domain before replay.
-    pub(crate) fn with_shared_index(mut self, index: Arc<crate::kv_index::KvBlockIndexer>) -> Self {
-        debug_assert!(self.index.with_source_snapshot(&self.target, |view| {
-            view.stream(&self.owner)
-                .is_none_or(|state| state.next_seq.is_none())
-        }));
-        self.index = index;
-        self
-    }
-
-    pub(in crate::kv_index) fn with_source_binding(
-        mut self,
-        binding: crate::kv_index::source::binding::SourceLease,
-    ) -> Self {
-        self.binding = Some(binding);
-        self
-    }
-}

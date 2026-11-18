@@ -19,8 +19,11 @@ use crate::request_identity::StableIdentity;
 
 /// Read-only placement port owned by its policy consumer.
 ///
-/// Dense providers use the default prompt hashing. Layout providers implement
-/// `matches` to apply their own hash identity and restore rules.
+/// Dense providers implement `find_tiered_matches` and use the default prompt
+/// hashing. Layout providers implement `matches` and return `true` from
+/// `target_scoped` because group evidence belongs to a single target and rank.
+/// Call `matches` when starting with prompt tokens so the provider can apply
+/// its own hashing and restore rules.
 pub trait TieredMatchProvider: Send + Sync {
     /// Raw hash lookup retained for existing full-attention providers.
     fn find_tiered_matches(&self, _query: &MatchQuery) -> Vec<TierMatch> {
@@ -49,6 +52,11 @@ pub trait TieredMatchProvider: Send + Sync {
                 StorageTier::Disk,
             ],
         })
+    }
+
+    /// Group restore evidence belongs to one target; dense lookups cover all targets.
+    fn target_scoped(&self) -> bool {
+        false
     }
 }
 
@@ -751,26 +759,24 @@ pub trait Picker: Send + Sync + std::fmt::Debug {
 /// reuse rule. The return value is in tokens and can be fractional because a
 /// transfer penalty is a credit ratio.
 fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
-    let device_blocks = candidate
-        .matches
-        .iter()
-        .filter(|hit| hit.tier == StorageTier::Device)
-        .flat_map(|hit| hit.segments.iter().copied())
-        .filter(|(start, _)| *start == 0)
-        .map(|(_, end)| end)
-        .max()
-        .unwrap_or(0)
-        // vLLM must recompute the last prompt token to obtain logits. Local
-        // GPU prefix reuse is block-aligned, so never credit its final block
-        // when that block ends at the prompt boundary.
-        .min(
-            candidate
-                .input_tokens
-                .saturating_sub(1)
-                .checked_div(params.block_size as usize)
-                .unwrap_or(0)
-                .min(u32::MAX as usize) as u32,
-        );
+    let device_blocks = crate::kv_index::layout::full_attention_prefix(
+        candidate
+            .matches
+            .iter()
+            .filter(|hit| hit.tier == StorageTier::Device)
+            .flat_map(|hit| hit.segments.iter().copied()),
+    )
+    // vLLM must recompute the last prompt token to obtain logits. Local
+    // GPU prefix reuse is block-aligned, so never credit its final block
+    // when that block ends at the prompt boundary.
+    .min(
+        candidate
+            .input_tokens
+            .saturating_sub(1)
+            .checked_div(params.block_size as usize)
+            .unwrap_or(0)
+            .min(u32::MAX as usize) as u32,
+    );
 
     let mut best_continuation = (0_u32, 0.0_f64);
     for hit in candidate
@@ -925,11 +931,7 @@ fn pick_minimum(costs: &[f64]) -> Option<usize> {
 #[derive(Debug, Default)]
 struct EmptyMatchProvider;
 
-impl TieredMatchProvider for EmptyMatchProvider {
-    fn find_tiered_matches(&self, _query: &MatchQuery) -> Vec<TierMatch> {
-        Vec::new()
-    }
-}
+impl TieredMatchProvider for EmptyMatchProvider {}
 
 #[derive(Clone)]
 struct TargetBinding {
@@ -939,6 +941,9 @@ struct TargetBinding {
     matches: Arc<dyn TieredMatchProvider>,
     block_size: u32,
 }
+
+type MatchCache<'a> =
+    HashMap<(Option<CacheKey>, Option<RoutableTarget>, &'a [u32]), Vec<TierMatch>>;
 
 /// One prepared selection snapshot: KV queries fill `grouped` outside every
 /// lock; the policy's short critical section then samples load, scores, and
@@ -1124,23 +1129,39 @@ impl KvAwarePolicy {
         crate::kv_index::local_block_hash_strings(token_ids, block_size, None)
     }
 
-    fn placement_matches(
+    fn cached_matches<'a, 'tokens>(
+        cache: &'a mut MatchCache<'tokens>,
         binding: &TargetBinding,
-        token_ids: Option<&[u32]>,
+        tokens: &'tokens [u32],
         lora_name: Option<&str>,
-        enabled: bool,
-    ) -> Vec<TierMatch> {
-        let Some(tokens) =
-            token_ids.filter(|tokens| enabled && binding.block_size != 0 && !tokens.is_empty())
-        else {
-            return Vec::new();
-        };
-        let hits = binding.matches.matches(
-            tokens,
-            binding.block_size,
-            lora_name,
-            binding.target.dp_rank,
-        );
+        fallback: Option<&'static str>,
+    ) -> &'a [TierMatch] {
+        let scope = binding
+            .matches
+            .target_scoped()
+            .then(|| binding.target.clone());
+        cache
+            .entry((binding.cache_key.clone(), scope, tokens))
+            .or_insert_with(|| {
+                if let Some(reason) = fallback {
+                    crate::metrics::RouterMetrics::record_kv_placement_lookup(reason);
+                    return Vec::new();
+                }
+                if tokens.is_empty() {
+                    return Vec::new();
+                }
+                let hits = binding.matches.matches(
+                    tokens,
+                    binding.block_size,
+                    lora_name,
+                    binding.target.dp_rank,
+                );
+                Self::record_placement_match(binding, &hits);
+                hits
+            })
+    }
+
+    fn record_placement_match(binding: &TargetBinding, hits: &[TierMatch]) {
         crate::metrics::RouterMetrics::record_kv_placement_lookup(if binding.cache_key.is_none() {
             "index_unavailable"
         } else if hits.is_empty() {
@@ -1148,7 +1169,6 @@ impl KvAwarePolicy {
         } else {
             "hit"
         });
-        hits
     }
 
     pub fn select_worker_with_token_ids(
@@ -1287,7 +1307,8 @@ impl KvAwarePolicy {
             let candidates = self.candidate_views(workers, &plan);
             let (costs, components) = self.score_candidates(&plan, &candidates)?;
 
-            // Recheck the table inside the critical section.
+            // Recheck the table inside the critical section. Affinity selects
+            // a worker; cache credit still comes from that worker's evidence.
             let acquired = digest
                 .as_ref()
                 .and_then(|digest| self.affinity.acquire(digest));
@@ -1324,7 +1345,6 @@ impl KvAwarePolicy {
                 }
             };
             let target = plan.bindings[position].target.clone();
-
             let (worker_index, new_prefill_tokens, decision) =
                 self.decision_for_position(&plan, &candidates, &costs, &components, position);
             let outcome = if used_binding {
@@ -1454,7 +1474,7 @@ impl KvAwarePolicy {
         if !has_tokens {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("missing_tokens");
         }
-        let mut query_cache: HashMap<(Option<CacheKey>, &[u32]), Vec<TierMatch>> = HashMap::new();
+        let mut query_cache = MatchCache::new();
         let mut grouped = Vec::with_capacity(bindings.len());
         let mut input_tokens = Vec::with_capacity(bindings.len());
         let mut prefill_tokens = Vec::with_capacity(bindings.len());
@@ -1469,15 +1489,13 @@ impl KvAwarePolicy {
                         total_prefill = total_prefill.saturating_add(ids.len() as u64);
                         continue;
                     }
-                    let hits = query_cache
-                        .entry((binding.cache_key.clone(), ids))
-                        .or_insert_with(|| {
-                            if let Some(reason) = credit_fallback {
-                                crate::metrics::RouterMetrics::record_kv_placement_lookup(reason);
-                                return Vec::new();
-                            }
-                            Self::placement_matches(binding, Some(ids), lora_name, true)
-                        });
+                    let hits = Self::cached_matches(
+                        &mut query_cache,
+                        binding,
+                        ids,
+                        lora_name,
+                        credit_fallback,
+                    );
                     let matches: Vec<_> = hits
                         .iter()
                         .filter(|hit| hit.target == binding.target)
@@ -1734,7 +1752,8 @@ impl KvAwareOps for KvAwarePolicy {
     ) -> bool {
         let _guard = self.selection_lock.lock();
         let records = self.affinity.records.lock();
-        let Some(record) = records.peek(&affinity_key.scoped_digest(lora_name, cache_salt)) else {
+        let record = records.peek(&affinity_key.scoped_digest(lora_name, cache_salt));
+        let Some(record) = record else {
             return false;
         };
         !record.is_expired(Instant::now())
@@ -1783,14 +1802,9 @@ impl KvAwareOps for KvAwarePolicy {
                 let mut new_prefill_tokens = 0u64;
                 for tokens in prompts {
                     let hits = if verified {
-                        query_cache
-                            .entry((binding.cache_key.clone(), tokens.as_slice()))
-                            .or_insert_with(|| {
-                                Self::placement_matches(&binding, Some(tokens), None, true)
-                            })
-                            .as_slice()
+                        Self::cached_matches(&mut query_cache, &binding, tokens, None, None)
                     } else {
-                        &[]
+                        &[][..]
                     };
                     let matches: Vec<_> = hits
                         .iter()
@@ -2063,6 +2077,221 @@ mod tests {
             Arc::new(TemperaturePicker::new(params.router_temperature)),
             params,
         )
+    }
+
+    #[test]
+    fn hybrid_token_matches_are_scored_per_target_for_regular_and_prefill() {
+        use crate::kv_index::source::binding::tests::qwen_index;
+
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://worker-{i}"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let policy = KvAwarePolicy::default();
+        let mut indexes = Vec::new();
+        for worker in &workers {
+            let target = target(worker.url(), 0);
+            let index = Arc::new(qwen_index(target.clone(), 8));
+            index.begin_empty(0);
+            policy.register_target_with_cache_identity(
+                worker.url(),
+                target,
+                CacheKey {
+                    model: Arc::from("qwen"),
+                    hash_mode: crate::kv_index::HashMode::Sha256,
+                    block_size: 528,
+                },
+                index.clone(),
+            );
+            indexes.push(index);
+        }
+        let payload = crate::kv_index::source::binding::tests::qwen35_payload();
+        indexes[1].apply_payload(0, &payload).unwrap();
+        let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
+        assert_eq!(
+            policy.select_worker_with_token_ids(&workers, Some(&prompt)),
+            Some(1)
+        );
+
+        let prompts = [prompt.clone()];
+        let estimates = policy.estimate_prefill_work(&[
+            (workers[0].as_ref(), &prompts, true),
+            (workers[1].as_ref(), &prompts, true),
+        ]);
+        assert_eq!(estimates[0].new_prefill_tokens, 1024);
+        assert_eq!(estimates[1].new_prefill_tokens, 496);
+        assert!(indexes[1]
+            .matches(&prompt, 528, Some("adapter"), 0)
+            .is_empty());
+        let _stream = crate::kv_index::EventStream::new(indexes[1].clone());
+        assert_eq!(
+            policy.estimate_prefill_work(&[(workers[1].as_ref(), &prompts, true)])[0]
+                .new_prefill_tokens,
+            1024
+        );
+    }
+
+    struct PlacementTestProvider {
+        hits: Vec<TierMatch>,
+        hybrid: bool,
+        queries: AtomicUsize,
+    }
+    impl TieredMatchProvider for PlacementTestProvider {
+        fn matches(&self, _: &[u32], _: u32, _: Option<&str>, _: u32) -> Vec<TierMatch> {
+            self.queries.fetch_add(1, Ordering::Relaxed);
+            self.hits.clone()
+        }
+        fn target_scoped(&self) -> bool {
+            self.hybrid
+        }
+    }
+
+    #[test]
+    fn request_qualification_applies_to_dense_and_hybrid_placement() {
+        for hybrid in [false, true] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let metrics_handle = recorder.handle();
+            let _metrics = metrics::set_default_local_recorder(&recorder);
+            let policy = KvAwarePolicy::default();
+            let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+                "http://qualified".into(),
+                WorkerType::Regular,
+            ))];
+            let provider = Arc::new(PlacementTestProvider {
+                hits: vec![tier_match(
+                    &target(workers[0].url(), 0),
+                    StorageTier::Device,
+                    &[(0, 4)],
+                )],
+                hybrid,
+                queries: AtomicUsize::new(0),
+            });
+            policy.register_target_with_cache_identity(
+                workers[0].url(),
+                target(workers[0].url(), 0),
+                CacheKey {
+                    model: Arc::from("model"),
+                    hash_mode: crate::kv_index::HashMode::Sha256,
+                    block_size: 16,
+                },
+                provider.clone(),
+            );
+            let ids: Vec<u32> = (0..65).collect();
+            for (allowed, prefill) in [(true, 1), (false, 65)] {
+                let receipt = policy
+                    .select_worker_with_qualified_inputs(
+                        &workers,
+                        QualifiedKvInput {
+                            tokens: KvRequestTokens::Shared(Some(&ids)),
+                            eligibility: Some(&[allowed]),
+                        },
+                        None,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap();
+                assert_eq!(receipt.new_prefill_tokens, prefill, "hybrid={hybrid}");
+                release_receipt(&workers, &receipt);
+                let pd = policy.estimate_prefill_work(&[(
+                    workers[0].as_ref(),
+                    std::slice::from_ref(&ids),
+                    allowed,
+                )]);
+                assert_eq!(pd[0].new_prefill_tokens, prefill, "hybrid={hybrid}");
+            }
+            assert_eq!(
+                provider.queries.load(Ordering::Relaxed),
+                2,
+                "hybrid={hybrid}"
+            );
+            assert!(
+                metrics_handle
+                    .render()
+                    .contains(r#"vllm_router_kv_placement_lookups_total{result="hit"} 2"#),
+                "both regular and prefill lookups must be recorded; hybrid={hybrid}"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_metrics_count_actual_misses_and_unavailable_lookups() {
+        for (hybrid, keyed, label, per_lookup) in [
+            (true, true, "miss", 2),
+            (false, true, "miss", 1),
+            (true, false, "index_unavailable", 2),
+            (false, false, "index_unavailable", 1),
+        ] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _metrics = metrics::set_default_local_recorder(&recorder);
+            let provider = Arc::new(PlacementTestProvider {
+                hits: Vec::new(),
+                hybrid,
+                queries: AtomicUsize::new(0),
+            });
+            let policy = KvAwarePolicy {
+                matches: provider.clone(),
+                ..KvAwarePolicy::default()
+            };
+            let workers: Vec<Arc<dyn Worker>> = (0..2)
+                .map(|n| {
+                    Arc::new(BasicWorker::new(
+                        format!("http://worker-{n}"),
+                        WorkerType::Regular,
+                    )) as Arc<dyn Worker>
+                })
+                .collect();
+            for worker in &workers {
+                if keyed {
+                    policy.register_target_with_cache_identity(
+                        worker.url(),
+                        target(worker.url(), 0),
+                        CacheKey {
+                            model: Arc::from("model"),
+                            hash_mode: crate::kv_index::HashMode::Sha256,
+                            block_size: 16,
+                        },
+                        provider.clone(),
+                    );
+                } else {
+                    policy.register_target(worker.url(), target(worker.url(), 0));
+                }
+            }
+            let ids: Vec<u32> = (0..65).collect();
+            let receipt = policy
+                .select_worker_with_qualified_inputs(
+                    &workers,
+                    QualifiedKvInput {
+                        tokens: KvRequestTokens::Shared(Some(&ids)),
+                        eligibility: None,
+                    },
+                    None,
+                    None,
+                    None,
+                    &[],
+                )
+                .unwrap();
+            release_receipt(&workers, &receipt);
+            assert_eq!(provider.queries.load(Ordering::Relaxed), per_lookup);
+            assert!(handle.render().contains(&format!(
+                "vllm_router_kv_placement_lookups_total{{result=\"{label}\"}} {per_lookup}"
+            )));
+            let prompts = vec![ids];
+            policy.estimate_prefill_work(&[
+                (workers[0].as_ref(), &prompts, true),
+                (workers[1].as_ref(), &prompts, true),
+            ]);
+            let expected = if keyed { 2 * per_lookup } else { per_lookup };
+            assert_eq!(provider.queries.load(Ordering::Relaxed), expected);
+            assert!(handle.render().contains(&format!(
+                "vllm_router_kv_placement_lookups_total{{result=\"{label}\"}} {expected}"
+            )));
+        }
     }
 
     #[test]
@@ -3158,6 +3387,80 @@ mod tests {
         record.state.lock().idle_deadline = None;
         policy.register_target(worker.url(), record.target.clone());
         assert!(!policy.has_affinity(&workers, None, None, &key));
+    }
+
+    #[test]
+    fn untokenized_binding_never_credits_prefill() {
+        let policy = KvAwarePolicy::default();
+        let workers = registered_worker_pair(&policy);
+        let key = affinity_key("tools-session");
+
+        // First turn has no exact tokens: it binds, but with no credit.
+        let first = policy
+            .select_worker_with_receipt(&workers, None, None, None, Some(&key), &[])
+            .unwrap();
+        assert_eq!(first.new_prefill_tokens, 0);
+        release_receipt(&workers, &first);
+
+        // Later turns reuse the worker, still without any prefill reduction.
+        workers[first.worker_index].increment_load();
+        let second = policy
+            .select_worker_with_receipt(&workers, None, None, None, Some(&key), &[])
+            .unwrap();
+        assert_eq!(second.worker_index, first.worker_index);
+        assert_eq!(second.new_prefill_tokens, 0);
+        release_receipt(&workers, &second);
+
+        // Identity isolation: a LoRA or salt changes the binding scope.
+        let adapter = policy
+            .select_worker_with_receipt(&workers, None, Some("adapter"), None, Some(&key), &[])
+            .unwrap();
+        assert!(policy
+            .affinity
+            .get(&key.scoped_digest(Some("adapter"), None))
+            .is_some());
+        release_receipt(&workers, &adapter);
+        workers[first.worker_index].decrement_load();
+
+        // With exact tokens but no verified cache, the same binding must still
+        // charge the full input: affinity picks the worker, never the credit.
+        let prompt: Vec<u32> = (0..64).collect();
+        let tokenized = policy
+            .select_worker_with_receipt(&workers, Some(&prompt), None, None, Some(&key), &[])
+            .unwrap();
+        assert_eq!(tokenized.worker_index, first.worker_index);
+        assert_eq!(tokenized.new_prefill_tokens, prompt.len() as u64);
+        release_receipt(&workers, &tokenized);
+    }
+
+    #[test]
+    fn affinity_keeps_failover_binding_when_old_worker_recovers() {
+        let policy = KvAwarePolicy::default();
+        let workers = registered_worker_pair(&policy);
+        let key = affinity_key("failover-session");
+        let prompt: Vec<u32> = (0..64).collect();
+
+        let first = policy
+            .select_worker_with_receipt(&workers, Some(&prompt), None, None, Some(&key), &[])
+            .unwrap();
+        let original = first.worker_index;
+        release_receipt(&workers, &first);
+        workers[original].set_healthy(false);
+
+        let failover = policy
+            .select_worker_with_receipt(&workers, None, None, None, Some(&key), &[])
+            .unwrap();
+        assert_ne!(failover.worker_index, original);
+        let rebound = failover.worker_index;
+        release_receipt(&workers, &failover);
+        workers[original].set_healthy(true);
+
+        let recovered = policy
+            .select_worker_with_receipt(&workers, Some(&prompt), None, None, Some(&key), &[])
+            .unwrap();
+        assert_eq!(recovered.worker_index, rebound);
+        assert_eq!(recovered.new_prefill_tokens, prompt.len() as u64);
+        release_receipt(&workers, &recovered);
     }
 
     #[test]

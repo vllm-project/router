@@ -23,6 +23,50 @@ pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience (keeps routers::openai_router path working)
 pub use http::{openai_router, pd_router, pd_types, router};
 
+/// Base-model names used to distinguish served aliases from LoRA names.
+pub(crate) async fn served_model_labels(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+    dp_rank: Option<usize>,
+    probe_model: bool,
+) -> std::collections::HashMap<String, String> {
+    let mut labels = std::collections::HashMap::new();
+    if crate::backend::is_grpc_url(worker_url) {
+        return labels;
+    }
+    let timeout = std::time::Duration::from_secs(2);
+    let mut aliases = Vec::new();
+    if probe_model {
+        let url = format!("{}/v1/models", worker_url.trim_end_matches('/'));
+        let mut probe = crate::core::worker::worker_get(client, &url, api_key).timeout(timeout);
+        if let Some(rank) = dp_rank {
+            probe = probe.header("X-data-parallel-rank", rank.to_string());
+        }
+        let served = match probe.send().await {
+            Ok(response) if response.status().is_success() => {
+                response.json::<serde_json::Value>().await.ok()
+            }
+            _ => None,
+        };
+        if let Some(served) = served {
+            aliases.extend(crate::core::worker::served_base_model_ids(&served).map(str::to_owned));
+        }
+    }
+    if let Ok(Ok(info)) = tokio::time::timeout(
+        timeout,
+        crate::kv_index::discovery::query_pd_server_info(client, worker_url, api_key),
+    )
+    .await
+    {
+        aliases.extend(info.served_model_aliases);
+    }
+    if !aliases.is_empty() {
+        labels.insert("served_model_aliases".to_string(), aliases.join(","));
+    }
+    labels
+}
+
 /// Full reports re-announce existing blocks and cannot be counted as physical
 /// copies. Reject them before they contaminate a monitored event stream.
 pub(crate) fn reject_full_report(
@@ -70,6 +114,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     /// Get a reference to self as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
 
+    /// Whether this router consumes vLLM KV events for placement.
     fn monitors_kv_events(&self) -> bool {
         false
     }

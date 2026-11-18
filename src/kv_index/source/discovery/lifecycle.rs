@@ -1,0 +1,379 @@
+//! Worker trust, source retirement and replay recovery.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
+use tracing::info;
+
+use super::probe::WorkerDescriptor;
+use super::reconcile::{
+    probe_keeps_trust, probe_renews_trust, static_hybrid_sources_match, BoundSources,
+    StaticHybridMatch,
+};
+use super::{CacheKey, KvIndexSupervisor, WorkerKvInfo, WorkerSubs};
+use crate::kv_index::subscriber::EventSource;
+use crate::kv_index::{EventStream, EventSubscriberHandle, KvBlockIndexer, SourceBinding};
+
+pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+pub(super) const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+pub(super) const MAX_PROBE_FAILURES: u8 = 3;
+const LAYOUT_FRESHNESS: Duration = Duration::from_secs(5);
+
+/// A read-only registration. Providers and policy bindings share its revision.
+#[derive(Clone)]
+pub(crate) struct WorkerRegistration {
+    pub(crate) revision: u64,
+    pub(crate) info: Option<WorkerKvInfo>,
+    pub(crate) provider: Option<Arc<dyn crate::policies::TieredMatchProvider>>,
+}
+
+/// Control observations for the same owner used by its event subscribers.
+/// Descriptor failures and layout freshness have distinct clocks and evidence.
+pub(super) struct WorkerLifecycle {
+    pub(super) active: Arc<AtomicBool>,
+    layout: bool,
+    pub(super) state: Mutex<LifecycleState>,
+}
+
+pub(super) struct LifecycleState {
+    pub(super) revision: u64,
+    pub(super) info: Option<WorkerKvInfo>,
+    pub(super) base_models: HashSet<String>,
+    pub(super) descriptor: Option<WorkerDescriptor>,
+    pub(super) checked: Instant,
+    pub(super) probe_failures: u8,
+    pub(super) trusted: bool,
+    pub(super) verified_at: Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SourceAction {
+    Keep,
+    Expire,
+    Recover,
+    Rebuild,
+    Stop,
+}
+
+impl WorkerLifecycle {
+    pub(super) fn new(
+        active: Arc<AtomicBool>,
+        layout: bool,
+        descriptor: Option<WorkerDescriptor>,
+    ) -> Self {
+        Self {
+            active,
+            layout,
+            state: Mutex::new(LifecycleState {
+                revision: crate::kv_index::next_owner_incarnation(),
+                info: None,
+                base_models: HashSet::new(),
+                descriptor,
+                checked: Instant::now(),
+                probe_failures: 0,
+                trusted: true,
+                verified_at: Instant::now(),
+            }),
+        }
+    }
+
+    fn trusted(&self, state: &LifecycleState) -> bool {
+        self.active.load(Ordering::Acquire)
+            && state.trusted
+            && (!self.layout || state.verified_at.elapsed() <= LAYOUT_FRESHNESS)
+    }
+
+    pub(super) fn is_trusted(&self) -> bool {
+        self.trusted(&self.state.lock())
+    }
+
+    pub(super) fn expire_if_needed(&self) -> bool {
+        let mut state = self.state.lock();
+        self.layout
+            && state.verified_at.elapsed() > LAYOUT_FRESHNESS
+            && std::mem::replace(&mut state.trusted, false)
+    }
+
+    pub(super) fn refresh_due(&self) -> bool {
+        let state = self.state.lock();
+        state.checked.elapsed()
+            >= if state.info.is_some() && (!self.layout || self.trusted(&state)) {
+                REFRESH_INTERVAL
+            } else {
+                CONTROL_TIMEOUT
+            }
+    }
+
+    /// Descriptor probes run every 30s; three failures retire an installed owner.
+    pub(super) fn observe_descriptor(&self, descriptor: Option<&WorkerDescriptor>) -> SourceAction {
+        let mut state = self.state.lock();
+        state.checked = Instant::now();
+        match descriptor {
+            Some(descriptor)
+                if state.info.is_some()
+                    && state.descriptor.as_ref() == Some(descriptor)
+                    && (!self.layout || self.trusted(&state)) =>
+            {
+                state.probe_failures = 0;
+                SourceAction::Keep
+            }
+            Some(_) => {
+                state.info = None;
+                state.trusted = false;
+                state.revision = crate::kv_index::next_owner_incarnation();
+                SourceAction::Rebuild
+            }
+            None if state.info.is_some() => {
+                state.probe_failures = state.probe_failures.saturating_add(1);
+                if state.probe_failures < MAX_PROBE_FAILURES {
+                    SourceAction::Keep
+                } else {
+                    state.info = None;
+                    state.base_models.clear();
+                    state.trusted = false;
+                    state.probe_failures = 0;
+                    state.revision = crate::kv_index::next_owner_incarnation();
+                    SourceAction::Stop
+                }
+            }
+            None => SourceAction::Keep,
+        }
+    }
+
+    /// A fast layout probe cannot advance the descriptor failure counter.
+    pub(super) fn observe_layout(&self, outcome: &StaticHybridMatch) -> SourceAction {
+        let mut state = self.state.lock();
+        if !self.active.load(Ordering::Acquire) || !probe_keeps_trust(outcome) {
+            state.trusted = false;
+            return SourceAction::Stop;
+        }
+        if probe_renews_trust(outcome) {
+            state.verified_at = Instant::now();
+            if !state.trusted {
+                return SourceAction::Recover;
+            }
+        } else if state.verified_at.elapsed() > LAYOUT_FRESHNESS && state.trusted {
+            state.trusted = false;
+            return SourceAction::Expire;
+        }
+        SourceAction::Keep
+    }
+}
+
+pub(super) struct HybridWorkerProvider {
+    /// Rank lookups share lifecycle evidence but never another rank's pages.
+    pub(super) indexes: HashMap<u32, Arc<SourceBinding>>,
+    pub(super) lifecycle: Arc<WorkerLifecycle>,
+}
+
+impl HybridWorkerProvider {
+    pub(super) fn is_trusted(&self) -> bool {
+        self.lifecycle.is_trusted()
+    }
+}
+
+impl crate::policies::TieredMatchProvider for HybridWorkerProvider {
+    fn target_scoped(&self) -> bool {
+        true
+    }
+
+    fn matches(
+        &self,
+        tokens: &[u32],
+        block_size: u32,
+        lora: Option<&str>,
+        dp_rank: u32,
+    ) -> Vec<crate::kv_index::TierMatch> {
+        if !self.is_trusted() {
+            return Vec::new();
+        }
+        // An unadmitted rank is a miss for that rank, never a fallback to a
+        // sibling rank's state or to the legacy single-group index.
+        let hits = self
+            .indexes
+            .get(&dp_rank)
+            .map(|index| {
+                crate::policies::TieredMatchProvider::matches(
+                    index.as_ref(),
+                    tokens,
+                    block_size,
+                    lora,
+                    dp_rank,
+                )
+            })
+            .unwrap_or_default();
+        if !self.is_trusted() {
+            return Vec::new();
+        }
+        hits
+    }
+}
+
+impl KvIndexSupervisor {
+    pub(super) fn monitor_hybrid_source(
+        &self,
+        provider: &Arc<HybridWorkerProvider>,
+        worker_url: &str,
+        mut handles: Vec<Arc<EventSubscriberHandle>>,
+        targets: Vec<(EventSource, Arc<SourceBinding>)>,
+        bound: Arc<BoundSources>,
+    ) {
+        let provider = Arc::downgrade(provider);
+        let probe_ctx = self.ctx.clone();
+        let client = self.client.clone();
+        let worker = worker_url.to_owned();
+        let api_key = self.api_key.clone();
+        let static_config = self.resolved_static_source(worker_url);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let Some(provider) = provider.upgrade() else {
+                    break;
+                };
+                if !provider.lifecycle.active.load(Ordering::Acquire) {
+                    break;
+                }
+                if provider.lifecycle.expire_if_needed() {
+                    for handle in &handles {
+                        handle.shutdown();
+                    }
+                }
+                let outcome = if let Some(config) = &static_config {
+                    static_hybrid_sources_match(
+                        &client,
+                        &worker,
+                        api_key.as_deref(),
+                        config,
+                        Some(&bound),
+                    )
+                    .await
+                } else {
+                    StaticHybridMatch::Differs
+                };
+                if !provider.lifecycle.active.load(Ordering::Acquire) {
+                    for handle in &handles {
+                        handle.shutdown();
+                    }
+                    break;
+                }
+                // A probe may cross the deadline while it is in flight.
+                if provider.lifecycle.expire_if_needed() {
+                    for handle in &handles {
+                        handle.shutdown();
+                    }
+                }
+                match provider.lifecycle.observe_layout(&outcome) {
+                    SourceAction::Stop => {
+                        for handle in &handles {
+                            handle.shutdown();
+                        }
+                        break;
+                    }
+                    SourceAction::Expire => {
+                        for handle in &handles {
+                            handle.shutdown();
+                        }
+                    }
+                    SourceAction::Recover => {
+                        handles.clear();
+                        let mut recovered = true;
+                        for (ev, index) in &targets {
+                            let stream = Arc::new(EventStream::new(index.clone()));
+                            match crate::kv_index::spawn_zmq(ev.clone(), stream, probe_ctx.clone())
+                            {
+                                Ok(handle) => handles.push(Arc::new(handle)),
+                                Err(_) => recovered = false,
+                            }
+                        }
+                        // Retirement can race the awaited probe and the new
+                        // subscriptions. Never make it active again.
+                        if !provider.lifecycle.active.load(Ordering::Acquire) || !recovered {
+                            for handle in &handles {
+                                handle.shutdown();
+                            }
+                            if !provider.lifecycle.active.load(Ordering::Acquire) {
+                                break;
+                            }
+                        } else {
+                            provider.lifecycle.state.lock().trusted = true;
+                        }
+                    }
+                    SourceAction::Keep => {}
+                    SourceAction::Rebuild => {
+                        unreachable!("layout probe cannot install a descriptor")
+                    }
+                }
+            }
+        });
+    }
+}
+
+impl KvIndexSupervisor {
+    /// Shut down this worker's subscribers, clear its residency, release its
+    /// identity ref.
+    pub fn on_worker_removed(&self, worker_url: &str) {
+        let mut workers = self.workers.lock();
+        self.lifecycles.lock().remove(worker_url);
+        if let Some(subs) = workers.remove(worker_url) {
+            self.retire_worker(subs);
+            info!("kv_index {}: removed subscribers", worker_url);
+        }
+    }
+
+    pub(super) fn retire_worker(&self, subs: WorkerSubs) {
+        subs.active.store(false, Ordering::Release);
+        for handle in &subs.handles {
+            handle.shutdown();
+        }
+        for handle in &subs.hybrid_handles {
+            handle.shutdown();
+        }
+        for live in &subs.live_sources {
+            let _guard = live.lease.strict_rank.lock();
+            subs.indexer.retire_source(&subs.source_id, live.rank);
+        }
+        self.release_identity(&subs.key);
+    }
+
+    /// Shut down every subscriber and drop all indexers.
+    pub fn shutdown(&self) {
+        let mut workers = self.workers.lock();
+        for (_url, subs) in workers.drain() {
+            self.retire_worker(subs);
+        }
+        self.lifecycles.lock().clear();
+        drop(workers);
+        info!("kv_index supervisor shut down");
+    }
+
+    /// Ref-count an identity; on first acquisition create its indexer.
+    pub(super) fn acquire_identity(&self, key: &CacheKey) -> Arc<KvBlockIndexer> {
+        let mut refs = self.identity_refs.lock();
+        let count = refs.entry(key.clone()).or_insert(0);
+        if *count == 0 {
+            self.indexers
+                .insert(key.clone(), Arc::new(KvBlockIndexer::new()));
+        }
+        *count += 1;
+        drop(refs);
+        self.indexers.get(key).expect("just inserted").clone()
+    }
+
+    /// Decrement an identity's ref-count; on last release drop its indexer.
+    fn release_identity(&self, key: &CacheKey) {
+        let mut refs = self.identity_refs.lock();
+        if let Some(c) = refs.get_mut(key) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                refs.remove(key);
+                drop(refs);
+                self.indexers.remove(key);
+                return;
+            }
+        }
+        drop(refs);
+    }
+}

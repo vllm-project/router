@@ -708,4 +708,232 @@ mod tests {
         wait_for(&index, &prompt, 528).await;
         drop(handle);
     }
+
+    #[tokio::test]
+    async fn subscriber_replays_then_applies_live_events_and_retires() {
+        use crate::kv_index::{AllBlocksCleared, KVEvent};
+
+        let ctx = Arc::new(zmq::Context::new());
+        let publisher = ctx.socket(zmq::XPUB).unwrap();
+        let replay = ctx.socket(zmq::ROUTER).unwrap();
+        publisher.set_linger(0).unwrap();
+        replay.set_linger(0).unwrap();
+        publisher.bind("inproc://hybrid-test-pub").unwrap();
+        replay.bind("inproc://hybrid-test-replay").unwrap();
+        let index = Arc::new(qwen_index(
+            RoutableTarget {
+                instance_id: Arc::from("worker"),
+                dp_rank: 0,
+            },
+            8,
+        ));
+        let stream = Arc::new(EventStream::new(index.clone()));
+        let source = EventSource {
+            source: Arc::from("worker"),
+            dp_rank: 0,
+            pub_endpoint: "inproc://hybrid-test-pub".into(),
+            replay_endpoint: Some("inproc://hybrid-test-replay".into()),
+            topic: "epoch-1".into(),
+            hwm: None,
+        };
+        let handle = spawn_zmq(source, stream, ctx.clone()).unwrap();
+        let subscription = recv(&publisher).await;
+        assert_eq!(subscription[0], [b"\x01".as_slice(), b"epoch-1"].concat());
+        let request = recv(&replay).await;
+        let payload = &crate::kv_index::source::binding::tests::qwen35_payload();
+        let seq0 = 0_i64.to_be_bytes();
+        let end = (-1_i64).to_be_bytes();
+        assert_eq!(request.len(), 3);
+        replay
+            .send_multipart(
+                [
+                    request[0].as_slice(),
+                    &[],
+                    b"epoch-1",
+                    &seq0,
+                    payload.as_slice(),
+                ],
+                0,
+            )
+            .unwrap();
+        replay
+            .send_multipart([request[0].as_slice(), &[], &[], &end, &[]], 0)
+            .unwrap();
+        let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
+        wait_for(&index, &prompt, 528).await;
+        let workers: Vec<Arc<dyn crate::core::Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(crate::core::BasicWorker::new(
+                    format!("http://worker-{i}"),
+                    crate::core::WorkerType::Regular,
+                )) as Arc<dyn crate::core::Worker>
+            })
+            .collect();
+        let policy = crate::policies::KvAwarePolicy::default();
+        policy.register_target(
+            workers[0].url(),
+            RoutableTarget {
+                instance_id: Arc::from("cold"),
+                dp_rank: 0,
+            },
+        );
+        policy.register_target_with_cache_identity(
+            workers[1].url(),
+            RoutableTarget {
+                instance_id: Arc::from("worker"),
+                dp_rank: 0,
+            },
+            crate::kv_index::CacheKey {
+                model: Arc::from("qwen"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size: 528,
+            },
+            index.clone(),
+        );
+        assert_eq!(
+            policy.select_worker_with_token_ids(&workers, Some(&prompt)),
+            Some(1)
+        );
+        let clear = rmp_serde::to_vec_named(&(
+            2.0_f64,
+            vec![KVEvent::AllBlocksCleared(AllBlocksCleared::default())],
+            Some(0_u32),
+        ))
+        .unwrap();
+        publisher
+            .send_multipart([b"epoch-1".as_slice(), &1_i64.to_be_bytes(), &clear], 0)
+            .unwrap();
+        wait_for(&index, &prompt, 0).await;
+        // After a clear both workers tie; the credit is gone, the tie-break
+        // winner is not part of this assertion.
+        assert!(policy
+            .select_worker_with_token_ids(&workers, Some(&prompt))
+            .is_some());
+        publisher
+            .send_multipart(
+                [
+                    b"epoch-1".as_slice(),
+                    &2_i64.to_be_bytes(),
+                    payload.as_slice(),
+                ],
+                0,
+            )
+            .unwrap();
+        wait_for(&index, &prompt, 528).await;
+        // A live gap requires a replay through the observed sequence. An end
+        // marker for a truncated history must not make its partial state visible.
+        publisher
+            .send_multipart(
+                [
+                    b"epoch-1".as_slice(),
+                    &4_i64.to_be_bytes(),
+                    payload.as_slice(),
+                ],
+                0,
+            )
+            .unwrap();
+        wait_for(&index, &prompt, 0).await;
+        let truncated = recv(&replay).await;
+        replay
+            .send_multipart(
+                [
+                    truncated[0].as_slice(),
+                    &[],
+                    b"epoch-1",
+                    &seq0,
+                    payload.as_slice(),
+                ],
+                0,
+            )
+            .unwrap();
+        replay
+            .send_multipart([truncated[0].as_slice(), &[], &[], &end, &[]], 0)
+            .unwrap();
+        let complete = recv(&replay).await;
+        assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 0);
+        for (seq, event) in [
+            (0_i64, payload.as_slice()),
+            (1, clear.as_slice()),
+            (2, payload.as_slice()),
+            (3, payload.as_slice()),
+            (4, payload.as_slice()),
+        ] {
+            replay
+                .send_multipart(
+                    [
+                        complete[0].as_slice(),
+                        &[],
+                        b"epoch-1",
+                        &seq.to_be_bytes(),
+                        event,
+                    ],
+                    0,
+                )
+                .unwrap();
+        }
+        replay
+            .send_multipart([complete[0].as_slice(), &[], &[], &end, &[]], 0)
+            .unwrap();
+        wait_for(&index, &prompt, 528).await;
+        // A restarted publisher that reuses the topic restarts at sequence 0.
+        // Treating that as a stale duplicate would keep the dead epoch's cache
+        // visible, so credit must be revoked until a new replay is verified.
+        publisher
+            .send_multipart([b"epoch-1".as_slice(), &0_i64.to_be_bytes(), &clear], 0)
+            .unwrap();
+        wait_for(&index, &prompt, 0).await;
+        let restarted = recv(&replay).await;
+        assert_eq!(restarted.len(), 3);
+        replay
+            .send_multipart([restarted[0].as_slice(), &[], b"epoch-1", &seq0, &clear], 0)
+            .unwrap();
+        replay
+            .send_multipart([restarted[0].as_slice(), &[], &[], &end, &[]], 0)
+            .unwrap();
+        publisher
+            .send_multipart(
+                [
+                    b"epoch-1".as_slice(),
+                    &1_i64.to_be_bytes(),
+                    payload.as_slice(),
+                ],
+                0,
+            )
+            .unwrap();
+        wait_for(&index, &prompt, 528).await;
+        // Negative live cursors cannot be retained as an unsigned replay target.
+        for invalid_seq in [-1_i64, -2] {
+            publisher
+                .send_multipart(
+                    [
+                        b"epoch-1".as_slice(),
+                        &invalid_seq.to_be_bytes(),
+                        payload.as_slice(),
+                    ],
+                    0,
+                )
+                .unwrap();
+            wait_for(&index, &prompt, 0).await;
+            let request = recv(&replay).await;
+            assert_eq!(request[2], 0_u64.to_be_bytes());
+            replay
+                .send_multipart(
+                    [
+                        request[0].as_slice(),
+                        &[],
+                        b"epoch-1",
+                        &seq0,
+                        payload.as_slice(),
+                    ],
+                    0,
+                )
+                .unwrap();
+            replay
+                .send_multipart([request[0].as_slice(), &[], &[], &end, &[]], 0)
+                .unwrap();
+            wait_for(&index, &prompt, 528).await;
+        }
+        handle.shutdown();
+        assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 0);
+    }
 }

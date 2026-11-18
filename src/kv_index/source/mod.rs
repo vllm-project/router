@@ -1,6 +1,7 @@
 //! Worker discovery and event ingestion.
 
 pub(crate) mod binding;
+pub mod discovery;
 pub(crate) mod endpoints;
 pub(crate) mod events;
 
