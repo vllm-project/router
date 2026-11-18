@@ -32,7 +32,9 @@ BUILDKITE_DIR = Path(__file__).resolve().parent.parent
 HARDWARE_PATH = BUILDKITE_DIR / "ci_mirror_hardwares.yml"
 # ``$$`` survives Buildkite upload interpolation as a single ``$``.
 CUDA_HF_TOKEN_ENV = "VLLM_CI_HF_TOKEN"
-CUDA_HF_TOKEN_EXPORT = f'if [ -n "$${{{CUDA_HF_TOKEN_ENV}:-}}" ]; then export HF_TOKEN="$${{{CUDA_HF_TOKEN_ENV}}}"; fi'
+CUDA_HF_TOKEN_EXPORT = (
+    f'if [ -n "$${{{CUDA_HF_TOKEN_ENV}:-}}" ]; then export HF_TOKEN="$${{{CUDA_HF_TOKEN_ENV}}}"; fi'
+)
 SHARED_GPU_DEVICE_COUNT_CHECK = (
     "import os, sys; from pathlib import Path; "
     'expected = int(os.environ["AMD_CI_GPU_COUNT"]); '
@@ -62,9 +64,7 @@ def load_presets() -> dict[str, dict[str, Any]]:
     doc = yaml.safe_load(HARDWARE_PATH.read_text(encoding="utf-8"))
     presets = doc.get("mirror_hardwares") if isinstance(doc, dict) else None
     if not isinstance(presets, dict) or not presets:
-        raise SystemExit(
-            f"mirror_hardwares must be a non-empty mapping in {HARDWARE_PATH}"
-        )
+        raise SystemExit(f"mirror_hardwares must be a non-empty mapping in {HARDWARE_PATH}")
     return presets
 
 
@@ -125,19 +125,11 @@ def shared_rocm_step(
     for key in ("devices", "privileged", "ipc", "shm-size"):
         plugin.pop(key, None)
     environment = plugin.get("environment", [])
-    if not isinstance(environment, list) or not all(
-        isinstance(e, str) for e in environment
-    ):
+    if not isinstance(environment, list) or not all(isinstance(e, str) for e in environment):
         raise SystemExit("shared Docker environment must be a list of strings")
-    plugin["environment"] = list(
-        dict.fromkeys(
-            [
-                *environment,
-                "AMD_CI_GPU_LEASE_ID",
-                "AMD_CI_GPU_COUNT",
-            ]
-        )
-    )
+    plugin["environment"] = list(dict.fromkeys([
+        *environment, "AMD_CI_GPU_LEASE_ID", "AMD_CI_GPU_COUNT",
+    ]))
     merged["agents"] = {"queue": queue}
     merged["env"] = {**merged.get("env", {}), "AMD_CI_GPU_COUNT": str(count)}
     if "command" in merged and "commands" in merged:
@@ -197,9 +189,7 @@ def expand_steps(
         name = step["mirror_hardwares"]
         label = _step_label(step)
         if not isinstance(name, str) or not name.strip():
-            raise SystemExit(
-                f"mirror_hardwares must be a preset name in step {label!r}"
-            )
+            raise SystemExit(f"mirror_hardwares must be a preset name in step {label!r}")
         if "agents" in step or "plugins" in step:
             raise SystemExit(
                 f"step {label!r} sets mirror_hardwares together with agents/plugins; "
@@ -208,22 +198,16 @@ def expand_steps(
         preset = presets.get(name)
         if preset is None:
             known = ", ".join(sorted(presets))
-            raise SystemExit(
-                f"unknown mirror_hardwares {name!r} in step {label!r}; known: {known}"
-            )
+            raise SystemExit(f"unknown mirror_hardwares {name!r} in step {label!r}; known: {known}")
 
-        merged = {
-            key: value for key, value in step.items() if key != "mirror_hardwares"
-        }
+        merged = {key: value for key, value in step.items() if key != "mirror_hardwares"}
         merged.update(copy.deepcopy(preset))
         shared_queue = preset.get("shared_gpu_queue")
         merged.pop("shared_gpu_queue", None)
         if shared_count is not None and (
             not isinstance(shared_queue, str) or not shared_queue.strip()
         ):
-            raise SystemExit(
-                f"hardware preset {name!r} does not declare shared_gpu_queue"
-            )
+            raise SystemExit(f"hardware preset {name!r} does not declare shared_gpu_queue")
         if CUDA_HF_TOKEN_ENV in _preset_env_names(preset):
             _prepend_hf_token_export(merged)
         if "retry" in step:
