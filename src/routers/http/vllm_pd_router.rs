@@ -5760,8 +5760,12 @@ mod tests {
         );
     }
 
+    /// Decode pricing must not fan out backend renders on non-gRPC pools: the
+    /// only free token source is `router_prompts`, and an HTTP pool has none.
+    /// Prefill still renders for its own estimate, so the counters prove the
+    /// gate suppresses only the Decode arm.
     #[tokio::test]
-    async fn removed_decode_during_pricing_is_not_committed() {
+    async fn http_decode_pool_never_renders_for_pricing() {
         use crate::config::{KvConnector, PolicyConfig, RouterConfig, RoutingMode};
         use axum::{
             extract::State,
@@ -5770,18 +5774,18 @@ mod tests {
             Json, Router,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::Duration;
-        use tokio::sync::{mpsc, Semaphore};
-        type Pricing = (mpsc::UnboundedSender<()>, Arc<Semaphore>, Arc<AtomicUsize>);
-        async fn render(State((entered, gate, _)): State<Pricing>) -> Json<Value> {
-            entered.send(()).unwrap();
-            gate.acquire().await.unwrap().forget();
+
+        #[derive(Clone)]
+        struct RenderCount(Arc<AtomicUsize>);
+        async fn render(State(count): State<RenderCount>) -> Json<Value> {
+            count.0.fetch_add(1, Ordering::SeqCst);
             Json(json!({"token_ids": [1, 2, 3]}))
         }
-        async fn generate(State((_, _, generations)): State<Pricing>) -> Json<Value> {
-            generations.fetch_add(1, Ordering::SeqCst);
-            Json(json!({"choices": [{"text": "removed worker answered"}]}))
+        async fn generate() -> Json<Value> {
+            Json(json!({"choices": [{"text": "decoded"}]}))
         }
+
+        let prefill_renders = Arc::new(AtomicUsize::new(0));
         let prefill_app = Router::new()
             .route("/health", get(|| async { "ok" }))
             .route(
@@ -5790,7 +5794,7 @@ mod tests {
             )
             .route(
                 "/v1/completions/render",
-                post(|| async { Json(json!({"token_ids": [1, 2, 3]})) }),
+                post(render).with_state(RenderCount(prefill_renders.clone())),
             )
             .route(
                 "/v1/completions",
@@ -5804,15 +5808,17 @@ mod tests {
             );
         let p = spawn_test_server(prefill_app).await;
         let bootstrap_port = p.rsplit(':').next().unwrap().parse().unwrap();
-        let (entered, mut events) = mpsc::unbounded_channel();
-        let gate = Arc::new(Semaphore::new(0));
-        let generations = Arc::new(AtomicUsize::new(0));
+
+        let decode_renders = Arc::new(AtomicUsize::new(0));
         let decode_app = Router::new()
             .route("/health", get(|| async { "ok" }))
-            .route("/v1/completions/render", post(render))
-            .route("/v1/completions", post(generate))
-            .with_state((entered, gate.clone(), generations.clone()));
+            .route(
+                "/v1/completions/render",
+                post(render).with_state(RenderCount(decode_renders.clone())),
+            )
+            .route("/v1/completions", post(generate));
         let d = spawn_test_server(decode_app).await;
+
         let publisher_context = zmq::Context::new();
         let publisher = publisher_context.socket(zmq::PUB).unwrap();
         publisher.bind("tcp://127.0.0.1:*").unwrap();
@@ -5863,34 +5869,26 @@ mod tests {
             .await
             .unwrap(),
         );
-        let runner = router.clone();
-        let request = tokio::spawn(async move {
-            runner
-                .route_transparent(
-                    None,
-                    "/v1/completions",
-                    &Method::POST,
-                    json!({"model": "m", "prompt": "hello", "stream": false, "max_tokens": 2}),
-                )
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(5), events.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        router.remove_decode_server(&d).await.unwrap();
-        assert!(ctx.worker_registry.get_decode_workers().is_empty());
-        gate.add_permits(1);
-        let response = tokio::time::timeout(Duration::from_secs(5), request)
-            .await
-            .unwrap()
-            .unwrap();
+
+        let response = router
+            .route_transparent(
+                None,
+                "/v1/completions",
+                &Method::POST,
+                json!({"model": "m", "prompt": "hello", "stream": false, "max_tokens": 2}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            generations.load(Ordering::SeqCst),
-            0,
-            "a removed Decode worker received the generation request"
+            prefill_renders.load(Ordering::SeqCst),
+            1,
+            "Prefill still renders for its own estimate"
         );
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            decode_renders.load(Ordering::SeqCst),
+            0,
+            "Decode pricing must not fan out backend renders on HTTP pools"
+        );
     }
     /// A push-addressed Prefill sent its KV to the provisional Decode: the
     /// commitment must stay there even when live load prefers another worker.

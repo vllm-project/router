@@ -627,8 +627,14 @@ impl PdKvState {
         // A candidate can only be priced when its base is creditable. `decode_context_from_
         // results` needs an estimate for every candidate, so pricing with a partial set
         // always falls back - after paying for the slowest render. Require the whole set.
+        // Decode pricing also must not fan out backend renders on non-gRPC pools: without
+        // `router_prompts` the only token source is a `/render` POST to every Decode base,
+        // paid on the admission hot path for a load-balancing heuristic. Fall back to
+        // request counts there; marginal pricing then applies only where the ids are
+        // already free (gRPC/router_prompts).
         let decode_expected = !defer_decode && kv_aware_ops(decode_policy.as_ref()).is_some();
         let decode_priced_here = decode_expected
+            && router_prompts.is_some()
             && self
                 .all_priceable(decode_workers, cache_salt, &allow_credit)
                 .await;
@@ -837,6 +843,14 @@ impl PdKvState {
         // stages through `prepare_stages`.
         let hashes = &mut PromptHashes::new();
         let kv = kv_aware_ops(policy.as_ref())?;
+        // Decode pricing must not fan out backend renders on non-gRPC pools. Without
+        // router token ids the deferred commit would re-render the whole pool for ids
+        // that cannot have changed, so the pool falls back to request counts instead
+        // of paying a second full render fan-out on the commit path.
+        if router_prompts.is_none() {
+            crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
+            return None;
+        }
         let allow_credit = self.credit_by_base(request).await;
         // A salted request must not be credited with unsalted blocks: the same rule
         // Prefill applies to its own estimate, so both stages price the same prefix.
