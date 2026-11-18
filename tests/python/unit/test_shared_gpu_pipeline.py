@@ -2,7 +2,10 @@
 
 import importlib.util
 import copy
+import os
 from pathlib import Path
+import subprocess
+import sys
 import unittest
 
 import pytest
@@ -27,6 +30,27 @@ def leaves(steps):
 
 
 class SharedGpuPipelineTest(unittest.TestCase):
+    def test_device_count_preflight_survives_optimized_mode(self):
+        actual = len(list(Path("/dev/dri").glob("renderD*")))
+        for expected, returncode in ((actual, 0), (actual + 1, 1)):
+            with self.subTest(expected=expected):
+                env = {**os.environ, "AMD_CI_GPU_COUNT": str(expected)}
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-O",
+                        "-c",
+                        uploader.SHARED_GPU_DEVICE_COUNT_CHECK,
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode, returncode)
+                if returncode:
+                    self.assertIn("shared GPU device count mismatch", result.stderr)
+
     def test_default_preserves_original_preset_and_command(self):
         presets = uploader.load_presets()
         for name in ("test-merge.yml", "test-nightly.yml"):
