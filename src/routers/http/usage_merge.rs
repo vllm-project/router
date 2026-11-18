@@ -13,25 +13,27 @@ pub(super) fn usage_object(value: &Value) -> Option<&Map<String, Value>> {
 }
 
 pub(super) fn cached_tokens(response: &Value) -> Option<u64> {
-    let usage = usage_object(response)?;
     // Validate each candidate against its matching input count, so an invalid
     // legacy spelling cannot hide a valid Responses spelling. Keep support for
     // details-only snapshots; an explicit input count must be valid and bound
     // the cache count. Zero remains a valid cache count.
-    [
-        ("prompt_tokens_details", "prompt_tokens"),
-        ("input_tokens_details", "input_tokens"),
-    ]
-    .iter()
-    .find_map(|(details_key, input_key)| {
-        let cached = usage.get(*details_key)?.get("cached_tokens")?.as_u64()?;
-        if let Some(input) = usage.get(*input_key) {
-            if cached > input.as_u64()? {
-                return None;
-            }
+    [UsageDialect::Completions, UsageDialect::Responses]
+        .into_iter()
+        .find_map(|dialect| cached_tokens_for_dialect(response, dialect))
+}
+
+/// P/D observation must read the same spelling that reconciliation selected,
+/// without falling back to an untouched Decode alias.
+pub(super) fn cached_tokens_for_dialect(response: &Value, dialect: UsageDialect) -> Option<u64> {
+    let usage = usage_object(response)?;
+    let (input_key, details_key, _) = dialect.keys();
+    let cached = usage.get(details_key)?.get("cached_tokens")?.as_u64()?;
+    if let Some(input) = usage.get(input_key) {
+        if cached > input.as_u64()? {
+            return None;
         }
-        Some(cached)
-    })
+    }
+    Some(cached)
 }
 
 pub(super) fn usage_object_mut(value: &mut Value) -> Option<&mut Map<String, Value>> {

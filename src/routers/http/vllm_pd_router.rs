@@ -456,6 +456,7 @@ fn finalize_decode_body(
         );
     }
     if reconcile_cache {
+        let dialect = usage_merge::usage_dialect(&json, prefill_response_json);
         if let Some(prefill) = prefill_response_json {
             changed |= usage_merge::merge_pd_usage(prefill, &mut json);
         }
@@ -464,7 +465,7 @@ fn finalize_decode_body(
                 changed |= rewritten;
                 if let Some(attempt) = observation {
                     if cached.is_some() {
-                        observe_merged_json(attempt, &json);
+                        observe_merged_json(attempt, &json, dialect);
                     } else {
                         observe_unavailable(attempt, status, UnavailableReason::MissingUsage);
                     }
@@ -3868,6 +3869,101 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn reconciled_dual_dialect_json_observes_the_rewritten_field() {
+        use crate::kv_observation::test_helpers::{has_outcome, prediction};
+
+        for nested in [false, true] {
+            for already_reconciled in [false, true] {
+                for cached in [Some(32_u64), Some(0), None] {
+                    let mut decode = json!({"usage": {
+                        "prompt_tokens": 64,
+                        "prompt_tokens_details": {"cached_tokens": 16, "prompt_extension": 3},
+                        "input_tokens": 64,
+                        "input_tokens_details": {"future_detail": 7},
+                        "output_tokens": 8,
+                        "total_tokens": 72,
+                        "future": 9
+                    }, "future_response": 11});
+                    if let Some(value) = if already_reconciled { cached } else { Some(8) } {
+                        decode["usage"]["input_tokens_details"]["cached_tokens"] = value.into();
+                    }
+                    if nested {
+                        decode = json!({"type": "response.completed", "response": decode, "future_event": 13});
+                    }
+                    let original = Bytes::from(format!(" \n{decode}\n "));
+                    let prefill = json!({"usage": {
+                        "input_tokens": 64,
+                        "input_tokens_details": {"cached_tokens": cached}
+                    }});
+                    let recorder =
+                        metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+                    let handle = recorder.handle();
+                    let _recorder = metrics::set_default_local_recorder(&recorder);
+                    let attempt = KvRouteAttempt::new(prediction());
+                    let response = finalize_decode_body(
+                        StatusCode::OK,
+                        HeaderMap::new(),
+                        original.clone(),
+                        Some(&prefill),
+                        "/v1/responses",
+                        false,
+                        Some(&attempt),
+                    )
+                    .unwrap();
+                    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    if already_reconciled {
+                        assert_eq!(bytes, original);
+                    }
+                    let result: Value = serde_json::from_slice(&bytes).unwrap();
+                    let usage = usage_merge::usage_object(&result).unwrap();
+                    assert_eq!(
+                        usage["prompt_tokens_details"],
+                        json!({"cached_tokens": 16, "prompt_extension": 3})
+                    );
+                    assert_eq!(usage["input_tokens_details"]["future_detail"], 7);
+                    assert_eq!(
+                        usage["input_tokens_details"].get("cached_tokens"),
+                        cached.map(Value::from).as_ref()
+                    );
+                    assert_eq!(usage["future"], 9);
+                    let response = if nested { &result["response"] } else { &result };
+                    assert_eq!(response["future_response"], 11);
+                    if nested {
+                        assert_eq!(result["future_event"], 13);
+                    }
+                    drop(attempt);
+                    let metrics = handle.render();
+                    if let Some(cached) = cached {
+                        assert!(has_outcome(&metrics, "observed", "none"), "{metrics}");
+                        assert!(metrics.lines().any(|line| line
+                            == format!("vllm_router_kv_actual_cached_tokens_sum {cached}")));
+                        assert!(metrics.contains("vllm_router_kv_actual_cached_tokens_count 1"));
+                        assert!(metrics.contains("vllm_router_kv_predicted_cached_tokens_count 1"));
+                        let direction = if cached == 32 {
+                            "exact"
+                        } else {
+                            "overpredicted"
+                        };
+                        assert!(metrics.lines().any(|line| line == format!(
+                            "vllm_router_kv_cached_token_absolute_error_sum{{direction=\"{direction}\"}} {}",
+                            32 - cached
+                        )), "{metrics}");
+                    } else {
+                        assert!(
+                            has_outcome(&metrics, "unavailable", "missing_usage"),
+                            "{metrics}"
+                        );
+                        assert!(!metrics.contains("vllm_router_kv_actual_cached_tokens_count"));
+                        assert!(!metrics.contains("vllm_router_kv_predicted_cached_tokens_count"));
+                    }
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn merged_pd_observation_compares_prefill_usage_for_json_and_sse() {

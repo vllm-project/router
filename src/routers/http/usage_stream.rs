@@ -114,10 +114,11 @@ fn rewrite_frame(
     usage_merge::usage_object(&json)?;
     let UsageMode::Reconcile { cached, prefill } = mode else {
         if let Some(obs) = observation {
-            obs.observe_value(&json);
+            obs.observe_value(&json, None);
         }
         return None;
     };
+    let dialect = usage_merge::usage_dialect(&json, prefill.as_ref());
     let mut changed = prefill
         .as_ref()
         .is_some_and(|value| usage_merge::merge_pd_usage(value, &mut json));
@@ -132,7 +133,7 @@ fn rewrite_frame(
     }
     if !changed {
         if let Some(obs) = observation {
-            obs.observe_value(&json);
+            obs.observe_value(&json, Some(dialect));
         }
         return None;
     }
@@ -163,7 +164,7 @@ fn rewrite_frame(
         if result.len() > limit {
             obs.reject(UnavailableReason::OversizedSseFrame);
         } else {
-            obs.observe_value(&json);
+            obs.observe_value(&json, Some(dialect));
         }
     }
     Some(Bytes::from(result))
@@ -1020,6 +1021,87 @@ mod tests {
         let output = String::from_utf8(output.concat()).unwrap();
         assert!(!output.contains("cached_tokens"));
         assert!(output.contains("audio_tokens"));
+    }
+
+    #[test]
+    fn reconciled_dual_dialect_sse_observation_uses_selected_field() {
+        use crate::kv_observation::test_helpers::*;
+        for nested in [false, true] {
+            for unchanged in [false, true] {
+                for actual in [Some(0_u64), Some(32), None] {
+                    let mut decode = json!({"usage": {
+                        "prompt_tokens": 64,
+                        "prompt_tokens_details": {"cached_tokens": 16, "legacy": true},
+                        "input_tokens": 64,
+                        "input_tokens_details": {"future": 9},
+                        "future": true
+                    }});
+                    if let Some(cached) = if unchanged { actual } else { Some(8) } {
+                        decode["usage"]["input_tokens_details"]["cached_tokens"] = cached.into();
+                    }
+                    if nested {
+                        decode = json!({"type": "response.completed", "response": decode});
+                    }
+                    let prefill = json!({"usage": {
+                        "input_tokens": 64,
+                        "input_tokens_details": {"cached_tokens": actual}
+                    }});
+                    let frame = Bytes::from(format!("data: {decode}\n\n"));
+                    let metrics = render(|| {
+                        let mut obs = SseUsageObservation::new(
+                            KvRouteAttempt::new(prediction()),
+                            StatusCode::OK,
+                        );
+                        let rewritten = rewrite_frame(
+                            &frame,
+                            &UsageMode::Reconcile {
+                                cached: actual,
+                                prefill: Some(prefill),
+                            },
+                            Some(&mut obs),
+                            MAX_USAGE_BYTES,
+                        );
+                        assert_eq!(rewritten.is_none(), unchanged);
+                        let output = rewritten.unwrap_or_else(|| frame.clone());
+                        let value: Value =
+                            serde_json::from_slice(&output[6..output.len() - 2]).unwrap();
+                        let usage = usage_merge::usage_object(&value).unwrap();
+                        assert_eq!(
+                            usage["input_tokens_details"].get("cached_tokens"),
+                            actual.map(Value::from).as_ref()
+                        );
+                        assert_eq!(usage["input_tokens_details"]["future"], 9);
+                        assert_eq!(
+                            usage["prompt_tokens_details"],
+                            json!({"cached_tokens": 16, "legacy": true})
+                        );
+                        assert_eq!(usage["future"], true);
+                        obs.finish(true);
+                    });
+                    let Some(actual) = actual else {
+                        assert!(
+                            has_outcome(&metrics, "unavailable", "missing_usage"),
+                            "{metrics}"
+                        );
+                        assert!(!metrics.contains("vllm_router_kv_actual_cached_tokens_count"));
+                        assert!(!metrics.contains("vllm_router_kv_predicted_cached_tokens_count"));
+                        continue;
+                    };
+                    assert!(has_outcome(&metrics, "observed", "none"), "{metrics}");
+                    assert!(
+                        metrics.lines().any(|line| line
+                            == format!("vllm_router_kv_actual_cached_tokens_sum {actual}")),
+                        "{metrics}"
+                    );
+                    let (direction, error) = if actual == 32 {
+                        ("exact", 0)
+                    } else {
+                        ("overpredicted", 32)
+                    };
+                    assert!(metrics.lines().any(|line| line == format!("vllm_router_kv_cached_token_absolute_error_sum{{direction=\"{direction}\"}} {error}")), "{metrics}");
+                }
+            }
+        }
     }
 
     #[test]

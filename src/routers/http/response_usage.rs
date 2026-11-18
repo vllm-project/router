@@ -123,8 +123,13 @@ impl Drop for JsonUsageObservation {
     }
 }
 
-pub(super) fn observe_merged_json(attempt: &KvRouteAttempt, merged: &Value) {
-    let observation = usage_merge::cached_tokens(merged).ok_or(UnavailableReason::MissingUsage);
+pub(super) fn observe_merged_json(
+    attempt: &KvRouteAttempt,
+    merged: &Value,
+    dialect: usage_merge::UsageDialect,
+) {
+    let observation = usage_merge::cached_tokens_for_dialect(merged, dialect)
+        .ok_or(UnavailableReason::MissingUsage);
     attempt.record_once(observation);
 }
 
@@ -167,20 +172,31 @@ impl SseUsageObservation {
     pub(super) fn set_incomplete(&mut self, incomplete: bool) {
         self.incomplete = incomplete;
     }
-    pub(super) fn observe_value(&mut self, value: &Value) {
+    pub(super) fn observe_value(
+        &mut self,
+        value: &Value,
+        dialect: Option<usage_merge::UsageDialect>,
+    ) {
         if self.attempt.is_finished() {
             return;
         }
-        let Some(cached_tokens) = usage_merge::cached_tokens(value) else {
+        // Keep mode accepts either usage spelling. Reconcile mode supplies its
+        // selected dialect so an untouched Decode alias cannot become a sample.
+        let dialects = dialect.as_ref().map(std::slice::from_ref).unwrap_or(&[
+            usage_merge::UsageDialect::Completions,
+            usage_merge::UsageDialect::Responses,
+        ]);
+        let Some(cached_tokens) = dialects
+            .iter()
+            .find_map(|dialect| usage_merge::cached_tokens_for_dialect(value, *dialect))
+        else {
             if usage_merge::usage_object(value).is_some_and(|usage| {
-                ["prompt_tokens_details", "input_tokens_details"]
-                    .iter()
-                    .any(|key| {
-                        usage
-                            .get(*key)
-                            .and_then(|details| details.get("cached_tokens"))
-                            .is_some_and(|cached| !cached.is_null())
-                    })
+                dialects.iter().any(|dialect| {
+                    usage
+                        .get(dialect.keys().1)
+                        .and_then(|details| details.get("cached_tokens"))
+                        .is_some_and(|cached| !cached.is_null())
+                })
             }) {
                 self.reject(UnavailableReason::InvalidUsage);
             }
