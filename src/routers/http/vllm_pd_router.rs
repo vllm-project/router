@@ -5760,10 +5760,7 @@ mod tests {
         );
     }
 
-    /// Decode pricing must not fan out backend renders on non-gRPC pools: the
-    /// only free token source is `router_prompts`, and an HTTP pool has none.
-    /// Prefill still renders for its own estimate, so the counters prove the
-    /// gate suppresses only the Decode arm.
+    /// HTTP Decode pricing must never render; Prefill still does.
     #[tokio::test]
     async fn http_decode_pool_never_renders_for_pricing() {
         use crate::config::{KvConnector, PolicyConfig, RouterConfig, RoutingMode};

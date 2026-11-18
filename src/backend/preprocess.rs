@@ -158,9 +158,8 @@ fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &
     Ok(HttpKvInput::Render { path })
 }
 
-/// Whether pricing this request would need a backend `/render`. Direct token-id
-/// inputs (`prompt: [ids]`, `input_ids`, `token_ids`) and unsupported inputs
-/// both avoid the render; only a string/chat body fans out to the workers.
+/// Whether pricing needs a backend `/render`: a string/chat body does, a
+/// direct token-id input does not.
 pub(crate) fn http_input_requires_render(body: &serde_json::Value, route: &str) -> bool {
     matches!(http_kv_input(body, route), Ok(HttpKvInput::Render { .. }))
 }

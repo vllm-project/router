@@ -630,11 +630,8 @@ impl PdKvState {
         // A candidate can only be priced when its base is creditable. `decode_context_from_
         // results` needs an estimate for every candidate, so pricing with a partial set
         // always falls back - after paying for the slowest render. Require the whole set.
-        // Decode pricing also must not fan out backend renders: without router
-        // token ids a string/chat body would `/render` every Decode base on the
-        // admission hot path for a load-balancing heuristic. Fall back to the
-        // load ladder there; marginal pricing then applies only where the ids
-        // are already free (gRPC/router_prompts, or a direct token-id prompt).
+        // Decode pricing also never renders on non-gRPC pools: only gRPC router_prompts
+        // and direct token-id prompts price without a `/render` fan-out.
         let decode_expected = !defer_decode && kv_aware_ops(decode_policy.as_ref()).is_some();
         let decode_requires_render =
             router_prompts.is_none() && http_input_requires_render(request, route);
@@ -848,10 +845,8 @@ impl PdKvState {
         // stages through `prepare_stages`.
         let hashes = &mut PromptHashes::new();
         let kv = kv_aware_ops(policy.as_ref())?;
-        // Decode pricing must not fan out backend renders. Without router token
-        // ids a string/chat body would re-render the whole pool for ids that
-        // cannot have changed, so the pool falls back to the load ladder instead
-        // of paying a second full render fan-out on the commit path.
+        // Same no-render rule as admission: the commit path must not pay a
+        // second fan-out for ids that cannot have changed.
         if router_prompts.is_none() && http_input_requires_render(request, route) {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
             return None;
@@ -1365,9 +1360,7 @@ mod kv_input_tests {
                 .is_some(),
             "Decode must be priced before the first request"
         );
-        // HTTP pools price Decode only when the ids are already free: a direct
-        // token-id prompt needs no render and still prices, while a string body
-        // would render and therefore falls back without a network call.
+        // HTTP prices Decode only from free ids: a token-id prompt prices, a string falls back.
         assert!(
             state
                 .prepare_decode_context(
