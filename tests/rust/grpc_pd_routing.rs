@@ -627,6 +627,8 @@ async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
                 (
                     prefill.grpc_url.clone(),
                     PdKvEventSources {
+                        hybrid: None,
+                        compatible_decode_urls: Vec::new(),
                         endpoints: vec![publisher.endpoint.clone()],
                         replay_endpoints: None,
                         block_size: 16,

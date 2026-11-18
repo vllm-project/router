@@ -11,6 +11,10 @@ impl crate::policies::TieredMatchProvider for KvBlockIndexer {
 }
 
 impl crate::policies::TieredMatchProvider for SourceBinding {
+    fn target_scoped(&self) -> bool {
+        true
+    }
+
     fn matches(
         &self,
         tokens: &[u32],

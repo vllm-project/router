@@ -3,8 +3,7 @@
 mod routing_provider;
 pub(crate) mod source;
 
-pub mod discovery;
-use source::endpoints;
+pub use source::discovery;
 pub use source::events::{subscriber, wire};
 
 use std::sync::Arc;
