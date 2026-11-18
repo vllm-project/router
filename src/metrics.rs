@@ -426,9 +426,25 @@ pub fn init_metrics() {
     );
 }
 
-/// Installs the global recorder and spawns the Prometheus listener onto the
-/// current Tokio runtime. The returned handle renders the same registry.
-pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
+pub fn start_prometheus(config: PrometheusConfig) {
+    prometheus_builder(config)
+        .install()
+        .expect("failed to install Prometheus metrics exporter");
+}
+
+/// Like [`start_prometheus`], but must run inside a Tokio runtime, and also
+/// returns a handle on the same registry.
+pub(crate) fn start_prometheus_with_handle(config: PrometheusConfig) -> PrometheusHandle {
+    let (recorder, exporter) = prometheus_builder(config)
+        .build()
+        .expect("failed to build Prometheus metrics exporter");
+    let handle = recorder.handle();
+    tokio::spawn(exporter);
+    metrics::set_global_recorder(recorder).expect("failed to install Prometheus metrics recorder");
+    handle
+}
+
+fn prometheus_builder(config: PrometheusConfig) -> PrometheusBuilder {
     // Initialize metric descriptions
     init_metrics();
 
@@ -448,15 +464,9 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
         .with_http_listener(socket_addr)
         .upkeep_timeout(Duration::from_secs(5 * 60));
     let builder = set_program_scheduling_buckets(builder);
-    let (recorder, exporter) = builder
+    builder
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
-        .build()
-        .expect("failed to build Prometheus metrics exporter");
-    let handle = recorder.handle();
-    tokio::spawn(exporter);
-    metrics::set_global_recorder(recorder).expect("failed to install Prometheus metrics recorder");
-    handle
 }
 
 fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuilder {

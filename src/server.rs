@@ -1034,7 +1034,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Initialize prometheus metrics exporter
     println!("DEBUG: Initializing Prometheus metrics");
-    let metrics_handle = config.prometheus_config.map(metrics::start_prometheus);
+    let metrics_handle = config
+        .prometheus_config
+        .map(metrics::start_prometheus_with_handle);
     println!("DEBUG: Prometheus metrics initialized");
 
     info!(
