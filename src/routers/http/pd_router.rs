@@ -834,8 +834,8 @@ impl PdRouterBase {
             .collect()
     }
 
-    /// Start profiling on a backend server
-    pub async fn start_profiling(&self, worker_url: &str) {
+    /// Return whether the backend accepted the profiling start
+    pub async fn start_profiling(&self, worker_url: &str) -> bool {
         // Extract base URL if worker_url is in DP-aware format (e.g., http://127.0.0.1:8081@2)
         let (base_url, _) = super::dp_utils::parse_worker_url(worker_url);
 
@@ -843,6 +843,7 @@ impl PdRouterBase {
         match self.client.post(&url).send().await {
             Ok(res) if res.status().is_success() => {
                 info!("Started profiling on {}", base_url);
+                true
             }
             Ok(res) => {
                 warn!(
@@ -850,9 +851,11 @@ impl PdRouterBase {
                     base_url,
                     res.status()
                 );
+                false
             }
             Err(e) => {
                 warn!("Error starting profiling on {}: {}", base_url, e);
+                false
             }
         }
     }

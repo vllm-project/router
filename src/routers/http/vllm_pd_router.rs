@@ -922,7 +922,9 @@ impl VllmPDRouter {
         }
         let worker = self.profiling_worker(worker_url).await;
         let mut session = worker.lock().await;
-        self.pd_router.start_profiling(worker_url).await;
+        if !self.pd_router.start_profiling(worker_url).await {
+            return None;
+        }
         // Keep the previous fallback if this start is cancelled. The worker
         // lock prevents it from sending a stop while the start is awaited.
         if let Some(previous) = session.take() {
