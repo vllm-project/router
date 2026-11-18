@@ -1448,7 +1448,8 @@ impl KvAwarePolicy {
         if !has_tokens {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("missing_tokens");
         }
-        let mut query_cache: HashMap<(Option<CacheKey>, &[u32]), Vec<TierMatch>> = HashMap::new();
+        // The binding snapshot owns these provider Arcs for the memo lifetime.
+        let mut query_cache = HashMap::new();
         let mut grouped = Vec::with_capacity(bindings.len());
         let mut input_tokens = Vec::with_capacity(bindings.len());
         let mut prefill_tokens = Vec::with_capacity(bindings.len());
@@ -1464,7 +1465,11 @@ impl KvAwarePolicy {
                         continue;
                     }
                     let hits = query_cache
-                        .entry((binding.cache_key.clone(), ids))
+                        .entry((
+                            Arc::as_ptr(&binding.matches) as *const () as usize,
+                            binding.cache_key.clone(),
+                            *ids,
+                        ))
                         .or_insert_with(|| {
                             if let Some(reason) = credit_fallback {
                                 crate::metrics::RouterMetrics::record_kv_placement_lookup(reason);
@@ -1797,10 +1802,20 @@ impl KvAwareOps for KvAwarePolicy {
                 for tokens in prompts {
                     let hits = if verified {
                         query_cache
-                            .entry((binding.cache_key.clone(), tokens.as_slice()))
+                            .entry((
+                                Arc::as_ptr(&binding.matches) as *const () as usize,
+                                binding.cache_key.clone(),
+                                tokens.as_slice(),
+                            ))
                             .or_insert_with(|| {
-                                Self::placement_matches(&binding, Some(tokens), None, true)
+                                // Keep the allocation alive even if a later
+                                // input observes a replaced registration.
+                                (
+                                    binding.matches.clone(),
+                                    Self::placement_matches(&binding, Some(tokens), None, true),
+                                )
                             })
+                            .1
                             .as_slice()
                     } else {
                         &[]
@@ -3587,6 +3602,99 @@ mod tests {
         let released_at = Instant::now();
         acquired.release_ref();
         assert!(record.state.lock().idle_deadline.unwrap() >= released_at + ttl);
+    }
+
+    #[test]
+    fn placement_memos_keep_distinct_providers_and_reuse_shared_arcs() {
+        struct Matches {
+            calls: AtomicUsize,
+            hits: Vec<TierMatch>,
+        }
+        impl TieredMatchProvider for Matches {
+            fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.hits.clone()
+            }
+        }
+        let policy = KvAwarePolicy::default();
+        let workers = registered_worker_pair(&policy);
+        let first = Arc::new(Matches {
+            calls: AtomicUsize::new(0),
+            hits: Vec::new(),
+        });
+        let second = Arc::new(Matches {
+            calls: AtomicUsize::new(0),
+            hits: vec![tier_match(
+                &target(workers[1].url(), 0),
+                StorageTier::Device,
+                &[(0, 1)],
+            )],
+        });
+        let info = WorkerKvInfo {
+            cache_key: Some(CacheKey {
+                model: Arc::from("shared"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size: 2,
+            }),
+            ..Default::default()
+        };
+        for (worker, provider) in workers.iter().zip([
+            first.clone() as Arc<dyn TieredMatchProvider>,
+            second.clone(),
+        ]) {
+            policy.register_worker(worker.as_ref(), Some(&info), Some(provider));
+        }
+        let prompts = [vec![1, 2, 3, 4]];
+        for shared in [false, true] {
+            if shared {
+                policy.register_worker(workers[1].as_ref(), Some(&info), Some(first.clone()));
+            }
+            let calls_before = [
+                first.calls.load(Ordering::Relaxed),
+                second.calls.load(Ordering::Relaxed),
+            ];
+            // An exclusion fixes the selected target, not its placement credit.
+            let receipt = policy
+                .select_worker_with_receipt(
+                    &workers,
+                    Some(&prompts[0]),
+                    None,
+                    None,
+                    None,
+                    &[workers[0].url().to_owned()],
+                )
+                .unwrap();
+            let work = policy.estimate_prefill_work(&[
+                (workers[0].as_ref(), &prompts, true),
+                (workers[1].as_ref(), &prompts, true),
+            ]);
+            let expected = if shared { 4 } else { 2 };
+            // Run both real callers before asserting, so the red observation
+            // includes the independent P/D estimate as well as Regular billing.
+            let actual = (
+                receipt.new_prefill_tokens,
+                work.iter()
+                    .map(|estimate| estimate.new_prefill_tokens)
+                    .collect::<Vec<_>>(),
+            );
+            release_receipt(&workers, &receipt);
+            assert_eq!(actual, (expected, vec![4, expected]), "shared={shared}");
+            assert_eq!(receipt.worker_index, 1);
+            assert!(work.iter().all(|estimate| estimate.placement_verified));
+            assert_eq!(
+                [
+                    first.calls.load(Ordering::Relaxed) - calls_before[0],
+                    second.calls.load(Ordering::Relaxed) - calls_before[1],
+                ],
+                [2, if shared { 0 } else { 2 }],
+                "each request-local memo reuses only the same provider Arc"
+            );
+            assert_eq!(
+                policy.load.sample(&receipt.decision.target),
+                LoadSample::default()
+            );
+            assert_eq!(workers[1].load(), 0);
+        }
     }
 
     #[test]
