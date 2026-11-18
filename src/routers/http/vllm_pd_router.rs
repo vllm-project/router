@@ -455,19 +455,20 @@ fn finalize_decode_body(
 }
 
 impl VllmPDRouter {
-    /// Keep the configured worker URL as the key; parse only for the bootstrap host.
+    /// Match the worker's base URL, stripping only the routing @rank suffix.
     fn mooncake_prefill_target(
         prefill_url: &str,
         bootstrap_port: Option<u16>,
     ) -> Result<(String, String), String> {
-        let parsed = url::Url::parse(prefill_url)
+        let (base_url, _) = dp_utils::parse_worker_url(prefill_url);
+        let parsed = url::Url::parse(&base_url)
             .map_err(|e| format!("Invalid prefill URL '{}': {}", prefill_url, e))?;
         let host = parsed
             .host()
             .ok_or_else(|| format!("Prefill URL '{}' has no host", prefill_url))?
             .to_string();
         let bootstrap_addr = format!("http://{}:{}", host, bootstrap_port.unwrap_or(8998));
-        Ok((prefill_url.to_string(), bootstrap_addr))
+        Ok((base_url, bootstrap_addr))
     }
 
     /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
@@ -4014,6 +4015,17 @@ mod tests {
                 (prefill.to_string(), bootstrap.to_string())
             );
         }
+        for (base, bootstrap) in [
+            ("http://prefill:8000", "http://prefill:8998"),
+            ("http://prefill:8000/prefill-a", "http://prefill:8998"),
+            ("grpc://prefill:8000/prefill-a", "http://prefill:8998"),
+            ("http://[::1]:8000/prefill-a", "http://[::1]:8998"),
+        ] {
+            assert_eq!(
+                VllmPDRouter::mooncake_prefill_target(&format!("{base}@1"), None).unwrap(),
+                (base.to_string(), bootstrap.to_string())
+            );
+        }
         for prefill in ["not-a-url", "file:///tmp/prefill"] {
             assert!(VllmPDRouter::mooncake_prefill_target(prefill, None).is_err());
         }
@@ -4029,7 +4041,10 @@ mod tests {
                         .route(
                             "/query",
                             axum::routing::get(move || async move {
-                                axum::Json(json!({"0": {"engine_id": engine}}))
+                                axum::Json(json!({
+                                    "0": {"engine_id": format!("{engine}-0")},
+                                    "1": {"engine_id": format!("{engine}-1")},
+                                }))
                             }),
                         )
                         .fallback(|| async { StatusCode::OK }),
@@ -4046,51 +4061,65 @@ mod tests {
             policy: crate::config::PolicyConfig::RoundRobin,
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 2,
             ..Default::default()
         };
         for order in [[0, 1], [1, 0]] {
-            let ctx = Arc::new(
-                crate::server::AppContext::new(
-                    config.clone(),
-                    reqwest::Client::new(),
-                    64,
-                    None,
-                    vec![],
-                )
-                .unwrap(),
-            );
-            let prefill_urls = order
-                .into_iter()
-                .map(|i| {
-                    let port = url::Url::parse(&bootstraps[i]).unwrap().port().unwrap();
-                    (prefills[i].0.clone(), Some(port))
-                })
-                .collect();
-            let router = VllmPDRouter::new(prefill_urls, vec![], None, &ctx)
-                .await
-                .unwrap();
-            let workers = router.pd_router.worker_registry.get_prefill_workers();
-            assert_eq!(workers.len(), 2);
-            assert_eq!(router.mooncake_prefill_info.len(), 2);
-            for worker in workers {
-                let i = prefills
-                    .iter()
-                    .position(|(url, _)| url == worker.base_url())
-                    .unwrap();
-                let params = router
-                    .build_decode_kv_transfer_params(
-                        worker.base_url(),
+            for pinned_rank in [None, Some(1)] {
+                let ctx = Arc::new(
+                    crate::server::AppContext::new(
+                        config.clone(),
+                        reqwest::Client::new(),
+                        64,
                         None,
-                        Some("xfer-test"),
-                        Some(1),
-                        Some(0),
-                        None,
+                        vec![],
                     )
+                    .unwrap(),
+                );
+                let prefill_urls = order
+                    .into_iter()
+                    .map(|i| {
+                        let port = url::Url::parse(&bootstraps[i]).unwrap().port().unwrap();
+                        let prefill_url = match pinned_rank {
+                            Some(rank) => format!("{}@{rank}", prefills[i].0),
+                            None => prefills[i].0.clone(),
+                        };
+                        (prefill_url, Some(port))
+                    })
+                    .collect();
+                let router = VllmPDRouter::new(prefill_urls, vec![], None, &ctx)
+                    .await
                     .unwrap();
-                assert_eq!(params["remote_engine_id"], prefills[i].1);
-                assert_eq!(params["remote_bootstrap_addr"], bootstraps[i]);
+                let workers = router.pd_router.worker_registry.get_prefill_workers();
+                assert_eq!(workers.len(), if pinned_rank.is_some() { 2 } else { 4 });
+                assert_eq!(router.mooncake_prefill_info.len(), 2);
+                for worker in workers {
+                    let i = prefills
+                        .iter()
+                        .position(|(url, _)| url == worker.base_url())
+                        .unwrap();
+                    let rank = worker.dp_rank().unwrap();
+                    if let Some(pinned) = pinned_rank {
+                        assert_eq!(rank, pinned);
+                    }
+                    let params = router
+                        .build_decode_kv_transfer_params(
+                            worker.base_url(),
+                            None,
+                            Some("xfer-test"),
+                            worker.dp_size(),
+                            Some(rank as u32),
+                            None,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        params["remote_engine_id"],
+                        format!("{}-{rank}", prefills[i].1)
+                    );
+                    assert_eq!(params["remote_bootstrap_addr"], bootstraps[i]);
+                }
+                assert!(router.get_mooncake_info(&bootstraps[0], Some(0)).is_none());
             }
-            assert!(router.get_mooncake_info(&bootstraps[0], Some(0)).is_none());
         }
     }
 
