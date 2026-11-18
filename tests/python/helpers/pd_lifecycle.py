@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import json
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -148,6 +149,7 @@ async def probe(url, model, levels=(1, 2, 4, 8), rounds=2, timeout=60, output=No
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=timeout)
     ) as session:
+        live_disconnect_observed = False
 
         async def one(phase, mode, level, iteration, slot):
             start = time.monotonic()
@@ -201,14 +203,20 @@ async def probe(url, model, levels=(1, 2, 4, 8), rounds=2, timeout=60, output=No
                     )
                     report["results"].extend(batch)
                     failed = any(r["outcome"] == "failed" for r in batch)
-                    disconnect_untested = phase == "disconnect" and all(
-                        r["outcome"] == "untested" for r in batch
-                    )
-                    if failed or disconnect_untested:
+                    if phase == "disconnect" and any(
+                        r["outcome"] == "disconnected_after_text" for r in batch
+                    ):
+                        live_disconnect_observed = True
+                    if failed:
                         report["status"] = "failed"
                         save_report(report, output)
                         return report  # no automatic retry or higher load after failure
                     save_report(report, output)
+    if not live_disconnect_observed:
+        report["status"] = "failed"
+        report["failure_reason"] = "no live disconnect observed"
+        save_report(report, output)
+        return report
     report["passed"] = True
     report["status"] = "passed"
     save_report(report, output)
@@ -237,10 +245,15 @@ def main():
         )
     except ValueError as exc:
         parser.error(str(exc))
-    print(
-        f"PD lifecycle {report['status']}: {len(report['results'])} requests; "
-        f"report={args.output}"
+    outcomes = Counter(result["outcome"] for result in report["results"])
+    counts = ", ".join(
+        f"{name}={outcomes[name]}"
+        for name in ("completed", "disconnected_after_text", "untested", "failed")
     )
+    print(f"PD lifecycle {report['status']}: {len(report['results'])} requests")
+    print(f"outcomes: {counts}; report={args.output}")
+    if reason := report.get("failure_reason"):
+        print(f"reason: {reason}")
     parser.exit(0 if report["passed"] else 1)
 
 

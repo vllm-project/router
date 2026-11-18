@@ -292,7 +292,7 @@ COMMON_DOCKER_ARGS=(
   -e VLLM_LOGGING_LEVEL=INFO
   --entrypoint vllm
 )
-if [[ -n "${VLLM_ROCM_USE_SKINNY_GEMM+x}" ]]; then
+if [[ -n "${VLLM_ROCM_USE_SKINNY_GEMM:-}" ]]; then
   COMMON_DOCKER_ARGS+=(
     -e VLLM_ROCM_USE_SKINNY_GEMM="${VLLM_ROCM_USE_SKINNY_GEMM}"
   )

@@ -1,13 +1,29 @@
 """Preflight failures must not contact hosts or retain stale probe results."""
 
 import os
+from pathlib import Path
 import shutil
 import subprocess
 
 import pytest
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = "tests/python/e2e/pd_disagg_vllm/run_moriio_rdma_accuracy_test.sh"
+NIGHTLY = ROOT / ".buildkite/test-nightly.yml"
+
+
+def test_lifecycle_runtime_overrides_are_scoped():
+    harness = (ROOT / SCRIPT).read_text()
+    nightly = NIGHTLY.read_text()
+    assert '[[ -n "${VLLM_ROCM_USE_SKINNY_GEMM:-}" ]]' in harness
+    assert (
+        '[[ "$${RUN_PD_LIFECYCLE:-false}" == "true" '
+        '&& "{{matrix.read_mode}}" == "true" ]]' in nightly
+    )
+    assert (
+        'export VLLM_ROCM_USE_SKINNY_GEMM="$${VLLM_ROCM_USE_SKINNY_GEMM:-0}"' in nightly
+    )
 
 
 @pytest.mark.parametrize(

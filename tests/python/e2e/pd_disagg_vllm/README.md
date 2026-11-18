@@ -237,8 +237,9 @@ bash tests/python/e2e/pd_disagg_vllm/run_moriio_rdma_accuracy_test.sh
 ```
 
 The current pinned image needs `VLLM_ROCM_USE_SKINNY_GEMM=0` for the validated
-read-mode path; the launcher forwards this override only when the caller sets it.
-It does not change the engine default. Write mode was validated without it.
+read-mode path. When the L3 matrix opts into the lifecycle probe, its read leg
+defaults this value to `0`; the conditional does not alter the write leg. The
+standalone launcher forwards only a non-empty caller override.
 
 The existing eval container runs completion, full-stream, active-client-disconnect,
 and recovery waves, before the normal accuracy evaluation. Defaults are
@@ -255,10 +256,10 @@ For a manual default-branch build, also set `RUN_ROCM_RDMA=1` and `NIGHTLY=1`.
 `LOG_DIR/pd-lifecycle.json` records each phase, outcome, and HTTP error status,
 with an atomic checkpoint after each wave. `status=running` means incomplete,
 not passed. Full streams need non-empty text, a normal finish reason, and
-`[DONE]`. Each disconnect wave must observe at least one live disconnect;
-requests that finish before disconnection are recorded as `untested`. Successful
-recovery requests follow each wave. The existing RDMA artifact glob includes
-the report alongside P/D/router logs.
+`[DONE]`. Requests that finish before disconnection are recorded as `untested`.
+The probe continues past an inconclusive wave, but fails at the end if no wave
+observed a live disconnect. Successful recovery requests follow each wave. The
+existing RDMA artifact glob includes the report alongside P/D/router logs.
 
 A pass demonstrates client-visible progress after disconnects, not engine abort
 propagation, KV reclamation, absence of leaks, or semantic accuracy. Inspect

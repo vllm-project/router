@@ -118,6 +118,9 @@ async def exercise(fault=None, output=None, cli=False, fragment=None):
             assert process.returncode == (0 if fault is None else 1), (stdout, stderr)
             assert not stderr
             assert (b"passed" if fault is None else b"failed") in stdout
+            assert b"outcomes:" in stdout
+            if fault == "already_done":
+                assert b"reason: no live disconnect observed" in stdout
             assert str(output) in stdout.decode()
             return json.loads(output.read_text()), calls
         task = asyncio.create_task(
@@ -169,28 +172,30 @@ def test_success_and_progress_after_disconnect(fragment):
         "bad_finish",
         "truncated",
         "stall",
-        "already_done",
-        "buffered_eof",
-        "buffered_done",
         "recovery",
     ],
 )
 def test_fail_closed_without_escalating_concurrency(fault):
     result, _ = asyncio.run(exercise(fault))
     assert not result["passed"]
-    expected = (
-        "untested"
-        if fault in ("already_done", "buffered_eof", "buffered_done")
-        else "failed"
-    )
-    assert result["results"][-1]["outcome"] == expected
+    assert result["results"][-1]["outcome"] == "failed"
     assert all(r["concurrency"] == 1 for r in result["results"])
     if fault == "empty":
         assert result["results"][-1]["detail"] == "completion text is empty or invalid"
-    if fault == "already_done":
-        assert "cancellation untested" in result["results"][-1]["detail"]
     if fault in ("http", "malformed", "stall"):
         assert "detail" not in result["results"][-1]
+
+
+@pytest.mark.parametrize("fault", ["already_done", "buffered_eof", "buffered_done"])
+def test_all_untested_disconnects_continue_then_fail(fault):
+    result, _ = asyncio.run(exercise(fault))
+    assert not result["passed"]
+    assert result["failure_reason"] == "no live disconnect observed"
+    assert {r["concurrency"] for r in result["results"]} == {1, 2}
+    disconnects = [r for r in result["results"] if r["phase"] == "disconnect"]
+    assert disconnects
+    assert all(r["outcome"] == "untested" for r in disconnects)
+    assert result["results"][-1]["phase"] == "recovery"
 
 
 def test_disconnect_wave_allows_partial_untested(monkeypatch):
@@ -253,9 +258,11 @@ def test_interrupted_probe_keeps_completed_wave(tmp_path):
     assert result["results"][0]["outcome"] == "completed"
 
 
-@pytest.mark.parametrize("fault", [None, "empty", "recovery"])
+@pytest.mark.parametrize("fault", [None, "empty", "recovery", "already_done"])
 def test_harness_cli_exit_and_report(tmp_path, fault):
     output = tmp_path / "evidence" / "probe.json"
     result, _ = asyncio.run(exercise(fault, output, cli=True))
     assert result["passed"] == (fault is None)
     assert result["status"] == ("passed" if fault is None else "failed")
+    if fault == "already_done":
+        assert result["failure_reason"] == "no live disconnect observed"
