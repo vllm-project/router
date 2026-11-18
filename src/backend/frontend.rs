@@ -330,6 +330,7 @@ fn ignored_cache_switches(read: impl Fn(&str) -> Option<String>) -> Vec<&'static
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

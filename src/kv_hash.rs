@@ -60,6 +60,7 @@ impl BlockKeyGenerator {
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn none_hash(&self) -> SequenceHash {
         self.none_hash
     }
@@ -110,6 +111,7 @@ fn digest(bytes: &[u8]) -> SequenceHash {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
