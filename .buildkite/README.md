@@ -260,7 +260,7 @@ bash ./run_accuracy_test.sh
 ## Additional Pipeline Steps
 
 ### Build
-The `build` group in `pipeline.yml` creates release artifacts:
+The `build` group in `bootstrap-upload-steps.yml` creates release artifacts:
 - Rust binary (`target/release/vllm-router`)
 - Python wheels and source distribution
 
