@@ -1243,13 +1243,25 @@ impl KvAwarePolicy {
             let plan = if fallback_guard.is_some() {
                 let (healthy, bindings) = self.selection_targets(workers)?;
                 let count = healthy.len();
+                let input_tokens: Vec<usize> = healthy
+                    .iter()
+                    .map(|&index| {
+                        input
+                            .tokens
+                            .prompts_for(workers[index].as_ref())
+                            .iter()
+                            .map(|ids| ids.len())
+                            .sum()
+                    })
+                    .collect();
+                let has_tokens = input_tokens.iter().any(|&size| size > 0);
                 SelectionPlan {
                     healthy,
                     bindings,
                     grouped: vec![Vec::new(); count],
-                    input_tokens: vec![0; count],
+                    input_tokens,
                     prefill_tokens: vec![None; count],
-                    has_tokens: false,
+                    has_tokens,
                 }
             } else {
                 self.prepare_selection(workers, input, lora_name, cache_salt)?
@@ -3654,6 +3666,82 @@ mod tests {
     }
 
     #[test]
+    fn churn_fallback_preserves_each_workers_known_input() {
+        struct Churn(Mutex<Option<Box<dyn Fn() + Send>>>);
+        impl TieredMatchProvider for Churn {
+            fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
+                self.0.lock().as_ref().unwrap()();
+                Vec::new()
+            }
+        }
+        let policy = Arc::new(KvAwarePolicy::default());
+        let workers = registered_worker_pair(&policy);
+        let matches = Arc::new(Churn(Mutex::new(None)));
+        let info = WorkerKvInfo {
+            cache_key: Some(CacheKey {
+                model: Arc::from("model"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size: 16,
+            }),
+            ..WorkerKvInfo::default()
+        };
+        for worker in &workers {
+            policy.register_worker(worker.as_ref(), Some(&info), Some(matches.clone()));
+        }
+        let weak_policy = Arc::downgrade(&policy);
+        let weak_matches = Arc::downgrade(&matches);
+        let registered = workers.clone();
+        // Every query replaces both registrations, forcing selection to reach
+        // the final, query-free attempt rather than reserve a stale snapshot.
+        *matches.0.lock() = Some(Box::new(move || {
+            for worker in &registered {
+                weak_policy.upgrade().unwrap().register_worker(
+                    worker.as_ref(),
+                    Some(&info),
+                    Some(weak_matches.upgrade().unwrap()),
+                );
+            }
+        }));
+        let mut inputs = WorkerTokenInputs::new();
+        for (worker, length) in workers.iter().zip([33, 17]) {
+            inputs.insert(
+                worker.base_url().to_owned(),
+                Arc::from(vec![vec![7; length]]),
+            );
+        }
+        for (chosen, expected, known) in [(0, 33, true), (1, 17, true), (1, 0, false)] {
+            if !known {
+                inputs.remove(workers[1].base_url());
+            }
+            let receipt = policy
+                .select_worker_with_inputs(
+                    &workers,
+                    KvRequestTokens::PerWorker(&inputs),
+                    None,
+                    None,
+                    None,
+                    &[workers[1 - chosen].url().to_owned()],
+                )
+                .unwrap();
+            assert_eq!(receipt.worker_index, chosen);
+            assert_eq!(receipt.new_prefill_tokens, expected, "worker {chosen}");
+            assert_eq!(receipt.decision.components.ptoken, expected);
+            let target = &receipt.decision.target;
+            assert_eq!(
+                policy.load.sample(target),
+                LoadSample {
+                    active_prefill_tokens: expected,
+                    active_requests: 1,
+                }
+            );
+            assert_eq!(workers[chosen].load(), 1);
+            release_receipt(&workers, &receipt);
+            assert_eq!(policy.load.sample(target), LoadSample::default());
+            assert_eq!(workers[chosen].load(), 0);
+        }
+    }
+
+    #[test]
     fn registration_uses_the_discovered_cache_block_size_and_provider() {
         #[derive(Default)]
         struct QueryBlocks(
@@ -3737,7 +3825,7 @@ mod tests {
         let queries_before = matches.2.load(Ordering::Relaxed);
         let receipt = select().unwrap();
         assert_eq!(matches.2.load(Ordering::Relaxed) - queries_before, 3);
-        assert_eq!(receipt.new_prefill_tokens, 0);
+        assert_eq!(receipt.new_prefill_tokens, 5);
         release_receipt(&workers, &receipt);
     }
 
