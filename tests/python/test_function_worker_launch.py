@@ -12,7 +12,14 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 @pytest.mark.parametrize(
     "hip_mask,rocr_mask",
-    [(None, None), ("", ""), ("0,1", "0,1"), (None, "4,5"), ("4,5", None)],
+    [
+        (None, None),
+        ("", ""),
+        ("0,1", "0,1"),
+        ("0,1", "4,5"),
+        (None, "4,5"),
+        ("4,5", None),
+    ],
 )
 @pytest.mark.parametrize("gpu_id", [0, 1])
 def test_worker_gpu_masks(monkeypatch, hip_mask, rocr_mask, gpu_id):

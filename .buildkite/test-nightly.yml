@@ -279,7 +279,7 @@ steps:
       export CUDA_VISIBLE_DEVICES=0,1
       # The dedicated host preset exposes physical GPUs; each worker narrows
       # CUDA_VISIBLE_DEVICES independently. Clear host masks at this boundary;
-      # inherited-HIP handling in the helper is covered by its CPU regression.
+      # inherited HIP/ROCR handling in the helper is covered by its CPU regression.
       unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
       # Keep scratch reclamation enabled, matching the manually validated run.
       export HSA_NO_SCRATCH_RECLAIM=0
