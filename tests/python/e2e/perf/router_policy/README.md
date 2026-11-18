@@ -49,6 +49,12 @@ When replay exits, [`log_summary.py`](log_summary.py) writes **`calibration.json
 
 Layout matches **`perf/grpc`**: case JSON + [`case_loader.py`](case_loader.py) + [`stack_launcher.py`](stack_launcher.py). [`log_summary.py`](log_summary.py) writes the stats and prints the cell summary.
 
+The sample-count regression tests run on CPU without model weights:
+
+```bash
+python -m pytest tests/python/unit/test_router_policy_log_summary.py -q
+```
+
 ## Buildkite nightly (L3)
 
 Job **`router-policy-perf-e2e`** in [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml)
