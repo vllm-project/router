@@ -41,6 +41,9 @@ to `true`; chat defaults to `false`). Batched prompts (`list[str]`, `list[list[i
 more than one entry) are rejected with 400 before any tokenization: lowering
 produces one prepared request per prompt sequence, and dispatching more than
 one is Stage 3's fan-out.
+Text lowering lives on the regular-pool path only (`prepare_completions`); the
+token-id lower (`prepare_grpc_completion`) is shared with the gRPC P/D route,
+which reads its `token_ids` directly.
 Routing honors `session_params.session_id` like chat; without one, token-id
 prompts create no prefix-cache affinity (cache_aware balances them on load alone).
 
@@ -295,7 +298,7 @@ not report them.
 | `src/backend/health.rs` | gRPC health checks for startup and worker probes |
 | `src/backend/preprocess.rs` | Tokenizer/model cache and chat render/encode |
 | `src/backend/vllm_frontend.rs` | Adapter around `vllm-chat`, `vllm-tokenizer`, and `vllm-text` |
-| `src/backend/convert.rs` | OpenAI request fields to `GenerateRequest`; `prepare_grpc_completion` lowers `/v1/completions` onto the chat shape |
+| `src/backend/convert.rs` | OpenAI request fields to `GenerateRequest`; `prepare_grpc_completion` lowers `/v1/completions` onto the chat shape (token ids only, shared with the gRPC P/D route); `prepare_grpc_completion_prompts` is the regular-pool text lower, used only by `EngineFrontend::prepare_completions` |
 | `src/backend/grpc.rs` | Cached tonic `InferenceClient` and `GenerateStream` |
 | `src/backend/openai.rs` | Proto chunks to OpenAI JSON/SSE for clients |
 

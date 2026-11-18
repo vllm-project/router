@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use axum::response::Response;
 
-use super::convert::{prepare_grpc_completion, CompletionPrompt};
+use super::convert::{prepare_grpc_completion_prompts, CompletionPrompt};
 use super::grpc::{FirstOutputCallback, GrpcEngineBackend, KvHandoff};
 use super::l1_encode_cache::{L1CacheConfig, L1CacheStats};
 use super::preprocess::{
@@ -197,7 +197,7 @@ impl EngineFrontend {
         })
     }
 
-    /// Wire adapter path for `/v1/completions` on the gRPC pool.
+    /// Wire adapter path for `/v1/completions` on the regular gRPC pool.
     ///
     /// Accepts every prompt form. Text is tokenized once here (outside policy
     /// and retry) through the same `PromptEncoder` chat uses, so L0 applies
@@ -206,12 +206,14 @@ impl EngineFrontend {
     /// that is the fan-out unit Stage 3 will dispatch. The HTTP route serves
     /// exactly one sequence and rejects a batch with 400 before any
     /// tokenization happens; fanning out batched prompts is Stage 3.
+    /// The gRPC P/D route never calls this: it lowers through the
+    /// token-id-only `prepare_grpc_completion` and `prepare_token_ids`.
     pub async fn prepare_completions(
         &self,
         request: &CompletionRequest,
     ) -> Result<Vec<PreparedRequest>, PrepareError> {
-        let lowered = prepare_grpc_completion(request).map_err(PrepareError::Invalid)?;
-        let crate::backend::convert::PreparedCompletion {
+        let lowered = prepare_grpc_completion_prompts(request).map_err(PrepareError::Invalid)?;
+        let crate::backend::convert::PreparedCompletionPrompts {
             mut chat,
             prompts,
             emit_token_ids,
