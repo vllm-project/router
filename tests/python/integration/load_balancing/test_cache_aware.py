@@ -9,9 +9,9 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
 @pytest.mark.integration
-def test_cache_aware_affinity(mock_workers, router_manager):
+def test_cache_aware_affinity(mock_worker_manager, router_manager):
     # Two workers; same prompt should stick to one due to cache tree
-    _, urls, ids = mock_workers(n=2)
+    _, urls, ids = mock_worker_manager.start_workers(n=2)
     rh = router_manager.start_router(worker_urls=urls, policy="cache_aware")
 
     counts = collections.Counter()
@@ -36,9 +36,9 @@ def test_cache_aware_affinity(mock_workers, router_manager):
 
 
 @pytest.mark.integration
-def test_cache_aware_diverse_prompts_balances(mock_workers, router_manager):
+def test_cache_aware_diverse_prompts_balances(mock_worker_manager, router_manager):
     # Add latency so concurrent requests overlap and influence load-based selection
-    _, urls, ids = mock_workers(n=3, args=["--latency-ms", "30"])
+    _, urls, ids = mock_worker_manager.start_workers(n=3, args=["--latency-ms", "30"])
     rh = router_manager.start_router(
         worker_urls=urls,
         policy="cache_aware",

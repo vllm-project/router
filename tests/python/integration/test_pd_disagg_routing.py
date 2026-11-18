@@ -1,3 +1,9 @@
+"""PD disaggregation routing: policy selection across prefill and decode workers.
+
+Companion to ``test_pd_merge_routing.py``, which covers the same policies when
+each worker does both prefill and decode.
+"""
+
 import collections
 import threading
 import time
@@ -5,7 +11,6 @@ import time
 import pytest
 
 from ..helpers.client import completion
-from ..helpers.mock import PdDisaggMock
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
@@ -21,12 +26,17 @@ _PROGRAM_SCHEDULING_CONFIG = (
 
 
 @pytest.mark.integration
-def test_pd_power_of_two_decode_attribution(router_manager, mock_workers):
-    pd = PdDisaggMock(router_manager, mock_workers)
-    pd.add_prefill(n=2)
-    pd.add_decode(n=3)
-    rh = pd.start_router("power_of_two")
-    decode_ids = pd.decode_ids
+def test_pd_power_of_two_decode_attribution(router_manager, mock_worker_manager):
+    mock_worker_manager.add_prefill(n=2)
+    mock_worker_manager.add_decode(n=3)
+    rh = router_manager.start_router(
+        policy="power_of_two",
+        vllm_pd_disaggregation=True,
+        prefill_urls=mock_worker_manager.prefill_urls,
+        decode_urls=mock_worker_manager.decode_urls,
+        extra={"worker_startup_check_interval": 1},
+    )
+    decode_ids = mock_worker_manager.decode_ids
 
     counts = collections.Counter()
     for i in range(30):
@@ -38,13 +48,20 @@ def test_pd_power_of_two_decode_attribution(router_manager, mock_workers):
 
 
 @pytest.mark.integration
-def test_pd_power_of_two_skews_to_faster_decode(router_manager, mock_workers):
-    pd = PdDisaggMock(router_manager, mock_workers)
-    pd.add_prefill(n=2)
+def test_pd_power_of_two_skews_to_faster_decode(router_manager, mock_worker_manager):
+    mock_worker_manager.add_prefill(n=2)
     # 2 second latency keeps the slow decode worker occupied.
-    [decode_slow_url], [slow_id] = pd.add_decode(n=1, args=["--latency-ms", "2000"])
-    _, [fast_id] = pd.add_decode(n=1)
-    rh = pd.start_router("power_of_two")
+    [decode_slow_url], [slow_id] = mock_worker_manager.add_decode(
+        n=1, args=["--latency-ms", "2000"]
+    )
+    _, [fast_id] = mock_worker_manager.add_decode(n=1)
+    rh = router_manager.start_router(
+        policy="power_of_two",
+        vllm_pd_disaggregation=True,
+        prefill_urls=mock_worker_manager.prefill_urls,
+        decode_urls=mock_worker_manager.decode_urls,
+        extra={"worker_startup_check_interval": 1},
+    )
 
     # Prime the router with some initial requests.
     completion(
@@ -100,30 +117,49 @@ def test_pd_power_of_two_skews_to_faster_decode(router_manager, mock_workers):
 
 @pytest.mark.integration
 def test_pd_round_robin_cycles_decode_in_registration_order(
-    router_manager, mock_workers
+    router_manager, mock_worker_manager
 ):
     # Prefill and decode have separate cursors. The decode cursor starts at 0
     # and advances once per request, in --decode registration order.
-    pd = PdDisaggMock(router_manager, mock_workers)
-    _, decode_ids = pd.start("round_robin")
-    order = [f"worker-{url.rstrip('/').rsplit(':', 1)[-1]}" for url in pd.decode_urls]
+    mock_worker_manager.add_prefill(n=2)
+    mock_worker_manager.add_decode(n=3)
+    rh = router_manager.start_router(
+        policy="round_robin",
+        vllm_pd_disaggregation=True,
+        prefill_urls=mock_worker_manager.prefill_urls,
+        decode_urls=mock_worker_manager.decode_urls,
+        extra={"worker_startup_check_interval": 1},
+    )
+    decode_ids = set(mock_worker_manager.decode_ids)
+    order = [
+        f"worker-{url.rstrip('/').rsplit(':', 1)[-1]}"
+        for url in mock_worker_manager.decode_urls
+    ]
     assert set(order) == decode_ids
 
-    seen = [completion(pd.router.url, f"p{i}") for i in range(len(order) * 10)]
+    seen = [completion(rh.url, f"p{i}") for i in range(len(order) * 10)]
 
     # Ten exact cycles also means each decode worker receives the same count.
     assert seen == order * 10
 
 
 @pytest.mark.integration
-def test_pd_random_spreads_decode(router_manager, mock_workers):
-    pd = PdDisaggMock(router_manager, mock_workers)
-    _, decode_ids = pd.start("random", n_decode=4)
+def test_pd_random_spreads_decode(router_manager, mock_worker_manager):
+    mock_worker_manager.add_prefill(n=2)
+    mock_worker_manager.add_decode(n=4)
+    rh = router_manager.start_router(
+        policy="random",
+        vllm_pd_disaggregation=True,
+        prefill_urls=mock_worker_manager.prefill_urls,
+        decode_urls=mock_worker_manager.decode_urls,
+        extra={"worker_startup_check_interval": 1},
+    )
+    decode_ids = set(mock_worker_manager.decode_ids)
 
     counts = collections.Counter()
     total = 200
     for i in range(total):
-        worker_id = completion(pd.router.url, f"p{i}")
+        worker_id = completion(rh.url, f"p{i}")
         assert worker_id in decode_ids
         counts[worker_id] += 1
 
@@ -133,13 +169,21 @@ def test_pd_random_spreads_decode(router_manager, mock_workers):
 
 
 @pytest.mark.integration
-def test_pd_consistent_hash_sticks_to_session(router_manager, mock_workers):
-    pd = PdDisaggMock(router_manager, mock_workers)
-    _, decode_ids = pd.start("consistent_hash")
+def test_pd_consistent_hash_sticks_to_session(router_manager, mock_worker_manager):
+    mock_worker_manager.add_prefill(n=2)
+    mock_worker_manager.add_decode(n=3)
+    rh = router_manager.start_router(
+        policy="consistent_hash",
+        vllm_pd_disaggregation=True,
+        prefill_urls=mock_worker_manager.prefill_urls,
+        decode_urls=mock_worker_manager.decode_urls,
+        extra={"worker_startup_check_interval": 1},
+    )
+    decode_ids = set(mock_worker_manager.decode_ids)
 
     def session_worker(session_id, turn):
         return completion(
-            pd.router.url,
+            rh.url,
             f"turn {turn}",
             extra={"session_params": {"session_id": session_id}},
         )
@@ -168,43 +212,51 @@ def test_pd_consistent_hash_sticks_to_session(router_manager, mock_workers):
 
 
 @pytest.mark.integration
-def test_pd_cache_aware_prefix_overrides_load(router_manager, mock_workers, tmp_path):
+def test_pd_cache_aware_prefix_overrides_load(
+    router_manager, mock_worker_manager, tmp_path
+):
     # The first request on each decode returns. Later requests stay in flight
     # until the release file appears, so the replay is admitted while the
     # cached decode is still busy. Least-loaded routing would miss it.
     release = tmp_path / "release"
-    pd = PdDisaggMock(router_manager, mock_workers)
-    _, decode_ids = pd.start(
-        "cache_aware",
-        n_decode=2,
-        decode_args=["--hold-after", "1", "--release-file", str(release)],
+    mock_worker_manager.add_prefill(n=2)
+    mock_worker_manager.add_decode(
+        n=2, args=["--hold-after", "1", "--release-file", str(release)]
     )
+    rh = router_manager.start_router(
+        policy="cache_aware",
+        vllm_pd_disaggregation=True,
+        prefill_urls=mock_worker_manager.prefill_urls,
+        decode_urls=mock_worker_manager.decode_urls,
+        extra={"worker_startup_check_interval": 1},
+    )
+    decode_ids = set(mock_worker_manager.decode_ids)
     cached_prompt = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     busy_prompt = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109]
     other_prompt = [200, 201, 202, 203, 204, 205, 206, 207, 208, 209]
 
-    cached = completion(pd.router.url, cached_prompt, timeout=10)
+    cached = completion(rh.url, cached_prompt, timeout=10)
     assert cached in decode_ids
 
     holder = threading.Thread(
         target=completion,
-        args=(pd.router.url, busy_prompt),
+        args=(rh.url, busy_prompt),
         kwargs={"timeout": 10},
         daemon=True,
     )
     holder.start()
-    pd.wait_for_decode_load(cached)
-    diverted = completion(pd.router.url, other_prompt, timeout=10)
+    mock_worker_manager.wait_for_decode_load(cached)
+    diverted = completion(rh.url, other_prompt, timeout=10)
 
     replay_box = {}
 
     def replay():
-        replay_box["worker"] = completion(pd.router.url, cached_prompt, timeout=10)
+        replay_box["worker"] = completion(rh.url, cached_prompt, timeout=10)
 
     replay_thread = threading.Thread(target=replay, daemon=True)
     replay_thread.start()
     try:
-        pd.wait_for_decode_load(cached, minimum=2)
+        mock_worker_manager.wait_for_decode_load(cached, minimum=2)
     finally:
         release.write_text("go")
     holder.join(timeout=10)
@@ -216,13 +268,21 @@ def test_pd_cache_aware_prefix_overrides_load(router_manager, mock_workers, tmp_
 
 
 @pytest.mark.integration
-def test_pd_kv_aware_spreads_equal_decode_load(router_manager, mock_workers):
-    pd = PdDisaggMock(router_manager, mock_workers)
-    _, decode_ids = pd.start("kv_aware")
+def test_pd_kv_aware_spreads_equal_decode_load(router_manager, mock_worker_manager):
+    mock_worker_manager.add_prefill(n=2)
+    mock_worker_manager.add_decode(n=3)
+    rh = router_manager.start_router(
+        policy="kv_aware",
+        vllm_pd_disaggregation=True,
+        prefill_urls=mock_worker_manager.prefill_urls,
+        decode_urls=mock_worker_manager.decode_urls,
+        extra={"worker_startup_check_interval": 1},
+    )
+    decode_ids = set(mock_worker_manager.decode_ids)
 
     counts = collections.Counter()
     for i in range(30):
-        worker_id = completion(pd.router.url, f"p{i}")
+        worker_id = completion(rh.url, f"p{i}")
         assert worker_id in decode_ids
         counts[worker_id] += 1
 
@@ -232,18 +292,25 @@ def test_pd_kv_aware_spreads_equal_decode_load(router_manager, mock_workers):
 
 
 @pytest.mark.integration
-def test_pd_kv_aware_affinity_sticks_to_session(router_manager, mock_workers):
-    pd = PdDisaggMock(router_manager, mock_workers)
-    _, decode_ids = pd.start(
-        "kv_aware",
-        n_decode=2,
-        extra={"kv_aware_session_affinity_ttl_secs": 60},
+def test_pd_kv_aware_affinity_sticks_to_session(router_manager, mock_worker_manager):
+    mock_worker_manager.add_prefill(n=2)
+    mock_worker_manager.add_decode(n=2)
+    rh = router_manager.start_router(
+        policy="kv_aware",
+        vllm_pd_disaggregation=True,
+        prefill_urls=mock_worker_manager.prefill_urls,
+        decode_urls=mock_worker_manager.decode_urls,
+        extra={
+            "worker_startup_check_interval": 1,
+            "kv_aware_session_affinity_ttl_secs": 60,
+        },
     )
+    decode_ids = set(mock_worker_manager.decode_ids)
 
     def session_workers(session_id):
         return [
             completion(
-                pd.router.url,
+                rh.url,
                 f"turn {i}",
                 extra={"session_params": {"session_id": session_id}},
             )
@@ -259,21 +326,26 @@ def test_pd_kv_aware_affinity_sticks_to_session(router_manager, mock_workers):
 
 
 @pytest.mark.integration
-def test_pd_program_scheduling_sticks_to_program(router_manager, mock_workers):
-    pd = PdDisaggMock(router_manager, mock_workers)
-    _, decode_ids = pd.start(
-        "round_robin",
-        n_decode=2,
+def test_pd_program_scheduling_sticks_to_program(router_manager, mock_worker_manager):
+    mock_worker_manager.add_prefill(n=2)
+    mock_worker_manager.add_decode(n=2)
+    rh = router_manager.start_router(
+        policy="round_robin",
+        vllm_pd_disaggregation=True,
+        prefill_urls=mock_worker_manager.prefill_urls,
+        decode_urls=mock_worker_manager.decode_urls,
         extra={
+            "worker_startup_check_interval": 1,
             "enable_program_scheduling": True,
             "program_scheduling_config_json": _PROGRAM_SCHEDULING_CONFIG,
         },
     )
+    decode_ids = set(mock_worker_manager.decode_ids)
 
     def program_workers(program_id):
         return [
             completion(
-                pd.router.url,
+                rh.url,
                 "hello",
                 extra={
                     "max_tokens": 8,
