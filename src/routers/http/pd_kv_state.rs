@@ -1,7 +1,9 @@
 //! P/D prefill KV discovery, refresh, and request-input preparation.
 
 use super::pd_types::PdPrefillInput;
-use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs};
+use crate::backend::preprocess::{
+    http_input_requires_render, prepare_http_token_inputs, router_token_inputs,
+};
 use crate::core::worker::worker_get;
 use crate::core::Worker;
 use crate::kv_index::discovery::WorkerDiscovery;
@@ -627,14 +629,16 @@ impl PdKvState {
         // A candidate can only be priced when its base is creditable. `decode_context_from_
         // results` needs an estimate for every candidate, so pricing with a partial set
         // always falls back - after paying for the slowest render. Require the whole set.
-        // Decode pricing also must not fan out backend renders on non-gRPC pools: without
-        // `router_prompts` the only token source is a `/render` POST to every Decode base,
-        // paid on the admission hot path for a load-balancing heuristic. Fall back to
-        // request counts there; marginal pricing then applies only where the ids are
-        // already free (gRPC/router_prompts).
+        // Decode pricing also must not fan out backend renders: without router
+        // token ids a string/chat body would `/render` every Decode base on the
+        // admission hot path for a load-balancing heuristic. Fall back to the
+        // load ladder there; marginal pricing then applies only where the ids
+        // are already free (gRPC/router_prompts, or a direct token-id prompt).
         let decode_expected = !defer_decode && kv_aware_ops(decode_policy.as_ref()).is_some();
+        let decode_requires_render =
+            router_prompts.is_none() && http_input_requires_render(request, route);
         let decode_priced_here = decode_expected
-            && router_prompts.is_some()
+            && !decode_requires_render
             && self
                 .all_priceable(decode_workers, cache_salt, &allow_credit)
                 .await;
@@ -843,11 +847,11 @@ impl PdKvState {
         // stages through `prepare_stages`.
         let hashes = &mut PromptHashes::new();
         let kv = kv_aware_ops(policy.as_ref())?;
-        // Decode pricing must not fan out backend renders on non-gRPC pools. Without
-        // router token ids the deferred commit would re-render the whole pool for ids
-        // that cannot have changed, so the pool falls back to request counts instead
+        // Decode pricing must not fan out backend renders. Without router token
+        // ids a string/chat body would re-render the whole pool for ids that
+        // cannot have changed, so the pool falls back to the load ladder instead
         // of paying a second full render fan-out on the commit path.
-        if router_prompts.is_none() {
+        if router_prompts.is_none() && http_input_requires_render(request, route) {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
             return None;
         }
@@ -1359,6 +1363,37 @@ mod kv_input_tests {
                 .await
                 .is_some(),
             "Decode must be priced before the first request"
+        );
+        // HTTP pools price Decode only when the ids are already free: a direct
+        // token-id prompt needs no render and still prices, while a string body
+        // would render and therefore falls back without a network call.
+        assert!(
+            state
+                .prepare_decode_context(
+                    &decode,
+                    &decode_policy,
+                    &request,
+                    "/v1/completions",
+                    None,
+                    None,
+                )
+                .await
+                .is_some(),
+            "an HTTP direct token-id prompt prices without rendering"
+        );
+        assert!(
+            state
+                .prepare_decode_context(
+                    &decode,
+                    &decode_policy,
+                    &json!({"model":"m","prompt":"hello"}),
+                    "/v1/completions",
+                    None,
+                    None,
+                )
+                .await
+                .is_none(),
+            "an HTTP string body must not render Decode for pricing"
         );
         // The same URL changes role before the next refresh. The cached
         // signature matches, but the owner changed, so the Decode policy must
