@@ -1002,6 +1002,7 @@ mod tests {
         let mut pair = Pair::new(0, 100);
         pair.load[1] = (0, 0);
         assert_eq!(pair.plan(&enabled()), Err(TransferSkip::SourceNotBusy));
+        assert_eq!(TransferSkip::SourceNotBusy.label(), "source_not_busy");
         let policy = TransferPolicy {
             source_load_threshold: 5,
             ..enabled()
