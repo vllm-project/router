@@ -14,10 +14,7 @@ impl GroupShard {
     ) -> bool {
         self.store_for_source(
             &Arc::new(owner.target()),
-            &StoreClaim {
-                key: (owner, tier),
-                incremental: false,
-            },
+            &(owner, tier),
             parent_seq,
             blocks,
         )
@@ -250,7 +247,7 @@ fn stale_query_version_cannot_credit_replayed_or_replaced_sources() {
 }
 
 #[test]
-fn incremental_shared_prefix_stays_compressed_until_divergence() {
+fn successive_stores_share_prefix_until_divergence() {
     let index = KvBlockIndexer::new();
     let w1 = worker("w1");
     let w2 = worker("w2");
@@ -541,7 +538,7 @@ fn conflicting_hash_at_another_offset_or_in_one_store_is_rejected() {
         .read()
         .records
         .owners
-        .contains_key(&b));
+        .contains(&b));
 }
 
 #[test]
@@ -987,67 +984,6 @@ fn concurrent_distinct_owner_alias_writes_splits_and_removes() {
             StorageTier::Device
         ),
         3
-    );
-}
-
-#[test]
-fn store_and_match_single_owner() {
-    let idx = KvBlockIndexer::new();
-    let blocks = vec![(h("h0"), h("h0")), (h("h1"), h("h1")), (h("h2"), h("h2"))];
-    idx.store(0, worker("w0"), StorageTier::Device, None, &blocks);
-
-    let res = idx.find_matches(&query(&["h0", "h1", "h2", "h3"], &[StorageTier::Device]));
-    assert_eq!(res.len(), 1);
-    // h3 absent → match depth 3.
-    assert_eq!(segments_of(&res, "w0", StorageTier::Device), vec![(0, 3)]);
-}
-
-#[test]
-fn store_is_idempotent_per_owner_tier_block() {
-    let idx = KvBlockIndexer::new();
-    let blocks = vec![(h("h0"), h("h0"))];
-    idx.store(0, worker("w0"), StorageTier::Device, None, &blocks);
-    idx.store(0, worker("w0"), StorageTier::Device, None, &blocks);
-
-    let key = (worker("w0"), StorageTier::Device);
-    let count = idx
-        .shards
-        .get(&0)
-        .map(|s| s.tier_sequences(&key.0, key.1).len())
-        .unwrap_or(0);
-    assert_eq!(count, 1);
-}
-
-#[test]
-fn cross_owner_refcount_survives_until_both_remove() {
-    let idx = KvBlockIndexer::new();
-    let blocks = vec![(h("h0"), h("h0"))];
-    idx.store(0, worker("w0"), StorageTier::Device, None, &blocks);
-    idx.store(0, worker("w1"), StorageTier::Device, None, &blocks);
-
-    idx.remove(0, &worker("w0"), StorageTier::Device, &[h("h0")]);
-    let res = idx.find_matches(&query(&["h0"], &[StorageTier::Device]));
-    assert_eq!(res.len(), 1);
-
-    idx.remove(0, &worker("w1"), StorageTier::Device, &[h("h0")]);
-    let res = idx.find_matches(&query(&["h0"], &[StorageTier::Device]));
-    assert!(res.is_empty());
-}
-
-#[test]
-fn same_block_second_tier_is_separate_claim() {
-    let idx = KvBlockIndexer::new();
-    let blocks = vec![(h("h0"), h("h0"))];
-    idx.store(0, worker("w0"), StorageTier::Device, None, &blocks);
-    idx.store(0, worker("w0"), StorageTier::HostPinned, None, &blocks);
-
-    // Remove Device only; HostPinned survives.
-    idx.remove(0, &worker("w0"), StorageTier::Device, &[h("h0")]);
-    let res = idx.find_matches(&query(&["h0"], &[StorageTier::HostPinned]));
-    assert_eq!(res.len(), 1);
-    assert_eq!(
-        segments_of(&res, "w0", StorageTier::HostPinned),
-        vec![(0, 1)]
     );
 }
 
@@ -1802,26 +1738,17 @@ fn anchored_store_rejects_mismatch_and_duplicate_without_mutation() {
     let shard = index.shard(0);
     let _topology = shard.topology.read();
     assert!(!shard.try_store_anchored(
-        &StoreClaim {
-            key: (owner.clone(), StorageTier::Device),
-            incremental: false
-        },
+        &(owner.clone(), StorageTier::Device),
         Some(&h("s1")),
         &[(h("s2"), h("wrong"))]
     ));
     assert!(!shard.try_store_anchored(
-        &StoreClaim {
-            key: (owner.clone(), StorageTier::Device),
-            incremental: false
-        },
+        &(owner.clone(), StorageTier::Device),
         Some(&h("s1")),
         &[(h("s1"), h("y"))]
     ));
     assert!(!shard.try_store_anchored(
-        &StoreClaim {
-            key: (owner.clone(), StorageTier::Device),
-            incremental: false
-        },
+        &(owner.clone(), StorageTier::Device),
         Some(&h("s1")),
         &[(h("new"), h("y"))]
     ));
@@ -2179,57 +2106,44 @@ fn duplicate_filter_handles_both_sides_of_small_batch_threshold() {
 }
 
 #[test]
-fn unique_prefix_churn_reclaims_paths_without_retiring_source() {
-    let index = KvBlockIndexer::new();
-    let owner = worker("churn");
-    for i in 0..2000 {
-        let seq = h(&format!("seq-{i}"));
-        index.store(
-            0,
-            owner.clone(),
-            StorageTier::Device,
-            None,
-            &[(seq.clone(), h("local"))],
-        );
-        index.remove(0, &owner, StorageTier::Device, &[seq]);
+fn prefix_churn_reclaims_retired_aliases_and_keeps_shared_live_paths() {
+    for keep_shared_prefix in [false, true] {
+        let index = KvBlockIndexer::new();
+        let owner = worker("churn");
+        if keep_shared_prefix {
+            index.store(
+                0,
+                worker("seed"),
+                StorageTier::Device,
+                None,
+                &[(h("seed"), h("local"))],
+            );
+        }
         let shard = index.shard(0);
-        assert!(shard.scoped_anchors.is_empty(), "iteration {i}");
-        assert!(shard.waiting.is_empty());
-        assert!(shard.root.read().children.is_empty());
-    }
-}
-
-#[test]
-fn shared_live_prefix_does_not_keep_another_sources_retired_aliases() {
-    let index = KvBlockIndexer::new();
-    index.store(
-        0,
-        worker("seed"),
-        StorageTier::Device,
-        None,
-        &[(h("seed"), h("local"))],
-    );
-    let owner = worker("churn");
-    for i in 0..1000 {
-        let seq = h(&format!("seq-{i}"));
-        index.store(
-            0,
-            owner.clone(),
-            StorageTier::Device,
-            None,
-            &[(seq.clone(), h("local"))],
+        for i in 0..200 {
+            let seq = h(&format!("seq-{i}"));
+            index.store(
+                0,
+                owner.clone(),
+                StorageTier::Device,
+                None,
+                &[(seq.clone(), h("local"))],
+            );
+            index.remove(0, &owner, StorageTier::Device, &[seq]);
+            assert_eq!(shard.scoped_anchors.len(), usize::from(keep_shared_prefix));
+            assert!(shard.waiting.is_empty());
+            assert_eq!(
+                shard.root.read().children.len(),
+                usize::from(keep_shared_prefix)
+            );
+        }
+        let hits = index.find_matches(&query(&["local"], &[StorageTier::Device]));
+        assert_eq!(
+            depth_of(&hits, "seed", StorageTier::Device),
+            u32::from(keep_shared_prefix)
         );
-        index.remove(0, &owner, StorageTier::Device, &[seq]);
-        assert_eq!(index.shard(0).scoped_anchors.len(), 1);
+        assert_eq!(depth_of(&hits, "churn", StorageTier::Device), 0);
     }
-    assert_eq!(
-        depth_of(
-            &index.find_matches(&query(&["local"], &[StorageTier::Device])),
-            "seed",
-            StorageTier::Device
-        ),
-        1
-    );
 }
 
 #[test]

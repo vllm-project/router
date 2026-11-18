@@ -13,28 +13,20 @@ impl IndexBatch<'_> {
     ) -> bool {
         let target = owner.target();
         self.check_target(&target);
-        self.with_data(&target, |owners| {
-            owners.entry(owner.clone()).or_default();
+        self.with_records(&target, |records| {
+            records.owners.insert(owner.clone());
         });
-        self.store_path(
-            group,
-            &StoreClaim {
-                key: (owner, tier),
-                incremental: false,
-            },
-            parent,
-            blocks,
-        )
+        self.store_path(group, &(owner, tier), parent, blocks)
     }
 
     fn store_path(
         &mut self,
         group: u32,
-        claim: &StoreClaim,
+        claim: &OwnerTier,
         parent: Option<Arc<str>>,
         blocks: &[(Arc<str>, Arc<str>)],
     ) -> bool {
-        let target = claim.key.0.target();
+        let target = claim.0.target();
         self.check_target(&target);
         let shard = self.index.shard(group);
         if parent.is_some() {

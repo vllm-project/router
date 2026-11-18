@@ -20,14 +20,6 @@ impl IndexBatch<'_> {
         }
     }
 
-    pub(super) fn with_data<R>(
-        &mut self,
-        target: &RoutableTarget,
-        operation: impl FnOnce(&mut HashMap<ResidencyOwner, OwnerMetadata>) -> R,
-    ) -> R {
-        self.with_records(target, |records| operation(&mut records.owners))
-    }
-
     pub(super) fn with_records<R>(
         &mut self,
         target: &RoutableTarget,
@@ -85,7 +77,7 @@ impl IndexBatch<'_> {
                 });
             }
         }
-        let keep = |candidate: &ResidencyOwner, _: &mut OwnerMetadata| {
+        let keep = |candidate: &ResidencyOwner| {
             (!matches!(scope, ClearScope::All) && scope != candidate.domain())
                 || !same_clear_owner(owner, candidate)
         };
@@ -115,7 +107,7 @@ impl SourceRecords {
     /// The source transaction and topology writer protect all reclamation.
     pub(super) fn collect(&mut self, shard: &GroupShard, target: &RoutableTarget, group: u32) {
         if let Some(hashes) = self.reclaim.remove(&group) {
-            let owners: Vec<_> = self.owners.keys().cloned().collect();
+            let owners: Vec<_> = self.owners.iter().cloned().collect();
             shard.release_paths(target, &owners, &hashes.into_iter().collect::<Vec<_>>());
         }
         shard.prune_dead_nodes();
@@ -130,7 +122,7 @@ impl SourceRecords {
     ) {
         if !self.reclaim.contains_key(&group)
             || (empty_only
-                && self.owners.keys().any(|owner| {
+                && self.owners.iter().any(|owner| {
                     shard
                         .reverse
                         .get(owner)

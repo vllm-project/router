@@ -122,17 +122,8 @@ struct SourceData {
 
 #[derive(Default)]
 struct SourceRecords {
-    owners: HashMap<ResidencyOwner, OwnerMetadata>,
+    owners: HashSet<ResidencyOwner>,
     reclaim: HashMap<u32, SequenceSet, Fast>,
-}
-
-#[derive(Default)]
-struct OwnerMetadata;
-
-/// The same record transition applies to a navigable page and a hash-only page.
-struct StoreClaim {
-    key: OwnerTier,
-    incremental: bool,
 }
 
 /// Identity and trust generation of one source at snapshot time.

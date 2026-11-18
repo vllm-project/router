@@ -210,10 +210,15 @@ impl GroupShard {
                     .remove_if(&key, |_, children| children.is_empty());
                 if let Some(mut paths) = self.scoped_anchors.get_mut(&parent) {
                     if let Some(parent_path) = paths.get_mut(target) {
-                        parent_path.children = parent_path.children.saturating_sub(1);
+                        // Only a recorded child link can make an ancestor eligible.
+                        if let Some(children) = parent_path.children.checked_sub(1) {
+                            parent_path.children = children;
+                            work.push(parent.clone());
+                        } else {
+                            debug_assert!(false, "retired child has no matching parent link");
+                        }
                     }
                 }
-                work.push(parent);
             }
         }
     }
@@ -245,6 +250,10 @@ impl GroupShard {
                 }
                 continue;
             }
+            debug_assert!(
+                current.claims.iter().all(|claims| claims.is_empty()),
+                "detached prefix nodes cannot retain cache claims"
+            );
             let Some(parent) = current.parent.upgrade() else {
                 continue;
             };
