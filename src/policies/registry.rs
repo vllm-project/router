@@ -254,7 +254,9 @@ impl PolicyRegistry {
             ),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
-            PolicyConfig::StickyLeastLoaded => Arc::new(StickyLeastLoadedPolicy::new()),
+            PolicyConfig::StickyLeastLoaded { session_ttl_secs } => Arc::new(
+                StickyLeastLoadedPolicy::with_expiration_secs(*session_ttl_secs),
+            ),
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
         }
     }
@@ -279,23 +281,24 @@ impl PolicyRegistry {
     /// the replica capacity held by the session; all other policies ignore it.
     /// This fans out to the default policy, every per-model policy, and the
     /// prefill/decode policies (for PD mode), since we don't know which policy
-    /// instance is tracking the session.
-    pub fn finish_session(&self, session_id: &str) {
-        self.default_policy.finish_session(session_id);
+    /// instance is tracking the session. Registry locks are released before
+    /// calling into the policies. Returns whether any policy held the session.
+    pub fn finish_session(&self, session_id: &str) -> bool {
+        let mut policies: Vec<Arc<dyn LoadBalancingPolicy>> = self
+            .model_policies
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        policies.extend(self.prefill_policy.read().unwrap().clone());
+        policies.extend(self.decode_policy.read().unwrap().clone());
 
-        {
-            let policies = self.model_policies.read().unwrap();
-            for policy in policies.values() {
-                policy.finish_session(session_id);
-            }
+        let mut released = self.default_policy.finish_session(session_id);
+        for policy in policies {
+            released |= policy.finish_session(session_id);
         }
-
-        if let Some(policy) = self.prefill_policy.read().unwrap().as_ref() {
-            policy.finish_session(session_id);
-        }
-        if let Some(policy) = self.decode_policy.read().unwrap().as_ref() {
-            policy.finish_session(session_id);
-        }
+        released
     }
 
     /// Clear all policies (useful for testing). Policy rebuilds also drop

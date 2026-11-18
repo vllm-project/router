@@ -30,7 +30,7 @@ use crate::protocols::spec::{
     GrpcRequestRef, InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult,
     ResponsesRequest,
 };
-use crate::request_identity::{resolve_affinity_identity, IdentityFields};
+use crate::request_identity::{resolve_affinity_identity, routing_session_key, IdentityFields};
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
@@ -1356,22 +1356,6 @@ impl Router {
         }
     }
 
-    /// Convert axum HeaderMap to policy RequestHeaders (HashMap<String, String>)
-    fn headers_to_request_headers(
-        headers: Option<&HeaderMap>,
-    ) -> Option<crate::policies::RequestHeaders> {
-        headers.map(|h| {
-            h.iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|v| (name.as_str().to_lowercase(), v.to_string()))
-                })
-                .collect()
-        })
-    }
-
     fn policy_for_model(&self, model_id: Option<&str>) -> Arc<dyn LoadBalancingPolicy> {
         match model_id {
             Some(model) => self.policy_registry.get_policy_or_default(model),
@@ -1403,6 +1387,7 @@ impl Router {
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
+        session_id: Option<&str>,
         excluded_workers: &[String],
     ) -> Option<SelectedWorker> {
         if available.is_empty() {
@@ -1412,7 +1397,7 @@ impl Router {
         let policy = self.policy_for_model(model_id);
 
         // Convert headers for policies that need them (e.g., consistent_hash)
-        let request_headers = Self::headers_to_request_headers(headers);
+        let request_headers = header_utils::to_policy_headers(headers);
 
         if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
             // The policy sees the full list: a retry exclusion must not
@@ -1432,18 +1417,45 @@ impl Router {
             });
         }
 
-        let idx = if let Some(cache) = policy
+        if let Some(cache) = policy
             .as_any()
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
-            cache.select_worker_with_inputs(
+            let idx = cache.select_worker_with_inputs(
                 available, token_ids, model_id, lora_name, cache_salt, "regular",
-            )?
+            )?;
+            return Some(SelectedWorker {
+                worker: available.get(idx)?.clone(),
+                kv_receipt: None,
+            });
+        }
+
+        // A session's retry must not go back to the replica that just failed:
+        // without it among the candidates, the session moves as it does off an
+        // unhealthy replica. If every replica failed, retry among all of them.
+        let retry_candidates: Vec<Arc<dyn Worker>>;
+        let candidates = if policy.needs_session_id() && !excluded_workers.is_empty() {
+            retry_candidates = available
+                .iter()
+                .filter(|worker| !excluded_workers.iter().any(|url| url == worker.url()))
+                .cloned()
+                .collect();
+            if retry_candidates.is_empty() {
+                available
+            } else {
+                &retry_candidates
+            }
         } else {
-            policy.select_worker_with_headers(available, text, request_headers.as_ref())?
+            available
         };
+        let idx = policy.select_worker_for_session(
+            candidates,
+            text,
+            request_headers.as_ref(),
+            session_id,
+        )?;
         Some(SelectedWorker {
-            worker: available.get(idx)?.clone(),
+            worker: candidates.get(idx)?.clone(),
             kv_receipt: None,
         })
     }
@@ -1593,9 +1605,16 @@ impl Router {
                     })
             });
 
+        let session_id = routing_session_key(
+            self.policy_for_model(model_id).needs_session_id(),
+            headers,
+            typed_req.affinity_identity(),
+        );
+
         let http_inputs = &http_inputs;
         let failed_workers = &failed_workers;
         let affinity_key = &affinity_key;
+        let session_id = &session_id;
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
@@ -1726,6 +1745,7 @@ impl Router {
                         lora_name,
                         cache_salt,
                         affinity_key.as_ref(),
+                        session_id.as_deref(),
                         &excluded_workers,
                     )
                 };
@@ -3214,12 +3234,18 @@ impl RouterTrait for Router {
         } else {
             let cache_key = (policy.needs_cache_routing_key())
                 .then(|| crate::protocols::spec::cache_routing::for_route(&body, path));
-            let request_headers = Self::headers_to_request_headers(headers);
+            let request_headers = header_utils::to_policy_headers(headers);
+            let session_id = routing_session_key(
+                policy.needs_session_id(),
+                headers,
+                IdentityFields::from_body(&body),
+            );
             policy
-                .select_worker_with_headers(
+                .select_worker_for_session(
                     &workers,
                     cache_key.as_deref().or(request_text.as_deref()),
                     request_headers.as_ref(),
+                    session_id.as_deref(),
                 )
                 .and_then(|index| workers.get(index).cloned())
                 .map(|worker| SelectedWorker {
@@ -6911,10 +6937,14 @@ mod tests {
 
     /// Create a test router with ConsistentHash policy instead of RoundRobin
     fn create_test_consistent_hash_router() -> Router {
+        create_test_router_with_policy(crate::config::types::PolicyConfig::ConsistentHash {
+            virtual_nodes: 100,
+        })
+    }
+
+    fn create_test_router_with_policy(policy: crate::config::types::PolicyConfig) -> Router {
         let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(
-            crate::config::types::PolicyConfig::ConsistentHash { virtual_nodes: 100 },
-        ));
+        let policy_registry = Arc::new(PolicyRegistry::new(policy));
 
         let worker1 = BasicWorker::new("http://worker1:8080".to_string(), WorkerType::Regular);
         let worker2 = BasicWorker::new("http://worker2:8080".to_string(), WorkerType::Regular);
@@ -6949,46 +6979,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_headers_to_request_headers_basic() {
-        // Test that headers_to_request_headers correctly converts HeaderMap to HashMap
-        let mut header_map = HeaderMap::new();
-        header_map.insert("x-session-id", HeaderValue::from_static("session-123"));
-        header_map.insert("content-type", HeaderValue::from_static("application/json"));
-        header_map.insert("X-Custom-Header", HeaderValue::from_static("custom-value"));
-
-        let result = Router::headers_to_request_headers(Some(&header_map));
-        assert!(result.is_some());
-        let headers = result.unwrap();
-
-        // All keys should be lowercased
-        assert_eq!(headers.get("x-session-id").unwrap(), "session-123");
-        assert_eq!(headers.get("content-type").unwrap(), "application/json");
-        assert_eq!(headers.get("x-custom-header").unwrap(), "custom-value");
-    }
-
-    #[test]
-    fn test_headers_to_request_headers_none() {
-        // Test that None headers produce None output
-        let result = Router::headers_to_request_headers(None);
-        assert!(result.is_none());
-    }
-
     #[tokio::test]
     async fn program_target_unavailable_has_distinct_retryable_response() {
         let response = Router::program_target_unavailable_response("/v1/chat/completions");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body, "Program-bound worker is unavailable");
-    }
-
-    #[test]
-    fn test_headers_to_request_headers_empty() {
-        // Test that empty HeaderMap produces empty HashMap
-        let header_map = HeaderMap::new();
-        let result = Router::headers_to_request_headers(Some(&header_map));
-        assert!(result.is_some());
-        assert!(result.unwrap().is_empty());
     }
 
     #[test]
@@ -7010,6 +7006,7 @@ mod tests {
                     Some(r#"{"prompt": "test"}"#),
                     Some(&header_map),
                     KvRequestTokens::Shared(None),
+                    None,
                     None,
                     None,
                     None,
@@ -7055,6 +7052,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 &[],
             )
             .expect("Should select the remaining healthy worker");
@@ -7087,6 +7085,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
         );
         assert!(
@@ -7110,6 +7109,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     excluded,
                 )
                 .expect("Should select a worker")
@@ -7119,6 +7119,46 @@ mod tests {
         };
         let first = select(&[]);
         assert_eq!(select(std::slice::from_ref(&first)), first);
+    }
+
+    #[test]
+    fn test_retry_exclusion_moves_a_sticky_session() {
+        let router =
+            create_test_router_with_policy(crate::config::types::PolicyConfig::StickyLeastLoaded {
+                session_ttl_secs: 60,
+            });
+        let select = |excluded: &[String]| {
+            router
+                .select_worker_for_model(
+                    None,
+                    &router.available_workers(None),
+                    None,
+                    None,
+                    KvRequestTokens::Shared(None),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("traj-1"),
+                    excluded,
+                )
+                .expect("Should select a worker")
+                .worker
+                .url()
+                .to_string()
+        };
+        let first = select(&[]);
+        let retry = select(std::slice::from_ref(&first));
+        assert_ne!(retry, first);
+        // The session stays on the replica it moved to.
+        assert_eq!(select(&[]), retry);
+        // With every replica excluded, the retry still routes.
+        let all: Vec<String> = router
+            .available_workers(None)
+            .iter()
+            .map(|worker| worker.url().to_string())
+            .collect();
+        select(&all);
     }
 
     #[test]
@@ -7142,6 +7182,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 &[],
             ) {
                 worker_urls_seen.insert(worker.worker.url().to_string());
@@ -7153,35 +7194,6 @@ mod tests {
             worker_urls_seen.len() >= 2,
             "Expected distribution across workers, only used: {:?}",
             worker_urls_seen
-        );
-    }
-
-    #[test]
-    fn test_inline_header_conversion_matches_headers_to_request_headers() {
-        // Verify that the inline header conversion pattern used in vllm_pd_router
-        // produces the same result as Router::headers_to_request_headers.
-        let mut header_map = HeaderMap::new();
-        header_map.insert("X-Session-Id", HeaderValue::from_static("session-abc"));
-        header_map.insert("Content-Type", HeaderValue::from_static("application/json"));
-        header_map.insert("x-user-id", HeaderValue::from_static("user-42"));
-
-        // Method 1: Router::headers_to_request_headers (used in router.rs)
-        let method1 = Router::headers_to_request_headers(Some(&header_map)).unwrap();
-
-        // Method 2: Inline conversion (used in vllm_pd_router.rs)
-        let method2: HashMap<String, String> = header_map
-            .iter()
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|v| (name.as_str().to_lowercase(), v.to_string()))
-            })
-            .collect();
-
-        assert_eq!(
-            method1, method2,
-            "Both header conversion methods should produce identical results"
         );
     }
 

@@ -154,6 +154,8 @@ pub struct PdRequestContext<'a> {
     pub affinity_key: Option<AffinityKey>,
     /// Borrowed LoRA name from the request; used for Decode binding only with an eligible affinity key.
     pub lora_name: Option<&'a str>,
+    /// Session id for policies whose `needs_session_id` is true.
+    pub session_id: Option<&'a str>,
     /// Request cache salt scoping the binding digest.
     pub cache_salt: Option<&'a str>,
     pub route: &'a str,

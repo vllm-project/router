@@ -363,8 +363,12 @@ fn select_stage(
         )?;
         (picked, None, None)
     } else {
-        let picked =
-            policy.select_worker_with_headers(&projected, policy_input, context.headers)?;
+        let picked = policy.select_worker_for_session(
+            &projected,
+            policy_input,
+            context.headers,
+            context.session_id,
+        )?;
         (picked, None, None)
     };
     if kv_aware {
@@ -1504,6 +1508,7 @@ impl PdRouterBase {
             headers: None,
             affinity_key: None,
             lora_name: None,
+            session_id: None,
             cache_salt: None,
             route: "/health_generate",
         };
@@ -2035,6 +2040,7 @@ mod tests {
             headers: None,
             affinity_key: None,
             lora_name: None,
+            session_id: None,
             cache_salt: None,
             route: "/health_generate",
         };
@@ -2064,6 +2070,7 @@ mod tests {
             headers: None,
             affinity_key: None,
             lora_name: None,
+            session_id: None,
             cache_salt: None,
             route: "/health_generate",
         };
@@ -2830,6 +2837,7 @@ mod admission_tests {
             headers: None,
             affinity_key: None,
             lora_name: None,
+            session_id: None,
             cache_salt: None,
             route: "/v1/completions",
         }
@@ -2895,6 +2903,7 @@ mod admission_tests {
             headers: None,
             affinity_key: Some(affinity_key(session)),
             lora_name: None,
+            session_id: None,
             cache_salt: None,
             route: "/v1/completions",
         }
@@ -3618,6 +3627,7 @@ mod admission_tests {
                 headers: None,
                 affinity_key: None,
                 lora_name: None,
+                session_id: None,
                 cache_salt: None,
                 route: "/v1/completions",
             }
