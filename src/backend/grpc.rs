@@ -869,7 +869,12 @@ fn notify_first_output(
     first_output_seen: &mut bool,
     callback: Option<&FirstOutputCallback>,
 ) {
-    if !*first_output_seen && has_generated_output(msg, text) {
+    let aborted = msg
+        .outputs
+        .as_ref()
+        .and_then(|output| output.finish_info.as_ref())
+        .is_some_and(|finish| finish.finish_reason == FinishReason::Aborted as i32);
+    if !*first_output_seen && !aborted && has_generated_output(msg, text) {
         *first_output_seen = true;
         if let Some(callback) = callback {
             callback();
@@ -965,6 +970,21 @@ mod tests {
         assert!(has_generated_output(&output, ""));
         notify_first_output(&output, "", &mut first_output_seen, Some(&callback));
         notify_first_output(&output, "", &mut first_output_seen, Some(&callback));
+        assert_eq!(decode_started.load(Ordering::Relaxed), 1);
+
+        let aborted = GenerateResponse {
+            outputs: Some(SequenceOutput {
+                finish_info: Some(super::super::pb::FinishInfo {
+                    finish_reason: FinishReason::Aborted as i32,
+                    ..Default::default()
+                }),
+                ..output.outputs.unwrap()
+            }),
+            prompt_info: None,
+        };
+        first_output_seen = false;
+        notify_first_output(&aborted, "", &mut first_output_seen, Some(&callback));
+        assert!(!first_output_seen);
         assert_eq!(decode_started.load(Ordering::Relaxed), 1);
     }
 
