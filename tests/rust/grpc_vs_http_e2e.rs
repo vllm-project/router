@@ -80,23 +80,11 @@ async fn history_app(
     (workers, ctx, app, publishers)
 }
 
-async fn history_request(app: AxumRouter, chat: bool, stream: bool) -> axum::response::Response {
-    let (path, mut body) = if chat {
-        (
-            "/v1/chat/completions",
-            json!({
-                "model": "test-model", "messages": [{"role":"user", "content":"plain text"}]
-            }),
-        )
-    } else {
-        (
-            "/v1/completions",
-            json!({"model":"test-model", "prompt":vec![42;33]}),
-        )
-    };
+async fn history_request(app: AxumRouter, stream: bool) -> axum::response::Response {
+    let mut body = json!({"model":"test-model", "prompt":vec![42;33]});
     body["stream"] = stream.into();
     body["max_tokens"] = 8.into();
-    app.oneshot(common::http::post(path, body.to_string()))
+    app.oneshot(common::http::post("/v1/completions", body.to_string()))
         .await
         .unwrap()
 }
@@ -127,14 +115,14 @@ fn history_reason_count(
 /// Real frontend preparation -> GenerateStream -> valid output -> history.
 /// The pinned tokenizer is a CPU fixture, not model/Worker compatibility proof.
 #[tokio::test]
-async fn grpc_history_observes_valid_output_for_completion_and_text_chat() {
+async fn grpc_history_observes_valid_output_for_completion() {
     use common::mock_vllm_rs::HoldGate;
     use vllm_router_rs::kv_index::RoutableTarget;
     use vllm_router_rs::policies::KvAwarePolicy;
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     let _metrics = metrics::set_default_local_recorder(&recorder);
-    for (chat, stream) in [(false, false), (false, true), (true, false), (true, true)] {
+    for stream in [false, true] {
         let gate = HoldGate::hold_all();
         let (workers, ctx, app, _publishers) = history_app(MockVllmRs {
             output_gate: Some(gate.clone()),
@@ -148,7 +136,7 @@ async fn grpc_history_observes_valid_output_for_completion_and_text_chat() {
             .unwrap()
             .slot_manager()
             .unwrap();
-        let first = tokio::spawn(history_request(app.clone(), chat, stream));
+        let first = tokio::spawn(history_request(app.clone(), stream));
         let selected = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
                 if let Some(index) = workers
@@ -170,20 +158,14 @@ async fn grpc_history_observes_valid_output_for_completion_and_text_chat() {
         assert_eq!(
             (before.active_prefill_tokens, before.active_requests),
             (33, 1),
-            "chat={chat} stream={stream}"
+            "stream={stream}"
         );
         let eligible = history_reason_count(&handle, &["eligible_ordinary", "override"]);
         gate.release();
         let response = first.await.unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let response = body_text(response).await;
-        assert!(response.contains(if stream {
-            "[DONE]"
-        } else if chat {
-            "chat.completion"
-        } else {
-            "text_completion"
-        }));
+        assert!(response.contains(if stream { "[DONE]" } else { "text_completion" }));
         assert_eq!(slots.sample(&target), Default::default());
         assert_eq!(
             ctx.worker_registry
@@ -194,13 +176,13 @@ async fn grpc_history_observes_valid_output_for_completion_and_text_chat() {
         );
         assert_eq!(workers[selected].captured()[0].token_ids, vec![42; 33]);
         assert!(!workers[selected].captured()[0].had_text_prompt);
-        let second = history_request(app, chat, stream).await;
+        let second = history_request(app, stream).await;
         assert_eq!(second.status(), axum::http::StatusCode::OK);
         body_text(second).await;
         assert_eq!(
             workers[selected].captured().len(),
             2,
-            "same-cost history choice chat={chat} stream={stream}"
+            "same-cost history choice stream={stream}"
         );
         assert_eq!(workers[1 - selected].captured().len(), 0);
         assert_eq!(
@@ -214,7 +196,6 @@ async fn grpc_history_observes_valid_output_for_completion_and_text_chat() {
 #[tokio::test]
 async fn grpc_history_does_not_observe_open_error_abort_or_cancelled_stream() {
     use common::mock_vllm_rs::HoldGate;
-    use http_body_util::BodyExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use vllm_router_rs::kv_index::RoutableTarget;
     use vllm_router_rs::policies::KvAwarePolicy;
@@ -239,21 +220,35 @@ async fn grpc_history_does_not_observe_open_error_abort_or_cancelled_stream() {
             .slot_manager()
             .unwrap();
         let eligible = history_reason_count(&handle, &["eligible_ordinary", "override"]);
-        let response = history_request(app.clone(), true, case != "abort").await;
+        let response = history_request(app.clone(), case != "abort").await;
         if case == "cancel" {
             assert_eq!(response.status(), axum::http::StatusCode::OK);
-            let mut body = response.into_body();
-            let frame = tokio::time::timeout(std::time::Duration::from_secs(3), body.frame())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            let bytes = frame.into_data().unwrap();
-            assert!(String::from_utf8_lossy(&bytes).contains("assistant"));
-            assert!(!String::from_utf8_lossy(&bytes).contains("hello from worker"));
-            drop(body);
+            // Completion emits no role-only frame. The real RPC has begun,
+            // but its output gate is still held when the client disconnects.
+            let selected = workers
+                .iter()
+                .position(|worker| !worker.captured().is_empty())
+                .expect("GenerateStream must be dispatched before cancellation");
+            assert_eq!(workers[selected].captured()[0].token_ids, vec![42; 33]);
+            let target = RoutableTarget {
+                instance_id: workers[selected].grpc_url.clone().into(),
+                dp_rank: 0,
+            };
+            let before = slots.sample(&target);
+            assert_eq!(
+                (before.active_prefill_tokens, before.active_requests),
+                (33, 1)
+            );
+            assert_eq!(
+                ctx.worker_registry
+                    .get_by_url(&workers[selected].grpc_url)
+                    .unwrap()
+                    .load(),
+                1
+            );
+            drop(response);
             tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                while workers[0].state.cancelled.load(Ordering::Relaxed) == 0 {
+                while workers[selected].state.cancelled.load(Ordering::Relaxed) == 0 {
                     tokio::task::yield_now().await;
                 }
             })
@@ -288,7 +283,7 @@ async fn grpc_history_does_not_observe_open_error_abort_or_cancelled_stream() {
             );
         }
         let no_overlap = history_reason_count(&handle, &["no_overlap"]);
-        let probe = history_request(app, true, false).await;
+        let probe = history_request(app, false).await;
         body_text(probe).await;
         assert_eq!(
             history_reason_count(&handle, &["no_overlap"]),

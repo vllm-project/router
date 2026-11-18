@@ -76,11 +76,8 @@ impl AppContext {
             }
         }
         if router_config.kv_aware_completion_history {
-            match router_config.regular_history_support() {
-                Ok(()) => {
-                    info!("Prefix history requested; awaiting a resolved Regular worker pool")
-                }
-                Err(reason) => warn!(reason, "Completion history disabled"),
+            if let Err(reason) = router_config.regular_history_support() {
+                warn!(reason, "Completion history disabled");
             }
         }
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
@@ -1352,6 +1349,7 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

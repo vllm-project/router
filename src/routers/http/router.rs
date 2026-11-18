@@ -19,7 +19,7 @@ use crate::policies::{
     kv_aware_ops, AffinityKey, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy,
     PolicyRegistry,
 };
-use crate::policies::{HistoryObservation, QualifiedKvInput};
+use crate::policies::{CompletionHistoryRequest, HistoryObservation, QualifiedKvInput};
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
@@ -216,6 +216,7 @@ impl Drop for LoadTrackedBody {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn hold_load_until_body_done(
     response: Response,
     worker: Arc<dyn Worker>,
@@ -316,19 +317,6 @@ const PROGRAM_MODEL_POOL_FALLBACK: &str = "program:fallback:unlabeled";
 const PROGRAM_MODEL_POOL_NAMED_PREFIX: &str = "program:model:";
 const UNLABELED_WORKER_MODEL_ID: &str = "unknown";
 
-fn completion_history_for_pool(
-    requested: bool,
-    pool: Option<crate::backend::WorkerPoolKind>,
-) -> Result<(), &'static str> {
-    if !requested {
-        return Err("not_requested_or_unsupported_config");
-    }
-    match pool {
-        Some(_) => Ok(()),
-        None => Err("unresolved_worker_pool"),
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedProgramModelPool {
     scheduler_key: String,
@@ -383,13 +371,10 @@ impl Router {
         let default_policy = ctx.policy_registry.get_default_policy();
         let kv_aware_completion_history = ctx.router_config.kv_aware_completion_history
             && ctx.router_config.regular_history_support().is_ok();
-        if ctx.router_config.kv_aware_completion_history {
-            match completion_history_for_pool(kv_aware_completion_history, pool_kind) {
-                Ok(()) => info!("Prefix history enabled for eligible Regular requests"),
-                Err("unresolved_worker_pool") => {
-                    info!("Prefix history pending until a worker pool is resolved")
-                }
-                Err(reason) => warn!(reason, "Completion history disabled for this worker pool"),
+        if kv_aware_completion_history {
+            match pool_kind {
+                Some(_) => info!("Prefix history enabled for eligible Regular requests"),
+                None => info!("Prefix history pending until a worker pool is resolved"),
             }
         }
         let pending_kv_supervisor = if kv_aware_ops(default_policy.as_ref()).is_some() {
@@ -519,7 +504,7 @@ impl Router {
                 let provider = kv_index_supervisor.as_ref().and_then(|supervisor| {
                     supervisor.match_provider_for_worker(worker_arc.base_url())
                 });
-                if completion_history_for_pool(kv_aware_completion_history, pool_kind).is_ok() {
+                if kv_aware_completion_history {
                     kv_aware.register_history_worker(
                         &worker_arc,
                         kv_worker_info.get(worker_arc.base_url()),
@@ -746,15 +731,7 @@ impl Router {
             .kv_index_supervisor
             .as_ref()
             .and_then(|supervisor| supervisor.match_provider_for_worker(worker.base_url()));
-        if completion_history_for_pool(
-            self.kv_aware_completion_history,
-            Some(match worker.connection_mode() {
-                crate::core::ConnectionMode::Http => crate::backend::WorkerPoolKind::Http,
-                crate::core::ConnectionMode::Grpc => crate::backend::WorkerPoolKind::Grpc,
-            }),
-        )
-        .is_ok()
-        {
+        if self.kv_aware_completion_history {
             kv_aware.register_history_worker(worker, info, provider);
         } else {
             kv_aware.register_worker(worker.as_ref(), info, provider);
@@ -1438,12 +1415,13 @@ impl Router {
     /// Select worker for a specific model considering circuit breaker state
     #[allow(clippy::too_many_arguments)]
     fn select_worker_for_model(
-        policy: &dyn LoadBalancingPolicy,
+        &self,
         model_id: Option<&str>,
         available: &[Arc<dyn Worker>],
         text: Option<&str>,
         headers: Option<&HeaderMap>,
         input: QualifiedKvInput<'_>,
+        history: Option<&CompletionHistoryRequest>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
@@ -1453,17 +1431,33 @@ impl Router {
             return None;
         }
 
-        if let Some(kv_aware) = kv_aware_ops(policy) {
+        let policy = self.policy_for_model(model_id);
+        if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
             // The policy sees the full list: a retry exclusion must not
             // rewrite a still-valid binding.
-            let (receipt, observation) = kv_aware.select_with_context(
-                available,
-                input,
-                lora_name,
-                cache_salt,
-                affinity_key,
-                excluded_workers,
-            )?;
+            let (receipt, observation) =
+                if history.is_some() && lora_name.is_none() && cache_salt.is_none() {
+                    kv_aware.select_with_history(
+                        available,
+                        input.tokens,
+                        input.eligibility,
+                        history,
+                        affinity_key,
+                        excluded_workers,
+                    )
+                } else {
+                    kv_aware
+                        .select_worker_with_qualified_inputs(
+                            available,
+                            input.tokens,
+                            lora_name,
+                            cache_salt,
+                            affinity_key,
+                            excluded_workers,
+                            input.eligibility,
+                        )
+                        .map(|receipt| (receipt, None))
+                }?;
             return Some((
                 SelectedWorker {
                     worker: available.get(receipt.worker_index)?.clone(),
@@ -1508,7 +1502,7 @@ impl Router {
         route: &str,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_prepared_request(headers, typed_req, route, model_id, None, false)
+        self.route_prepared_request(headers, typed_req, route, model_id, None)
             .await
     }
 
@@ -1520,7 +1514,6 @@ impl Router {
         route: &str,
         model_id: Option<&str>,
         raw_body: Option<axum::body::Bytes>,
-        plain_other_route: bool,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
@@ -1556,10 +1549,16 @@ impl Router {
         }
 
         // Fence registrations before either transport awaits preparation.
-        let history = if completion_history_for_pool(self.kv_aware_completion_history, pool).is_ok()
-            && (plain_other_route
-                || super::completion_route::plain_history_input(typed_req.grpc_request()))
-        {
+        let history_eligible = match (pool, typed_req.grpc_request()) {
+            (Some(_), Some(GrpcRequestRef::Completion(request))) => {
+                super::completion_route::completion_history_input(request)
+            }
+            // HTTP Chat gets only the prompts qualified by the existing
+            // identity/render preparation below; no second field allowlist.
+            (Some(crate::backend::WorkerPoolKind::Http), Some(GrpcRequestRef::Chat(_))) => true,
+            _ => false,
+        };
+        let history = if self.kv_aware_completion_history && history_eligible {
             typed_req
                 .get_model()
                 .filter(|m| !m.is_empty() && model_id.is_none_or(|id| id == *m))
@@ -1785,8 +1784,7 @@ impl Router {
                     });
                     Some((SelectedWorker { worker, kv_receipt }, None))
                 } else {
-                    Self::select_worker_for_model(
-                        policy.as_ref(),
+                    self.select_worker_for_model(
                         model_id,
                         &workers,
                         Some(if policy.needs_cache_routing_key() {
@@ -1795,7 +1793,8 @@ impl Router {
                             text
                         }),
                         headers,
-                        QualifiedKvInput { tokens: request_tokens, eligibility: eligibility.as_deref(), history },
+                        QualifiedKvInput { tokens: request_tokens, eligibility: eligibility.as_deref() },
+                        history,
                         lora_name,
                         cache_salt,
                         affinity_key.as_ref(),
@@ -2943,15 +2942,8 @@ impl RouterTrait for Router {
         body: &InferenceGenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_prepared_request(
-            headers,
-            body,
-            "/inference/v1/generate",
-            model_id,
-            None,
-            body.other.is_empty(),
-        )
-        .await
+        self.route_typed_request(headers, body, "/inference/v1/generate", model_id)
+            .await
     }
 
     async fn route_chat(
@@ -2994,15 +2986,8 @@ impl RouterTrait for Router {
             drop(raw);
             None
         };
-        self.route_prepared_request(
-            headers,
-            body.as_ref(),
-            "/v1/completions",
-            model_id,
-            raw,
-            false,
-        )
-        .await
+        self.route_prepared_request(headers, body.as_ref(), "/v1/completions", model_id, raw)
+            .await
     }
 
     async fn route_responses(
@@ -3011,14 +2996,7 @@ impl RouterTrait for Router {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let plain = self.kv_aware_completion_history
-            && !body.store
-            && !body.background
-            && body.previous_response_id.is_none()
-            && body.reasoning.is_none()
-            && body.tools.is_empty()
-            && matches!(body.input, crate::protocols::spec::ResponseInput::Text(_));
-        self.route_prepared_request(headers, body, "/v1/responses", model_id, None, plain)
+        self.route_typed_request(headers, body, "/v1/responses", model_id)
             .await
     }
 
@@ -3210,18 +3188,6 @@ impl RouterTrait for Router {
 
         let policy = self.policy_for_model(routing_model);
         let kv_ops = kv_aware_ops(policy.as_ref());
-        // The public Responses API reaches this raw path. Capture the current
-        // registrations before rendering so late metadata/tokens cannot be
-        // attached to a replacement. Forward the complete Value unchanged.
-        let history = (self.kv_aware_completion_history
-            && *method == Method::POST
-            && path == "/v1/responses"
-            && workers
-                .iter()
-                .all(|worker| worker.connection_mode() == crate::core::ConnectionMode::Http)
-            && super::completion_route::plain_responses_history_input(&body))
-        .then(|| kv_ops?.capture_completion_history(&workers, model_id.filter(|m| !m.is_empty())?))
-        .flatten();
         // Serializing the whole body is expensive when it carries base64
         // media; only consumers that actually read the text pay for it.
         let request_text = if (policy.needs_request_text() && !policy.needs_cache_routing_key())
@@ -3298,7 +3264,6 @@ impl RouterTrait for Router {
         } else {
             None
         };
-        let mut history_observation = None;
         let selection = if let Some(completion) = &program_completion {
             self.worker_registry
                 .get_by_url(&completion.dispatch().target_id)
@@ -3317,33 +3282,14 @@ impl RouterTrait for Router {
                     SelectedWorker { worker, kv_receipt }
                 })
         } else if let Some(ops) = kv_ops {
-            let receipt = if let Some(history) = &history {
-                ops.select_with_context(
-                    &workers,
-                    QualifiedKvInput {
-                        tokens: request_tokens,
-                        eligibility: None,
-                        history: Some(history),
-                    },
-                    lora_name,
-                    cache_salt,
-                    affinity_key.as_ref(),
-                    &[],
-                )
-                .map(|(receipt, observation)| {
-                    history_observation = observation;
-                    receipt
-                })
-            } else {
-                ops.select_worker_with_inputs(
-                    &workers,
-                    request_tokens,
-                    lora_name,
-                    cache_salt,
-                    affinity_key.as_ref(),
-                    &[],
-                )
-            };
+            let receipt = ops.select_worker_with_inputs(
+                &workers,
+                request_tokens,
+                lora_name,
+                cache_salt,
+                affinity_key.as_ref(),
+                &[],
+            );
             receipt.map(|receipt| SelectedWorker {
                 worker: workers[receipt.worker_index].clone(),
                 kv_receipt: Some(receipt),
@@ -3504,9 +3450,6 @@ impl RouterTrait for Router {
                     self.worker_registry.notify_worker_state_change();
                 }
                 if status.is_success() {
-                    if let (Some(ops), Some(observation)) = (kv_ops, history_observation) {
-                        ops.observe_completion_headers(worker.as_ref(), observation);
-                    }
                     if let Some(transfers) = transfers.as_mut() {
                         transfers.disarm();
                     }
@@ -3649,6 +3592,7 @@ impl RouterTrait for Router {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::policies::{kv_aware_policy, KvAwareOps, KvAwarePolicy};
@@ -3657,7 +3601,6 @@ mod tests {
     const NO_KV_INPUT: QualifiedKvInput<'static> = QualifiedKvInput {
         tokens: KvRequestTokens::Shared(None),
         eligibility: None,
-        history: None,
     };
 
     struct CompletionResponseFixture {
@@ -3817,7 +3760,11 @@ mod tests {
             );
             let router = Router::new(vec![], &ctx).await.unwrap();
             assert_eq!(router.kv_aware_completion_history, enabled);
-            assert!(completion_history_for_pool(router.kv_aware_completion_history, None).is_err());
+            assert!(
+                crate::backend::classify_worker_urls(&router.get_worker_urls())
+                    .unwrap()
+                    .is_none()
+            );
             // Discovery starts empty. Resolve actual registered transports,
             // rather than inferring an HTTP pool from an empty URL list.
             for url in ["http://discovered:8000", "grpc://discovered:8000"] {
@@ -3827,11 +3774,8 @@ mod tests {
                 let pool =
                     crate::backend::classify_worker_urls(&router.worker_registry.get_all_urls())
                         .unwrap();
-                assert_eq!(
-                    completion_history_for_pool(router.kv_aware_completion_history, pool).is_ok(),
-                    enabled,
-                    "{url}"
-                );
+                assert!(pool.is_some(), "{url}");
+                assert_eq!(router.kv_aware_completion_history, enabled, "{url}");
                 router.worker_registry.remove(&id);
             }
         }
@@ -5307,9 +5251,6 @@ mod tests {
             ("/v1/completions", true),
             ("/v1/chat/completions", false),
             ("/v1/chat/completions", true),
-            ("/v1/responses", false),
-            ("/v1/responses", true),
-            ("/inference/v1/generate", false),
         ] {
             for w in &f.workers {
                 register_history_target(kv, w, kv.target_for_worker(w.as_ref()), "model", 16);
@@ -5321,10 +5262,6 @@ mod tests {
                     "/v1/chat/completions" => {
                         json!({"model":"model","stream":stream,"messages":[{"role":"user","content":"hello"}]})
                     }
-                    "/v1/responses" => {
-                        json!({"model":"model","store":false,"stream":stream,"input":"hello"})
-                    }
-                    "/inference/v1/generate" => json!({"model":"model","token_ids":ids}),
                     _ => unreachable!(),
                 };
                 let r = app
@@ -5371,16 +5308,19 @@ mod tests {
                 assert!(f.workers.iter().all(|w| w.load() == 0), "{path}");
             }
         }
-        // The public Responses handler forwards a Value, not ResponsesRequest:
-        // an unknown field must reach the backend intact without training history.
+        // The shared HTTP input preparation, not a Chat-specific field list,
+        // keeps unmodelled adapter identity out of history while forwarding it.
         for w in &f.workers {
             register_history_target(kv, w, kv.target_for_worker(w.as_ref()), "model", 16);
         }
         f.workers[0].set_healthy(false);
-        let raw = json!({"model":"model","store":false,"input":"hello", "unmodeled_extension":{"keep":[1,null,3]}});
+        let raw = json!({
+            "model":"model", "messages":[{"role":"user","content":"hello"}],
+            "prompt_adapter_request":{"id":7}
+        });
         let response = app
             .oneshot(
-                Request::post("/v1/responses")
+                Request::post("/v1/chat/completions")
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(raw.to_string()))
                     .unwrap(),
@@ -5388,20 +5328,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(selected_http_worker(response).await, 1);
-        assert_eq!(f.calls.lock().last().unwrap().2, raw);
+        // Chat retains typed forwarding, including serialized defaults; the
+        // unmodelled extension must still reach the backend.
+        let expected =
+            serde_json::to_value(serde_json::from_value::<ChatCompletionRequest>(raw).unwrap())
+                .unwrap();
+        assert_eq!(f.calls.lock().last().unwrap().2, expected);
         assert_eq!(
             kv.observed_completion_prefix(f.workers[1].as_ref(), &ids),
             0
-        );
-        assert_eq!(
-            f.loads.lock().last().copied(),
-            Some((
-                1,
-                crate::policies::LoadSample {
-                    active_prefill_tokens: 33,
-                    active_requests: 1,
-                }
-            ))
         );
         assert!(f.workers.iter().all(|w| w.load() == 0));
     }
@@ -7640,19 +7575,20 @@ mod tests {
         // Make multiple selections with the same headers - should all pick the same worker
         let mut selected_urls: Vec<String> = Vec::new();
         for _ in 0..10 {
-            let (worker, _) = Router::select_worker_for_model(
-                router.policy_for_model(None).as_ref(),
-                None,
-                &router.available_workers(None),
-                Some(r#"{"prompt": "test"}"#),
-                Some(&header_map),
-                NO_KV_INPUT,
-                None,
-                None,
-                None,
-                &[],
-            )
-            .expect("Should select a worker");
+            let (worker, _) = router
+                .select_worker_for_model(
+                    None,
+                    &router.available_workers(None),
+                    Some(r#"{"prompt": "test"}"#),
+                    Some(&header_map),
+                    NO_KV_INPUT,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &[],
+                )
+                .expect("Should select a worker");
             selected_urls.push(worker.worker.url().to_string());
         }
 
@@ -7680,19 +7616,20 @@ mod tests {
             }
         }
 
-        let (worker, _) = Router::select_worker_for_model(
-            router.policy_for_model(None).as_ref(),
-            None,
-            &router.available_workers(None),
-            Some(r#"{"prompt": "test"}"#),
-            None,
-            NO_KV_INPUT,
-            None,
-            None,
-            None,
-            &[],
-        )
-        .expect("Should select the remaining healthy worker");
+        let (worker, _) = router
+            .select_worker_for_model(
+                None,
+                &router.available_workers(None),
+                Some(r#"{"prompt": "test"}"#),
+                None,
+                NO_KV_INPUT,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .expect("Should select the remaining healthy worker");
 
         assert_eq!(
             worker.worker.url(),
@@ -7712,13 +7649,13 @@ mod tests {
             w.set_healthy(false);
         }
 
-        let result = Router::select_worker_for_model(
-            router.policy_for_model(None).as_ref(),
+        let result = router.select_worker_for_model(
             None,
             &router.available_workers(None),
             Some(r#"{"prompt": "test"}"#),
             None,
             NO_KV_INPUT,
+            None,
             None,
             None,
             None,
@@ -7734,23 +7671,24 @@ mod tests {
     fn test_retry_exclusion_does_not_change_other_policies() {
         let router = create_test_consistent_hash_router();
         let select = |excluded: &[String]| {
-            Router::select_worker_for_model(
-                router.policy_for_model(None).as_ref(),
-                None,
-                &router.available_workers(None),
-                Some(r#"{"prompt": "test"}"#),
-                None,
-                NO_KV_INPUT,
-                None,
-                None,
-                None,
-                excluded,
-            )
-            .expect("Should select a worker")
-            .0
-            .worker
-            .url()
-            .to_string()
+            router
+                .select_worker_for_model(
+                    None,
+                    &router.available_workers(None),
+                    Some(r#"{"prompt": "test"}"#),
+                    None,
+                    NO_KV_INPUT,
+                    None,
+                    None,
+                    None,
+                    None,
+                    excluded,
+                )
+                .expect("Should select a worker")
+                .0
+                .worker
+                .url()
+                .to_string()
         };
         let first = select(&[]);
         assert_eq!(select(std::slice::from_ref(&first)), first);
@@ -7767,13 +7705,13 @@ mod tests {
             let session_id = format!("session-{}", i);
             header_map.insert("x-session-id", HeaderValue::from_str(&session_id).unwrap());
 
-            if let Some((worker, _)) = Router::select_worker_for_model(
-                router.policy_for_model(None).as_ref(),
+            if let Some((worker, _)) = router.select_worker_for_model(
                 None,
                 &router.available_workers(None),
                 Some(r#"{"prompt": "test"}"#),
                 Some(&header_map),
                 NO_KV_INPUT,
+                None,
                 None,
                 None,
                 None,

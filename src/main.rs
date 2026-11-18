@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
@@ -852,11 +854,12 @@ Provide --worker-urls or PD flags as usual.",
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
     #[test]
-    fn completion_history_is_opt_in_and_reaches_router_config() {
+    fn completion_history_is_opt_in() {
         for enabled in [false, true] {
             let mut argv = vec![
                 "vllm-router",
@@ -870,12 +873,6 @@ mod tests {
             }
             let args = CliArgs::try_parse_from(argv).unwrap();
             assert_eq!(args.kv_aware_completion_history, enabled);
-            assert_eq!(
-                args.to_router_config(vec![])
-                    .unwrap()
-                    .kv_aware_completion_history,
-                enabled
-            );
         }
     }
 

@@ -55,11 +55,16 @@ pub enum KvRequestTokens<'a> {
 
 /// Request-local placement qualification; it restricts credit, not candidacy.
 #[derive(Clone, Copy)]
-pub struct QualifiedKvInput<'a> {
+pub(crate) struct QualifiedKvInput<'a> {
     pub tokens: KvRequestTokens<'a>,
     pub eligibility: Option<&'a [bool]>,
-    /// Optional advisory context captured from this policy before preparation.
-    pub history: Option<&'a CompletionHistoryRequest>,
+}
+
+#[derive(Default)]
+struct SelectionIdentity<'a> {
+    lora_name: Option<&'a str>,
+    cache_salt: Option<&'a str>,
+    affinity_key: Option<&'a AffinityKey>,
 }
 
 impl QualifiedKvInput<'_> {
@@ -146,24 +151,25 @@ pub trait KvAwareOps: Send + Sync {
     fn observe_completion_headers(&self, _worker: &dyn Worker, _observation: HistoryObservation) {}
 
     /// Ordinary and history-assisted requests share selection and reservation.
+    /// History applies only to requests without a LoRA or cache-salt identity.
     /// Implementers without history keep their existing qualification behavior.
-    fn select_with_context(
+    fn select_with_history(
         &self,
         workers: &[Arc<dyn Worker>],
-        input: QualifiedKvInput<'_>,
-        lora_name: Option<&str>,
-        cache_salt: Option<&str>,
+        tokens: KvRequestTokens<'_>,
+        eligibility: Option<&[bool]>,
+        _history: Option<&CompletionHistoryRequest>,
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
     ) -> Option<(KvSelectionReceipt, Option<HistoryObservation>)> {
         self.select_worker_with_qualified_inputs(
             workers,
-            input.tokens,
-            lora_name,
-            cache_salt,
+            tokens,
+            None,
+            None,
             affinity_key,
             excluded_workers,
-            input.eligibility,
+            eligibility,
         )
         .map(|receipt| (receipt, None))
     }
@@ -680,6 +686,7 @@ impl KvAffinityTable {
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn get(&self, digest: &[u8; 32]) -> Option<Arc<AffinityRecord>> {
         self.records.lock().peek(digest).cloned()
     }
@@ -744,11 +751,13 @@ impl KvAffinityTable {
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn len(&self) -> usize {
         self.records.lock().len()
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -1044,6 +1053,7 @@ impl std::fmt::Debug for KvAwarePolicy {
 
 impl KvAwarePolicy {
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn observed_completion_prefix(&self, worker: &dyn Worker, ids: &[u32]) -> usize {
         let now = Instant::now();
         let Some(store) = self.completion_history.get() else {
@@ -1357,12 +1367,12 @@ impl KvAwarePolicy {
         let plan = self.prepare_selection(
             workers,
             QualifiedKvInput {
-                history: None,
                 tokens: KvRequestTokens::Shared(token_ids),
                 eligibility: None,
             },
             lora_name,
             cache_salt,
+            false,
         )?;
         let candidates = self.candidate_views(workers, &plan);
         let (costs, components) = self.score_candidates(&plan, &candidates)?;
@@ -1408,7 +1418,6 @@ impl KvAwarePolicy {
         self.select_worker_with_qualified_inputs(
             workers,
             QualifiedKvInput {
-                history: None,
                 tokens,
                 eligibility: None,
             },
@@ -1431,10 +1440,13 @@ impl KvAwarePolicy {
         self.select_with_context(
             workers,
             input,
-            lora_name,
-            cache_salt,
-            affinity_key,
+            SelectionIdentity {
+                lora_name,
+                cache_salt,
+                affinity_key,
+            },
             excluded_workers,
+            None,
         )
         .map(|(receipt, _)| receipt)
     }
@@ -1443,12 +1455,16 @@ impl KvAwarePolicy {
         &self,
         workers: &[Arc<dyn Worker>],
         input: QualifiedKvInput<'_>,
-        lora_name: Option<&str>,
-        cache_salt: Option<&str>,
-        affinity_key: Option<&AffinityKey>,
+        identity: SelectionIdentity<'_>,
         excluded_workers: &[String],
+        history: Option<&CompletionHistoryRequest>,
     ) -> Option<(KvSelectionReceipt, Option<HistoryObservation>)> {
-        let history = input.history.filter(|_| {
+        let SelectionIdentity {
+            lora_name,
+            cache_salt,
+            affinity_key,
+        } = identity;
+        let history = history.filter(|_| {
             self.params.router_temperature == 0.0 && lora_name.is_none() && cache_salt.is_none()
         });
         let digest = affinity_key.map(|key| key.scoped_digest(lora_name, cache_salt));
@@ -1484,7 +1500,7 @@ impl KvAwarePolicy {
                     has_tokens,
                 }
             } else {
-                self.prepare_selection(workers, input, lora_name, cache_salt)?
+                self.prepare_selection(workers, input, lora_name, cache_salt, history.is_some())?
             };
             // Token comparisons happen outside the reservation lock. Only a
             // single qualified, backend-rendered prompt can establish history.
@@ -1745,6 +1761,7 @@ impl KvAwarePolicy {
         input: QualifiedKvInput<'_>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
+        collect_history_credit: bool,
     ) -> Option<SelectionPlan> {
         let (healthy, bindings) = {
             let _guard = self.selection_lock.lock();
@@ -1848,7 +1865,7 @@ impl KvAwarePolicy {
                 total_input = known_input_tokens;
             }
             grouped.push(single_matches);
-            if input.history.is_some() {
+            if collect_history_credit {
                 let evidence_known = binding.cache_key.is_some()
                     && !prompts.is_empty()
                     && prompts.iter().all(|ids| !ids.is_empty())
@@ -2102,23 +2119,28 @@ impl KvAwareOps for KvAwarePolicy {
         self.commit_history_observation(worker, observation);
     }
 
-    fn select_with_context(
+    fn select_with_history(
         &self,
         workers: &[Arc<dyn Worker>],
-        input: QualifiedKvInput<'_>,
-        lora_name: Option<&str>,
-        cache_salt: Option<&str>,
+        tokens: KvRequestTokens<'_>,
+        eligibility: Option<&[bool]>,
+        history: Option<&CompletionHistoryRequest>,
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
     ) -> Option<(KvSelectionReceipt, Option<HistoryObservation>)> {
-        KvAwarePolicy::select_with_context(
-            self,
+        self.select_with_context(
             workers,
-            input,
-            lora_name,
-            cache_salt,
-            affinity_key,
+            QualifiedKvInput {
+                tokens,
+                eligibility,
+            },
+            SelectionIdentity {
+                lora_name: None,
+                cache_salt: None,
+                affinity_key,
+            },
             excluded_workers,
+            history,
         )
     }
 
@@ -2181,10 +2203,20 @@ impl KvAwareOps for KvAwarePolicy {
                 for tokens in prompts {
                     let hits = if verified {
                         query_cache
-                            .entry((binding.cache_key.clone(), tokens.as_slice()))
+                            .entry((
+                                Arc::as_ptr(&binding.matches) as *const () as usize,
+                                binding.cache_key.clone(),
+                                tokens.as_slice(),
+                            ))
                             .or_insert_with(|| {
-                                Self::placement_matches(&binding, Some(tokens), None, true)
+                                // Keep the allocation alive even if a later
+                                // input observes a replaced registration.
+                                (
+                                    binding.matches.clone(),
+                                    Self::placement_matches(&binding, Some(tokens), None, true),
+                                )
                             })
+                            .1
                             .as_slice()
                     } else {
                         &[]
@@ -2355,7 +2387,6 @@ impl KvAwareOps for KvAwarePolicy {
             self,
             workers,
             QualifiedKvInput {
-                history: None,
                 tokens,
                 eligibility,
             },
@@ -2381,6 +2412,7 @@ impl KvAwareOps for KvAwarePolicy {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::request_identity::{resolve_affinity_identity, IdentityFields};
@@ -2546,7 +2578,6 @@ mod tests {
                         .select_worker_with_qualified_inputs(
                             &workers,
                             QualifiedKvInput {
-                                history: None,
                                 tokens: KvRequestTokens::Shared(Some(&ids)),
                                 eligibility: Some(&mask),
                             },
@@ -3483,14 +3514,10 @@ mod tests {
         let denied = [false];
         for eligibility in [None, Some(denied.as_slice())] {
             assert!(ops
-                .select_with_context(
+                .select_with_history(
                     &workers,
-                    QualifiedKvInput {
-                        tokens: KvRequestTokens::Shared(Some(&[1, 2])),
-                        eligibility,
-                        history: None,
-                    },
-                    None,
+                    KvRequestTokens::Shared(Some(&[1, 2])),
+                    eligibility,
                     None,
                     None,
                     &[],
@@ -3573,21 +3600,16 @@ mod tests {
             .capture_completion_history(&workers, "model")
             .unwrap();
         let input = QualifiedKvInput {
-            history: None,
             tokens: KvRequestTokens::PerWorker(&inputs),
             eligibility: None,
         };
         let (seed, observation) = policy
             .select_with_context(
                 &workers,
-                QualifiedKvInput {
-                    history: Some(&request),
-                    ..input
-                },
-                None,
-                None,
-                None,
+                input,
+                SelectionIdentity::default(),
                 &[workers[0].url().to_owned()],
+                Some(&request),
             )
             .unwrap();
         assert_eq!(seed.worker_index, 1);
@@ -3596,14 +3618,10 @@ mod tests {
         let (receipt, observation) = policy
             .select_with_context(
                 &workers,
-                QualifiedKvInput {
-                    history: Some(&request),
-                    ..input
-                },
-                None,
-                None,
-                None,
+                input,
+                SelectionIdentity::default(),
                 &[],
+                Some(&request),
             )
             .unwrap();
         assert_eq!(receipt.worker_index, 1);
@@ -3626,14 +3644,12 @@ mod tests {
             .select_with_context(
                 &workers,
                 QualifiedKvInput {
-                    history: Some(&request),
                     tokens: KvRequestTokens::PerWorker(&inputs),
                     eligibility: None,
                 },
-                None,
-                None,
-                None,
+                SelectionIdentity::default(),
                 &[workers[0].url().to_owned()],
+                Some(&request),
             )
             .unwrap();
         release_receipt(&workers, &receipt);
@@ -3688,7 +3704,6 @@ mod tests {
             .capture_completion_history(&workers, "model")
             .unwrap();
         let input = QualifiedKvInput {
-            history: Some(&request),
             tokens: KvRequestTokens::PerWorker(&inputs),
             eligibility: None,
         };
@@ -3696,10 +3711,9 @@ mod tests {
             .select_with_context(
                 &workers,
                 input,
-                None,
-                None,
-                None,
+                SelectionIdentity::default(),
                 &[workers[0].url().to_owned()],
+                Some(&request),
             )
             .unwrap();
         policy.observe_completion_headers(workers[1].as_ref(), observation.unwrap());
@@ -3760,14 +3774,16 @@ mod tests {
                 .select_with_context(
                     &workers,
                     QualifiedKvInput {
-                        history: Some(captured),
                         tokens,
                         eligibility: mask.as_ref().map(|m| m.as_slice()),
                     },
-                    lora,
-                    salt,
-                    None,
+                    SelectionIdentity {
+                        lora_name: lora,
+                        cache_salt: salt,
+                        affinity_key: None,
+                    },
                     &[workers[0].url().to_owned()],
+                    Some(captured),
                 )
                 .unwrap();
             assert_eq!(receipt.worker_index, 1, "{name}");
@@ -3782,14 +3798,12 @@ mod tests {
             .select_with_context(
                 &workers,
                 QualifiedKvInput {
-                    history: Some(&request),
                     tokens: KvRequestTokens::PerWorker(&missing_peer),
                     eligibility: None,
                 },
-                None,
-                None,
-                None,
+                SelectionIdentity::default(),
                 &[],
+                Some(&request),
             )
             .unwrap();
         assert_eq!(receipt.worker_index, 0);
@@ -3799,7 +3813,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_history_placement_memo_is_provider_scoped() {
+    fn placement_memos_keep_distinct_providers_and_reuse_shared_arcs() {
         struct Matches {
             calls: AtomicUsize,
             hits: Vec<TierMatch>,
@@ -3812,67 +3826,83 @@ mod tests {
         }
         let policy = KvAwarePolicy::default();
         let workers = registered_worker_pair(&policy);
-        let targets: Vec<_> = workers.iter().map(|w| target(w.url(), 0)).collect();
         let first = Arc::new(Matches {
             calls: AtomicUsize::new(0),
             hits: Vec::new(),
         });
         let second = Arc::new(Matches {
             calls: AtomicUsize::new(0),
-            hits: vec![tier_match(&targets[1], StorageTier::Device, &[(0, 1)])],
+            hits: vec![tier_match(
+                &target(workers[1].url(), 0),
+                StorageTier::Device,
+                &[(0, 1)],
+            )],
         });
+        let info = WorkerKvInfo {
+            cache_key: Some(CacheKey {
+                model: Arc::from("shared"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size: 2,
+            }),
+            ..Default::default()
+        };
         for (worker, provider) in workers.iter().zip([
             first.clone() as Arc<dyn TieredMatchProvider>,
             second.clone(),
         ]) {
-            policy.register_history_worker(
-                worker,
-                Some(&WorkerKvInfo {
-                    instance_id: worker.url().into(),
-                    ranks: vec![0],
-                    cache_key: Some(CacheKey {
-                        model: Arc::from("model"),
-                        hash_mode: crate::kv_index::HashMode::Sha256,
-                        block_size: 2,
-                    }),
-                    ..Default::default()
-                }),
-                Some(provider),
-            );
+            policy.register_worker(worker.as_ref(), Some(&info), Some(provider));
         }
-        let ids = [1, 2, 3, 4];
-        let capture = policy
-            .capture_completion_history(&workers, "model")
-            .unwrap();
-        let input = QualifiedKvInput {
-            tokens: KvRequestTokens::Shared(Some(&ids)),
-            eligibility: None,
-            history: Some(&capture),
-        };
-        let plan = policy
-            .prepare_selection(&workers, input, None, None)
-            .unwrap();
-        assert_eq!(plan.history_credit, [Some(false), Some(true)]);
-        assert!(plan.grouped[0].is_empty());
-        assert_eq!(plan.grouped[1][0].target, targets[1]);
-        assert_eq!(first.calls.load(Ordering::Relaxed), 1);
-        assert_eq!(second.calls.load(Ordering::Relaxed), 1);
-        // A truly shared provider still serves both targets with one query.
-        let info = policy.binding_for_worker(workers[0].as_ref());
-        policy.register_worker(
-            workers[1].as_ref(),
-            Some(&WorkerKvInfo {
-                cache_key: info.cache_key,
-                instance_id: workers[1].url().into(),
-                ..Default::default()
-            }),
-            Some(first.clone()),
-        );
-        let _ = policy
-            .prepare_selection(&workers, input, None, None)
-            .unwrap();
-        assert_eq!(first.calls.load(Ordering::Relaxed), 2);
-        assert_eq!(second.calls.load(Ordering::Relaxed), 1);
+        let prompts = [vec![1, 2, 3, 4]];
+        for shared in [false, true] {
+            if shared {
+                policy.register_worker(workers[1].as_ref(), Some(&info), Some(first.clone()));
+            }
+            let calls_before = [
+                first.calls.load(Ordering::Relaxed),
+                second.calls.load(Ordering::Relaxed),
+            ];
+            // An exclusion fixes the selected target, not its placement credit.
+            let receipt = policy
+                .select_worker_with_receipt(
+                    &workers,
+                    Some(&prompts[0]),
+                    None,
+                    None,
+                    None,
+                    &[workers[0].url().to_owned()],
+                )
+                .unwrap();
+            let work = policy.estimate_prefill_work(&[
+                (workers[0].as_ref(), &prompts, true),
+                (workers[1].as_ref(), &prompts, true),
+            ]);
+            let expected = if shared { 4 } else { 2 };
+            // Run both real callers before asserting, so the red observation
+            // includes the independent P/D estimate as well as Regular billing.
+            let actual = (
+                receipt.new_prefill_tokens,
+                work.iter()
+                    .map(|estimate| estimate.new_prefill_tokens)
+                    .collect::<Vec<_>>(),
+            );
+            release_receipt(&workers, &receipt);
+            assert_eq!(actual, (expected, vec![4, expected]), "shared={shared}");
+            assert_eq!(receipt.worker_index, 1);
+            assert!(work.iter().all(|estimate| estimate.placement_verified));
+            assert_eq!(
+                [
+                    first.calls.load(Ordering::Relaxed) - calls_before[0],
+                    second.calls.load(Ordering::Relaxed) - calls_before[1],
+                ],
+                [2, if shared { 0 } else { 2 }],
+                "each request-local memo reuses only the same provider Arc"
+            );
+            assert_eq!(
+                policy.load.sample(&receipt.decision.target),
+                LoadSample::default()
+            );
+            assert_eq!(workers[1].load(), 0);
+        }
     }
 
     #[test]
@@ -3910,7 +3940,6 @@ mod tests {
             .unwrap();
         let ids = [7; 33];
         let input = QualifiedKvInput {
-            history: Some(&request),
             tokens: KvRequestTokens::Shared(Some(&ids)),
             eligibility: None,
         };
@@ -3918,10 +3947,9 @@ mod tests {
             .select_with_context(
                 &workers,
                 input,
-                None,
-                None,
-                None,
+                SelectionIdentity::default(),
                 &[workers[0].url().into()],
+                Some(&request),
             )
             .unwrap();
         assert_eq!(seed.new_prefill_tokens, 33);
@@ -3936,7 +3964,13 @@ mod tests {
             32
         );
         let (next, observation) = policy
-            .select_with_context(&workers, input, None, None, None, &[])
+            .select_with_context(
+                &workers,
+                input,
+                SelectionIdentity::default(),
+                &[],
+                Some(&request),
+            )
             .unwrap();
         assert_eq!(next.worker_index, 1);
         assert_eq!(next.new_prefill_tokens, 33);
@@ -3955,21 +3989,16 @@ mod tests {
             .capture_completion_history(&workers, "model")
             .unwrap();
         let input = QualifiedKvInput {
-            history: None,
             tokens: KvRequestTokens::PerWorker(&inputs),
             eligibility: None,
         };
         let (seed, observation) = policy
             .select_with_context(
                 &workers,
-                QualifiedKvInput {
-                    history: Some(&request),
-                    ..input
-                },
-                None,
-                None,
-                None,
+                input,
+                SelectionIdentity::default(),
                 &[workers[0].url().to_owned()],
+                Some(&request),
             )
             .unwrap();
         policy.observe_completion_headers(workers[1].as_ref(), observation.unwrap());
@@ -3989,14 +4018,14 @@ mod tests {
         let (receipt, _) = policy
             .select_with_context(
                 &workers,
-                QualifiedKvInput {
-                    history: Some(&request),
-                    ..input
+                input,
+                SelectionIdentity {
+                    lora_name: None,
+                    cache_salt: None,
+                    affinity_key: Some(&key),
                 },
-                None,
-                None,
-                Some(&key),
                 &[],
+                Some(&request),
             )
             .unwrap();
         assert_eq!(receipt.worker_index, 0);
@@ -4005,14 +4034,10 @@ mod tests {
         let (receipt, _) = policy
             .select_with_context(
                 &workers,
-                QualifiedKvInput {
-                    history: Some(&request),
-                    ..input
-                },
-                None,
-                None,
-                None,
+                input,
+                SelectionIdentity::default(),
                 &[],
+                Some(&request),
             )
             .unwrap();
         assert_eq!(receipt.worker_index, 0);
@@ -4031,14 +4056,10 @@ mod tests {
             let (receipt, _) = policy
                 .select_with_context(
                     &workers,
-                    QualifiedKvInput {
-                        history: Some(&request),
-                        ..input
-                    },
-                    None,
-                    None,
-                    None,
+                    input,
+                    SelectionIdentity::default(),
                     &excluded,
+                    Some(&request),
                 )
                 .unwrap();
             assert_eq!(receipt.worker_index, expected);
@@ -4070,14 +4091,10 @@ mod tests {
             let (receipt, _) = policy
                 .select_with_context(
                     &workers,
-                    QualifiedKvInput {
-                        history: Some(&current),
-                        ..input
-                    },
-                    None,
-                    None,
-                    None,
+                    input,
+                    SelectionIdentity::default(),
                     &[],
+                    Some(&current),
                 )
                 .unwrap();
             assert_eq!(receipt.worker_index, 0);
@@ -4094,7 +4111,6 @@ mod tests {
             .capture_completion_history(&workers, "model")
             .unwrap();
         let input = QualifiedKvInput {
-            history: Some(&captured),
             tokens: KvRequestTokens::PerWorker(&inputs),
             eligibility: None,
         };
@@ -4103,10 +4119,9 @@ mod tests {
                 .select_with_context(
                     &workers,
                     input,
-                    None,
-                    None,
-                    None,
+                    SelectionIdentity::default(),
                     &[workers[1 - target].url().to_owned()],
+                    Some(&captured),
                 )
                 .unwrap();
             assert_eq!(receipt.worker_index, target);
@@ -4118,7 +4133,13 @@ mod tests {
                 .map(|i| vec![workers[i].url().to_owned()])
                 .unwrap_or_default();
             let (receipt, _) = policy
-                .select_with_context(&workers, input, None, None, None, &excluded_urls)
+                .select_with_context(
+                    &workers,
+                    input,
+                    SelectionIdentity::default(),
+                    &excluded_urls,
+                    Some(&captured),
+                )
                 .unwrap();
             assert!(receipt.worker_index < workers.len());
             assert_ne!(Some(receipt.worker_index), excluded);
@@ -4137,14 +4158,12 @@ mod tests {
             .select_with_context(
                 &workers,
                 QualifiedKvInput {
-                    history: Some(&captured),
                     tokens: KvRequestTokens::PerWorker(&inputs),
                     eligibility: None,
                 },
-                None,
-                None,
-                None,
+                SelectionIdentity::default(),
                 &[workers[0].url().to_owned()],
+                Some(&captured),
             )
             .unwrap();
         policy.observe_completion_headers(workers[1].as_ref(), observation.unwrap());
@@ -4170,7 +4189,6 @@ mod tests {
             .capture_completion_history(&workers, "model")
             .unwrap();
         let input = QualifiedKvInput {
-            history: None,
             tokens: KvRequestTokens::PerWorker(&inputs),
             eligibility: None,
         };
@@ -4179,14 +4197,10 @@ mod tests {
             let (receipt, observation) = policy
                 .select_with_context(
                     &workers,
-                    QualifiedKvInput {
-                        history: Some(&captured),
-                        ..input
-                    },
-                    None,
-                    None,
-                    None,
+                    input,
+                    SelectionIdentity::default(),
                     &[workers[1 - index].url().to_owned()],
+                    Some(&captured),
                 )
                 .unwrap();
             let binding = policy.targets.get(workers[index].url()).unwrap().clone();
@@ -4232,14 +4246,10 @@ mod tests {
         let (receipt, observation) = policy
             .select_with_context(
                 &workers,
-                QualifiedKvInput {
-                    history: Some(&captured),
-                    ..input
-                },
-                None,
-                None,
-                None,
+                input,
+                SelectionIdentity::default(),
                 &[workers[1].url().to_owned()],
+                Some(&captured),
             )
             .unwrap();
         assert_eq!(receipt.new_prefill_tokens, 4);
@@ -4283,14 +4293,10 @@ mod tests {
         let (receipt, observation) = policy
             .select_with_context(
                 &replaced_workers,
-                QualifiedKvInput {
-                    history: Some(&fresh),
-                    ..input
-                },
-                None,
-                None,
-                None,
+                input,
+                SelectionIdentity::default(),
                 &[workers[0].url().to_owned()],
+                Some(&fresh),
             )
             .unwrap();
         assert_eq!(receipt.worker_index, 1);
@@ -4311,14 +4317,10 @@ mod tests {
         let (receipt, _) = policy
             .select_with_context(
                 &workers,
-                QualifiedKvInput {
-                    history: Some(&captured),
-                    ..input
-                },
-                None,
-                None,
-                None,
+                input,
+                SelectionIdentity::default(),
                 &[],
+                Some(&captured),
             )
             .unwrap();
         assert_eq!(receipt.worker_index, 1);
@@ -4920,102 +4922,78 @@ mod tests {
     }
 
     #[test]
-    fn churn_fallback_preserves_each_workers_known_input_without_history_credit() {
-        struct Churn {
-            calls: AtomicUsize,
-            callback: Mutex<Option<Box<dyn Fn() + Send>>>,
-        }
+    fn churn_fallback_preserves_each_workers_known_input() {
+        struct Churn(Mutex<Option<Box<dyn Fn() + Send>>>);
         impl TieredMatchProvider for Churn {
             fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
-                self.calls.fetch_add(1, Ordering::Relaxed);
-                self.callback.lock().as_ref().unwrap()();
+                self.0.lock().as_ref().unwrap()();
                 Vec::new()
             }
         }
-        for history_enabled in [false, true] {
-            let policy = Arc::new(KvAwarePolicy::default());
-            let workers = registered_worker_pair(&policy);
-            let matches = Arc::new(Churn {
-                calls: AtomicUsize::new(0),
-                callback: Mutex::new(None),
-            });
-            let info = WorkerKvInfo {
-                cache_key: Some(CacheKey {
-                    model: Arc::from("model"),
-                    hash_mode: crate::kv_index::HashMode::Sha256,
-                    block_size: 16,
-                }),
-                ..WorkerKvInfo::default()
-            };
-            for worker in &workers {
-                policy.register_worker(worker.as_ref(), Some(&info), Some(matches.clone()));
+        let policy = Arc::new(KvAwarePolicy::default());
+        let workers = registered_worker_pair(&policy);
+        let matches = Arc::new(Churn(Mutex::new(None)));
+        let info = WorkerKvInfo {
+            cache_key: Some(CacheKey {
+                model: Arc::from("model"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size: 16,
+            }),
+            ..WorkerKvInfo::default()
+        };
+        for worker in &workers {
+            policy.register_worker(worker.as_ref(), Some(&info), Some(matches.clone()));
+        }
+        let weak_policy = Arc::downgrade(&policy);
+        let weak_matches = Arc::downgrade(&matches);
+        let registered = workers.clone();
+        // Every query replaces both registrations, forcing selection to reach
+        // the final, query-free attempt rather than reserve a stale snapshot.
+        *matches.0.lock() = Some(Box::new(move || {
+            for worker in &registered {
+                weak_policy.upgrade().unwrap().register_worker(
+                    worker.as_ref(),
+                    Some(&info),
+                    Some(weak_matches.upgrade().unwrap()),
+                );
             }
-            let weak_policy = Arc::downgrade(&policy);
-            let weak_matches = Arc::downgrade(&matches);
-            let registered = workers.clone();
-            *matches.callback.lock() = Some(Box::new(move || {
-                for worker in &registered {
-                    weak_policy.upgrade().unwrap().register_worker(
-                        worker.as_ref(),
-                        Some(&info),
-                        Some(weak_matches.upgrade().unwrap()),
-                    );
+        }));
+        let mut inputs = WorkerTokenInputs::new();
+        for (worker, length) in workers.iter().zip([33, 17]) {
+            inputs.insert(
+                worker.base_url().to_owned(),
+                Arc::from(vec![vec![7; length]]),
+            );
+        }
+        for (chosen, expected, known) in [(0, 33, true), (1, 17, true), (1, 0, false)] {
+            if !known {
+                inputs.remove(workers[1].base_url());
+            }
+            let receipt = policy
+                .select_worker_with_inputs(
+                    &workers,
+                    KvRequestTokens::PerWorker(&inputs),
+                    None,
+                    None,
+                    None,
+                    &[workers[1 - chosen].url().to_owned()],
+                )
+                .unwrap();
+            assert_eq!(receipt.worker_index, chosen);
+            assert_eq!(receipt.new_prefill_tokens, expected, "worker {chosen}");
+            assert_eq!(receipt.decision.components.ptoken, expected);
+            let target = &receipt.decision.target;
+            assert_eq!(
+                policy.load.sample(target),
+                LoadSample {
+                    active_prefill_tokens: expected,
+                    active_requests: 1,
                 }
-            }));
-            let history =
-                history_enabled.then(|| policy.capture_history_registrations(&workers, "model"));
-            let mut inputs = WorkerTokenInputs::new();
-            for (worker, length) in workers.iter().zip([33, 17]) {
-                inputs.insert(
-                    worker.base_url().to_owned(),
-                    Arc::from(vec![vec![7; length]]),
-                );
-            }
-            // Force each known target, then a target without preparation
-            // evidence. Query callbacks invalidate all three initial plans.
-            for (chosen, expected, known) in [(0, 33, true), (1, 17, true), (1, 0, false)] {
-                if !known {
-                    inputs.remove(workers[1].base_url());
-                }
-                let before = matches.calls.load(Ordering::Relaxed);
-                let (receipt, observation) = policy
-                    .select_with_context(
-                        &workers,
-                        QualifiedKvInput {
-                            tokens: KvRequestTokens::PerWorker(&inputs),
-                            eligibility: None,
-                            history: history.as_ref(),
-                        },
-                        None,
-                        None,
-                        None,
-                        &[workers[1 - chosen].url().to_owned()],
-                    )
-                    .unwrap();
-                assert_eq!(
-                    matches.calls.load(Ordering::Relaxed) - before,
-                    if known { 6 } else { 3 }
-                );
-                assert_eq!(receipt.worker_index, chosen);
-                assert_eq!(
-                    receipt.new_prefill_tokens, expected,
-                    "history={history_enabled}"
-                );
-                assert_eq!(receipt.decision.components.ptoken, expected);
-                assert!(observation.is_none());
-                let target = &receipt.decision.target;
-                assert_eq!(
-                    policy.load.sample(target),
-                    LoadSample {
-                        active_prefill_tokens: expected,
-                        active_requests: 1
-                    }
-                );
-                assert_eq!(workers[chosen].load(), 1);
-                release_receipt(&workers, &receipt);
-                assert_eq!(policy.load.sample(target), LoadSample::default());
-                assert_eq!(workers[chosen].load(), 0);
-            }
+            );
+            assert_eq!(workers[chosen].load(), 1);
+            release_receipt(&workers, &receipt);
+            assert_eq!(policy.load.sample(target), LoadSample::default());
+            assert_eq!(workers[chosen].load(), 0);
         }
     }
 

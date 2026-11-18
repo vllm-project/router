@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use pyo3::prelude::*;
 pub mod backend;
 pub mod config;

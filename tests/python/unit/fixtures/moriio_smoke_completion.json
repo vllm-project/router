@@ -1,0 +1,30 @@
+{
+  "id": "cmpl-redacted",
+  "object": "text_completion",
+  "created": 1794282755,
+  "model": "Qwen/Qwen3-0.6B",
+  "choices": [
+    {
+      "index": 0,
+      "text": " Paris. The capital of Italy is Rome",
+      "logprobs": null,
+      "finish_reason": "length",
+      "stop_reason": null,
+      "token_ids": null,
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "routed_experts": null
+    }
+  ],
+  "service_tier": null,
+  "system_fingerprint": "vllm-0.26.1rc1.dev306+gcb8104839-3b5e736b",
+  "usage": {
+    "prompt_tokens": 5,
+    "total_tokens": 13,
+    "completion_tokens": 8,
+    "prompt_tokens_details": null
+  },
+  "kv_transfer_params": null,
+  "ec_transfer_params": null,
+  "metrics": null
+}

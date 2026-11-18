@@ -688,6 +688,7 @@ fn hex(b: &[u8]) -> String {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 

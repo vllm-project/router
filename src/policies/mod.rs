@@ -27,13 +27,14 @@ pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 pub(crate) use kv_aware::kv_aware_policy;
+pub(crate) use kv_aware::QualifiedKvInput;
 pub use kv_aware::{
     cost_components, kv_aware_ops, AffinityKey, AffinityRecord, CandidateView,
     CompletionHistoryRequest, CostComponents, CostDecision, CostParams, HistoryObservation,
     InMemorySlotManager, KvAffinityTable, KvAwareOps, KvAwarePolicy, KvRequestSlot,
     KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample, MultiplicativeScorer, Picker,
-    PrefillWorkEstimate, QualifiedKvInput, Scorer, SelectionError, SlotManager, StagePick,
-    TemperaturePicker, TieredMatchProvider, TransferCredits, WorkerTokenInputs,
+    PrefillWorkEstimate, Scorer, SelectionError, SlotManager, StagePick, TemperaturePicker,
+    TieredMatchProvider, TransferCredits, WorkerTokenInputs,
 };
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
@@ -279,6 +280,7 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
