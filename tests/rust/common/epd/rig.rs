@@ -5,7 +5,7 @@
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -339,8 +339,9 @@ impl Rig {
         })
     }
 
-    /// The transfer IDs that the router gave the two images, as the encoder
-    /// requests carry them.
+    /// The transfer IDs that the router gave the media items, as the encoder
+    /// requests carry them: one per media item in each request, and no two
+    /// the same.
     fn transfer_ids(&self) -> Vec<String> {
         self.expect_encoder_assignment();
         let mut ids = Vec::new();
@@ -351,11 +352,29 @@ impl Rig {
                 self.ec.address.as_str(),
                 "[dispatch] Mooncake push target"
             );
-            for item in params["ec_items"].as_array().unwrap() {
+            let media_len = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["content"].as_array())
+                .flatten()
+                .count();
+            let items = params["ec_items"].as_array().unwrap();
+            assert_eq!(
+                items.len(),
+                media_len,
+                "[dispatch] one transfer per media item in the encoder request: {request}"
+            );
+            for item in items {
                 ids.push(item["transfer_id"].as_str().unwrap().to_owned());
             }
         }
-        assert_eq!(ids.len(), 2, "[dispatch] one transfer per image: {ids:?}");
+        let distinct: HashSet<&String> = ids.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            ids.len(),
+            "[dispatch] each media item has its own transfer ID: {ids:?}"
+        );
         ids
     }
 
