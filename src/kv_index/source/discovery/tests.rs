@@ -682,7 +682,7 @@ async fn layout_only_sources_retire_when_the_engine_changes_its_topic() {
 }
 
 #[tokio::test]
-async fn hybrid_discovery_accepts_rank_specific_hash_block_sizes() {
+async fn hybrid_discovery_binds_only_ranks_for_the_worker_model() {
     let rank = |rank: u32, block_size: u32| {
         let mut layout = capability(
             "qwen",
@@ -702,32 +702,38 @@ async fn hybrid_discovery_accepts_rank_specific_hash_block_sizes() {
     };
     let mut capability = rank(0, 16);
     capability.ranks.extend(rank(1, 32).ranks);
-    let sources = serde_json::from_value(serde_json::json!({
+    let sources: KvEventSourcesResponse = serde_json::from_value(serde_json::json!({
             "0":{"publisher":"zmq","encoding":"msgpack","schema_version":1,
                  "endpoint":"inproc://rank0-pub","replay_endpoint":"inproc://rank0-replay","topic":"rank-0"},
             "1":{"publisher":"zmq","encoding":"msgpack","schema_version":1,
                  "endpoint":"inproc://rank1-pub","replay_endpoint":"inproc://rank1-replay","topic":"rank-1"}
         })).unwrap();
-    let discovery = WorkerDiscovery {
+    let discovery = |capability| WorkerDiscovery {
         server_info: Ok(ServerInfo {
             instance_id: Some("worker".into()),
             model_id: Some("qwen".into()),
             kv_block_size: Some(576),
             ..Default::default()
         }),
-        sources: Ok(sources),
+        sources: Ok(sources.clone()),
         model_id: Ok(Some("qwen".into())),
         hybrid: Some(capability),
     };
     let (supervisor, _signals) =
         KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
-    let info = supervisor
-        .install_worker("http://127.0.0.1:8080", discovery)
-        .unwrap();
-    assert_eq!(info.block_size, Some(16));
-    let mut ranks = info.ranks;
-    ranks.sort_unstable();
-    assert_eq!(ranks, [0, 1]);
+    let worker_url = "http://127.0.0.1:8080";
+    for (model, expected) in [("qwen", &[0, 1][..]), ("other", &[0][..])] {
+        capability.ranks[1].model = model.into();
+        let info = supervisor
+            .install_worker(worker_url, discovery(capability.clone()))
+            .unwrap();
+        assert_eq!(info.block_size, Some(16));
+        let workers = supervisor.workers.lock();
+        let provider = workers[worker_url].hybrid.as_ref().unwrap();
+        let mut bound: Vec<_> = provider.indexes.keys().copied().collect();
+        bound.sort_unstable();
+        assert_eq!(bound, expected);
+    }
 }
 
 #[tokio::test]

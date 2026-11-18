@@ -932,7 +932,12 @@ impl ConfigValidator {
         // Static KV event sources are only meaningful with a KV-aware
         // prefill policy; anything else would silently ignore them.
         if !config.pd_kv_event_sources.is_empty() {
-            if let RoutingMode::VllmPrefillDecode { prefill_urls, .. } = &config.mode {
+            if let RoutingMode::VllmPrefillDecode {
+                prefill_urls,
+                decode_urls,
+                ..
+            } = &config.mode
+            {
                 for (url, sources) in &config.pd_kv_event_sources {
                     // Static sources are looked up by `Worker::base_url()`, which
                     // drops the `@dp_rank` suffix, so a rank-pinned prefill URL
@@ -958,9 +963,50 @@ impl ConfigValidator {
                             reason: format!("pd_kv_event_sources['{url}'] block_size must be > 0"),
                         });
                     }
-                    if sources.hybrid.is_some() || !sources.compatible_decode_urls.is_empty() {
+                    if let Some(layout) = &sources.hybrid {
+                        if config.program_scheduling.is_some() {
+                            return Err(ConfigError::IncompatibleConfig {
+                                reason: "hybrid PD sources do not support Program scheduling"
+                                    .into(),
+                            });
+                        }
+                        let invalid = |reason: &str| ConfigError::IncompatibleConfig {
+                            reason: format!("hybrid PD source '{url}': {reason}"),
+                        };
+                        let model = sources
+                            .model
+                            .as_deref()
+                            .filter(|model| !model.trim().is_empty())
+                            .ok_or_else(|| invalid("model must not be empty"))?;
+                        let replay = sources
+                            .replay_endpoints
+                            .as_ref()
+                            .filter(|endpoints| endpoints.len() == sources.endpoints.len())
+                            .ok_or_else(|| invalid("requires one replay endpoint per rank"))?;
+                        if sources.compatible_decode_urls.is_empty() {
+                            return Err(invalid("requires at least one compatible decode URL"));
+                        }
+                        if let Some(decode) = sources.compatible_decode_urls.iter().find(|url| {
+                            !decode_urls
+                                .iter()
+                                .any(|decode| base_url_without_rank(decode) == *url)
+                        }) {
+                            return Err(invalid(&format!(
+                                "decode URL '{decode}' is not a configured decode base URL"
+                            )));
+                        }
+                        if layout.ranks.len() != sources.endpoints.len() {
+                            return Err(invalid("layout must declare one capability per endpoint"));
+                        }
+                        for (rank, replay_endpoint) in replay.iter().enumerate() {
+                            layout.validate_declared_source(rank as u32, model, replay_endpoint)
+                                .map_err(|reason| ConfigError::IncompatibleConfig {
+                                    reason: format!("invalid hybrid PD layout for '{url}' rank {rank}: {reason}"),
+                                })?;
+                        }
+                    } else if !sources.compatible_decode_urls.is_empty() {
                         return Err(ConfigError::IncompatibleConfig {
-                            reason: "hybrid KV event sources require regular routing".into(),
+                            reason: format!("PD source '{url}' declares compatible decode URLs without a hybrid layout"),
                         });
                     }
                     for endpoint in sources
@@ -1779,6 +1825,93 @@ mod tests {
     #[test]
     fn test_pd_kv_event_sources_valid() {
         assert!(ConfigValidator::validate(&pd_config_with_static_kv_sources()).is_ok());
+    }
+
+    #[test]
+    fn hybrid_pd_requires_known_pair_and_replay() {
+        let mut config = pd_config_with_static_kv_sources();
+        let source = config
+            .pd_kv_event_sources
+            .get_mut("http://prefill:8000")
+            .unwrap();
+        source.model = Some("model".into());
+        source.replay_endpoints = Some(vec!["tcp://prefill:5558".into()]);
+        source.compatible_decode_urls = vec!["http://decode:8000".into()];
+        source.hybrid = Some(serde_json::from_value(serde_json::json!({"schema_version":1,"ranks":[{
+            "rank":0,"model":"model","weight_version":"v1","publisher_topic":"boot-1",
+            "instance_topic":true,"hash_algorithm":"sha256_cbor","full_hashes":true,
+            "root_hash":"4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+            "hash_block_size":16,"hash_lookahead_tokens":0,
+            "speculative_tokens":0,"prefix_caching":true,"groups":[
+                {"group_idx":0,"kind":"mamba","spec_type":"MambaSpec","block_size":16,
+                 "prefix_cacheable":true,"prefix_replay_tokens":0,"mamba_cache_mode":"align"},
+                {"group_idx":1,"kind":"full_attention","spec_type":"FullAttentionSpec","block_size":16,
+                 "prefix_cacheable":true,"prefix_replay_tokens":0}
+            ]
+        }]})).unwrap());
+        assert!(ConfigValidator::validate(&config).is_ok());
+        for (case, expected) in [
+            ("decode", "not a configured decode base URL"),
+            ("replay", "one replay endpoint per rank"),
+            ("model", "model must not be empty"),
+            ("rank", "rank 0: missing rank capability"),
+            ("rank-model", "model does not match source model"),
+            ("empty-replay", "invalid capability or source binding"),
+            ("missing-topic", "invalid capability or source binding"),
+            ("hash-root", "invalid root hash"),
+            ("group-size", "invalid group layout"),
+            ("duplicate-rank", "invalid capability or source binding"),
+        ] {
+            let mut invalid = config.clone();
+            let source = invalid
+                .pd_kv_event_sources
+                .get_mut("http://prefill:8000")
+                .unwrap();
+            match case {
+                "decode" => source.compatible_decode_urls = vec!["http://unlisted:8000".into()],
+                "replay" => source.replay_endpoints = None,
+                "model" => source.model = None,
+                "rank" => source.hybrid.as_mut().unwrap().ranks[0].rank = 1,
+                "rank-model" => source.hybrid.as_mut().unwrap().ranks[0].model = "other".into(),
+                "empty-replay" => source.replay_endpoints = Some(vec![String::new()]),
+                "missing-topic" => source.hybrid.as_mut().unwrap().ranks[0].publisher_topic = None,
+                "hash-root" => {
+                    source.hybrid.as_mut().unwrap().ranks[0].root_hash = Some("bad".into())
+                }
+                "group-size" => source.hybrid.as_mut().unwrap().ranks[0].groups[0].block_size = 17,
+                "duplicate-rank" => {
+                    source.endpoints.push("tcp://prefill:5559".into());
+                    source
+                        .replay_endpoints
+                        .as_mut()
+                        .unwrap()
+                        .push("tcp://prefill:5560".into());
+                    let ranks = &mut source.hybrid.as_mut().unwrap().ranks;
+                    ranks.push(ranks[0].clone());
+                }
+                _ => unreachable!(),
+            }
+            let error = ConfigValidator::validate(&invalid).unwrap_err().to_string();
+            assert!(error.contains(expected), "{case}: {error}");
+        }
+        let source = config
+            .pd_kv_event_sources
+            .get_mut("http://prefill:8000")
+            .unwrap();
+        source.endpoints.push("tcp://prefill:5559".into());
+        source
+            .replay_endpoints
+            .as_mut()
+            .unwrap()
+            .push("tcp://prefill:5560".into());
+        let ranks = &mut source.hybrid.as_mut().unwrap().ranks;
+        let mut second = ranks[0].clone();
+        second.rank = 1;
+        second.publisher_topic = Some("boot-2".into());
+        ranks.insert(0, second);
+        assert!(ConfigValidator::validate(&config).is_ok());
+        config.program_scheduling = Some(ProgramSchedulingConfig::default());
+        assert!(ConfigValidator::validate(&config).is_err());
     }
 
     /// A rank-pinned prefill URL is keyed by its base URL at runtime.

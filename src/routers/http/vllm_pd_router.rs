@@ -1185,6 +1185,7 @@ impl VllmPDRouter {
         // cache matches can be recomputed against the tree at dispatch.
         let decode_cache = decode_cache.map(Arc::new);
         let context = PdRequestContext {
+            hybrid_pairs: None,
             prefill_inputs: prefill_inputs.as_ref(),
             model_id,
             legacy_policy_input: text.as_deref(),
@@ -1346,6 +1347,7 @@ impl VllmPDRouter {
             )
         });
         let context = PdRequestContext {
+            hybrid_pairs: None,
             prefill_inputs: None,
             model_id: input.model_id.as_deref(),
             legacy_policy_input: None,
@@ -1399,7 +1401,7 @@ impl VllmPDRouter {
         Ok(worker)
     }
 
-    /// Cheap opt-in gate: only Program-capable requests are serialized twice.
+    /// Cheap opt-in gate before Program admission.
     fn program_turn_enabled(
         &self,
         headers: Option<&HeaderMap>,

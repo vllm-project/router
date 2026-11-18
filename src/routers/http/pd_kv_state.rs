@@ -1,6 +1,6 @@
 //! P/D prefill KV discovery, refresh, and request-input preparation.
 
-use super::pd_types::PdPrefillInput;
+use super::pd_types::{PdEndpoint, PdPrefillInput};
 use crate::backend::preprocess::{
     http_cache_read_fallback, prepare_http_token_inputs, router_token_inputs,
 };
@@ -10,7 +10,7 @@ use crate::kv_index::{HashMode, KvIndexSupervisor};
 use crate::policies::{kv_aware_ops, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy};
 use axum::http::HeaderMap;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -35,6 +35,7 @@ pub(super) struct PdKvState {
     targets: Mutex<HashMap<String, u64>>,
     // The background refresh loop's latest view of the P pool and policy.
     refresh_inputs: Mutex<RefreshInputs>,
+    hybrid_pairs: Option<HashMap<String, HashSet<String>>>,
 }
 
 impl std::fmt::Debug for PdKvState {
@@ -89,6 +90,16 @@ impl PdKvState {
         client: reqwest::Client,
         static_sources: HashMap<String, crate::config::types::PdKvEventSources>,
     ) -> Self {
+        let pairs: HashMap<_, _> = static_sources
+            .iter()
+            .filter(|(_, source)| source.hybrid.is_some())
+            .map(|(prefill, source)| {
+                (
+                    prefill.clone(),
+                    source.compatible_decode_urls.iter().cloned().collect(),
+                )
+            })
+            .collect();
         let (supervisor, signals) =
             KvIndexSupervisor::new_pd(client.clone(), HashMode::Sha256, static_sources);
         drop(signals);
@@ -98,7 +109,32 @@ impl PdKvState {
             api_key: None,
             targets: Mutex::new(HashMap::new()),
             refresh_inputs: Mutex::new(RefreshInputs::default()),
+            hybrid_pairs: (!pairs.is_empty()).then_some(pairs),
         }
+    }
+
+    /// Restrict declared hybrid sources; full-attention sources keep their pool.
+    pub(super) fn compatible_hybrid_pairs(
+        &self,
+        prefill: &[Arc<dyn Worker>],
+        decode: &[Arc<dyn Worker>],
+    ) -> Option<HashSet<(PdEndpoint, PdEndpoint)>> {
+        let configured = self.hybrid_pairs.as_ref()?;
+        let mut allowed = HashSet::new();
+        for p in prefill {
+            for d in decode {
+                if configured
+                    .get(p.base_url())
+                    .is_none_or(|decodes| decodes.contains(d.base_url()))
+                {
+                    allowed.insert((
+                        PdEndpoint::for_worker(p.as_ref()),
+                        PdEndpoint::for_worker(d.as_ref()),
+                    ));
+                }
+            }
+        }
+        Some(allowed)
     }
 
     /// Reconcile bindings off the request path. Requests only record their
@@ -304,6 +340,56 @@ mod kv_input_tests {
             assert_eq!(input.prompts.as_ref().unwrap()[0].len(), 65);
             assert_eq!(input.work_by_rank[&worker.dp_rank()].new_prefill_tokens, 65);
         }
+    }
+
+    #[tokio::test]
+    async fn configured_hybrid_pairs_restrict_hybrid_and_preserve_full_workers() {
+        let source = crate::config::PdKvEventSources {
+            endpoints: vec!["tcp://127.0.0.1:5557".into()],
+            replay_endpoints: Some(vec!["tcp://127.0.0.1:5558".into()]),
+            block_size: 16,
+            model: Some("model".into()),
+            hybrid: Some(crate::kv_index::CacheCapabilities {
+                schema_version: 1,
+                adapters: vec![],
+                ranks: vec![],
+            }),
+            compatible_decode_urls: vec!["http://d0".into()],
+        };
+        let state = PdKvState::new_with_statics(
+            Client::new(),
+            HashMap::from([("http://p0".into(), source)]),
+        );
+        let workers = |prefix: &str| -> Vec<Arc<dyn Worker>> {
+            (0..2)
+                .map(|i| {
+                    Arc::new(BasicWorker::new(
+                        format!("http://{prefix}{i}"),
+                        WorkerType::Regular,
+                    )) as Arc<dyn Worker>
+                })
+                .collect()
+        };
+        let p = workers("p");
+        let d = workers("d");
+        let pairs = state.compatible_hybrid_pairs(&p, &d).unwrap();
+        assert_eq!(
+            pairs,
+            HashSet::from([
+                (
+                    PdEndpoint::for_worker(p[0].as_ref()),
+                    PdEndpoint::for_worker(d[0].as_ref())
+                ),
+                (
+                    PdEndpoint::for_worker(p[1].as_ref()),
+                    PdEndpoint::for_worker(d[0].as_ref())
+                ),
+                (
+                    PdEndpoint::for_worker(p[1].as_ref()),
+                    PdEndpoint::for_worker(d[1].as_ref())
+                )
+            ])
+        );
     }
 
     #[tokio::test]

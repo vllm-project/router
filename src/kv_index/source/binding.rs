@@ -114,35 +114,25 @@ impl SourceBinding {
         max_entries: usize,
         keys: BlockKeyGenerator,
     ) -> Result<Self, SourceError> {
-        let mut ids = HashSet::new();
-        if groups.is_empty()
-            || groups.len() > 64
-            || max_entries == 0
-            || groups.iter().any(|group| {
-                group.block_size == 0
-                    || !(group.block_size as usize).is_multiple_of(keys.block_size())
-                    || !ids.insert(group.group_idx)
-                    // Compressed state covers `tokens_per_state` tokens, so the
-                    // group boundary has to be a multiple of that ratio.
-                    || match group.kind {
-                        GroupRule::SlidingWindow { window_tokens } => window_tokens == 0,
-                        GroupRule::CompressedFullAttention { tokens_per_state } => {
-                            tokens_per_state == 0
-                                || !group.block_size.is_multiple_of(tokens_per_state)
-                        }
-                        _ => false,
-                    }
-            })
-        {
+        if max_entries == 0 || !valid_groups(&groups, keys.block_size()) {
             return Err(SourceError::InvalidLayout);
         }
+        Ok(Self::bind(target, groups, max_entries, keys))
+    }
+
+    fn bind(
+        target: RoutableTarget,
+        groups: Vec<CacheGroup>,
+        max_entries: usize,
+        keys: BlockKeyGenerator,
+    ) -> Self {
         let incarnation = crate::kv_index::next_owner_incarnation();
         let owner = ResidencyOwner::Worker {
             source: target.instance_id.clone(),
             dp_rank: target.dp_rank,
             incarnation,
         };
-        Ok(Self {
+        Self {
             target,
             groups,
             keys,
@@ -154,7 +144,7 @@ impl SourceBinding {
             owner,
             control: Arc::new(StreamControl::default()),
             binding: None,
-        })
+        }
     }
 
     /// Bind an admitted layout to its supervisor's cache domain before replay.
@@ -333,6 +323,35 @@ fn validate_adapters(
         .collect())
 }
 
+fn valid_groups(groups: &[CacheGroup], hash_block_size: usize) -> bool {
+    let mut ids = HashSet::new();
+    hash_block_size != 0
+        && !groups.is_empty()
+        && groups.len() <= 64
+        && groups.iter().all(|group| {
+            group.block_size != 0
+                && (group.block_size as usize).is_multiple_of(hash_block_size)
+                && ids.insert(group.group_idx)
+                && match group.kind {
+                    GroupRule::SlidingWindow { window_tokens } => window_tokens != 0,
+                    GroupRule::CompressedFullAttention { tokens_per_state } => {
+                        tokens_per_state != 0 && group.block_size.is_multiple_of(tokens_per_state)
+                    }
+                    _ => true,
+                }
+        })
+}
+
+/// The decoded cache contract. Validation does not allocate an index or owner.
+struct VerifiedLayout {
+    groups: Vec<CacheGroup>,
+    hash_block_size: u32,
+    root: SequenceHash,
+    replay_tokens: u32,
+    adapters: Vec<(String, String)>,
+    partial_hash_hits: bool,
+}
+
 impl CacheCapabilities {
     /// The capability declared for one DP rank. Ranks are independent
     /// instances: a rank that is absent here simply gets no hybrid credit and
@@ -349,23 +368,90 @@ impl CacheCapabilities {
         target: RoutableTarget,
         max_entries: usize,
     ) -> Result<SourceBinding, &'static str> {
+        self.bind_source(source, target, None, max_entries)
+    }
+
+    pub(crate) fn bind_worker_source(
+        &self,
+        source: &EventSource,
+        model: &str,
+        max_entries: usize,
+    ) -> Result<SourceBinding, &'static str> {
+        let target = RoutableTarget {
+            instance_id: source.source.clone(),
+            dp_rank: source.dp_rank,
+        };
+        self.bind_source(source, target, Some(model), max_entries)
+    }
+
+    fn bind_source(
+        &self,
+        source: &EventSource,
+        target: RoutableTarget,
+        model: Option<&str>,
+        max_entries: usize,
+    ) -> Result<SourceBinding, &'static str> {
+        if target.dp_rank != source.dp_rank || target.instance_id != source.source {
+            return Err("invalid capability or source binding");
+        }
+        if max_entries == 0 {
+            return Err("invalid group layout");
+        }
+        let layout = self.verify_layout(
+            source.dp_rank,
+            model,
+            Some(&source.topic),
+            source.replay_endpoint.as_deref(),
+        )?;
+        let keys = BlockKeyGenerator::from_root_hash(layout.hash_block_size as usize, layout.root);
+        Ok(
+            SourceBinding::bind(target, layout.groups, max_entries, keys)
+                .with_replay_tokens(layout.replay_tokens)
+                .with_adapters(layout.adapters)
+                .with_partial_hash_hits(layout.partial_hash_hits),
+        )
+    }
+
+    /// Check startup declarations. Registration also checks the observed topic.
+    pub(crate) fn validate_declared_source(
+        &self,
+        rank: u32,
+        model: &str,
+        replay_endpoint: &str,
+    ) -> Result<(), &'static str> {
+        self.verify_layout(rank, Some(model), None, Some(replay_endpoint))
+            .map(drop)
+    }
+
+    fn verify_layout(
+        &self,
+        dp_rank: u32,
+        model: Option<&str>,
+        observed_topic: Option<&str>,
+        replay_endpoint: Option<&str>,
+    ) -> Result<VerifiedLayout, &'static str> {
         let mut ranks = HashSet::new();
         if self.schema_version != 1
             || self.ranks.iter().any(|entry| !ranks.insert(entry.rank))
-            || target.dp_rank != source.dp_rank
-            || target.instance_id != source.source
-            || source.topic.is_empty()
-            || source.replay_endpoint.as_deref().is_none_or(str::is_empty)
+            || observed_topic.is_some_and(str::is_empty)
+            || replay_endpoint.is_none_or(str::is_empty)
         {
             return Err("invalid capability or source binding");
         }
         let rank = self
-            .rank_capability(source.dp_rank)
+            .rank_capability(dp_rank)
             .ok_or("missing rank capability")?;
+        if model.is_some_and(|model| rank.model != model) {
+            return Err("model does not match source model");
+        }
+        let topic = rank.publisher_topic.as_deref();
+        if topic.is_none_or(str::is_empty) {
+            return Err("invalid capability or source binding");
+        }
         if rank.model.is_empty()
             || rank.weight_version.is_empty()
             || !rank.instance_topic
-            || rank.publisher_topic.as_deref() != Some(source.topic.as_str())
+            || observed_topic.is_some_and(|observed| topic != Some(observed))
             || rank.hash_algorithm != "sha256_cbor"
             || !rank.full_hashes
             || !rank.prefix_caching
@@ -447,9 +533,6 @@ impl CacheCapabilities {
                             let tokens_per_state = declared
                                 .parse::<u32>()
                                 .ok()
-                                .filter(|value| {
-                                    *value > 0 && group.block_size.is_multiple_of(*value)
-                                })
                                 .ok_or("unsupported compressed attention group")?;
                             GroupRule::CompressedFullAttention { tokens_per_state }
                         }
@@ -512,14 +595,17 @@ impl CacheCapabilities {
         {
             return Err("not a supported mixed layout");
         }
-        let adapters = validate_adapters(&self.adapters)?;
-        Ok(
-            SourceBinding::new_with_root_hash(target, groups, hash_block_size, root, max_entries)
-                .map_err(|_| "invalid group layout")?
-                .with_replay_tokens(replay_tokens)
-                .with_adapters(adapters)
-                .with_partial_hash_hits(rank.partial_hash_hits),
-        )
+        if !valid_groups(&groups, hash_block_size as usize) {
+            return Err("invalid group layout");
+        }
+        Ok(VerifiedLayout {
+            groups,
+            hash_block_size,
+            root,
+            replay_tokens,
+            adapters: validate_adapters(&self.adapters)?,
+            partial_hash_hits: rank.partial_hash_hits,
+        })
     }
 }
 
