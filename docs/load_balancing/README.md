@@ -14,7 +14,7 @@ the policy is the same for `grpc://host:port`.
 | `consistent_hash` | Multi-turn conversations, KV cache reuse | Yes | No |
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
-| `kv_aware` | KV reuse and stage-aware load scoring | No | Yes |
+| `kv_aware` | KV reuse from worker events | Optional | Yes |
 
 ---
 
@@ -244,32 +244,7 @@ Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyon
 
 ## KV Aware
 
-`kv_aware` uses KV cache reuse and worker load to route requests. It suits workloads with repeated prompt prefixes and supports HTTP, [gRPC](../backend/grpc.md), and P/D disaggregation over HTTP or gRPC.
-
-HTTP Completion uses the existing [Direct/Worker input preparation](http_completion_kv.md), without local tokenizer assets. Unmodeled identities and unqualified targets stay routable without cache credit.
-
-```bash
-vllm-router --policy kv_aware \
-  --worker-urls grpc://worker1:8000 grpc://worker2:8000
-```
-
-Enable KV events on the workers. HTTP text requests also need a render endpoint or, for simple prompts, `/tokenize`. Without usable KV information, routing falls back to load.
-
-For regular pools without event discovery, configure `--kv-event-source WORKER_URL=tcp://HOST:PORT` per worker, plus matching `--kv-event-model` and `--kv-event-block-size`.
-
-### P/D disaggregation
-
-```bash
-vllm-router --vllm-pd-disaggregation \
-  --prefill http://prefill:8000 --decode http://decode:8000 \
-  --prefill-policy kv_aware --decode-policy kv_aware
-```
-
-Prefill selection considers reusable KV and current work. Decode selection favors the least busy worker. Both stages inherit `--policy` unless overridden.
-
-Configure the engines' P/D connector and enable prefix caching and KV events on prefill workers. For native Python vLLM metadata discovery, set `VLLM_SERVER_DEV_MODE=1`.
-
-If event discovery is unavailable, add `--pd-kv-events http://prefill:8000=tcp://prefill:5557` for each prefill worker.
+See the [KV-aware deployment guide](http_completion_kv.md) for worker requirements, routing modes and model recipes.
 
 ### Session affinity
 
@@ -320,6 +295,7 @@ Multiple router replicas need ingress stickiness to preserve affinity.
 | Batch inference with no state | `round_robin` |
 | Variable request complexity | `power_of_two` |
 | Repeated system prompts / few-shot | `cache_aware` |
+| Repeated prefixes with worker KV events | `kv_aware` |
 | Simple testing / development | `random` |
 
 ---
