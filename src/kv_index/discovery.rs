@@ -15,6 +15,7 @@ use tracing::{info, warn};
 use crate::config::StaticKvEventSources;
 use crate::core::worker::worker_get;
 use crate::kv_index::indexer::KvBlockIndexer;
+use crate::kv_index::source::binding::SourceLease;
 use crate::kv_index::subscriber::{EventSource, SubscriberHandle};
 use crate::kv_index::{HashMode, IngestionSignal, SourceId};
 use crate::protocols::worker_spec::ServerInfo;
@@ -95,7 +96,7 @@ struct LiveSource {
     publisher: String,
     topic: String,
     rank: u32,
-    lease: super::binding::SourceLease,
+    lease: SourceLease,
 }
 
 /// Orchestrates discovery + subscriber lifecycle for the router's workers.
@@ -494,7 +495,7 @@ impl KvIndexSupervisor {
                 publisher: source.pub_endpoint.clone(),
                 topic: source.topic.clone(),
                 rank: source.dp_rank,
-                lease: super::binding::SourceLease {
+                lease: SourceLease {
                     strict_rank,
                     active: active.clone(),
                 },
@@ -1684,6 +1685,48 @@ mod tests {
         })
     }
 
+    async fn recv_frames(socket: &zmq::Socket) -> Vec<Vec<u8>> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match socket.recv_multipart(zmq::DONTWAIT) {
+                    Ok(frames) => break frames,
+                    Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                    Err(error) => panic!("ZMQ receive: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    fn replay_reply(
+        socket: &zmq::Socket,
+        request: &[Vec<u8>],
+        topic: &[u8],
+        seq: i64,
+        payload: &[u8],
+    ) {
+        let topic = if seq == -1 { &[][..] } else { topic };
+        socket
+            .send_multipart(
+                [
+                    request[0].as_slice(),
+                    &[],
+                    topic,
+                    &seq.to_be_bytes(),
+                    payload,
+                ],
+                0,
+            )
+            .unwrap();
+    }
+
+    async fn finish_empty_startup_replay(replay: &zmq::Socket) {
+        let request = recv_frames(replay).await;
+        assert_eq!(request.last().unwrap(), &0_i64.to_be_bytes());
+        replay_reply(replay, &request, &[], -1, &[]);
+    }
+
     fn store_payload(
         hash: i64,
         tokens: &[u32],
@@ -2247,6 +2290,7 @@ mod tests {
             KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
         supervisor.on_worker_added(&worker_a).await.unwrap();
         boundary_subscription(&a, "kv/boundary", true).await;
+        finish_empty_startup_replay(&replay).await;
         a.send_multipart(
             [
                 b"kv/boundary".as_slice(),
@@ -2460,6 +2504,7 @@ mod tests {
             );
             supervisor.on_worker_added(&worker).await.unwrap();
             boundary_subscription(&publisher, "kv/boundary", true).await;
+            finish_empty_startup_replay(&replay).await;
             let (indexer, active) = {
                 let workers = supervisor.workers.lock();
                 let entry = &workers[&worker];

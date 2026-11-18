@@ -7,17 +7,23 @@ use std::sync::Arc;
 use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::{Mutex, RwLock};
 
+use crate::kv_hash::SequenceHash;
 mod anchors;
 mod mutations;
 mod prefix_tree;
 mod records;
+pub(crate) mod source;
 mod transaction;
 
 use self::anchors::AnchorSet;
+pub(crate) use self::mutations::{PageBatch, PageWriteError, RemovedPages};
 use self::prefix_tree::{edge_common_prefix, unique_alias_position, EdgeBlock, TreeNode};
-use self::records::FactKey;
-use self::records::{unqualified_seq, ResidencyRecords};
-use self::transaction::IndexBatch;
+pub(crate) use self::records::qualified_seq;
+pub(crate) use self::records::TierBits;
+use self::records::{namespaced_seq, sparse_key, unqualified_seq, ResidencyRecords};
+pub(crate) use self::records::{prepare_sparse_keys, FactKey};
+use self::source::{StreamControl, StreamState};
+pub(crate) use self::transaction::{IndexBatch, IndexSnapshot};
 use crate::kv_index::types::{
     ClearScope, Locality, ResidencyOwner, RoutableTarget, SourceId, StorageTier,
 };
@@ -118,12 +124,26 @@ struct SourceLock {
 #[derive(Default)]
 struct SourceData {
     records: SourceRecords,
+    streams: HashMap<ResidencyOwner, StreamState>,
 }
 
 #[derive(Default)]
 struct SourceRecords {
-    owners: HashSet<ResidencyOwner>,
+    owners: HashMap<ResidencyOwner, OwnerMetadata>,
     reclaim: HashMap<u32, SequenceSet, Fast>,
+}
+
+#[derive(Default)]
+struct OwnerMetadata {
+    // Unbounded path writes invalidate this count; bounded batches maintain it.
+    base_pages: Option<usize>,
+    namespaces: HashMap<String, usize>,
+}
+
+/// The same record transition applies to a navigable page and a hash-only page.
+struct StoreClaim {
+    key: OwnerTier,
+    incremental: bool,
 }
 
 /// Identity and trust generation of one source at snapshot time.
@@ -193,12 +213,11 @@ impl KvBlockIndexer {
     /// valid snapshot transition; suspension, resume, or retirement invalidates
     /// the result. This does not reserve engine blocks.
     pub(crate) fn source_version_is_current(&self, version: &SourceVersion) -> bool {
-        // Retirement increments the retained source generation before removing
-        // its map entry, so the snapshot need not look that entry up again.
-        version.source.generation.load(Ordering::Acquire) == version.generation
-            && !self
-                .suspended_sources
-                .contains_key(&(version.target.instance_id.clone(), version.target.dp_rank))
+        // Resume and retirement increment the generation before revealing
+        // the source. Read it last to fence snapshots across that transition.
+        !self
+            .suspended_sources
+            .contains_key(&(version.target.instance_id.clone(), version.target.dp_rank))
             && version.source.generation.load(Ordering::Acquire) == version.generation
     }
 
@@ -408,6 +427,100 @@ impl KvBlockIndexer {
             index: self,
             scope: Some(target.clone()),
             source_data: Some(&mut data.records),
+        })
+    }
+
+    /// Apply a stream batch and its cache mutations under the same source lock.
+    pub(crate) fn with_stream_batch<R>(
+        &self,
+        target: &RoutableTarget,
+        owner: &ResidencyOwner,
+        control: &Arc<StreamControl>,
+        f: impl FnOnce(&mut StreamState, &mut IndexBatch<'_>) -> R,
+    ) -> R {
+        self.stream_batch(target, owner, control, true, f).unwrap()
+    }
+
+    /// Cleanup must not recreate a gate or owner that discovery already retired.
+    pub(crate) fn with_existing_stream_batch<R>(
+        &self,
+        target: &RoutableTarget,
+        owner: &ResidencyOwner,
+        control: &Arc<StreamControl>,
+        f: impl FnOnce(&mut StreamState, &mut IndexBatch<'_>) -> R,
+    ) -> Option<R> {
+        self.stream_batch(target, owner, control, false, f)
+    }
+
+    fn stream_batch<R>(
+        &self,
+        target: &RoutableTarget,
+        owner: &ResidencyOwner,
+        control: &Arc<StreamControl>,
+        create: bool,
+        f: impl FnOnce(&mut StreamState, &mut IndexBatch<'_>) -> R,
+    ) -> Option<R> {
+        assert_eq!(owner.target(), *target, "stream crossed targets");
+        let _domain = self.domain.read();
+        let source = if create {
+            self.source_lock(target)
+        } else {
+            self.source_locks.get(target)?.clone()
+        };
+        let mut data = source.access.write();
+        let SourceData { records, streams } = &mut *data;
+        let state = if create {
+            streams
+                .entry(owner.clone())
+                .or_insert_with(|| StreamState::new(control.clone()))
+        } else {
+            streams.get_mut(owner)?
+        };
+        assert!(
+            state.has_control(control),
+            "stream owner reused with another control"
+        );
+        let mut tx = IndexBatch {
+            index: self,
+            scope: Some(target.clone()),
+            source_data: Some(records),
+        };
+        let result = f(state, &mut tx);
+        if state.lease_id == 0 && state.next_seq.is_none() && !state.visible() {
+            streams.remove(owner);
+        }
+        Some(result)
+    }
+
+    pub(crate) fn stream_lease_is_active(&self, owner: &ResidencyOwner, lease: u64) -> bool {
+        let _domain = self.domain.read();
+        let Some(source) = self
+            .source_locks
+            .get(&owner.target())
+            .map(|entry| entry.clone())
+        else {
+            return false;
+        };
+        let data = source.access.read();
+        data.streams.get(owner).is_some_and(|state| {
+            state.lease_id == lease && state.phase != source::StreamPhase::Retired
+        })
+    }
+
+    /// Read all groups for one target from the same source transaction.
+    pub(crate) fn with_source_snapshot<R>(
+        &self,
+        target: &RoutableTarget,
+        f: impl FnOnce(&IndexSnapshot<'_>) -> R,
+    ) -> R {
+        let _domain = self.domain.read();
+        let source = self.source_lock(target);
+        let data = source.access.read();
+        f(&IndexSnapshot {
+            index: self,
+            scope: Some(target.clone()),
+            source_data: Some(&data),
+            source: Some(&source),
         })
     }
 }

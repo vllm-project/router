@@ -49,7 +49,7 @@ impl GroupShard {
     pub(in crate::kv_index::index) fn store_for_source(
         &self,
         target: &Arc<RoutableTarget>,
-        claim: &OwnerTier,
+        claim: &StoreClaim,
         parent_seq: Option<Arc<str>>,
         blocks: &[IncomingBlock],
     ) -> bool {
@@ -67,7 +67,7 @@ impl GroupShard {
     pub(in crate::kv_index::index) fn store_topology(
         &self,
         target: &Arc<RoutableTarget>,
-        key: Option<&OwnerTier>,
+        key: Option<&StoreClaim>,
         parent_seq: Option<Arc<str>>,
         blocks: &[IncomingBlock],
     ) -> bool {
@@ -84,13 +84,16 @@ impl GroupShard {
                         if !self.register_paths(target, parent_seq.as_ref(), blocks) {
                             return false;
                         }
-                        let mut facts = self.reverse.entry(key.0.clone()).or_default();
+                        let mut facts = self.reverse.entry(key.key.0.clone()).or_default();
                         let mut parent = seq.clone();
                         for (seq, local) in blocks {
-                            facts
+                            if !facts
                                 .entry(FactKey::from_seq(seq))
                                 .or_default()
-                                .observe(key.1);
+                                .observe(key.key.1, key.incremental)
+                            {
+                                return false;
+                            }
                             self.waiting
                                 .entry((target.as_ref().clone(), parent))
                                 .or_default()
@@ -145,14 +148,16 @@ impl GroupShard {
                     let start = pos + 1;
                     let matched = edge_common_prefix(&parent.edge[start..], &blocks[bi..]);
                     if matched > 0 {
-                        self.record_locked_at(
+                        if !self.record_locked_at(
                             &mut parent,
                             &node,
                             target,
                             key,
                             (cursor.as_ref(), &blocks[bi..bi + matched]),
                             start,
-                        );
+                        ) {
+                            return false;
+                        }
                         bi += matched;
                         cursor = Some(blocks[bi - 1].0.clone());
                         if bi == blocks.len() {
@@ -171,11 +176,11 @@ impl GroupShard {
             // another node. Claims and aliases remain per block.
             if cursor.is_some() && parent.children.is_empty() {
                 let offset = parent.edge.len();
-                let extension = TreeNode::with_edge(&blocks[bi..], target, key);
+                let extension = TreeNode::with_edge(&blocks[bi..], target, key.map(|c| &c.key));
                 parent.alias_count += extension.alias_count;
                 parent.edge.extend(extension.edge);
                 parent.claims.extend(extension.claims);
-                self.record_locked_at(
+                return self.record_locked_at(
                     &mut parent,
                     &node,
                     target,
@@ -183,24 +188,28 @@ impl GroupShard {
                     (cursor.as_ref(), &blocks[bi..]),
                     offset,
                 );
-                return true;
             }
             let child = parent.children.get(&blocks[bi].1).cloned();
             let Some(child) = child else {
                 // Keep the parent locked from lookup through publication so
                 // another writer cannot replace a newly installed child.
-                let new_node =
-                    Arc::new(RwLock::new(TreeNode::with_edge(&blocks[bi..], target, key)));
+                let new_node = Arc::new(RwLock::new(TreeNode::with_edge(
+                    &blocks[bi..],
+                    target,
+                    key.map(|c| &c.key),
+                )));
                 let mut new = new_node.write();
                 new.parent = Arc::downgrade(&node);
-                self.record_locked_at(
+                if !self.record_locked_at(
                     &mut new,
                     &new_node,
                     target,
                     key,
                     (cursor.as_ref(), &blocks[bi..]),
                     0,
-                );
+                ) {
+                    return false;
+                }
                 parent
                     .children
                     .insert(blocks[bi].1.clone(), new_node.clone());
@@ -215,14 +224,16 @@ impl GroupShard {
             if matched < c.edge.len() && bi + matched < blocks.len() {
                 self.split_locked(&mut c, &child, matched);
             }
-            self.record_locked_at(
+            if !self.record_locked_at(
                 &mut c,
                 &child,
                 target,
                 key,
                 (cursor.as_ref(), &blocks[bi..bi + matched]),
                 0,
-            );
+            ) {
+                return false;
+            }
             bi += matched;
             // record_locked registered this incoming key, so its current
             // anchor remains a valid cursor even if a later split moves it.
@@ -235,7 +246,7 @@ impl GroupShard {
     /// The caller holds the topology read lock, so an edge cannot split.
     pub(in crate::kv_index::index) fn try_store_anchored(
         &self,
-        claim: &OwnerTier,
+        claim: &StoreClaim,
         parent: Option<&Arc<str>>,
         blocks: &[IncomingBlock],
     ) -> bool {
@@ -245,7 +256,7 @@ impl GroupShard {
         let Some(parent) = parent else {
             return false;
         };
-        let target = claim.0.target();
+        let target = claim.key.0.target();
         let Some(anchor) = self.positioned_anchor(&target, parent) else {
             return false;
         };
@@ -266,13 +277,25 @@ impl GroupShard {
         {
             return false;
         }
-        let mut claims = ClaimWriter::new(claim);
-        let mut facts = self.reverse.entry(claim.0.clone()).or_default();
+        let mut claims = ClaimWriter::new(&claim.key);
+        let mut facts = self.reverse.entry(claim.key.0.clone()).or_default();
+        if claim.incremental
+            && blocks.iter().any(|(seq, _)| {
+                facts
+                    .get(&FactKey::from_seq(seq))
+                    .is_some_and(|r| !r.can_observe(claim.incremental))
+            })
+        {
+            return false;
+        }
         for (i, (seq, _)) in blocks.iter().enumerate() {
-            facts
+            if !facts
                 .entry(FactKey::from_seq(seq))
                 .or_default()
-                .observe(claim.1);
+                .observe(claim.key.1, claim.incremental)
+            {
+                return false;
+            }
             claims.add(&mut node.claims[offset + i]);
         }
         true
@@ -460,15 +483,15 @@ impl GroupShard {
         n: &mut TreeNode,
         node: &NodeRef,
         target: &Arc<RoutableTarget>,
-        key: Option<&OwnerTier>,
+        key: Option<&StoreClaim>,
         (parent, incoming): (Option<&Arc<str>>, &[IncomingBlock]),
         offset: usize,
-    ) {
-        let mut facts = key.map(|key| self.reverse.entry(key.0.clone()).or_default());
+    ) -> bool {
+        let mut facts = key.map(|key| self.reverse.entry(key.key.0.clone()).or_default());
         if let Some(facts) = facts.as_mut().filter(|facts| facts.is_empty()) {
             facts.reserve(incoming.len());
         }
-        let mut claims = key.map(ClaimWriter::new);
+        let mut claims = key.map(|key| ClaimWriter::new(&key.key));
         let mut aliases = AliasWriter::new(target);
         // Register from the leaf back: each new parent link increments the
         // preceding record in the same visit, rather than a second map write.
@@ -485,12 +508,15 @@ impl GroupShard {
             }
             children = usize::from(self.set_position(target, seq, node, i, (parent, children)));
             if let Some(key) = key {
-                facts
+                if !facts
                     .as_mut()
                     .unwrap()
                     .entry(FactKey::from_seq(seq))
                     .or_default()
-                    .observe(key.1);
+                    .observe(key.key.1, key.incremental)
+                {
+                    return false;
+                }
                 claims.as_mut().unwrap().add(&mut n.claims[i]);
             }
         }
@@ -501,6 +527,7 @@ impl GroupShard {
                 .or_default();
             paths.get_or_insert(target).children += children;
         }
+        true
     }
 
     /// Split `child`'s edge at `pos`: the first `pos` blocks stay on `child`

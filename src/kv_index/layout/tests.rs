@@ -1,0 +1,727 @@
+#![cfg(all(test, feature = "cpu", feature = "ready"))]
+
+use std::sync::Arc;
+
+use super::evidence::credit_from_pages;
+use super::*;
+use crate::kv_index::index::TierBits;
+use crate::kv_index::subscriber::EventSource;
+use crate::kv_index::{
+    KvBlockIndexer, Locality, MatchQuery, ResidencyOwner, RoutableTarget, StorageTier, TierMatch,
+};
+
+fn target(name: &str, rank: u32) -> RoutableTarget {
+    RoutableTarget {
+        instance_id: Arc::from(name),
+        dp_rank: rank,
+    }
+}
+
+// The index tests cover path/hash equivalence; restoration only needs page facts.
+#[test]
+fn restore_coverage_unites_local_tiers_and_excludes_external_pages() {
+    use StorageTier::{Device, Disk, External, HostPinned};
+
+    let worker = target("w", 0);
+    let full = CacheGroup {
+        group_idx: 0,
+        block_size: 16,
+        kind: GroupRule::FullAttention,
+    };
+    let claims = vec![vec![
+        Some(Device),
+        Some(HostPinned),
+        Some(Disk),
+        Some(External),
+    ]];
+    assert_eq!(
+        credit_from_groups(&worker, &[full], &claims, 16, 64, 0),
+        (48, Some(Disk))
+    );
+    for mask in 0..16 {
+        let expected = [Device, HostPinned, Disk]
+            .into_iter()
+            .find(|tier| mask & TierBits::bit(*tier) != 0);
+        assert_eq!(
+            credit_from_pages(&worker, &[full], &[vec![TierBits(mask)]], 16, 16, 0),
+            (if expected.is_some() { 16 } else { 0 }, expected),
+            "residency mask {mask}"
+        );
+    }
+    let partial = CacheGroup {
+        block_size: 32,
+        ..full
+    };
+    for (pages, expected) in [
+        (
+            vec![None, Some(Device), Some(HostPinned)],
+            (48, Some(HostPinned)),
+        ),
+        (vec![None, None, Some(HostPinned)], (0, None)),
+    ] {
+        assert_eq!(
+            credit_from_groups(&worker, &[partial], &[pages], 16, 48, 0),
+            expected
+        );
+    }
+}
+
+fn credit_from_groups(
+    target: &RoutableTarget,
+    groups: &[CacheGroup],
+    claims: &[Vec<Option<StorageTier>>],
+    hash_unit: usize,
+    cap: u64,
+    replay: u32,
+) -> (u64, Option<StorageTier>) {
+    let pages: Vec<_> = claims
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .map(|tier| TierBits(tier.map_or(0, TierBits::bit)))
+                .collect()
+        })
+        .collect();
+    credit_from_pages(target, groups, &pages, hash_unit, cap, replay)
+}
+
+#[test]
+fn group_evidence_combines_partial_checkpoint_and_tier() {
+    use StorageTier::{Device, HostPinned};
+
+    let worker = target("w", 0);
+    let groups = [
+        CacheGroup {
+            group_idx: 0,
+            block_size: 16,
+            kind: GroupRule::FullAttention,
+        },
+        CacheGroup {
+            group_idx: 1,
+            block_size: 16,
+            kind: GroupRule::Checkpoint,
+        },
+    ];
+    let mut claims = vec![
+        vec![Some(Device); 4],
+        vec![None, Some(Device), Some(HostPinned), None],
+    ];
+    assert_eq!(
+        credit_from_groups(&worker, &groups[..1], &claims[..1], 8, 32, 0),
+        (32, Some(Device))
+    );
+    assert_eq!(
+        credit_from_groups(&worker, &groups, &claims, 8, 32, 0),
+        (24, Some(HostPinned))
+    );
+    assert_eq!(
+        credit_from_groups(&worker, &groups, &claims, 8, 23, 0),
+        (16, Some(Device))
+    );
+    claims[1][2] = None;
+    assert_eq!(
+        credit_from_groups(&worker, &groups, &claims, 8, 32, 0),
+        (16, Some(Device))
+    );
+}
+
+#[test]
+fn replay_prices_groups_at_the_restore_boundary() {
+    use StorageTier::{Device, HostPinned};
+
+    let worker = target("w", 0);
+    let groups = [
+        CacheGroup {
+            group_idx: 0,
+            block_size: 16,
+            kind: GroupRule::FullAttention,
+        },
+        CacheGroup {
+            group_idx: 1,
+            block_size: 16,
+            kind: GroupRule::Checkpoint,
+        },
+        CacheGroup {
+            group_idx: 2,
+            block_size: 16,
+            kind: GroupRule::SlidingWindow { window_tokens: 32 },
+        },
+    ];
+    let claims = vec![
+        vec![Some(Device); 4],
+        vec![None, None, None, Some(HostPinned)],
+        vec![None, None, Some(Device), Some(HostPinned)],
+    ];
+    assert_eq!(
+        credit_from_groups(&worker, &groups, &claims, 16, 64, 16),
+        (48, Some(HostPinned))
+    );
+    assert_eq!(
+        credit_from_groups(&worker, &groups, &claims, 16, 64, 0),
+        (64, Some(HostPinned))
+    );
+    assert_eq!(
+        credit_from_groups(&worker, &groups, &claims, 16, 64, 64),
+        (0, None)
+    );
+}
+
+fn hit(target: &RoutableTarget, segments: &[(u32, u32)]) -> TierMatch {
+    TierMatch {
+        target: target.clone(),
+        tier: StorageTier::Device,
+        segments: segments.to_vec(),
+        locality: Locality::Local,
+    }
+}
+
+fn group<'a>(id: u32, block_size: u32, kind: GroupRule, matches: &'a [TierMatch]) -> GroupView<'a> {
+    GroupView {
+        group_idx: id,
+        block_size,
+        kind,
+        matches,
+        page_evidence: true,
+        partial_ends: &[],
+    }
+}
+
+#[test]
+fn restore_rules_respect_the_cap_and_page_gaps() {
+    let worker = target("w", 0);
+    let dense = [hit(&worker, &[(0, 4)])];
+    let cases = [
+        (GroupRule::FullAttention, vec![(0, 2)], 8, 4),
+        (GroupRule::FullAttention, vec![(1, 4)], 8, 0),
+        (
+            GroupRule::CompressedFullAttention {
+                tokens_per_state: 1,
+            },
+            vec![(0, 4)],
+            7,
+            6,
+        ),
+        (GroupRule::Checkpoint, vec![(2, 4)], 7, 6),
+        (GroupRule::Checkpoint, vec![(1, 2), (3, 4)], 7, 4),
+        (
+            GroupRule::SlidingWindow { window_tokens: 5 },
+            vec![(0, 1)],
+            8,
+            2,
+        ),
+        (
+            GroupRule::SlidingWindow { window_tokens: 5 },
+            vec![(1, 3)],
+            8,
+            6,
+        ),
+        (
+            GroupRule::SlidingWindow { window_tokens: 5 },
+            vec![(1, 3)],
+            5,
+            0,
+        ),
+        (
+            GroupRule::SlidingWindow { window_tokens: 5 },
+            vec![(1, 2)],
+            8,
+            0,
+        ),
+    ];
+    for (kind, segments, cap, expected) in cases {
+        let pages = [hit(&worker, &segments)];
+        let groups = [
+            group(0, 2, GroupRule::FullAttention, &dense),
+            group(1, 2, kind, &pages),
+        ];
+        assert_eq!(
+            common_reusable_tokens(&worker, &groups, cap),
+            expected,
+            "kind={kind:?} segments={segments:?} cap={cap}"
+        );
+    }
+}
+
+#[test]
+fn missing_sliding_pages_never_inherit_dense_group_credit() {
+    let worker = target("w", 0);
+    let dense = [hit(&worker, &[(0, 4)])];
+    let mut sliding = group(1, 16, GroupRule::SlidingWindow { window_tokens: 32 }, &[]);
+    sliding.page_evidence = false;
+    let groups = [group(0, 16, GroupRule::FullAttention, &dense), sliding];
+    assert_eq!(common_reusable_tokens(&worker, &groups, 64), 0);
+}
+
+#[test]
+fn interleaved_checkpoints_descend_to_zero() {
+    let worker = target("w", 0);
+    let odd: Vec<_> = (0..64).step_by(2).map(|i| (i, i + 1)).collect();
+    let even: Vec<_> = (1..64).step_by(2).map(|i| (i, i + 1)).collect();
+    let a = [hit(&worker, &odd)];
+    let b = [hit(&worker, &even)];
+    let groups = [
+        group(0, 1, GroupRule::Checkpoint, &a),
+        group(1, 1, GroupRule::Checkpoint, &b),
+    ];
+    assert_eq!(common_reusable_tokens(&worker, &groups, 64), 0);
+}
+
+#[test]
+fn sliding_window_is_rechecked_after_checkpoint_rewinds() {
+    let worker = target("w", 0);
+    let checkpoints = [hit(&worker, &[(3, 4)])];
+    let tail = [hit(&worker, &[(4, 6)])];
+    let groups = [
+        group(0, 16, GroupRule::Checkpoint, &checkpoints),
+        group(1, 16, GroupRule::SlidingWindow { window_tokens: 32 }, &tail),
+    ];
+    assert_eq!(common_reusable_tokens(&worker, &groups, 96), 0);
+}
+
+/// vLLM also caches a prefix ending inside a page (`cache_partial_block`).
+/// The boundary is the partial token end, not the page end.
+#[test]
+fn a_partial_page_boundary_is_restorable() {
+    let worker = target("w", 0);
+    // Page 576, a partial entry at 560: no page-level hash exists yet.
+    let mut full_group = group(0, 576, GroupRule::FullAttention, &[]);
+    full_group.partial_ends = &[560];
+    assert_eq!(common_reusable_tokens(&worker, &[full_group], 1024), 560);
+}
+
+/// A checkpoint needs only itself, so its partial entry alone is enough.
+#[test]
+fn a_partial_checkpoint_is_restorable_on_its_own() {
+    let worker = target("w", 0);
+    let mut checkpoint = group(0, 576, GroupRule::Checkpoint, &[]);
+    checkpoint.partial_ends = &[560];
+    assert_eq!(common_reusable_tokens(&worker, &[checkpoint], 1024), 560);
+}
+
+#[test]
+fn partial_checkpoint_respects_cap_and_does_not_need_earlier_pages() {
+    let worker = target("w", 0);
+    let mut checkpoint = group(0, 576, GroupRule::Checkpoint, &[]);
+    checkpoint.partial_ends = &[560, 1136];
+    assert_eq!(common_reusable_tokens(&worker, &[checkpoint], 544), 0);
+    let mut checkpoint = group(0, 576, GroupRule::Checkpoint, &[]);
+    checkpoint.partial_ends = &[560, 1136];
+    assert_eq!(common_reusable_tokens(&worker, &[checkpoint], 1100), 560);
+    let mut checkpoint = group(0, 576, GroupRule::Checkpoint, &[]);
+    checkpoint.partial_ends = &[560, 1136];
+    assert_eq!(common_reusable_tokens(&worker, &[checkpoint], 1152), 1136);
+}
+
+#[test]
+fn dense_partial_requires_earlier_full_pages() {
+    let worker = target("w", 0);
+    let mut full = group(0, 576, GroupRule::FullAttention, &[]);
+    full.partial_ends = &[1136];
+    assert_eq!(common_reusable_tokens(&worker, &[full], 1152), 0);
+    let hits = [hit(&worker, &[(0, 1)])];
+    let mut full = group(0, 576, GroupRule::FullAttention, &hits);
+    full.partial_ends = &[1136];
+    assert_eq!(common_reusable_tokens(&worker, &[full], 1152), 1136);
+}
+
+#[test]
+fn sparse_checkpoints_and_different_block_sizes_use_the_same_boundary() {
+    let worker = target("w", 0);
+    let full = [hit(&worker, &[(0, 6)])]; // 0..96, blocks of 16
+    let state = [hit(&worker, &[(0, 2)])]; // checkpoints at 32 and 64
+    let groups = [
+        group(0, 16, GroupRule::FullAttention, &full),
+        group(1, 32, GroupRule::Checkpoint, &state),
+    ];
+    assert_eq!(common_reusable_tokens(&worker, &groups, 127), 64);
+    assert_eq!(common_reusable_tokens(&worker, &groups, 63), 32);
+    assert_eq!(common_reusable_tokens(&worker, &groups, 31), 0);
+}
+
+#[test]
+fn missing_full_blocks_or_checkpoint_falls_back_to_an_earlier_boundary() {
+    let worker = target("w", 0);
+    let full = [hit(&worker, &[(0, 3), (4, 6)])]; // gap at 48..64
+    let state = [hit(&worker, &[(0, 1), (2, 3)])];
+    let groups = [
+        group(0, 16, GroupRule::FullAttention, &full),
+        group(1, 32, GroupRule::Checkpoint, &state),
+    ];
+    assert_eq!(common_reusable_tokens(&worker, &groups, 128), 32);
+}
+
+#[test]
+fn sliding_window_needs_only_the_required_local_interval() {
+    let worker = target("w", 0);
+    let full = [hit(&worker, &[(0, 8)])];
+    let window = [hit(&worker, &[(5, 8)])];
+    let groups = [
+        group(0, 16, GroupRule::FullAttention, &full),
+        group(
+            1,
+            16,
+            GroupRule::SlidingWindow { window_tokens: 33 },
+            &window,
+        ),
+    ];
+    assert_eq!(common_reusable_tokens(&worker, &groups, 128), 128);
+    // The last token cannot be reused, so both groups report 7 blocks. The
+    // sliding group still holds two contiguous blocks below that boundary,
+    // which is what its window needs, so the reduced boundary stands.
+    assert_eq!(common_reusable_tokens(&worker, &groups, 127), 112);
+}
+
+/// The sliding group's retained tail can sit entirely above a boundary
+/// another group pulled down. The window that ends at that boundary is then
+/// absent, so there is no shared restore point and no credit.
+#[test]
+fn a_reduced_boundary_that_loses_the_sliding_window_credits_nothing() {
+    let worker = target("w", 0);
+    let full = [hit(&worker, &[(0, 4)])]; // 0..64
+    let window = [hit(&worker, &[(6, 8)])]; // 96..128, a 32-token window
+    let groups = [
+        group(0, 16, GroupRule::FullAttention, &full),
+        group(
+            1,
+            16,
+            GroupRule::SlidingWindow { window_tokens: 32 },
+            &window,
+        ),
+    ];
+    assert_eq!(common_reusable_tokens(&worker, &groups, 143), 0);
+}
+
+/// A sliding group whose resident run starts at the root has no earlier
+/// state the window could be missing, so a prefix shorter than the window is
+/// still reusable: the engine restores the whole run.
+#[test]
+fn a_root_anchored_prefix_shorter_than_the_window_is_reusable() {
+    let worker = target("w", 0);
+    let full = [hit(&worker, &[(0, 1)])];
+    let window = [hit(&worker, &[(0, 1)])];
+    let groups = [
+        group(0, 64, GroupRule::FullAttention, &full),
+        group(
+            1,
+            64,
+            GroupRule::SlidingWindow { window_tokens: 128 },
+            &window,
+        ),
+    ];
+    // A 65-token request keeps one 64-token block, well inside the window.
+    assert_eq!(common_reusable_tokens(&worker, &groups, 64), 64);
+    assert_eq!(common_reusable_tokens(&worker, &groups, 128), 64);
+}
+
+/// A sliding group whose run sits below the boundary still supports it,
+/// because the engine's lookup accepts any run of the window's blocks under
+/// the candidate length.
+#[test]
+fn a_sliding_run_below_the_boundary_keeps_the_credit() {
+    let worker = target("w", 0);
+    let full = [hit(&worker, &[(0, 6)])]; // 0..96
+    let window = [hit(&worker, &[(4, 8)])]; // 64..128, a 32-token window
+    let groups = [
+        group(0, 16, GroupRule::FullAttention, &full),
+        group(
+            1,
+            16,
+            GroupRule::SlidingWindow { window_tokens: 32 },
+            &window,
+        ),
+    ];
+    assert_eq!(common_reusable_tokens(&worker, &groups, 143), 96);
+}
+
+#[test]
+fn state_on_another_rank_or_remote_locality_cannot_complete_a_hit() {
+    let worker = target("w", 0);
+    let full = [hit(&worker, &[(0, 4)])];
+    let mut remote = hit(&worker, &[(0, 4)]);
+    remote.locality = Locality::Remote;
+    let state = [hit(&target("w", 1), &[(0, 4)]), remote];
+    let groups = [
+        group(0, 16, GroupRule::FullAttention, &full),
+        group(1, 16, GroupRule::Checkpoint, &state),
+    ];
+    assert_eq!(common_reusable_tokens(&worker, &groups, 64), 0);
+}
+
+/// A host or storage copy of a checkpoint still completes the hit: the page
+/// is restorable, only its transfer cost differs.
+#[test]
+fn a_host_resident_checkpoint_completes_the_hit() {
+    let worker = target("w", 0);
+    let full = [hit(&worker, &[(0, 4)])];
+    let mut host = hit(&worker, &[(0, 4)]);
+    host.tier = StorageTier::HostPinned;
+    let state = [host];
+    let groups = [
+        group(0, 16, GroupRule::FullAttention, &full),
+        group(1, 16, GroupRule::Checkpoint, &state),
+    ];
+    assert_eq!(common_reusable_tokens(&worker, &groups, 64), 64);
+}
+
+#[test]
+fn incomplete_or_invalid_layout_never_grants_credit() {
+    let worker = target("w", 0);
+    let hits = [hit(&worker, &[(0, 4)])];
+    let invalid = [group(0, 0, GroupRule::FullAttention, &hits)];
+    let duplicate = [
+        group(0, 16, GroupRule::FullAttention, &hits),
+        group(0, 16, GroupRule::Checkpoint, &hits),
+    ];
+    let empty_window = [group(
+        1,
+        16,
+        GroupRule::SlidingWindow { window_tokens: 0 },
+        &hits,
+    )];
+    let invalid_compression = [group(
+        2,
+        16,
+        GroupRule::CompressedFullAttention {
+            tokens_per_state: 3,
+        },
+        &hits,
+    )];
+    assert_eq!(common_reusable_tokens(&worker, &[], 64), 0);
+    assert_eq!(common_reusable_tokens(&worker, &invalid, 64), 0);
+    assert_eq!(common_reusable_tokens(&worker, &duplicate, 64), 0);
+    assert_eq!(common_reusable_tokens(&worker, &empty_window, 64), 0);
+    assert_eq!(common_reusable_tokens(&worker, &invalid_compression, 64), 0);
+}
+
+#[test]
+fn group_index_removal_reduces_the_common_restore_point() {
+    let worker = target("w", 0);
+    let owner = ResidencyOwner::Worker {
+        source: worker.instance_id.clone(),
+        dp_rank: worker.dp_rank,
+        incarnation: 1,
+    };
+    let index = KvBlockIndexer::new();
+    let blocks: Vec<(Arc<str>, Arc<str>)> = (0..4)
+        .map(|i| (Arc::from(format!("seq{i}")), Arc::from(format!("block{i}"))))
+        .collect();
+    for id in [0, 1] {
+        index.store(id, owner.clone(), StorageTier::Device, None, &blocks);
+    }
+    let query = |group_idx| MatchQuery {
+        group_idx,
+        local_hashes: blocks.iter().map(|(_, local)| local.clone()).collect(),
+        tiers_of_interest: vec![StorageTier::Device],
+    };
+    let full = index.find_matches(&query(0));
+    let before = index.find_matches(&query(1));
+    let groups = [
+        group(0, 16, GroupRule::FullAttention, &full),
+        group(1, 16, GroupRule::Checkpoint, &before),
+    ];
+    assert_eq!(common_reusable_tokens(&worker, &groups, 63), 48);
+
+    index.remove(1, &owner, StorageTier::Device, &[Arc::from("seq2")]);
+    let after = index.find_matches(&query(1));
+    let groups = [
+        group(0, 16, GroupRule::FullAttention, &full),
+        group(1, 16, GroupRule::Checkpoint, &after),
+    ];
+    assert_eq!(common_reusable_tokens(&worker, &groups, 63), 32);
+}
+
+mod declarations {
+    use super::*;
+    use crate::kv_index::SourceBinding;
+
+    fn bind_layout(value: &serde_json::Value, topic: &str) -> Result<SourceBinding, &'static str> {
+        let target = target("worker", 0);
+        let source = EventSource {
+            source: target.instance_id.clone(),
+            dp_rank: target.dp_rank,
+            pub_endpoint: "inproc://publisher".into(),
+            replay_endpoint: Some("inproc://replay".into()),
+            topic: topic.into(),
+            hwm: None,
+        };
+        serde_json::from_value::<CacheCapabilities>(value.clone())
+            .expect("layout")
+            .index_for_source(&source, target, 16)
+    }
+
+    #[test]
+    fn a_declared_single_attention_layout_is_admitted() {
+        let group = serde_json::json!({
+            "group_idx": 5, "kind": "full_attention", "spec_type": "FullAttentionSpec",
+            "block_size": 128, "sliding_window": null, "prefix_cacheable": true,
+            "prefix_replay_tokens": 0, "mamba_cache_mode": null,
+            "prefill_checkpoint_alignment": null,
+        });
+        let mut value = serde_json::json!({"schema_version": 1, "ranks": [{
+            "rank": 0, "model": "v41", "weight_version": "default",
+            "weight_identity": "model-sha256", "publisher_topic": "epoch-1",
+            "instance_topic": true, "hash_algorithm": "sha256_cbor",
+            "full_hashes": true,
+            "root_hash": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+            "hash_block_size": 128, "hash_lookahead_tokens": 0,
+            "speculative_tokens": 0, "prefix_caching": true,
+            "declared_groups": 1,
+            "groups": [group]
+        }]});
+        assert!(bind_layout(&value, "epoch-1").is_ok());
+        // Without the explicit total the same layout is indistinguishable
+        // from a truncated multi-group declaration, so it stays rejected.
+        value["ranks"][0]["declared_groups"] = serde_json::Value::Null;
+        assert!(bind_layout(&value, "epoch-1").is_err());
+        // A declared single group that is not an attention group is useless.
+        value["ranks"][0]["groups"][0]["kind"] = serde_json::json!("mamba");
+        value["ranks"][0]["groups"][0]["spec_type"] = serde_json::json!("MambaSpec");
+        value["ranks"][0]["groups"][0]["mamba_cache_mode"] = serde_json::json!("align");
+        value["ranks"][0]["declared_groups"] = serde_json::json!(1);
+        assert!(bind_layout(&value, "epoch-1").is_err());
+    }
+
+    #[test]
+    fn capability_requires_complete_supported_layout_and_same_publisher() {
+        let group = |idx, kind, spec, mode| {
+            serde_json::json!({
+                "group_idx": idx, "kind": kind, "spec_type": spec, "block_size": 528,
+                "sliding_window": null, "prefix_cacheable": true,
+                "prefix_replay_tokens": 0, "mamba_cache_mode": mode,
+                "prefill_checkpoint_alignment": if kind == "mamba" { Some(528) } else { None },
+            })
+        };
+        let mut value = serde_json::json!({"schema_version": 1, "ranks": [{
+            "rank": 0, "model": "qwen", "weight_version": "default", "weight_identity": "model-sha256",
+            "publisher_topic": "epoch-1", "instance_topic": true,
+            "hash_algorithm": "sha256_cbor", "full_hashes": true,
+            "root_hash": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+            "hash_block_size": 528, "hash_lookahead_tokens": 0,
+            "speculative_tokens": 0, "prefix_caching": true,
+            "groups": [group(0, "mamba", "MambaSpec", Some("align")),
+                group(1, "mamba", "MambaSpec", Some("align")),
+                group(2, "mamba", "MambaSpec", Some("align")),
+                group(3, "full_attention", "FullAttentionSpec", None)]
+        }]});
+        let index = bind_layout(&value, "epoch-1").unwrap();
+        index.begin_empty(0);
+        index
+            .apply_payload(
+                0,
+                &crate::kv_index::source::binding::tests::qwen35_payload(),
+            )
+            .unwrap();
+        let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
+        assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 528);
+        value["ranks"][0]["groups"][0]["prefill_checkpoint_alignment"] = serde_json::Value::Null;
+        assert!(bind_layout(&value, "epoch-1").is_ok());
+        value["ranks"][0]["groups"][0]["prefill_checkpoint_alignment"] = serde_json::json!(7);
+        assert!(bind_layout(&value, "epoch-1").is_err());
+        value["ranks"][0]["groups"][0]["prefill_checkpoint_alignment"] = serde_json::json!(528);
+        for (field, invalid) in [
+            ("publisher_topic", serde_json::json!("other")),
+            ("full_hashes", serde_json::json!(false)),
+            ("speculative_tokens", serde_json::json!(1)),
+            ("root_hash", serde_json::json!("bad")),
+        ] {
+            let saved = value["ranks"][0][field].clone();
+            value["ranks"][0][field] = invalid;
+            assert!(bind_layout(&value, "epoch-1").is_err(), "{field}");
+            value["ranks"][0][field] = saved;
+        }
+        value["ranks"][0]["groups"][0]["prefix_replay_tokens"] = serde_json::json!(128);
+        assert!(bind_layout(&value, "epoch-1").is_err());
+    }
+
+    /// DeepSeek V4 can declare MLA pages without `tokens_per_state` next to
+    /// sliding-window groups on a 4-token hash chain; that layout has to bind.
+    #[test]
+    fn deepseek_v4_layout_binds_without_a_checkpoint_group() {
+        let group = |idx, kind, spec, block, window: Option<u32>| {
+            serde_json::json!({
+                "group_idx": idx, "kind": kind, "spec_type": spec, "block_size": block,
+                "sliding_window": window, "prefix_cacheable": true,
+                "prefix_replay_tokens": 0, "mamba_cache_mode": null,
+                "prefill_checkpoint_alignment": null,
+            })
+        };
+        let value = serde_json::json!({"schema_version": 1, "ranks": [{
+            "rank": 0, "model": "deepseek-v4", "weight_version": "default",
+            "weight_identity": null, "publisher_topic": "ds4", "instance_topic": true,
+            "hash_algorithm": "sha256_cbor", "root_hash":
+                "9bd96a485ad84efdafb72ee48a1d7a69bcead0f8f0433173941b276b9581eef0",
+            "full_hashes": true, "hash_block_size": 4, "hash_lookahead_tokens": 0,
+            "speculative_tokens": 0, "prefix_caching": true,
+            "groups": [
+                group(0, "sliding_window_mla", "SlidingWindowMLASpec", 64, Some(128)),
+                group(1, "sliding_window_mla", "SlidingWindowMLASpec", 64, Some(128)),
+                group(2, "mla_attention", "MLAAttentionSpec", 256, None),
+                group(3, "sliding_window_mla", "SlidingWindowMLASpec", 4, Some(8)),
+                group(4, "sliding_window_mla", "SlidingWindowMLASpec", 8, Some(128)),
+            ]
+        }]});
+        bind_layout(&value, "ds4").expect("deepseek v4 layout must bind");
+    }
+
+    #[test]
+    fn qwen4_layout_admits_compressed_group_and_skips_the_scratch_ring() {
+        let group = |idx, kind, spec, extra: serde_json::Value| {
+            let mut value = serde_json::json!({
+                "group_idx": idx, "kind": kind, "spec_type": spec, "block_size": 320,
+                "sliding_window": null, "prefix_cacheable": true,
+                "prefix_replay_tokens": 0, "mamba_cache_mode": null,
+                "prefill_checkpoint_alignment": null, "tokens_per_state": "1",
+                "cache_role": null,
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            value
+        };
+        let mamba = || {
+            group(
+                0,
+                "mamba",
+                "MambaSpec",
+                serde_json::json!({"mamba_cache_mode": "align", "prefill_checkpoint_alignment": 320, "tokens_per_state": "-1", "block_size": 320}),
+            )
+        };
+        // Captured from a Qwen4Exp (QSA) vLLM 0.33.0 probe: three GDN groups,
+        // one per-request key ring that emits no block events, and one
+        // compressed MLA group whose states cover four tokens each.
+        let mut value = serde_json::json!({"schema_version": 1, "ranks": [{
+            "rank": 0, "model": "qwen4", "weight_version": "default",
+            "weight_identity": "qwen4-sha256",
+            "publisher_topic": "kv-events", "instance_topic": true,
+            "hash_algorithm": "sha256_cbor", "full_hashes": true,
+            "root_hash": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+            "hash_block_size": 320, "hash_lookahead_tokens": 0,
+            "speculative_tokens": 0, "prefix_caching": true,
+            "groups": [
+                mamba(),
+                group(1, "mamba", "MambaSpec", serde_json::json!({"mamba_cache_mode": "align", "prefill_checkpoint_alignment": 320, "tokens_per_state": "-1"})),
+                group(2, "mamba", "MambaSpec", serde_json::json!({"mamba_cache_mode": "align", "prefill_checkpoint_alignment": 320, "tokens_per_state": "-1"})),
+                group(3, "unknown", "CircularBufferSpec", serde_json::json!({"prefix_cacheable": false, "block_size": 4})),
+                group(4, "mla_attention", "MLAAttentionSpec", serde_json::json!({"tokens_per_state": "4", "cache_role": "sparse"}))
+            ]
+        }]});
+        assert!(bind_layout(&value, "kv-events").is_ok());
+
+        for (path, invalid) in [(4, serde_json::json!("3")), (4, serde_json::json!("field"))] {
+            let saved = value["ranks"][0]["groups"][path]["tokens_per_state"].clone();
+            value["ranks"][0]["groups"][path]["tokens_per_state"] = invalid;
+            assert!(bind_layout(&value, "kv-events").is_err(), "{path}");
+            value["ranks"][0]["groups"][path]["tokens_per_state"] = saved;
+        }
+        value["ranks"][0]["groups"][4]["cache_role"] = serde_json::json!("indexer");
+        assert!(bind_layout(&value, "kv-events").is_err());
+        value["ranks"][0]["groups"][4]["cache_role"] = serde_json::json!("sparse");
+        value["ranks"][0]["groups"][3]["spec_type"] = serde_json::json!("FullAttentionSpec");
+        assert!(bind_layout(&value, "kv-events").is_err());
+        value["ranks"][0]["groups"][3]["spec_type"] = serde_json::json!("CircularBufferSpec");
+        value["ranks"][0]["groups"][4]["kind"] = serde_json::json!("full_attention");
+        assert!(bind_layout(&value, "kv-events").is_err());
+    }
+}

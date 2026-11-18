@@ -1,6 +1,5 @@
 #![cfg(all(test, feature = "cpu", feature = "ready"))]
 
-use super::records::{qualified_seq, sparse_key};
 use super::*;
 use crate::kv_index::types::SourceId;
 
@@ -14,7 +13,10 @@ impl GroupShard {
     ) -> bool {
         self.store_for_source(
             &Arc::new(owner.target()),
-            &(owner, tier),
+            &StoreClaim {
+                key: (owner, tier),
+                incremental: false,
+            },
             parent_seq,
             blocks,
         )
@@ -22,6 +24,80 @@ impl GroupShard {
 
     fn find_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
         Self::aggregate_claims(query, &self.collect_claims(query))
+    }
+}
+
+impl KvBlockIndexer {
+    fn with_snapshot<R>(&self, f: impl FnOnce(&IndexSnapshot<'_>) -> R) -> R {
+        let _guard = self.domain.write();
+        f(&IndexSnapshot {
+            index: self,
+            scope: None,
+            source_data: None,
+            source: None,
+        })
+    }
+}
+
+impl IndexBatch<'_> {
+    fn store_sparse(
+        &mut self,
+        owner: &ResidencyOwner,
+        namespace: Option<&str>,
+        group: u32,
+        hash: &SequenceHash,
+        tier: StorageTier,
+        max_entries: usize,
+    ) -> bool {
+        self.store_pages(
+            group,
+            owner,
+            tier,
+            PageBatch::Hashes {
+                namespace,
+                hashes: &[*hash],
+            },
+            false,
+            max_entries,
+        )
+        .is_ok()
+    }
+    fn remove_sparse(
+        &mut self,
+        owner: &ResidencyOwner,
+        group: u32,
+        hash: &SequenceHash,
+        tier: Option<StorageTier>,
+    ) {
+        self.remove_pages(group, owner, tier, RemovedPages::Hashes(&[*hash]), false);
+    }
+}
+
+impl IndexSnapshot<'_> {
+    fn best_sparse_tier(
+        &self,
+        owner: &ResidencyOwner,
+        namespace: Option<&str>,
+        group: u32,
+        hash: &SequenceHash,
+    ) -> Option<StorageTier> {
+        let hash = match namespace {
+            None => FactKey::Digest(*hash),
+            Some(name) => FactKey::Text(sparse_key(Some(name), hash)),
+        };
+        self.page_tiers(owner, group, &[hash])[0].best()
+    }
+
+    fn sparse_tiers(
+        &self,
+        owner: &ResidencyOwner,
+        group: u32,
+        keys: &[FactKey],
+    ) -> Vec<Option<StorageTier>> {
+        self.page_tiers(owner, group, keys)
+            .into_iter()
+            .map(TierBits::best)
+            .collect()
     }
 }
 
@@ -70,6 +146,327 @@ fn h(s: &str) -> Arc<str> {
 }
 
 #[test]
+fn path_and_hash_pages_have_identical_replica_tier_and_clear_transitions() {
+    use super::mutations::{PageBatch, RemovedPages};
+    let index = KvBlockIndexer::new();
+    let a = worker_rank("w1", 0);
+    let b = worker_rank("w2", 1);
+    let hashes = [[1; 32], [2; 32], [3; 32]];
+    let blocks: Vec<_> = hashes
+        .iter()
+        .enumerate()
+        .map(|(i, hash)| (sparse_key(None, hash), h(&format!("local-{i}"))))
+        .collect();
+    let keys = prepare_sparse_keys(None, &hashes);
+    let check = || {
+        let left = index.with_source_snapshot(&a.target(), |view| view.page_tiers(&a, 0, &keys));
+        let right = index.with_source_snapshot(&b.target(), |view| view.page_tiers(&b, 0, &keys));
+        assert_eq!(left, right);
+        let hits = index.find_matches(&MatchQuery {
+            group_idx: 0,
+            local_hashes: blocks.iter().map(|b| b.1.clone()).collect(),
+            tiers_of_interest: TIERS.to_vec(),
+        });
+        for tier in TIERS {
+            for (i, bits) in left.iter().enumerate() {
+                let actual = segments_of(&hits, "w1", tier)
+                    .iter()
+                    .any(|&(s, e)| s <= i as u32 && (i as u32) < e);
+                assert_eq!(actual, bits.contains(tier));
+            }
+        }
+    };
+    for (tier, incremental) in [
+        (StorageTier::Device, true),
+        (StorageTier::Device, true),
+        (StorageTier::HostPinned, false),
+    ] {
+        index.with_source_batch(&a.target(), |tx| {
+            assert!(tx
+                .store_pages(
+                    0,
+                    &a,
+                    tier,
+                    PageBatch::Path {
+                        namespace: None,
+                        parent: None,
+                        blocks: &blocks
+                    },
+                    incremental,
+                    3
+                )
+                .is_ok())
+        });
+        index.with_source_batch(&b.target(), |tx| {
+            assert!(tx
+                .store_pages(
+                    0,
+                    &b,
+                    tier,
+                    PageBatch::Hashes {
+                        namespace: None,
+                        hashes: &hashes
+                    },
+                    incremental,
+                    3
+                )
+                .is_ok())
+        });
+        check();
+    }
+    for tier in [
+        StorageTier::Device,
+        StorageTier::Device,
+        StorageTier::HostPinned,
+    ] {
+        let incremental = tier == StorageTier::Device;
+        let seqs: Vec<_> = blocks.iter().map(|b| b.0.clone()).collect();
+        index.with_source_batch(&a.target(), |tx| {
+            tx.remove_pages(0, &a, Some(tier), RemovedPages::Path(&seqs), incremental)
+        });
+        index.with_source_batch(&b.target(), |tx| {
+            tx.remove_pages(
+                0,
+                &b,
+                Some(tier),
+                RemovedPages::Hashes(&hashes),
+                incremental,
+            )
+        });
+        check();
+    }
+    assert!(index.shard(0).scoped_anchors.is_empty());
+    for owner in [&a, &b] {
+        index.with_source_batch(&owner.target(), |tx| {
+            assert!(tx
+                .store_pages(
+                    1,
+                    owner,
+                    StorageTier::Device,
+                    PageBatch::Hashes {
+                        namespace: None,
+                        hashes: &hashes[..1]
+                    },
+                    true,
+                    1
+                )
+                .is_ok());
+            assert!(tx
+                .store_pages(
+                    1,
+                    owner,
+                    StorageTier::Device,
+                    PageBatch::Hashes {
+                        namespace: None,
+                        hashes: &hashes[1..]
+                    },
+                    true,
+                    1
+                )
+                .is_err());
+            tx.clear_owner_exact(owner);
+        });
+    }
+    assert!(index.shard(1).reverse.is_empty());
+}
+
+#[test]
+fn named_adapter_path_and_hash_pages_share_one_key_and_copy_count() {
+    let index = KvBlockIndexer::new();
+    let owner = worker_rank("w1", 1);
+    let name = "适配:a";
+    let hash = [7; 32];
+    let blocks = [(sparse_key(None, &hash), h("adapter-local"))];
+    let keys = prepare_sparse_keys(Some(name), &[hash]);
+    index.with_source_batch(&owner.target(), |tx| {
+        assert!(tx
+            .store_pages(
+                0,
+                &owner,
+                StorageTier::Device,
+                PageBatch::Path {
+                    namespace: Some(name),
+                    parent: None,
+                    blocks: &blocks
+                },
+                true,
+                1
+            )
+            .is_ok());
+        assert!(tx
+            .store_pages(
+                0,
+                &owner,
+                StorageTier::Device,
+                PageBatch::Hashes {
+                    namespace: Some(name),
+                    hashes: &[hash]
+                },
+                true,
+                1
+            )
+            .is_ok());
+        tx.remove_pages(
+            0,
+            &owner,
+            Some(StorageTier::Device),
+            RemovedPages::Hashes(&[hash]),
+            true,
+        );
+    });
+    assert_eq!(
+        index.with_source_snapshot(&owner.target(), |v| v.page_tiers(&owner, 0, &keys)),
+        vec![TierBits(TierBits::bit(StorageTier::Device))]
+    );
+    assert_eq!(
+        depth_of(
+            &index.find_matches(&query(&["adapter-local"], &[StorageTier::Device])),
+            "w1",
+            StorageTier::Device
+        ),
+        1
+    );
+    index.with_source_batch(&owner.target(), |tx| {
+        tx.remove_pages(
+            0,
+            &owner,
+            Some(StorageTier::Device),
+            RemovedPages::Path(&[sparse_key(None, &hash)]),
+            true,
+        )
+    });
+    assert_eq!(
+        index.with_source_snapshot(&owner.target(), |v| v.page_tiers(&owner, 0, &keys)),
+        vec![TierBits::default()]
+    );
+    assert!(index
+        .find_matches(&query(&["adapter-local"], &[StorageTier::Device]))
+        .is_empty());
+}
+
+#[test]
+fn namespaced_integer_parent_cannot_borrow_another_source_path() {
+    let index = KvBlockIndexer::new();
+    let first = worker("first");
+    let second = worker("second");
+    let parent = h("i:1");
+    let child = h("i:2");
+    index.with_source_batch(&first.target(), |tx| {
+        assert!(tx
+            .store_pages(
+                0,
+                &first,
+                StorageTier::Device,
+                PageBatch::Path {
+                    namespace: Some("lora"),
+                    parent: None,
+                    blocks: &[(parent.clone(), h("x"))]
+                },
+                false,
+                8
+            )
+            .is_ok())
+    });
+    index.with_source_batch(&second.target(), |tx| {
+        assert!(tx
+            .store_pages(
+                0,
+                &second,
+                StorageTier::Device,
+                PageBatch::Path {
+                    namespace: Some("lora"),
+                    parent: Some(parent),
+                    blocks: &[(child.clone(), h("y"))]
+                },
+                false,
+                8
+            )
+            .is_ok())
+    });
+    assert!(index
+        .shard(0)
+        .positioned_anchor(&second.target(), &qualified_seq("lora", &child))
+        .is_none());
+    assert_eq!(
+        depth_of(
+            &index.find_matches(&query(&["x", "y"], &[StorageTier::Device])),
+            "second",
+            StorageTier::Device
+        ),
+        0
+    );
+}
+
+#[test]
+fn retired_adapter_names_do_not_accumulate_while_base_pages_stay_live() {
+    let index = KvBlockIndexer::new();
+    let owner = worker("w");
+    let base = [(h("base"), h("base-local"))];
+    index.store(0, owner.clone(), StorageTier::Device, None, &base);
+    for i in 0..8 {
+        let name = format!("adapter-{i}");
+        let hash = [i as u8; 32];
+        let blocks = [(sparse_key(None, &hash), h(&format!("adapter-local-{i}")))];
+        index.with_source_batch(&owner.target(), |tx| {
+            let pages = if i % 2 == 0 {
+                PageBatch::Path {
+                    namespace: Some(&name),
+                    parent: None,
+                    blocks: &blocks,
+                }
+            } else {
+                PageBatch::Hashes {
+                    namespace: Some(&name),
+                    hashes: std::slice::from_ref(&hash),
+                }
+            };
+            assert!(tx
+                .store_pages(0, &owner, StorageTier::Device, pages, true, 1)
+                .is_ok());
+        });
+        index.with_source_batch(&owner.target(), |tx| {
+            if i % 2 == 0 {
+                tx.remove_pages(
+                    0,
+                    &owner,
+                    Some(StorageTier::Device),
+                    RemovedPages::Hashes(&[hash]),
+                    true,
+                );
+            } else {
+                tx.remove_pages(
+                    0,
+                    &owner,
+                    Some(StorageTier::Device),
+                    RemovedPages::Path(&[sparse_key(None, &hash)]),
+                    true,
+                );
+            }
+        });
+        assert_eq!(
+            index.with_source_snapshot(&owner.target(), |view| {
+                view.page_tiers(&owner, 0, &prepare_sparse_keys(Some(&name), &[hash]))
+            }),
+            vec![TierBits::default()]
+        );
+        let gate = index.source_lock(&owner.target());
+        let state = gate.access.read();
+        let metadata = state.records.owners.get(&owner).unwrap();
+        assert!(metadata.namespaces.is_empty(), "iteration {i}");
+    }
+    index.store(0, owner.clone(), StorageTier::Device, None, &base);
+    assert_eq!(index.shard(0).scoped_anchors.len(), 1);
+    assert_eq!(
+        depth_of(
+            &index.find_matches(&query(&["base-local"], &[StorageTier::Device])),
+            "w",
+            StorageTier::Device
+        ),
+        1
+    );
+}
+
+#[test]
 fn fact_keys_preserve_wire_identity_and_canonical_digest_equivalence() {
     let hash = [0xab; 32];
     let canonical = sparse_key(None, &hash);
@@ -85,6 +482,35 @@ fn fact_keys_preserve_wire_identity_and_canonical_digest_equivalence() {
         assert_eq!(&key.to_seq(), seq);
         assert_ne!(key, FactKey::Digest(hash));
     }
+}
+
+#[test]
+fn prepared_sparse_keys_match_canonical_base_and_adapter_keys() {
+    let hash: SequenceHash = std::array::from_fn(|i| (i * 7) as u8);
+    let base = prepare_sparse_keys(None, &[hash]);
+    assert!(matches!(base[0], FactKey::Digest(_)));
+    assert_eq!(base[0].to_seq(), sparse_key(None, &hash));
+    let expected = format!(
+        "b:{}",
+        hash.iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join("")
+    );
+    assert_eq!(base[0].to_seq().as_ref(), expected);
+    assert_eq!(base[0].to_seq().len(), 66);
+    assert!(base[0].to_seq().starts_with("b:00070e"));
+    let adapter = prepare_sparse_keys(Some("适配:a"), &[hash]);
+    assert!(matches!(adapter[0], FactKey::Text(_)));
+    assert_eq!(
+        adapter[0].to_seq().as_ref(),
+        sparse_key(Some("适配:a"), &hash).as_ref()
+    );
+    assert_eq!(
+        adapter[0].to_seq().as_ref(),
+        format!("n:{}:适配:a:{}", "适配:a".len(), expected)
+    );
+    assert_ne!(base[0], adapter[0]);
 }
 
 #[test]
@@ -295,6 +721,101 @@ fn successive_stores_share_prefix_until_divergence() {
 }
 
 #[test]
+fn sparse_records_are_scoped_by_group_identity_and_incarnation() {
+    let index = KvBlockIndexer::new();
+    let first = worker("a");
+    let second = ResidencyOwner::Worker {
+        source: SourceId::from("a"),
+        dp_rank: 0,
+        incarnation: 1,
+    };
+    let hash = [7; 32];
+    index.with_batch(|batch| {
+        assert!(batch.store_sparse(&first, None, 0, &hash, StorageTier::Device, 4));
+        assert!(batch.store_sparse(
+            &first,
+            Some("adapter"),
+            0,
+            &hash,
+            StorageTier::HostPinned,
+            4
+        ));
+        assert!(batch.store_sparse(&first, None, 1, &hash, StorageTier::Disk, 4));
+        assert!(batch.store_sparse(&second, None, 0, &hash, StorageTier::Device, 4));
+    });
+    index.with_snapshot(|view| {
+        assert_eq!(
+            view.best_sparse_tier(&first, None, 0, &hash),
+            Some(StorageTier::Device)
+        );
+        let prepared = prepare_sparse_keys(None, &[hash, [8; 32]]);
+        assert_eq!(
+            view.sparse_tiers(&first, 0, &prepared),
+            vec![Some(StorageTier::Device), None]
+        );
+        assert_eq!(
+            view.best_sparse_tier(&first, Some("adapter"), 0, &hash),
+            Some(StorageTier::HostPinned)
+        );
+        let adapter_keys = prepare_sparse_keys(Some("adapter"), &[hash]);
+        assert_eq!(
+            view.sparse_tiers(&first, 0, &adapter_keys),
+            vec![Some(StorageTier::HostPinned)]
+        );
+        assert_eq!(
+            view.best_sparse_tier(&first, None, 1, &hash),
+            Some(StorageTier::Disk)
+        );
+    });
+    index.with_batch(|batch| batch.clear_owner_exact(&first));
+    index.with_snapshot(|view| {
+        assert_eq!(view.best_sparse_tier(&first, None, 0, &hash), None);
+        assert_eq!(
+            view.best_sparse_tier(&second, None, 0, &hash),
+            Some(StorageTier::Device)
+        );
+    });
+}
+
+#[test]
+fn sparse_remove_preserves_other_dense_alias_and_tier() {
+    let index = KvBlockIndexer::new();
+    let owner = worker("a");
+    let hash = [9; 32];
+    let seq = sparse_key(None, &hash);
+    let alias = h("legacy-alias");
+    for tier in [StorageTier::Device, StorageTier::HostPinned] {
+        index.store(0, owner.clone(), tier, None, &[(seq.clone(), h("x"))]);
+        index.store(0, owner.clone(), tier, None, &[(alias.clone(), h("x"))]);
+    }
+    index.with_batch(|batch| batch.remove_sparse(&owner, 0, &hash, Some(StorageTier::Device)));
+    assert_eq!(
+        depth_of(
+            &index.find_matches(&query(&["x"], &[StorageTier::Device])),
+            "a",
+            StorageTier::Device
+        ),
+        1
+    );
+    assert_eq!(
+        index.with_snapshot(|view| view.best_sparse_tier(&owner, None, 0, &hash)),
+        Some(StorageTier::HostPinned)
+    );
+    index.remove(0, &owner, StorageTier::Device, &[alias]);
+    assert!(index
+        .find_matches(&query(&["x"], &[StorageTier::Device]))
+        .is_empty());
+    assert_eq!(
+        depth_of(
+            &index.find_matches(&query(&["x"], &[StorageTier::HostPinned])),
+            "a",
+            StorageTier::HostPinned
+        ),
+        1
+    );
+}
+
+#[test]
 fn batched_remove_keeps_other_aliases_sources_and_tiers() {
     let index = KvBlockIndexer::new();
     let a = worker("a");
@@ -323,6 +844,102 @@ fn batched_remove_keeps_other_aliases_sources_and_tiers() {
     assert_eq!(depth_of(&hits, "a", StorageTier::Device), 0);
     assert_eq!(depth_of(&hits, "a", StorageTier::HostPinned), 1);
     assert_eq!(depth_of(&hits, "b", StorageTier::Device), 1);
+}
+
+#[test]
+fn sparse_and_dense_use_same_residency_facts() {
+    let index = KvBlockIndexer::new();
+    let owner = worker("a");
+    let hash = [9; 32];
+    let seq = sparse_key(None, &hash);
+    index.store(
+        0,
+        owner.clone(),
+        StorageTier::Device,
+        None,
+        &[(seq, h("x")), (h("tail"), h("y"))],
+    );
+    assert_eq!(
+        index.with_snapshot(|v| v.best_sparse_tier(&owner, None, 0, &hash)),
+        Some(StorageTier::Device)
+    );
+    index.with_batch(|batch| {
+        assert!(batch.store_sparse(&owner, None, 0, &hash, StorageTier::HostPinned, 4));
+    });
+    index.with_batch(|batch| batch.remove_sparse(&owner, 0, &hash, Some(StorageTier::Device)));
+    assert!(index
+        .find_matches(&query(&["x"], &[StorageTier::Device]))
+        .is_empty());
+    // The host fact retains the navigation needed by a device reinsert.
+    index.with_batch(|batch| {
+        assert!(batch.store_sparse(&owner, None, 0, &hash, StorageTier::Device, 4));
+    });
+    assert_eq!(
+        depth_of(
+            &index.find_matches(&query(&["x"], &[StorageTier::Device])),
+            "a",
+            StorageTier::Device
+        ),
+        1
+    );
+    index.with_batch(|batch| batch.remove_sparse(&owner, 0, &hash, Some(StorageTier::Device)));
+    assert!(index
+        .find_matches(&query(&["x"], &[StorageTier::Device]))
+        .is_empty());
+    index.with_batch(|batch| batch.remove_sparse(&owner, 0, &hash, Some(StorageTier::HostPinned)));
+    assert_eq!(
+        segments_of(
+            &index.find_matches(&query(&["x", "y"], &[StorageTier::Device])),
+            "a",
+            StorageTier::Device
+        ),
+        [(1, 2)]
+    );
+    index.remove(0, &owner, StorageTier::Device, &[h("tail")]);
+    assert!(index.shard(0).scoped_anchors.is_empty());
+    index.with_batch(|batch| {
+        assert!(batch.store_sparse(&owner, None, 0, &hash, StorageTier::Device, 4));
+    });
+    // A hash-only fact cannot reconstruct a reclaimed local-token path.
+    assert_eq!(
+        index.with_snapshot(|v| v.best_sparse_tier(&owner, None, 0, &hash)),
+        Some(StorageTier::Device)
+    );
+    assert!(index
+        .find_matches(&query(&["x"], &[StorageTier::Device]))
+        .is_empty());
+    index.store(
+        0,
+        owner,
+        StorageTier::Device,
+        None,
+        &[(sparse_key(None, &hash), h("x"))],
+    );
+    assert_eq!(
+        depth_of(
+            &index.find_matches(&query(&["x"], &[StorageTier::Device])),
+            "a",
+            StorageTier::Device
+        ),
+        1
+    );
+}
+
+#[test]
+fn sparse_fact_without_anchor_does_not_create_a_dense_path() {
+    let index = KvBlockIndexer::new();
+    let owner = worker("a");
+    let hash = [12; 32];
+    index.with_batch(|batch| {
+        assert!(batch.store_sparse(&owner, None, 0, &hash, StorageTier::Device, 4));
+    });
+    assert_eq!(
+        index.with_snapshot(|view| view.best_sparse_tier(&owner, None, 0, &hash)),
+        Some(StorageTier::Device)
+    );
+    assert!(index
+        .find_matches(&query(&["x"], &[StorageTier::Device]))
+        .is_empty());
 }
 
 #[test]
@@ -538,7 +1155,251 @@ fn conflicting_hash_at_another_offset_or_in_one_store_is_rejected() {
         .read()
         .records
         .owners
-        .contains(&b));
+        .contains_key(&b));
+}
+
+#[test]
+fn clear_sparse_owner_preserves_other_owner_and_resets_capacity() {
+    let index = KvBlockIndexer::new();
+    let a = worker("clear-a");
+    let b = worker("clear-b");
+    let hash = [5; 32];
+    index.with_batch(|batch| {
+        for tier in [StorageTier::Device, StorageTier::HostPinned] {
+            assert!(batch.store_sparse(&a, None, 0, &hash, tier, 1));
+            assert!(batch.store_sparse(&b, None, 0, &hash, tier, 1));
+        }
+        assert!(batch.store_sparse(&a, Some("adapter"), 1, &hash, StorageTier::Disk, 1));
+        batch.clear_owner_exact(&a);
+        assert!(batch.store_sparse(&a, None, 1, &[6; 32], StorageTier::Device, 1));
+    });
+    index.with_snapshot(|view| {
+        assert_eq!(view.best_sparse_tier(&a, None, 0, &hash), None);
+        assert_eq!(view.best_sparse_tier(&a, Some("adapter"), 1, &hash), None);
+        assert_eq!(
+            view.best_sparse_tier(&b, None, 0, &hash),
+            Some(StorageTier::Device)
+        );
+        assert_eq!(
+            view.best_sparse_tier(&a, None, 1, &[6; 32]),
+            Some(StorageTier::Device)
+        );
+    });
+}
+
+#[test]
+fn sparse_tier_lookup_falls_back_as_resident_tiers_are_removed() {
+    let index = KvBlockIndexer::new();
+    let owner = worker("tier-fallback");
+    let hash = [23; 32];
+    let best = || index.with_snapshot(|view| view.best_sparse_tier(&owner, None, 0, &hash));
+
+    assert_eq!(best(), None);
+    index.with_batch(|batch| {
+        for tier in TIERS.into_iter().rev() {
+            assert!(batch.store_sparse(&owner, None, 0, &hash, tier, 1));
+        }
+    });
+    // Removing a tier on a missing page must leave the observed page alone.
+    index.with_batch(|batch| batch.remove_sparse(&owner, 0, &[24; 32], Some(TIERS[0])));
+    for tier in TIERS {
+        assert_eq!(best(), Some(tier));
+        index.with_batch(|batch| {
+            batch.remove_sparse(&owner, 0, &hash, Some(tier));
+            batch.remove_sparse(&owner, 0, &hash, Some(tier));
+        });
+    }
+    assert_eq!(best(), None);
+}
+
+#[test]
+fn sparse_capacity_counts_pages_not_tiers_or_repeated_stores() {
+    let index = KvBlockIndexer::new();
+    let owner = worker("a");
+    index.with_batch(|batch| {
+        assert!(batch.store_sparse(&owner, None, 0, &[1; 32], StorageTier::Device, 1));
+        assert!(batch.store_sparse(&owner, None, 0, &[1; 32], StorageTier::HostPinned, 1));
+        assert!(!batch.store_sparse(&owner, None, 1, &[2; 32], StorageTier::Device, 1));
+        batch.remove_sparse(&owner, 0, &[1; 32], None);
+        assert!(batch.store_sparse(&owner, None, 1, &[2; 32], StorageTier::Device, 1));
+    });
+}
+
+#[test]
+fn persistent_sparse_capacity_tracks_tier_removal_across_batches() {
+    for namespace in [None, Some("adapter")] {
+        let index = KvBlockIndexer::new();
+        let owner = worker("a");
+        index.with_batch(|tx| {
+            assert!(tx.store_sparse(&owner, namespace, 0, &[1; 32], StorageTier::Device, 1))
+        });
+        index.with_batch(|tx| {
+            assert!(tx.store_sparse(&owner, namespace, 0, &[1; 32], StorageTier::HostPinned, 1))
+        });
+        index.with_batch(|tx| {
+            tx.store_pages(
+                0,
+                &owner,
+                StorageTier::Device,
+                PageBatch::Hashes {
+                    namespace,
+                    hashes: &[[1; 32]; 2],
+                },
+                true,
+                1,
+            )
+            .unwrap();
+            tx.remove_pages(
+                0,
+                &owner,
+                Some(StorageTier::Device),
+                RemovedPages::Hashes(&[[1; 32], [255; 32], [1; 32]]),
+                true,
+            );
+            assert!(!tx.store_sparse(&owner, namespace, 1, &[2; 32], StorageTier::Device, 1));
+        });
+        assert_eq!(
+            index.with_snapshot(|view| view.best_sparse_tier(&owner, namespace, 0, &[1; 32])),
+            Some(StorageTier::HostPinned)
+        );
+        index.with_batch(|tx| tx.remove_sparse(&owner, 0, &[1; 32], Some(StorageTier::Device)));
+        index.with_batch(|tx| {
+            assert!(!tx.store_sparse(&owner, namespace, 1, &[2; 32], StorageTier::Device, 1))
+        });
+        index.with_batch(|tx| {
+            tx.remove_pages(
+                0,
+                &owner,
+                Some(StorageTier::HostPinned),
+                RemovedPages::Hashes(&[[1; 32], [255; 32], [1; 32]]),
+                false,
+            )
+        });
+        index.with_batch(|tx| {
+            assert!(tx.store_sparse(&owner, namespace, 1, &[2; 32], StorageTier::Device, 1))
+        });
+        index.with_batch(|tx| tx.clear_owner_exact(&owner));
+        index.with_batch(|tx| {
+            assert!(tx.store_sparse(&owner, namespace, 0, &[1; 32], StorageTier::Device, 1))
+        });
+    }
+}
+
+#[test]
+fn retired_streams_are_removed_without_reusing_snapshot_generations() {
+    let index = KvBlockIndexer::new();
+    let owner = worker("a");
+    let target = owner.target();
+    let control = Arc::new(StreamControl::default());
+    let mut previous = 0;
+    for _ in 0..8 {
+        let generation = index.with_stream_batch(&target, &owner, &control, |state, _| {
+            state.reset(Some(0), true);
+            state.reset_generation
+        });
+        assert_ne!(generation, previous);
+        previous = generation;
+        index.with_stream_batch(&target, &owner, &control, |state, _| {
+            state.reset(None, false)
+        });
+        assert!(index.source_lock(&target).access.read().streams.is_empty());
+    }
+}
+
+#[test]
+fn independent_sources_update_sparse_capacity_during_dense_edits() {
+    use std::sync::{mpsc, Barrier};
+    use std::time::Duration;
+
+    let index = Arc::new(KvBlockIndexer::new());
+    let barrier = Arc::new(Barrier::new(7));
+    let (done, finished) = mpsc::channel();
+    let mut threads = Vec::new();
+    for id in 0..6 {
+        let index = index.clone();
+        let barrier = barrier.clone();
+        let done = done.clone();
+        threads.push(std::thread::spawn(move || {
+            let owner = worker(&format!("source-{id}"));
+            let target = owner.target();
+            let hash = [id as u8; 32];
+            barrier.wait();
+            for _ in 0..250 {
+                index.with_source_batch(&target, |tx| {
+                    assert!(tx.store_sparse(&owner, None, 0, &hash, StorageTier::Device, 1));
+                    assert!(tx.store_sparse(&owner, None, 0, &hash, StorageTier::HostPinned, 1));
+                    assert!(!tx.store_sparse(&owner, None, 1, &[255; 32], StorageTier::Device, 1));
+                    tx.remove_sparse(&owner, 0, &hash, Some(StorageTier::Device));
+                    tx.remove_sparse(&owner, 0, &hash, Some(StorageTier::HostPinned));
+                });
+            }
+            done.send(()).unwrap();
+        }));
+    }
+    {
+        let index = index.clone();
+        let barrier = barrier.clone();
+        let done = done.clone();
+        threads.push(std::thread::spawn(move || {
+            let owner = worker("dense");
+            let sequence = h("dense-sequence");
+            barrier.wait();
+            for _ in 0..250 {
+                index.store(
+                    0,
+                    owner.clone(),
+                    StorageTier::Device,
+                    None,
+                    &[(sequence.clone(), h("local"))],
+                );
+                index.remove(
+                    0,
+                    &owner,
+                    StorageTier::Device,
+                    std::slice::from_ref(&sequence),
+                );
+            }
+            done.send(()).unwrap();
+        }));
+    }
+    for _ in 0..7 {
+        finished
+            .recv_timeout(Duration::from_secs(15))
+            .expect("concurrent writers stalled");
+    }
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    for id in 0..6 {
+        let owner = worker(&format!("source-{id}"));
+        index.with_snapshot(|tx| {
+            assert_eq!(tx.best_sparse_tier(&owner, None, 0, &[id as u8; 32]), None)
+        });
+    }
+}
+
+#[test]
+fn dense_edits_invalidate_the_owner_sparse_capacity_cache() {
+    let index = KvBlockIndexer::new();
+    let owner = worker("a");
+    index.with_batch(|tx| {
+        assert!(tx.store_sparse(&owner, None, 0, &[1; 32], StorageTier::Device, 2))
+    });
+    let dense = sparse_key(None, &[2; 32]);
+    index.store(
+        0,
+        owner.clone(),
+        StorageTier::Device,
+        None,
+        &[(dense.clone(), h("x"))],
+    );
+    index.with_batch(|tx| {
+        assert!(!tx.store_sparse(&owner, None, 0, &[3; 32], StorageTier::Device, 2))
+    });
+    index.remove(0, &owner, StorageTier::Device, &[dense]);
+    index.with_batch(|tx| {
+        assert!(tx.store_sparse(&owner, None, 0, &[3; 32], StorageTier::Device, 2))
+    });
 }
 
 #[test]
@@ -633,6 +1494,26 @@ fn foreign_alias_cannot_keep_a_removed_source_claim_alive() {
     assert_eq!(depth_of(&a, "w2", StorageTier::Device), 1);
     let x = index.find_matches(&query(&["x"], &[StorageTier::Device]));
     assert_eq!(depth_of(&x, "w1", StorageTier::Device), 1);
+}
+
+#[test]
+fn source_suspension_hides_sparse_records_until_resumed() {
+    let index = KvBlockIndexer::new();
+    let owner = worker("a");
+    let hash = [3; 32];
+    index.with_batch(|tx| {
+        assert!(tx.store_sparse(&owner, None, 0, &hash, StorageTier::Device, 10));
+        tx.suspend_source(&SourceId::from("a"), 0);
+    });
+    assert_eq!(
+        index.with_snapshot(|v| v.best_sparse_tier(&owner, None, 0, &hash)),
+        None
+    );
+    index.with_batch(|tx| tx.resume_source(&SourceId::from("a"), 0));
+    assert_eq!(
+        index.with_snapshot(|v| v.best_sparse_tier(&owner, None, 0, &hash)),
+        Some(StorageTier::Device)
+    );
 }
 
 #[test]
@@ -734,6 +1615,133 @@ fn source_suspension_and_invalidation_cover_tiers_groups_and_only_that_rank() {
     );
     assert_eq!(idx.find_matches(&query(&["y"], &tiers)).len(), 1);
     assert_eq!(idx.find_matches(&query(&["x"], &tiers)).len(), 2);
+}
+
+#[test]
+fn four_source_readers_do_not_block_an_unrelated_source_writer() {
+    use std::sync::{mpsc, Barrier};
+    use std::time::Duration;
+
+    let index = Arc::new(KvBlockIndexer::new());
+    let entered = Arc::new(Barrier::new(5));
+    let release = Arc::new(Barrier::new(5));
+    let mut readers = Vec::new();
+    for id in 0..4 {
+        let index = index.clone();
+        let entered = entered.clone();
+        let release = release.clone();
+        readers.push(std::thread::spawn(move || {
+            let target = worker(&format!("reader-{id}")).target();
+            index.with_source_snapshot(&target, |_| {
+                entered.wait();
+                release.wait();
+            });
+        }));
+    }
+    entered.wait();
+    let writer_index = index.clone();
+    let (done, received) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let owner = worker("writer");
+        writer_index.with_source_batch(&owner.target(), |batch| {
+            assert!(batch.store_sparse(&owner, None, 0, &[1; 32], StorageTier::Device, 8));
+        });
+        done.send(()).unwrap();
+    });
+    let completed = received.recv_timeout(Duration::from_secs(5)).is_ok();
+    release.wait();
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    writer.join().unwrap();
+    assert!(
+        completed,
+        "unrelated writer waited for other source snapshots"
+    );
+}
+
+#[test]
+fn source_batches_publish_atomically_to_dense_queries_and_group_snapshots() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    for dense in [false, true] {
+        let index = Arc::new(KvBlockIndexer::new());
+        let owner = worker("a");
+        if dense {
+            index.store(
+                0,
+                owner.clone(),
+                StorageTier::Device,
+                None,
+                &[(h("s1"), h("x")), (h("s2"), h("y"))],
+            );
+        }
+        let (entered, ready) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let writer_index = index.clone();
+        let writer_owner = owner.clone();
+        let writer = std::thread::spawn(move || {
+            writer_index.with_source_batch(&writer_owner.target(), |batch| {
+                if dense {
+                    batch.remove(0, &writer_owner, StorageTier::Device, &[h("s1")]);
+                } else {
+                    assert!(batch.store_sparse(
+                        &writer_owner,
+                        None,
+                        0,
+                        &[1; 32],
+                        StorageTier::Device,
+                        8
+                    ));
+                }
+                entered.send(()).unwrap();
+                resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                if dense {
+                    batch.remove(0, &writer_owner, StorageTier::Device, &[h("s2")]);
+                } else {
+                    assert!(batch.store_sparse(
+                        &writer_owner,
+                        None,
+                        1,
+                        &[1; 32],
+                        StorageTier::Device,
+                        8
+                    ));
+                }
+            });
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (started, scheduled) = mpsc::channel();
+        let (done, result) = mpsc::channel();
+        let reader_index = index.clone();
+        let reader = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let complete = if dense {
+                reader_index
+                    .find_matches(&query(&["x", "y"], &[StorageTier::Device]))
+                    .is_empty()
+            } else {
+                reader_index.with_source_snapshot(&owner.target(), |view| {
+                    [0, 1].into_iter().all(|group| {
+                        view.best_sparse_tier(&owner, None, group, &[1; 32])
+                            == Some(StorageTier::Device)
+                    })
+                })
+            };
+            done.send(complete).unwrap();
+        });
+        scheduled.recv_timeout(Duration::from_secs(5)).unwrap();
+        let premature = result.recv_timeout(Duration::from_millis(100));
+        release.send(()).unwrap();
+        writer.join().unwrap();
+        reader.join().unwrap();
+        assert!(
+            matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)),
+            "a query observed an incomplete source transaction (dense={dense})"
+        );
+        assert!(result.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
 }
 
 #[test]
@@ -1738,17 +2746,26 @@ fn anchored_store_rejects_mismatch_and_duplicate_without_mutation() {
     let shard = index.shard(0);
     let _topology = shard.topology.read();
     assert!(!shard.try_store_anchored(
-        &(owner.clone(), StorageTier::Device),
+        &StoreClaim {
+            key: (owner.clone(), StorageTier::Device),
+            incremental: false
+        },
         Some(&h("s1")),
         &[(h("s2"), h("wrong"))]
     ));
     assert!(!shard.try_store_anchored(
-        &(owner.clone(), StorageTier::Device),
+        &StoreClaim {
+            key: (owner.clone(), StorageTier::Device),
+            incremental: false
+        },
         Some(&h("s1")),
         &[(h("s1"), h("y"))]
     ));
     assert!(!shard.try_store_anchored(
-        &(owner.clone(), StorageTier::Device),
+        &StoreClaim {
+            key: (owner.clone(), StorageTier::Device),
+            incremental: false
+        },
         Some(&h("s1")),
         &[(h("new"), h("y"))]
     ));
@@ -2395,4 +3412,66 @@ fn rooted_batch_attaches_preexisting_pending_facts_from_every_owner_and_tier() {
         ),
         vec![(1, 2)]
     );
+}
+
+#[test]
+fn sparse_churn_and_unknown_removes_do_not_accumulate_navigation_debt() {
+    let index = KvBlockIndexer::new();
+    let owner = worker("sparse");
+    index.store(
+        0,
+        worker("dense"),
+        StorageTier::Device,
+        None,
+        &[(h("keep"), h("local"))],
+    );
+    index.with_batch(|tx| {
+        assert!(tx.store_sparse(&owner, None, 0, &[255; 32], StorageTier::Device, 8));
+    });
+    for n in 0u32..200 {
+        let mut hash = [0; 32];
+        hash[..4].copy_from_slice(&n.to_le_bytes());
+        index.with_batch(|tx| {
+            assert!(tx.store_sparse(&owner, None, 0, &hash, StorageTier::Device, 8));
+            tx.remove_sparse(&owner, 0, &hash, Some(StorageTier::Device));
+        });
+        index.remove(
+            0,
+            &owner,
+            StorageTier::Device,
+            &[h(&format!("unknown-{n}"))],
+        );
+    }
+    assert!(index
+        .source_lock(&owner.target())
+        .access
+        .read()
+        .records
+        .reclaim
+        .is_empty());
+    assert_eq!(index.shard(0).scoped_anchors.len(), 1);
+
+    index.with_batch(|tx| tx.clear_owner_exact(&owner));
+    let hash = [254; 32];
+    index.store(
+        0,
+        owner.clone(),
+        StorageTier::Device,
+        None,
+        &[(sparse_key(None, &hash), h("discarded"))],
+    );
+    let shard = index.shard(0);
+    let source = index.source_lock(&owner.target());
+    let topology = shard.topology.read();
+    index.with_batch(|tx| {
+        tx.remove_sparse(&owner, 0, &hash, Some(StorageTier::Device));
+        tx.clear_owner_exact(&owner);
+    });
+    assert!(!shard.reverse.contains_key(&owner));
+    assert!(source.access.read().records.reclaim.contains_key(&0));
+    drop(topology);
+
+    index.with_batch(|tx| tx.remove_sparse(&owner, 0, &[253; 32], Some(StorageTier::Device)));
+    assert!(source.access.read().records.reclaim.is_empty());
+    assert_eq!(shard.scoped_anchors.len(), 1);
 }

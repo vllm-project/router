@@ -18,8 +18,38 @@ use crate::kv_index::{CacheKey, MatchQuery, RoutableTarget, StorageTier, TierMat
 use crate::request_identity::StableIdentity;
 
 /// Read-only placement port owned by its policy consumer.
+///
+/// Dense providers use the default prompt hashing. Layout providers implement
+/// `matches` to apply their own hash identity and restore rules.
 pub trait TieredMatchProvider: Send + Sync {
-    fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch>;
+    /// Raw hash lookup retained for existing full-attention providers.
+    fn find_tiered_matches(&self, _query: &MatchQuery) -> Vec<TierMatch> {
+        Vec::new()
+    }
+
+    /// Match the prompt using the provider's complete restore rules.
+    fn matches(
+        &self,
+        tokens: &[u32],
+        block_size: u32,
+        lora_name: Option<&str>,
+        _dp_rank: u32,
+    ) -> Vec<TierMatch> {
+        let local_hashes = crate::kv_index::local_block_hash_strings(tokens, block_size, lora_name);
+        if local_hashes.is_empty() {
+            return Vec::new();
+        }
+        self.find_tiered_matches(&MatchQuery {
+            group_idx: 0,
+            local_hashes,
+            tiers_of_interest: vec![
+                StorageTier::Device,
+                StorageTier::HostPinned,
+                StorageTier::External,
+                StorageTier::Disk,
+            ],
+        })
+    }
 }
 
 /// Exact prompt sequences rendered by each HTTP backend. DP ranks share their
@@ -1091,24 +1121,7 @@ impl KvAwarePolicy {
     }
 
     pub fn local_hashes(token_ids: &[u32], block_size: u32) -> Vec<Arc<str>> {
-        Self::local_hashes_with_lora(token_ids, block_size, None)
-    }
-
-    fn tiers_of_interest() -> Vec<StorageTier> {
-        vec![
-            StorageTier::Device,
-            StorageTier::HostPinned,
-            StorageTier::External,
-            StorageTier::Disk,
-        ]
-    }
-
-    fn local_hashes_with_lora(
-        token_ids: &[u32],
-        block_size: u32,
-        lora_name: Option<&str>,
-    ) -> Vec<Arc<str>> {
-        crate::kv_index::local_block_hash_strings(token_ids, block_size, lora_name)
+        crate::kv_index::local_block_hash_strings(token_ids, block_size, None)
     }
 
     fn placement_matches(
@@ -1117,32 +1130,25 @@ impl KvAwarePolicy {
         lora_name: Option<&str>,
         enabled: bool,
     ) -> Vec<TierMatch> {
-        let local_hashes = if enabled {
-            token_ids
-                .map(|ids| Self::local_hashes_with_lora(ids, binding.block_size, lora_name))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
+        let Some(tokens) =
+            token_ids.filter(|tokens| enabled && binding.block_size != 0 && !tokens.is_empty())
+        else {
+            return Vec::new();
         };
-        if local_hashes.is_empty() {
-            Vec::new()
+        let hits = binding.matches.matches(
+            tokens,
+            binding.block_size,
+            lora_name,
+            binding.target.dp_rank,
+        );
+        crate::metrics::RouterMetrics::record_kv_placement_lookup(if binding.cache_key.is_none() {
+            "index_unavailable"
+        } else if hits.is_empty() {
+            "miss"
         } else {
-            let hits = binding.matches.find_tiered_matches(&MatchQuery {
-                group_idx: 0,
-                local_hashes,
-                tiers_of_interest: Self::tiers_of_interest(),
-            });
-            crate::metrics::RouterMetrics::record_kv_placement_lookup(
-                if binding.cache_key.is_none() {
-                    "index_unavailable"
-                } else if hits.is_empty() {
-                    "miss"
-                } else {
-                    "hit"
-                },
-            );
-            hits
-        }
+            "hit"
+        });
+        hits
     }
 
     pub fn select_worker_with_token_ids(
@@ -1470,26 +1476,7 @@ impl KvAwarePolicy {
                                 crate::metrics::RouterMetrics::record_kv_placement_lookup(reason);
                                 return Vec::new();
                             }
-                            let local_hashes =
-                                Self::local_hashes_with_lora(ids, binding.block_size, lora_name);
-                            if local_hashes.is_empty() {
-                                return Vec::new();
-                            }
-                            let hits = binding.matches.find_tiered_matches(&MatchQuery {
-                                group_idx: 0,
-                                local_hashes,
-                                tiers_of_interest: Self::tiers_of_interest(),
-                            });
-                            crate::metrics::RouterMetrics::record_kv_placement_lookup(
-                                if binding.cache_key.is_none() {
-                                    "index_unavailable"
-                                } else if hits.is_empty() {
-                                    "miss"
-                                } else {
-                                    "hit"
-                                },
-                            );
-                            hits
+                            Self::placement_matches(binding, Some(ids), lora_name, true)
                         });
                     let matches: Vec<_> = hits
                         .iter()
@@ -2802,7 +2789,7 @@ mod tests {
         policy.register_target("http://lora", lora.clone());
         let ids = [1_u32, 2, 3, 4];
         let base_hashes = KvAwarePolicy::local_hashes(&ids, 2);
-        let lora_hashes = KvAwarePolicy::local_hashes_with_lora(&ids, 2, Some("adapter"));
+        let lora_hashes = crate::kv_index::local_block_hash_strings(&ids, 2, Some("adapter"));
         for (target, hashes) in [(&base, base_hashes), (&lora, lora_hashes)] {
             index.store(
                 0,

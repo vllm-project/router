@@ -14,7 +14,7 @@ impl GroupShard {
         tier: StorageTier,
         seq_hashes: &[Arc<str>],
     ) -> Vec<Arc<str>> {
-        self.remove_pages(owner, Some(tier), seq_hashes)
+        self.remove_pages(owner, Some(tier), seq_hashes, false)
     }
 
     pub(in crate::kv_index::index) fn remove_pages(
@@ -22,10 +22,13 @@ impl GroupShard {
         owner: &ResidencyOwner,
         tier: Option<StorageTier>,
         seq_hashes: &[Arc<str>],
+        incremental: bool,
     ) -> Vec<Arc<str>> {
         if seq_hashes.len() > 1 {
             if let Some(tier) = tier {
-                if let Some(removed) = self.try_remove_same_node(owner, tier, seq_hashes) {
+                if let Some(removed) =
+                    self.try_remove_same_node(owner, tier, seq_hashes, incremental)
+                {
                     return removed;
                 }
             }
@@ -36,7 +39,7 @@ impl GroupShard {
             if let Some(mut claims) = self.reverse.get_mut(owner) {
                 let fact = FactKey::from_seq(seq);
                 if let Some(bits) = claims.get_mut(&fact) {
-                    bits.withdraw(tier);
+                    bits.withdraw(tier, incremental);
                     if bits.tiers.0 == 0 {
                         claims.remove(&fact);
                         last = true;
@@ -63,6 +66,7 @@ impl GroupShard {
         owner: &ResidencyOwner,
         tier: StorageTier,
         seqs: &[Arc<str>],
+        incremental: bool,
     ) -> Option<Vec<Arc<str>>> {
         let target = owner.target();
         let first = self.positioned_anchor(&target, &seqs[0])?;
@@ -95,7 +99,7 @@ impl GroupShard {
             for seq in seqs {
                 let fact = FactKey::from_seq(seq);
                 if let Some(bits) = facts.get_mut(&fact) {
-                    bits.withdraw(Some(tier));
+                    bits.withdraw(Some(tier), incremental);
                     if bits.tiers.0 == 0 {
                         facts.remove(&fact);
                         removed.push(seq.clone());
