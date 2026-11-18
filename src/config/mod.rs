@@ -183,6 +183,7 @@ fn is_reachable_tcp_endpoint(endpoint: &str) -> bool {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod static_kv_event_source_tests {
     use super::*;
 
