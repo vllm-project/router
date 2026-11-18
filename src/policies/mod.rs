@@ -280,10 +280,9 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
 
 /// Picks uniformly among tied candidates.
 ///
-/// Equal scores carry no ranking evidence.
-/// Keeping the first candidate would encode slice order as a preference:
-/// with an idle pool every cold request of the same length has one cost,
-/// and all of them would land on the same worker.
+/// Equal scores carry no ranking evidence. Keeping the first candidate would
+/// encode slice order as a preference: with an idle pool every cold request of
+/// the same length has one cost, and all of them would land on the same worker.
 pub(crate) fn pick_tied(candidates: &[usize]) -> Option<usize> {
     match candidates {
         [] => None,
