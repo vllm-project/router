@@ -14,8 +14,8 @@ Both install an executable named `vllm-router`. Check which executable is on
 your `PATH` before copying flags between installations. Their options are
 similar, but they are not interchangeable. In particular:
 
-- Rust accepts `rendezvous_hash`; Python does not. Both support `kv_aware` in regular and P/D routing. Rust also exposes backend
-  selection, tracing, API-key validation URLs, history storage and profiling.
+- Both CLIs support `kv_aware` in regular and P/D routing. The [hybrid layout options](load_balancing/http_completion_kv.md#hybrid-attention-models) require the Rust binary.
+- Rust also exposes `rendezvous_hash`, backend selection, tracing, API-key validation URLs, history storage and profiling.
 - Python exposes `--mini-lb`, queue settings and the token bucket refill rate.
   The Rust CLI fixes queue size at `100`, queue timeout at `60` seconds, and
   leaves the refill rate unset (it falls back to `max_concurrent_requests`).

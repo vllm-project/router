@@ -8,7 +8,7 @@ A high-performance and light-weight request forwarding system for vLLM large sca
 ### Key Features
 
 - **Core Architecture**: Request routing framework and async processing patterns
-- **Load Balancing**: Multiple algorithms (cache-aware, power of two, consistent hashing, random, round robin)
+- **Load Balancing**: KV-aware prefix reuse, cache-aware routing, and general-purpose policies
 - **Program Scheduling**: Optional Program identity, RequestPool admission, Progress-TTL, and Global Queue placement for agent workloads
 - **Prefill-Decode Disaggregation**: Specialized routing for separated processing phases
 - **Service Discovery**: Kubernetes-native worker management and health monitoring
@@ -236,6 +236,7 @@ The router supports multiple load balancing policies:
 | `consistent_hash` | Routes same session/user to same worker | Yes | Multi-turn chat, KV cache reuse |
 | `power_of_two` | Picks least loaded of two random workers | No | Load-sensitive workloads |
 | `cache_aware` | Optimizes for prefix cache hits | Yes | Repeated prompts, few-shot |
+| [`kv_aware`](docs/load_balancing/http_completion_kv.md) | Scores observed KV reuse and worker load | Optional | Full and hybrid attention in colocated and P/D deployments |
 
 ```bash
 # Example: Using consistent_hash with HTTP header for session affinity
