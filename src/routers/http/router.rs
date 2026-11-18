@@ -2232,6 +2232,10 @@ impl Router {
     }
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
+        if let Some(epd) = &self.epd {
+            epd.validate_consumer_url(worker_url)?;
+        }
+
         let mut urls = self.get_worker_urls();
         urls.push(worker_url.to_string());
         crate::backend::classify_worker_urls(&urls)?;

@@ -154,12 +154,22 @@ async fn regular_epd_workers_list_to_detail() {
     assert_epd_list_to_detail(false).await;
 }
 
-#[tokio::test]
-async fn regular_epd_dp_http_delete_removes_exact_encode_worker() {
+struct RegularEpdDpFixture {
+    app: axum::Router,
+    context: Arc<AppContext>,
+    router: Arc<dyn RouterTrait>,
+    encoder_url: String,
+    retained_encoder_url: String,
+    consumer_url: String,
+    consumer_urls: Vec<String>,
+    backend: tokio::task::JoinHandle<()>,
+}
+
+async fn regular_epd_dp_fixture() -> RegularEpdDpFixture {
     let backend = Router::new().fallback(|| async { "ok" });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    let backend = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
 
     let consumer_url = format!("{base}/pd");
     let encoder_url = format!("{base}/e");
@@ -190,7 +200,6 @@ async fn regular_epd_dp_http_delete_removes_exact_encode_worker() {
         vec![format!("{consumer_url}@0"), format!("{consumer_url}@1")]
     );
 
-    let initial_counts = context.policy_registry.get_worker_counts();
     let app = build_app_with_request_tracing(
         Arc::new(AppState {
             router: router.clone(),
@@ -204,10 +213,71 @@ async fn regular_epd_dp_http_delete_removes_exact_encode_worker() {
         false,
         false,
     );
+    RegularEpdDpFixture {
+        app,
+        context,
+        router,
+        encoder_url,
+        retained_encoder_url,
+        consumer_url,
+        consumer_urls,
+        backend,
+    }
+}
+
+#[tokio::test]
+async fn regular_epd_dp_add_rejects_encode_url_with_trailing_slash() {
+    let fixture = regular_epd_dp_fixture().await;
+    let add_url = format!("{}/", fixture.encoder_url);
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/workers")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"url": add_url, "worker_type": "regular"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
+    assert!(error["error"]
+        .as_str()
+        .unwrap()
+        .contains("Encode and consumer"));
+    assert_eq!(
+        fixture
+            .context
+            .worker_registry
+            .get_by_url(&fixture.encoder_url)
+            .unwrap()
+            .worker_type(),
+        WorkerType::Encode
+    );
+    for rank in 0..2 {
+        assert!(fixture
+            .context
+            .worker_registry
+            .get_by_url(&format!("{}/@{rank}", fixture.encoder_url))
+            .is_none());
+    }
+    assert_eq!(fixture.router.get_worker_urls(), fixture.consumer_urls);
+    fixture.backend.abort();
+}
+
+#[tokio::test]
+async fn regular_epd_dp_http_delete_removes_exact_encode_worker() {
+    let fixture = regular_epd_dp_fixture().await;
+    let initial_counts = fixture.context.policy_registry.get_worker_counts();
 
     let encoded_url: String =
-        url::form_urlencoded::byte_serialize(encoder_url.as_bytes()).collect();
-    let response = app
+        url::form_urlencoded::byte_serialize(fixture.encoder_url.as_bytes()).collect();
+    let response = fixture
+        .app
         .clone()
         .oneshot(
             Request::delete(format!("/workers/{encoded_url}"))
@@ -221,25 +291,41 @@ async fn regular_epd_dp_http_delete_removes_exact_encode_worker() {
         serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
     assert_eq!(deletion["success"], true);
 
-    assert!(context.worker_registry.get_by_url(&encoder_url).is_none());
-    assert!(context
+    assert!(fixture
+        .context
         .worker_registry
-        .get_by_url(&retained_encoder_url)
+        .get_by_url(&fixture.encoder_url)
+        .is_none());
+    assert!(fixture
+        .context
+        .worker_registry
+        .get_by_url(&fixture.retained_encoder_url)
         .is_some());
-    assert_eq!(context.policy_registry.get_worker_counts(), initial_counts);
-    assert_eq!(router.get_worker_urls(), consumer_urls);
+    assert_eq!(
+        fixture.context.policy_registry.get_worker_counts(),
+        initial_counts
+    );
+    assert_eq!(fixture.router.get_worker_urls(), fixture.consumer_urls);
 
-    let encode_pool = context.worker_registry.get_by_type(&WorkerType::Encode);
+    let encode_pool = fixture
+        .context
+        .worker_registry
+        .get_by_type(&WorkerType::Encode);
     assert_eq!(encode_pool.len(), 1);
-    let selected_index = context
+    let selected_index = fixture
+        .context
         .policy_registry
         .get_encode_policy()
         .unwrap()
         .select_worker(&encode_pool, None)
         .unwrap();
-    assert_eq!(encode_pool[selected_index].url(), retained_encoder_url);
+    assert_eq!(
+        encode_pool[selected_index].url(),
+        fixture.retained_encoder_url
+    );
 
-    let list_response = app
+    let list_response = fixture
+        .app
         .clone()
         .oneshot(Request::get("/workers").body(Body::empty()).unwrap())
         .await
@@ -251,9 +337,10 @@ async fn regular_epd_dp_http_delete_removes_exact_encode_worker() {
         .as_array()
         .unwrap()
         .iter()
-        .all(|worker| worker["url"] != encoder_url));
+        .all(|worker| worker["url"] != fixture.encoder_url));
 
-    let detail_response = app
+    let detail_response = fixture
+        .app
         .clone()
         .oneshot(
             Request::get(format!("/workers/{encoded_url}"))
@@ -265,8 +352,9 @@ async fn regular_epd_dp_http_delete_removes_exact_encode_worker() {
     assert_eq!(detail_response.status(), StatusCode::NOT_FOUND);
 
     let encoded_consumer: String =
-        url::form_urlencoded::byte_serialize(consumer_url.as_bytes()).collect();
-    let response = app
+        url::form_urlencoded::byte_serialize(fixture.consumer_url.as_bytes()).collect();
+    let response = fixture
+        .app
         .oneshot(
             Request::delete(format!("/workers/{encoded_consumer}"))
                 .body(Body::empty())
@@ -275,8 +363,8 @@ async fn regular_epd_dp_http_delete_removes_exact_encode_worker() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(router.get_worker_urls().is_empty());
-    server.abort();
+    assert!(fixture.router.get_worker_urls().is_empty());
+    fixture.backend.abort();
 }
 
 #[tokio::test]

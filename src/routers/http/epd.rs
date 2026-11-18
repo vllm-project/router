@@ -117,6 +117,21 @@ fn cancel_ec_transfers(control_addr: &str, transfer_ids: &[String]) -> anyhow::R
 }
 
 impl EncoderStage {
+    pub(super) fn validate_consumer_url(&self, url: &str) -> Result<(), String> {
+        let consumer_base = super::dp_utils::parse_worker_url(url).0;
+        let canonical_consumer = canonical_epd_base_url(&consumer_base);
+        if canonical_consumer.is_some_and(|consumer| {
+            self.config
+                .encoder_urls
+                .iter()
+                .filter_map(|encoder| canonical_epd_base_url(encoder))
+                .any(|encoder| encoder == consumer)
+        }) {
+            return Err("EPD Encode and consumer URLs must not conflict".into());
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_consumers<'a>(
         config: &EpdConfig,
         urls: impl Iterator<Item = &'a str>,
@@ -430,6 +445,12 @@ impl EncoderStage {
         );
         Ok((body, pending))
     }
+}
+
+fn canonical_epd_base_url(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .map(|parsed| parsed.as_str().trim_end_matches('/').to_string())
 }
 
 fn collect_media_items(body: &Value) -> Result<Vec<MediaItem>, EpdError> {
