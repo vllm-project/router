@@ -19,9 +19,7 @@ For a local worker, set the model path and the HTTP, publisher and replay ports.
 MODEL=/models/Qwen3-4B-Instruct-2507
 SERVED=qwen3
 HTTP=8000
-EVENTS=$(jq -nc --arg topic "kv-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')" \
-  '{enable_kv_cache_events:true,publisher:"zmq",endpoint:"tcp://127.0.0.1:5557",
-    replay_endpoint:"tcp://127.0.0.1:5558",topic:$topic,buffer_steps:30000}')
+EVENTS='{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://127.0.0.1:5557","replay_endpoint":"tcp://127.0.0.1:5558","topic":"qwen3-8000-start01","buffer_steps":30000}'
 
 VLLM_SERVER_DEV_MODE=1 vllm serve "$MODEL" --host 127.0.0.1 --port "$HTTP" \
   --served-model-name "$SERVED" --enable-prefix-caching --kv-events-config "$EVENTS"
@@ -30,7 +28,7 @@ VLLM_SERVER_DEV_MODE=1 vllm serve "$MODEL" --host 127.0.0.1 --port "$HTTP" \
 For a gRPC worker, replace the serve command.
 
 ```bash
-"${VLLM_RS:-vllm-rs}" serve "$MODEL" --host 127.0.0.1 --port "$HTTP" --grpc-port 50051 -- \
+VLLM_SERVER_DEV_MODE=1 "${VLLM_RS:-vllm-rs}" serve "$MODEL" --host 127.0.0.1 --port "$HTTP" --grpc-port 50051 -- \
   --served-model-name "$SERVED" --enable-prefix-caching --kv-events-config "$EVENTS"
 ```
 
@@ -38,7 +36,7 @@ Use distinct ports and GPU placement for additional workers. Across hosts, bind 
 
 ### Hybrid attention models
 
-Use the [hybrid model recipes](hybrid_kv_recipes.md) to start the engine and export its layout. HTTP `/kv_event_sources` and gRPC `GetKvEventSources` discover publisher and replay endpoints. The layout supplies each rank's hash root and all cache groups, including groups that emit no events.
+Use the [hybrid layout example](hybrid_kv_recipes.md) to start the engine and write its layout JSON. The Router discovers publisher and replay endpoints over HTTP or gRPC.
 
 ## 2. Start the Router
 
@@ -55,12 +53,12 @@ vllm-router --host 127.0.0.1 --port 19000 --policy kv_aware --worker-urls "${WOR
 
 Use one served model per regular pool. For separate model pools, enable `--enable-igw` and register each worker through `POST /workers` with its `model_id`.
 
-- **Hybrid workers.** Add `--kv-hybrid-layout layout.json`. [Build the file from exported rank layouts](hybrid_kv_recipes.md#colocated-layout).
+- **Hybrid workers.** Add `--kv-hybrid-layout layout.json`. [See the colocated JSON example](hybrid_kv_recipes.md#colocated-layout).
 - **Static event sources.** If discovery is unavailable, supply `--kv-event-source 'WORKER_URL=tcp://HOST:5557'` and `--kv-event-replay-source 'WORKER_URL=tcp://HOST:5558'` per worker, plus `--kv-event-block-size` and `--kv-event-model`. For a hybrid worker, the layout supplies the topic.
 
 ### P/D routing
 
-Start separate engines with the same model and compatible transfer settings. For NIXL, pass `--kv-transfer-config` with `"kv_connector":"NixlConnector"` and set `kv_role` to `kv_producer` on prefill and `kv_consumer` on decode. Give each engine a reachable `VLLM_NIXL_SIDE_CHANNEL_HOST` and its own `VLLM_NIXL_SIDE_CHANNEL_PORT`. Enable KV events and replay on prefill. See the [complete NIXL example](hybrid_kv_recipes.md#hybrid-pd-example).
+Start separate engines with the same model and compatible transfer settings. For NIXL, pass `--kv-transfer-config` with `"kv_connector":"NixlConnector"` and set `kv_role` to `kv_producer` on prefill and `kv_consumer` on decode. Give each engine a reachable `VLLM_NIXL_SIDE_CHANNEL_HOST` and its own `VLLM_NIXL_SIDE_CHANNEL_PORT`. Enable KV events and replay on prefill.
 
 ```bash
 PREFILL=${PREFILL:-http://127.0.0.1:8000}
@@ -75,7 +73,7 @@ vllm-router --port 19000 --vllm-pd-disaggregation --prefill "$PREFILL" --decode 
 Repeat `--prefill` and `--decode` for multiple workers. Match `--kv-connector` to the engines. The [gRPC P/D API](../backend/grpc.md#pd-disaggregation) requires vLLM 0.30.0 or later.
 
 - **Full attention without event discovery.** Add `--pd-kv-events 'PREFILL_URL=tcp://HOST:5557'` for 16-token blocks.
-- **Hybrid attention.** Add `--pd-hybrid-config pd-layout.json` with [explicit compatible pairs](hybrid_kv_recipes.md#hybrid-pd-example). Disable Program scheduling.
+- **Hybrid attention.** Add `--pd-hybrid-config pd-layout.json` with [explicit compatible pairs](hybrid_kv_recipes.md#pd-layout). Disable Program scheduling.
 
 ### Optional CLI settings
 
@@ -90,16 +88,14 @@ See [all routing options](../cli_reference.md#routing-policies).
 
 ### Reporting and restarts
 
-Use incremental reporting on monitored workers. Explicit `vllm_xargs.kv_cache_report_mode=full` is rejected. Hybrid cache recovery requires ordered replay from an empty cache. After a hybrid worker restarts or its layout changes, export a fresh layout and restart the Router with the updated file.
+Use incremental reporting on monitored workers. Explicit `vllm_xargs.kv_cache_report_mode=full` is rejected. Hybrid cache recovery requires ordered replay from an empty cache. When a hybrid worker is restarted, update its publisher topic and any changed layout values in the JSON, then restart the Router with the updated file.
 
 ## Verify reuse
 
-Put a prompt spanning several cache pages in `long-prompt.txt` and set the served model name. Send the request twice, allowing cache events from the first request to arrive.
+Save a chat request as `request.json` with the served model name and a prompt spanning several cache pages. Send the request twice, allowing cache events from the first request to arrive.
 
 ```bash
 curl -fsS http://127.0.0.1:19000/health
-jq -n --arg model qwen3 --rawfile prompt long-prompt.txt \
-  '{model:$model,messages:[{role:"user",content:$prompt}],max_tokens:1}' > request.json
 curl -fsS http://127.0.0.1:19000/v1/chat/completions -H 'Content-Type: application/json' --data-binary @request.json
 curl -fsS http://127.0.0.1:29000/metrics | grep vllm_router_kv_placement_lookups_total
 ```
