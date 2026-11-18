@@ -393,7 +393,20 @@ pub struct QueuedRequest {
     /// Time when the request was queued
     queued_at: tokio::time::Instant,
     /// Channel to send the permit back when acquired
-    permit_tx: oneshot::Sender<Result<OwnedSemaphorePermit, StatusCode>>,
+    permit_tx: oneshot::Sender<Result<QueueGrant, StatusCode>>,
+}
+
+/// Own both reservations across the oneshot handoff until dispatch starts.
+struct QueueGrant {
+    permit: OwnedSemaphorePermit,
+    rate: crate::core::token_bucket::TokenReservation,
+}
+
+impl QueueGrant {
+    fn dispatch(self) -> OwnedSemaphorePermit {
+        self.rate.commit();
+        self.permit
+    }
 }
 
 /// Queue metrics for monitoring
@@ -475,18 +488,17 @@ impl QueueProcessor {
                         return None;
                     }
 
-                    if token_bucket.try_acquire(1.0).await.is_ok() {
-                        return Some(Ok(permit));
+                    if let Ok(rate) = token_bucket.try_reserve(1.0).await {
+                        return Some(Ok(QueueGrant { permit, rate }));
                     }
                 }
             })
             .await;
 
             match acquisition {
-                Ok(Some(Ok(permit))) => {
-                    if queued.permit_tx.send(Ok(permit)).is_err() {
+                Ok(Some(Ok(grant))) => {
+                    if queued.permit_tx.send(Ok(grant)).is_err() {
                         debug!("Queued request was cancelled before permit delivery");
-                        token_bucket.return_tokens(1.0).await;
                     }
                 }
                 Ok(Some(Err(status))) => {
@@ -680,8 +692,9 @@ pub async fn concurrency_limit_middleware(
                 drop(queue_metric);
 
                 match permit_result {
-                    Ok(Ok(permit)) => {
+                    Ok(Ok(grant)) => {
                         debug!("Acquired concurrency permit from queue");
+                        let permit = grant.dispatch();
                         let response = next.run(request).await;
                         hold_permit_for_body(response, permit)
                     }
@@ -703,5 +716,84 @@ pub async fn concurrency_limit_middleware(
     } else {
         warn!("No admission capacity available and queuing is disabled, returning 429");
         too_many_requests(&token_bucket).await
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod queue_grant_tests {
+    use super::*;
+
+    async fn delivered_grant() -> (
+        Arc<TokenBucket>,
+        Arc<Semaphore>,
+        oneshot::Receiver<Result<QueueGrant, StatusCode>>,
+    ) {
+        let bucket = Arc::new(TokenBucket::new(1, 1));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (limiter, processor) =
+            ConcurrencyLimiter::new(bucket.clone(), semaphore.clone(), 1, Duration::from_secs(5));
+        let queue_tx = limiter.queue_tx.unwrap();
+        let (permit_tx, permit_rx) = oneshot::channel();
+        assert!(queue_tx
+            .try_send(QueuedRequest {
+                queued_at: tokio::time::Instant::now(),
+                permit_tx,
+            })
+            .is_ok());
+        // Drive the real processor to completion without polling the receiver.
+        drop(queue_tx);
+        processor.unwrap().run().await;
+        (bucket, semaphore, permit_rx)
+    }
+
+    #[tokio::test]
+    async fn failed_send_refunds_both_reservations() {
+        let bucket = Arc::new(TokenBucket::new(1, 1));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let grant = QueueGrant {
+            permit: semaphore.clone().acquire_owned().await.unwrap(),
+            rate: bucket.try_reserve(1.0).await.unwrap(),
+        };
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        let delivery = tx.send(grant);
+        assert!(delivery.is_err());
+        drop(delivery);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+        assert!(bucket.try_acquire(1.0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unread_successful_handoff_reserves_then_refunds_rate_token() {
+        let (bucket, semaphore, rx) = delivered_grant().await;
+        assert_eq!(semaphore.available_permits(), 0);
+        // The queued grant must prevent a competing admission spending its token.
+        assert!(bucket.try_acquire(1.0).await.is_err());
+        drop(rx);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+        assert!(bucket.try_acquire(1.0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn received_grant_cancelled_before_dispatch_refunds_rate_token() {
+        let (bucket, semaphore, rx) = delivered_grant().await;
+        let grant = rx.await.unwrap().unwrap();
+        drop(grant);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatched_grant_charges_once_and_completion_does_not_refund() {
+        let (bucket, semaphore, rx) = delivered_grant().await;
+        let permit = rx.await.unwrap().unwrap().dispatch();
+        assert_eq!(semaphore.available_permits(), 0);
+        assert!(bucket.try_acquire(1.0).await.is_err());
+        drop(permit);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert!(bucket.try_acquire(1.0).await.is_err());
     }
 }

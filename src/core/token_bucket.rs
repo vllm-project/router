@@ -18,6 +18,27 @@ pub struct TokenBucket {
     refill_rate: f64, // tokens per second
 }
 
+/// A rate token withheld until dispatch, refunded if admission is abandoned.
+#[must_use]
+pub(crate) struct TokenReservation {
+    bucket: Option<TokenBucket>,
+    tokens: f64,
+}
+
+impl TokenReservation {
+    pub(crate) fn commit(mut self) {
+        self.bucket = None;
+    }
+}
+
+impl Drop for TokenReservation {
+    fn drop(&mut self) {
+        if let Some(bucket) = &self.bucket {
+            bucket.refund(self.tokens);
+        }
+    }
+}
+
 struct TokenBucketInner {
     tokens: f64,
     last_refill: Instant,
@@ -80,6 +101,15 @@ impl TokenBucket {
         } else {
             Err(())
         }
+    }
+
+    /// Reserve rate capacity before handing admission to another task.
+    pub(crate) async fn try_reserve(&self, tokens: f64) -> Result<TokenReservation, ()> {
+        self.try_acquire(tokens).await?;
+        Ok(TokenReservation {
+            bucket: Some(self.clone()),
+            tokens,
+        })
     }
 
     /// Wait until `tokens` are expected to be available without consuming them.
@@ -145,6 +175,11 @@ impl TokenBucket {
 
     /// Return tokens to the bucket (for cancelled requests)
     pub async fn return_tokens(&self, tokens: f64) {
+        self.refund(tokens);
+    }
+
+    // Synchronous so a dropped handoff refunds before another admission runs.
+    fn refund(&self, tokens: f64) {
         let mut inner = self.inner.lock();
         inner.tokens = (inner.tokens + tokens).min(self.capacity);
         self.notify.notify_waiters();
