@@ -19,9 +19,11 @@ When every changed path is under `docs/`, ends in `.md`, or is
 documentation additions and deletions. Mixed code/documentation changes run CI.
 For PRs (including `merge-test`), the bootstrap fetches the target branch and
 compares its merge base with `HEAD`. Merge queues compare against Buildkite's
-recorded queue base commit. Default-branch builds compare `HEAD^1` to `HEAD`,
-covering the complete PR for merge commits and squash merges. For rebase merges
-or multi-commit pushes, this comparison covers only the final commit.
+recorded queue base commit. Default-branch pushes always run full CI because
+the bootstrap has no verified pre-push SHA to compare the complete push range.
+It does not fall back to `HEAD^1`, which could miss earlier code changes in a
+multi-commit push. Skipping post-merge pushes requires a verified push range
+from the webhook before it can be enabled safely.
 Renames include both the old and new paths. Empty or unresolved diffs run CI.
 Scheduled builds and `NIGHTLY=1` always run CI.
 PR labels `ready`, `merge-test`, and `nightly-test` do not override docs-only
@@ -43,7 +45,8 @@ on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 
 A pull request labeled `ready` uploads `test-ready.yml`, including forks,
 unless the bootstrap skips it as documentation-only. The same exception applies
-to `merge-test` and default-branch/merge-queue L2 uploads.
+to `merge-test` and merge-queue L2 uploads. Default-branch push L2 uploads
+remain enabled.
 `test-merge.yml` has no per-job `if`. In `test-ready.yml` and `test-nightly.yml`, a job whose gate is narrower than the upload keeps its own `if`.
 
 GPU machine presets are in [`ci_mirror_hardwares.yml`](ci_mirror_hardwares.yml).

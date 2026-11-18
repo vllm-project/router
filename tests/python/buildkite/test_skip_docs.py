@@ -102,11 +102,11 @@ class TestDocsOnlyChanges:
             **overrides,
         }
 
-    def test_main_squash_docs(self):
+    def test_main_squash_docs_without_push_base_runs(self):
         self.git("checkout", "main")
         self.write("README.md", "squashed documentation\n")
         self.commit()
-        assert skip_docs.docs_only_change(self.main_env())
+        assert not skip_docs.docs_only_change(self.main_env())
 
     def test_main_merge_includes_all_pr_commits(self):
         self.write("src/main.rs", "// code change in earlier commit\n")
@@ -117,12 +117,20 @@ class TestDocsOnlyChanges:
         self.git("merge", "--no-ff", "feature", "-m", "Merge PR")
         assert not skip_docs.docs_only_change(self.main_env())
 
-    def test_main_docs_merge(self):
+    def test_main_docs_merge_without_push_base_runs(self):
         self.write("README.md", "documentation\n")
         self.commit()
         self.git("checkout", "main")
         self.git("merge", "--no-ff", "feature", "-m", "Merge PR")
-        assert skip_docs.docs_only_change(self.main_env())
+        assert not skip_docs.docs_only_change(self.main_env())
+
+    def test_main_push_code_then_docs_runs(self):
+        self.git("checkout", "main")
+        self.write("src/main.rs", "// code in the first pushed commit\n")
+        self.commit()
+        self.write("README.md", "docs in the last pushed commit\n")
+        self.commit()
+        assert not skip_docs.docs_only_change(self.main_env())
 
     def test_merge_queue_docs_and_code(self):
         base = self.git("rev-parse", "HEAD").decode().strip()

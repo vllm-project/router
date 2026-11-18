@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Skip Buildkite builds/tests for documentation-only changes.
 
-PRs, merge queues and default-branch commits qualify. Nightly and scheduled
-builds always run, as do unresolved diffs.
+PRs and merge queues qualify. Default-branch pushes run full CI because the
+bootstrap has no verified pre-push SHA. Nightly and scheduled builds always
+run, as do unresolved diffs.
 Use a merge-base diff and disable rename detection so moving code into docs
 cannot hide the deletion of a source file.
 """
@@ -46,14 +47,9 @@ def docs_only_change(env: Mapping[str, str]) -> bool:
             # Always fetch the target: agent refs can be missing or stale.
             git("fetch", "--no-tags", "origin", f"refs/heads/{base}")
             ancestor = git("merge-base", "FETCH_HEAD", "HEAD")
-        elif (
-            not pr.isdecimal()
-            and env.get("BUILDKITE_PIPELINE_DEFAULT_BRANCH")
-            and env.get("BUILDKITE_BRANCH") == env["BUILDKITE_PIPELINE_DEFAULT_BRANCH"]
-        ):
-            # First-parent diff captures the entire merged PR, or squash commit.
-            ancestor = git("rev-parse", "--verify", "HEAD^1")
         else:
+            # HEAD^1 only covers the last commit, not necessarily the full push.
+            # Without a verified webhook `before` SHA, do not skip branch CI.
             return False
         changed = git("diff", "--name-only", "--no-renames", "-z", ancestor, "HEAD")
         files = [path for path in changed.split("\0") if path]
