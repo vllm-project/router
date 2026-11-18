@@ -21,7 +21,11 @@ the failure modes that are easy to mistake for "no benefit".
 This procedure applies to Program scheduling on the Router's internal-DP path,
 with one or more workers and either single-node or multi-node placement. In the
 formulas below, `dp` is the total number of DP Ranks across all workers, and
-`per_rank_capacity` is read separately for each Rank.
+`per_rank_capacity` assumes a common measured capacity across homogeneous Ranks.
+Read every Rank's startup capacity to verify that assumption. The Router's
+`token_capacity_per_dp_rank` is one scalar applied to every Rank, not a map of
+per-Rank limits; use the conservative mixed-Rank procedure in section 3.1 when
+the measured capacities differ.
 
 It does not apply to PD-disaggregated deployments. Those use a different
 scheduling path and different capacity boundaries; see
@@ -63,9 +67,13 @@ record the result as a non-regression case rather than a failed experiment.
 2. Before `stats_window_size` samples accumulate, the automatic TTL is `0` and
    the growth reserve is `0`. A cold Router therefore pauses on the first tool
    gap.
-3. Progress-TTL retains KV that would otherwise be evicted. It cannot create
-   reuse when the working set fits in capacity; in that regime only the affinity
-   component can help.
+3. Progress-TTL controls Router admission and logical token reservations to
+   reduce competing KV demand across tool gaps. It does not pin physical KV
+   blocks or execute engine eviction, offload, or prefetch. An engine can still
+   evict blocks before the logical TTL expires. Armed TTL and a hit-rate gain
+   establish logical scheduling behavior and measured reuse, not physical
+   residency. With a working set that already fits, there may be little reuse
+   to recover; measure affinity and full-scheduler effects separately.
 
 ## 1. Preconditions
 
@@ -101,8 +109,17 @@ equals the engine's data-parallel size, otherwise the per-Rank view is wrong.
   config JSON.
 - Keep the baseline on the default request-level policy (`cache_aware`). A
   degraded baseline (`round_robin`) measures the baseline, not the feature.
-- Restart the engine before each arm so prefix cache and cumulative counters
-  start clean, and keep the start-of-run metrics as cold-start evidence.
+- For every recorded cold-start arm, including C0/C and TTL-sweep arms, restart
+  both the Router and the engines. The engine restart clears prefix cache and
+  its counters; the Router restart clears Program/affinity bindings, queued
+  state, and learned rank windows. Refreshing unchanged rank registrations or
+  only waiting for Programs to expire does not clear learned rank windows.
+- Use the same readiness and idle-observation procedure before traffic. Save
+  startup logs, start-of-run metrics, and enabled-arm scheduling diagnostics;
+  verify no leftover Programs or queued requests and zero rank
+  `rolling.request_samples` / `rolling.continuity_samples`. For a separate
+  warm-state comparison, document equivalent warmup histories and scheduler
+  state in both arms; do not present an engine-only restart as a cold start.
 - Hold the task set (same IDs and order), concurrency, sampling, engine
   context-length and memory-utilization settings, and node count fixed. Once
   concurrency is chosen, it is no longer a variable.
@@ -128,6 +145,14 @@ in-flight ratio rho = r * CC * mean_context / (dp * per_rank_capacity) target 0.
 gap coverage        = TTL > p95(tool-call gap)
 ```
 
+The capacity ratios assume homogeneous Ranks and roughly balanced load. With
+mixed capacities, the smallest measured Rank capacity can be used for a
+conservative screening calculation, but `dp * min_capacity` is only a lower
+bound on total physical capacity. Check each Rank's load, cache pressure, and
+hit ratio; an aggregate ratio or the common logical limit does not establish
+physical eviction pressure. Gap coverage refers to logical TTL, not a guarantee
+that the engine keeps the blocks resident.
+
 - `r` is in-flight requests divided by concurrency. It depends on the workload:
   interactive coding agents have been observed around 0.28–0.37 at low pressure,
   while traffic with no gaps can approach 1 and long tool or deliberation gaps
@@ -148,9 +173,18 @@ gap coverage        = TTL > p95(tool-call gap)
 Read the per-Rank KV capacity from the engine's startup output (vLLM prints
 `GPU KV cache size`), not from block counters. Block-count arithmetic has
 disagreed with the engine's own number by more than 2x on real deployments,
-which shifts every admission decision. Set
-`token_capacity_per_dp_rank = 0.95 * log_value` and leave `low_watermark_ratio`
-at 1.0; discounting twice removes the headroom twice.
+which shifts every admission decision. For homogeneous Ranks, start with
+`token_capacity_per_dp_rank = floor(0.95 * common_log_capacity)`.
+
+For mixed Ranks, this Router still applies one scalar to every Rank: use
+`floor(0.95 * min(all_rank_log_capacities))`, including every worker's Ranks.
+Do not use the largest Rank, an average, or a summed capacity as that per-Rank
+limit. This conservative starting point leaves some capacity on larger Ranks
+unused by the logical guard; record the per-Rank measurements and that trade-off,
+and verify pressure per Rank rather than assuming uniform utilization. Leave
+`low_watermark_ratio` at 1.0 when capacity already includes the 0.95 discount;
+discounting twice removes the headroom twice. Logical admission limits do not
+guarantee physical KV residency.
 
 Re-read the value after any change to the engine's memory-utilization or
 context-length setting (`--gpu-memory-utilization`, `--max-model-len` in vLLM),
@@ -162,10 +196,11 @@ the hardware.
 Run a short baseline arm and derive `r`, mean context, and the gap distribution
 from the request log. Two useful analyses:
 
-- gap-to-hit-rate buckets: if long gaps return with a materially lower hit rate
-  than short gaps, the KV was lost during the gap and a longer TTL can pay. If
-  all buckets look alike, the hits come from first turns or backend eviction,
-  and lengthening TTL will not help.
+- gap-to-hit-rate buckets: lower hit rates after long gaps show reduced reuse,
+  not proof of eviction or a benefit from a longer logical TTL. Check request
+  prefix stability, placement, and backend cache pressure, then use the C/C0
+  control in section 8 to test retention. A flat bucket profile alone does not
+  identify where the hits came from or rule out a TTL effect.
 - in-flight ratio: `requests * mean_latency / wall_time` divided by concurrency.
 
 ### 3.3 Concurrency and task count
@@ -207,7 +242,8 @@ pick the value that lands the token cache hit in the 80–88% band. The band is 
 heuristic for workloads capable of high reuse at low pressure; if the workload
 cannot reach it, record a non-regression result instead of forcing eviction.
 Each probe needs its own result directory, and probe runs are not evidence:
-restart the engine before the recorded arms. Freeze concurrency here.
+restart both the Router and engines before the recorded arms, following section
+1.2. Freeze concurrency here.
 
 ## 4. Tuning order
 
@@ -219,7 +255,7 @@ changes dominate everything.
 
 | Field | Default | Guidance |
 |---|---:|---|
-| `token_capacity_per_dp_rank` | `null` (count guard only) | `0.95 * log capacity`; recheck it when persistent queueing or INFO `unexpected_cache_discontinuity` events appear, but neither alone proves a capacity error |
+| `token_capacity_per_dp_rank` | `null` (count guard only) | One scalar for all Ranks: start with `floor(0.95 * smallest rank log capacity)`; see section 3.1. Recheck it when persistent queueing or INFO `unexpected_cache_discontinuity` events appear, but neither alone proves a capacity error |
 | `max_active_programs_per_target` | `64` | Scale with concurrency: about `CC / dp * 1.2`. Leaving it at a value sized for a smaller run makes the count guard bind before token admission |
 | `high_watermark_ratio` / `low_watermark_ratio` | `1.0` / `1.0` | Keep 1.0 when capacity already carries the 0.95 discount |
 | `admission_waiting_request_threshold` | `1` | Backend waiting-queue ceiling: ordinary admission/resume blocks when `waiting >= threshold`; `0` disables the gate. Raising it relaxes backpressure and can worsen backend queueing. Increase only when evidence shows the gate suppresses useful concurrency, not in response to a request avalanche |
@@ -292,8 +328,9 @@ gap p95, all else equal. This override isolates retention duration from the
 automatic interval fit and impact cap; sweeping `max_acting_ttl_seconds` alone
 does not establish that the acting TTL changed. Verify the armed TTL and pause
 reasons in each arm, since capacity or segment yields can still end retention
-early. A flat sweep is informative only if retention actually changed; then
-return to section 3 to investigate other limits. Restore automatic TTL selection
+early, and the engine can evict physical blocks while logical retention remains
+active. A flat sweep is informative only if logical retention actually changed;
+then return to section 3 to investigate other limits. Restore automatic TTL selection
 after the diagnostic. Fixed-second values are only meaningful once the gap scale
 is known.
 
@@ -304,7 +341,7 @@ an end-to-end result.
 
 | Layer | Evidence |
 |---|---|
-| Mechanism | token cache hit ratio moves; armed TTL is non-zero and consistent with the calibration; pause reasons match the workload's gap distribution |
+| Mechanism | token cache hit ratio moves; logical armed TTL is non-zero and consistent with the calibration; pause reasons match the workload's gap distribution. These signals do not establish physical KV residency; a residency claim needs independent engine evidence |
 | End to end | job completion time p50/p95 and wall time do not regress; TTFT p95 does not regress |
 | Correctness and cost | resolved/completed tasks do not degrade (paired test); input and output token volume stays comparable |
 
@@ -368,9 +405,10 @@ queueing, task completion, and end-to-end cost.
 - Tuning TTL before confirming eviction pressure. No pressure means no effect.
 - Raising `max_acting_ttl_seconds` without fixing the cost model. The impact cap
   absorbs it.
-- Comparing arms without restarting the engine. Prefix cache and cumulative
-  counters leak across arms and bias the hit-rate comparison in favor of the
-  second arm.
+- Comparing cold-start arms after restarting only the engine. Router affinity
+  and learned rank windows can carry over and mature automatic TTL earlier in
+  a later arm. Restart both components as in section 1.2; record equivalent
+  histories explicitly for a separate warm-state experiment.
 - Changing concurrency and TTL in the same round. The two effects are then
   inseparable.
 - Enabling `global_queue` at low in-flight ratio. Cross-Rank moves discard the
