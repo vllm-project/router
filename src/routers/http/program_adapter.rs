@@ -93,6 +93,7 @@ impl ProgramCompletion {
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn finished_success(&self) -> bool {
         self.inner.finished_success.load(Ordering::Acquire)
     }

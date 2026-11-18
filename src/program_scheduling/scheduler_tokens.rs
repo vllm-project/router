@@ -365,7 +365,13 @@ impl ProgramScheduler {
             return;
         };
         if prepared == observed {
-            self.mark_fingerprint_verified(state, fingerprint);
+            // In-flight matches still supply usage evidence, but cannot put a
+            // revoked fingerprint (or a disabled pool) back in the verified LRU.
+            if !self.fingerprint_revoked(state, Some(fingerprint))
+                && !state.token_fingerprint_saturated_pools.contains(model_pool)
+            {
+                self.mark_fingerprint_verified(state, fingerprint);
+            }
             return;
         }
         // A mismatch revokes this class until restart; matching later responses
@@ -458,6 +464,7 @@ impl ProgramScheduler {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::program_scheduling::{
@@ -999,11 +1006,81 @@ mod tests {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod revocation_tests {
     use super::tests::identity;
     use super::*;
     use crate::program_scheduling::*;
     use std::time::Duration;
+
+    #[test]
+    fn late_matches_do_not_reverify_revoked_or_saturated_fingerprints() {
+        for saturated in [false, true] {
+            let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+            let fingerprint = TokenizerFingerprint::from_parts(&["late-match"]);
+            let mut state = scheduler.state.lock();
+            scheduler.reconcile_observed_prompt_tokens(
+                &mut state,
+                "model",
+                TokenFactSource::PreparedTokenIds,
+                Some(fingerprint),
+                Some(10),
+                Some(11),
+            );
+            if saturated {
+                // An overflow entry is removed from the revoked map, while
+                // its entire model pool remains disabled until restart.
+                state.revoked_token_fingerprints.remove(&fingerprint);
+                state
+                    .token_fingerprint_saturated_pools
+                    .insert("model".into());
+            }
+            for index in 0..MAX_VERIFIED_FINGERPRINTS {
+                scheduler.reconcile_observed_prompt_tokens(
+                    &mut state,
+                    "other-model",
+                    TokenFactSource::PreparedTokenIds,
+                    Some(TokenizerFingerprint::from_parts(&[&format!(
+                        "valid-{index}"
+                    )])),
+                    Some(10),
+                    Some(10),
+                );
+            }
+            let verified_before = state.verified_token_fingerprints.clone();
+            let sequence_before = state.token_fingerprint_verification_sequence;
+            // A previously dispatched attempt reports a match after revocation.
+            scheduler.reconcile_observed_prompt_tokens(
+                &mut state,
+                "model",
+                TokenFactSource::PreparedTokenIds,
+                Some(fingerprint),
+                Some(10),
+                Some(10),
+            );
+            assert!(
+                state.verified_token_fingerprints == verified_before,
+                "a late match changed the verified LRU after revocation (saturated={saturated})"
+            );
+            assert_eq!(
+                state.token_fingerprint_verification_sequence,
+                sequence_before
+            );
+            drop(state);
+            assert_eq!(
+                scheduler.diagnostics().verified_token_fingerprints,
+                MAX_VERIFIED_FINGERPRINTS
+            );
+            let context = scheduler.resolve_arrival_tokens(
+                "model",
+                ArrivalTokenFacts::new(100, Some(TokenFacts::prepared_token_ids(10, fingerprint))),
+            );
+            assert_eq!(
+                context.fallback(),
+                Some(TokenFactFallback::FingerprintRevoked)
+            );
+        }
+    }
 
     #[test]
     fn revoked_gauge_matches_the_bounded_map_after_overflow() {

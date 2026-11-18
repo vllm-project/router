@@ -288,6 +288,7 @@ pub struct ContextTokens {
 /// (`ContextTokens::estimated`, `from_prepared`, or an arrival fact), which is
 /// exactly the property this type exists to enforce.
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl From<usize> for ContextTokens {
     fn from(tokens: usize) -> Self {
         Self::estimated(tokens)
@@ -460,6 +461,7 @@ pub fn resolve_context_tokens(
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use TokenCountMode::{Estimated, Exact, Shadow};

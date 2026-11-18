@@ -355,6 +355,12 @@ fn inject_stream_usage(value: &mut serde_json::Value) {
     match object.get_mut("stream_options") {
         Some(serde_json::Value::Object(options)) => {
             options.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+            // Enabling usage must not add statistics to ordinary deltas when
+            // the client disabled usage. Only the final usage-only frame can
+            // be hidden without changing the client's content frames.
+            if let Some(continuous) = options.get_mut("continuous_usage_stats") {
+                *continuous = serde_json::Value::Bool(false);
+            }
         }
         _ => {
             object.insert(
@@ -6111,13 +6117,15 @@ mod tests {
         let mut body = serde_json::json!({
             "model": "m",
             "stream": true,
-            "stream_options": {"include_usage": false}
+            "stream_options": {"include_usage": false, "continuous_usage_stats": true, "other_option": 7}
         });
         inject_stream_usage(&mut body);
         assert_eq!(
             body["stream_options"]["include_usage"],
             serde_json::Value::Bool(true)
         );
+        assert_eq!(body["stream_options"]["continuous_usage_stats"], false);
+        assert_eq!(body["stream_options"]["other_option"], 7);
         let mut without = serde_json::json!({"model": "m", "stream": true});
         inject_stream_usage(&mut without);
         assert_eq!(
@@ -8628,14 +8636,94 @@ mod tests {
             to_bytes(response.into_body(), 10_000).await.unwrap();
             let received = fixture.requests.recv().await.unwrap();
             let wire: serde_json::Value = serde_json::from_slice(&received).unwrap();
-            assert_eq!(wire.pointer("/stream_options/continuous_usage_stats"), Some(&serde_json::json!(true)),
-                "exact={exact}: usage injection must preserve the original raw request options: {wire}");
+            assert_eq!(
+                wire.pointer("/stream_options/continuous_usage_stats"),
+                Some(&serde_json::json!(!exact)),
+                "exact={exact}: injected usage must disable continuous statistics: {wire}"
+            );
             assert_eq!(
                 wire.get("max_tokens"),
                 Some(&serde_json::Value::Null),
                 "exact={exact}: explicit null must survive forwarding"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn injected_usage_preserves_content_deltas_and_client_usage_opt_in() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let capture = captured.clone();
+        let app = axum::Router::new().route("/v1/completions", axum::routing::post(
+            move |Json(body): Json<serde_json::Value>| {
+                let include = body.pointer("/stream_options/include_usage") == Some(&serde_json::json!(true));
+                let continuous = body.pointer("/stream_options/continuous_usage_stats") == Some(&serde_json::json!(true));
+                capture.lock().push(body);
+                async move {
+                    let usage = serde_json::json!({"prompt_tokens":3,"completion_tokens":1});
+                    let mut delta = serde_json::json!({"choices":[{"index":0,"text":"hello","finish_reason":"stop"}]});
+                    if include && continuous { delta["usage"] = usage.clone(); }
+                    let mut sse = format!("data: {delta}\n\n");
+                    if include { sse.push_str(&format!("data: {{\"choices\":[],\"usage\":{usage}}}\n\n")); }
+                    sse.push_str("data: [DONE]\n\n");
+                    Response::new(Body::from(sse))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for exact in [false, true] {
+            for client_usage in [false, true] {
+                let mut router = router_pointing_at(address);
+                // Raw completion forwarding is the KV-aware path; ordinary
+                // typed forwarding intentionally drops unknown stream options.
+                router.policy_registry = create_test_kv_router().policy_registry;
+                if exact {
+                    router.program_scheduler = Some(Arc::new(ProgramScheduler::new(
+                        ProgramSchedulerConfig::default(),
+                    )));
+                }
+                let body = serde_json::json!({
+                    "model":"m", "prompt":[1,2,3], "add_special_tokens":false,
+                    "stream":true, "max_tokens":null,
+                    "stream_options":{"include_usage":client_usage,"continuous_usage_stats":true},
+                    "vllm_xargs":{"agentic_context":{"program_id":"p","expected_resume":false}}
+                });
+                let raw = bytes::Bytes::from(serde_json::to_vec(&body).unwrap());
+                let request = Arc::new(serde_json::from_value::<CompletionRequest>(body).unwrap());
+                let response = router.route_completion_raw(None, request, raw, None).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), 10_000).await.unwrap();
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                let delta: serde_json::Value = serde_json::from_str(
+                    text.lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .unwrap(),
+                )
+                .unwrap();
+                let mut expected = serde_json::json!({"choices":[{"index":0,"text":"hello","finish_reason":"stop"}]});
+                if client_usage {
+                    expected["usage"] =
+                        serde_json::json!({"prompt_tokens":3,"completion_tokens":1});
+                }
+                assert_eq!(
+                    delta, expected,
+                    "exact={exact}, client_usage={client_usage}"
+                );
+                assert_eq!(text.contains("\"usage\""), client_usage);
+                assert!(text.ends_with("data: [DONE]\n\n"));
+                let wire = captured.lock().last().unwrap().clone();
+                assert_eq!(
+                    wire.pointer("/stream_options/include_usage"),
+                    Some(&serde_json::json!(exact || client_usage))
+                );
+                assert_eq!(
+                    wire.pointer("/stream_options/continuous_usage_stats"),
+                    Some(&serde_json::json!(!exact || client_usage))
+                );
+                assert_eq!(wire["max_tokens"], serde_json::Value::Null);
+            }
+        }
+        server.abort();
     }
 
     #[tokio::test]
