@@ -1,5 +1,37 @@
 use std::sync::Arc;
 
+/// One request's query against the index.
+#[derive(Debug, Clone)]
+pub struct MatchQuery {
+    /// kv-cache-spec group to query — selects the shard within the indexer.
+    pub group_idx: u32,
+    /// Block-local hashes, walked from the shard root in prefix order.
+    pub local_hashes: Vec<Arc<str>>,
+    /// Tiers to report; the cost model requests the tiers it scores.
+    pub tiers_of_interest: Vec<StorageTier>,
+}
+
+/// One hit: the block intervals `[start, end)` a target holds at this tier,
+/// each maximal. Flat — one row per `(target, tier)` — so the cost model
+/// applies two-segment reuse over a target's tiers in one pass.
+#[derive(Debug, Clone)]
+pub struct TierMatch {
+    pub target: RoutableTarget,
+    pub tier: StorageTier,
+    /// Held block intervals `[start, end)`, each maximal; a gap closes a
+    /// segment but later segments survive.
+    pub segments: Vec<(u32, u32)>,
+    pub locality: Locality,
+}
+
+/// Append a block to the last contiguous segment or start a new segment.
+pub(crate) fn push_block_segment(segments: &mut Vec<(u32, u32)>, start: u32, end: u32) {
+    match segments.last_mut() {
+        Some((_, previous_end)) if *previous_end == start => *previous_end = end,
+        _ => segments.push((start, end)),
+    }
+}
+
 /// Where a request goes — one (worker, rank) target.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RoutableTarget {
@@ -97,6 +129,15 @@ pub enum StorageTier {
 }
 
 impl StorageTier {
+    pub(crate) fn rank(self) -> u8 {
+        match self {
+            Self::Device => 0,
+            Self::HostPinned => 1,
+            Self::Disk => 2,
+            Self::External => 3,
+        }
+    }
+
     /// Map a worker's `medium` field to its tier. vLLM emits uppercase
     /// `GPU`/`CPU`/`STORAGE`; matched case-insensitively. Unknown/None → Device.
     /// `External` is not produced here — it derives from the owner domain.

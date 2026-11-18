@@ -564,7 +564,7 @@ impl KvIndexSupervisor {
         }
         for live in &subs.live_sources {
             let _guard = live.lease.strict_rank.lock();
-            subs.indexer.invalidate_source(&subs.source_id, live.rank);
+            subs.indexer.retire_source(&subs.source_id, live.rank);
         }
         self.release_identity(&subs.key);
     }

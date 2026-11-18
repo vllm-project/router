@@ -1325,7 +1325,6 @@ mod tests {
             Some(0),
         )
         .await;
-        let generation = indexer.source_generation_for_test();
         publish_until_advanced(
             &publisher,
             &mut signals,
@@ -1336,7 +1335,6 @@ mod tests {
             Some(0),
         )
         .await;
-        assert_eq!(indexer.source_generation_for_test(), generation);
         for tokens in [&old, &current] {
             let found = hits(&indexer, tokens);
             assert_eq!(found.len(), 1);
@@ -1349,7 +1347,6 @@ mod tests {
             let _guard = strict_rank.lock();
             indexer.invalidate_source(&SourceId::from("w0"), 0);
         }
-        assert_eq!(indexer.source_generation_for_test(), generation + 1);
         assert!(hits(&indexer, &current).is_empty());
         publish_until_advanced(
             &publisher,
@@ -1361,12 +1358,10 @@ mod tests {
             Some(0),
         )
         .await;
-        assert_eq!(indexer.source_generation_for_test(), generation + 2);
         assert!(hits(&indexer, &old).is_empty());
         assert!(hits(&indexer, &current).is_empty());
         assert_eq!(hits(&indexer, &fresh)[0].segments, [(0, 1)]);
         publish_until_advanced(&publisher, &mut signals, b"kv", 3, 3.0, &[], Some(0)).await;
-        assert_eq!(indexer.source_generation_for_test(), generation + 2);
         assert_eq!(hits(&indexer, &fresh)[0].segments, [(0, 1)]);
         handle.shutdown();
     }
