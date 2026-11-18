@@ -1700,14 +1700,16 @@ async fn replay_requires_continuous_history_and_valid_topic_rank_and_payload() {
 #[tokio::test]
 async fn tcp_disconnect_fences_until_replay_and_live_handoff() {
     tcp_full_recovery(false).await;
+    tcp_layout_recovery(false).await;
 }
 
 #[tokio::test]
 async fn tcp_monitor_failure_rebuilds_and_replays() {
     tcp_full_recovery(true).await;
+    tcp_layout_recovery(true).await;
 }
 
-pub(crate) async fn wait_until(ready: impl Fn() -> bool) {
+async fn wait_until(ready: impl Fn() -> bool) {
     tokio::time::timeout(Duration::from_secs(4), async {
         while !ready() {
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -1717,16 +1719,16 @@ pub(crate) async fn wait_until(ready: impl Fn() -> bool) {
     .expect("subscriber state did not converge");
 }
 
-/// Wire fixture shared by full and layout recovery; their cache assertions stay separate.
-pub(crate) struct TcpReplay {
-    pub(crate) ctx: Arc<zmq::Context>,
+/// TCP publisher and replay server for both subscriber sinks.
+struct TcpReplay {
+    ctx: Arc<zmq::Context>,
     replay: Option<zmq::Socket>,
     publisher: Option<zmq::Socket>,
     endpoint: String,
 }
 
 impl TcpReplay {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self::with_replay(true)
     }
 
@@ -1750,7 +1752,7 @@ impl TcpReplay {
         }
     }
 
-    pub(crate) fn source(&self, name: &str) -> EventSource {
+    fn source(&self, name: &str) -> EventSource {
         EventSource {
             source: Arc::from(name),
             dp_rank: 0,
@@ -1764,18 +1766,18 @@ impl TcpReplay {
         }
     }
 
-    pub(crate) async fn subscribed(&self) {
+    async fn subscribed(&self) {
         let frames = replay_request(self.publisher.as_ref().unwrap()).await;
         assert_eq!(frames[0], b"\x01kv");
     }
 
-    pub(crate) async fn request(&self, start: u64) -> Vec<Vec<u8>> {
+    async fn request(&self, start: u64) -> Vec<Vec<u8>> {
         let frames = replay_request(self.replay.as_ref().unwrap()).await;
         assert_eq!(frames[2], start.to_be_bytes());
         frames
     }
 
-    pub(crate) fn live(&self, seq: i64, payload: &[u8]) {
+    fn live(&self, seq: i64, payload: &[u8]) {
         self.publisher
             .as_ref()
             .unwrap()
@@ -1783,7 +1785,7 @@ impl TcpReplay {
             .unwrap();
     }
 
-    pub(crate) fn history(&self, request: &[Vec<u8>], frames: &[(i64, &[u8])]) {
+    fn history(&self, request: &[Vec<u8>], frames: &[(i64, &[u8])]) {
         for (seq, payload) in frames.iter().copied().chain(std::iter::once((-1, &[][..]))) {
             self.reply(request, seq, payload);
         }
@@ -1811,7 +1813,25 @@ impl TcpReplay {
         drop(self.publisher.take());
     }
 
-    pub(crate) async fn reconnect(&mut self, monitor_failure: bool, cold: impl Fn() -> bool) {
+    async fn retry_after_fault(
+        &mut self,
+        monitor_failure: bool,
+        payload: &[u8],
+        credit: impl Fn() -> u64,
+        expected: u64,
+    ) -> Vec<Vec<u8>> {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(credit(), expected, "idle source lost verified credit");
+
+        self.reconnect(monitor_failure, || credit() == 0).await;
+        let request = self.request(0).await;
+        self.history(&request, &[(2, payload)]);
+        let retry = self.request(0).await;
+        assert_eq!(credit(), 0, "truncated history restored credit");
+        retry
+    }
+
+    async fn reconnect(&mut self, monitor_failure: bool, cold: impl Fn() -> bool) {
         if monitor_failure {
             crate::kv_index::source::events::transport::fail_next_monitor_drain(&self.endpoint);
         } else {
@@ -1863,21 +1883,13 @@ async fn tcp_full_recovery(monitor_failure: bool) {
         matches!(signal, Some(IngestionSignal::Advance { last_seq: 0, .. })),
         "unexpected {signal:?}"
     );
-    assert_eq!(hits(&indexer, &prompt).len(), 1);
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(hits(&indexer, &prompt).len(), 1);
-
-    tcp.reconnect(monitor_failure, || hits(&indexer, &prompt).is_empty())
+    let matched = || hits(&indexer, &prompt).len() as u64;
+    assert_eq!(matched(), 1);
+    let request = tcp
+        .retry_after_fault(monitor_failure, &payload, matched, 1)
         .await;
-    let request = tcp.request(0).await;
-    tcp.history(&request, &[(2, &payload)]);
-    let request = tcp.request(0).await;
-    assert!(
-        hits(&indexer, &prompt).is_empty(),
-        "truncated history restored credit"
-    );
     tcp.history(&request, &[(0, &payload)]);
-    wait_until(|| !hits(&indexer, &prompt).is_empty()).await;
+    wait_until(|| matched() == 1).await;
 
     // Full attention first catches up from its cursor; after an incomplete
     // answer it must rebuild and cover the highest sequence observed live.
@@ -1899,6 +1911,49 @@ async fn tcp_full_recovery(monitor_failure: bool) {
     tcp.history(&request, &[(0, &payload), (1, &empty), (2, &payload)]);
     wait_until(|| !hits(&indexer, &prompt).is_empty()).await;
     tcp.live(3, &payload);
+    handle.shutdown();
+}
+
+async fn tcp_layout_recovery(monitor_failure: bool) {
+    use crate::kv_index::source::binding::tests::{qwen35_payload, qwen_index};
+    use crate::kv_index::{spawn_zmq, EventStream, RoutableTarget};
+
+    let mut tcp = TcpReplay::new();
+    let source = tcp.source("tcp-hybrid");
+    let index = Arc::new(qwen_index(
+        RoutableTarget {
+            instance_id: source.source.clone(),
+            dp_rank: source.dp_rank,
+        },
+        8,
+    ));
+    let stream = Arc::new(EventStream::new(index.clone()));
+    let handle = spawn_zmq(source, stream, tcp.ctx.clone()).unwrap();
+    let payload = qwen35_payload();
+    let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
+    let credit = || index.reusable_tokens(&prompt, usize::MAX);
+    let next_seq = || index.with_stream_batch(|state, _| state.next_seq);
+    let empty = batch_payload(&[], 0);
+
+    tcp.subscribed().await;
+    let request = tcp.request(0).await;
+    tcp.history(&request, &[(0, &payload)]);
+    wait_until(|| credit() == 528).await;
+    tcp.live(1, &empty);
+    wait_until(|| next_seq() == Some(2)).await;
+
+    let request = tcp
+        .retry_after_fault(monitor_failure, &payload, credit, 528)
+        .await;
+    // The store has reached the index, but the replay is still open.
+    tcp.reply(&request, 0, &payload);
+    wait_until(|| next_seq() == Some(1)).await;
+    assert_eq!(credit(), 0);
+    tcp.reply(&request, -1, &[]);
+    wait_until(|| credit() == 528).await;
+    tcp.live(1, &empty);
+    wait_until(|| next_seq() == Some(2)).await;
+    assert_eq!(credit(), 528);
     handle.shutdown();
 }
 
