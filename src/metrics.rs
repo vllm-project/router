@@ -45,6 +45,11 @@ pub fn init_metrics() {
         "Total number of requests that exhausted retries by route"
     );
 
+    describe_counter!(
+        "vllm_router_sse_forward_stops_total",
+        "Downstream SSE forwarding stops by route and reason (client_gone/stall_timeout)"
+    );
+
     // Circuit breaker metrics
     describe_gauge!(
         "vllm_router_cb_state",
@@ -616,6 +621,14 @@ impl RouterMetrics {
         counter!("vllm_router_request_errors_total",
             "route" => route.to_string(),
             "error_type" => error_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub(crate) fn record_sse_forward_stop(route: &str, reason: &'static str) {
+        counter!("vllm_router_sse_forward_stops_total",
+            "route" => route.to_string(),
+            "reason" => reason
         )
         .increment(1);
     }

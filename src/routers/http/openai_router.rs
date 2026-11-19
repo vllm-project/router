@@ -20,8 +20,9 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-/// Matches the `Client` timeout set in `OpenAIRouter::new`.
-const STREAM_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+// A per-hand-off wait budget; the upstream client's whole-request cap remains separate.
+const STREAM_FORWARD_STALL_TIMEOUT: std::time::Duration = CLIENT_TIMEOUT;
 
 /// Router for OpenAI backend
 #[derive(Debug)]
@@ -43,7 +44,7 @@ impl OpenAIRouter {
         circuit_breaker_config: Option<CircuitBreakerConfig>,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(CLIENT_TIMEOUT)
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
@@ -339,18 +340,18 @@ impl super::super::RouterTrait for OpenAIRouter {
             // the rest of the HTTP path uses: an unbounded hand-off lets this task
             // pull from the worker faster than the client reads.
             let stream = resp.bytes_stream();
-            // The client is built with a 300 s timeout; the forwarder uses the
-            // same bound so a client that stops reading cannot keep the upstream
-            // response open indefinitely.
+            // Bound each wait for downstream capacity, independently of stream age.
             let (forward, body_stream) = super::router::sse_forward_channel(
-                tokio::time::Instant::now() + STREAM_FORWARD_TIMEOUT,
+                STREAM_FORWARD_STALL_TIMEOUT,
+                &self.base_url,
+                "/v1/chat/completions",
             );
             tokio::spawn(async move {
                 let mut s = stream;
                 while let Some(chunk) = s.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            if !forward.send(bytes).await {
+                            if forward.send(bytes).await != super::router::HandOff::Sent {
                                 break;
                             }
                         }
