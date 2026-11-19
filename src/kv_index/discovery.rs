@@ -1242,6 +1242,7 @@ mod metrics_meta {
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     mod tests {
         use super::*;
 
@@ -1315,6 +1316,7 @@ vllm:cache_config_info{block_size="32",engine="1"} 1.0
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::kv_index::{MatchQuery, StorageTier};

@@ -189,6 +189,7 @@ pub struct PdLoadManager {
 
 impl PdLoadManager {
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn snapshot(&self) -> Loads {
         self.loads.lock().clone()
     }
@@ -584,6 +585,7 @@ impl PdAttempt {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::fmt;

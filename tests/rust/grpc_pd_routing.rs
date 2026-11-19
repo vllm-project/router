@@ -26,7 +26,7 @@ use vllm_router_rs::config::{
     KvConnector, PdKvEventSources, PolicyConfig, RouterConfig, RoutingMode,
 };
 use vllm_router_rs::policies::PolicyFactory;
-use vllm_router_rs::protocols::spec::ChatCompletionRequest;
+use vllm_router_rs::protocols::spec::{ChatCompletionRequest, CompletionRequest};
 use vllm_router_rs::routers::http::vllm_pd_router::VllmPDRouter;
 use vllm_router_rs::routers::RouterTrait;
 
@@ -134,6 +134,145 @@ fn chat(stream: bool) -> ChatCompletionRequest {
         "stream": stream,
     }))
     .unwrap()
+}
+
+fn completion(prompt: Value, stream: bool) -> CompletionRequest {
+    serde_json::from_value(json!({
+        "model": "test-model",
+        "prompt": prompt,
+        "max_tokens": 8,
+        "stream": stream,
+    }))
+    .unwrap()
+}
+
+/// Replay harnesses send token ids, so the router must accept them without a
+/// tokenizer round trip on either leg and answer in the completion shape.
+#[tokio::test]
+async fn grpc_pd_completion_passes_client_token_ids_to_both_legs() {
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        finish_kv_transfer_params: Some(prefill_kv()),
+        ..Default::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router(&prefill, &decode).await;
+    // No second pin: `pd_router` already pins ids the client does not send, which is
+    // what makes the captured client ids meaningful.
+
+    let response = router
+        .route_completion(None, &completion(json!([11, 12, 13, 14]), false), None)
+        .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["object"], "text_completion", "{json}");
+    assert!(json["choices"][0].get("message").is_none(), "{json}");
+    assert!(
+        json["id"].as_str().unwrap_or_default().starts_with("cmpl-"),
+        "{json}"
+    );
+
+    assert_eq!(prefill.captured()[0].token_ids, vec![11, 12, 13, 14]);
+    assert_eq!(decode.captured()[0].token_ids, vec![11, 12, 13, 14]);
+}
+
+/// The same path must serve a streaming completion: completion-shaped chunks carrying
+/// `choices[].text` (never chat deltas) and a terminal `[DONE]`.
+#[tokio::test]
+async fn grpc_pd_completion_streams_text_completion_events() {
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        finish_kv_transfer_params: Some(prefill_kv()),
+        ..Default::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router(&prefill, &decode).await;
+
+    let response = router
+        .route_completion(None, &completion(json!([11, 12, 13]), true), None)
+        .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("data: [DONE]"),
+        "stream must terminate: {text}"
+    );
+
+    let chunks: Vec<Value> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|payload| *payload != "[DONE]")
+        .filter_map(|payload| serde_json::from_str(payload).ok())
+        .collect();
+    assert!(!chunks.is_empty(), "{text}");
+
+    let mut streamed = String::new();
+    for chunk in &chunks {
+        assert_eq!(chunk["object"], "text_completion", "{chunk}");
+        let Some(choice) = chunk["choices"].get(0) else {
+            continue;
+        };
+        assert!(
+            choice.get("delta").is_none(),
+            "completion chunks must not use chat deltas: {chunk}"
+        );
+        if let Some(piece) = choice["text"].as_str() {
+            streamed.push_str(piece);
+        }
+    }
+    assert!(!streamed.is_empty(), "no text streamed: {text}");
+}
+
+/// A prompt the gRPC wire cannot carry is rejected before any worker is used.
+#[tokio::test]
+async fn grpc_pd_completion_rejects_text_prompts() {
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        finish_kv_transfer_params: Some(prefill_kv()),
+        ..Default::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router(&prefill, &decode).await;
+
+    let response = router
+        .route_completion(None, &completion(json!("hello"), false), None)
+        .await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert!(prefill.captured().is_empty());
+    assert!(decode.captured().is_empty());
+}
+
+#[tokio::test]
+async fn grpc_pd_unavailable_pool_rejects_before_request_preparation() {
+    let prefill = MockVllmRsServer::spawn().await;
+    let decode = MockVllmRsServer::spawn().await;
+    // Leave the tokenizer unpinned so preparing either request would try to
+    // resolve a model before reaching the availability guard.
+    let router = pd_router_with_pools(&[&prefill], &decode, 1, PolicyConfig::RoundRobin).await;
+    router.worker_registry().get_prefill_workers()[0].set_healthy(false);
+
+    let chat_response = router.route_chat(None, &chat(false), None).await;
+    let completion_response = router
+        .route_completion(None, &completion(json!([11, 12, 13]), false), None)
+        .await;
+    for response in [chat_response, completion_response] {
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"No available workers: 0 prefill, 1 decode");
+    }
+    assert!(prefill.captured().is_empty());
+    assert!(decode.captured().is_empty());
 }
 
 #[tokio::test]
@@ -1122,8 +1261,11 @@ async fn grpc_pd_nixl_push_client_disconnect_during_prefill_releases_both_legs()
     assert_eq!(d.load(), 0);
 }
 
+/// A route this path still does not serve is refused before either stage is used.
+/// Completions used to be that route; it is served now, so the guard is checked with one
+/// that remains unsupported instead of testing an internal entry point.
 #[tokio::test]
-async fn grpc_pd_rejects_non_chat_routes_before_dispatch() {
+async fn grpc_pd_rejects_unsupported_routes_before_dispatch() {
     let prefill = MockVllmRsServer::spawn().await;
     let decode = MockVllmRsServer::spawn().await;
     let router = pd_router(&prefill, &decode).await;
@@ -1131,9 +1273,9 @@ async fn grpc_pd_rejects_non_chat_routes_before_dispatch() {
     let response = router
         .route_transparent(
             None,
-            "/v1/completions",
+            "/v1/embeddings",
             &axum::http::Method::POST,
-            json!({"model": "test-model", "prompt": "hi", "max_tokens": 4}),
+            json!({"model": "test-model", "input": "hi"}),
         )
         .await;
     assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
