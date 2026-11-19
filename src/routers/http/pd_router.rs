@@ -336,14 +336,13 @@ fn select_stage(
         // deterministic minimum occupancy with rotating equal-load ties, and
         // the optional decode session binding on top.
         let kv = kv_aware_ops(policy)?;
-        // Marginal credit is only usable when the price table covers every candidate
-        // that is eligible right now. A worker that was unavailable when the prices were
-        // taken and recovered since has no entry, and `select_decode` would read the
-        // missing price as zero - making the recovered worker look free.
+        // `select_decode` itself discards a table that misses any eligible
+        // candidate; this mirror exists so `decode_prices_used` reports what the
+        // selector actually acted on.
         //
-        // The table is keyed by `Worker::url()`, not `base_url()`: DP ranks of one
-        // engine have independent KV caches, so rank `@0` must not consume rank
-        // `@1`'s price (or a missing rank's zero).
+        // The table is keyed by `Worker::url()`, not `base_url()`: DP ranks of
+        // one engine have independent KV caches, so rank `@0` must not consume
+        // rank `@1`'s price.
         let decode_prices = if !decode_tokens_known {
             None
         } else {

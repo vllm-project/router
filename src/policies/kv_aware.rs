@@ -151,9 +151,10 @@ pub trait KvAwareOps: Send + Sync {
     /// allocate there: its prompt length less the blocks that candidate already
     /// holds, so a Decode engine that can reuse a cached prefix is charged only
     /// for what it has to add. It is computed before admission (the KV index is
-    /// never queried under the selection lock) and is `None` unless every
-    /// candidate's figure is known, because a partial list would compare
-    /// candidates in different units.
+    /// never queried under the selection lock). A table that misses any present
+    /// candidate is treated as `None`, so a partial list cannot compare
+    /// candidates in different units: a missing entry read as zero would make a
+    /// recovered worker look free.
     ///
     /// `new_context` is keyed by worker URL, so it survives the caller
     /// projecting each candidate onto a load-only handle.
