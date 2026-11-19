@@ -219,6 +219,7 @@ steps:
       - "tests/python/e2e/run/perf/router_policy/*/router.log"
       - "tests/python/e2e/run/perf/router_policy/*/engine*.log"
       - "tests/python/e2e/run/perf/router_policy/*/replay.log"
+      - "tests/python/e2e/run/perf/router_policy/*/replay_entry.py"
       - "tests/python/e2e/run/perf/router_policy/*/runtime-replay.yaml"
       - "tests/python/e2e/run/perf/router_policy/*/*.command.json"
 

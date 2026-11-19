@@ -25,7 +25,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,7 +75,6 @@ class RouterPolicyStack:
     stack: list[RunningProc] = field(default_factory=list)
     replay_proc: subprocess.Popen[Any] | None = None
     replay_stream: RunningProc | None = None
-    replay_entry: Path | None = None
     port_holders: list[socket.socket | None] = field(default_factory=list)
     kv_port_holders: list[socket.socket | None] = field(default_factory=list)
     did_cleanup: bool = False
@@ -182,9 +180,6 @@ def cleanup(run: RouterPolicyStack) -> None:
     for proc in reversed(run.stack):
         proc.stop()
     run.stack.clear()
-    if run.replay_entry is not None:
-        run.replay_entry.unlink(missing_ok=True)
-        run.replay_entry = None
     release_all_port_holders(run.port_holders)
     release_all_port_holders(run.kv_port_holders)
 
@@ -587,10 +582,7 @@ def _run_cell(run: RouterPolicyStack) -> None:
         time.sleep(settle)
     allocate_ports(run)
     ports = run.ports
-    fd, entry_name = tempfile.mkstemp(prefix="router-policy-replay-", suffix=".py")
-    os.close(fd)
-    entry = Path(entry_name)
-    run.replay_entry = entry
+    entry = run.out / "replay_entry.py"
     entry.write_text(
         """import asyncio
 import os
