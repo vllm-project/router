@@ -971,21 +971,31 @@ mod tests {
         notify_first_output(&output, "", &mut first_output_seen, Some(&callback));
         notify_first_output(&output, "", &mut first_output_seen, Some(&callback));
         assert_eq!(decode_started.load(Ordering::Relaxed), 1);
+    }
 
+    #[test]
+    fn aborted_response_does_not_notify_first_output() {
         let aborted = GenerateResponse {
             outputs: Some(SequenceOutput {
+                num_tokens: 1,
+                token_ids: vec![42],
                 finish_info: Some(super::super::pb::FinishInfo {
                     finish_reason: FinishReason::Aborted as i32,
                     ..Default::default()
                 }),
-                ..output.outputs.unwrap()
+                ..Default::default()
             }),
             prompt_info: None,
         };
-        first_output_seen = false;
+        let decode_started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let decode_started_callback = decode_started.clone();
+        let callback: FirstOutputCallback = Arc::new(move || {
+            decode_started_callback.fetch_add(1, Ordering::Relaxed);
+        });
+        let mut first_output_seen = false;
         notify_first_output(&aborted, "", &mut first_output_seen, Some(&callback));
         assert!(!first_output_seen);
-        assert_eq!(decode_started.load(Ordering::Relaxed), 1);
+        assert_eq!(decode_started.load(Ordering::Relaxed), 0);
     }
 
     #[test]
