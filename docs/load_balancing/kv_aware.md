@@ -2,9 +2,14 @@
 
 If requests often start with the same prompt, such as a shared system message, `kv_aware` prefers a worker that can reuse that prefix and also considers worker load. vLLM publishes cache events so the Router can track which workers have the prefix. When cache information is unavailable, the Router routes by load.
 
-- [Full attention](#colocated-prefill-and-decode) starts one HTTP or gRPC worker. Clients use the Router's OpenAI HTTP API either way.
-- [Hybrid attention](#hybrid-attention-models) uses a model-specific cache layout with the same Router commands.
-- [Separate prefill and decode](#pd-routing) runs the two stages on different workers.
+Clients send OpenAI HTTP requests to the Router with either HTTP or gRPC workers. Pick the setup that matches your deployment.
+
+| Deployment | Layout JSON to pass to the Router |
+| --- | --- |
+| [Full attention on standard vLLM](#colocated-prefill-and-decode), HTTP or gRPC | Pass the [one-group layout](#full-attention-layout) with `--kv-hybrid-layout`. |
+| Colocated HTTP worker that exposes `/kv_routing_capabilities` for one full-attention group | Omit the layout when [the worker meets the discovery requirements](#full-attention-layout). |
+| [Hybrid attention](#hybrid-attention-models), HTTP or gRPC | Pass the checkpoint's group layout with `--kv-hybrid-layout`. |
+| [P/D disaggregation](#pd-routing), HTTP or gRPC | Pass [`pd-layout.json`](#pd-layout) with `--pd-hybrid-config` for this guide's `sha256_cbor` Prefill setup. |
 
 ## Colocated prefill and decode
 
@@ -105,19 +110,25 @@ On stock HTTP vLLM 0.30.0, append these options to the Router command. Change th
 
 ### 3. Check cache reuse
 
-With `curl` and `jq`, send this Qwen3 request once to fill the cache. Run the final `curl` again after the worker's events arrive.
+Send the same prompt twice with one output token each. The first request fills the cache. The second should increase the Router's KV-aware hit counter.
 
 ```bash
-curl -fsS http://127.0.0.1:19000/health
-jq -n '{model:"qwen3",prompt:[range(1000;1129)],max_tokens:1,temperature:0}' > request.json
-curl -fsS http://127.0.0.1:19000/v1/completions \
-  -H 'Content-Type: application/json' --data-binary @request.json
+payload=$(jq -nc '{model:"qwen3",prompt:[range(1000;1129)],max_tokens:1,temperature:0}')
+request() {
+  curl -fsS http://127.0.0.1:19000/v1/completions \
+    -H 'Content-Type: application/json' --data-binary "$payload" >/dev/null
+}
+hits() {
+  curl -fsS http://127.0.0.1:29000/metrics |
+    awk '$1 == "vllm_router_kv_placement_lookups_total{result=\"hit\"}" {hits += $2} END {print hits+0}'
+}
+request && sleep 1 && before=$(hits) && request && after=$(hits) &&
+  printf 'Router KV-aware hits: %s → %s\n' "$before" "$after"
 ```
 
-Compare these counters before and after the repeat request. The Router counter shows that routing saw the cached prefix. The worker counter shows actual reuse. For P/D use the Prefill worker's metrics.
+An increase such as `0 → 1` confirms that KV-aware routing found a cached prefix. If the counts are equal, retry the final request after the Router has received the cache events. Use an idle pool for the check so the counter reflects your requests. To confirm vLLM reuse as well, compare this worker counter before and after the repeat. For P/D, check the Prefill worker.
 
 ```bash
-curl -fsS http://127.0.0.1:29000/metrics | grep '^vllm_router_kv_placement_lookups_total{result="hit"}'
 curl -fsS http://127.0.0.1:8000/metrics | grep '^vllm:prefix_cache_hits_total'
 ```
 
@@ -248,7 +259,7 @@ To [check reuse](#3-check-cache-reuse) for a hybrid model, use its served name a
 
 ## P/D routing
 
-In P/D, Prefill processes the prompt and Decode generates the output. This example uses NIXL and enables KV-aware routing for Prefill.
+P/D disaggregation puts prompt processing on Prefill workers and token generation on Decode workers. This example uses NIXL and enables KV-aware routing for Prefill.
 
 1. Start two workers on different GPUs with the same checkpoint, vLLM version, connector and transport. Keep Prefill on HTTP port `8000` or gRPC port `50051`. Move Decode to HTTP port `8001` and, for a gRPC worker, gRPC port `50052`.
 2. Set `VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1` on both workers. Set `VLLM_NIXL_SIDE_CHANNEL_PORT=5600` on Prefill and `5601` on Decode. For separate hosts, use reachable addresses.
@@ -287,43 +298,47 @@ Save this as `pd-layout.json`. Replace the empty `hybrid` object with the comple
 
 ## Versions
 
-The table lists event discovery in standard vLLM releases. Event discovery supplies live and replay addresses, topics and ranks. For `sha256_cbor`, the examples use layout JSON on all five versions. The layout supplies the hash root and describes one group for full attention or the model's group list for hybrid attention.
+Use the same vLLM release for the engine and its gRPC frontend. The table tells you how to supply the live and replay addresses in **colocated** deployments. Replay recovers missed events from the worker's recent history.
 
-| vLLM release | HTTP event discovery | gRPC event discovery | Events with nonzero hash lookahead | Verification |
-| --- | --- | --- | --- | --- |
-| [0.30.0](https://github.com/vllm-project/vllm/tree/v0.30.0) | Static endpoints | Automatic | Unavailable | Source inspected |
-| [0.31.0](https://github.com/vllm-project/vllm/tree/v0.31.0) | Automatic | Automatic | Unavailable | Source inspected |
-| [0.32.0](https://github.com/vllm-project/vllm/tree/v0.32.0) | Automatic | Automatic | Unavailable | Source inspected |
-| [0.33.0](https://github.com/vllm-project/vllm/tree/v0.33.0) | Automatic | Automatic | Available | B300 reference version |
-| [0.34.0](https://github.com/vllm-project/vllm/tree/v0.34.0) | Automatic | Automatic | Available | Source inspected |
+| vLLM release | Colocated HTTP | Colocated gRPC | Hybrid or speculative decoding |
+| --- | --- | --- | --- |
+| [0.30.0](https://github.com/vllm-project/vllm/tree/v0.30.0) | Pass [static live and replay addresses](#static-event-endpoints). | `GetKvEventSources` supplies both addresses. | Use layouts with zero hash lookahead. The V4.1 bounded-replay recipe requires 0.31 or newer. |
+| [0.31.0](https://github.com/vllm-project/vllm/tree/v0.31.0) | `/kv_event_sources` supplies both addresses. | Same as 0.30.0. | Adds V4.1 bounded replay. Use layouts with zero hash lookahead. |
+| [0.32.0](https://github.com/vllm-project/vllm/tree/v0.32.0) | Same as 0.31.0. | Same as 0.30.0. | Same KV event and layout options as 0.31.0. |
+| [0.33.0](https://github.com/vllm-project/vllm/tree/v0.33.0) | Same as 0.31.0. | Same as 0.30.0. | Adds events for nonzero hash lookahead. Use this release for the model recipes above. |
+| [0.34.0](https://github.com/vllm-project/vllm/tree/v0.34.0) | Same as 0.31.0. | Same as 0.30.0. | Same Router setup as 0.33.0. Check the layout against your running model. |
+
+Standard workers on all five versions need layout JSON for the `sha256_cbor` setup in this guide. Address discovery covers the event connection. The JSON supplies the hash root and cache groups. In P/D disaggregation, include the Prefill addresses in [`pd-layout.json`](#pd-layout). Hash lookahead only matters if the worker uses future tokens when hashing cached blocks, such as the [Qwen3.8 MTP example](#qwen38-27b).
 
 ## CLI options
 
-**Worker registration**
+| Option | Value format or example | Rust type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `--policy` | `kv_aware` | enum | `cache_aware` | Selects the colocated policy and the fallback policy for both P/D stages. |
+| `--worker-urls` | `http://worker:8000` or `grpc://worker:50051` | list of strings | `[]` | Registers colocated workers. Use one transport per pool. |
+| `--kv-hybrid-layout` | `layout.json` | path | unset | Loads a colocated full- or hybrid-attention layout keyed by worker URL. |
+| `--kv-event-source` | `WORKER_URL=ENDPOINT[,ENDPOINT...]` | string, repeatable | `[]` | Supplies live ZMQ addresses when event discovery is unavailable. |
+| `--kv-event-replay-source` | `WORKER_URL=ENDPOINT[,ENDPOINT...]` | string, repeatable | `[]` | Supplies replay addresses for a matching static live source. |
+| `--kv-event-block-size` | `16` | `u32` | `16` | Sets the block size in tokens for static colocated sources. |
+| `--kv-event-model` | `qwen3` | string | unset | Sets the served model name when using static colocated sources. |
+| `--intra-node-data-parallel-size` | `4` | `usize` | `1` | Sets the data-parallel rank count per worker URL. List event endpoints in rank order. |
+| `--vllm-pd-disaggregation` | no value | flag | `false` | Enables vLLM P/D disaggregation. |
+| `--prefill` | `URL [PORT or none]` | URL with optional `u16` port, repeatable | `[]` | Adds a Prefill worker. The optional port is for connector bootstrap. |
+| `--decode` | `URL` | string, repeatable | `[]` | Adds a Decode worker. |
+| `--prefill-policy` | `kv_aware` | enum | inherits `--policy` | Enables KV-aware prefix routing on Prefill. |
+| `--decode-policy` | `round_robin` or `kv_aware` | enum | inherits `--policy` | Sets the Decode policy. See [Decode load and affinity](README.md#pd-decode-load). |
+| `--kv-connector` | `nixl`, `mooncake`, `moriio` | enum | `nixl` | Matches the workers' P/D transfer connector. MoRI-IO requires vLLM ZMQ service discovery. |
+| `--vllm-discovery-address` | `0.0.0.0:30001` | string | unset | Listens for vLLM ZMQ worker registrations in P/D. |
+| `--pd-hybrid-config` | `pd-layout.json` | path | unset | Supplies Prefill sources, their layouts and compatible Decode URLs. |
+| `--pd-kv-events` | `WORKER_URL=ENDPOINT[,ENDPOINT...]` | string, repeatable | `[]` | Supplies live publishers for 16-token P/D sources without a declared layout. |
+| `--router-temperature` | finite value ≥ `0` | `f64` | `0.0` | Samples more broadly with higher values in colocated routing and P/D Prefill. Zero selects the lowest-cost worker. |
+| `--kv-penalty-host` | `0.0` to `1.0` | `f64` | `0.8` | Sets the fraction of full cache credit for a hit in host memory. |
+| `--kv-penalty-external` | `0.0` to `1.0` | `f64` | `0.6` | Sets the fraction for a hit in external storage. |
+| `--kv-penalty-disk` | `0.0` to `1.0` | `f64` | `0.3` | Sets the fraction for a hit on disk. |
+| `--kv-aware-session-affinity-ttl-secs` | `1` to `31536000` seconds | `u64` | unset | Enables session affinity until the idle timeout. In P/D it applies to Decode. |
+| `--prometheus-port` | `29000` | `u16` | `29000` | Sets the Router metrics port used in the reuse check. |
 
-- `--worker-urls` and `--policy kv_aware` select a colocated pool. Use one transport per pool.
-- `--kv-hybrid-layout` loads a colocated layout for full or hybrid attention.
-- `--kv-event-source`, `--kv-event-replay-source`, `--kv-event-model` and `--kv-event-block-size` describe static colocated sources. Repeat endpoint options per worker. For data parallelism, list endpoints in rank order and set `--intra-node-data-parallel-size` (default `1`).
-
-**P/D**
-
-- `--vllm-pd-disaggregation`, `--prefill` and `--decode` declare the stages. Repeat the URL flags for more workers.
-- `--prefill-policy` and `--decode-policy` override `--policy` for each stage. Use `kv_aware` on Prefill for prefix reuse. See [Decode load and affinity](README.md#pd-decode-load) for Decode policy behavior.
-- `--kv-connector` selects NIXL (default), Mooncake or MoRI-IO. Match the connector on both workers. MoRI-IO requires vLLM ZMQ service discovery.
-- `--pd-hybrid-config` supplies the Prefill layout and compatible pairs. `--pd-kv-events` supplies a static publisher for a 16-token P/D source using event-based load accounting.
-
-**Tuning and metrics**
-
-| Flag | Default | Use |
-| --- | --- | --- |
-| `--router-temperature` | `0` | Select the lowest-cost worker. Higher values distribute requests among candidates in colocated routing and P/D Prefill. |
-| `--kv-penalty-host` | `0.8` | Credit for a hit in host memory. |
-| `--kv-penalty-external` | `0.6` | Credit for a hit in external storage. |
-| `--kv-penalty-disk` | `0.3` | Credit for a hit on disk. |
-| `--kv-aware-session-affinity-ttl-secs` | Disabled | Enable an idle timeout for session affinity. Send the same `x-session-id` or `session_params.session_id` on each turn. In P/D this applies to Decode. |
-| `--prometheus-port` | `29000` | Router metrics port. |
-
-See the [CLI reference](../cli_reference.md) for values and CLI availability.
+For session affinity, send the same `x-session-id` or `session_params.session_id` on each turn. See the [CLI reference](../cli_reference.md) for launcher availability and other Router options.
 
 ## Troubleshooting
 

@@ -48,8 +48,6 @@ Edit the YAML files to customize:
 - `nodeSelector` - Uncomment in router-deployment.yaml to pin to specific node
 - Resources (CPU/memory limits)
 
-For KV-aware prefill, make the prefill publishers reachable from the Router pod. Follow the [KV-aware P/D guide](../../../docs/load_balancing/kv_aware.md#pd-routing) for the policy and hybrid configuration.
-
 ## Accessing the Router
 
 ### From within cluster
