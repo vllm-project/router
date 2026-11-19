@@ -30,11 +30,12 @@ pub(crate) use kv_aware::kv_aware_policy;
 pub(crate) use kv_aware::QualifiedKvInput;
 pub use kv_aware::{
     cost_components, kv_aware_ops, AffinityKey, AffinityRecord, CandidateView,
-    CompletionHistoryRequest, CostComponents, CostDecision, CostParams, HistoryObservation,
-    InMemorySlotManager, KvAffinityTable, KvAwareOps, KvAwarePolicy, KvRequestSlot,
-    KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample, MultiplicativeScorer, Picker,
-    PrefillWorkEstimate, Scorer, SelectionError, SlotManager, StagePick, TemperaturePicker,
-    TieredMatchProvider, TransferCredits, WorkerTokenInputs,
+    CompletionHistoryRequest, CostComponents, CostDecision, CostParams, DecodeWorkEstimate,
+    HistoryObservation, InMemorySlotManager, KvAffinityTable, KvAwareOps, KvAwarePolicy,
+    KvRequestSlot, KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample,
+    MultiplicativeScorer, Picker, PrefillWorkEstimate, PromptHashes, Scorer, SelectionError,
+    SlotManager, StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits,
+    WorkerTokenInputs,
 };
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
