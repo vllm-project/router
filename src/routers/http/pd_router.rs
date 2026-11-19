@@ -1897,6 +1897,7 @@ impl PdRouterBase {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerFactory, WorkerType};
@@ -2692,6 +2693,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod admission_tests {
     use super::super::pd_types::PdLoadSample;
     use super::*;

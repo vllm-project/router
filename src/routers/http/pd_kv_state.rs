@@ -152,6 +152,7 @@ impl PdKvState {
     /// Test-only constructor; production always passes the configured
     /// `pd_kv_event_sources` via `new_with_statics`.
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn new(client: reqwest::Client) -> Self {
         Self::new_with_statics(client, HashMap::new())
     }
@@ -883,6 +884,7 @@ impl Drop for PdKvState {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod kv_input_tests {
     use super::*;
 

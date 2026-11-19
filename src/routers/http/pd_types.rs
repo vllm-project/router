@@ -240,6 +240,7 @@ pub struct PdLoadManager {
 
 impl PdLoadManager {
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn snapshot(&self) -> Loads {
         self.loads.lock().clone()
     }
@@ -655,6 +656,7 @@ impl PdAttempt {
 
     /// Committed decode endpoint, or `None` while the commitment is deferred.
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn decode_endpoint(&self) -> Option<PdEndpoint> {
         self.0.state.lock().decode_endpoint.clone()
     }
@@ -705,6 +707,7 @@ impl PdAttempt {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::fmt;
