@@ -1,105 +1,122 @@
 # KV-aware prefix routing
 
-`kv_aware` routes using worker KV events and current load. The examples use the [Rust binary](../cli_reference.md). Clients send OpenAI HTTP requests to the Router.
+Choose [HTTP](#http-workers) or [gRPC](#grpc-workers) for the worker pool. For both, clients send OpenAI HTTP requests to the Router.
 
-| Deployment | HTTP workers | gRPC workers |
-| --- | --- | --- |
-| Colocated prefill and decode | Chat and Completion | Chat and flat token-ID Completion |
-| Separate prefill and decode (P/D) | Chat and Completion | Chat and flat token-ID Completion on static pools |
+## Versions
 
-Use vLLM 0.30.0 or later and one worker transport per pool. For gRPC, export `VLLM_ROUTER_TOKENIZER` with the model directory used by the workers. See the [gRPC worker setup](../backend/grpc.md).
+| Component | Version and pairing |
+| --- | --- |
+| Router | Build the Rust `vllm-router` binary from this PR. |
+| HTTP worker | vLLM 0.33.0 for the commands below. vLLM 0.30.0 requires static event endpoints. |
+| gRPC worker | vLLM 0.33.0 and `vllm-rs` from the same tag, with the Rust Inference service. |
+| P/D workers | Use the same vLLM version, model checkpoint, connector and worker transport on both sides. |
 
-## 1. Start workers
+## 1. Configure vLLM
 
-### Full attention models
-
-For a local worker, set the model path and the HTTP, publisher and replay ports. Use a fresh event topic on every launch.
+These single-GPU examples use Qwen3-4B-Instruct-2507. Set the variables in each terminal and replace the model path. Use the engine's actual [hash seed or root](hybrid_kv_recipes.md#full-attention-layout) if it differs from the example.
 
 ```bash
 MODEL=/models/Qwen3-4B-Instruct-2507
-SERVED=qwen3
-HTTP=8000
-EVENTS='{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://127.0.0.1:5557","replay_endpoint":"tcp://127.0.0.1:5558","topic":"qwen3-8000-start01","buffer_steps":30000}'
-
-VLLM_SERVER_DEV_MODE=1 vllm serve "$MODEL" --host 127.0.0.1 --port "$HTTP" \
-  --served-model-name "$SERVED" --enable-prefix-caching --kv-events-config "$EVENTS"
+export VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0
+unset PYTHONHASHSEED
+EVENTS='{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://127.0.0.1:5557","replay_endpoint":"tcp://127.0.0.1:5558","topic":"qwen3-start01","buffer_steps":30000}'
 ```
 
-For a gRPC worker, replace the serve command.
+Use incremental event reporting, the default. Replay lets the Router catch up on recent events after a disconnect. Use a fresh topic on every worker launch and update the layout JSON to match. For multiple workers, use distinct ports and one transport per pool. Across hosts, use addresses reachable from the Router.
 
-```bash
-VLLM_SERVER_DEV_MODE=1 "${VLLM_RS:-vllm-rs}" serve "$MODEL" --host 127.0.0.1 --port "$HTTP" --grpc-port 50051 -- \
-  --served-model-name "$SERVED" --enable-prefix-caching --kv-events-config "$EVENTS"
-```
-
-Use distinct ports and GPU placement for additional workers. Across hosts, bind addresses the Router can reach.
-
-For a colocated HTTP worker serving one full-attention group without LoRA or a KV connector, the Router can discover the `sha256_cbor` contract from a vLLM build that exposes `/kv_routing_capabilities`. Enable full-width event hashes, replay, and a per-instance topic on the worker. The Router uses this contract automatically when available. See the [manual layout example](hybrid_kv_recipes.md#full-attention-layout) for other workers using the shared hash contract.
-
-### Hybrid attention models
-
-Use the [hybrid layout example](hybrid_kv_recipes.md) to start the engine and write its layout JSON. The Router discovers publisher and replay endpoints over HTTP or gRPC.
-
-## 2. Start the Router
+## 2. Start the worker and Router
 
 ### Colocated prefill and decode
 
-Set `WORKERS` to the worker URLs from the previous step.
+Choose one of the following setups and save the [full-attention example](hybrid_kv_recipes.md#full-attention-layout) as `layout.json`.
+
+#### HTTP workers
+
+Start vLLM.
 
 ```bash
-WORKERS=(http://127.0.0.1:8000 http://127.0.0.1:8001)
-# For gRPC:
-# WORKERS=(grpc://127.0.0.1:50051 grpc://127.0.0.1:50052)
-vllm-router --host 127.0.0.1 --port 19000 --policy kv_aware --worker-urls "${WORKERS[@]}"
+vllm serve "$MODEL" --host 127.0.0.1 --port 8000 --served-model-name qwen3 \
+  --enable-prefix-caching --prefix-caching-hash-algo sha256_cbor --block-size 16 \
+  --enable-prompt-tokens-details --kv-events-config "$EVENTS"
 ```
 
-Use one served model per regular pool. For separate model pools, enable `--enable-igw` and register each worker through `POST /workers` with its `model_id`.
+Set the worker key in `layout.json` to `http://127.0.0.1:8000`. In a second terminal, start the Router.
 
-- **Workers requiring a layout declaration.** Add `--kv-hybrid-layout layout.json`. [See the colocated JSON examples](hybrid_kv_recipes.md#colocated-layout).
-- **Static event sources.** If discovery is unavailable, supply `--kv-event-source 'WORKER_URL=tcp://HOST:5557'` and `--kv-event-replay-source 'WORKER_URL=tcp://HOST:5558'` per worker, plus `--kv-event-block-size` and `--kv-event-model`. For a hybrid worker, the layout supplies the topic.
+```bash
+vllm-router --host 127.0.0.1 --port 19000 --policy kv_aware \
+  --worker-urls http://127.0.0.1:8000 --kv-hybrid-layout layout.json
+```
+
+For a single full-attention group without LoRA or a KV connector, omit `--kv-hybrid-layout` if the worker build exposes its resolved contract at `/kv_routing_capabilities`. Standard vLLM 0.33 deployments can use the JSON example.
+
+#### gRPC workers
+
+Use [a vLLM build with the Rust gRPC service](../backend/grpc.md#starting-vllm-029).
+
+```bash
+vllm-rs serve "$MODEL" --host 127.0.0.1 --port 8000 --grpc-port 50051 --served-model-name qwen3 -- \
+  --enable-prefix-caching --prefix-caching-hash-algo sha256_cbor \
+  --block-size 16 --kv-events-config "$EVENTS"
+```
+
+Use `grpc://127.0.0.1:50051` as the worker key in `layout.json`. In a second terminal, point the Router at the worker's gRPC port and use its tokenizer.
+
+```bash
+VLLM_ROUTER_TOKENIZER="$MODEL" vllm-router --host 127.0.0.1 --port 19000 \
+  --policy kv_aware --worker-urls grpc://127.0.0.1:50051 --kv-hybrid-layout layout.json
+```
+
+The Router discovers the event endpoints from the worker. For a build without event discovery, append `--kv-event-source "$WORKER_URL=tcp://127.0.0.1:5557"` and `--kv-event-replay-source "$WORKER_URL=tcp://127.0.0.1:5558"`, where `WORKER_URL` is the worker URL in `layout.json`.
+
+### Hybrid attention models
+
+Use the worker command and `layout.json` from the [hybrid recipes](hybrid_kv_recipes.md). Keep the model name, hash settings, publisher topic, and cache groups aligned with the engine. For gRPC, use the same engine flags after `vllm-rs serve ... --` and key the JSON by the gRPC URL.
 
 ### P/D routing
 
-Start separate engines with the same model and compatible transfer settings. For NIXL, pass `--kv-transfer-config` with `"kv_connector":"NixlConnector"` and set `kv_role` to `kv_producer` on prefill and `kv_consumer` on decode. Give each engine a reachable `VLLM_NIXL_SIDE_CHANNEL_HOST` and its own `VLLM_NIXL_SIDE_CHANNEL_PORT`. Enable KV events and replay on prefill.
+Start one prefill and one decode engine on different GPUs using the same model and worker transport. For NIXL, add these settings to the worker commands above.
+
+| Setting | Prefill | Decode |
+| --- | --- | --- |
+| Service port | HTTP `8000` or gRPC `50051` | HTTP `8001` or gRPC `50052` |
+| `VLLM_NIXL_SIDE_CHANNEL_HOST` | `127.0.0.1` | `127.0.0.1` |
+| `VLLM_NIXL_SIDE_CHANNEL_PORT` | `5600` | `5601` |
+| `--kv-transfer-config` | `'{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'` | `'{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'` |
+| `--kv-events-config` | `"$EVENTS"` | Omit |
+
+For gRPC, also move Decode's worker HTTP port to `8001` and export `VLLM_ROUTER_TOKENIZER="$MODEL"` in the Router terminal. Write [`pd-layout.json`](hybrid_kv_recipes.md#pd-layout) with the prefill layout and the compatible decode URL, then start the Router.
 
 ```bash
-PREFILL=${PREFILL:-http://127.0.0.1:8000}
-DECODE=${DECODE:-http://127.0.0.1:8001}
-# For gRPC:
-# PREFILL=grpc://127.0.0.1:50051
-# DECODE=grpc://127.0.0.1:50052
+PREFILL=http://127.0.0.1:8000
+DECODE=http://127.0.0.1:8001
+# For gRPC, use grpc://127.0.0.1:50051 and grpc://127.0.0.1:50052.
 vllm-router --port 19000 --vllm-pd-disaggregation --prefill "$PREFILL" --decode "$DECODE" \
-  --prefill-policy kv_aware --decode-policy kv_aware --kv-connector nixl
+  --prefill-policy kv_aware --decode-policy round_robin --kv-connector nixl \
+  --pd-hybrid-config pd-layout.json
 ```
 
-Repeat `--prefill` and `--decode` for multiple workers. Match `--kv-connector` to the engines. See the [gRPC P/D API](../backend/grpc.md#pd-disaggregation).
+Leave Program scheduling disabled with declared P/D layouts. See the [CLI reference](../cli_reference.md#routing-policies) for additional settings.
 
-- **Full attention without event discovery.** Add `--pd-kv-events 'WORKER_URL=tcp://HOST:5557'` for a KV-aware prefill or decode worker with 16-token blocks.
-- **Prefill workers using the shared hash contract.** Add `--pd-hybrid-config pd-layout.json` with [explicit compatible pairs](hybrid_kv_recipes.md#pd-layout). Disable Program scheduling for these pairs.
+## 3. Verify reuse
 
-### Optional CLI settings
-
-| Setting | Effect |
-| --- | --- |
-| `--intra-node-data-parallel-size` | Rank count per worker URL. Default `1`. |
-| `--router-temperature` | Selection temperature for colocated routing and P/D prefill. Default `0` selects the lowest cost. |
-| `--kv-penalty-host`, `--kv-penalty-external`, `--kv-penalty-disk` | Cache credit by storage tier. Defaults `0.8`, `0.6`, `0.3`. |
-| `--kv-aware-session-affinity-ttl-secs` | Optional session affinity. Applies to decode only in P/D. |
-
-See [all routing options](../cli_reference.md#routing-policies).
-
-### Reporting and restarts
-
-Use incremental reporting on monitored workers. Explicit `vllm_xargs.kv_cache_report_mode=full` is rejected. Hybrid cache recovery requires ordered replay from an empty cache. When a hybrid worker is restarted, update its publisher topic and any changed layout values in the JSON, then restart the Router with the updated file.
-
-## Verify reuse
-
-Save a chat request as `request.json` with the served model name and a prompt spanning several cache pages. Send the request twice, allowing cache events from the first request to arrive.
+For the Qwen3 example, send the same token-ID prompt twice. Allow the Router to receive the first request's KV events before sending the second.
 
 ```bash
 curl -fsS http://127.0.0.1:19000/health
-curl -fsS http://127.0.0.1:19000/v1/chat/completions -H 'Content-Type: application/json' --data-binary @request.json
-curl -fsS http://127.0.0.1:29000/metrics | grep vllm_router_kv_placement_lookups_total
+jq -n '{model:"qwen3",prompt:[range(1000;1129)],max_tokens:1,temperature:0}' > request.json
+curl -fsS http://127.0.0.1:19000/v1/completions \
+  -H 'Content-Type: application/json' --data-binary @request.json
 ```
 
-A rise in `result="hit"` shows Router-observed reuse. Check `usage.prompt_tokens_details.cached_tokens` for actual engine reuse when the backend exposes it. If cache credit stays zero, check the served model, rank, topic and replay endpoint. For HTTP text input, also check worker rendering or `/tokenize` for supported simple prompts. The Router falls back to load-based routing when cache evidence is unavailable.
+Run the request again and check both sides.
+
+- **Router** — The `result="hit"` counter should increase for the warm request.
+  ```bash
+  curl -fsS http://127.0.0.1:29000/metrics | grep '^vllm_router_kv_placement_lookups_total{result="hit"}'
+  ```
+- **Worker** — For HTTP, check `usage.prompt_tokens_details.cached_tokens` when available. For either transport, compare the worker's prefix-cache hit counter before and after the warm request. Use the prefill worker in P/D.
+  ```bash
+  curl -fsS http://127.0.0.1:8000/metrics | grep '^vllm:prefix_cache_hits_total'
+  ```
+
+Both transports also support `/v1/chat/completions`. With gRPC, `/v1/completions` requires a flat array of token IDs. If Router lookups stay cold while the engine reports hits, check that the layout model, hash settings, and topic match the worker and that both event endpoints are reachable.

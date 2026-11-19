@@ -67,16 +67,33 @@ For LoRA, add `"adapters": [{"name": "my-adapter", "path": "/models/my-adapter"}
 
 Add `--prefix-caching-hash-algo sha256_cbor` and set `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` on each worker publishing KV events. Keep prefix caching, incremental events, and replay enabled.
 
-Use the colocated JSON above with the worker's actual `model`, `publisher_topic`, and `hash_block_size`. For a 16-token full-attention worker, replace `root_hash` with `hash_seed` and set these rank fields:
+Save this example as `layout.json` for the [Qwen3 walkthrough](http_completion_kv.md#colocated-prefill-and-decode). For HTTP, change the worker key to `http://127.0.0.1:8000`.
 
 ```json
 {
-  "hash_seed": "vllm-none-hash",
-  "partial_hash_hits": false,
-  "declared_groups": 1,
-  "groups": [
-    {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 16, "prefix_cacheable": true, "prefix_replay_tokens": 0}
-  ]
+  "grpc://127.0.0.1:50051": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "model": "qwen3",
+        "weight_version": "default",
+        "publisher_topic": "qwen3-start01",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "hash_seed": "vllm-none-hash",
+        "full_hashes": true,
+        "hash_block_size": 16,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 0,
+        "prefix_caching": true,
+        "declared_groups": 1,
+        "groups": [
+          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 16, "prefix_cacheable": true, "prefix_replay_tokens": 0}
+        ]
+      }
+    ]
+  }
 }
 ```
 
@@ -99,7 +116,7 @@ Start matching prefill and decode engines with the roles and connector in the [P
 }
 ```
 
-Replace the empty `hybrid` object with the complete layout before starting the Router. List endpoints in rank order and use base URLs without `@rank`. Save as `pd-layout.json` and pass `--pd-hybrid-config pd-layout.json`.
+Replace the empty `hybrid` object with the value under your prefill URL in `layout.json`. For the Qwen3 walkthrough, set `model` to `qwen3`. For gRPC, use the gRPC URLs for both workers. List event endpoints in rank order and use worker URLs without `@rank`. Save as `pd-layout.json` and pass `--pd-hybrid-config pd-layout.json`.
 
 ## Layout examples by checkpoint
 
