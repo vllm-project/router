@@ -84,7 +84,12 @@ impl ProgramCompletion {
     }
 
     pub(super) fn finish(&self, success: bool) {
-        self.inner.finish(success);
+        self.inner.finish(success, false);
+    }
+
+    /// A successful OpenAI SSE response needs a terminal marker, not just EOF.
+    pub(super) fn finish_openai_sse(&self, transport_success: bool) {
+        self.inner.finish(transport_success, true);
     }
 
     /// Terminal Engine outcome channel for the gRPC producer.
@@ -100,14 +105,18 @@ impl ProgramCompletion {
 }
 
 impl ProgramCompletionInner {
-    fn finish(&self, mut success: bool) {
+    fn finish(&self, mut success: bool, require_done: bool) {
         if self.finished.swap(true, Ordering::AcqRel) {
             return;
         }
-        let (mut usage, wire_error) = {
+        let (mut usage, wire_error, saw_done) = {
             let mut accumulator = self.usage.lock();
             accumulator.finish_sse();
-            (accumulator.observation, accumulator.wire_error)
+            (
+                accumulator.observation,
+                accumulator.wire_error,
+                accumulator.saw_done,
+            )
         };
         // The gRPC producer knows the Engine's final counts even when the client
         // did not ask for a wire `usage` chunk; prefer them over missing SSE.
@@ -129,7 +138,7 @@ impl ProgramCompletionInner {
             // not a successful completion even though the SSE body ended.
             success = false;
         }
-        if wire_error {
+        if wire_error || (require_done && !saw_done) {
             success = false;
         }
         self.finished_success.store(success, Ordering::Release);
@@ -160,7 +169,7 @@ impl ProgramCompletionInner {
 
 impl Drop for ProgramCompletionInner {
     fn drop(&mut self) {
-        self.finish(false);
+        self.finish(false, false);
     }
 }
 
@@ -171,6 +180,7 @@ struct ProgramUsageAccumulator {
     /// A wire-level error payload ended the stream; the body-level EOF must not
     /// be treated as success.
     wire_error: bool,
+    saw_done: bool,
 }
 
 impl ProgramUsageAccumulator {
@@ -226,6 +236,10 @@ impl ProgramUsageAccumulator {
             return;
         };
         let data = data.trim();
+        if data == "[DONE]" {
+            self.saw_done = true;
+            return;
+        }
         let data = data.as_bytes();
         if data
             .windows(b"\"error\"".len())
@@ -334,6 +348,17 @@ mod tests {
         accumulator.observe_sse_chunk(b"\"completion_tokens\":3}}\n\ndata: [DONE]\n");
         assert_eq!(accumulator.observation.prompt_tokens, Some(12));
         assert_eq!(accumulator.observation.completion_tokens, Some(3));
+    }
+
+    #[test]
+    fn sse_done_is_a_data_marker_and_can_cross_chunk_boundaries() {
+        let mut accumulator = ProgramUsageAccumulator::default();
+        accumulator.observe_sse_chunk(b": comment containing data: [DONE]\r\n\r\n");
+        assert!(!accumulator.saw_done);
+        accumulator.observe_sse_chunk(b"data: [DO");
+        assert!(!accumulator.saw_done);
+        accumulator.observe_sse_chunk(b"NE]\r\n\r\n");
+        assert!(accumulator.saw_done);
     }
 
     #[tokio::test]

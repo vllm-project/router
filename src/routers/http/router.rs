@@ -2385,6 +2385,7 @@ impl Router {
             strip_usage,
         } = dispatch;
         let completion_echo = completion.map(|input| input.echo);
+        let openai_sse = matches!(route, "/v1/chat/completions" | "/v1/completions");
         let load_incremented = load.tracks_worker();
         if crate::backend::is_grpc_url(worker_url) {
             // gRPC workers currently support only the chat and completions
@@ -2718,7 +2719,11 @@ impl Router {
                     }
                 }
                 if let Some(completion) = &completion {
-                    completion.finish(stream_succeeded);
+                    if openai_sse {
+                        completion.finish_openai_sse(stream_succeeded);
+                    } else {
+                        completion.finish(stream_succeeded);
+                    }
                 }
             });
 
@@ -2780,7 +2785,11 @@ impl Router {
                     }
                 }
                 if let Some(completion) = &completion {
-                    completion.finish(stream_succeeded);
+                    if openai_sse {
+                        completion.finish_openai_sse(stream_succeeded);
+                    } else {
+                        completion.finish(stream_succeeded);
+                    }
                 }
             });
 
@@ -8110,13 +8119,36 @@ mod tests {
 
     #[tokio::test]
     async fn missing_http_usage_stops_injection_and_optional_preparation() {
+        check_missing_http_usage(true).await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_http_sse_does_not_disable_usage_injection() {
+        check_missing_http_usage(false).await;
+    }
+
+    async fn check_missing_http_usage(complete: bool) {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let capture = captured.clone();
-        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(
-            move |Json(body): Json<serde_json::Value>| {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
                 capture.lock().push(body);
-                async { Response::new(Body::from("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n")) }
-            }));
+                async move {
+                    let delta = concat!(
+                        "data: ",
+                        r#"{"choices":[{"delta":{"content":"hello"}}]}"#,
+                        "\n\n"
+                    );
+                    let body = if complete {
+                        format!("{delta}data: [DONE]\n\n")
+                    } else {
+                        delta.to_owned()
+                    };
+                    Response::new(Body::from(body))
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -8139,7 +8171,7 @@ mod tests {
                 .await;
             assert_eq!(response.status(), StatusCode::OK);
             let bytes = to_bytes(response.into_body(), 10000).await.unwrap();
-            assert!(bytes.ends_with(b"data: [DONE]\n\n"));
+            assert_eq!(bytes.ends_with(b"data: [DONE]\n\n"), complete);
         }
         let injected: Vec<_> = captured
             .lock()
@@ -8150,9 +8182,19 @@ mod tests {
                     == Some(true)
             })
             .collect();
-        assert_eq!(injected, [true, true, true, false, false]);
+        assert_eq!(
+            injected,
+            if complete {
+                [true, true, true, false, false]
+            } else {
+                [true; 5]
+            }
+        );
         let diagnostic = router.program_scheduler.as_ref().unwrap().diagnostics();
-        assert_eq!(diagnostic.usage_unavailable_model_pools.len(), 1);
+        assert_eq!(
+            diagnostic.usage_unavailable_model_pools.len(),
+            if complete { 1 } else { 0 }
+        );
         assert_eq!(diagnostic.verified_token_fingerprints, 0);
         server.abort();
     }
