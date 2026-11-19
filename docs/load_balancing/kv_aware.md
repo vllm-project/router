@@ -17,13 +17,13 @@ Each worker handles the entire request. The walkthrough uses one Qwen3-4B-Instru
 
 ### 1. Prepare the worker settings
 
-In the worker terminal, set a local model directory and publish full 32-byte hashes in KV events. The replay port lets the Router recover recent events after a disconnect. Keep the default incremental reporting.
+In the worker terminal, set a local model directory and publish full 32-byte hashes in KV events. Use `tcp://*:5557` to bind the live publisher. The replay port lets the Router recover recent events after a disconnect. Keep the default incremental reporting.
 
 ```bash
 MODEL=/models/Qwen3-4B-Instruct-2507
 export VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0
 unset PYTHONHASHSEED
-EVENTS='{"enable_kv_cache_events":true,"endpoint":"tcp://127.0.0.1:5557","replay_endpoint":"tcp://127.0.0.1:5558","topic":"qwen3-start01"}'
+EVENTS='{"enable_kv_cache_events":true,"endpoint":"tcp://*:5557","replay_endpoint":"tcp://127.0.0.1:5558","topic":"qwen3-start01"}'
 ```
 
 #### Full-attention layout
@@ -83,7 +83,7 @@ vllm-router --host 127.0.0.1 --port 19000 --policy kv_aware \
 
 #### gRPC workers
 
-Use [`vllm-rs` from the same vLLM version](../backend/grpc.md#starting-vllm-029).
+Use [`vllm-rs` from the same vLLM version](../backend/grpc.md#starting-vllm-029). Activate that vLLM Python environment before starting the worker.
 
 ```bash
 "${VLLM_RS:-vllm-rs}" serve "$MODEL" --host 127.0.0.1 --port 8000 --grpc-port 50051 --served-model-name qwen3 -- \
@@ -168,10 +168,12 @@ Use `--max-model-len 4096 --prefix-match-unit 16`. Copy the Qwen3.5 rank fields 
 
 For the base checkpoint, use the [Qwen3.6 settings](#qwen36-27b) with the Qwen3.8 weights and served model name. Update the rank when enabling speculation.
 
+Enable MTP or DSpark on the worker with `--speculative-config`. In Router's layout, `speculative_tokens` is the configured draft length and `hash_lookahead_tokens` is the number of tokens after each block that enter its hash. For lookahead 1 and a 16-token block, token 17 is part of the hash of tokens 1–16. For lookahead 0, set `tail_drop_groups` to the groups for which the engine rolls back the last matched unit. DSpark uses `[]` in the examples below. Use the values in effect on Prefill for P/D disaggregation.
+
 | vLLM configuration | Rank settings |
 | --- | --- |
 | `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` in colocated routing | Keep the four base groups. Set `speculative_tokens: 3` and `hash_lookahead_tokens: 1`. |
-| MTP with `"disable_lookahead_block_hashes":true` or the tested Mooncake P/D setup | Keep the four base groups. Set `speculative_tokens: 3`, `hash_lookahead_tokens: 0` and `tail_drop_groups: [3]`. |
+| MTP with `"disable_lookahead_block_hashes":true` added to the worker's `--speculative-config`, or the tested Mooncake P/D setup | Keep the four base groups. Set `speculative_tokens: 3`, `hash_lookahead_tokens: 0` and `tail_drop_groups: [3]`. |
 | `--speculative-config '{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.8-27B-speculator.dspark"}'` | Set `speculative_tokens: 8`, `hash_lookahead_tokens: 0`, `tail_drop_groups: []` and `partial_hash_hits: false`. Keep `hash_block_size: 16`. |
 
 With the [Qwen3.8 DSpark draft](https://huggingface.co/RedHatAI/Qwen3.8-27B-speculator.dspark), set `declared_groups: 15`. Groups 0–9 use the 832-token Mamba settings above, and groups 10–13 use the 832-token full-attention settings. Group 14 uses `kind: "sliding_window"`, `spec_type: "SlidingWindowSpec"`, `block_size: 832`, `sliding_window: 2048`, `prefix_cacheable: true` and `prefix_replay_tokens: 0`.
