@@ -1,52 +1,30 @@
-//! Prepare engine events before committing them through one page-update path.
-
-use std::sync::Arc;
+//! Prepare engine events before committing their native hashes.
 
 use crate::kv_hash::SequenceHash;
 use crate::kv_index::storage::source_transaction::StreamState as State;
 use crate::kv_index::storage::{IndexBatch, PageWriteError};
-use crate::kv_index::wire::{BlockStored, ExternalBlockHash};
+use crate::kv_index::wire::BlockStored;
 use crate::kv_index::{
-    ClearScope, KVEvent, KVEventBatch, ResidencyOwner, SourceBinding, SourceError, SourceId,
-    StorageTier,
+    KVEvent, KVEventBatch, ResidencyOwner, SourceBinding, SourceError, StorageTier,
 };
 
-use super::validate::{
-    native_device, publishes_int_hash, sequence_hash, validate_full_attention_batch,
-    validate_hybrid_store, FullAttentionBatchRejection, FullAttentionRejectionReason,
-};
+use super::validate::{native_device, publishes_int_hash, sequence_hash, validate_store};
 
-pub(super) enum StoredPages {
-    Full {
-        parent: Option<Arc<str>>,
-        blocks: Vec<(Arc<str>, SequenceHash)>,
-    },
-    Hashes(Vec<SequenceHash>),
-}
-
-pub(super) enum RemovedKeys {
-    Full(Vec<Arc<str>>),
-    Hashes(Vec<SequenceHash>),
-}
-
-/// Layout validation chooses the addresses; both paths commit the same facts.
 pub(super) enum PreparedEvent<'a> {
     Store {
         group: u32,
         tier: StorageTier,
         incremental: bool,
         namespace: Option<&'a str>,
-        pages: StoredPages,
+        hashes: Vec<SequenceHash>,
     },
     Remove {
         group: u32,
         tier: StorageTier,
         incremental: bool,
-        keys: RemovedKeys,
+        hashes: Vec<SequenceHash>,
     },
-    // A plain worker clear includes older local incarnations; a bound stream
-    // clears only its exact owner. Neither clears an external pool by accident.
-    Clear(Option<ClearScope>),
+    Clear,
 }
 
 impl PreparedEvent<'_> {
@@ -62,161 +40,31 @@ impl PreparedEvent<'_> {
                 tier,
                 incremental,
                 namespace,
-                pages,
-            } => match pages {
-                StoredPages::Full { parent, blocks } => {
-                    tx.store_full_pages(group, owner, tier, parent.as_ref(), &blocks, incremental)
-                }
-                StoredPages::Hashes(hashes) => tx.store_hash_pages(
-                    owner,
-                    group,
-                    tier,
-                    namespace,
-                    &hashes,
-                    incremental,
-                    max_entries,
-                ),
-            },
+                hashes,
+            } => tx.store_hash_pages(
+                owner,
+                group,
+                tier,
+                namespace,
+                &hashes,
+                incremental,
+                max_entries,
+            ),
             Self::Remove {
                 group,
                 tier,
                 incremental,
-                keys,
+                hashes,
             } => {
-                match keys {
-                    RemovedKeys::Full(wires) => {
-                        tx.remove_full_pages(group, owner, tier, &wires, incremental)
-                    }
-                    RemovedKeys::Hashes(hashes) => {
-                        tx.remove_hash_pages(owner, group, tier, &hashes, incremental)
-                    }
-                }
+                tx.remove_hash_pages(owner, group, tier, &hashes, incremental);
                 Ok(())
             }
-            Self::Clear(scope) => {
-                match scope {
-                    Some(scope) => tx.clear(owner, scope),
-                    None => tx.clear_owner_exact(owner),
-                }
+            Self::Clear => {
+                tx.clear_owner_exact(owner);
                 Ok(())
             }
         }
     }
-}
-
-pub(super) struct PreparedFullBatch<'a> {
-    mutations: Vec<(ResidencyOwner, PreparedEvent<'a>)>,
-}
-
-impl PreparedFullBatch<'_> {
-    pub(super) fn apply(self, tx: &mut IndexBatch<'_>) -> Result<(), FullAttentionBatchRejection> {
-        for (event_index, (owner, event)) in self.mutations.into_iter().enumerate() {
-            if let Err(error) = event.apply(tx, &owner, usize::MAX) {
-                if error == PageWriteError::Capacity {
-                    tx.clear_owner_exact(&owner);
-                    let target = owner.target();
-                    tx.suspend_source(&target.instance_id, target.dp_rank);
-                }
-                return Err(FullAttentionBatchRejection {
-                    reason: match error {
-                        PageWriteError::Capacity => FullAttentionRejectionReason::Capacity,
-                        PageWriteError::ConflictingHash => {
-                            FullAttentionRejectionReason::ConflictingHash
-                        }
-                    },
-                    event_index,
-                });
-            }
-        }
-        Ok(())
-    }
-}
-
-pub(super) fn prepare_full_batch<'a>(
-    source: &SourceId,
-    dp_rank: u32,
-    incarnation: u64,
-    batch: &'a KVEventBatch,
-    expected_block_size: Option<u32>,
-) -> Result<PreparedFullBatch<'a>, FullAttentionBatchRejection> {
-    if let Some(expected) = expected_block_size {
-        validate_full_attention_batch(batch, expected)?;
-    }
-    let rank = batch.data_parallel_rank.unwrap_or(dp_rank);
-    let mutations = batch
-        .events
-        .iter()
-        .enumerate()
-        .map(|(event_index, event)| {
-            let tier = |owner: &ResidencyOwner, medium: Option<&str>| {
-                event_tier(owner, medium).ok_or(FullAttentionBatchRejection {
-                    reason: FullAttentionRejectionReason::Residency,
-                    event_index,
-                })
-            };
-            Ok(match event {
-                KVEvent::BlockStored(store) => {
-                    let owner = event_owner(source, rank, incarnation, store.ownership.as_deref());
-                    let locals = crate::kv_index::local_block_hashes(
-                        &store.token_ids,
-                        store.block_size,
-                        store.lora_name.as_deref(),
-                    );
-                    let prepared = PreparedEvent::Store {
-                        group: store.group_idx.unwrap_or(0),
-                        tier: tier(&owner, store.medium.as_deref())?,
-                        incremental: expected_block_size.is_some()
-                            && native_device(store.ownership.as_deref(), store.medium.as_deref()),
-                        namespace: store.lora_name.as_deref(),
-                        pages: StoredPages::Full {
-                            parent: store.parent_block_hash.as_ref().map(hash_str),
-                            blocks: store
-                                .block_hashes
-                                .iter()
-                                .map(hash_str)
-                                .zip(locals)
-                                .collect(),
-                        },
-                    };
-                    (owner, prepared)
-                }
-                KVEvent::BlockRemoved(remove) => {
-                    let owner = event_owner(source, rank, incarnation, remove.ownership.as_deref());
-                    let prepared = PreparedEvent::Remove {
-                        group: remove.group_idx.unwrap_or(0),
-                        tier: tier(&owner, remove.medium.as_deref())?,
-                        incremental: expected_block_size.is_some()
-                            && native_device(remove.ownership.as_deref(), remove.medium.as_deref()),
-                        keys: RemovedKeys::Full(remove.block_hashes.iter().map(hash_str).collect()),
-                    };
-                    (owner, prepared)
-                }
-                KVEvent::AllBlocksCleared(_) => (
-                    event_owner(source, rank, incarnation, None),
-                    PreparedEvent::Clear(Some(ClearScope::Worker)),
-                ),
-            })
-        })
-        .collect::<Result<_, FullAttentionBatchRejection>>()?;
-    Ok(PreparedFullBatch { mutations })
-}
-
-#[cfg(all(test, feature = "cpu", feature = "ready"))]
-#[cfg_attr(coverage_nightly, coverage(off))]
-pub(super) fn apply_batch(
-    index: &crate::kv_index::KvBlockIndexer,
-    source: &SourceId,
-    dp_rank: u32,
-    incarnation: u64,
-    batch: &KVEventBatch,
-    expected_block_size: Option<u32>,
-) -> Result<(), FullAttentionBatchRejection> {
-    let prepared = prepare_full_batch(source, dp_rank, incarnation, batch, expected_block_size)?;
-    let target = crate::kv_index::RoutableTarget {
-        instance_id: source.clone(),
-        dp_rank: batch.data_parallel_rank.unwrap_or(dp_rank),
-    };
-    index.with_source_batch(&target, |tx| prepared.apply(tx))
 }
 
 impl SourceBinding {
@@ -229,7 +77,7 @@ impl SourceBinding {
                 tracing::warn!(
                     error,
                     bytes = payload.len(),
-                    "hybrid payload did not decode"
+                    "KV event payload did not decode"
                 );
                 self.invalidate();
                 Err(SourceError::InvalidBatch)
@@ -293,10 +141,10 @@ impl SourceBinding {
                             remove.ownership.as_deref(),
                             remove.medium.as_deref(),
                         ),
-                        keys: RemovedKeys::Hashes(hashes),
+                        hashes,
                     });
                 }
-                KVEvent::AllBlocksCleared(_) => prepared.push(PreparedEvent::Clear(None)),
+                KVEvent::AllBlocksCleared(_) => prepared.push(PreparedEvent::Clear),
             }
         }
         Ok(prepared)
@@ -328,7 +176,7 @@ impl SourceBinding {
             Err(error) => return Self::fail(state, tx, &self.owner, error),
         };
         for event in prepared {
-            let clear = matches!(event, PreparedEvent::Clear(_));
+            let clear = matches!(event, PreparedEvent::Clear);
             if event.apply(tx, &self.owner, self.max_entries).is_err() {
                 return Self::fail(state, tx, &self.owner, SourceError::Capacity);
             }
@@ -358,7 +206,10 @@ impl SourceBinding {
             .iter()
             .find(|group| store.group_idx == Some(group.group_idx))
             .ok_or(SourceError::InvalidBatch)?;
-        if !validate_hybrid_store(
+        if self.strict_event_block_size && store.block_size != group.block_size {
+            return Err(SourceError::InvalidBatch);
+        }
+        if !validate_store(
             group,
             store,
             self.keys.block_size(),
@@ -380,7 +231,7 @@ impl SourceBinding {
             tier,
             namespace,
             incremental: native_device(store.ownership.as_deref(), store.medium.as_deref()),
-            pages: StoredPages::Hashes(hashes),
+            hashes,
         }))
     }
 
@@ -393,48 +244,5 @@ impl SourceBinding {
         tx.clear_owner_exact(owner);
         state.reset(None, false);
         Err(error)
-    }
-}
-
-fn event_owner(
-    source: &SourceId,
-    dp_rank: u32,
-    incarnation: u64,
-    ownership: Option<&str>,
-) -> ResidencyOwner {
-    match ownership {
-        Some(pool) if !pool.is_empty() => ResidencyOwner::CacheOwner {
-            pool_id: Arc::from(pool),
-            source: source.clone(),
-            dp_rank,
-        },
-        _ => ResidencyOwner::Worker {
-            source: source.clone(),
-            dp_rank,
-            incarnation,
-        },
-    }
-}
-
-fn event_tier(owner: &ResidencyOwner, medium: Option<&str>) -> Option<StorageTier> {
-    match owner {
-        ResidencyOwner::CacheOwner { .. } => Some(StorageTier::External),
-        ResidencyOwner::Worker { .. } => StorageTier::from_medium(medium),
-    }
-}
-
-pub(super) fn hash_str(hash: &ExternalBlockHash) -> Arc<str> {
-    match hash {
-        ExternalBlockHash::Int(value) => Arc::from(format!("i:{value}")),
-        ExternalBlockHash::Bytes(bytes) => {
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            let mut encoded = String::with_capacity(2 + bytes.len() * 2);
-            encoded.push_str("b:");
-            for &byte in bytes {
-                encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-                encoded.push(char::from(HEX[usize::from(byte & 0xf)]));
-            }
-            Arc::from(encoded)
-        }
     }
 }

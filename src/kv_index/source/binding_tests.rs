@@ -536,32 +536,30 @@ fn retired_source_cannot_reactivate_a_shared_domain() {
 
 #[test]
 fn old_hybrid_cleanup_preserves_a_new_full_attention_owner() {
-    use crate::kv_index::{KvBlockIndexer, MatchQuery, ResidencyOwner, StorageTier};
+    use crate::kv_index::source::test_support::full_store;
+    use crate::kv_index::KvBlockIndexer;
+
     let shared = Arc::new(KvBlockIndexer::new());
     let old = index(8).with_shared_index(shared.clone());
     old.begin_empty(0);
     old.apply_batch(0, &qwen_batch()).unwrap();
-    let next = ResidencyOwner::Worker {
-        source: target().instance_id,
-        dp_rank: 0,
-        incarnation: crate::kv_index::next_owner_incarnation(),
-    };
-    assert_ne!(old.owner, next);
-    shared.store(
-        3,
-        next,
-        StorageTier::Device,
-        None,
-        &[(Arc::from("full-hash"), [10; 32])],
-    );
+
+    let next = SourceBinding::new(target(), vec![groups()[3]], 528, 0, 8)
+        .unwrap()
+        .with_shared_index(shared);
+    assert_ne!(old.owner, next.owner);
+    next.begin_empty(0);
+    let tokens = prompt();
+    let mut store = full_store(&tokens[..528], 528, None);
+    store.group_idx = Some(3);
+    next.apply_batch(0, &event_batch(1.0, vec![KVEvent::BlockStored(store)]))
+        .unwrap();
+    assert_eq!(old.reusable_tokens(&tokens, usize::MAX), 528);
+    assert_eq!(next.reusable_tokens(&tokens, usize::MAX), 528);
+
     old.invalidate();
-    let hits = shared.find_matches(&MatchQuery {
-        group_idx: 3,
-        local_hashes: vec![[10; 32]],
-        tiers_of_interest: vec![StorageTier::Device],
-    });
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].segments, vec![(0, 1)]);
+    assert_eq!(old.reusable_tokens(&tokens, usize::MAX), 0);
+    assert_eq!(next.reusable_tokens(&tokens, usize::MAX), 528);
 }
 
 #[test]

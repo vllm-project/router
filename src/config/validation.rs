@@ -758,10 +758,14 @@ impl ConfigValidator {
                     || program.enable_batch_gain_admission
                     || program.token_capacity_per_dp_rank.is_none()
                     || program.pd.max_prefill_requests_per_target == 0
-                    || program.pd.max_prefill_requests_per_target > u32::MAX as usize)
+                    || program.pd.max_prefill_requests_per_target > u32::MAX as usize
+                    || !matches!(
+                        program.pd.kv_hash_mode.as_str(),
+                        "sha256" | "python_hash_seed" | "xxhash_cbor"
+                    ))
             {
                 return Err(ConfigError::IncompatibleConfig {
-                    reason: "PD scheduling requires per-rank capacity and positive bounded P concurrency; binding_only and uncalibrated batch gain are unsupported".to_string(),
+                    reason: "PD scheduling requires per-rank capacity, positive bounded P concurrency and a known KV hash mode; binding_only and uncalibrated batch gain are unsupported".to_string(),
                 });
             }
         }
@@ -985,12 +989,17 @@ impl ConfigValidator {
                     }
                     if let Some(layout) = &sources.hybrid {
                         let invalid = |reason: &str| ConfigError::IncompatibleConfig {
-                            reason: format!("hybrid PD source '{url}': {reason}"),
+                            reason: format!("PD cache layout for '{url}': {reason}"),
                         };
-                        if !prefill_kv {
+                        let paired_layout = !layout
+                            .ranks
+                            .iter()
+                            .all(crate::kv_index::RankCapability::is_plain_full_attention)
+                            || !sources.compatible_decode_urls.is_empty();
+                        if paired_layout && !prefill_kv {
                             return Err(invalid("requires a KV-aware prefill worker"));
                         }
-                        if config.program_scheduling.is_some() {
+                        if paired_layout && config.program_scheduling.is_some() {
                             return Err(ConfigError::IncompatibleConfig {
                                 reason: "hybrid PD sources do not support Program scheduling"
                                     .into(),
@@ -1006,7 +1015,7 @@ impl ConfigValidator {
                             .as_ref()
                             .filter(|endpoints| endpoints.len() == sources.endpoints.len())
                             .ok_or_else(|| invalid("requires one replay endpoint per rank"))?;
-                        if sources.compatible_decode_urls.is_empty() {
+                        if paired_layout && sources.compatible_decode_urls.is_empty() {
                             return Err(invalid("requires at least one compatible decode URL"));
                         }
                         if let Some(decode) = sources.compatible_decode_urls.iter().find(|url| {
@@ -1022,9 +1031,12 @@ impl ConfigValidator {
                             return Err(invalid("layout must declare one capability per endpoint"));
                         }
                         for (rank, replay_endpoint) in replay.iter().enumerate() {
-                            layout.validate_declared_source(rank as u32, model, replay_endpoint)
+                            layout
+                                .validate_declared_source(rank as u32, model, replay_endpoint)
                                 .map_err(|reason| ConfigError::IncompatibleConfig {
-                                    reason: format!("invalid hybrid PD layout for '{url}' rank {rank}: {reason}"),
+                                    reason: format!(
+                                        "invalid PD layout for '{url}' rank {rank}: {reason}"
+                                    ),
                                 })?;
                         }
                     } else if !sources.compatible_decode_urls.is_empty() {

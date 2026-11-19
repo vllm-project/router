@@ -211,8 +211,6 @@ impl Default for PredictionProfileConfig {
 pub struct PdProgramSchedulingConfig {
     /// Event residency is advisory and never authorizes a warm transfer.
     pub kv_events: bool,
-    /// Accepted for existing configurations. Page lookup derives keys from events.
-    #[serde(skip_serializing)]
     pub kv_hash_mode: String,
     pub max_prefill_requests_per_target: usize,
     /// Only bounded explicit TTL is supported; otherwise Acting TTL is zero.
@@ -287,7 +285,7 @@ impl Default for PdProgramSchedulingConfig {
     fn default() -> Self {
         Self {
             kv_events: false,
-            kv_hash_mode: String::new(),
+            kv_hash_mode: "sha256".to_string(),
             max_prefill_requests_per_target: 1,
             explicit_ttl: false,
             exclusive_capacity_accounting: true,

@@ -3,11 +3,10 @@
 use std::sync::Arc;
 
 use super::*;
+use crate::kv_index::source::test_support::{event_batch, full_store, gpu_remove};
 use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::types::TierBits;
-use crate::kv_index::{
-    KvBlockIndexer, Locality, MatchQuery, ResidencyOwner, RoutableTarget, StorageTier, TierMatch,
-};
+use crate::kv_index::{KVEvent, Locality, RoutableTarget, SourceBinding, StorageTier, TierMatch};
 
 fn target(name: &str, rank: u32) -> RoutableTarget {
     RoutableTarget {
@@ -568,39 +567,46 @@ fn incomplete_or_invalid_layout_never_grants_credit() {
 
 #[test]
 fn group_index_removal_reduces_the_common_restore_point() {
-    let worker = target("w", 0);
-    let owner = ResidencyOwner::Worker {
-        source: worker.instance_id.clone(),
-        dp_rank: worker.dp_rank,
-        incarnation: 1,
-    };
-    let index = KvBlockIndexer::new();
-    let blocks: Vec<(Arc<str>, [u8; 32])> = (0..4)
-        .map(|i| (Arc::from(format!("seq{i}")), [i; 32]))
-        .collect();
-    for id in [0, 1] {
-        index.store(id, owner.clone(), StorageTier::Device, None, &blocks);
-    }
-    let query = |group_idx| MatchQuery {
-        group_idx,
-        local_hashes: blocks.iter().map(|(_, local)| *local).collect(),
-        tiers_of_interest: vec![StorageTier::Device],
-    };
-    let full = index.find_matches(&query(0));
-    let before = index.find_matches(&query(1));
-    let groups = [
-        group(0, 16, GroupRule::FullAttention, &full),
-        group(1, 16, GroupRule::Checkpoint, &before),
-    ];
-    assert_eq!(common_reusable_tokens(&worker, &groups, 63), 48);
+    let tokens: Vec<_> = (0..64).collect();
+    let full = full_store(&tokens, 16, None);
+    let mut checkpoint = full.clone();
+    checkpoint.group_idx = Some(1);
+    checkpoint.kv_cache_spec_kind = Some("mamba".into());
+    let removed = checkpoint.block_hashes[2].clone();
+    let index = SourceBinding::new(
+        target("w", 0),
+        vec![
+            CacheGroup {
+                group_idx: 0,
+                block_size: 16,
+                kind: GroupRule::FullAttention,
+            },
+            CacheGroup {
+                group_idx: 1,
+                block_size: 16,
+                kind: GroupRule::Checkpoint,
+            },
+        ],
+        16,
+        0,
+        8,
+    )
+    .unwrap();
+    index.begin_empty(0);
+    let stored = event_batch(
+        1.0,
+        vec![KVEvent::BlockStored(full), KVEvent::BlockStored(checkpoint)],
+    );
+    index.apply_batch(0, &stored).unwrap();
+    assert_eq!(index.reusable_tokens(&tokens, 63), 48);
 
-    index.remove(1, &owner, StorageTier::Device, &[Arc::from("seq2")]);
-    let after = index.find_matches(&query(1));
-    let groups = [
-        group(0, 16, GroupRule::FullAttention, &full),
-        group(1, 16, GroupRule::Checkpoint, &after),
-    ];
-    assert_eq!(common_reusable_tokens(&worker, &groups, 63), 32);
+    index
+        .apply_batch(
+            1,
+            &event_batch(1.0, vec![gpu_remove(Some(1), vec![removed])]),
+        )
+        .unwrap();
+    assert_eq!(index.reusable_tokens(&tokens, 63), 32);
 }
 
 mod declarations {

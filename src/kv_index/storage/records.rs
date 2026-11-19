@@ -1,6 +1,6 @@
 //! Residency tiers and incremental device replica counts.
 
-pub(crate) use crate::kv_index::types::TierBits;
+use crate::kv_index::types::TierBits;
 use crate::kv_index::StorageTier;
 
 /// One authoritative observation, including native incremental GPU copies.
@@ -12,10 +12,6 @@ pub(super) struct Residency {
 }
 
 impl Residency {
-    pub(super) fn can_observe(self, incremental: bool) -> bool {
-        !incremental || self.device_copies < u32::MAX
-    }
-
     pub(super) fn observe(&mut self, tier: StorageTier, incremental: bool) -> bool {
         if incremental {
             if tier != StorageTier::Device {

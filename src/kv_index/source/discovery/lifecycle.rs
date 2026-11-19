@@ -16,7 +16,8 @@ use super::reconcile::{
 use super::{CacheKey, KvIndexSupervisor, WorkerKvInfo, WorkerSubs};
 use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::{
-    CacheCapabilities, EventStream, EventSubscriberHandle, KvBlockIndexer, SourceBinding,
+    CacheCapabilities, EventStream, EventSubscriberHandle, IngestionSignal, KvBlockIndexer,
+    SourceBinding,
 };
 
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -253,10 +254,26 @@ impl KvIndexSupervisor {
         let provider = Arc::downgrade(provider);
         let probe_ctx = self.ctx.clone();
         let client = self.client.clone();
+        let signals = Some(self.signal_tx.clone());
         let worker = worker_url.to_owned();
         let api_key = self.api_key.clone();
         let static_config = self.resolved_static_source(worker_url);
         tokio::spawn(async move {
+            let invalidate = |handles: &[Arc<EventSubscriberHandle>]| {
+                for handle in handles {
+                    handle.shutdown();
+                }
+                for (source, _) in &targets {
+                    crate::kv_index::subscriber::emit(
+                        &signals,
+                        IngestionSignal::Invalidated {
+                            source: source.source.clone(),
+                            dp_rank: source.dp_rank,
+                            reason: "cache_contract",
+                        },
+                    );
+                }
+            };
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let Some(provider) = provider.upgrade() else {
@@ -266,9 +283,7 @@ impl KvIndexSupervisor {
                     break;
                 }
                 if provider.lifecycle.expire_if_needed() {
-                    for handle in &handles {
-                        handle.shutdown();
-                    }
+                    invalidate(&handles);
                 }
                 let outcome = if let Some(config) = &static_config {
                     static_hybrid_sources_match(
@@ -297,29 +312,27 @@ impl KvIndexSupervisor {
                 }
                 // A probe may cross the deadline while it is in flight.
                 if provider.lifecycle.expire_if_needed() {
-                    for handle in &handles {
-                        handle.shutdown();
-                    }
+                    invalidate(&handles);
                 }
                 match provider.lifecycle.observe_layout(&outcome) {
                     SourceAction::Stop => {
-                        for handle in &handles {
-                            handle.shutdown();
-                        }
+                        invalidate(&handles);
                         break;
                     }
                     SourceAction::Expire => {
-                        for handle in &handles {
-                            handle.shutdown();
-                        }
+                        invalidate(&handles);
                     }
                     SourceAction::Recover => {
                         handles.clear();
                         let mut recovered = true;
                         for (ev, index) in &targets {
                             let stream = Arc::new(EventStream::new(index.clone()));
-                            match crate::kv_index::spawn_zmq(ev.clone(), stream, probe_ctx.clone())
-                            {
+                            match super::super::events::event_stream::spawn_zmq_with_signals(
+                                ev.clone(),
+                                stream,
+                                probe_ctx.clone(),
+                                signals.clone(),
+                            ) {
                                 Ok(handle) => handles.push(Arc::new(handle)),
                                 Err(_) => recovered = false,
                             }
@@ -351,6 +364,10 @@ impl KvIndexSupervisor {
     /// Shut down this worker's subscribers, clear its residency, release its
     /// identity ref.
     pub fn on_worker_removed(&self, worker_url: &str) {
+        if let Some(observers) = &self.observers {
+            observers.lock().remove(worker_url);
+            return;
+        }
         let mut workers = self.workers.lock();
         self.lifecycles.lock().remove(worker_url);
         if let Some(subs) = workers.remove(worker_url) {
@@ -364,9 +381,6 @@ impl KvIndexSupervisor {
         for handle in &subs.handles {
             handle.shutdown();
         }
-        for handle in &subs.hybrid_handles {
-            handle.shutdown();
-        }
         for live in &subs.live_sources {
             let _guard = live.lease.strict_rank.lock();
             subs.indexer.retire_source(&subs.source_id, live.rank);
@@ -376,6 +390,10 @@ impl KvIndexSupervisor {
 
     /// Shut down every subscriber and drop all indexers.
     pub fn shutdown(&self) {
+        if let Some(observers) = &self.observers {
+            observers.lock().clear();
+            return;
+        }
         let mut workers = self.workers.lock();
         for (_url, subs) in workers.drain() {
             self.retire_worker(subs);

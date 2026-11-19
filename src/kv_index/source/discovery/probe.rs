@@ -1,6 +1,7 @@
 //! Read worker model metadata and KV event source endpoints.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use tracing::{info, warn};
 
@@ -183,15 +184,72 @@ pub(super) async fn fetch_kv_event_sources(
     })
 }
 
-/// Read the worker's resolved contract. The automatic path covers plain full
-/// attention; connectors and LoRA keep their existing event handling.
-pub(super) async fn fetch_native_full_layout(
+/// Read the source list and its automatically published cache contract.
+pub(super) async fn fetch_native_full_sources(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> (
+    Result<KvEventSourcesResponse, SourcesUnavailable>,
+    Result<Option<CacheCapabilities>, String>,
+) {
+    if crate::backend::is_grpc_url(worker_url) {
+        let response =
+            match crate::backend::control::get_grpc_kv_event_sources(worker_url, timeout).await {
+                Ok(response) => response,
+                Err(error) => return (Err(error.into()), Ok(None)),
+            };
+        let rank_count = response.sources.len();
+        let sources = grpc_kv_event_source_entries(worker_url, response.sources);
+        let layout = match response.kv_routing_capabilities.as_deref() {
+            Some(bytes) if sources.len() == rank_count => serde_json::from_slice(bytes)
+                .map_err(|error| format!("kv_routing_capabilities parse: {error}"))
+                .and_then(parse_native_full_layout),
+            _ => Ok(None),
+        };
+        return (Ok(sources), layout);
+    }
+
+    let (sources, layout) = tokio::join!(
+        fetch_kv_event_sources(client, worker_url, api_key),
+        tokio::time::timeout(timeout, fetch_http_full_layout(client, worker_url, api_key)),
+    );
+    (
+        sources,
+        layout.unwrap_or_else(|_| Err("kv_routing_capabilities timed out".into())),
+    )
+}
+
+async fn fetch_http_full_layout(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
 ) -> Result<Option<CacheCapabilities>, String> {
-    let body: serde_json::Value =
-        query_worker_json(client, worker_url, "kv_routing_capabilities", true, api_key).await?;
+    let url = format!(
+        "{}/kv_routing_capabilities",
+        worker_url.trim_end_matches('/')
+    );
+    let response = worker_get(client, &url, api_key)
+        .send()
+        .await
+        .map_err(|error| format!("kv_routing_capabilities {url}: {error}"))?;
+    let status = response.status();
+    if matches!(status.as_u16(), 404 | 405) {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(format!("kv_routing_capabilities {url}: {status}"));
+    }
+    let body = response
+        .json()
+        .await
+        .map_err(|error| format!("kv_routing_capabilities parse: {error}"))?;
+    parse_native_full_layout(body)
+}
+
+/// Automatic discovery accepts only a complete plain full-attention contract.
+fn parse_native_full_layout(body: serde_json::Value) -> Result<Option<CacheCapabilities>, String> {
     if !body
         .get("adapters")
         .and_then(serde_json::Value::as_array)
@@ -210,25 +268,12 @@ pub(super) async fn fetch_native_full_layout(
     }
     let mut capability: CacheCapabilities =
         serde_json::from_value(body).map_err(|e| format!("kv_routing_capabilities parse: {e}"))?;
-    for rank in &mut capability.ranks {
-        let [group] = rank.groups.as_slice() else {
-            return Ok(None);
-        };
-        if rank.declared_groups.is_some_and(|count| count != 1)
-            || rank.hash_block_size != Some(group.block_size)
-            || rank.hash_lookahead_tokens != 0
-            || rank.speculative_tokens != 0
-            || rank.partial_hash_hits
-            || group.group_idx != 0
-            || group.kind != "full_attention"
-            || group.spec_type != "FullAttentionSpec"
-            || !group.prefix_cacheable
-            || group.prefix_replay_tokens != 0
-        {
-            return Ok(None);
-        }
-        // The discovery endpoint lists the live engine's complete topology.
-        rank.declared_groups = Some(1);
+    if capability
+        .ranks
+        .iter()
+        .any(|rank| rank.declared_groups != Some(1) || !rank.is_plain_full_attention())
+    {
+        return Ok(None);
     }
     capability.ranks.sort_unstable_by_key(|rank| rank.rank);
     Ok(Some(capability))

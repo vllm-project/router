@@ -4,13 +4,12 @@ use super::*;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 
-/// A batch holds either the global barrier exclusively, or the barrier for
-/// reading together with its scoped source write lock. Its closure must not
-/// re-enter any locking `KvBlockIndexer` method.
+/// A batch holds the write lock for one source. Its closure must not re-enter
+/// any locking `KvBlockIndexer` method.
 pub(crate) struct IndexBatch<'a> {
     pub(super) index: &'a KvBlockIndexer,
-    pub(super) scope: Option<RoutableTarget>,
-    pub(super) source_data: Option<&'a mut SourceRecords>,
+    pub(super) target: &'a RoutableTarget,
+    pub(super) active_pages: &'a mut ActivePages,
 }
 
 /// A consistent view under one source read lock.
@@ -21,27 +20,8 @@ pub(crate) struct IndexSnapshot<'a> {
 }
 
 impl IndexBatch<'_> {
-    pub(super) fn check_target(&self, target: &RoutableTarget) {
-        if let Some(scope) = &self.scope {
-            assert_eq!(scope, target, "source transaction crossed targets");
-        }
-    }
-
-    pub(super) fn with_records<R>(
-        &mut self,
-        target: &RoutableTarget,
-        operation: impl FnOnce(&mut SourceRecords) -> R,
-    ) -> R {
-        self.check_target(target);
-        if let Some(data) = self.source_data.as_deref_mut() {
-            operation(data)
-        } else {
-            // The global domain write guard excludes every source transaction.
-            let source = self.index.source_lock(target);
-            let mut data = source.access.write();
-            let _revision = SourceWrite::new(&source.revision);
-            operation(&mut data.records)
-        }
+    fn check_target(&self, target: &RoutableTarget) {
+        assert_eq!(self.target, target, "source transaction crossed targets");
     }
 
     pub(crate) fn suspend_source(&self, source: &SourceId, rank: u32) {
@@ -60,60 +40,10 @@ impl IndexBatch<'_> {
         self.index.resume_source_unlocked(source, rank);
     }
 
-    pub(crate) fn invalidate_source(&mut self, source: &SourceId, rank: u32) {
-        let index = self.index;
-        self.with_records(
-            &RoutableTarget {
-                instance_id: source.clone(),
-                dp_rank: rank,
-            },
-            |records| index.invalidate_source_unlocked(source, rank, records),
-        );
-    }
-
-    pub(crate) fn clear(&mut self, owner: &ResidencyOwner, scope: ClearScope) {
-        if self.scope.is_some() {
-            assert!(
-                matches!(owner, ResidencyOwner::Worker { .. }) && scope == ClearScope::Worker,
-                "cross-source clear requires a global transaction"
-            );
-        }
-        self.check_target(&owner.target());
-        let targets: Vec<_> = if let Some(target) = &self.scope {
-            vec![target.clone()]
-        } else {
-            self.index.source_locks.read().keys().cloned().collect()
-        };
-        let index = self.index;
-        for target in targets {
-            self.with_records(&target, |records| {
-                let owners: Vec<_> = records
-                    .hash_keys
-                    .keys()
-                    .filter(|candidate| {
-                        (scope == ClearScope::All || scope == candidate.domain())
-                            && same_clear_owner(owner, candidate)
-                    })
-                    .cloned()
-                    .collect();
-                for owner in owners {
-                    index.hash_pages.clear_owner(&mut records.hash_keys, &owner);
-                }
-                records.addresses.clear(|candidate| {
-                    (scope == ClearScope::All || scope == candidate.domain())
-                        && same_clear_owner(owner, candidate)
-                });
-            });
-        }
-    }
-
     /// Remove only this precise owner, including its incarnation.
     pub(crate) fn clear_owner_exact(&mut self, owner: &ResidencyOwner) {
-        let index = self.index;
-        self.with_records(&owner.target(), |records| {
-            index.hash_pages.clear_owner(&mut records.hash_keys, owner);
-            records.addresses.clear(|candidate| candidate == owner);
-        });
+        self.check_target(&owner.target());
+        self.index.hash_pages.clear_owner(self.active_pages, owner);
     }
 }
 
@@ -166,7 +96,7 @@ impl IndexSnapshot<'_> {
                         prefix_len: 0,
                         prefix: TierBits::default(),
                         tail: Cow::Owned(self.index.hash_pages.for_owner(
-                            self.source_data.records.hash_keys.get(owner),
+                            self.source_data.active_pages.get(owner),
                             group,
                             namespace,
                             keys,
@@ -224,19 +154,17 @@ impl IndexBatch<'_> {
         incremental: bool,
         max_entries: usize,
     ) -> Result<(), PageWriteError> {
-        let index = self.index;
-        self.with_records(&owner.target(), |records| {
-            index.hash_pages.store(
-                &mut records.hash_keys,
-                owner,
-                group,
-                tier,
-                namespace,
-                hashes,
-                incremental,
-                max_entries,
-            )
-        })
+        self.check_target(&owner.target());
+        self.index.hash_pages.store(
+            self.active_pages,
+            owner,
+            group,
+            tier,
+            namespace,
+            hashes,
+            incremental,
+            max_entries,
+        )
     }
     pub(crate) fn remove_hash_pages(
         &mut self,
@@ -246,17 +174,10 @@ impl IndexBatch<'_> {
         hashes: &[SequenceHash],
         incremental: bool,
     ) {
-        let index = self.index;
-        self.with_records(&owner.target(), |records| {
-            index.hash_pages.remove(
-                &mut records.hash_keys,
-                owner,
-                group,
-                tier,
-                hashes,
-                incremental,
-            )
-        });
+        self.check_target(&owner.target());
+        self.index
+            .hash_pages
+            .remove(self.active_pages, owner, group, tier, hashes, incremental);
     }
 }
 

@@ -65,14 +65,12 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
 }
 
 use super::lifecycle::SourceAction;
-use super::probe::worker_descriptor;
+use super::probe::{grpc_kv_event_source_entries, worker_descriptor};
 use super::reconcile::{bound_source_moved, probe_keeps_trust, probe_renews_trust, BoundSource};
 use super::*;
 use crate::core::worker::worker_get;
-use crate::kv_index::source::test_support::{event_payload, stored_block as stored};
-use crate::kv_index::subscriber::EventSource;
-use crate::kv_index::wire::{ExternalBlockHash, KVEvent};
-use crate::kv_index::{MatchQuery, StorageTier};
+use crate::kv_index::source::test_support::{event_payload, full_store};
+use crate::kv_index::wire::KVEvent;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -96,8 +94,31 @@ fn capability(
     .unwrap()
 }
 
+fn plain_full_layout(model: &str, topic: &str, block_size: u32) -> CacheCapabilities {
+    let mut layout = capability(
+        model,
+        topic,
+        block_size,
+        serde_json::json!([{
+            "group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec",
+            "block_size": block_size, "prefix_cacheable": true, "prefix_replay_tokens": 0
+        }]),
+    );
+    layout.ranks[0].declared_groups = Some(1);
+    layout
+}
+
+fn automatic_layout(layout: CacheCapabilities) -> serde_json::Value {
+    let mut response = serde_json::to_value(layout).unwrap();
+    response["adapters"] = serde_json::json!([]);
+    for rank in response["ranks"].as_array_mut().unwrap() {
+        rank["transfer"] = serde_json::Value::Null;
+    }
+    response
+}
+
 #[tokio::test]
-async fn configured_event_sources_skip_unavailable_control_discovery() {
+async fn endpoints_without_a_verified_layout_do_not_create_a_cache_provider() {
     let publisher_context = zmq::Context::new();
     let publisher = publisher_context.socket(zmq::PUB).unwrap();
     publisher.bind("tcp://127.0.0.1:*").unwrap();
@@ -122,15 +143,11 @@ async fn configured_event_sources_skip_unavailable_control_discovery() {
             KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
         let supervisor = supervisor.with_static_sources(sources);
 
-        let mut info = supervisor.on_worker_added(worker_url).await.unwrap();
+        let info = supervisor.on_worker_added(worker_url).await.unwrap();
         assert_eq!(info.block_size, Some(32));
-        info.ranks.sort_unstable();
-        assert_eq!(info.ranks, (0..rank_count as u32).collect::<Vec<_>>());
-        assert_eq!(info.cache_key.unwrap().model.as_ref(), "shared-model");
-        assert!(supervisor.match_provider_for_worker(worker_url).is_some());
-        assert!(supervisor.workers.lock()[worker_url]
-            .worker_origin
-            .is_none());
+        assert!(info.ranks.is_empty());
+        assert!(info.cache_key.is_none());
+        assert!(supervisor.match_provider_for_worker(worker_url).is_none());
         supervisor.on_worker_removed(worker_url);
     }
 }
@@ -458,15 +475,15 @@ async fn source_boundary_worker(
         "publisher": "zmq", "encoding": "msgpack", "schema_version": 1,
         "enable_kv_cache_events": true
     }});
-    source_boundary_worker_with_metadata(info, sources).await
-}
-
-async fn source_boundary_worker_with_metadata(
-    info: serde_json::Value,
-    sources: serde_json::Value,
-) -> (String, tokio::task::JoinHandle<()>) {
-    source_boundary_worker_with_routes(axum::Router::new(), info, Arc::new(Mutex::new(sources)))
-        .await
+    let layout = automatic_layout(plain_full_layout("boundary-model", "kv/boundary", 8));
+    let app = axum::Router::new().route(
+        "/kv_routing_capabilities",
+        axum::routing::get(move || {
+            let layout = layout.clone();
+            async move { axum::Json(layout) }
+        }),
+    );
+    source_boundary_worker_with_routes(app, info, Arc::new(Mutex::new(sources))).await
 }
 
 async fn source_boundary_worker_with_routes(
@@ -501,13 +518,14 @@ async fn source_boundary_worker_with_routes(
 #[tokio::test]
 async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
     use axum::{http::StatusCode, routing::get, Json, Router};
-    use serde_json::{json, Value};
+    use serde_json::json;
 
     let topic = "kv/full-boot-1";
-    for (algorithm, native) in [
-        (None, false),
-        (Some("sha256"), false),
-        (Some("sha256_cbor"), true),
+    for (algorithm, declared_groups, native) in [
+        (None, None, false),
+        (Some("sha256"), Some(1), false),
+        (Some("sha256_cbor"), None, false),
+        (Some("sha256_cbor"), Some(1), true),
     ] {
         let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
         let sources = Arc::new(Mutex::new(json!({"0": {
@@ -520,20 +538,10 @@ async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
             "instance_id": "boot-1", "kv_block_size": 8
         });
         let layout = algorithm.map(|algorithm| {
-            let mut layout = capability(
-                "full-model",
-                topic,
-                8,
-                json!([{
-                    "group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec",
-                    "block_size": 8, "prefix_cacheable": true, "prefix_replay_tokens": 0
-                }]),
-            );
+            let mut layout = plain_full_layout("full-model", topic, 8);
             layout.ranks[0].hash_algorithm = algorithm.to_owned();
-            let mut response = serde_json::to_value(layout).unwrap();
-            response["adapters"] = json!([]);
-            response["ranks"][0]["transfer"] = Value::Null;
-            response
+            layout.ranks[0].declared_groups = declared_groups;
+            automatic_layout(layout)
         });
         let capability_response = Arc::new(Mutex::new(layout));
         let app = Router::new().route(
@@ -551,12 +559,16 @@ async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
         let (supervisor, _signals) =
             KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
         let registered = supervisor.on_worker_added(&worker).await.unwrap();
-        assert_eq!(registered.ranks, [0], "{algorithm:?}");
-        assert_eq!(registered.cache_key.unwrap().model.as_ref(), "served-alias");
-        let provider = supervisor.match_provider_for_worker(&worker).unwrap();
-        assert_eq!(provider.target_scoped(), native, "{algorithm:?}");
+        assert_eq!(registered.cache_key.is_some(), native, "{algorithm:?}");
+        assert_eq!(
+            supervisor.match_provider_for_worker(&worker).is_some(),
+            native,
+            "{algorithm:?}"
+        );
         if native {
-            let provider = supervisor.workers.lock()[&worker].hybrid.clone().unwrap();
+            assert_eq!(registered.ranks, [0]);
+            assert_eq!(registered.cache_key.unwrap().model.as_ref(), "served-alias");
+            let provider = supervisor.workers.lock()[&worker].provider.clone();
             let verified_at = provider.lifecycle.state.lock().verified_at;
             tokio::time::timeout(Duration::from_secs(5), async {
                 while provider.lifecycle.state.lock().verified_at == verified_at {
@@ -588,7 +600,7 @@ async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
                 .as_ref()
                 .unwrap()
                 .target_scoped());
-            let replacement = supervisor.workers.lock()[&worker].hybrid.clone().unwrap();
+            let replacement = supervisor.workers.lock()[&worker].provider.clone();
             assert!(replacement.is_trusted());
             assert!(!provider.lifecycle.active.load(Ordering::Acquire));
         }
@@ -659,32 +671,19 @@ async fn finish_empty_startup_replay(replay: &zmq::Socket) {
     replay_reply(replay, &request, &[], -1, &[]);
 }
 
-fn stored_block(hash: i64, tokens: &[u32], block_size: u32, medium: &str) -> KVEvent {
-    let mut event = stored(
-        vec![ExternalBlockHash::Int(hash.try_into().unwrap())],
-        tokens.to_vec(),
-        block_size,
-    );
-    event.medium = Some(medium.into());
-    KVEvent::BlockStored(event)
+fn full_payload(tokens: &[u32], block_size: u32, rank: u32) -> Vec<u8> {
+    let store = KVEvent::BlockStored(full_store(tokens, block_size, None));
+    event_payload(1.0, &[store], Some(rank))
 }
 
-fn store_payload(
-    hash: i64,
-    tokens: &[u32],
-    block_size: u32,
-    medium: &str,
-    rank: Option<u32>,
-) -> Vec<u8> {
-    event_payload(1.0, &[stored_block(hash, tokens, block_size, medium)], rank)
-}
-
-fn block_query(tokens: &[u32], block_size: u32, tiers: &[StorageTier]) -> MatchQuery {
-    MatchQuery {
-        group_idx: 0,
-        local_hashes: crate::kv_index::local_block_hashes(tokens, block_size, None),
-        tiers_of_interest: tiers.to_vec(),
-    }
+async fn wait_for(mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -836,7 +835,7 @@ async fn hybrid_discovery_binds_only_ranks_for_the_worker_model() {
             .unwrap();
         assert_eq!(info.block_size, Some(16));
         let workers = supervisor.workers.lock();
-        let provider = workers[worker_url].hybrid.as_ref().unwrap();
+        let provider = &workers[worker_url].provider;
         let mut bound: Vec<_> = provider.indexes.keys().copied().collect();
         bound.sort_unstable();
         assert_eq!(bound, expected);
@@ -975,9 +974,8 @@ async fn exercise_static_hybrid(pd: bool) {
         .lock()
         .get(&worker_url)
         .unwrap()
-        .hybrid
-        .clone()
-        .unwrap();
+        .provider
+        .clone();
     fail_probe.store(true, Ordering::Release);
     tokio::time::timeout(Duration::from_secs(5), async {
         while failed_probes.load(Ordering::Acquire) == 0 {
@@ -1071,563 +1069,180 @@ async fn exercise_static_hybrid(pd: bool) {
     server.abort();
 }
 
+fn declared_full_worker(
+    model: &str,
+    instance: &str,
+    rank: u32,
+    endpoint: &str,
+    replay_endpoint: &str,
+    topic: &str,
+) -> WorkerDiscovery {
+    let mut layout = plain_full_layout(model, topic, 8);
+    layout.ranks[0].rank = rank;
+    WorkerDiscovery {
+        server_info: Ok(ServerInfo {
+            instance_id: Some(instance.into()),
+            kv_block_size: Some(8),
+            ..Default::default()
+        }),
+        sources: Ok(HashMap::from([(
+            rank.to_string(),
+            KvEventSourceEntry {
+                endpoint: endpoint.into(),
+                replay_endpoint: Some(replay_endpoint.into()),
+                topic: topic.into(),
+                publisher: Some("zmq".into()),
+                encoding: Some("msgpack".into()),
+                schema_version: Some(1),
+                enable_kv_cache_events: Some(true),
+                ..Default::default()
+            },
+        )])),
+        model_id: Ok(Some(model.into())),
+        hybrid: Some(layout),
+    }
+}
+
 #[tokio::test]
-async fn source_installation_preserves_topic_rank_and_cache_identity_boundaries() {
-    for (case, (topic_b, rank_b, model_b, same_publisher, accepted)) in [
-        ("kv/other", 0u32, "boundary-model", true, true),
-        ("kv/boundary", 1, "boundary-model", true, true),
-        ("kv/boundary", 0, "other-model", false, true),
-        ("kv/boundary", 0, "other-model", true, false),
-        ("kv/boundary", 0, "boundary-model", true, false),
-        ("kv/boundary", 0, "boundary-model", false, false),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let endpoint_a = format!("inproc://source-boundary-{case}-a");
-        let endpoint_b = format!("inproc://source-boundary-{case}-b");
-        let discovery =
-            |model: &str, instance: &str, endpoint: &str, topic: &str, rank: u32| WorkerDiscovery {
-                hybrid: None,
-                server_info: Ok(ServerInfo {
-                    instance_id: Some(instance.into()),
-                    kv_block_size: Some(8),
-                    ..Default::default()
-                }),
-                model_id: Ok(Some(model.into())),
-                sources: Ok(HashMap::from([(
-                    rank.to_string(),
-                    KvEventSourceEntry {
-                        endpoint: endpoint.into(),
-                        topic: topic.into(),
-                        publisher: Some("zmq".into()),
-                        encoding: Some("msgpack".into()),
-                        schema_version: Some(1),
-                        enable_kv_cache_events: Some(true),
-                        ..Default::default()
-                    },
-                )])),
-            };
-        let worker_a = "http://worker-a:8000";
-        let worker_b = "http://worker-b:8000";
+async fn source_installation_keeps_live_streams_replays_and_index_targets_independent() {
+    let worker_a = "http://worker-a:8000";
+    let worker_b = "http://worker-b:8000";
+    for (model_b, rank_b, endpoint_b, replay_b, topic_b, error) in [
+        ("model", 1, "inproc://p1", "inproc://r2", "other", None),
+        ("other", 0, "inproc://p2", "inproc://r2", "kv", None),
+        (
+            "other",
+            0,
+            "inproc://p1",
+            "inproc://r2",
+            "kv",
+            Some("live KV streams"),
+        ),
+        (
+            "model",
+            1,
+            "inproc://p1",
+            "inproc://r2",
+            "kv",
+            Some("live KV streams"),
+        ),
+        (
+            "model",
+            0,
+            "inproc://p2",
+            "inproc://r1",
+            "kv",
+            Some("KV replay endpoints"),
+        ),
+        (
+            "model",
+            0,
+            "inproc://p2",
+            "inproc://r2",
+            "kv",
+            Some("KV index targets"),
+        ),
+    ] {
         let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-        let a = supervisor
+        let info = supervisor
             .install_worker(
                 worker_a,
-                discovery(
-                    "boundary-model",
-                    "shared-target",
-                    &endpoint_a,
-                    "kv/boundary",
-                    0,
-                ),
+                declared_full_worker("model", "shared-id", 0, "inproc://p1", "inproc://r1", "kv"),
             )
             .unwrap();
-        assert_eq!(a.ranks, [0]);
-        assert_eq!(
-            a.cache_key.as_ref().unwrap().model.as_ref(),
-            "boundary-model"
-        );
-        let b = supervisor.install_worker(
+        assert_eq!(info.ranks, [0]);
+        let other = supervisor.install_worker(
             worker_b,
-            discovery(
-                model_b,
-                if topic_b == "kv/other" {
-                    "other-topic-target"
-                } else {
-                    "shared-target"
-                },
-                if same_publisher {
-                    &endpoint_a
-                } else {
-                    &endpoint_b
-                },
-                topic_b,
-                rank_b,
-            ),
+            declared_full_worker(model_b, "shared-id", rank_b, endpoint_b, replay_b, topic_b),
         );
-        if accepted {
-            let b = b.unwrap();
-            assert_eq!(b.ranks, [rank_b]);
-            assert_eq!(b.cache_key.as_ref().unwrap().model.as_ref(), model_b);
-            assert_eq!(supervisor.workers.lock().len(), 2);
-            assert_eq!(
-                supervisor.indexers.len(),
-                if model_b == "boundary-model" { 1 } else { 2 }
-            );
-            if same_publisher && rank_b == 1 {
-                let workers = supervisor.workers.lock();
-                let guard_a = &workers[worker_a].live_sources[0].lease.strict_rank;
-                let guard_b = &workers[worker_b].live_sources[0].lease.strict_rank;
-                assert!(Arc::ptr_eq(guard_a, guard_b));
-                assert!(*guard_a.lock());
-            }
-        } else {
-            let error = b.unwrap_err();
-            assert!(
-                error.contains(if same_publisher {
-                    "live KV streams"
-                } else {
-                    "KV index targets"
-                }),
-                "{error}"
-            );
+        if let Some(error) = error {
+            assert!(other.unwrap_err().contains(error), "{error}");
+            assert!(supervisor.match_provider_for_worker(worker_b).is_none());
             assert_eq!(supervisor.workers.lock().len(), 1);
-            assert!(!supervisor.workers.lock().contains_key(worker_b));
-            assert_eq!(supervisor.indexers.len(), 1);
+        } else {
+            assert_eq!(other.unwrap().ranks, [rank_b]);
+            assert!(supervisor.match_provider_for_worker(worker_b).is_some());
+            assert_eq!(supervisor.workers.lock().len(), 2);
         }
-        assert!(supervisor.workers.lock().contains_key(worker_a));
-        assert_eq!(
-            supervisor
-                .identity_refs
-                .lock()
-                .values()
-                .copied()
-                .sum::<usize>(),
-            if accepted { 2 } else { 1 }
-        );
+        assert!(supervisor.match_provider_for_worker(worker_a).is_some());
         supervisor.shutdown();
         assert!(supervisor.workers.lock().is_empty());
-        assert!(supervisor.indexers.is_empty());
         assert!(supervisor.identity_refs.lock().is_empty());
     }
 }
 
 #[tokio::test]
 async fn source_group_rejects_duplicate_normalized_ranks_without_mutation() {
-    let entry = KvEventSourceEntry {
-        endpoint: "inproc://duplicate-normalized-rank".into(),
-        publisher: Some("zmq".into()),
-        encoding: Some("msgpack".into()),
-        schema_version: Some(1),
-        enable_kv_cache_events: Some(true),
-        ..Default::default()
-    };
     let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-    assert!(supervisor
-        .install_worker(
-            "http://worker:8000",
-            WorkerDiscovery {
-                hybrid: None,
-                server_info: Ok(ServerInfo {
-                    instance_id: Some("duplicate-rank".into()),
-                    kv_block_size: Some(8),
-                    ..Default::default()
-                }),
-                model_id: Ok(Some("boundary-model".into())),
-                sources: Ok(HashMap::from([
-                    ("0".into(), entry.clone()),
-                    ("00".into(), entry)
-                ])),
-            }
-        )
-        .unwrap_err()
-        .contains("duplicate normalized"));
+    let mut discovery = declared_full_worker(
+        "model",
+        "duplicate-rank",
+        0,
+        "inproc://pub",
+        "inproc://replay",
+        "kv",
+    );
+    let sources = discovery.sources.as_mut().unwrap();
+    let duplicate = sources["0"].clone();
+    sources.insert("00".into(), duplicate);
+    let error = supervisor
+        .install_worker("http://worker:8000", discovery)
+        .unwrap_err();
+    assert!(error.contains("duplicate normalized"));
     assert!(supervisor.workers.lock().is_empty());
-    assert!(supervisor.indexers.is_empty());
     assert!(supervisor.identity_refs.lock().is_empty());
 }
 
 #[tokio::test]
-async fn failed_readd_preserves_registration_then_accepted_readd_retires_it() {
-    use axum::{routing::get, Json, Router};
-    use serde_json::json;
-
-    let context = zmq::Context::new();
-    let publisher_a = context.socket(zmq::XPUB).unwrap();
-    let publisher_b = context.socket(zmq::XPUB).unwrap();
-    for publisher in [&publisher_a, &publisher_b] {
-        publisher.set_xpub_verbose(true).unwrap();
-        publisher.bind("tcp://127.0.0.1:*").unwrap();
-    }
-    let source = |endpoint: &str| {
-        json!({"0": {"endpoint": endpoint, "publisher": "zmq",
-            "topic": "kv/boundary", "encoding": "msgpack", "schema_version": 1,
-            "enable_kv_cache_events": true}})
-    };
-    let endpoint_a = publisher_a.get_last_endpoint().unwrap().unwrap();
-    let endpoint_b = publisher_b.get_last_endpoint().unwrap().unwrap();
-    let sources_a = Arc::new(Mutex::new(source(&endpoint_a)));
-    let mutable_sources = sources_a.clone();
-    let app = Router::new()
-        .route(
-            "/get_server_info",
-            get(|| async {
-                Json(json!({
-                    "model_id": "boundary-model", "instance_id": "readd-a", "kv_block_size": 8
-                }))
-            }),
+async fn failed_readd_preserves_the_active_binding_and_success_fences_it() {
+    let (endpoint, replay_endpoint, publisher, replay) = layout_endpoints();
+    let (second_endpoint, second_replay_endpoint, _second_publisher, _second_replay) =
+        layout_endpoints();
+    let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
+    let worker = "http://worker-a:8000";
+    let neighbor = "http://worker-b:8000";
+    let initial = || declared_full_worker("model", "a", 0, &endpoint, &replay_endpoint, "kv");
+    supervisor.install_worker(worker, initial()).unwrap();
+    supervisor
+        .install_worker(
+            neighbor,
+            declared_full_worker(
+                "model",
+                "b",
+                0,
+                &second_endpoint,
+                &second_replay_endpoint,
+                "kv",
+            ),
         )
-        .route(
-            "/kv_event_sources",
-            get(move || {
-                let value = mutable_sources.lock().clone();
-                async move { Json(value) }
-            }),
-        );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let worker_a = format!("http://{}", listener.local_addr().unwrap());
-    let task_a = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let (worker_b, task_b) = source_boundary_worker_with_metadata(
-        json!({"model_id": "boundary-model", "instance_id": "readd-b", "kv_block_size": 8}),
-        source(&endpoint_b),
-    )
-    .await;
-    let (supervisor, mut signals) =
-        KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-    supervisor.on_worker_added(&worker_a).await.unwrap();
-    supervisor.on_worker_added(&worker_b).await.unwrap();
-    boundary_subscription(&publisher_a, "kv/boundary", true).await;
-    let payload = store_payload(1, &[1; 8], 8, "GPU", Some(0));
-    let query = block_query(&[1; 8], 8, &[StorageTier::Device]);
-    live_frame(&publisher_a, b"kv/boundary", 0i64, &payload);
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(5), signals.recv())
-            .await
-            .unwrap(),
-        Some(IngestionSignal::Advance { last_seq: 0, .. })
-    ));
-    let provider = supervisor.match_provider_for_worker(&worker_a).unwrap();
-    assert_eq!(provider.find_tiered_matches(&query).len(), 1);
-    let original = supervisor.workers.lock()[&worker_a].active.clone();
-    *sources_a.lock() = source(&endpoint_b);
-    assert!(supervisor
-        .on_worker_added(&worker_a)
-        .await
-        .unwrap_err()
-        .contains("live KV streams"));
-    assert!(original.load(Ordering::Acquire));
-    assert!(Arc::ptr_eq(
-        &original,
-        &supervisor.workers.lock()[&worker_a].active
-    ));
-    assert!(supervisor.match_provider_for_worker(&worker_a).is_some());
-    assert_eq!(provider.find_tiered_matches(&query).len(), 1);
-    let valid_entry = source(&endpoint_a)["0"].clone();
-    let mut bad_publisher = valid_entry.clone();
-    bad_publisher["endpoint"] = json!("tcp://127.0.0.1:0");
-    let mut bad_replay = valid_entry.clone();
-    bad_replay["replay_endpoint"] = json!("tcp://127.0.0.1:0");
-    for (case, invalid_sources) in [
-        ("bad rank", json!({"not-a-rank": valid_entry})),
-        ("bad publisher", json!({"0": bad_publisher})),
-        ("bad replay", json!({"0": bad_replay})),
-        (
-            "mixed valid and malformed",
-            json!({"0": valid_entry, "1": bad_publisher}),
-        ),
-    ] {
-        *sources_a.lock() = invalid_sources;
-        assert!(
-            supervisor.on_worker_added(&worker_a).await.is_err(),
-            "{case} must reject the complete re-add"
-        );
-        assert!(original.load(Ordering::Acquire), "{case}");
-        assert!(
-            Arc::ptr_eq(&original, &supervisor.workers.lock()[&worker_a].active),
-            "{case}"
-        );
-        assert!(
-            supervisor.match_provider_for_worker(&worker_a).is_some(),
-            "{case}"
-        );
-        assert_eq!(provider.find_tiered_matches(&query).len(), 1, "{case}");
-        assert_eq!(
-            supervisor.identity_refs.lock().values().sum::<usize>(),
-            2,
-            "{case}"
-        );
-    }
-    *sources_a.lock() = source(&endpoint_a);
-    supervisor.on_worker_added(&worker_a).await.unwrap();
-    assert!(!original.load(Ordering::Acquire));
-    assert!(!Arc::ptr_eq(
-        &original,
-        &supervisor.workers.lock()[&worker_a].active
-    ));
-    assert!(provider.find_tiered_matches(&query).is_empty());
-    boundary_subscription(&publisher_a, "kv/boundary", true).await;
-    live_frame(&publisher_a, b"kv/boundary", 0i64, &payload);
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(5), signals.recv())
-            .await
-            .unwrap(),
-        Some(IngestionSignal::Advance { last_seq: 0, .. })
-    ));
-    assert_eq!(provider.find_tiered_matches(&query).len(), 1);
-    assert_eq!(supervisor.identity_refs.lock().values().sum::<usize>(), 2);
-    supervisor.shutdown();
-    task_a.abort();
-    task_b.abort();
-}
-
-#[tokio::test]
-async fn shared_publisher_rank_promotion_revokes_unranked_credit_before_registration() {
-    use serde_json::json;
-
-    let context = zmq::Context::new();
-    let publisher = context.socket(zmq::XPUB).unwrap();
-    publisher.set_xpub_verbose(true).unwrap();
-    publisher.bind("tcp://127.0.0.1:*").unwrap();
-    let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-    let source = |rank: u32| {
-        json!({rank.to_string(): {
-            "endpoint": endpoint, "publisher": "zmq", "topic": "kv/boundary",
-            "encoding": "msgpack", "schema_version": 1, "enable_kv_cache_events": true
-        }})
-    };
-    let info = |instance| {
-        json!({
-            "model_id": "boundary-model", "instance_id": instance, "kv_block_size": 8
-        })
-    };
-    let (worker_a, task_a) =
-        source_boundary_worker_with_metadata(info("promotion-a"), source(0)).await;
-    let (worker_b, task_b) =
-        source_boundary_worker_with_metadata(info("promotion-b"), source(1)).await;
-    let (supervisor, mut signals) =
-        KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-    let send = |sequence: i64, token: u32, rank: Option<u32>| {
-        let payload = store_payload(sequence + 1, &[token; 8], 8, "GPU", rank);
-        live_frame(&publisher, b"kv/boundary", sequence, &payload);
-    };
-    let query = |token| block_query(&[token; 8], 8, &[StorageTier::Device]);
-    supervisor.on_worker_added(&worker_a).await.unwrap();
-    boundary_subscription(&publisher, "kv/boundary", true).await;
-    send(0, 1, None);
-    assert!(
-        matches!(tokio::time::timeout(Duration::from_secs(5), signals.recv()).await.unwrap(),
-            Some(IngestionSignal::Advance { source, last_seq: 0 }) if source.as_ref() == "promotion-a")
-    );
-    let provider = supervisor.match_provider_for_worker(&worker_a).unwrap();
-    let positive = provider.find_tiered_matches(&query(1));
-    assert_eq!(positive.len(), 1);
-    assert_eq!(positive[0].target.instance_id.as_ref(), "promotion-a");
-    supervisor.on_worker_added(&worker_b).await.unwrap();
-    assert!(provider.find_tiered_matches(&query(1)).is_empty());
-    boundary_subscription(&publisher, "kv/boundary", true).await;
-
-    send(1, 2, None);
-    let mut rejected_sources = HashSet::new();
-    for _ in 0..2 {
-        let signal = tokio::time::timeout(Duration::from_secs(5), signals.recv())
-            .await
-            .unwrap();
-        match signal {
-            Some(IngestionSignal::Gap {
-                source, to_seq: 1, ..
-            }) => {
-                rejected_sources.insert(source);
-            }
-            other => panic!("missing shared rank must reject: {other:?}"),
-        }
-    }
-    assert_eq!(rejected_sources.len(), 2);
-    assert!(provider.find_tiered_matches(&query(2)).is_empty());
-    for (sequence, token, rank) in [(1, 3, 0), (2, 4, 1), (3, 5, 0)] {
-        send(sequence, token, Some(rank));
-        let mut advanced_sources = HashSet::new();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while advanced_sources.len() != 2 {
-                if let Some(IngestionSignal::Advance { source, last_seq }) = signals.recv().await {
-                    assert_eq!(last_seq, sequence);
-                    advanced_sources.insert(source);
-                }
-            }
-        })
-        .await
         .unwrap();
-        let hits = provider.find_tiered_matches(&query(token));
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].target.dp_rank, rank);
-        assert_eq!(
-            hits[0].target.instance_id.as_ref(),
-            if rank == 0 {
-                "promotion-a"
-            } else {
-                "promotion-b"
-            }
-        );
-        assert_eq!(hits[0].segments, [(0, 1)]);
-        // Foreign traffic must preserve already-qualified owned observations.
-        assert_eq!(provider.find_tiered_matches(&query(3)).len(), 1);
-        if sequence >= 2 {
-            assert_eq!(provider.find_tiered_matches(&query(4)).len(), 1);
-        }
-    }
-    assert!(provider.find_tiered_matches(&query(1)).is_empty());
-    assert!(provider.find_tiered_matches(&query(2)).is_empty());
-    supervisor.shutdown();
-    task_a.abort();
-    task_b.abort();
-}
 
-#[tokio::test]
-async fn live_source_and_target_conflicts_reject_before_subscription_without_replay() {
-    use serde_json::json;
-
-    for static_a in [false, true] {
-        for same_publisher in [true, false] {
-            let context = zmq::Context::new();
-            let publisher_a = context.socket(zmq::XPUB).unwrap();
-            let publisher_b = context.socket(zmq::XPUB).unwrap();
-            for publisher in [&publisher_a, &publisher_b] {
-                publisher.set_xpub_verbose(true).unwrap();
-                publisher.bind("tcp://127.0.0.1:*").unwrap();
-            }
-            let endpoint_a = publisher_a.get_last_endpoint().unwrap().unwrap();
-            let endpoint_b = publisher_b.get_last_endpoint().unwrap().unwrap();
-            let source = |endpoint: &str| {
-                json!({"0": {
-                    "endpoint": endpoint, "topic": "kv/boundary", "publisher": "zmq",
-                    "encoding": "msgpack", "schema_version": 1, "enable_kv_cache_events": true
-                }})
-            };
-            let info = |instance: &str| {
-                json!({
-                    "model_id": "boundary-model", "instance_id": instance, "kv_block_size": 8
-                })
-            };
-            let (worker_a, task_a) =
-                source_boundary_worker_with_metadata(info("boundary-a"), source(&endpoint_a)).await;
-            let instance_a = if static_a {
-                worker_a.as_str()
-            } else {
-                "boundary-a"
-            };
-            let (worker_b, task_b) = source_boundary_worker_with_metadata(
-                info(if same_publisher {
-                    "boundary-b"
-                } else {
-                    instance_a
-                }),
-                source(if same_publisher {
-                    &endpoint_a
-                } else {
-                    &endpoint_b
-                }),
-            )
-            .await;
-            let (mut supervisor, mut signals) = KvIndexSupervisor::new(reqwest::Client::new());
-            supervisor.full_attention_http = true;
-            if static_a {
-                supervisor.static_sources = serde_json::from_value(json!({&worker_a: {
-                    "endpoints": [endpoint_a], "topic": "kv/boundary",
-                    "block_size": 8, "model": "boundary-model"
-                }}))
-                .unwrap();
-            }
-            supervisor.on_worker_added(&worker_a).await.unwrap();
-            boundary_subscription(&publisher_a, "kv/boundary", true).await;
-            let payload = store_payload(1, &[1; 8], 8, "GPU", Some(0));
-            live_frame(&publisher_a, b"kv/boundary", 0i64, &payload);
-            assert!(matches!(
-                tokio::time::timeout(Duration::from_secs(5), signals.recv())
-                    .await
-                    .unwrap(),
-                Some(IngestionSignal::Advance { last_seq: 0, .. })
-            ));
-            let query = block_query(&[1; 8], 8, &[StorageTier::Device]);
-            let provider = supervisor.match_provider_for_worker(&worker_a).unwrap();
-            assert_eq!(provider.find_tiered_matches(&query).len(), 1);
-            let admission = supervisor.on_worker_added(&worker_b).await;
-            let error =
-                admission.expect_err("conflicting worker must be rejected before publication");
-            assert!(
-                error.contains(if same_publisher {
-                    "live KV streams must be independent"
-                } else {
-                    "KV index targets must be independent"
-                }),
-                "{error}"
-            );
-            assert!(supervisor.match_provider_for_worker(&worker_b).is_none());
-            assert_eq!(supervisor.workers.lock().len(), 1);
-            assert!(matches!(
-                publisher_a.recv_bytes(zmq::DONTWAIT),
-                Err(zmq::Error::EAGAIN)
-            ));
-            assert!(matches!(
-                publisher_b.recv_bytes(zmq::DONTWAIT),
-                Err(zmq::Error::EAGAIN)
-            ));
-            let retained = provider.find_tiered_matches(&query);
-            assert_eq!(retained.len(), 1);
-            assert_eq!(retained[0].target.instance_id.as_ref(), instance_a);
-            assert_eq!(retained[0].segments, [(0, 1)]);
-            supervisor.shutdown();
-            task_a.abort();
-            task_b.abort();
-        }
-    }
-}
-
-#[tokio::test]
-async fn discovered_sources_reject_shared_replay_before_wrong_owner_is_published() {
-    let context = zmq::Context::new();
-    let a = context.socket(zmq::XPUB).unwrap();
-    let b = context.socket(zmq::XPUB).unwrap();
-    let replay = context.socket(zmq::ROUTER).unwrap();
-    for socket in [&a, &b, &replay] {
-        socket.bind("tcp://127.0.0.1:*").unwrap();
-    }
-    let replay_endpoint = replay.get_last_endpoint().unwrap().unwrap();
-    let (worker_a, http_a) = source_boundary_worker(
-        &a.get_last_endpoint().unwrap().unwrap(),
-        &replay_endpoint,
-        "boundary-a",
-    )
-    .await;
-    let (worker_b, http_b) = source_boundary_worker(
-        &b.get_last_endpoint().unwrap().unwrap(),
-        &replay_endpoint,
-        "boundary-b",
-    )
-    .await;
-    let (supervisor, mut signals) =
-        KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-    supervisor.on_worker_added(&worker_a).await.unwrap();
-    boundary_subscription(&a, "kv/boundary", true).await;
+    let provider = supervisor.match_provider_for_worker(worker).unwrap();
+    let active = supervisor.workers.lock()[worker].active.clone();
+    boundary_subscription(&publisher, "kv", true).await;
     finish_empty_startup_replay(&replay).await;
-    live_frame(
-        &a,
-        b"kv/boundary",
-        0i64,
-        &store_payload(1, &[1; 8], 8, "GPU", Some(0)),
+    live_frame(&publisher, b"kv", 0, &full_payload(&[1; 8], 8, 0));
+    let hit = || !provider.matches(&[1; 9], 8, None, 0).is_empty();
+    wait_for(hit).await;
+
+    let conflicting = declared_full_worker(
+        "model",
+        "a",
+        0,
+        &second_endpoint,
+        &second_replay_endpoint,
+        "kv",
     );
-    assert!(
-        matches!(tokio::time::timeout(Duration::from_secs(5), signals.recv()).await.unwrap(),
-            Some(IngestionSignal::Advance { source, last_seq: 0 }) if source.as_ref() == "boundary-a")
-    );
-    let query = |token| block_query(&[token; 8], 8, &[StorageTier::Device]);
-    assert_eq!(
-        supervisor
-            .match_provider_for_worker(&worker_a)
-            .unwrap()
-            .find_tiered_matches(&query(1))
-            .len(),
-        1
-    );
-    let error = supervisor.on_worker_added(&worker_b).await.unwrap_err();
-    assert!(
-        error.contains("replay endpoints must be independent"),
-        "{error}"
-    );
-    assert!(supervisor.match_provider_for_worker(&worker_b).is_none());
-    assert!(matches!(
-        b.recv_bytes(zmq::DONTWAIT),
-        Err(zmq::Error::EAGAIN)
-    ));
-    let retained = supervisor
-        .match_provider_for_worker(&worker_a)
-        .unwrap()
-        .find_tiered_matches(&query(1));
-    assert_eq!(retained.len(), 1);
-    assert_eq!(retained[0].target.instance_id.as_ref(), "boundary-a");
-    assert_eq!(retained[0].segments, [(0, 1)]);
+    let error = supervisor.install_worker(worker, conflicting).unwrap_err();
+    assert!(error.contains("live KV streams") || error.contains("KV replay endpoints"));
+    assert!(active.load(Ordering::Acquire));
+    assert!(hit());
+
+    supervisor.install_worker(worker, initial()).unwrap();
+    assert!(!active.load(Ordering::Acquire));
+    assert!(!hit());
+    assert!(supervisor.match_provider_for_worker(neighbor).is_some());
     supervisor.shutdown();
-    http_a.abort();
-    http_b.abort();
 }
 
 #[tokio::test]
@@ -1658,7 +1273,15 @@ async fn discovered_source_bindings_are_atomic_and_released_with_the_worker() {
         let first = Arc::new(AtomicBool::new(true));
         let entered_tx = entered_tx.clone();
         let release = release.clone();
+        let layout = automatic_layout(plain_full_layout("boundary-model", "kv/boundary", 8));
         let app = Router::new()
+            .route(
+                "/kv_routing_capabilities",
+                get(move || {
+                    let layout = layout.clone();
+                    async move { Json(layout) }
+                }),
+            )
             .route(
                 "/get_server_info",
                 get(move || {
@@ -1778,357 +1401,48 @@ async fn discovered_source_bindings_are_atomic_and_released_with_the_worker() {
 }
 
 #[tokio::test]
-async fn dropping_supervisor_retires_inflight_replay_without_clearing_other_sources() {
-    for explicit_shutdown in [false, true] {
-        let context = Arc::new(zmq::Context::new());
-        let publisher = context.socket(zmq::XPUB).unwrap();
-        let replay = context.socket(zmq::ROUTER).unwrap();
-        for socket in [&publisher, &replay] {
-            socket.bind("tcp://127.0.0.1:*").unwrap();
-        }
-        let (worker, server) = source_boundary_worker(
-            &publisher.get_last_endpoint().unwrap().unwrap(),
-            &replay.get_last_endpoint().unwrap().unwrap(),
-            "retiring-source",
-        )
-        .await;
-        let (supervisor, mut signals) =
-            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-        supervisor.on_worker_added(&worker).await.unwrap();
-        boundary_subscription(&publisher, "kv/boundary", true).await;
-        finish_empty_startup_replay(&replay).await;
-        let (indexer, active) = {
-            let workers = supervisor.workers.lock();
-            let entry = &workers[&worker];
-            (entry.indexer.clone(), entry.active.clone())
-        };
-        let provider = supervisor.match_provider_for_worker(&worker).unwrap();
-        let (neighbor_tx, mut neighbor_signals) = mpsc::channel(8);
-        let neighbor = crate::kv_index::subscriber::spawn(
-            EventSource {
-                source: Arc::from("independent-source"),
-                dp_rank: 4,
-                pub_endpoint: publisher.get_last_endpoint().unwrap().unwrap(),
-                replay_endpoint: None,
-                topic: "kv/independent".into(),
-                hwm: None,
-            },
-            indexer,
-            Some(neighbor_tx),
-            context.clone(),
-        );
-        boundary_subscription(&publisher, "kv/independent", false).await;
-        let payload = |hash, token, rank| store_payload(hash, &[token; 8], 8, "GPU", Some(rank));
-        let query = |token| block_query(&[token; 8], 8, &[StorageTier::Device]);
-        for (topic, body) in [
-            ("kv/boundary", payload(1, 1, 0)),
-            ("kv/independent", payload(2, 2, 4)),
-        ] {
-            live_frame(&publisher, topic.as_bytes(), 0i64, &body);
-        }
-        for receiver in [&mut signals, &mut neighbor_signals] {
-            assert!(matches!(
-                tokio::time::timeout(Duration::from_secs(5), receiver.recv())
-                    .await
-                    .unwrap(),
-                Some(IngestionSignal::Advance { last_seq: 0, .. })
-            ));
-        }
-        assert_eq!(provider.find_tiered_matches(&query(1)).len(), 1);
-        assert_eq!(provider.find_tiered_matches(&query(2)).len(), 1);
-        live_frame(&publisher, b"kv/boundary", 2i64, &payload(3, 3, 0));
-        let request = recv_frames(&replay).await;
-        assert_eq!(request.last().unwrap(), &1i64.to_be_bytes());
-        if explicit_shutdown {
-            supervisor.shutdown();
-            supervisor.shutdown();
-            assert!(supervisor.workers.lock().is_empty());
-            assert!(supervisor.identity_refs.lock().is_empty());
-        }
-        drop(supervisor);
-        assert!(!active.load(Ordering::Acquire));
-        for (seq, body) in [
-            (1i64, payload(4, 4, 0)),
-            (2, payload(3, 3, 0)),
-            (-1, vec![]),
-        ] {
-            replay_reply(&replay, &request, b"kv/boundary", seq, &body);
-        }
-        assert_eq!(recv_frames(&publisher).await, [b"\x00kv/boundary".to_vec()]);
-        for token in [1, 3, 4] {
-            assert!(provider.find_tiered_matches(&query(token)).is_empty());
-        }
-        let retained = provider.find_tiered_matches(&query(2));
-        assert_eq!(retained.len(), 1);
-        assert_eq!(
-            retained[0].target.instance_id.as_ref(),
-            "independent-source"
-        );
-        assert_eq!(retained[0].target.dp_rank, 4);
-        assert_eq!(retained[0].segments, [(0, 1)]);
-        neighbor.shutdown();
-        server.abort();
-    }
+async fn verified_plain_full_attention_rejects_mismatched_event_page_size() {
+    let (endpoint, replay_endpoint, publisher, replay) = layout_endpoints();
+    let (worker, server) = source_boundary_worker(&endpoint, &replay_endpoint, "plain").await;
+    let (supervisor, _signals) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
+    let info = supervisor.on_worker_added(&worker).await.unwrap();
+    assert_eq!(info.ranks, [0]);
+    let provider = supervisor.match_provider_for_worker(&worker).unwrap();
+    boundary_subscription(&publisher, "kv/boundary", false).await;
+    finish_empty_startup_replay(&replay).await;
+    live_frame(&publisher, b"kv/boundary", 0, &full_payload(&[1; 8], 8, 0));
+    let hits = || provider.matches(&[1; 9], 8, None, 0);
+    wait_for(|| !hits().is_empty()).await;
+    live_frame(&publisher, b"kv/boundary", 1, &full_payload(&[2; 4], 4, 0));
+    wait_for(|| hits().is_empty()).await;
+    supervisor.shutdown();
+    server.abort();
 }
 
 #[tokio::test]
-async fn generic_static_sources_preserve_worker_base_paths_in_full_attention_router() {
-    let context = zmq::Context::new();
-    let publisher = context.socket(zmq::XPUB).unwrap();
-    let replay = context.socket(zmq::ROUTER).unwrap();
-    for socket in [&publisher, &replay] {
-        socket.bind("tcp://127.0.0.1:*").unwrap();
-    }
-    let (worker, http_task) = source_boundary_worker(
-        &publisher.get_last_endpoint().unwrap().unwrap(),
-        &replay.get_last_endpoint().unwrap().unwrap(),
-        "prefixed-source",
-    )
-    .await;
+async fn generic_static_layout_preserves_the_worker_base_path() {
+    let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
+    let (worker, server) = source_boundary_worker(&endpoint, &replay_endpoint, "prefixed").await;
     let prefixed = format!("{worker}/proxy");
-    let (generic, _) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-    let generic = generic.with_static_sources(HashMap::from([(
+    let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
+    let supervisor = supervisor.with_static_sources(HashMap::from([(
         prefixed.clone(),
         StaticKvEventSources {
-            endpoints: vec![publisher.get_last_endpoint().unwrap().unwrap()],
-            replay_endpoints: Some(vec![replay.get_last_endpoint().unwrap().unwrap()]),
+            endpoints: vec![endpoint],
+            replay_endpoints: Some(vec![replay_endpoint]),
             block_size: 8,
-            model: "prefixed-model".into(),
+            model: "boundary-model".into(),
             topic: "kv/boundary".into(),
-            hybrid: None,
+            hybrid: Some(plain_full_layout("boundary-model", "kv/boundary", 8)),
         },
     )]));
-    let result = generic.on_worker_added(&prefixed).await;
-    let registered = generic.match_provider_for_worker(&prefixed).is_some();
-    let original_absent = generic.match_provider_for_worker(&worker).is_none();
-    assert!(generic.workers.lock()[&prefixed].worker_origin.is_none());
-    generic.shutdown();
-    let (full_attention, _) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-    let full_attention_result = full_attention.on_worker_added(&prefixed).await;
-    let unqualified = full_attention
-        .match_provider_for_worker(&prefixed)
-        .is_none();
-    full_attention.shutdown();
-    http_task.abort();
-    let info = result.unwrap();
+    let info = supervisor.on_worker_added(&prefixed).await.unwrap();
     assert_eq!(info.instance_id, prefixed);
     assert_eq!(info.ranks, [0]);
-    assert!(registered);
-    assert!(original_absent);
-    assert!(full_attention_result
-        .unwrap_err()
-        .contains("plain HTTP(S) origins"));
-    assert!(unqualified);
-}
-
-#[tokio::test]
-async fn full_attention_source_block_size_mismatch_revokes_only_affected_source() {
-    for (expected, actual) in [(16, 8), (8, 16)] {
-        check_full_attention_source_block_size(expected, actual).await;
-    }
-}
-
-async fn check_full_attention_source_block_size(expected: u32, actual: u32) {
-    use serde_json::json;
-
-    let context = zmq::Context::new();
-    let publisher = context.socket(zmq::XPUB).unwrap();
-    publisher.bind("tcp://127.0.0.1:*").unwrap();
-    let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-    let (supervisor, mut signals) =
-        KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-    let rank = 3;
-    let sources = json!({(rank.to_string()): {
-        "endpoint": endpoint, "topic": "kv/dense", "publisher": "zmq",
-        "encoding": "msgpack", "schema_version": 1, "enable_kv_cache_events": true
-    }});
-    let (worker, http_task) = source_boundary_worker_with_metadata(
-        json!({"model_id": "dense-model", "instance_id": "dense-boot", "kv_block_size": expected}),
-        sources,
-    )
-    .await;
-    let info = supervisor.on_worker_added(&worker).await.unwrap();
-    assert_eq!(info.cache_key.as_ref().unwrap().block_size, expected);
-    assert_eq!(info.ranks, [rank]);
-    boundary_subscription(&publisher, "kv/dense", false).await;
-    let indexer = supervisor
-        .workers
-        .lock()
-        .get(&worker)
-        .unwrap()
-        .indexer
-        .clone();
-    let old_tokens: Vec<u32> = (0..expected).collect();
-    let new_tokens: Vec<u32> = (100..100 + actual).collect();
-    let query = |tokens: &[u32]| {
-        block_query(
-            tokens,
-            expected,
-            &[StorageTier::Device, StorageTier::HostPinned],
-        )
-    };
-    let mut neighbors = Vec::new();
-    for (source, neighbor_rank, topic) in [
-        ("other-source", rank, "kv/other-source"),
-        (info.instance_id.as_str(), rank + 1, "kv/other-rank"),
-    ] {
-        let (tx, mut rx) = mpsc::channel(8);
-        neighbors.push(crate::kv_index::subscriber::spawn(
-            EventSource {
-                source: Arc::from(source),
-                dp_rank: neighbor_rank,
-                pub_endpoint: publisher.get_last_endpoint().unwrap().unwrap(),
-                replay_endpoint: None,
-                topic: topic.into(),
-                hwm: None,
-            },
-            indexer.clone(),
-            Some(tx),
-            Arc::new(zmq::Context::new()),
-        ));
-        boundary_subscription(&publisher, topic, false).await;
-        let payload = store_payload(70, &old_tokens, expected, "GPU", Some(neighbor_rank));
-        assert!(crate::kv_index::decode_batch(&payload).is_ok());
-        live_frame(&publisher, topic.as_bytes(), 0i64, &payload);
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(5), rx.recv())
-                .await
-                .unwrap(),
-            Some(IngestionSignal::Advance { last_seq: 0, .. })
-        ));
-    }
-    let source_hits = |tokens: &[u32]| {
-        indexer
-            .find_matches(&query(tokens))
-            .into_iter()
-            .filter(|hit| {
-                hit.target.instance_id.as_ref() == info.instance_id && hit.target.dp_rank == rank
-            })
-            .collect::<Vec<_>>()
-    };
-    for (seq, block_size, tokens) in [(0i64, expected, &old_tokens), (1, actual, &new_tokens)] {
-        let payload = store_payload(seq + 7, tokens, block_size, "CPU", Some(rank));
-        live_frame(&publisher, b"kv/dense", seq, &payload);
-        if seq == 0 {
-            assert!(matches!(
-                tokio::time::timeout(Duration::from_secs(5), signals.recv())
-                    .await
-                    .unwrap(),
-                Some(IngestionSignal::Advance { last_seq: 0, .. })
-            ));
-            let hits = source_hits(&old_tokens);
-            assert_eq!(hits.len(), 1);
-            assert_eq!(hits[0].segments, [(0, 1)]);
-            assert_eq!(hits[0].target.dp_rank, rank);
-        } else {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        if source_hits(&old_tokens).is_empty() {
-                            assert!(indexer.find_matches(&query(&new_tokens)).is_empty());
-                            let remaining = indexer.find_matches(&query(&old_tokens));
-                            assert_eq!(remaining.len(), 2, "mismatch invalidated another source/rank");
-                            assert!(remaining.iter().all(|hit| hit.segments == [(0, 1)]));
-                            break;
-                        }
-                        if let Ok(signal) = signals.try_recv() {
-                            assert!(!matches!(signal, IngestionSignal::Advance { last_seq: 1, .. }),
-                                "accepted mismatched Dense batch: source={expected}, event={actual}, old={:?}, mismatched={:?}",
-                                indexer.find_matches(&query(&old_tokens)),
-                                indexer.find_matches(&query(&new_tokens)));
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                }).await.expect("mismatch must revoke the previously indexed source");
-        }
-    }
+    assert!(supervisor.match_provider_for_worker(&prefixed).is_some());
+    assert!(supervisor.match_provider_for_worker(&worker).is_none());
     supervisor.shutdown();
-    drop(neighbors);
-    http_task.abort();
-}
-
-#[tokio::test]
-async fn http_and_static_sources_ingest_nonempty_topics_through_live_zmq() {
-    use serde_json::json;
-
-    for (use_static, block_size) in [(false, 8u32), (true, 32)] {
-        let context = zmq::Context::new();
-        let publisher = context.socket(zmq::XPUB).unwrap();
-        publisher.bind("tcp://127.0.0.1:*").unwrap();
-        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-        let rank = if use_static { 0u32 } else { 3 };
-        let (mut supervisor, mut signals) =
-            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-        let (worker, http_task) = if use_static {
-            let worker = "http://127.0.0.1:1".to_string();
-            let value = json!({
-                &worker: {
-                    "endpoints": [endpoint], "block_size": block_size,
-                    "model": "served-alias", "topic": "kv/served-alias"
-                }
-            });
-            supervisor.static_sources = serde_json::from_value(value).unwrap();
-            (worker, None)
-        } else {
-            let sources = json!({(rank.to_string()): {
-                "endpoint": endpoint, "topic": "kv/served-alias", "hwm": 128,
-                "publisher": "zmq", "encoding": "msgpack", "schema_version": 1,
-                "enable_kv_cache_events": true
-            }});
-            let (worker, task) = source_boundary_worker_with_metadata(
-                    json!({
-                        "model_id": "served-alias", "instance_id": "observed-boot", "kv_block_size": block_size
-                    }),
-                    sources,
-                )
-                .await;
-            (worker, Some(task))
-        };
-        let info = supervisor.on_worker_added(&worker).await.unwrap();
-        assert_eq!(info.ranks, [rank]);
-        assert_eq!(
-            info.cache_key.as_ref().unwrap().model.as_ref(),
-            "served-alias"
-        );
-        boundary_subscription(&publisher, "kv/served-alias", false).await;
-        let tokens: Vec<u32> = (0..block_size).collect();
-        let payload = store_payload(
-            7,
-            &tokens,
-            block_size,
-            if use_static { "GPU" } else { "CPU" },
-            Some(rank),
-        );
-        assert!(crate::kv_index::decode_batch(&payload).is_ok());
-        live_frame(&publisher, b"kv/served-alias", 0i64, &payload);
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(5), signals.recv())
-                .await
-                .unwrap(),
-            Some(IngestionSignal::Advance { last_seq: 0, .. })
-        ));
-        let tier = if use_static {
-            StorageTier::Device
-        } else {
-            StorageTier::HostPinned
-        };
-        let indexer = supervisor
-            .workers
-            .lock()
-            .get(&worker)
-            .unwrap()
-            .indexer
-            .clone();
-        let hits = indexer.find_matches(&block_query(&tokens, block_size, &[tier]));
-        assert_eq!(hits.len(), 1, "use_static={use_static}");
-        assert_eq!(hits[0].target.instance_id.as_ref(), info.instance_id);
-        assert_eq!(hits[0].target.dp_rank, rank);
-        assert_eq!(hits[0].tier, tier);
-        assert_eq!(hits[0].segments, [(0, 1)]);
-        supervisor.shutdown();
-        if let Some(task) = http_task {
-            task.abort();
-        }
-    }
+    server.abort();
 }
 
 #[test]
@@ -2188,37 +1502,34 @@ fn static_pd_discovery_falls_back_to_worker_url_as_model() {
     assert_eq!(discovery.model_id, Ok(Some("http://127.0.0.1:8000".into())));
 }
 
-/// A worker with static sources must become indexable without any HTTP
-/// control plane — the discovery client would fail every request.
+/// A complete static layout can index an engine without a discovery endpoint.
 #[tokio::test]
 async fn static_sources_skip_http_discovery() {
-    let publisher_context = zmq::Context::new();
-    let publisher = publisher_context.socket(zmq::PUB).unwrap();
-    publisher.bind("tcp://127.0.0.1:*").unwrap();
-    let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-
-    let worker_url = "http://127.0.0.1:1"; // nothing listens here
+    let (endpoint, replay, _publisher_socket, _replay_socket) = layout_endpoints();
+    let (worker, server) = spawn_metrics_only_worker(axum::Router::new()).await;
+    let model = "pd-model";
     let static_sources = std::iter::once((
-        worker_url.to_string(),
+        worker.clone(),
         crate::config::types::PdKvEventSources {
             endpoints: vec![endpoint],
-            replay_endpoints: None,
+            replay_endpoints: Some(vec![replay]),
             block_size: 16,
-            model: None,
-            hybrid: None,
-            compatible_decode_urls: Vec::new(),
+            model: Some(model.into()),
+            hybrid: Some(plain_full_layout(model, "pd-static", 16)),
+            compatible_decode_urls: vec!["http://decode".into()],
         },
     ))
     .collect();
     let (supervisor, _signals) = KvIndexSupervisor::new_pd(reqwest::Client::new(), static_sources);
 
-    let info = supervisor.on_worker_added(worker_url).await.unwrap();
+    let info = supervisor.on_worker_added(&worker).await.unwrap();
     assert_eq!(info.block_size, Some(16));
     assert_eq!(info.ranks, vec![0]);
     let key = info.cache_key.expect("static sources must create a key");
-    assert_eq!(key.model.as_ref(), worker_url);
-    assert!(supervisor.match_provider_for_worker(worker_url).is_some());
-    supervisor.on_worker_removed(worker_url);
+    assert_eq!(key.model.as_ref(), model);
+    assert!(supervisor.match_provider_for_worker(&worker).is_some());
+    supervisor.on_worker_removed(&worker);
+    server.abort();
 }
 
 /// A rank-pinned static source takes its rank from the worker URL, so two
@@ -2260,7 +1571,7 @@ async fn layout_without_endpoints_discovers_publishers() {
     let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
     let (worker, task) = layout_worker(endpoint, replay_endpoint, "kv-hybrid").await;
     let config = layout_only_sources("kv-hybrid", 8, "layout-only");
-    let (supervisor, _signals) = KvIndexSupervisor::new(reqwest::Client::new());
+    let (supervisor, _signals) = KvIndexSupervisor::indexed(reqwest::Client::new());
     let supervisor = supervisor.with_static_sources(HashMap::from([(worker.clone(), config)]));
 
     let info = supervisor.on_worker_added(&worker).await.unwrap();
@@ -2279,7 +1590,7 @@ async fn layout_rejects_a_publisher_with_another_topic() {
     let (worker, task) = layout_worker(endpoint, replay_endpoint, "kv-rebooted").await;
 
     let config = layout_only_sources("kv-hybrid", 8, "layout-only");
-    let (supervisor, _signals) = KvIndexSupervisor::new(reqwest::Client::new());
+    let (supervisor, _signals) = KvIndexSupervisor::indexed(reqwest::Client::new());
     let supervisor = supervisor.with_static_sources(HashMap::from([(worker.clone(), config)]));
 
     let info = supervisor.on_worker_added(&worker).await;
@@ -2318,7 +1629,7 @@ async fn layout_worker(
 /// One PUB and one ROUTER endpoint, like a real rank's ZMQ pair.
 fn layout_endpoints() -> (String, String, zmq::Socket, zmq::Socket) {
     let context = zmq::Context::new();
-    let publisher = context.socket(zmq::PUB).unwrap();
+    let publisher = context.socket(zmq::XPUB).unwrap();
     publisher.bind("tcp://127.0.0.1:*").unwrap();
     let replay = context.socket(zmq::ROUTER).unwrap();
     replay.bind("tcp://127.0.0.1:*").unwrap();
@@ -2356,85 +1667,6 @@ fn layout_only_sources(
         model: model.to_owned(),
         hybrid: Some(layout),
     }
-}
-
-#[tokio::test]
-async fn pd_static_full_attention_rejects_entire_bad_batch_with_source_block_size() {
-    use serde_json::json;
-
-    let context = zmq::Context::new();
-    let publisher = context.socket(zmq::XPUB).unwrap();
-    publisher.bind("tcp://127.0.0.1:*").unwrap();
-    let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-    let worker = "http://127.0.0.1:1";
-    let (supervisor, mut signals) = KvIndexSupervisor::new_pd(
-        reqwest::Client::new(),
-        HashMap::from([(
-            worker.to_owned(),
-            crate::config::types::PdKvEventSources {
-                endpoints: vec![endpoint],
-                replay_endpoints: None,
-                block_size: 8,
-                model: Some("pd-model".into()),
-                hybrid: None,
-                compatible_decode_urls: Vec::new(),
-            },
-        )]),
-    );
-    let info = supervisor.on_worker_added(worker).await.unwrap();
-    assert_eq!(info.cache_key.unwrap().block_size, 8);
-    boundary_subscription(&publisher, "", false).await;
-    let stored = |hash, start, size| {
-        serde_json::to_value(stored_block(
-            hash,
-            &(start..start + size).collect::<Vec<_>>(),
-            size,
-            "GPU",
-        ))
-        .unwrap()
-    };
-    let batch = rmp_serde::to_vec(&(
-        1.0,
-        [
-            json!({"type": "BlockRemoved", "block_hashes": [9], "medium": "GPU"}),
-            json!({"type": "AllBlocksCleared"}),
-            stored(1, 20, 4),
-            stored(2, 100, 8),
-        ],
-        0u32,
-    ))
-    .unwrap();
-    live_frame(&publisher, b"", 0i64, &batch);
-    // A subsequent valid frame is a deterministic processing barrier;
-    // a rejected earlier batch must not become visible after resume.
-    let marker = rmp_serde::to_vec(&(2.0, [stored(3, 200, 8)], 0u32)).unwrap();
-    live_frame(&publisher, b"", 1i64, &marker);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if matches!(
-                signals.recv().await,
-                Some(IngestionSignal::Advance { last_seq: 1, .. })
-            ) {
-                break;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    let index = supervisor.workers.lock()[worker].indexer.clone();
-    let query = |start| {
-        block_query(
-            &(start..start + 8).collect::<Vec<_>>(),
-            8,
-            &[StorageTier::Device],
-        )
-    };
-    assert!(
-        index.find_matches(&query(100)).is_empty(),
-        "bad block-size batch leaked its valid Store"
-    );
-    assert_eq!(index.find_matches(&query(200)).len(), 1);
-    supervisor.shutdown();
 }
 
 /// A stock vLLM worker exposes no engine config endpoint, only `/metrics`.
@@ -2478,7 +1710,7 @@ async fn metrics_only_worker_supplies_cache_metadata() {
 }
 
 #[tokio::test]
-async fn metrics_only_worker_creates_a_cache_identity() {
+async fn cache_metrics_and_event_addresses_do_not_prove_a_hash_contract() {
     use axum::routing::get;
 
     let context = zmq::Context::new();
@@ -2505,10 +1737,8 @@ async fn metrics_only_worker_creates_a_cache_identity() {
     let (supervisor, _signals) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
     let info = supervisor.on_worker_added(&worker).await.unwrap();
     assert_eq!(info.block_size, Some(16));
-    assert!(
-        info.cache_key.is_some(),
-        "metadata should produce a cache identity"
-    );
+    assert!(info.cache_key.is_none());
+    assert!(supervisor.match_provider_for_worker(&worker).is_none());
     supervisor.shutdown();
     server.abort();
 }
@@ -2589,14 +1819,18 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
     use axum::{routing::get, Json, Router};
 
     let healthy = Arc::new(AtomicBool::new(true));
-    let context = zmq::Context::new();
-    let publisher = context.socket(zmq::XPUB).unwrap();
-    publisher.bind("tcp://127.0.0.1:*").unwrap();
-    let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+    let (endpoint, replay_endpoint, publisher, replay) = layout_endpoints();
     let metadata = Arc::new(Mutex::new(serde_json::json!({"0": {
-        "publisher":"zmq", "endpoint":endpoint, "enable_kv_cache_events":true
+        "publisher":"zmq", "endpoint":endpoint, "enable_kv_cache_events":true,
+        "topic":"kv/boot", "replay_endpoint":replay_endpoint
     }})));
-    let app = Router::new().route("/server_info", get({
+    let layout = automatic_layout(plain_full_layout("m", "kv/boot", 16));
+    let app = Router::new()
+      .route("/kv_routing_capabilities", get(move || {
+        let layout = layout.clone();
+        async move { Json(layout) }
+      }))
+      .route("/server_info", get({
         let healthy = healthy.clone();
         move || {
             let healthy = healthy.clone();
@@ -2628,28 +1862,18 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
     let initial = supervisor.refresh_workers(&bases).await;
     assert!(initial[&base].info.is_some());
     let provider = initial[&base].provider.as_ref().unwrap();
-    boundary_subscription(&publisher, "", false).await;
-    live_frame(
-        &publisher,
-        b"",
-        0,
-        &store_payload(7, &[1; 16], 16, "GPU", Some(0)),
-    );
-    let query = block_query(&[1; 16], 16, &[StorageTier::Device]);
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while provider.find_tiered_matches(&query).is_empty() {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .unwrap();
+    boundary_subscription(&publisher, "kv/boot", false).await;
+    finish_empty_startup_replay(&replay).await;
+    live_frame(&publisher, b"kv/boot", 0, &full_payload(&[1; 16], 16, 0));
+    let hits = || provider.matches(&[1; 17], 16, None, 0);
+    wait_for(|| !hits().is_empty()).await;
     let valid = metadata.lock()["0"].clone();
     *metadata.lock() = serde_json::json!({"not-a-rank": valid.clone()});
     rewind();
     let rejected = supervisor.refresh_workers(&bases).await;
     assert!(rejected[&base].info.is_none());
     assert!(rejected[&base].provider.is_none());
-    assert!(provider.find_tiered_matches(&query).is_empty());
+    assert!(hits().is_empty());
     assert!(!supervisor.workers.lock().contains_key(&base));
     *metadata.lock() = serde_json::json!({"0": valid});
     rewind();

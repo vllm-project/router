@@ -4,7 +4,7 @@ use super::pd_warm_remote::{PdResponseContext, PdWarmRemoteRuntime};
 use super::program_adapter::ProgramCompletion;
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
 use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerRegistry, WorkerType};
-use crate::kv_index::KvIndexSupervisor;
+use crate::kv_index::{HashMode, KvIndexSupervisor};
 use crate::program_scheduling::{
     max_prometheus_gauge, sum_prometheus_gauge, BackendObservationProvider, ProgramIdentity,
     ProgramScheduler, ProgramSchedulerConfig, ProgramTarget, ScheduleError,
@@ -93,7 +93,10 @@ impl PdProgramRuntime {
         let kv_observer = if kv_config.kv_events {
             Some(
                 tokio::spawn(async move {
-                    let (supervisor, mut signals) = KvIndexSupervisor::new(kv_client);
+                    let (supervisor, mut signals) = KvIndexSupervisor::new(
+                        kv_client,
+                        HashMode::parse_config(&kv_config.kv_hash_mode),
+                    );
                     let mut previous = BTreeSet::new();
                     let mut subscribed = BTreeSet::new();
                     let mut loss_epoch = crate::kv_index::signal_loss_epoch();
@@ -107,17 +110,17 @@ impl PdProgramRuntime {
                                 let invalidation = match signal {
                                     IngestionSignal::Invalidated {
                                         source, dp_rank, ..
-                                    } => (source, Some(dp_rank as usize)),
+                                    } => Some((source, Some(dp_rank as usize))),
                                     IngestionSignal::Gap { source, .. }
                                     | IngestionSignal::IncarnationReset { source, .. } => {
-                                        (source, None)
+                                        Some((source, None))
                                     }
-                                    #[cfg(all(test, feature = "cpu", feature = "ready"))]
-                                    IngestionSignal::Advance { .. } => continue,
+                                    _ => None,
                                 };
-                                let (source, rank) = invalidation;
-                                for url in supervisor.worker_urls_for_source(&source) {
-                                    warm_remote.invalidate_target(&url, rank);
+                                if let Some((source, rank)) = invalidation {
+                                    for url in supervisor.worker_urls_for_source(&source) {
+                                        warm_remote.invalidate_target(&url, rank);
+                                    }
                                 }
                             }
                         }
@@ -897,7 +900,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let (supervisor, _signals) = KvIndexSupervisor::new(reqwest::Client::new());
+        let (supervisor, _signals) =
+            KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
         let urls = BTreeSet::from([format!("http://{address}")]);
         let mut previous = BTreeSet::new();
         let mut subscribed = BTreeSet::new();

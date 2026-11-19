@@ -73,6 +73,25 @@ pub struct GroupCapability {
     pub tokens_per_state: Option<String>,
     pub cache_role: Option<String>,
 }
+
+impl RankCapability {
+    pub(crate) fn is_plain_full_attention(&self) -> bool {
+        self.declared_groups.is_none_or(|count| count == 1)
+            && self.hash_lookahead_tokens == 0
+            && self.speculative_tokens == 0
+            && !self.partial_hash_hits
+            && matches!(
+                self.groups.as_slice(),
+                [group] if self.hash_block_size == Some(group.block_size)
+                    && group.group_idx == 0
+                    && group.kind == "full_attention"
+                    && group.spec_type == "FullAttentionSpec"
+                    && group.sliding_window.is_none()
+                    && group.prefix_cacheable
+                    && group.prefix_replay_tokens == 0
+            )
+    }
+}
 /// Adapter declarations are the only way to credit adapter pages, so a
 /// malformed declaration must fail the layout instead of binding a chain that
 /// is not the one the engine stores.

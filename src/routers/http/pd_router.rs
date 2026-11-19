@@ -2726,58 +2726,45 @@ mod admission_tests {
     use super::super::pd_types::PdLoadSample;
     use super::*;
     use crate::core::{BasicWorker, DPAwareWorker};
-    use crate::policies::{
-        AffinityKey, CostParams, KvAwarePolicy, RequestHeaders, RoundRobinPolicy,
-    };
+    use crate::policies::{AffinityKey, KvAwarePolicy, RequestHeaders, RoundRobinPolicy};
 
+    #[cfg(all(feature = "cpu", feature = "ready"))]
     fn prefix_policy_with_blocks(
         p: &[Arc<dyn Worker>],
         tokens: &[u32],
         stored_blocks: usize,
-        params: CostParams,
     ) -> KvAwarePolicy {
-        use crate::kv_index::{
-            CacheKey, KvBlockIndexer, ResidencyOwner, RoutableTarget, StorageTier,
-        };
-        let policy = KvAwarePolicy::new(params);
-        let index = Arc::new(KvBlockIndexer::new());
-        let hashes = KvAwarePolicy::local_hashes(tokens, 16);
-        let blocks: Vec<_> = hashes
-            .into_iter()
-            .enumerate()
-            .take(stored_blocks)
-            .map(|(i, hash)| (Arc::<str>::from(format!("block-{i}")), hash))
-            .collect();
-        index.store(
-            0,
-            ResidencyOwner::Worker {
-                source: Arc::from(p[1].base_url()),
-                dp_rank: 0,
-                incarnation: 0,
-            },
-            StorageTier::Device,
-            None,
-            &blocks,
-        );
-        for worker in p {
+        use crate::kv_index::source::test_support::{full_binding, warm_full};
+        use crate::kv_index::{CacheKey, RoutableTarget};
+
+        let policy = KvAwarePolicy::default();
+        let stored_tokens = (tokens.len() / 16).min(stored_blocks) * 16;
+        for (i, worker) in p.iter().enumerate() {
+            let target = RoutableTarget {
+                instance_id: Arc::from(worker.base_url()),
+                dp_rank: worker.dp_rank().unwrap_or(0) as u32,
+            };
+            let binding = Arc::new(full_binding(target.clone(), 16));
+            binding.begin_empty(0);
+            if i == 1 {
+                warm_full(&binding, 0, &tokens[..stored_tokens]);
+            }
             policy.register_target_with_cache_identity(
                 worker.url(),
-                RoutableTarget {
-                    instance_id: Arc::from(worker.base_url()),
-                    dp_rank: 0,
-                },
+                target,
                 CacheKey {
                     model: Arc::from("model"),
                     block_size: 16,
                 },
-                index.clone(),
+                binding,
             );
         }
         policy
     }
 
+    #[cfg(all(feature = "cpu", feature = "ready"))]
     fn resident_prefix_policy(p: &[Arc<dyn Worker>], tokens: &[u32]) -> KvAwarePolicy {
-        prefix_policy_with_blocks(p, tokens, usize::MAX, CostParams::default())
+        prefix_policy_with_blocks(p, tokens, usize::MAX)
     }
 
     fn token_inputs(
@@ -2806,6 +2793,7 @@ mod admission_tests {
             .collect()
     }
 
+    #[cfg(all(feature = "cpu", feature = "ready"))]
     #[test]
     fn pd_prefix_credit_changes_placement_and_charges_exact_attempt_work() {
         let manager = Arc::new(PdLoadManager::default());
@@ -2934,6 +2922,7 @@ mod admission_tests {
         );
     }
 
+    #[cfg(all(feature = "cpu", feature = "ready"))]
     #[test]
     fn prefill_backlog_shifts_to_idle_worker() {
         let p = pool("p", 2);
@@ -2945,7 +2934,7 @@ mod admission_tests {
         let tokens: Vec<u32> = (0..400).collect();
         let mut context = context();
 
-        let policy = prefix_policy_with_blocks(&p, &tokens, 12, CostParams::default());
+        let policy = prefix_policy_with_blocks(&p, &tokens, 12);
         let inputs = token_inputs(&p, &tokens, &policy);
         context.prefill_inputs = Some(&inputs);
         let manager = Arc::new(PdLoadManager::default());
@@ -2963,6 +2952,7 @@ mod admission_tests {
         drop((a, b));
     }
 
+    #[cfg(all(feature = "cpu", feature = "ready"))]
     #[test]
     fn unknown_inflight_work_forces_one_unit_consistent_pool_fallback() {
         let manager = Arc::new(PdLoadManager::default());
@@ -3359,6 +3349,7 @@ mod admission_tests {
         ))
     }
 
+    #[cfg(all(feature = "cpu", feature = "ready"))]
     #[test]
     fn decode_affinity_does_not_filter_prefill_token_cost_candidates() {
         let manager = Arc::new(PdLoadManager::default());

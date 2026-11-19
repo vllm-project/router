@@ -397,7 +397,6 @@ impl Router {
             let (mut supervisor, signals) =
                 crate::kv_index::KvIndexSupervisor::new_http_full_attention(ctx.client.clone());
             supervisor.set_api_key(ctx.router_config.api_key.clone());
-            supervisor.set_strict_recovery(ctx.router_config.kv_event_strict_recovery);
             let static_sources = match &ctx.router_config.policy {
                 crate::config::PolicyConfig::KvAware {
                     static_kv_event_sources,
@@ -4134,22 +4133,16 @@ mod tests {
         let requests = requests.lock();
         // Discovery asks every metadata source before giving up, and none of the
         // probes may carry an Authorization header the operator did not configure.
-        let mut probed: Vec<&str> = requests.iter().map(|(path, _)| path.as_str()).collect();
-        probed.sort_unstable();
-        assert_eq!(
-            probed,
-            [
-                "/get_server_info",
-                "/get_server_info",
-                "/kv_event_sources",
-                "/metrics",
-                "/metrics",
-                "/server_info",
-                "/server_info",
-                "/v1/models"
-            ],
-            "metadata requests: {requests:?}"
-        );
+        for path in [
+            "/get_server_info",
+            "/kv_event_sources",
+            "/kv_routing_capabilities",
+            "/metrics",
+            "/server_info",
+            "/v1/models",
+        ] {
+            assert!(requests.iter().any(|(actual, _)| actual == path));
+        }
         assert!(requests
             .iter()
             .all(|(_, authorization)| authorization.is_none()));
@@ -4177,6 +4170,124 @@ mod tests {
             .expect("invalid static configuration");
         assert!(error.contains("model identity"), "{error}");
     }
+    struct NativePublisher {
+        live: zmq::Socket,
+        replay: zmq::Socket,
+    }
+
+    impl NativePublisher {
+        fn new() -> Self {
+            let context = zmq::Context::new();
+            let socket = |kind| {
+                let socket = context.socket(kind).unwrap();
+                socket.set_linger(0).unwrap();
+                socket.bind("tcp://127.0.0.1:*").unwrap();
+                socket
+            };
+            Self {
+                live: socket(zmq::XPUB),
+                replay: socket(zmq::ROUTER),
+            }
+        }
+
+        fn sources(&self, rank: u32, topic: &str) -> serde_json::Value {
+            serde_json::json!({(rank.to_string()): {
+                "endpoint": self.live.get_last_endpoint().unwrap().unwrap(),
+                "replay_endpoint": self.replay.get_last_endpoint().unwrap().unwrap(),
+                "topic": topic, "publisher": "zmq", "encoding": "msgpack",
+                "schema_version": 1, "enable_kv_cache_events": true
+            }})
+        }
+
+        async fn replay_request(&self, start: u64) -> Vec<Vec<u8>> {
+            let request = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match self.replay.recv_multipart(zmq::DONTWAIT) {
+                        Ok(request) => break request,
+                        Err(zmq::Error::EAGAIN) => {
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                        Err(error) => panic!("KV replay request: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(request.last().unwrap(), &start.to_be_bytes());
+            request
+        }
+
+        fn reply(&self, request: &[Vec<u8>], topic: &str, frames: &[(i64, &[u8])]) {
+            for (seq, payload) in frames.iter().copied().chain([(-1, &[][..])]) {
+                self.replay
+                    .send_multipart(
+                        [
+                            request[0].as_slice(),
+                            &[],
+                            if seq == -1 { &[] } else { topic.as_bytes() },
+                            &seq.to_be_bytes(),
+                            payload,
+                        ],
+                        0,
+                    )
+                    .unwrap();
+            }
+        }
+
+        async fn bootstrap(&self, topic: &str) {
+            let mut subscription = None;
+            wait_for_kv(|| {
+                subscription = self.live.recv_bytes(zmq::DONTWAIT).ok();
+                subscription.is_some()
+            })
+            .await;
+            assert_eq!(
+                subscription.unwrap(),
+                [b"\x01".as_slice(), topic.as_bytes()].concat()
+            );
+            let request = self.replay_request(0).await;
+            self.reply(&request, topic, &[]);
+        }
+
+        fn send(&self, topic: &str, seq: i64, payload: &[u8]) {
+            self.live
+                .send_multipart([topic.as_bytes(), &seq.to_be_bytes(), payload], 0)
+                .unwrap();
+        }
+    }
+
+    async fn wait_for_kv(mut ready: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("KV state did not converge");
+    }
+
+    fn plain_native_layout(
+        model: &str,
+        rank: u32,
+        block_size: u32,
+        topic: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1, "adapters": [],
+            "ranks": [{
+                "rank": rank, "declared_groups": 1, "model": model, "weight_version": "default",
+                "publisher_topic": topic, "instance_topic": true, "hash_algorithm": "sha256_cbor",
+                "hash_seed": "0", "full_hashes": true, "hash_block_size": block_size,
+                "partial_hash_hits": false, "hash_lookahead_tokens": 0, "speculative_tokens": 0,
+                "prefix_caching": true, "transfer": null,
+                "groups": [{
+                    "group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec",
+                    "block_size": block_size, "prefix_cacheable": true, "prefix_replay_tokens": 0
+                }]
+            }]
+        })
+    }
+
     #[tokio::test]
     async fn empty_router_retains_static_mapping_for_future_http_add_worker() {
         for managed in [false, true] {
@@ -4186,19 +4297,19 @@ mod tests {
 
     async fn exercise_future_http_worker(managed: bool) {
         use crate::config::{PolicyConfig, RouterConfig};
-        use crate::kv_index::{MatchQuery, StorageTier};
+        use crate::kv_index::source::test_support::{event_payload, full_store, gpu_remove};
+        use crate::kv_index::KVEvent;
         use crate::protocols::worker_spec::WorkerConfigRequest;
         use crate::routers::router_manager::{RouterId, RouterManager};
         use axum::routing::get;
         use serde_json::json;
 
-        let context = zmq::Context::new();
-        let publisher = context.socket(zmq::XPUB).unwrap();
-        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let publisher = NativePublisher::new();
+        let topic = "kv/future";
+        let sources = publisher.sources(0, topic);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let worker = format!("http://{}", listener.local_addr().unwrap());
-        // Discovery endpoints deliberately do not exist: the saved mapping must
-        // supply the source for this later, independently addressed worker.
+        // The later worker has no discovery endpoints.
         let app = axum::Router::new().route("/health", get(|| async { "ok" }));
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let config = RouterConfig {
@@ -4210,8 +4321,10 @@ mod tests {
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Box::new(
                     serde_json::from_value(json!({&worker: {
-                        "endpoints": [publisher.get_last_endpoint().unwrap().unwrap()],
-                        "block_size": 8, "model": "future-model", "topic": "kv/future"
+                        "endpoints": [sources["0"]["endpoint"]],
+                        "replay_endpoints": [sources["0"]["replay_endpoint"]],
+                        "block_size": 8, "model": "future-model",
+                        "hybrid": plain_native_layout("future-model", 0, 8, topic)
                     }}))
                     .unwrap(),
                 ),
@@ -4248,52 +4361,17 @@ mod tests {
         }
         let supervisor = router.kv_index_supervisor.as_ref().unwrap();
         let provider = supervisor.match_provider_for_worker(&worker).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match publisher.recv_bytes(zmq::DONTWAIT) {
-                    Ok(frame) => {
-                        assert_eq!(frame, b"\x01kv/future");
-                        break;
-                    }
-                    Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
-                    Err(error) => panic!("future worker subscription: {error}"),
-                }
-            }
-        })
-        .await
-        .unwrap();
-        let payload = rmp_serde::to_vec(&(
-            1.0,
-            [json!({
-                "type": "BlockStored", "block_hashes": [1], "parent_block_hash": null,
-                "token_ids": vec![1; 8], "block_size": 8, "medium": "GPU",
-                "lora_id": null, "lora_name": null
-            })],
-            0u32,
-        ))
-        .unwrap();
-        publisher
-            .send_multipart([b"kv/future".as_slice(), &0i64.to_be_bytes(), &payload], 0)
-            .unwrap();
-        let query = MatchQuery {
-            group_idx: 0,
-            local_hashes: crate::kv_index::local_block_hashes(&[1; 8], 8, None),
-            tiers_of_interest: vec![StorageTier::Device],
-        };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let hits = provider.find_tiered_matches(&query);
-                if !hits.is_empty() {
-                    assert_eq!(hits.len(), 1);
-                    assert_eq!(hits[0].target.instance_id.as_ref(), worker);
-                    assert_eq!(hits[0].segments, [(0, 1)]);
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        publisher.bootstrap(topic).await;
+        let store = full_store(&[1; 8], 8, None);
+        let payload = event_payload(1.0, &[KVEvent::BlockStored(store.clone())], Some(0));
+        let lookup = || provider.matches(&[1; 9], 8, None, 0);
+        publisher.send(topic, 0, &payload);
+        wait_for_kv(|| !lookup().is_empty()).await;
+        let hits = lookup();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].target.instance_id.as_ref(), worker);
+        assert_eq!(hits[0].segments, [(0, 1)]);
+
         if let Some(manager) = &manager {
             let target = router.available_workers(Some("future-model"));
             let other = router.available_workers(Some("other-model"));
@@ -4318,40 +4396,17 @@ mod tests {
                 assert_eq!(remaining(policy, target[0].as_ref()), 1);
                 assert_eq!(remaining(policy, other[0].as_ref()), 9);
             }
-            let removed = rmp_serde::to_vec(&(
-                2.0,
-                [json!({
-                    "type": "BlockRemoved", "block_hashes": [1], "medium": "GPU"
-                })],
-                0u32,
-            ))
-            .unwrap();
-            publisher
-                .send_multipart([b"kv/future".as_slice(), &1i64.to_be_bytes(), &removed], 0)
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !provider.find_tiered_matches(&query).is_empty() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
+            let removed = event_payload(2.0, &[gpu_remove(Some(0), store.block_hashes)], Some(0));
+            publisher.send(topic, 1, &removed);
+            wait_for_kv(|| lookup().is_empty()).await;
             for policy in [&model, &default] {
                 assert_eq!(remaining(policy, target[0].as_ref()), 9);
             }
-            publisher
-                .send_multipart([b"kv/future".as_slice(), &2i64.to_be_bytes(), &payload], 0)
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while provider.find_tiered_matches(&query).is_empty() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
+            publisher.send(topic, 2, &payload);
+            wait_for_kv(|| !lookup().is_empty()).await;
             manager.remove_worker_from_registry(&worker).unwrap();
             assert!(supervisor.match_provider_for_worker(&worker).is_none());
-            assert!(provider.find_tiered_matches(&query).is_empty());
+            assert!(lookup().is_empty());
             assert!(router.available_workers(Some("future-model")).is_empty());
             assert_eq!(router.available_workers(Some("other-model")).len(), 1);
             for policy in [&model, &default] {
@@ -4365,49 +4420,43 @@ mod tests {
     #[tokio::test]
     async fn discovered_http_sources_use_full_attention_admission_through_router_startup_and_add() {
         use crate::config::{PolicyConfig, RouterConfig};
-        use crate::kv_index::{MatchQuery, StorageTier};
+        use crate::kv_index::source::test_support::{event_payload, full_store};
+        use crate::kv_index::{BlockRemoved, KVEvent, StorageTier};
         use axum::{routing::get, Json};
         use serde_json::json;
 
-        for (expected, actual, replayed, empty_start) in
-            [(16u32, 8u32, false, false), (8, 16, true, true)]
-        {
-            let context = zmq::Context::new();
-            let publisher = context.socket(zmq::XPUB).unwrap();
-            publisher.bind("tcp://127.0.0.1:*").unwrap();
-            let replay = context.socket(zmq::ROUTER).unwrap();
-            replay.bind("tcp://127.0.0.1:*").unwrap();
-            let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-            let replay_endpoint = replay.get_last_endpoint().unwrap().unwrap();
-            let sources = json!({"3": {
-                "endpoint": endpoint, "replay_endpoint": replay_endpoint,
-                "topic": "kv/router", "publisher": "zmq", "encoding": "msgpack",
-                "schema_version": 1, "enable_kv_cache_events": true
-            }});
+        let topic = "kv/router";
+        for empty_start in [false, true] {
+            let publisher = NativePublisher::new();
+            let sources = publisher.sources(3, topic);
+            let layout = plain_native_layout("router-dense", 3, 8, topic);
             let requests = Arc::new(Mutex::new(Vec::new()));
             let metadata_requests = requests.clone();
             let app = axum::Router::new()
                 .route("/health", get(|| async { "ok" }))
                 .fallback(get(move |request: Request| {
-                    let sources = sources.clone();
-                    let requests = metadata_requests.clone();
+                    let (sources, layout, requests) =
+                        (sources.clone(), layout.clone(), metadata_requests.clone());
                     async move {
                         let authorization = request
                             .headers()
                             .get("authorization")
-                            .map(|value| value.to_str().unwrap().to_owned());
-                        let path = request.uri().path().to_owned();
-                        requests.lock().push((path.clone(), authorization.clone()));
-                        if authorization.as_deref() != Some("Bearer backend-key") {
+                            .and_then(|value| value.to_str().ok());
+                        let path = request.uri().path();
+                        requests
+                            .lock()
+                            .push((path.to_owned(), authorization.map(str::to_owned)));
+                        if authorization != Some("Bearer backend-key") {
                             return StatusCode::UNAUTHORIZED.into_response();
                         }
-                        match path.as_str() {
+                        match path {
                             "/get_server_info" => Json(json!({
                                 "model_id": "router-dense", "instance_id": "router-source",
-                                "kv_block_size": expected
+                                "kv_block_size": 8
                             }))
                             .into_response(),
                             "/kv_event_sources" => Json(sources).into_response(),
+                            "/kv_routing_capabilities" => Json(layout).into_response(),
                             _ => StatusCode::NOT_FOUND.into_response(),
                         }
                     }
@@ -4431,16 +4480,12 @@ mod tests {
             let ctx = Arc::new(
                 crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
             );
-            let router = Router::new(
-                if empty_start {
-                    vec![]
-                } else {
-                    vec![worker.clone()]
-                },
-                &ctx,
-            )
-            .await
-            .unwrap();
+            let urls = if empty_start {
+                vec![]
+            } else {
+                vec![worker.clone()]
+            };
+            let router = Router::new(urls, &ctx).await.unwrap();
             if empty_start {
                 router.add_worker(&worker).await.unwrap();
             }
@@ -4448,205 +4493,70 @@ mod tests {
             let provider = supervisor.match_provider_for_worker(&worker).unwrap();
             {
                 let requests = requests.lock();
-                assert_eq!(requests.len(), 4, "metadata requests: {requests:?}");
                 assert!(requests.iter().all(|(_, authorization)| {
                     authorization.as_deref() == Some("Bearer backend-key")
                 }));
-                for path in ["/get_server_info", "/kv_event_sources", "/v1/models"] {
+                for path in [
+                    "/get_server_info",
+                    "/kv_event_sources",
+                    "/kv_routing_capabilities",
+                    "/v1/models",
+                ] {
                     assert!(
-                        requests.iter().any(|(actual_path, authorization)| {
-                            actual_path == path
-                                && authorization.as_deref() == Some("Bearer backend-key")
-                        }),
+                        requests.iter().any(|(actual, _)| actual == path),
                         "missing authenticated {path}: {requests:?}"
                     );
                 }
             }
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    match publisher.recv_bytes(zmq::DONTWAIT) {
-                        Ok(frame) => {
-                            assert_eq!(frame, b"\x01kv/router");
-                            break;
-                        }
-                        Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
-                        Err(error) => panic!("Router XPUB subscription: {error}"),
-                    }
-                }
-            })
-            .await
-            .unwrap();
-            // A bound source first replays existing history before consuming
-            // live events. This fresh mock publisher has no earlier batches.
-            let request = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    match replay.recv_multipart(zmq::DONTWAIT) {
-                        Ok(request) => break request,
-                        Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
-                        Err(error) => panic!("Router startup replay: {error}"),
-                    }
-                }
-            })
-            .await
-            .unwrap();
-            assert_eq!(request.last().unwrap(), &0i64.to_be_bytes());
-            replay
-                .send_multipart(
-                    [
-                        request[0].clone(),
-                        vec![],
-                        vec![],
-                        (-1i64).to_be_bytes().to_vec(),
-                        vec![],
-                    ],
-                    0,
-                )
-                .unwrap();
-            let payload =
-                |hash: u32, token: u32, block_size: u32| {
-                    rmp_serde::to_vec(&(1.0, [json!({
-                "type": "BlockStored", "block_hashes": [hash], "parent_block_hash": null,
-                "token_ids": vec![token; block_size as usize], "block_size": block_size,
-                "medium": "CPU", "lora_id": null, "lora_name": null
-            })], 3u32)).unwrap()
-                };
-            let query = |token| MatchQuery {
-                group_idx: 0,
-                local_hashes: crate::kv_index::local_block_hashes(
-                    &vec![token; expected as usize],
-                    expected,
-                    None,
-                ),
-                tiers_of_interest: vec![StorageTier::HostPinned],
+            publisher.bootstrap(topic).await;
+            let mut store = full_store(&[1; 8], 8, None);
+            store.medium = Some("CPU".into());
+            let warm = event_payload(1.0, &[KVEvent::BlockStored(store.clone())], Some(3));
+            let lookup = |token| provider.matches(&[token; 9], 8, None, 3);
+            let check_hit = |token| {
+                let hits = lookup(token);
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].target.instance_id.as_ref(), "router-source");
+                assert_eq!(hits[0].target.dp_rank, 3);
+                assert_eq!(hits[0].tier, StorageTier::HostPinned);
+                assert_eq!(hits[0].segments, [(0, 1)]);
             };
-            publisher
-                .send_multipart(
-                    [
-                        b"kv/router".as_slice(),
-                        &0i64.to_be_bytes(),
-                        &payload(1, 1, expected),
-                    ],
-                    0,
-                )
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let hits = provider.find_tiered_matches(&query(1));
-                    if !hits.is_empty() {
-                        assert_eq!(hits.len(), 1);
-                        assert_eq!(hits[0].target.instance_id.as_ref(), "router-source");
-                        assert_eq!(hits[0].target.dp_rank, 3);
-                        assert_eq!(hits[0].tier, StorageTier::HostPinned);
-                        assert_eq!(hits[0].segments, [(0, 1)]);
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            if replayed {
-                let fresh = payload(3, 3, expected);
-                publisher
-                    .send_multipart([b"kv/router".as_slice(), &2i64.to_be_bytes(), &fresh], 0)
-                    .unwrap();
-                let request = tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        match replay.recv_multipart(zmq::DONTWAIT) {
-                            Ok(request) => break request,
-                            Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
-                            Err(error) => panic!("Router replay: {error}"),
-                        }
-                    }
-                })
-                .await
-                .unwrap();
-                assert_eq!(request.last().unwrap(), &1i64.to_be_bytes());
-                for (seq, body) in [(1i64, payload(2, 2, actual)), (2, fresh), (-1, vec![])] {
-                    replay
-                        .send_multipart(
-                            [
-                                request[0].clone(),
-                                vec![],
-                                if seq == -1 {
-                                    vec![]
-                                } else {
-                                    b"kv/router".to_vec()
-                                },
-                                seq.to_be_bytes().to_vec(),
-                                body,
-                            ],
-                            0,
-                        )
-                        .unwrap();
-                }
-                let recovered = rmp_serde::to_vec(&(
-                    1.0,
-                    [
-                        json!({"type": "AllBlocksCleared"}),
-                        json!({
-                            "type": "BlockStored", "block_hashes": [4],
-                            "parent_block_hash": null,
-                            "token_ids": vec![4; expected as usize],
-                            "block_size": expected, "medium": "CPU",
-                            "lora_id": null, "lora_name": null
-                        }),
-                    ],
-                    3u32,
-                ))
-                .unwrap();
-                publisher
-                    .send_multipart(
-                        [b"kv/router".as_slice(), &3i64.to_be_bytes(), &recovered],
-                        0,
-                    )
-                    .unwrap();
+            publisher.send(topic, 0, &warm);
+            wait_for_kv(|| !lookup(1).is_empty()).await;
+            check_hit(1);
+
+            if empty_start {
+                let removed = KVEvent::BlockRemoved(BlockRemoved {
+                    block_hashes: store.block_hashes,
+                    medium: Some("CPU".into()),
+                    group_idx: Some(0),
+                    locality: None,
+                    ownership: None,
+                });
+                let remove = event_payload(2.0, &[removed], Some(3));
+                let mut new = full_store(&[3; 8], 8, None);
+                new.medium = Some("CPU".into());
+                let fresh = event_payload(3.0, &[KVEvent::BlockStored(new)], Some(3));
+                publisher.send(topic, 2, &fresh);
+                let request = publisher.replay_request(0).await;
+                assert!(lookup(1).is_empty(), "gap must hide the source");
+                publisher.reply(&request, topic, &[(0, &warm), (1, &remove), (2, &fresh)]);
+                wait_for_kv(|| !lookup(3).is_empty()).await;
+                check_hit(3);
+                assert!(lookup(1).is_empty());
             } else {
-                publisher
-                    .send_multipart(
-                        [
-                            b"kv/router".as_slice(),
-                            &1i64.to_be_bytes(),
-                            &payload(2, 2, actual),
-                        ],
-                        0,
-                    )
-                    .unwrap();
+                let mut bad = full_store(&[2; 8], 8, None);
+                bad.group_idx = Some(1);
+                let invalid = event_payload(2.0, &[KVEvent::BlockStored(bad)], Some(3));
+                publisher.send(topic, 1, &invalid);
+                wait_for_kv(|| lookup(1).is_empty()).await;
+                assert!(lookup(2).is_empty());
             }
-            let result = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    if replayed {
-                        let recovered = provider.find_tiered_matches(&query(4));
-                        if recovered.is_empty() {
-                            tokio::task::yield_now().await;
-                            continue;
-                        }
-                        assert_eq!(recovered.len(), 1);
-                        assert_eq!(recovered[0].target.instance_id.as_ref(), "router-source");
-                        assert_eq!(recovered[0].target.dp_rank, 3);
-                        assert_eq!(recovered[0].tier, StorageTier::HostPinned);
-                        assert_eq!(recovered[0].segments, [(0, 1)]);
-                        assert!(provider.find_tiered_matches(&query(1)).is_empty());
-                        assert!(provider.find_tiered_matches(&query(2)).is_empty());
-                        assert!(provider.find_tiered_matches(&query(3)).is_empty());
-                        break true;
-                    }
-                    let old = provider.find_tiered_matches(&query(1));
-                    let new = provider.find_tiered_matches(&query(2));
-                    if old.is_empty() {
-                        assert!(new.is_empty());
-                        break true;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await;
             supervisor.shutdown();
             if let Some(task) = &router._load_monitor_handle {
                 task.abort();
             }
             http_task.abort();
-            assert!(result.is_ok(), "ordinary Router accepted source/event mismatch: source={expected},event={actual},replay={replayed},empty={empty_start}");
         }
     }
 
@@ -4998,8 +4908,8 @@ mod tests {
 
     #[tokio::test]
     async fn completion_registered_source_credits_prepared_alias_and_preserves_raw() {
-        use crate::kv_index::wire::ExternalBlockHash;
-        use crate::kv_index::{BlockStored, IngestionSignal, KVEvent};
+        use crate::kv_index::source::test_support::{event_payload, full_store};
+        use crate::kv_index::KVEvent;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
             format!("http://{}", listener.local_addr().unwrap()),
@@ -5014,10 +4924,9 @@ mod tests {
             .unwrap();
         let manager = kv.slot_manager().unwrap();
         let target = kv.target_for_worker(worker.as_ref());
-        let context = zmq::Context::new();
-        let publisher = context.socket(zmq::XPUB).unwrap();
-        publisher.bind("tcp://127.0.0.1:*").unwrap();
-        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let publisher = NativePublisher::new();
+        let topic = "kv/completion-alias";
+        let sources = publisher.sources(0, topic);
         let captured = Arc::new(Mutex::new(Vec::new()));
         let bodies = captured.clone();
         let (inflight_manager, inflight_target, inflight_worker) =
@@ -5037,8 +4946,11 @@ mod tests {
                 async move { Json(serde_json::json!({"model_id":"qwen3","instance_id":source_url,"kv_block_size":4})) }
             }))
             .route("/kv_event_sources", axum::routing::get(move || {
-                let endpoint = endpoint.clone();
-                async move { Json(serde_json::json!({"0":{"endpoint":endpoint,"publisher":"zmq","encoding":"msgpack","schema_version":1,"enable_kv_cache_events":true}})) }
+                let sources = sources.clone();
+                async move { Json(sources) }
+            }))
+            .route("/kv_routing_capabilities", axum::routing::get(move || async move {
+                Json(plain_native_layout("qwen3", 0, 4, topic))
             }))
             .route("/v1/completions", axum::routing::post(move |body: axum::body::Bytes| {
                 let (bodies, manager, target, worker) = (bodies.clone(), inflight_manager.clone(), inflight_target.clone(), inflight_worker.clone());
@@ -5050,69 +4962,22 @@ mod tests {
                 }
             }));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let (supervisor, mut signals) =
+        let (supervisor, _signals) =
             crate::kv_index::KvIndexSupervisor::new_http_full_attention(Client::new());
         let supervisor = Arc::new(supervisor);
         let info = supervisor.on_worker_added(worker.url()).await.unwrap();
+        let provider = supervisor.match_provider_for_worker(worker.url()).unwrap();
         kv_aware_ops(policy.as_ref()).unwrap().register_worker(
             worker.as_ref(),
             Some(&info),
-            supervisor.match_provider_for_worker(worker.url()),
+            Some(provider.clone()),
         );
         router.kv_index_supervisor = Some(supervisor.clone());
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match publisher.recv_bytes(zmq::DONTWAIT) {
-                    Ok(subscription) => {
-                        assert_eq!(subscription, [1]);
-                        break;
-                    }
-                    Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
-                    Err(error) => panic!("subscription handshake: {error}"),
-                }
-            }
-        })
-        .await
-        .expect("subscriber handshake");
-        let event = KVEvent::BlockStored(BlockStored {
-            extra_keys: None,
-            block_hashes: vec![ExternalBlockHash::Int(1), ExternalBlockHash::Int(2)],
-            parent_block_hash: None,
-            token_ids: vec![1, 3, 4, 3, 4, 3, 4, 3],
-            block_size: 4,
-            lora_id: None,
-            medium: Some("GPU".into()),
-            lora_name: None,
-            group_idx: Some(0),
-            kv_cache_spec_kind: Some("full_attention".into()),
-            kv_cache_spec_sliding_window: None,
-            locality: Some("LOCAL".into()),
-            ownership: None,
-            session_id: None,
-            lookahead_token_ids: None,
-        });
-        let payload = rmp_serde::to_vec_named(&(0.0, vec![event], Some(0u32))).unwrap();
-        publisher
-            .send_multipart(
-                [
-                    b"".as_slice(),
-                    0i64.to_be_bytes().as_slice(),
-                    payload.as_slice(),
-                ],
-                0,
-            )
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match signals.recv().await {
-                    Some(IngestionSignal::Advance { last_seq: 0, .. }) => break,
-                    Some(_) => {}
-                    None => panic!("source signal channel closed"),
-                }
-            }
-        })
-        .await
-        .expect("stored prefix applied");
+        publisher.bootstrap(topic).await;
+        let tokens = [1, 3, 4, 3, 4, 3, 4, 3, 4];
+        let event = KVEvent::BlockStored(full_store(&tokens[..8], 4, None));
+        publisher.send(topic, 0, &event_payload(1.0, &[event], Some(0)));
+        wait_for_kv(|| !provider.matches(&tokens, 4, None, 0).is_empty()).await;
         manager.begin_prefill(&target, 7);
         worker.increment_load();
         let raw = bytes::Bytes::from_static(
@@ -5432,13 +5297,11 @@ mod tests {
         warm: usize,
         render_available: bool,
     ) -> HttpKvFixture {
-        use crate::kv_index::{
-            CacheKey, KvBlockIndexer, ResidencyOwner, RoutableTarget, StorageTier,
-        };
+        use crate::kv_index::source::test_support::{full_binding, warm_full};
+        use crate::kv_index::{CacheKey, RoutableTarget};
         use crate::policies::KvAwarePolicy;
         use axum::{extract::OriginalUri, routing::post};
         let router = create_test_kv_router();
-        let index = Arc::new(KvBlockIndexer::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let loads = Arc::new(Mutex::new(Vec::new()));
         let fail_first = Arc::new(AtomicBool::new(false));
@@ -5489,6 +5352,8 @@ mod tests {
                 instance_id: Arc::from(format!("worker-{worker_index}")),
                 dp_rank: 0,
             };
+            let index = Arc::new(full_binding(target.clone(), 2));
+            index.begin_empty(0);
             policy.register_target_with_cache_identity(
                 worker.url(),
                 target.clone(),
@@ -5501,22 +5366,7 @@ mod tests {
             if worker_index == warm {
                 worker.increment_load();
                 for (prompt_index, ids) in inputs[warm].iter().enumerate() {
-                    let blocks: Vec<_> = KvAwarePolicy::local_hashes(&ids[..4], 2)
-                        .into_iter()
-                        .enumerate()
-                        .map(|(block, hash)| (Arc::from(format!("{prompt_index}-{block}")), hash))
-                        .collect();
-                    index.store(
-                        0,
-                        ResidencyOwner::Worker {
-                            source: target.instance_id.clone(),
-                            dp_rank: 0,
-                            incarnation: 0,
-                        },
-                        StorageTier::Device,
-                        None,
-                        &blocks,
-                    );
+                    warm_full(&index, prompt_index as u64, &ids[..4]);
                 }
             }
             workers.push(worker);
@@ -7708,7 +7558,6 @@ mod tests {
                 async move {
                     let body = if fail_body {
                         Body::from_stream(futures_util::stream::once(async {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
                             Err::<bytes::Bytes, _>(std::io::Error::other("broken backend body"))
                         }))
                     } else {

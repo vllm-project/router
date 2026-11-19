@@ -103,7 +103,7 @@ impl PdKvState {
     ) -> Self {
         let pairs: HashMap<_, _> = static_sources
             .iter()
-            .filter(|(_, source)| source.hybrid.is_some())
+            .filter(|(_, source)| !source.compatible_decode_urls.is_empty())
             .map(|(prefill, source)| {
                 (
                     prefill.clone(),
@@ -821,36 +821,157 @@ mod kv_input_tests {
         }
     }
 
+    struct TestPublisher {
+        live: zmq::Socket,
+        replay: zmq::Socket,
+        topic: &'static str,
+    }
+
+    impl TestPublisher {
+        fn new(topic: &'static str) -> Self {
+            let context = zmq::Context::new();
+            let bound = |kind| {
+                let socket = context.socket(kind).unwrap();
+                socket.set_linger(0).unwrap();
+                socket.bind("tcp://127.0.0.1:*").unwrap();
+                socket
+            };
+            Self {
+                live: bound(zmq::XPUB),
+                replay: bound(zmq::ROUTER),
+                topic,
+            }
+        }
+
+        fn endpoints(&self) -> (String, String) {
+            (
+                self.live.get_last_endpoint().unwrap().unwrap(),
+                self.replay.get_last_endpoint().unwrap().unwrap(),
+            )
+        }
+
+        fn layout(&self, model: &str) -> Value {
+            json!({
+                "schema_version": 1,
+                "adapters": [],
+                "ranks": [{
+                    "rank": 0, "model": model, "weight_version": "default",
+                    "publisher_topic": self.topic, "instance_topic": true,
+                    "hash_algorithm": "sha256_cbor", "full_hashes": true, "hash_seed": "0",
+                    "hash_block_size": 16, "hash_lookahead_tokens": 0, "speculative_tokens": 0,
+                    "prefix_caching": true, "declared_groups": 1, "transfer": null,
+                    "groups": [{
+                        "group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec",
+                        "block_size": 16, "prefix_cacheable": true, "prefix_replay_tokens": 0
+                    }]
+                }]
+            })
+        }
+
+        fn static_source(&self, model: &str) -> crate::config::PdKvEventSources {
+            let (live, replay) = self.endpoints();
+            crate::config::PdKvEventSources {
+                endpoints: vec![live],
+                replay_endpoints: Some(vec![replay]),
+                block_size: 16,
+                model: Some(model.into()),
+                hybrid: Some(serde_json::from_value(self.layout(model)).unwrap()),
+                compatible_decode_urls: Vec::new(),
+            }
+        }
+
+        async fn replay_empty_and_publish(&self, events: &[crate::kv_index::KVEvent]) {
+            async fn receive(socket: &zmq::Socket) -> Vec<Vec<u8>> {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        match socket.recv_multipart(zmq::DONTWAIT) {
+                            Ok(frames) => return frames,
+                            Err(zmq::Error::EAGAIN) => {
+                                tokio::time::sleep(Duration::from_millis(2)).await
+                            }
+                            Err(error) => panic!("KV test publisher receive: {error}"),
+                        }
+                    }
+                })
+                .await
+                .expect("subscriber did not connect")
+            }
+
+            let subscribed = receive(&self.live).await;
+            assert_eq!(
+                subscribed[0],
+                [b"\x01".as_slice(), self.topic.as_bytes()].concat()
+            );
+            let request = receive(&self.replay).await;
+            assert_eq!(request.last().unwrap(), &0_u64.to_be_bytes());
+            self.replay
+                .send_multipart(
+                    [
+                        request[0].as_slice(),
+                        &[],
+                        &[],
+                        &(-1_i64).to_be_bytes(),
+                        &[],
+                    ],
+                    0,
+                )
+                .unwrap();
+            let payload =
+                crate::kv_index::source::test_support::event_payload(1.0, events, Some(0));
+            self.live
+                .send_multipart([self.topic.as_bytes(), &0_i64.to_be_bytes(), &payload], 0)
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn discovered_and_static_sources_enable_real_prefix_credit() {
+        use crate::kv_index::source::test_support::full_store;
+        use crate::kv_index::KVEvent;
         use axum::{routing::get, Json, Router};
         use std::sync::atomic::{AtomicUsize, Ordering};
+
         for static_source in [false, true] {
+            let publisher = TestPublisher::new("kv/boot");
+            let (endpoint, replay_endpoint) = publisher.endpoints();
             let probes = Arc::new(AtomicUsize::new(0));
-            let info_probes = probes.clone();
-            let source_probes = probes.clone();
-            let publisher_context = zmq::Context::new();
-            let publisher = publisher_context.socket(zmq::PUB).unwrap();
-            publisher.bind("tcp://127.0.0.1:*").unwrap();
-            let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-            let source_metadata = Arc::new(parking_lot::Mutex::new(json!({"0": {
-                "publisher": "zmq", "endpoint": endpoint, "enable_kv_cache_events": true
-            }})));
             let mut app = Router::new().route(
                 "/v1/models",
-                get(|| async { Json(json!({"data":[{"id":"m", "parent":null}]})) }),
+                get(|| async { Json(json!({"data":[{"id":"m","parent":null}]})) }),
             );
             if !static_source {
-                app = app.route("/server_info", get(move || {
-            let probes = info_probes.clone();
-            async move { probes.fetch_add(1, Ordering::Relaxed);
-                Json(json!({"vllm_config":{"model_config":{"model":"engine-model"},"cache_config":{"block_size":16}}}))
-            }}))
-            .route("/kv_event_sources", get({ let sources = source_metadata.clone(); move || {
-                let sources = sources.lock().clone();
-                let probes = source_probes.clone();
-                async move { probes.fetch_add(1, Ordering::Relaxed); Json(sources) }
-            }}));
+                let info_probes = probes.clone();
+                let source_probes = probes.clone();
+                let layout_probes = probes.clone();
+                let sources = json!({"0": {
+                    "publisher": "zmq", "endpoint": endpoint, "replay_endpoint": replay_endpoint,
+                    "topic": publisher.topic, "enable_kv_cache_events": true
+                }});
+                let layout = publisher.layout("engine-model");
+                app = app
+                    .route("/server_info", get(move || {
+                        let probes = info_probes.clone();
+                        async move {
+                            probes.fetch_add(1, Ordering::Relaxed);
+                            Json(json!({"vllm_config":{
+                                "model_config":{"model":"engine-model"}, "cache_config":{"block_size":16}
+                            }}))
+                        }
+                    }))
+                    .route("/kv_event_sources", get(move || {
+                        let (probes, sources) = (source_probes.clone(), sources.clone());
+                        async move {
+                            probes.fetch_add(1, Ordering::Relaxed);
+                            Json(sources)
+                        }
+                    }))
+                    .route("/kv_routing_capabilities", get(move || {
+                        let (probes, layout) = (layout_probes.clone(), layout.clone());
+                        async move {
+                            probes.fetch_add(1, Ordering::Relaxed);
+                            Json(layout)
+                        }
+                    }));
             }
             let app = app.layer(axum::middleware::from_fn(
                 |request: Request, next: axum::middleware::Next| async move {
@@ -867,22 +988,9 @@ mod kv_input_tests {
             ));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
-            let task = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let sources = if static_source {
-                std::iter::once((
-                    base.clone(),
-                    crate::config::types::PdKvEventSources {
-                        endpoints: vec![endpoint],
-                        replay_endpoints: None,
-                        block_size: 16,
-                        model: None,
-                        hybrid: None,
-                        compatible_decode_urls: Vec::new(),
-                    },
-                ))
-                .collect()
+                HashMap::from([(base.clone(), publisher.static_source("m"))])
             } else {
                 HashMap::new()
             };
@@ -900,29 +1008,23 @@ mod kv_input_tests {
             state.bind(&workers, ops).await;
             assert_eq!(
                 probes.load(Ordering::Relaxed),
-                if static_source { 0 } else { 2 }
+                if static_source { 0 } else { 3 }
             );
+
             let initial =
                 prepare_prefill(&state, &workers, &policy, &request, "/v1/completions", None).await;
             assert_eq!(initial[&base].work_by_rank[&None].new_prefill_tokens, 33);
             assert!(initial[&base].work_by_rank[&None].placement_verified);
-            let payload = rmp_serde::to_vec(&(
-                1.0,
-                vec![json!({
-                    "type":"BlockStored", "block_hashes":[1,2], "parent_block_hash":null,
-                    "token_ids":(0..32).collect::<Vec<u32>>(), "block_size":16,
-                    "lora_id":null, "lora_name":null, "medium":"GPU"
-                })],
-                0_u32,
-            ))
-            .unwrap();
-            let seq = 0_u64.to_be_bytes();
+
+            publisher
+                .replay_empty_and_publish(&[KVEvent::BlockStored(full_store(
+                    &tokens[..32],
+                    16,
+                    None,
+                ))])
+                .await;
             tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
-                    publisher
-                        .send_multipart([b"".as_slice(), seq.as_slice(), payload.as_slice()], 0)
-                        .unwrap();
-                    tokio::time::sleep(Duration::from_millis(10)).await;
                     let work = ops.estimate_prefill_work(
                         &[(workers[0].as_ref(), std::slice::from_ref(&tokens), true)],
                         &mut PromptHashes::new(),
@@ -930,10 +1032,12 @@ mod kv_input_tests {
                     if work.new_prefill_tokens == 1 {
                         break;
                     }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
                 }
             })
             .await
             .expect("subscriber should ingest the warm prefix");
+
             let warm =
                 prepare_prefill(&state, &workers, &policy, &request, "/v1/completions", None).await;
             assert_eq!(warm[&base].work_by_rank[&None].new_prefill_tokens, 1);
@@ -960,14 +1064,8 @@ mod kv_input_tests {
         let (base, server) = models_server().await;
         let p_base = format!("{base}/p");
         let d_base = format!("{base}/d");
-        let sources = |port: u16| crate::config::types::PdKvEventSources {
-            endpoints: vec![format!("tcp://127.0.0.1:{port}")],
-            replay_endpoints: None,
-            block_size: 16,
-            model: Some("m".to_owned()),
-            hybrid: None,
-            compatible_decode_urls: Vec::new(),
-        };
+        let prefill_publisher = TestPublisher::new("kv/prefill");
+        let decode_publisher = TestPublisher::new("kv/decode");
         let prefill_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
         let decode_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
         let prefill: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
@@ -988,8 +1086,8 @@ mod kv_input_tests {
             reqwest::Client::new(),
             None,
             HashMap::from([
-                (p_base.clone(), sources(5557)),
-                (d_base.clone(), sources(5558)),
+                (p_base.clone(), prefill_publisher.static_source("m")),
+                (d_base.clone(), decode_publisher.static_source("m")),
             ]),
             KvConnector::Nixl,
             registry.clone(),
@@ -997,6 +1095,10 @@ mod kv_input_tests {
             Some(decode_policy.clone()),
         )
         .await;
+        tokio::join!(
+            prefill_publisher.replay_empty_and_publish(&[]),
+            decode_publisher.replay_empty_and_publish(&[]),
+        );
         let request = json!({"model":"m","prompt":[1,2,3]});
         let credit = state
             .credit_by_base(&[p_base.clone(), d_base.clone()], &request)

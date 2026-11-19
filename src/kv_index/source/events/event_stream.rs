@@ -7,12 +7,14 @@ use std::sync::Arc;
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 use std::time::Duration;
 
+use tokio::sync::mpsc;
+
 use crate::kv_index::source::endpoints::EventSource;
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 use crate::kv_index::source::events::transport::retry_backoff;
 use crate::kv_index::storage::source_transaction::{StreamPhase as Phase, StreamState};
 use crate::kv_index::storage::IndexBatch;
-use crate::kv_index::{SourceBinding, SourceError};
+use crate::kv_index::{IngestionSignal, KVEvent, SourceBinding, SourceError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamLease(pub(crate) u64);
@@ -88,6 +90,16 @@ impl EventStream {
         seq: u64,
         payload: &[u8],
     ) -> Result<(), StreamError> {
+        self.apply_publisher_payload(lease, seq, payload)
+            .map(|_| ())
+    }
+
+    pub(super) fn apply_publisher_payload(
+        &self,
+        lease: StreamLease,
+        seq: u64,
+        payload: &[u8],
+    ) -> Result<bool, StreamError> {
         let batch = crate::kv_index::decode_batch(payload);
         let prepared = batch
             .as_ref()
@@ -102,7 +114,7 @@ impl EventStream {
             };
             if let Err(error) = result {
                 // A rejected batch means the publisher's layout and the declared
-                // one disagree; naming the reason is the only way to fix a layout
+                // one disagree; naming the reason helps fix a layout
                 // from a live system.
                 match error {
                     SourceError::IntBlockHashes => {
@@ -111,19 +123,24 @@ impl EventStream {
                         if !state.rejection_reported {
                             state.rejection_reported = true;
                             tracing::error!(
-                            seq,
-                            "hybrid event source publishes integer block hashes, which the sha256 \
+                                seq,
+                                "KV event source publishes integer block hashes, which the sha256 \
                              index cannot address; no prefix will be credited for this engine. \
                              Start it with VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0."
-                        );
+                            );
                         }
                     }
-                    _ => tracing::warn!(seq, error = ?error, "hybrid event batch rejected"),
+                    _ => tracing::warn!(seq, error = ?error, "KV event batch rejected"),
                 }
                 state.phase = Phase::Replaying;
                 return Err(StreamError::Index(error));
             }
-            Ok(())
+            Ok(batch.as_ref().is_ok_and(|batch| {
+                batch
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, KVEvent::AllBlocksCleared(_)))
+            }))
         })
     }
 
@@ -224,6 +241,15 @@ pub fn spawn_zmq(
     stream: Arc<EventStream>,
     ctx: Arc<zmq::Context>,
 ) -> Result<EventSubscriberHandle, &'static str> {
+    spawn_zmq_with_signals(source, stream, ctx, None)
+}
+
+pub(in crate::kv_index::source) fn spawn_zmq_with_signals(
+    source: EventSource,
+    stream: Arc<EventStream>,
+    ctx: Arc<zmq::Context>,
+    signals: Option<mpsc::Sender<IngestionSignal>>,
+) -> Result<EventSubscriberHandle, &'static str> {
     if source.replay_endpoint.as_deref().is_none_or(str::is_empty) {
         return Err("replay endpoint required");
     }
@@ -231,7 +257,7 @@ pub fn spawn_zmq(
         return Err("an incarnation-bound topic and publisher are required");
     }
     let lease = stream.begin_replay();
-    let subscriber = super::subscriber::spawn_layout(source, stream.clone(), lease, ctx);
+    let subscriber = super::subscriber::spawn(source, stream.clone(), lease, ctx, signals);
     Ok(EventSubscriberHandle {
         subscriber,
         stream,

@@ -1,18 +1,5 @@
 use std::sync::Arc;
 
-use crate::kv_hash::SequenceHash;
-
-/// One request's query against the index.
-#[derive(Debug, Clone)]
-pub struct MatchQuery {
-    /// The kv-cache-spec group to query.
-    pub group_idx: u32,
-    /// Block-local hashes in prompt order. The index derives the cumulative page keys.
-    pub local_hashes: Vec<SequenceHash>,
-    /// Tiers to report; the cost model requests the tiers it scores.
-    pub tiers_of_interest: Vec<StorageTier>,
-}
-
 /// One hit: the block intervals `[start, end)` a target holds at this tier,
 /// each maximal. Flat — one row per `(target, tier)` — so the cost model
 /// applies two-segment reuse over a target's tiers in one pass.
@@ -101,6 +88,24 @@ impl ResidencyOwner {
 
 /// Names one event source — a worker publisher.
 pub type SourceId = Arc<str>;
+
+/// Compatibility values for the advisory KV event observer configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HashMode {
+    PythonHashSeed,
+    Sha256,
+    XxhashCbor,
+}
+
+impl HashMode {
+    pub fn parse_config(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "python_hash_seed" | "pythonhashseed" => Self::PythonHashSeed,
+            "xxhash_cbor" | "xxhashcbor" => Self::XxhashCbor,
+            _ => Self::Sha256,
+        }
+    }
+}
 
 /// Storage medium holding a residency. Decoded from the engine `medium` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

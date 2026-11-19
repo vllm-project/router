@@ -59,6 +59,7 @@ pub struct SourceBinding {
     pub(in crate::kv_index) adapters: Vec<(String, String)>,
     pub(in crate::kv_index) max_entries: usize,
     pub(in crate::kv_index) partial_hash_hits: bool,
+    pub(in crate::kv_index) strict_event_block_size: bool,
     /// The same domain index used by full-attention workers. Layout and stream
     /// state live here; cache residency lives only in this shared index.
     pub(in crate::kv_index) index: Arc<KvBlockIndexer>,
@@ -113,6 +114,7 @@ impl SourceBinding {
             adapters: Vec::new(),
             max_entries,
             partial_hash_hits: false,
+            strict_event_block_size: false,
             index: Arc::new(KvBlockIndexer::new()),
             owner,
             control: Arc::new(StreamControl::default()),
@@ -197,7 +199,7 @@ impl SourceBinding {
     /// Declare the LoRA adapters this worker serves. Adapter pages are a
     /// separate chain keyed by `(name, path)`; without the declaration their
     /// pages are skipped rather than credited to the base model.
-    fn with_adapters(mut self, adapters: Vec<(String, String)>) -> Self {
+    pub(super) fn with_adapters(mut self, adapters: Vec<(String, String)>) -> Self {
         self.adapters = adapters;
         self
     }
@@ -344,13 +346,15 @@ impl CacheCapabilities {
         )?;
         let keys = BlockKeyGenerator::from_root_hash(layout.hash_block_size as usize, layout.root)
             .with_lookahead(layout.hash_lookahead_tokens);
-        Ok(
-            SourceBinding::bind(target, layout.groups, max_entries, keys)
-                .with_replay_tokens(layout.replay_tokens)
-                .with_tail_drop_group(layout.tail_drop_group)
-                .with_adapters(layout.adapters)
-                .with_partial_hash_hits(layout.partial_hash_hits),
-        )
+        let mut binding = SourceBinding::bind(target, layout.groups, max_entries, keys)
+            .with_replay_tokens(layout.replay_tokens)
+            .with_tail_drop_group(layout.tail_drop_group)
+            .with_adapters(layout.adapters)
+            .with_partial_hash_hits(layout.partial_hash_hits);
+        binding.strict_event_block_size = self
+            .rank_capability(source.dp_rank)
+            .is_some_and(|rank| rank.declared_groups == Some(1) && rank.is_plain_full_attention());
+        Ok(binding)
     }
 
     /// Check startup declarations. Registration also checks the observed topic.

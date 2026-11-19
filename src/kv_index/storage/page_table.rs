@@ -747,8 +747,7 @@ mod tests {
             .source_lock(&a.target())
             .access
             .read()
-            .records
-            .hash_keys
+            .active_pages
             .is_empty());
     }
 
@@ -1022,7 +1021,7 @@ mod tests {
         });
         assert!(index.hash_pages.rows.is_empty());
         for source in index.source_locks.read().values() {
-            assert!(source.access.read().records.hash_keys.is_empty());
+            assert!(source.access.read().active_pages.is_empty());
         }
     }
 

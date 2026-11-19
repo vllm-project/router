@@ -15,24 +15,24 @@ use tracing::{debug, info, warn};
 
 use crate::config::StaticKvEventSources;
 use crate::kv_index::storage::KvBlockIndexer;
-use crate::kv_index::subscriber::SubscriberHandle;
 use crate::kv_index::CacheCapabilities;
 use crate::kv_index::EventSubscriberHandle;
-use crate::kv_index::{IngestionSignal, SourceId};
+use crate::kv_index::{HashMode, IngestionSignal, SourceId};
 use crate::protocols::worker_spec::ServerInfo;
 
 mod lifecycle;
+mod observer;
 mod probe;
 mod reconcile;
 mod registration;
 
 pub(crate) use lifecycle::CONTROL_TIMEOUT;
 use lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
+use observer::WorkerObservation;
 use reconcile::{static_hybrid_sources_match, StaticHybridMatch};
 
 use probe::{
-    fetch_kv_event_sources, fetch_native_full_layout, grpc_kv_event_source_entries, grpc_model_id,
-    layout_model, server_model_id,
+    fetch_kv_event_sources, fetch_native_full_sources, grpc_model_id, layout_model, server_model_id,
 };
 pub(crate) use probe::{query_pd_server_info, query_worker_metadata};
 
@@ -126,9 +126,8 @@ struct WorkerSubs {
     live_sources: Vec<LiveSource>,
     ranks: Vec<u32>,
     indexer: Arc<KvBlockIndexer>,
-    handles: Vec<SubscriberHandle>,
-    hybrid: Option<Arc<LayoutWorkerProvider>>,
-    hybrid_handles: Vec<Arc<EventSubscriberHandle>>,
+    provider: Arc<LayoutWorkerProvider>,
+    handles: Vec<Arc<EventSubscriberHandle>>,
 }
 
 struct LiveSource {
@@ -159,6 +158,7 @@ pub struct KvIndexSupervisor {
     /// Live-worker ref-count per identity; drop the indexer on last departure.
     identity_refs: Mutex<HashMap<CacheKey, usize>>,
     signal_tx: mpsc::Sender<IngestionSignal>,
+    observers: Option<Mutex<HashMap<String, WorkerObservation>>>,
     /// Per-worker subscriber state.
     workers: Mutex<HashMap<String, WorkerSubs>>,
     lifecycles: Mutex<HashMap<String, Arc<WorkerLifecycle>>>,
@@ -178,9 +178,17 @@ impl std::fmt::Debug for KvIndexSupervisor {
 }
 
 impl KvIndexSupervisor {
-    /// Construct the supervisor. The returned receiver streams ingestion signals
-    /// to the trust arbiter; drop it to ignore signals.
-    pub fn new(client: reqwest::Client) -> (Self, mpsc::Receiver<IngestionSignal>) {
+    /// Observe event continuity for existing advisory clients.
+    pub fn new(
+        client: reqwest::Client,
+        _hash_mode: HashMode,
+    ) -> (Self, mpsc::Receiver<IngestionSignal>) {
+        let (mut supervisor, signals) = Self::indexed(client);
+        supervisor.observers = Some(Mutex::new(HashMap::new()));
+        (supervisor, signals)
+    }
+
+    fn indexed(client: reqwest::Client) -> (Self, mpsc::Receiver<IngestionSignal>) {
         let (signal_tx, signal_rx) = mpsc::channel::<IngestionSignal>(256);
         let supervisor = KvIndexSupervisor {
             client,
@@ -194,6 +202,7 @@ impl KvIndexSupervisor {
             indexers: DashMap::new(),
             identity_refs: Mutex::new(HashMap::new()),
             signal_tx,
+            observers: None,
             workers: Mutex::new(HashMap::new()),
             lifecycles: Mutex::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
@@ -205,7 +214,7 @@ impl KvIndexSupervisor {
     pub(crate) fn new_http_full_attention(
         client: reqwest::Client,
     ) -> (Self, mpsc::Receiver<IngestionSignal>) {
-        let (mut supervisor, signals) = Self::new(client);
+        let (mut supervisor, signals) = Self::indexed(client);
         supervisor.full_attention_http = true;
         (supervisor, signals)
     }
@@ -216,7 +225,7 @@ impl KvIndexSupervisor {
         client: reqwest::Client,
         static_pd_sources: HashMap<String, crate::config::types::PdKvEventSources>,
     ) -> (Self, mpsc::Receiver<IngestionSignal>) {
-        let (mut supervisor, signals) = Self::new(client);
+        let (mut supervisor, signals) = Self::indexed(client);
         supervisor.http_pd = true;
         supervisor.static_sources = static_pd_sources
             .iter()
@@ -229,6 +238,14 @@ impl KvIndexSupervisor {
 
     /// Resolve source-owned feedback to registered URLs, never remote metadata addresses.
     pub fn worker_urls_for_source(&self, source: &SourceId) -> Vec<String> {
+        if let Some(observers) = &self.observers {
+            return observers
+                .lock()
+                .iter()
+                .filter(|(_, worker)| &worker.source == source)
+                .map(|(url, _)| url.clone())
+                .collect();
+        }
         self.workers
             .lock()
             .iter()
@@ -249,6 +266,9 @@ impl KvIndexSupervisor {
         mut self,
         static_sources: HashMap<String, StaticKvEventSources>,
     ) -> Self {
+        if !static_sources.is_empty() {
+            self.observers = None;
+        }
         self.static_sources = static_sources;
         self
     }
@@ -322,6 +342,9 @@ impl KvIndexSupervisor {
     /// Query both endpoints for `worker_url`, spawn one subscriber per rank into
     /// this worker's identity's indexer. A missing source route is a soft skip.
     pub async fn on_worker_added(&self, worker_url: &str) -> Result<WorkerKvInfo, String> {
+        if let Some(observers) = &self.observers {
+            return self.observe_worker(worker_url, observers).await;
+        }
         // Discovery awaits without the owner lock. A failed/stale re-add must
         // leave the prior registration and its observed placement intact.
         let (observed, lifecycle) = {
@@ -465,10 +488,7 @@ impl KvIndexSupervisor {
         self.workers
             .lock()
             .get(worker_url)
-            .map(|worker| match &worker.hybrid {
-                Some(provider) => provider.clone() as Arc<dyn crate::policies::TieredMatchProvider>,
-                None => worker.indexer.clone() as Arc<dyn crate::policies::TieredMatchProvider>,
-            })
+            .map(|worker| worker.provider.clone() as Arc<dyn crate::policies::TieredMatchProvider>)
     }
 
     fn check_block_size(&self, worker_url: &str, block_size: Option<u32>) {
@@ -560,32 +580,22 @@ async fn discover_worker(
 ) -> WorkerDiscovery {
     if crate::backend::is_grpc_url(worker_url) {
         let timeout = Duration::from_secs(10);
-        let server = crate::backend::control::get_grpc_server_info(worker_url, timeout).await;
-        let model =
-            grpc_model_id(crate::backend::control::get_grpc_model_info(worker_url, timeout).await);
-        let sources = crate::backend::control::get_grpc_kv_event_sources(worker_url, timeout)
-            .await
-            .map_err(SourcesUnavailable::from);
-        let server_info = server.map(|server| {
-            let model_id = model.as_ref().ok().and_then(|model| model.clone());
-            ServerInfo {
-                model_id,
-                instance_id: (!server.instance_id.is_empty()).then_some(server.instance_id),
-                kv_block_size: (server.kv_block_size != 0).then_some(server.kv_block_size),
-                effective_attention_block_size: server
-                    .effective_attention_block_size
-                    .and_then(|size| u32::try_from(size).ok()),
-                ..Default::default()
-            }
+        let (server, model, (sources, layout)) = tokio::join!(
+            crate::backend::control::get_grpc_server_info(worker_url, timeout),
+            crate::backend::control::get_grpc_model_info(worker_url, timeout),
+            fetch_native_full_sources(client, worker_url, api_key, timeout),
+        );
+        let model_id = grpc_model_id(model);
+        let server_info = server.map(|server| ServerInfo {
+            model_id: model_id.as_ref().ok().and_then(Clone::clone),
+            instance_id: (!server.instance_id.is_empty()).then_some(server.instance_id),
+            kv_block_size: (server.kv_block_size != 0).then_some(server.kv_block_size),
+            effective_attention_block_size: server
+                .effective_attention_block_size
+                .and_then(|size| u32::try_from(size).ok()),
+            ..Default::default()
         });
-        let sources =
-            sources.map(|response| grpc_kv_event_source_entries(worker_url, response.sources));
-        return WorkerDiscovery {
-            server_info,
-            sources,
-            model_id: model,
-            hybrid: None,
-        };
+        return native_worker_discovery(worker_url, server_info, sources, model_id, layout);
     }
     if !http_pd {
         return WorkerDiscovery {
@@ -725,20 +735,26 @@ async fn discover_full_attention_http_worker(
     worker_url: &str,
     api_key: Option<&str>,
 ) -> WorkerDiscovery {
-    let (server_info, sources, layout) = tokio::join!(
+    let (server_info, (sources, layout)) = tokio::join!(
         query_worker_metadata(client, worker_url, api_key),
-        fetch_kv_event_sources(client, worker_url, api_key),
-        tokio::time::timeout(
-            CONTROL_TIMEOUT,
-            fetch_native_full_layout(client, worker_url, api_key),
-        ),
+        fetch_native_full_sources(client, worker_url, api_key, CONTROL_TIMEOUT),
     );
     let model_id = server_info
         .as_ref()
         .map(|info| Some(server_model_id(info).unwrap_or_else(|| worker_url.to_string())))
         .map_err(Clone::clone);
+    native_worker_discovery(worker_url, server_info, sources, model_id, layout)
+}
+
+fn native_worker_discovery(
+    worker_url: &str,
+    server_info: Result<ServerInfo, String>,
+    sources: Result<KvEventSourcesResponse, SourcesUnavailable>,
+    model_id: Result<Option<String>, String>,
+    layout: Result<Option<CacheCapabilities>, String>,
+) -> WorkerDiscovery {
     let hybrid = match (&server_info, &sources, &model_id, layout) {
-        (Ok(info), Ok(sources), Ok(Some(model)), Ok(Ok(Some(layout)))) => {
+        (Ok(info), Ok(sources), Ok(Some(model)), Ok(Some(layout))) => {
             let engine_model = layout_model(info, model, &layout);
             let mut active = sources.iter().filter(|(_, source)| events_enabled(source));
             let mut topics = HashSet::new();
@@ -926,7 +942,7 @@ mod rank_merge_tests {
                 "hybrid": {"schema_version": 1, "ranks": [rank(1, "m1")]},
             }),
         );
-        let (mut supervisor, _signals) = KvIndexSupervisor::new(reqwest::Client::new());
+        let (mut supervisor, _signals) = KvIndexSupervisor::indexed(reqwest::Client::new());
         supervisor.static_sources =
             serde_json::from_value(serde_json::Value::Object(sources)).expect("sources");
         let resolved = supervisor

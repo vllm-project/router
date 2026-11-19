@@ -16,7 +16,7 @@ use super::{
     WorkerDiscovery, WorkerKvInfo, WorkerSubs,
 };
 use crate::kv_index::subscriber::EventSource;
-use crate::kv_index::{EventStream, SourceBinding, SourceId};
+use crate::kv_index::{EventStream, SourceId};
 use crate::protocols::worker_spec::ServerInfo;
 
 impl KvIndexSupervisor {
@@ -44,7 +44,6 @@ impl KvIndexSupervisor {
         base_models: HashSet<String>,
     ) -> Result<WorkerKvInfo, String> {
         let descriptor = worker_descriptor(&discovery).ok();
-        let hybrid_capability = discovery.hybrid;
         let grpc = crate::backend::is_grpc_url(worker_url);
         let full_attention_http =
             !grpc && self.full_attention_http && self.resolved_static_source(worker_url).is_none();
@@ -128,22 +127,32 @@ impl KvIndexSupervisor {
                 cache_key: None,
             });
         };
+        let Some(capability) = discovery.hybrid else {
+            debug!(
+                worker_url,
+                "no verified sha256_cbor cache contract; skipping KV subscription"
+            );
+            return Ok(WorkerKvInfo {
+                instance_id,
+                block_size: Some(block_size),
+                ranks: vec![],
+                cache_key: None,
+            });
+        };
         // Policy intervals use this unit to translate hits back into tokens.
         // A hybrid hash boundary can lie inside the physical attention page.
         // Use a common divisor when ranks declare different granularities.
-        let block_size = hybrid_capability.as_ref().map_or(block_size, |capability| {
-            capability
-                .ranks
-                .iter()
-                .filter_map(|rank| rank.hash_block_size)
-                .filter(|size| *size > 0)
-                .fold(block_size, |mut a, mut b| {
-                    while b != 0 {
-                        (a, b) = (b, a % b);
-                    }
-                    a
-                })
-        });
+        let block_size = capability
+            .ranks
+            .iter()
+            .filter_map(|rank| rank.hash_block_size)
+            .filter(|size| *size > 0)
+            .fold(block_size, |mut a, mut b| {
+                while b != 0 {
+                    (a, b) = (b, a % b);
+                }
+                a
+            });
         let key = CacheKey {
             model: Arc::from(model_id.as_str()),
             block_size,
@@ -180,32 +189,32 @@ impl KvIndexSupervisor {
             event_sources.push(ev);
         }
 
-        let hybrid_indexes = if let Some(capability) = &hybrid_capability {
-            if event_sources.is_empty() {
-                return Err("hybrid capability has no event sources".into());
-            }
-            // Admit each rank on its own evidence; one rank's miss does not
-            // revoke its siblings.
-            let engine_model = layout_model(&server_info, &model_id, capability);
-            let mut indexes: HashMap<u32, SourceBinding> = HashMap::new();
-            for source in &event_sources {
-                match capability.bind_worker_source(source, engine_model, 1_000_000) {
-                    Ok(index) => {
-                        indexes.insert(source.dp_rank, index.with_mooncake_prefill(self.mooncake_prefill));
-                    }
-                    Err(reason) => warn!(
-                        "kv_index {}: hybrid rank {} not admitted for model {model_id}: {reason}; rank will receive no cache credit",
-                        worker_url, source.dp_rank
-                    ),
+        // Admit each rank on its own verified contract.
+        let engine_model = layout_model(&server_info, &model_id, &capability);
+        let mut bindings = HashMap::new();
+        event_sources.retain(|source| {
+            match capability.bind_worker_source(source, engine_model, 1_000_000) {
+                Ok(binding) => {
+                    bindings.insert(
+                        source.dp_rank,
+                        binding.with_mooncake_prefill(self.mooncake_prefill),
+                    );
+                    true
+                }
+                Err(reason) => {
+                    warn!(
+                        worker_url,
+                        rank = source.dp_rank,
+                        reason,
+                        "KV source has no verified cache layout"
+                    );
+                    false
                 }
             }
-            if indexes.is_empty() {
-                return Err("no hybrid rank has a verified layout".into());
-            }
-            Some(indexes)
-        } else {
-            None
-        };
+        });
+        if bindings.is_empty() {
+            return Err("no KV event rank has a verified layout".into());
+        }
 
         // Full-attention HTTP bindings require plain origins. Generic discovery retains
         // its backend-specific URI scope, including HTTP base paths.
@@ -241,7 +250,12 @@ impl KvIndexSupervisor {
             return Err("KV worker origins must be independent".into());
         }
         let mut replay_endpoints = Vec::new();
+        let mut live_endpoints = HashSet::new();
         for source in &event_sources {
+            // Topic-specific continuity requires one publisher stream per rank.
+            if !live_endpoints.insert((&source.pub_endpoint, &source.topic)) {
+                return Err("live KV streams must be independent".into());
+            }
             if let Some(endpoint) = &source.replay_endpoint {
                 // This replay protocol sends only start_seq, not a source key.
                 if replay_endpoints.contains(endpoint)
@@ -254,11 +268,11 @@ impl KvIndexSupervisor {
                 replay_endpoints.push(endpoint.clone());
             }
             for (url, worker) in workers.iter().filter(|(url, _)| url.as_str() != worker_url) {
-                if worker.live_sources.iter().any(|live| {
-                    live.publisher == source.pub_endpoint
-                        && live.topic == source.topic
-                        && live.rank == source.dp_rank
-                }) {
+                if worker
+                    .live_sources
+                    .iter()
+                    .any(|live| live.publisher == source.pub_endpoint && live.topic == source.topic)
+                {
                     return Err("live KV streams must be independent".into());
                 }
                 if worker.key == key
@@ -269,87 +283,25 @@ impl KvIndexSupervisor {
                 }
             }
         }
-        // No admission can fail below this point. Share rank guards by exact
-        // publisher/topic and promote them monotonically before publishing B.
+        // Publish the new registration while holding the source-owner lock.
         let active = Arc::new(AtomicBool::new(true));
-        let lifecycle = Arc::new(WorkerLifecycle::new(
-            active.clone(),
-            hybrid_indexes.is_some(),
-            descriptor,
-        ));
-        let mut live_sources: Vec<LiveSource> = Vec::with_capacity(event_sources.len());
-        for source in &event_sources {
-            let strict_rank = workers
-                .values()
-                .flat_map(|worker| &worker.live_sources)
-                .chain(live_sources.iter())
-                .find(|live| live.publisher == source.pub_endpoint && live.topic == source.topic)
-                .map(|live| live.lease.strict_rank.clone())
-                .unwrap_or_else(|| Arc::new(Mutex::new(false)));
-            let shared_rank = workers
-                .iter()
-                .filter(|(url, _)| url.as_str() != worker_url)
-                .flat_map(|(_, worker)| &worker.live_sources)
-                .any(|live| {
-                    live.publisher == source.pub_endpoint
-                        && live.topic == source.topic
-                        && live.rank != source.dp_rank
-                })
-                || event_sources.iter().any(|other| {
-                    other.pub_endpoint == source.pub_endpoint
-                        && other.topic == source.topic
-                        && other.dp_rank != source.dp_rank
-                });
-            if shared_rank {
-                let mut strict = strict_rank.lock();
-                if !*strict {
-                    *strict = true;
-                    for worker in workers.values() {
-                        for live in &worker.live_sources {
-                            if live.publisher == source.pub_endpoint && live.topic == source.topic {
-                                worker
-                                    .indexer
-                                    .invalidate_source(&worker.source_id, live.rank);
-                            }
-                        }
-                    }
-                }
-            }
-            live_sources.push(LiveSource {
+        let lifecycle = Arc::new(WorkerLifecycle::new(active.clone(), true, descriptor));
+        let live_sources: Vec<_> = event_sources
+            .iter()
+            .map(|source| LiveSource {
                 publisher: source.pub_endpoint.clone(),
                 topic: source.topic.clone(),
                 rank: source.dp_rank,
                 lease: crate::kv_index::source::binding::SourceLease {
-                    strict_rank,
+                    strict_rank: Arc::new(Mutex::new(true)),
                     active: active.clone(),
                 },
-            });
-        }
+            })
+            .collect();
         if let Some(previous) = workers.remove(worker_url) {
             self.retire_worker(previous);
         }
         let indexer = self.acquire_identity(&key);
-        let hybrid_indexes = hybrid_indexes.map(|indexes| {
-            indexes
-                .into_iter()
-                .map(|(rank, index)| {
-                    let binding = live_sources
-                        .iter()
-                        .find(|live| live.rank == rank)
-                        .expect("admitted rank has a live source")
-                        .lease
-                        .clone();
-                    (
-                        rank,
-                        Arc::new(
-                            index
-                                .with_shared_index(indexer.clone())
-                                .with_source_binding(binding),
-                        ),
-                    )
-                })
-                .collect::<HashMap<_, _>>()
-        });
         // Endpoints the subscribers are about to attach to, so the freshness
         // task can notice a publisher that moves while keeping its identity.
         let bound_sources: Arc<BoundSources> = Arc::new(
@@ -368,54 +320,33 @@ impl KvIndexSupervisor {
         );
         let mut ranks = Vec::with_capacity(event_sources.len());
         let mut handles = Vec::with_capacity(event_sources.len());
-        let mut hybrid_handles = Vec::new();
-        let mut hybrid_targets: Vec<(
-            crate::kv_index::subscriber::EventSource,
-            Arc<SourceBinding>,
-        )> = Vec::new();
+        let mut targets = Vec::new();
+        let mut indexes = HashMap::new();
         for (ev, live) in event_sources.into_iter().zip(&live_sources) {
             let rank = ev.dp_rank;
-            if let Some(indexes) = &hybrid_indexes {
-                // A hybrid-configured rank without an admitted index gets no
-                // subscriber at all: the single-group event reader must not
-                // credit an unmodeled hybrid layout.
-                if let Some(index) = indexes.get(&rank) {
-                    // Two ranks on one publisher and one topic cannot be told
-                    // apart when a batch omits its rank, and the hybrid
-                    // subscriber has no rank fence to apply: give the rank no
-                    // subscriber instead of crediting the other rank's cache.
-                    if *live.lease.strict_rank.lock() {
-                        tracing::warn!(
-                            "kv_index {}: rank{} shares a publisher and topic with another rank; no hybrid subscriber",
-                            worker_url,
-                            rank
-                        );
-                        ranks.push(rank);
-                        continue;
-                    }
-                    let stream = Arc::new(EventStream::new(index.clone()));
-                    let handle =
-                        match crate::kv_index::spawn_zmq(ev.clone(), stream, self.ctx.clone()) {
-                            Ok(handle) => handle,
-                            Err(error) => {
-                                warn!(worker_url, rank, error, "KV event subscription rejected");
-                                continue;
-                            }
-                        };
-                    hybrid_targets.push((ev, index.clone()));
-                    hybrid_handles.push(Arc::new(handle));
+            let index = Arc::new(
+                bindings
+                    .remove(&rank)
+                    .expect("admitted rank has a source binding")
+                    .with_shared_index(indexer.clone())
+                    .with_source_binding(live.lease.clone()),
+            );
+            let stream = Arc::new(EventStream::new(index.clone()));
+            let handle = match super::super::events::event_stream::spawn_zmq_with_signals(
+                ev.clone(),
+                stream,
+                self.ctx.clone(),
+                Some(self.signal_tx.clone()),
+            ) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    warn!(worker_url, rank, error, "KV event subscription rejected");
+                    continue;
                 }
-            } else {
-                let handle = crate::kv_index::subscriber::spawn_bound(
-                    ev,
-                    indexer.clone(),
-                    Some(self.signal_tx.clone()),
-                    self.ctx.clone(),
-                    key.block_size,
-                    live.lease.clone(),
-                );
-                handles.push(handle);
-            }
+            };
+            targets.push((ev, index.clone()));
+            indexes.insert(rank, index);
+            handles.push(Arc::new(handle));
             info!(
                 "kv_index {}: spawned subscriber rank{} (instance {})",
                 worker_url, rank, instance_id
@@ -423,22 +354,18 @@ impl KvIndexSupervisor {
             ranks.push(rank);
         }
 
-        let hybrid = hybrid_indexes.map(|indexes| {
-            Arc::new(LayoutWorkerProvider {
-                indexes,
-                lifecycle: lifecycle.clone(),
-            })
+        let provider = Arc::new(LayoutWorkerProvider {
+            indexes,
+            lifecycle: lifecycle.clone(),
         });
-        if let (Some(provider), Some(capability)) = (&hybrid, hybrid_capability) {
-            self.monitor_hybrid_source(
-                provider,
-                worker_url,
-                hybrid_handles.clone(),
-                hybrid_targets,
-                bound_sources,
-                capability,
-            );
-        }
+        self.monitor_hybrid_source(
+            &provider,
+            worker_url,
+            handles.clone(),
+            targets,
+            bound_sources,
+            capability,
+        );
 
         workers.insert(
             worker_url.to_string(),
@@ -452,8 +379,7 @@ impl KvIndexSupervisor {
                 ranks: ranks.clone(),
                 indexer,
                 handles,
-                hybrid,
-                hybrid_handles,
+                provider,
             },
         );
         let info = WorkerKvInfo {

@@ -5,18 +5,12 @@ use crate::kv_index::layout::align_down;
 use crate::kv_index::request_hash::BlockKeyGenerator;
 use crate::kv_index::storage::PageEvidence;
 use crate::kv_index::SourceBinding;
-use crate::kv_index::{KvBlockIndexer, Locality, MatchQuery, TierMatch};
+use crate::kv_index::{KvBlockIndexer, Locality, TierMatch};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use foldhash::fast::RandomState;
-
-impl crate::policies::TieredMatchProvider for KvBlockIndexer {
-    fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
-        self.find_matches(query)
-    }
-}
 
 impl crate::policies::TieredMatchProvider for SourceBinding {
     fn target_scoped(&self) -> bool {

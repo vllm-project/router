@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use super::lifecycle::{SourceAction, WorkerLifecycle, WorkerRegistration, CONTROL_TIMEOUT};
 use super::probe::{
-    fetch_kv_event_sources, fetch_native_full_layout, grpc_kv_event_source_entries,
-    query_pd_kv_event_sources,
+    fetch_native_full_sources, grpc_kv_event_source_entries, query_pd_kv_event_sources,
 };
 use super::{
     dp_rank_suffix, events_enabled, layout_topic_mismatch, resolve_endpoint,
@@ -90,13 +89,8 @@ impl KvIndexSupervisor {
                     .as_ref()
                     .and_then(|_| workers.get(url))
                     .filter(|worker| Arc::ptr_eq(&worker.active, &lifecycle.active))
-                    .map(|worker| match &worker.hybrid {
-                        Some(provider) => {
-                            provider.clone() as Arc<dyn crate::policies::TieredMatchProvider>
-                        }
-                        None => {
-                            worker.indexer.clone() as Arc<dyn crate::policies::TieredMatchProvider>
-                        }
+                    .map(|worker| {
+                        worker.provider.clone() as Arc<dyn crate::policies::TieredMatchProvider>
                     });
                 (
                     url.clone(),
@@ -147,8 +141,8 @@ impl KvIndexSupervisor {
         self.worker_registrations()
     }
 
-    /// Ordinary serving only re-probes automatically discovered layouts whose
-    /// monitor revoked trust. Leave static and opaque registrations alone.
+    /// Ordinary serving re-probes automatically discovered layouts whose
+    /// monitor revoked trust.
     pub(crate) async fn refresh_discovered_workers(&self) -> HashMap<String, WorkerRegistration> {
         let _refresh = self.refresh_lock.lock().await;
         let refresh = {
@@ -290,14 +284,13 @@ pub(super) async fn native_full_sources_match(
     expected: &CacheCapabilities,
     bound: &BoundSources,
 ) -> StaticHybridMatch {
-    let observed = tokio::time::timeout(Duration::from_secs(2), async {
-        tokio::join!(
-            fetch_native_full_layout(client, worker, api_key),
-            fetch_kv_event_sources(client, worker, api_key),
-        )
-    })
+    let timeout = Duration::from_secs(2);
+    let observed = tokio::time::timeout(
+        timeout,
+        fetch_native_full_sources(client, worker, api_key, timeout),
+    )
     .await;
-    let Ok((Ok(layout), Ok(sources))) = observed else {
+    let Ok((Ok(sources), Ok(layout))) = observed else {
         return StaticHybridMatch::Unavailable(SourcesProbe::Failed);
     };
     let Some(host) = worker_host(worker) else {
