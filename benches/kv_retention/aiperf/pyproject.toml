@@ -1,0 +1,16 @@
+[project]
+name = "kv-retention-aiperf"
+version = "0.1.0"
+description = "AIPerf endpoint that adds the #427 retention hint to Flatshare's chat endpoint"
+requires-python = ">=3.12"
+dependencies = ["aiperf==0.13.0"]
+
+[project.entry-points."aiperf.plugins"]
+kv_retention = "kv_retention_aiperf:plugins.yaml"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-data]
+kv_retention_aiperf = ["plugins.yaml"]

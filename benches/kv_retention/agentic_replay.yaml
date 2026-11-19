@@ -1,0 +1,43 @@
+# AIPerf 0.13.0 agentic_replay of the block-scaled Claude Code traces, as in Flatshare v1.22's
+# python/flatshare_bench/configs/agentic_replay.yaml, through the retention_chat endpoint (aiperf/). run_eval.py sets
+# the variables; AIPerf substitutes ${VAR:default} when it loads the file.
+schemaVersion: "2.0"
+randomSeed: "${KV_RETENTION_SEED:11}"
+benchmark:
+  model: Qwen/Qwen3-4B-Instruct-2507-FP8
+  tokenizer:
+    name: Qwen/Qwen3-4B-Instruct-2507-FP8
+  endpoint:
+    url: "${KV_RETENTION_URL:http://127.0.0.1:8000/v1/chat/completions}"
+    type: retention_chat
+    streaming: true
+    timeout: 300.0
+    useServerTokenCount: true
+    # Decode each turn's recorded output length, not until the model's own EOS.
+    extra:
+      ignore_eos: true
+  dataset:
+    type: file
+    path: "${KV_RETENTION_CORPUS:data/weka-x32}"
+    format: weka_trace_scaled
+    useThinkTimeOnly: true
+    interTurnDelayCapSeconds: 120
+    cacheBust:
+      target: first_turn_prefix
+  phases:
+    - name: profiling
+      type: concurrency
+      concurrency: "${KV_RETENTION_SESSIONS:16}"
+      duration: "${KV_RETENTION_DURATION:600}"
+      gracePeriod: 60
+      timingMode: agentic_replay
+      trajectoryStartMinRatio: 0.0
+      trajectoryStartMaxRatio: 1.0
+      burstPhaseStarts: true
+      systemIdleGapCapSeconds: 10
+  runtime:
+    workers: 4
+    recordProcessors: 2
+    ui: simple
+  artifacts:
+    dir: "${KV_RETENTION_ARTIFACTS:runs/aiperf}"
