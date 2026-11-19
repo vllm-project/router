@@ -284,7 +284,8 @@ steps:
       # CUDA_VISIBLE_DEVICES independently. Clear host masks at this boundary;
       # inherited HIP/ROCR handling in the helper is covered by its CPU regression.
       unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
-      # Keep scratch reclamation enabled, matching the manually validated run.
+      # Explicitly retain the validated reclaim-on setting even if inherited
+      # image defaults change; 0 is also the ROCr default.
       export HSA_NO_SCRATCH_RECLAIM=0
       export KV_AWARE_WORKER_LOG_QUIET=1
       export KV_AWARE_E2E_MODEL=Qwen/Qwen3-0.6B
@@ -294,10 +295,9 @@ steps:
       timeout --signal=TERM --kill-after=120s 1800 \
         python3 -m pytest tests/python/e2e/function/kv_aware/test_kv_aware_prefix_cache.py \
         --confcutdir=tests/python/e2e/function/kv_aware \
-        --junitxml="$$TMPDIR/results.xml" -m e2e -v -s 2>&1 | tee "$$TMPDIR/pytest.log"
+        --junitxml="$$TMPDIR/results.xml" -m e2e -v -s
       BASH
     artifact_paths:
-      - "target/ci-logs/kv-aware-rocm/pytest.log"
       - "target/ci-logs/kv-aware-rocm/results.xml"
       - "target/ci-logs/kv-aware-rocm/kv_aware_worker_logs_*/*.log"
 

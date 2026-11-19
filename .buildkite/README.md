@@ -212,9 +212,8 @@ The 450-minute job timeout covers 360 minutes of host lease acquisition plus
 `vllm-router-rocm-hold-cluster-lease` after the agent accepts the job; this is
 inside Buildkite's step timer, not a wait before dispatch. Existing lanes have
 timed out in the hook before the test command started. #508 aligns those lanes
-with the same 360-minute lease budget. Each attempt may hold its agent step for
-up to 7.5 hours: at most six hours waiting for the lease and 90 minutes after
-acquisition. A manual retry starts another independently bounded attempt.
+with the same lease budget. A manual retry starts a fresh, independently
+bounded attempt rather than continuing the previous attempt's budget.
 Artifact installation and Python dependency installation each have a ten-minute
 bound; pytest has a separate 30-minute bound. On forced termination, container
 teardown remains the final cleanup boundary for workers.
@@ -223,8 +222,9 @@ The pinned ROCm image supplies `vllm-rs`; the router binary comes from this
 build. Two full Qwen3-0.6B workers publish KV events with replay enabled.
 The test primes a distinct prefix on each worker, checks streaming and
 non-streaming reuse routing, then checks concurrent completion. It does not
-validate P/D transfers or server-side resource reclamation. Worker logs,
-pytest output, and JUnit results are collected under `target/ci-logs/kv-aware-rocm`.
+validate P/D transfers or server-side resource reclamation. Worker logs and
+JUnit results are collected under `target/ci-logs/kv-aware-rocm`; pytest output
+is available in the Buildkite console.
 
 ## Agent Queues
 
