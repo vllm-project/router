@@ -147,14 +147,17 @@ class RouterArgs:
             f"--{prefix}enable-program-scheduling",
             action="store_true",
             default=False,
-            help="Enable Program-level scheduling",
+            help="Enable Program-level scheduling (defaults to verified exact counts with estimation fallback)",
         )
 
         parser.add_argument(
             f"--{prefix}program-scheduling-config-json",
             type=str,
             default=None,
-            help="JSON object overriding Program-level scheduling defaults (requires the enable flag)",
+            help=(
+                "JSON object overriding Program-level scheduling defaults (requires the enable flag). "
+                'For compatible byte-estimated counts, use {"token_count_mode":"estimated"}; HTTP text tokenization is opt-in'
+            ),
         )
 
         # Routing policy configuration
