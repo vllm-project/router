@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use rand::Rng;
 use sha2::{Digest as _, Sha256};
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
+use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::kv_index::{CacheKey, MatchQuery, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo};
 use crate::request_identity::StableIdentity;
@@ -935,19 +935,6 @@ impl Picker for TemperaturePicker {
             draw -= weight;
         }
         Some(costs.len() - 1)
-    }
-}
-
-/// Picks uniformly among tied candidates.
-///
-/// Equal scores carry no ranking evidence. Keeping the first candidate would
-/// encode slice order as a preference: with an idle pool every cold request of
-/// the same length has one cost, and all of them would land on the same worker.
-fn pick_tied(candidates: &[usize]) -> Option<usize> {
-    match candidates {
-        [] => None,
-        [only] => Some(*only),
-        _ => Some(candidates[rand::rng().random_range(0..candidates.len())]),
     }
 }
 
