@@ -158,6 +158,12 @@ fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &
     Ok(HttpKvInput::Render { path })
 }
 
+/// Whether pricing needs a backend `/render`: a string/chat body does, a
+/// direct token-id input does not.
+pub(crate) fn http_input_requires_render(body: &serde_json::Value, route: &str) -> bool {
+    matches!(http_kv_input(body, route), Ok(HttpKvInput::Render { .. }))
+}
+
 /// Backend-effective prompts, shared by colocated and PD routing policies.
 #[derive(Clone)]
 pub(crate) struct HttpTokenInput {
