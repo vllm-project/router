@@ -24,13 +24,12 @@ class DisconnectUntested(ValueError):
     """The response finished before the client could disconnect it."""
 
 
-def _buffered_sse_completed(buffered, eof):
+def _buffered_sse_completed(buffered, eof, finished=False):
     """Validate complete buffered events and identify a finished response."""
     lines = buffered.split(b"\n")
     partial = lines.pop()
     if eof and partial.strip():
         raise ValueError("truncated buffered SSE line")
-    finished = False
     done = False
     for pending in lines:
         pending = pending.strip()
@@ -115,10 +114,6 @@ async def request(session, url, model, mode, sequence):
                     raise ValueError("invalid SSE finish_reason")
                 finished = True
             if mode == "disconnect" and text_seen:
-                if finished:
-                    raise DisconnectUntested(
-                        "first text already finished; cancellation untested"
-                    )
                 # is_eof includes unread buffered bytes, unlike at_eof(). Drain
                 # and validate them before classifying an EOF as normal completion.
                 eof = response.content.is_eof()
@@ -126,7 +121,7 @@ async def request(session, url, model, mode, sequence):
                 # Without EOF, leave a trailing partial line unclassified and
                 # disconnect immediately. With EOF, it must form a complete,
                 # normally terminated SSE response to count as untested.
-                if _buffered_sse_completed(buffered, eof):
+                if _buffered_sse_completed(buffered, eof, finished):
                     raise DisconnectUntested(
                         "completion already buffered; cancellation untested"
                     )

@@ -67,13 +67,27 @@ async def exercise(fault=None, output=None, cli=False, fragment=None, levels=(1,
                 if fault == "buffered_done":
                     await asyncio.sleep(0.02)  # terminal SSE buffered before HTTP EOF
                 return response
-            if fault in ("disconnect_truncated", "disconnect_buffered_error") and (
-                "-disconnect-0" in payload["prompt"]
+            if (
+                fault
+                in (
+                    "disconnect_truncated",
+                    "disconnect_buffered_error",
+                    "finished_truncated",
+                    "finished_buffered_error",
+                )
+                and "-disconnect-0" in payload["prompt"]
             ):
-                first = b'data: {"choices":[{"text":"blue","finish_reason":null}]}\n\n'
+                reason = "stop" if fault.startswith("finished_") else None
+                first = (
+                    "data: "
+                    + json.dumps(
+                        {"choices": [{"text": "blue", "finish_reason": reason}]}
+                    )
+                    + "\n\n"
+                ).encode()
                 tail = (
                     b'data: {"error":"transfer failed"}\n\n'
-                    if fault == "disconnect_buffered_error"
+                    if fault.endswith("buffered_error")
                     else b""
                 )
                 await response.write(first + tail)
@@ -227,7 +241,15 @@ def test_disconnect_wave_allows_partial_untested(monkeypatch):
     ]
 
 
-@pytest.mark.parametrize("fault", ["disconnect_truncated", "disconnect_buffered_error"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "disconnect_truncated",
+        "disconnect_buffered_error",
+        "finished_truncated",
+        "finished_buffered_error",
+    ],
+)
 def test_disconnect_tail_failure_is_not_masked_by_peer_success(fault):
     result, _ = asyncio.run(exercise(fault, levels=(2,)))
     assert not result["passed"]
