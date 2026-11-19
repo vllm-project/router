@@ -8969,7 +8969,7 @@ mod tests {
                 let mut router = router_pointing_at(address);
                 // Raw completion forwarding is the KV-aware path; ordinary
                 // typed forwarding intentionally drops unknown stream options.
-                router.policy_registry = create_test_kv_router().policy_registry;
+                router.policy_registry = create_test_kv_router().policy_registry.clone();
                 if exact {
                     router.program_scheduler = Some(Arc::new(ProgramScheduler::new(
                         ProgramSchedulerConfig::default(),
