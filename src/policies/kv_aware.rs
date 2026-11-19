@@ -1236,8 +1236,9 @@ impl KvAwarePolicy {
         excluded_workers: &[String],
     ) -> Option<KvSelectionReceipt> {
         let digest = affinity_key.map(|key| key.scoped_digest(lora_name, cache_salt));
-        // Try up to three placement snapshots under registration churn.
-        // The final attempt scores live load and full input work without KV credit.
+        // Run up to three rounds of placement queries under registration churn.
+        // The final attempt scores live load and full input work without querying
+        // placement or granting KV credit.
         for attempt in 0..=3 {
             let fallback_guard = (attempt == 3).then(|| self.selection_lock.lock());
             let plan = if fallback_guard.is_some() {
@@ -1247,7 +1248,12 @@ impl KvAwarePolicy {
                     .iter()
                     .map(|&index| {
                         let prompts = input.tokens.prompts_for(workers[index].as_ref());
-                        (!prompts.is_empty()).then(|| prompts.iter().map(|ids| ids.len()).sum())
+                        (!prompts.is_empty()).then(|| {
+                            prompts
+                                .iter()
+                                .map(|ids| ids.len())
+                                .fold(0, usize::saturating_add)
+                        })
                     })
                     .collect();
                 // As in normal preparation, bound missing input using current
@@ -3713,25 +3719,38 @@ mod tests {
                 );
             }
         }));
-        let both_known = [Some(33), Some(17)];
-        let missing_second = [Some(33), None];
+        let both_known: [Option<&[usize]>; 2] = [Some(&[33]), Some(&[17])];
+        let missing_second = [both_known[0], None];
         for (case, lengths, excluded, chosen, expected, queries) in [
             ("known and missing", missing_second, None, None, 33, 3),
             ("both known", both_known, None, Some(1), 17, 6),
             ("forced longer", both_known, Some(1), Some(0), 33, 6),
             ("forced shorter", both_known, Some(0), Some(1), 17, 6),
             ("forced missing", missing_second, Some(0), Some(1), 33, 3),
-            ("empty prompt", [Some(33), Some(0)], None, Some(1), 0, 3),
+            (
+                "empty prompt",
+                [Some(&[33]), Some(&[0])],
+                None,
+                Some(1),
+                0,
+                3,
+            ),
             ("all unknown", [None, None], None, None, 0, 0),
+            ("two prompts", [Some(&[17, 16]); 2], None, None, 33, 6),
         ] {
             let inputs: WorkerTokenInputs = workers
                 .iter()
                 .zip(lengths)
-                .filter_map(|(worker, length)| {
-                    length.map(|length| {
+                .filter_map(|(worker, lengths)| {
+                    lengths.map(|lengths| {
                         (
                             worker.base_url().to_owned(),
-                            Arc::from(vec![vec![7; length]]),
+                            Arc::from(
+                                lengths
+                                    .iter()
+                                    .map(|&length| vec![7; length])
+                                    .collect::<Vec<_>>(),
+                            ),
                         )
                     })
                 })
