@@ -269,9 +269,10 @@ class RouterArgs:
             action="append",
             default=[],
             metavar="URL=ENDPOINT[,ENDPOINT...]",
-            help="Static KV event sources for a prefill worker in PD mode "
-            "(requires a kv_aware prefill policy). Repeat for multiple workers; "
-            "comma-separated endpoints are ordered by DP rank. Block size is 16.",
+            help="Static KV event sources for a prefill or decode worker in PD "
+            "mode; a source belongs to a stage whose policy is kv_aware. "
+            "Repeat for multiple workers; comma-separated endpoints are "
+            "ordered by DP rank. Block size is 16.",
         )
         parser.add_argument(
             f"--{prefix}mini-lb",

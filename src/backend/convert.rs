@@ -527,6 +527,7 @@ pub fn prepare_grpc_completion(request: &CompletionRequest) -> Result<PreparedCo
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

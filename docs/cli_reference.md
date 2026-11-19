@@ -134,7 +134,7 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--decode` | `string (repeatable)` | `[]` | `string (repeatable)` | `unset` | Add one decode URL per occurrence: `--decode URL`. |
 | `--vllm-discovery-address` | `string` | `unset` | `string` | `unset` | ZMQ registration address for vLLM workers, e.g. `0.0.0.0:30001`. |
 | `--kv-connector` | `nixl, mooncake, moriio` | `nixl` | `nixl, mooncake, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. |
-| `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill KV publishers as URL=ENDPOINT[,ENDPOINT...]; requires kv_aware prefill. Endpoints follow DP-rank order; block size is 16. |
+| `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill or decode KV publishers as URL=ENDPOINT[,ENDPOINT...]; a source belongs to a stage whose policy is kv_aware. Endpoints follow DP-rank order; block size is 16. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
 discovery. For static configuration, provide both prefill and decode workers:
@@ -247,8 +247,17 @@ has tracing support.
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key used for requests to workers. |
+| `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key for the router's own requests to workers, including HTTP health checks. |
 | `--api-key-validation-urls` | `string [0..] (repeatable)` | `[]` | — | — | Validation URLs; an empty list falls back to comma-separated `API_KEY_VALIDATION_URLS` from the environment or `.env`. |
+
+The key is the bearer token the router sends on its own requests to HTTP
+workers, including health checks; clients authenticate to the router
+separately with `--api-key-validation-urls`. It is not sent yet on
+`/flush_cache`, `/get_load`, gRPC requests, or PD and `--enable-igw` health
+checks.
+
+The startup wait and `add_worker` always probe `/health`, regardless of
+`--health-check-endpoint`.
 
 ## WASM middleware
 

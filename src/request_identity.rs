@@ -122,6 +122,7 @@ pub fn resolve_affinity_identity(
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) fn resolve_stable_identity(
     headers: Option<&HeaderMap>,
     request: Option<&JsonValue>,
