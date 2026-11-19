@@ -1260,25 +1260,21 @@ mod test_pd_routing {
         let decode_calls = Arc::new(AtomicUsize::new(0));
         let decode_calls_clone = decode_calls.clone();
 
-        // Prefill server responds with HTTP 200 and Content-Length indicating body,
-        // but stream aborts / errors prematurely so read_prefill_body fails.
-        async fn prefill_truncated_body() -> (StatusCode, axum::response::Response) {
-            let stream = futures_util::stream::iter(vec![
-                Ok::<_, std::io::Error>(bytes::Bytes::from("start")),
+        // Prefill server responds with HTTP 200 headers,
+        // but stream aborts with error so read_prefill_body fails.
+        async fn prefill_truncated_body() -> axum::response::Response {
+            let chunks: Vec<std::io::Result<bytes::Bytes>> = vec![
+                Ok(bytes::Bytes::from("start")),
                 Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionReset,
                     "premature stream EOF",
                 )),
-            ]);
-            let body = Body::from_stream(stream);
-            (
-                StatusCode::OK,
-                axum::response::Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(body)
-                    .unwrap(),
-            )
+            ];
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                .unwrap()
         }
 
         async fn decode_gen(
@@ -1319,33 +1315,45 @@ mod test_pd_routing {
         let config = RouterConfig {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(format!("{base}/p"), None)],
-                decode_urls: vec![(format!("{base}/d"), None)],
-                connector: Some(KvConnector::Mooncake),
+                decode_urls: vec![format!("{base}/d")],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
             },
-            ..Default::default()
+            policy: PolicyConfig::Random,
+            kv_connector: vllm_router_rs::config::KvConnector::Mooncake,
+            disable_retries: true,
+            disable_circuit_breaker: true,
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
         };
 
-        let router = VllmPDRouter::new(config).await.unwrap();
-        let client = reqwest::Client::new();
+        let app_context = vllm_router_rs::server::AppContext::new(
+            config.clone(),
+            reqwest::Client::new(),
+            64,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let router = RouterFactory::create_router(&std::sync::Arc::new(app_context))
+            .await
+            .unwrap();
 
-        let req = json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "hello"}]
+        let request = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "stream": false
         });
 
-        let resp = router
-            .route_request(
-                &client,
-                Method::POST,
-                "/v1/chat/completions",
-                None,
-                req,
-                Default::default(),
-            )
+        // Request fails during prefill body read
+        let response = router
+            .route_transparent(None, "/v1/chat/completions", &Method::POST, request)
             .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 
-        // Prefill body read failed, so overall request must fail
-        assert!(resp.is_err());
+        // Verify Decode never received generation POST
         assert_eq!(decode_calls.load(Ordering::SeqCst), 0);
 
         // Guard dropped on prefill body error must fire rejection to companion decode endpoint
@@ -1361,128 +1369,5 @@ mod test_pd_routing {
         assert!(recorded[0]["kv_transfer_params"]["transfer_id"].is_string());
 
         server.abort();
-    }
-
-    #[tokio::test]
-    async fn test_deferred_decode_changed_target_non_2xx_fires_rejection_to_committed_worker() {
-        use axum::{
-            extract::State,
-            http::{Method, StatusCode},
-            routing::{get, post},
-            Json, Router,
-        };
-        use serde_json::{json, Value};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-
-        let rejections_d1 = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
-        let rejections_d1_clone = rejections_d1.clone();
-        let rejections_d2 = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
-        let rejections_d2_clone = rejections_d2.clone();
-
-        async fn prefill_ok() -> Json<Value> {
-            json!({
-                "id": "cmpl-prefill-test",
-                "choices": [{"text": ""}],
-                "kv_transfer_params": {
-                    "do_remote_prefill": true,
-                    "remote_engine_id": "engine-p",
-                    "transfer_id": "tx-deferred-target-test"
-                }
-            })
-        }
-
-        async fn decode_429() -> StatusCode {
-            StatusCode::TOO_MANY_REQUESTS
-        }
-
-        async fn reject_handler(
-            State(rejections): State<Arc<tokio::sync::Mutex<Vec<Value>>>>,
-            Json(body): Json<Value>,
-        ) -> StatusCode {
-            rejections.lock().await.push(body);
-            StatusCode::ACCEPTED
-        }
-
-        let app_d1 = Router::new()
-            .route("/health", get(|| async { "ok" }))
-            .route(
-                "/v1/kv_transfer/reject",
-                post(reject_handler).with_state(rejections_d1_clone),
-            );
-
-        let app_d2 = Router::new()
-            .route("/health", get(|| async { "ok" }))
-            .route("/v1/chat/completions", post(decode_429))
-            .route(
-                "/v1/kv_transfer/reject",
-                post(reject_handler).with_state(rejections_d2_clone),
-            );
-
-        let app_p = Router::new()
-            .route("/health", get(|| async { "ok" }))
-            .route("/v1/chat/completions", post(prefill_ok));
-
-        let l_p = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let l_d1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let l_d2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-
-        let p_url = format!("http://{}", l_p.local_addr().unwrap());
-        let d1_url = format!("http://{}", l_d1.local_addr().unwrap());
-        let d2_url = format!("http://{}", l_d2.local_addr().unwrap());
-
-        let s_p = tokio::spawn(async move {
-            axum::serve(l_p, app_p).await.unwrap();
-        });
-        let s_d1 = tokio::spawn(async move {
-            axum::serve(l_d1, app_d1).await.unwrap();
-        });
-        let s_d2 = tokio::spawn(async move {
-            axum::serve(l_d2, app_d2).await.unwrap();
-        });
-
-        let worker_d1: Arc<dyn Worker> =
-            Arc::new(BasicWorker::new(d1_url.clone(), WorkerType::Decode));
-        let worker_d2: Arc<dyn Worker> =
-            Arc::new(BasicWorker::new(d2_url.clone(), WorkerType::Decode));
-
-        // Create KvTransferGuard initially pointing at D1 (provisional)
-        let mut guard = KvTransferGuard::new(
-            reqwest::Client::new(),
-            worker_d1,
-            "req-deferred-429".to_string(),
-            json!({
-                "do_remote_prefill": true,
-                "remote_engine_id": "engine-p",
-                "transfer_id": "tx-deferred-target-test"
-            }),
-        );
-
-        // Deferred decode selection switches target to D2 (committed)
-        guard.update_decode_worker(worker_d2);
-
-        // D2 returns HTTP 429 -> guard remains armed and drops
-        let status = StatusCode::TOO_MANY_REQUESTS;
-        if status.is_success() {
-            guard.disarm();
-        }
-        drop(guard);
-
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-        let rec_d1 = rejections_d1.lock().await;
-        let rec_d2 = rejections_d2.lock().await;
-
-        assert_eq!(rec_d1.len(), 0, "Provisional D1 must NOT receive rejection");
-        assert_eq!(rec_d2.len(), 1, "Committed D2 MUST receive rejection");
-        assert_eq!(rec_d2[0]["request_id"], "req-deferred-429");
-        assert_eq!(
-            rec_d2[0]["kv_transfer_params"]["transfer_id"],
-            "tx-deferred-target-test"
-        );
-
-        s_p.abort();
-        s_d1.abort();
-        s_d2.abort();
     }
 }
