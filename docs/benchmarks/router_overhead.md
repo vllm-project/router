@@ -102,8 +102,8 @@ The fixture configuration differs from library and CLI defaults:
 | CLI / overhead harness | 0.3 | 64 | 1.5 | 120 s / 3600 s |
 
 Branch cases warm W1 and normally use loads `[1, 1, 1, 0]`: W1 identifies
-a cache hit, W3 a low-match or imbalanced selection, and W0 the fallback
-when W1 is unhealthy. Small load thresholds make boundary cases easy to set up.
+a cache hit, and W3 a low-match, imbalanced, or stale-tenant selection.
+Small load thresholds make boundary cases easy to set up.
 
 Routing inserts the probe into the tree. Before each timed call, the
 benchmark clears and re-warms the fixture outside the timer. Long inputs
