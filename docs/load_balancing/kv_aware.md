@@ -21,7 +21,41 @@ unset PYTHONHASHSEED
 EVENTS='{"enable_kv_cache_events":true,"endpoint":"tcp://127.0.0.1:5557","replay_endpoint":"tcp://127.0.0.1:5558","topic":"qwen3-start01"}'
 ```
 
-Save the [full-attention JSON](hybrid_kv_recipes.md#full-attention-layout) as `layout.json`. It supplies the cache block size and hash settings for this worker. Keep its model name, topic and worker URL in sync with the commands below.
+#### Full-attention layout
+
+For one full-attention group without speculative decoding, LoRA or a KV connector, a colocated HTTP worker with `/kv_routing_capabilities` supplies the layout automatically. Skip this file and omit `--kv-hybrid-layout` from the Router command in that case.
+
+For standard vLLM, save this one-group example as `layout.json`. Copy `group_idx: 0` as shown for a 16-token block size. Set the model name and topic to match the worker. Use `http://127.0.0.1:8000` as the top-level key for HTTP or keep the `grpc://` key for gRPC.
+
+```json
+{
+  "grpc://127.0.0.1:50051": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "model": "qwen3",
+        "weight_version": "default",
+        "publisher_topic": "qwen3-start01",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "hash_seed": "vllm-none-hash",
+        "full_hashes": true,
+        "hash_block_size": 16,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 0,
+        "prefix_caching": true,
+        "declared_groups": 1,
+        "groups": [
+          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 16, "prefix_cacheable": true, "prefix_replay_tokens": 0}
+        ]
+      }
+    ]
+  }
+}
+```
+
+The sample uses the vLLM default seed with `PYTHONHASHSEED` unset. If the worker sets `PYTHONHASHSEED=42`, use `"hash_seed": "42"`. You can also supply the engine's 64-digit hexadecimal `root_hash`. The two fields must agree when both are present. For LoRA, add `"adapters": [{"name": "my-adapter", "path": "/models/my-adapter"}]` alongside `ranks` and use the path from `--lora-modules`.
 
 ### 2. Start the worker and Router
 
@@ -41,8 +75,6 @@ Set the top-level key in `layout.json` to `http://127.0.0.1:8000`, then start th
 vllm-router --host 127.0.0.1 --port 19000 --policy kv_aware \
   --worker-urls http://127.0.0.1:8000 --kv-hybrid-layout layout.json
 ```
-
-A worker build with `/kv_routing_capabilities` can supply the layout automatically for one full-attention group without speculative decoding, LoRA or a KV connector. Omit `--kv-hybrid-layout` in that case.
 
 #### gRPC workers
 
@@ -93,9 +125,126 @@ Both worker transports accept `/v1/chat/completions` through the Router. On gRPC
 
 ## Hybrid attention models
 
-Use the [settings for your checkpoint](hybrid_kv_recipes.md#layout-examples-by-checkpoint) and the [hybrid JSON example](hybrid_kv_recipes.md#colocated-layout). Start the worker with those model settings, then use the same HTTP or gRPC Router command. For gRPC, use the engine options after `--` and key the layout by the `grpc://` URL.
+[Qwen3.5](#qwen35-4b) · [Qwen3.6](#qwen36-27b) · [Qwen3.8](#qwen38-27b) · [Qwen4Exp](#qwen4exp-fp8-qsa) · [DeepSeek V4 Flash](#deepseek-v4-flash) · [DeepSeek V4 Pro](#deepseek-v4-pro) · [DeepSeek V4.1 Flash](#deepseek-v41-flash)
 
-To check reuse, repeat a prompt that spans several cache pages for that model. Keep the hash unit, cache groups and any MTP or DSpark settings aligned with the running engine.
+Start with the [full-attention JSON](#full-attention-layout). Set the worker URL, served model and publisher topic for your deployment. In each rank, replace the four fields shown for your checkpoint. Keep the engine's full cache-group order, including groups that do not publish cache events.
+
+Use the same HTTP or gRPC commands with the selected checkpoint and model settings. Drop `--block-size 16` from the worker command for the hybrid examples. Keep `--prefix-caching-hash-algo sha256_cbor`, the full-width event hashes and the live and replay publishers. The configurations below use vLLM 0.33.0 and a 4,096-token context. Adjust memory and parallelism for your hardware and confirm the layout again if the engine changes its cache groups.
+
+### Qwen3.5-4B
+
+Add `--max-model-len 4096 --prefix-match-unit 16` to vLLM. The layout uses aligned Mamba checkpoints. For NIXL P/D, set `VLLM_SSM_CONV_STATE_LAYOUT=DS` on Prefill and Decode.
+
+```json
+{
+  "hash_block_size": 16,
+  "partial_hash_hits": true,
+  "declared_groups": 4,
+  "groups": [
+    {"group_idx": 0, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
+    {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
+    {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
+    {"group_idx": 3, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0}
+  ]
+}
+```
+
+### Qwen3.6-27B
+
+Use `--max-model-len 4096 --prefix-match-unit 16`. Copy the Qwen3.5 rank fields and set all four `groups[].block_size` values to `832`. Keep `prefill_checkpoint_alignment: 64`, `hash_block_size: 16` and `partial_hash_hits: true`.
+
+### Qwen3.8-27B
+
+For the base checkpoint, use the [Qwen3.6 settings](#qwen36-27b) with the Qwen3.8 weights and served model name. Update the rank when enabling speculation.
+
+| vLLM configuration | Rank settings |
+| --- | --- |
+| `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` in colocated routing | Keep the four base groups. Set `speculative_tokens: 3` and `hash_lookahead_tokens: 1`. |
+| MTP with `"disable_lookahead_block_hashes":true` or the tested Mooncake P/D setup | Keep the four base groups. Set `speculative_tokens: 3`, `hash_lookahead_tokens: 0` and `tail_drop_groups: [3]`. |
+| `--speculative-config '{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.8-27B-speculator.dspark"}'` | Set `speculative_tokens: 8`, `hash_lookahead_tokens: 0`, `tail_drop_groups: []` and `partial_hash_hits: false`. Keep `hash_block_size: 16`. |
+
+With the [Qwen3.8 DSpark draft](https://huggingface.co/RedHatAI/Qwen3.8-27B-speculator.dspark), set `declared_groups: 15`. Groups 0–9 use the 832-token Mamba settings above, and groups 10–13 use the 832-token full-attention settings. Group 14 uses `kind: "sliding_window"`, `spec_type: "SlidingWindowSpec"`, `block_size: 832`, `sliding_window: 2048`, `prefix_cacheable: true` and `prefix_replay_tokens: 0`.
+
+### Qwen4Exp FP8 QSA
+
+Use the FP8 QSA checkpoint with architecture `Qwen4ExpForConditionalGeneration`. The reference checkpoint has the name `Qwen3.8-Flash-Next-FP8`. Use `--max-model-len 4096` and let the engine choose cache block sizes. Use a prompt longer than 1,600 tokens to check reuse.
+
+```json
+{
+  "hash_block_size": 1600,
+  "partial_hash_hits": false,
+  "declared_groups": 6,
+  "groups": [
+    {"group_idx": 0, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 1600, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 1600},
+    {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 1600, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 1600},
+    {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 1600, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 1600},
+    {"group_idx": 3, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 1600, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 1600},
+    {"group_idx": 4, "kind": "scratch", "spec_type": "CircularBufferSpec", "block_size": 4, "prefix_cacheable": false, "prefix_replay_tokens": 0, "tokens_per_state": "1"},
+    {"group_idx": 5, "kind": "mla_attention", "spec_type": "MLAAttentionSpec", "block_size": 1600, "prefix_cacheable": true, "prefix_replay_tokens": 0, "tokens_per_state": "4", "cache_role": "sparse"}
+  ]
+}
+```
+
+### DeepSeek V4 Flash
+
+Use the V4 Flash 0731 checkpoint with `--max-model-len 4096` and the engine-selected cache block sizes. For DSpark, add `--speculative-config '{"method":"dspark","num_speculative_tokens":4}'`. Keep these groups and set `speculative_tokens: 4`, `hash_lookahead_tokens: 0` and `tail_drop_groups: []`. The reference DSpark P/D setup uses NIXL.
+
+```json
+{
+  "hash_block_size": 4,
+  "partial_hash_hits": false,
+  "declared_groups": 5,
+  "groups": [
+    {"group_idx": 0, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 64, "prefix_cacheable": true, "prefix_replay_tokens": 0, "sliding_window": 128},
+    {"group_idx": 1, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 64, "prefix_cacheable": true, "prefix_replay_tokens": 0, "sliding_window": 128},
+    {"group_idx": 2, "kind": "mla_attention", "spec_type": "MLAAttentionSpec", "block_size": 256, "prefix_cacheable": true, "prefix_replay_tokens": 0, "tokens_per_state": "4", "cache_role": "sparse"},
+    {"group_idx": 3, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 4, "prefix_cacheable": true, "prefix_replay_tokens": 0, "sliding_window": 8},
+    {"group_idx": 4, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 8, "prefix_cacheable": true, "prefix_replay_tokens": 0, "sliding_window": 128}
+  ]
+}
+```
+
+### DeepSeek V4 Pro
+
+Use `--max-model-len 4096` and the engine-selected cache block sizes. The reference V4 Pro checkpoint used `--tensor-parallel-size 4`.
+
+```json
+{
+  "hash_block_size": 4,
+  "partial_hash_hits": false,
+  "declared_groups": 5,
+  "groups": [
+    {"group_idx": 0, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 64, "prefix_cacheable": true, "prefix_replay_tokens": 0, "sliding_window": 128},
+    {"group_idx": 1, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 64, "prefix_cacheable": true, "prefix_replay_tokens": 0, "sliding_window": 128},
+    {"group_idx": 2, "kind": "mla_attention", "spec_type": "MLAAttentionSpec", "block_size": 256, "prefix_cacheable": true, "prefix_replay_tokens": 0, "tokens_per_state": "128", "cache_role": "sparse"},
+    {"group_idx": 3, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 8, "prefix_cacheable": true, "prefix_replay_tokens": 0, "sliding_window": 128},
+    {"group_idx": 4, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 4, "prefix_cacheable": true, "prefix_replay_tokens": 0, "sliding_window": 8}
+  ]
+}
+```
+
+### DeepSeek V4.1 Flash
+
+Use `--max-model-len 4096`, keep `--swa-bounded-replay` enabled, and let vLLM choose cache block sizes. The V4.1 Flash 1017 reference used `--tensor-parallel-size 2`. Groups 0–4 rebuild their last 128 tokens after a cache hit. Keep their replay settings in the layout.
+
+```json
+{
+  "hash_block_size": 128,
+  "partial_hash_hits": false,
+  "declared_groups": 7,
+  "groups": [
+    {"group_idx": 0, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 32, "prefix_cacheable": false, "prefix_replay_tokens": 128, "sliding_window": 128},
+    {"group_idx": 1, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 32, "prefix_cacheable": false, "prefix_replay_tokens": 128, "sliding_window": 128},
+    {"group_idx": 2, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 32, "prefix_cacheable": false, "prefix_replay_tokens": 128, "sliding_window": 128},
+    {"group_idx": 3, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 32, "prefix_cacheable": false, "prefix_replay_tokens": 128, "sliding_window": 128},
+    {"group_idx": 4, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 32, "prefix_cacheable": false, "prefix_replay_tokens": 128, "sliding_window": 128},
+    {"group_idx": 5, "kind": "mla_attention", "spec_type": "MLAAttentionSpec", "block_size": 128, "prefix_cacheable": true, "prefix_replay_tokens": 0, "tokens_per_state": "2", "cache_role": "sparse"},
+    {"group_idx": 6, "kind": "scratch", "spec_type": "CircularBufferSpec", "block_size": 8, "prefix_cacheable": false, "prefix_replay_tokens": 0, "tokens_per_state": "1"}
+  ]
+}
+```
+
+To [check reuse](#3-check-cache-reuse) for a hybrid model, use its served name and a repeated prompt long enough to span its cache pages. The configurations describe the tested CUDA layouts, including the declared speculative modes. Check connector compatibility when deploying a model in P/D.
 
 ## P/D routing
 
@@ -104,7 +253,7 @@ In P/D, Prefill processes the prompt and Decode generates the output. This examp
 1. Start two workers on different GPUs with the same checkpoint, vLLM version, connector and transport. Keep Prefill on HTTP port `8000` or gRPC port `50051`. Move Decode to HTTP port `8001` and, for a gRPC worker, gRPC port `50052`.
 2. Set `VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1` on both workers. Set `VLLM_NIXL_SIDE_CHANNEL_PORT=5600` on Prefill and `5601` on Decode. For separate hosts, use reachable addresses.
 3. Add `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'` to Prefill and the same option with `"kv_role":"kv_consumer"` to Decode. Enable events and replay on Prefill. Omit `--kv-events-config` on Decode for this setup. For gRPC, pass these engine options after `--`.
-4. Create [`pd-layout.json`](hybrid_kv_recipes.md#pd-layout) with the Prefill layout, its live and replay addresses, and the compatible Decode URL. Leave Program scheduling disabled for declared P/D layouts.
+4. Create [`pd-layout.json`](#pd-layout) with the Prefill layout, its live and replay addresses, and the compatible Decode URL. Leave Program scheduling disabled for declared P/D layouts.
 
 For gRPC, export `VLLM_ROUTER_TOKENIZER` with the model directory in the Router terminal.
 
@@ -119,9 +268,26 @@ vllm-router --port 19000 --vllm-pd-disaggregation --prefill "$PREFILL" --decode 
 
 Use the same client URL and [reuse check](#3-check-cache-reuse). To check NIXL transfer, send a fresh prompt and compare `vllm:nixl_bytes_transferred_sum` on Decode's HTTP metrics port `8001` before and after the request.
 
+### P/D layout
+
+Save this as `pd-layout.json`. Replace the empty `hybrid` object with the complete value under the Prefill worker URL in your colocated layout. Match `model` and `block_size` to the Prefill rank's model and `hash_block_size`. List addresses in rank order. For gRPC, use the Prefill and Decode gRPC URLs with their service ports.
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "endpoints": ["tcp://127.0.0.1:5557"],
+    "replay_endpoints": ["tcp://127.0.0.1:5558"],
+    "block_size": 16,
+    "model": "qwen3",
+    "hybrid": {},
+    "compatible_decode_urls": ["http://127.0.0.1:8001"]
+  }
+}
+```
+
 ## Versions
 
-The table lists event discovery in standard vLLM releases. The `sha256_cbor` examples use layout JSON on all five versions. Event discovery supplies live and replay addresses, topics and ranks. The layout supplies the hash root and cache groups.
+The table lists event discovery in standard vLLM releases. Event discovery supplies live and replay addresses, topics and ranks. For `sha256_cbor`, the examples use layout JSON on all five versions. The layout supplies the hash root and describes one group for full attention or the model's group list for hybrid attention.
 
 | vLLM release | HTTP event discovery | gRPC event discovery | Events with nonzero hash lookahead | Verification |
 | --- | --- | --- | --- | --- |
