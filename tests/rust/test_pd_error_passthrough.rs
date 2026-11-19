@@ -32,13 +32,16 @@ async fn all_topologies_endpoints_and_statuses() {
     for discovery in [false, true] {
         for concurrent in [false, true] {
             for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
-                // A fresh identity cache is required to genuinely exercise sequential D errors.
                 for phase in ["p", "d"] {
+                    let f = Fixture::new(Duration::from_secs(2), discovery).await;
+                    if concurrent {
+                        f.warmup().await;
+                    } else {
+                        // Pull metadata keeps sequential requests from warming the push cache.
+                        f.control.prefill_pull.store(true, Ordering::SeqCst);
+                    }
                     for code in [400, 422, 429, 500, 503] {
-                        let f = Fixture::new(Duration::from_secs(2), discovery).await;
-                        if concurrent {
-                            f.warmup().await;
-                        }
+                        let calls_before = f.d_calls.load(Ordering::SeqCst);
                         let response = f.request(path, &format!("{phase}-{code}"), true).await;
                         assert_error(
                             response,
@@ -46,8 +49,11 @@ async fn all_topologies_endpoints_and_statuses() {
                             if phase == "p" { "prefill" } else { "decode" },
                         )
                         .await;
-                        if phase == "p" && !concurrent {
-                            assert_eq!(f.d_calls.load(Ordering::SeqCst), 0);
+                        if !concurrent {
+                            assert_eq!(
+                                f.d_calls.load(Ordering::SeqCst),
+                                calls_before + usize::from(phase == "d")
+                            );
                         }
                         f.assert_no_load();
                     }

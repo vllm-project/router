@@ -1,48 +1,36 @@
 # P/D error responses
 
-The vLLM prefill/decode (P/D) router preserves upstream failure statuses and
-returns a JSON error response that identifies the failing phase. Upstream means
-the Prefill or Decode worker; downstream means the client calling the router.
+The vLLM prefill/decode (P/D) router preserves upstream HTTP errors and returns
+a JSON error that identifies whether Prefill or Decode failed.
 
-This contract covers request failures in direct and service-discovery P/D
-routing, with sequential or concurrent dispatch, for `/v1/chat/completions`,
-`/v1/completions`, and `/v1/responses`. Opt-in Program scheduling uses the same
-contract for cold HTTP chat completions and completions. Program warm-remote
-execution, gRPC P/D, and worker-management errors are outside this contract;
-warm-remote backend responses retain their existing passthrough behavior.
-Other router backends have their own error handling.
+This contract covers direct and service-discovery HTTP P/D routing for
+`/v1/chat/completions`, `/v1/completions`, and `/v1/responses`. It also covers
+cold HTTP Program chat and completion requests. Program warm-remote, gRPC P/D,
+and worker-management requests have separate error handling.
 
-## Status mapping
+## Status and error type
 
-The following mapping applies before the router commits the downstream response
-(sends its HTTP status and headers). A successful upstream status does not rule
-out a later body-read or required protocol-validation failure.
+| Failure before response headers are sent | HTTP status | `error.type` |
+| --- | --- | --- |
+| Worker returns 429 | 429 | `rate_limit_error` |
+| Worker returns another 4xx | Original status | `invalid_request_error` |
+| Worker returns 5xx | Original status | `server_error` |
+| Upstream timeout before an error status is received | 504 | `server_error` |
+| Connection or other transport failure before an error status is received | 502 | `server_error` |
+| Required upstream protocol validation or internal router failure | 500 | `server_error` |
 
-| Upstream response or failure | Downstream HTTP status | Public `error.type` | Default `error.code` |
-| --- | --- | --- | --- |
-| HTTP 400 | 400 | `invalid_request_error` | `"400"` |
-| HTTP 422 | 422 | `invalid_request_error` | `"422"` |
-| HTTP 429 | 429 | `rate_limit_error` | `"429"` |
-| Other HTTP 4xx | Preserve the received status | `invalid_request_error` | Status as a string |
-| HTTP 500 | 500 | `server_error` | `"500"` |
-| HTTP 503 | 503 | `server_error` | `"503"` |
-| Other HTTP 5xx | Preserve the received status | `server_error` | Status as a string |
-| Other non-2xx response received by the error handler | Preserve the received status | `server_error` | Status as a string |
-| Timeout without a received upstream HTTP error status to preserve | 504 | `server_error` | `"504"` |
-| Connection refusal or other transport failure without a received upstream HTTP error status to preserve | 502 | `server_error` | `"502"` |
-| Required upstream protocol or JSON validation failure | 500 | `server_error` | `"500"` |
-| Internal request/response construction, serialization, or configuration failure | 500 | `server_error` | `"500"` |
+If a worker returns an error status and its body stalls or cannot be read,
+the router keeps the status it received. For example, a Prefill 503 still
+returns 503 if its error body times out.
 
-Once an upstream non-2xx status has been received, an error-body read failure,
-timeout, or size limit does not replace that status. For example, a Prefill 503
-whose error body times out still produces a downstream 503, rather than 504.
-The table describes responses received by the error handler; it does not change
-the HTTP client's redirect behavior.
+Other non-2xx statuses, including 3xx, are preserved if they reach the error
+handler. This is defensive handling. The HTTP client's redirect behavior is
+unchanged, and a 304 response has no body.
 
-## Error fields
+## Response body and retry hints
 
-The router generates `Content-Type: application/json` and an `error` object.
-For example, a Prefill 503 produces HTTP 503 with:
+The router returns `Content-Type: application/json` with an `error` object.
+For example, a Prefill 503 returns:
 
 ```json
 {
@@ -54,162 +42,28 @@ For example, a Prefill 503 produces HTTP 503 with:
 }
 ```
 
-| Field | Behavior |
-| --- | --- |
-| `message` | Identifies `prefill` or `decode` for upstream failures. Eligible 4xx diagnostics are appended to the router-generated phase/status prefix. Internal failures use `The router could not complete the request.` |
-| `type` | Generated from the downstream status: 429 maps to `rate_limit_error`, other 4xx to `invalid_request_error`, and other failures to `server_error`. An upstream `type` is not forwarded. |
-| `code` | Always a string. Defaults to the downstream HTTP status; an eligible upstream 4xx string or numeric code can override it. |
-| `param` | Included only when an eligible upstream 4xx contains a string `param`. Otherwise omitted. |
+`error.code` is a string and defaults to the HTTP status. The message identifies
+the failing worker phase when known. Router failures may return a generic
+message.
 
-### Preserving 4xx diagnostics
+Details from a worker's 4xx are best-effort. When the router receives a complete
+`application/json` body with an `error` object and a string `message`, it appends
+the message and can include a string `param` and a string or numeric `code`.
+Numeric codes are converted to strings. Each retained string is capped at
+2 KiB including a trailing ellipsis if truncated. Slow, incomplete, oversized,
+or invalid worker bodies fall back to the generic diagnostic for that status.
+Clients can always use the returned HTTP status to identify the error class.
 
-The router retains selected upstream diagnostics only when all of these
-conditions hold:
+The router preserves a valid upstream `Retry-After` as delay-seconds from 0
+through 86,400 or as a supported HTTP date. Other upstream error headers and
+raw error bodies are omitted.
 
-- The upstream status is 4xx.
-- The body was read completely and is at most 64 KiB (65,536 bytes).
-- The media type is `application/json`, compared without case sensitivity and
-  allowing parameters such as `charset=utf-8`.
-- The body parses as JSON with an `error` object containing a string `message`.
+## Concurrent requests and streaming
 
-The router appends at most 2 KiB of the upstream message, truncated at a UTF-8
-character boundary, to its phase/status prefix, retains a
-string `param`, and retains a string `code` or converts a numeric `code` to a
-string. A missing, null, or otherwise unsupported `code` keeps the default from
-the status table. Unknown fields are omitted.
+If both phases fail in concurrent routing, the Prefill failure takes precedence.
+The router waits for Prefill validation before sending the Decode response.
 
-For example, an HTTP 400 Prefill response with `Content-Type: application/json`
-and this complete body:
-
-```json
-{
-  "error": {
-    "message": "max_tokens exceeds the model limit.",
-    "type": "BadRequestError",
-    "param": "max_tokens",
-    "code": "context_length_exceeded"
-  }
-}
-```
-
-produces HTTP 400 with:
-
-```json
-{
-  "error": {
-    "message": "Upstream prefill request failed (HTTP 400). max_tokens exceeds the model limit.",
-    "type": "invalid_request_error",
-    "param": "max_tokens",
-    "code": "context_length_exceeded"
-  }
-}
-```
-
-5xx bodies, non-JSON bodies, malformed envelopes, incomplete bodies, and bodies
-over the size limit use the router-generated fallback message and code. The
-upstream body is never forwarded wholesale.
-
-## Headers and body capture
-
-The only upstream error response header forwarded to the client is a valid
-`Retry-After`: delay-seconds from 0 through 86,400 (24 hours), or a supported
-HTTP-date. Invalid, overflowing, and larger numeric values are omitted.
-The upstream `Content-Type` is used to validate 4xx diagnostics; the router
-generates its own JSON content type. Other upstream error headers, including
-`Content-Encoding`, `Set-Cookie`, and `WWW-Authenticate`, are not forwarded.
-
-Error-body capture saves at most 64 KiB incrementally and has a dedicated
-one-second deadline starting when capture begins. The existing upstream request
-timeout remains active, so whichever expires first stops the read. The capture
-deadline is not reset per chunk and also bounds the wait for EOF at exactly
-64 KiB. On expiry, the router drops the upstream body and returns its fallback
-JSON envelope with the original HTTP status and validated `Retry-After`.
-Incomplete diagnostics are not appended or previewed, even if their saved
-prefix parses as JSON. Normal completion still requires EOF.
-
-The one-second budget covers body capture only. Failure-side profiling cleanup
-can separately take up to two seconds before capture begins; local Decode
-cancellation and load release happen before either wait.
-
-Other non-2xx statuses (including 3xx) are defensive cases; this change does not
-alter redirect handling. HTTP semantics still apply: a 304 has no response body.
-
-## Failure precedence and response commitment
-
-In sequential dispatch, a Prefill failure prevents Decode dispatch. In
-concurrent dispatch, the router waits for Prefill body consumption and required
-validation before exposing the Decode response. If both phases fail, the
-Prefill failure takes precedence, even when Decode finishes first.
-
-Receiving Prefill non-2xx headers drops the pending local Decode future or held
-Decode response before profiling cleanup or collecting the Prefill error body.
-The common failure wrapper releases local load, then attempts both profiling
-stops concurrently with a shared two-second cleanup deadline. Cleanup is best
-effort: request cancellation or a timeout may interrupt a stop request, leaving
-the existing profiling timeout task to retry cleanup. A new profiling session
-supersedes the previous session's timeout only after the backend accepts the
-start. Rejected or failed starts preserve the previous session and timeout and
-return no ownership token to the new attempt. Each attempt retains the
-identifiers of the sessions it actually started; successful and failure cleanup stop only
-matching sessions. A sequential Prefill failure cannot stop an unrelated
-Decode profile, and stale cleanup cannot stop a replacement session. Profiling
-HTTP operations are serialized per worker while their requests are awaited;
-other workers use
-independent locks. Neither cleanup nor capture can delay local Decode
-cancellation or resource release. Dropping local HTTP work does not guarantee
-that the remote engine immediately stops computation.
-
-After the downstream status and headers have been sent, a body transport failure
-terminates the body. The committed status cannot change, and the router does
-not synthesize an SSE error event or a `[DONE]` marker. This also applies to
-oversized non-streaming responses forwarded through the byte-stream path.
-Body-read or validation failures detected before commitment use the status
-mapping above.
-
-Successful Prefill bodies are bounded to 64 MiB. Non-streaming Decode bodies
-are buffered up to 64 MiB for usage reconciliation; larger bodies are forwarded
-as streams. Optional JSON enrichment, including logprobs merging, is limited
-to 8 MiB. These successful-response limits are separate from the 64 KiB
-error-body capture limit.
-
-## Operational diagnostics
-
-Internal error classifications remain separate from public `error.type` values:
-
-| Internal classification | Meaning |
-| --- | --- |
-| `upstream_http_error` | An upstream non-2xx response was received. |
-| `upstream_timeout` | An upstream operation timed out without an HTTP error status to preserve. |
-| `upstream_transport_error` | An upstream connection or other transport operation failed. |
-| `upstream_protocol_error` | A required upstream response protocol check failed. |
-| `internal_error` | Router construction, serialization, or configuration failed. |
-
-`vllm_router_pd_phase_errors_total` records the returned primary failure with
-`phase` and internal `error_type` labels; internal failures use `phase=router`.
-`vllm_router_pd_error_body_total` records capture outcomes as `complete`,
-`limit_exceeded`, `capture_timeout`, or `read_failed`. `vllm_router_pd_response_body_errors_total`
-records transport failures after response commitment.
-
-When DEBUG logging is enabled, a completely captured upstream error body can
-produce an escaped preview of at most 256 Unicode characters. Incomplete or
-oversized bodies produce no preview. This preview is excluded from the
-production OpenTelemetry span filter; it does not change the public response.
-
-## Tests
-
-Focused error-contract coverage:
-
-```bash
-cargo test --offline --locked --features cpu,ready --lib pd_request_error
-cargo test --offline --locked --features cpu,ready --lib pd_dispatch
-cargo test --offline --locked --features cpu,ready --test test_pd_error_passthrough
-cargo test --offline --locked --features cpu,ready --test test_pd_error_observability
-cargo test --offline --locked --features cpu,ready --test test_pd_program_scheduling
-```
-
-The passthrough tests include 120 combinations of direct/discovery routing,
-sequential/concurrent dispatch, three endpoints, two failure phases, and
-400/422/429/500/503 statuses. Additional cases cover transport failures, bounded
-capture, failure precedence, cancellation, and failures after commitment.
-These tests use mock workers; they do not establish real-model or connector
-behavior. Omit `--offline` if dependencies must first be downloaded.
+Once the client has received the status and headers, a transport failure ends
+the response body. The status stays the same. A broken stream does not receive
+a synthetic SSE error or `[DONE]` marker. Clients should handle an interrupted
+stream as an incomplete response.

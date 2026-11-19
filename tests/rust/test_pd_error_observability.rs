@@ -42,7 +42,7 @@ async fn logs_and_otel_use_safe_diagnostics_at_info_and_debug() {
                     .with_tracer(provider.tracer("pd-errors"))
                     .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
                         // Match the production CustomOtelFilter: ordinary logs
-                        // must not become span events, including DEBUG previews.
+                        // must not become span events.
                         metadata.target().starts_with("otel_trace")
                     })),
             );
@@ -58,6 +58,14 @@ async fn logs_and_otel_use_safe_diagnostics_at_info_and_debug() {
             .collect();
         assert_eq!(failures.len(), usize::from(level == tracing::Level::DEBUG));
         assert!(failures.iter().all(|line| line.contains("DEBUG")));
+        let dispatch_log = initial_logs
+            .lines()
+            .find(|line| line.contains("P/D dispatch failed"));
+        assert_eq!(dispatch_log.is_some(), level == tracing::Level::DEBUG);
+        if let Some(line) = dispatch_log {
+            assert!(line.contains("prefill_worker=") && line.contains(&f._p.url));
+            assert!(line.contains("decode_worker=") && line.contains(&f._d.url));
+        }
         assert!(!initial_logs.contains("P/D error classification"));
         assert!(!initial_logs.contains("Transparent proxy request failed"));
         assert_eq!(
@@ -149,6 +157,8 @@ async fn logs_and_otel_use_safe_diagnostics_at_info_and_debug() {
         )));
         let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         let span_diagnostics = format!("{spans:?}");
+        assert!(!span_diagnostics.contains("P/D dispatch failed"));
+        assert!(!logs.contains("Serialized chat request:"));
         let diagnostics = format!("{logs} {span_diagnostics}");
         assert!(
             diagnostics.contains("MoriIoTransferModeMissing"),
@@ -159,7 +169,6 @@ async fn logs_and_otel_use_safe_diagnostics_at_info_and_debug() {
             level == tracing::Level::DEBUG
         );
         for restored in [
-            "Serialized chat request:",
             "📤 Prefill request payload:",
             "📥 Prefill response body content:",
             "📤 Decode request payload:",
@@ -173,31 +182,27 @@ async fn logs_and_otel_use_safe_diagnostics_at_info_and_debug() {
                 "restored log: {restored}"
             );
         }
+        // Capture details remain available even when the worker body is sensitive.
+        assert!(logs.lines().any(|line| {
+            line.contains("P/D request failed")
+                && line.contains("phase: Prefill")
+                && line.contains("status: 503")
+                && line.contains("saved_bytes:")
+                && line.contains("body_state: Complete")
+        }));
+        assert!(!logs.contains("Upstream error body preview"));
         for marker in [
             "/private/secret.py",
             "worker-secret.internal",
             "secret-marker",
             "Traceback",
+            "preview-tail-marker",
+            "incomplete-body-marker",
+            &"界".repeat(256),
         ] {
-            assert!(!span_diagnostics.contains(marker), "span leaked {marker}");
-            assert_eq!(
-                logs.contains(marker),
-                level == tracing::Level::DEBUG,
-                "preview level for {marker}"
-            );
-        }
-        assert_eq!(
-            logs.matches("Upstream error body preview").count(),
-            if level == tracing::Level::DEBUG { 2 } else { 0 }
-        );
-        assert_eq!(
-            logs.contains(&"界".repeat(256)),
-            level == tracing::Level::DEBUG
-        );
-        for marker in ["preview-tail-marker", "incomplete-body-marker"] {
             assert!(
                 !diagnostics.contains(marker),
-                "unexpected preview: {marker}"
+                "worker error body leaked: {marker}"
             );
         }
     }

@@ -8,7 +8,7 @@ use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_request_error::{
     decode_stream, pd_error_description, InternalErrorReason, PdPhase, PdRequestError,
 };
-use super::pd_router::PdRouterBase;
+use super::pd_router::{PdRouterBase, ProfilingStartOutcome};
 use super::pd_types::{PDRouterError, PdAttempt, PdEndpoint, PdRequestContext};
 use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
@@ -35,12 +35,15 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
-use tokio::sync::{Mutex, OwnedSemaphorePermit};
+use std::time::{Duration, Instant};
+use tokio::sync::{oneshot, Mutex, OwnedSemaphorePermit};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 type ProgramPrefillCandidate = (String, Arc<dyn Worker>);
+
+// Profiling must not occupy the worker lock for the inference request budget.
+const PROFILING_HTTP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct ProfilingSession {
@@ -285,6 +288,8 @@ enum ResponseBody {
     Passthrough(Body),
 }
 
+// Only Decode forwards Passthrough bodies. Prefill drops them without polling
+// the stream, so the Decode-specific stream error mapping does not run for it.
 async fn read_response_body(
     response: reqwest::Response,
     limit: usize,
@@ -927,21 +932,58 @@ impl VllmPDRouter {
         }
         let worker = self.profiling_worker(worker_url).await;
         let mut session = worker.lock().await;
-        if !self.pd_router.start_profiling(worker_url).await {
-            return None;
-        }
-        // Keep the previous fallback if this start is cancelled. The worker
-        // lock prevents it from sending a stop while the start is awaited.
-        if let Some(previous) = session.take() {
-            previous.timeout.abort();
-        }
+        let initial_start = if session.is_none() {
+            // Arm cleanup before the worker can receive the first start. The
+            // timer begins when the sender is dropped, including on cancellation.
+            let (pending, finished) = oneshot::channel();
+            *session = Some(self.schedule_profiling_stop(worker_url, &worker, Some(finished)));
+            Some(pending)
+        } else {
+            None
+        };
+        let generation = match self
+            .pd_router
+            .start_profiling_with_outcome(worker_url, Some(PROFILING_HTTP_TIMEOUT))
+            .await
+        {
+            ProfilingStartOutcome::Accepted => {
+                if initial_start.is_none() {
+                    // A confirmed replacement supersedes the previous fallback.
+                    let replacement = self.schedule_profiling_stop(worker_url, &worker, None);
+                    if let Some(previous) = session.replace(replacement) {
+                        previous.timeout.abort();
+                    }
+                }
+                session.as_ref().map(|session| session.generation)
+            }
+            ProfilingStartOutcome::Rejected if initial_start.is_some() => {
+                if let Some(pending) = session.take() {
+                    pending.timeout.abort();
+                }
+                None
+            }
+            // Keep cleanup without giving an unconfirmed start ownership.
+            ProfilingStartOutcome::Rejected | ProfilingStartOutcome::Uncertain => None,
+        };
+        drop(initial_start);
+        generation
+    }
 
+    fn schedule_profiling_stop(
+        &self,
+        worker_url: &str,
+        worker: &ProfilingWorker,
+        initial_start_finished: Option<oneshot::Receiver<()>>,
+    ) -> ProfilingSession {
         let generation = Uuid::new_v4();
         let timeout_secs = self.profile_timeout_secs;
         let worker_url = worker_url.to_owned();
         let pd_router = self.pd_router.clone();
         let timeout_worker = worker.clone();
         let task = tokio::spawn(async move {
+            if let Some(finished) = initial_start_finished {
+                let _ = finished.await;
+            }
             tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
             let mut session = timeout_worker.lock().await;
             if session
@@ -956,17 +998,19 @@ impl VllmPDRouter {
             );
             // Hold only this worker's lock: a new start must not overtake an
             // old stop that is already in flight.
-            pd_router.stop_profiling(&worker_url).await;
+            // This is the final best-effort attempt for this generation.
+            pd_router
+                .stop_profiling_with_result(&worker_url, Some(PROFILING_HTTP_TIMEOUT))
+                .await;
             session.take();
         });
-        *session = Some(ProfilingSession {
+        ProfilingSession {
             generation,
             timeout: task.abort_handle(),
-        });
-        Some(generation)
+        }
     }
 
-    /// Stop once; retain the registered fallback until cleanup completes.
+    /// Stop the owned session, retaining its fallback until the worker accepts.
     async fn stop_profiling(&self, worker_url: &str, generation: Option<Uuid>) {
         if !self.enable_profiling {
             return;
@@ -982,7 +1026,13 @@ impl VllmPDRouter {
         {
             return;
         }
-        self.pd_router.stop_profiling(worker_url).await;
+        if !self
+            .pd_router
+            .stop_profiling_with_result(worker_url, Some(PROFILING_HTTP_TIMEOUT))
+            .await
+        {
+            return;
+        }
         if let Some(finished) = session.take() {
             finished.timeout.abort();
         }
@@ -2224,6 +2274,14 @@ impl VllmPDRouter {
                     .unwrap_or_else(|| decode_worker.base_url().to_owned());
                 attempt.release();
                 metrics.record_failure(&error, prefill_worker.base_url(), &decode_base);
+                // Keep worker identity in local logs, separate from the public error
+                // envelope and the OpenTelemetry targets.
+                debug!(
+                    prefill_worker = prefill_worker.base_url(),
+                    decode_worker = decode_base.as_str(),
+                    details = ?error,
+                    "P/D dispatch failed"
+                );
                 // The race has dropped both legs and local load is released.
                 // Bound best-effort cleanup independently of error-body capture.
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -3442,10 +3500,6 @@ impl RouterTrait for VllmPDRouter {
         }
         match serde_json::to_value(body) {
             Ok(body) => {
-                debug!(
-                    "Serialized chat request: {}",
-                    serde_json::to_string_pretty(&body).unwrap_or_default()
-                );
                 self.route_transparent(headers, "/v1/chat/completions", &Method::POST, body)
                     .await
             }

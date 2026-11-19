@@ -144,6 +144,7 @@ pub struct Controls {
     pub p_wait: std::sync::atomic::AtomicBool,
     pub d_wait: std::sync::atomic::AtomicBool,
     pub p_status: AtomicUsize,
+    pub prefill_pull: std::sync::atomic::AtomicBool,
     pub p_active: Arc<AtomicUsize>,
     pub d_active: Arc<AtomicUsize>,
     pub stream_release: Arc<Notify>,
@@ -407,7 +408,8 @@ async fn stage(State(stage): State<Stage>, request: Request) -> Response {
             .into_response();
     }
     Json(if stage.prefill {
-        json!({"kv_transfer_params": {"remote_engine_id": "P", "remote_host": "127.0.0.1", "remote_port": 9100, "transfer_mode": "push"}})
+        let transfer_mode = if control.prefill_pull.load(Ordering::SeqCst) { "pull" } else { "push" };
+        json!({"kv_transfer_params": {"remote_engine_id": "P", "remote_host": "127.0.0.1", "remote_port": 9100, "transfer_mode": transfer_mode}})
     } else { json!({"choices":[]}) }).into_response()
 }
 

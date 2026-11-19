@@ -104,9 +104,6 @@ impl<'a> RequestMetrics<'a> {
             recorded: false,
         }
     }
-    pub(super) fn record_error(&mut self) -> bool {
-        self.record()
-    }
     /// Returns true only for the first observation. Response-body failures
     /// must not count the request or its worker error a second time.
     pub(super) fn record(&mut self) -> bool {
@@ -131,7 +128,7 @@ impl RequestMetrics<'_> {
                 error.phase()
             }
         };
-        if self.record_error() {
+        if self.record() {
             match phase {
                 Some(PdPhase::Prefill) => RouterMetrics::record_pd_prefill_error(prefill),
                 Some(PdPhase::Decode) => RouterMetrics::record_pd_decode_error(decode),

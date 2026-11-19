@@ -418,14 +418,6 @@ async fn response_body_failures_do_not_extend_legacy_stream_error_counter() {
             0
         );
     }
-    let rendered = handle.render();
-    let body_errors = rendered
-        .lines()
-        .find(|line| line.starts_with("vllm_router_pd_response_body_errors_total{"))
-        .unwrap();
-    assert!(body_errors.contains("phase=\"decode\""));
-    assert!(body_errors.contains("error_type=\"upstream_transport_error\""));
-    assert!(body_errors.ends_with(" 2"));
 }
 
 #[tokio::test]

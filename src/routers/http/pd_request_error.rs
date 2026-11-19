@@ -7,7 +7,7 @@ use axum::{
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 pub(super) const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
 const ERROR_BODY_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -58,16 +58,6 @@ pub(super) enum ErrorBodyState {
     LimitExceeded,
     CaptureTimedOut,
     ReadFailed { kind: TransportErrorKind },
-}
-impl ErrorBodyState {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Complete => "complete",
-            Self::LimitExceeded => "limit_exceeded",
-            Self::CaptureTimedOut => "capture_timeout",
-            Self::ReadFailed { .. } => "read_failed",
-        }
-    }
 }
 pub(super) struct UpstreamHttpError {
     phase: PdPhase,
@@ -219,10 +209,10 @@ impl IntoResponse for PdRequestError {
                     bounded_diagnostic(upstream["message"].as_str().unwrap())
                 ));
                 if let Some(param) = upstream.get("param").and_then(Value::as_str) {
-                    detail["param"] = json!(param);
+                    detail["param"] = json!(bounded_diagnostic(param));
                 }
                 match upstream.get("code") {
-                    Some(Value::String(code)) => detail["code"] = json!(code),
+                    Some(Value::String(code)) => detail["code"] = json!(bounded_diagnostic(code)),
                     Some(Value::Number(code)) => detail["code"] = json!(code.to_string()),
                     _ => {}
                 }
@@ -263,13 +253,18 @@ impl UpstreamHttpError {
     }
 }
 
-// Limit appended backend diagnostics in bytes without splitting UTF-8.
-fn bounded_diagnostic(message: &str) -> &str {
-    let mut end = message.len().min(2048);
-    while !message.is_char_boundary(end) {
+// Include the truncation marker in the byte limit and preserve UTF-8 boundaries.
+fn bounded_diagnostic(value: &str) -> Cow<'_, str> {
+    const LIMIT: usize = 2048;
+    const ELLIPSIS: &str = "…";
+    if value.len() <= LIMIT {
+        return Cow::Borrowed(value);
+    }
+    let mut end = LIMIT - ELLIPSIS.len();
+    while !value.is_char_boundary(end) {
         end -= 1;
     }
-    &message[..end]
+    Cow::Owned(format!("{}{ELLIPSIS}", &value[..end]))
 }
 
 // Accept only delay-seconds or a round-tripped HTTP-date. chrono is already a
@@ -348,22 +343,15 @@ pub(super) async fn capture_upstream_error(
             .map(|chunk| chunk.map_err(|e| classify_transport(&e))),
     )
     .await;
-    metrics::counter!("vllm_router_pd_error_body_total", "phase" => phase.to_string(), "state" => body_state.label()).increment(1);
-    let error = UpstreamHttpError {
+    // IntoResponse logs the safe Debug representation, including capture
+    // metadata. The body may echo caller input and must stay out of logs.
+    PdRequestError::UpstreamHttp(Box::new(UpstreamHttpError {
         phase,
         status,
         headers,
         body,
         body_state,
-    };
-    if body_state == ErrorBodyState::Complete && tracing::enabled!(tracing::Level::DEBUG) {
-        let preview: String = String::from_utf8_lossy(&error.body)
-            .chars()
-            .take(256)
-            .collect();
-        tracing::debug!(phase = %phase, status = status.as_u16(), preview = ?preview, "Upstream error body preview");
-    }
-    PdRequestError::UpstreamHttp(Box::new(error))
+    }))
 }
 
 /// Stream failures occur after commitment: terminate without synthesizing SSE.
@@ -373,10 +361,6 @@ pub(super) fn decode_stream(
     source.map(|chunk| {
         chunk.map_err(|e| {
             let error = PdRequestError::from_reqwest(PdPhase::Decode, e);
-            let (kind, _) = error.public_fields();
-            // Byte streaming is used for both stream=true and ordinary direct
-            // responses. New diagnostics must not change legacy SSE counters.
-            metrics::counter!("vllm_router_pd_response_body_errors_total", "phase" => "decode", "error_type" => kind).increment(1);
             tracing::warn!(error = %error, "P/D stream terminated");
             error
         })
@@ -717,14 +701,15 @@ mod tests {
                 .status(400)
                 .header("content-type", "application/json")
                 .body(Bytes::from(
-                    json!({"error": {"message": message, "code": "bad_input"}}).to_string(),
+                    json!({"error": {"message": message, "param": message, "code": message}})
+                        .to_string(),
                 ))
                 .unwrap();
             let response =
                 capture_upstream_error(PdPhase::Prefill, reqwest::Response::from(upstream))
                     .await
                     .into_response();
-            let body = axum::body::to_bytes(response.into_body(), 4096)
+            let body = axum::body::to_bytes(response.into_body(), 8192)
                 .await
                 .unwrap();
             let parsed: crate::protocols::spec::ErrorResponse =
@@ -734,21 +719,20 @@ mod tests {
                 .message
                 .strip_prefix("Upstream prefill request failed (HTTP 400). ")
                 .unwrap();
-            assert!(diagnostic.len() <= 2048);
-            assert!(message.starts_with(diagnostic));
-            assert_eq!(parsed.error.code.as_deref(), Some("bad_input"));
-            if message.len() > 2048 {
-                assert!(
-                    diagnostic.len()
-                        + message[diagnostic.len()..]
-                            .chars()
-                            .next()
-                            .unwrap()
-                            .len_utf8()
-                        > 2048
-                );
-            } else {
-                assert_eq!(diagnostic, message);
+            for value in [
+                diagnostic,
+                parsed.error.param.as_deref().unwrap(),
+                parsed.error.code.as_deref().unwrap(),
+            ] {
+                assert!(value.len() <= 2048);
+                if message.len() > 2048 {
+                    let prefix = value.strip_suffix('…').expect("truncation marker");
+                    assert!(message.starts_with(prefix));
+                    let next = message[prefix.len()..].chars().next().unwrap();
+                    assert!(value.len() + next.len_utf8() > 2048);
+                } else {
+                    assert_eq!(value, message);
+                }
             }
         }
     }
