@@ -71,6 +71,16 @@ pub struct PdLoadSample {
     pub unknown_prefill_requests: usize,
     pub pending_decode_requests: usize,
     pub active_decode_requests: usize,
+    /// Logical context tokens of Decode requests admitted but not yet
+    /// dispatched. Their KV is not on the engine yet, so they are waiting work.
+    pub pending_decode_tokens: u64,
+    /// Logical context tokens of Decode requests already dispatched. Each
+    /// sequence contributes its full prompt length; shared physical prefix
+    /// blocks still count once per request: sequences share one copy.
+    pub active_decode_tokens: u64,
+    /// Admitted Decode requests whose prompt length the Router does not know.
+    /// Any candidate holding one is compared by request counts.
+    pub unknown_decode_requests: usize,
 }
 
 impl PdLoadSample {
@@ -106,6 +116,18 @@ impl PdLoadSample {
                     "vllm_router_pd_active_decode_requests",
                     self.active_decode_requests as f64,
                 );
+                record(
+                    "vllm_router_pd_pending_decode_tokens",
+                    self.pending_decode_tokens as f64,
+                );
+                record(
+                    "vllm_router_pd_active_decode_tokens",
+                    self.active_decode_tokens as f64,
+                );
+                record(
+                    "vllm_router_pd_unknown_decode_requests",
+                    self.unknown_decode_requests as f64,
+                );
             }
         }
     }
@@ -115,6 +137,19 @@ impl PdLoadSample {
             Stage::Prefill => self.prefill_requests,
             Stage::Decode => self.pending_decode_requests + self.active_decode_requests,
         }
+    }
+
+    /// The unit Decode ranks by, when it can be known.
+    ///
+    /// `None` as soon as one admitted request on this endpoint has an unknown
+    /// prompt length: mixing a known token figure with an unknown one would
+    /// compare different units across the pool, and request counts are the
+    /// documented fallback.
+    pub(super) fn decode_tokens(self) -> Option<u64> {
+        (self.unknown_decode_requests == 0).then(|| {
+            self.pending_decode_tokens
+                .saturating_add(self.active_decode_tokens)
+        })
     }
 
     fn idle(self) -> bool {
@@ -157,7 +192,21 @@ pub struct PdRequestContext<'a> {
     pub lora_name: Option<&'a str>,
     /// Request cache salt scoping the binding digest.
     pub cache_salt: Option<&'a str>,
+    /// Marginal Decode context per candidate, keyed by worker URL, priced
+    /// immediately before Decode is selected. `None` keeps Decode on full
+    /// context tokens, or on request counts when those are unknown too.
+    pub decode_context: Option<&'a HashMap<String, u64>>,
     pub route: &'a str,
+    /// True when this admission is a health probe: it takes a pair but starts
+    /// no sequence, so it must not reserve Decode occupancy.
+    pub probe: bool,
+}
+
+/// Prompt tokens a Prefill decision established, including credited prefix.
+fn prompt_tokens(prefill: &StageDecision) -> Option<u64> {
+    prefill
+        .new_prefill_tokens
+        .map(|new| new.saturating_add(prefill.credited_prefix_tokens.unwrap_or(0)))
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +239,7 @@ pub struct PdLoadManager {
 
 impl PdLoadManager {
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn snapshot(&self) -> Loads {
         self.loads.lock().clone()
     }
@@ -199,11 +249,25 @@ impl PdLoadManager {
     ///
     /// Both stages are charged here. Callers that dispatch Decode only after
     /// Prefill completes use [`Self::admit_deferred`] instead.
+    #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn admit(
         &self,
         select: impl FnOnce(&Loads) -> Option<PdSelection>,
     ) -> Option<(PdSelection, PdAttempt)> {
-        self.admit_inner(select, false)
+        self.admit_inner(select, true)
+    }
+
+    /// Admission with Decode occupancy charged now or left to the deferred
+    /// commit. A probe reserves nothing (`reserve_decode = false`): it takes a
+    /// pair but starts no sequence, so booking Decode for it would flip the
+    /// whole pool to request counts for the length of every probe.
+    pub(super) fn admit_with(
+        &self,
+        select: impl FnOnce(&Loads) -> Option<PdSelection>,
+        reserve_decode: bool,
+    ) -> Option<(PdSelection, PdAttempt)> {
+        self.admit_inner(select, reserve_decode)
     }
 
     /// Admit the Prefill stage only and leave the Decode commitment open.
@@ -216,18 +280,19 @@ impl PdLoadManager {
         &self,
         select: impl FnOnce(&Loads) -> Option<PdSelection>,
     ) -> Option<(PdSelection, PdAttempt)> {
-        self.admit_inner(select, true)
+        self.admit_inner(select, false)
     }
 
     fn admit_inner(
         &self,
         select: impl FnOnce(&Loads) -> Option<PdSelection>,
-        defer_decode: bool,
+        charge_decode: bool,
     ) -> Option<(PdSelection, PdAttempt)> {
         let mut loads = self.loads.lock();
         let selection = select(&loads)?;
         let prefill = &selection.prefill;
         let decode = &selection.decode;
+        let prompt = prompt_tokens(prefill);
         // Neither stage is charged until both selections have succeeded.
         let p = loads
             .entry((Stage::Prefill, prefill.endpoint.clone()))
@@ -240,13 +305,15 @@ impl PdLoadManager {
         }
         p.publish(Stage::Prefill, &prefill.endpoint);
         let now = std::time::Instant::now();
-        let (decode_endpoint, affinity, decode_state, pending_since) = if defer_decode {
-            (None, None, DecodeState::Unbound, None)
-        } else {
+        let (decode_endpoint, affinity, decode_state, pending_since) = if charge_decode {
             let d = loads
                 .entry((Stage::Decode, decode.endpoint.clone()))
                 .or_default();
             d.pending_decode_requests += 1;
+            match prompt {
+                Some(tokens) => d.pending_decode_tokens += tokens,
+                None => d.unknown_decode_requests += 1,
+            }
             d.publish(Stage::Decode, &decode.endpoint);
             (
                 Some(decode.endpoint.clone()),
@@ -254,6 +321,8 @@ impl PdLoadManager {
                 DecodeState::Pending,
                 Some(now),
             )
+        } else {
+            (None, None, DecodeState::Unbound, None)
         };
         let attempt = PdAttempt(Arc::new(AttemptInner {
             admitted_at: now,
@@ -262,6 +331,7 @@ impl PdLoadManager {
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_tokens: selection.prefill.new_prefill_tokens,
+            decode_prompt_tokens: prompt,
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: decode_state,
@@ -296,6 +366,13 @@ impl PdLoadManager {
             .entry((Stage::Decode, decision.endpoint.clone()))
             .or_default();
         d.pending_decode_requests += 1;
+        // The request's logical context is the prompt it carries: shared prefix blocks are
+        // counted once per request, never once per block and never once per sequence -
+        // sequences share that copy, which is what makes this a physical KV approximation.
+        match inner.decode_prompt_tokens {
+            Some(tokens) => d.pending_decode_tokens += tokens,
+            None => d.unknown_decode_requests += 1,
+        }
         d.publish(Stage::Decode, &decision.endpoint);
         state.decode_endpoint = Some(decision.endpoint.clone());
         state.affinity = decision.affinity.clone();
@@ -327,6 +404,7 @@ impl PdLoadManager {
             p.publish(Stage::Prefill, &prefill);
             let d = loads.entry((Stage::Decode, decode.clone())).or_default();
             d.pending_decode_requests += 1;
+            d.unknown_decode_requests += 1;
             d.publish(Stage::Decode, &decode);
         }
         let attempt = PdAttempt(Arc::new(AttemptInner {
@@ -336,6 +414,11 @@ impl PdLoadManager {
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_tokens: None,
+            // The prompt length is unknown here, so the Decode charge is
+            // unknown too and the pool stays on request counts for this
+            // attempt.
+            decode_prompt_tokens: None,
+
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: DecodeState::Pending,
@@ -377,9 +460,29 @@ struct AttemptInner {
     prefill_worker: Mutex<Option<Arc<dyn Worker>>>,
     decode_worker: Mutex<Option<Arc<dyn Worker>>>,
     prefill_tokens: Option<u64>,
+    /// Prompt length this attempt will hold on a Decode engine, counted once per request:
+    /// the request's sequences share one copy of those blocks. `None` when the prompt was
+    /// never measured.
+    decode_prompt_tokens: Option<u64>,
+
     /// Guards every stage transition and the decode fields below, so a commit
     /// and a release cannot interleave halfway through.
     state: Mutex<AttemptState>,
+}
+
+impl AttemptInner {
+    /// Tokens this attempt charged to a Decode engine, derived from the prompt length it
+    /// recorded at admission. Deriving instead of mirroring removes two fields that had to
+    /// stay in step with an immutable one.
+    fn decode_charge(&self) -> u64 {
+        self.decode_prompt_tokens.unwrap_or(0)
+    }
+
+    /// Whether this attempt charged as an unknown-length Decode request, which the release
+    /// must undo exactly once.
+    fn decode_unknown(&self) -> bool {
+        self.decode_prompt_tokens.is_none()
+    }
 }
 
 impl AttemptInner {
@@ -422,6 +525,9 @@ impl AttemptInner {
             .expect("admitted decode");
         load.pending_decode_requests -= 1;
         load.active_decode_requests += 1;
+        let tokens = self.decode_charge();
+        load.pending_decode_tokens = load.pending_decode_tokens.saturating_sub(tokens);
+        load.active_decode_tokens += tokens;
         load.publish(Stage::Decode, &endpoint);
         if let Some(since) = state.pending_since {
             metrics::histogram!("vllm_router_pd_decode_pending_seconds")
@@ -450,9 +556,22 @@ impl AttemptInner {
         let key = (Stage::Decode, endpoint.clone());
         if let Some(load) = loads.get_mut(&key) {
             match state.decode {
-                DecodeState::Pending => load.pending_decode_requests -= 1,
-                DecodeState::Active => load.active_decode_requests -= 1,
+                DecodeState::Pending => {
+                    load.pending_decode_requests -= 1;
+                    let tokens = self.decode_charge();
+                    load.pending_decode_tokens = load.pending_decode_tokens.saturating_sub(tokens);
+                }
+                DecodeState::Active => {
+                    load.active_decode_requests -= 1;
+                    let tokens = self.decode_charge();
+                    load.active_decode_tokens = load.active_decode_tokens.saturating_sub(tokens);
+                }
                 DecodeState::Unbound | DecodeState::Finished => unreachable!(),
+            }
+            // Undo the unknown-length charge too, or this attempt keeps the pool on
+            // request counts after it has already finished.
+            if self.decode_unknown() {
+                load.unknown_decode_requests = load.unknown_decode_requests.saturating_sub(1);
             }
             load.publish(Stage::Decode, &endpoint);
             if load.idle() {
@@ -536,6 +655,7 @@ impl PdAttempt {
 
     /// Committed decode endpoint, or `None` while the commitment is deferred.
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn decode_endpoint(&self) -> Option<PdEndpoint> {
         self.0.state.lock().decode_endpoint.clone()
     }
@@ -586,6 +706,7 @@ impl PdAttempt {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::fmt;
