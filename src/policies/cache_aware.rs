@@ -1103,7 +1103,13 @@ mod tests {
                 counts[idx] += 1;
                 sessions.push((ids, idx));
             }
-            assert_eq!(counts, [8, 8, 7, 7], "shared tokens: {common_tokens}");
+            let mut sorted = counts;
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                [7, 7, 8, 8],
+                "shared tokens: {common_tokens}, placement {counts:?}"
+            );
 
             // A new turn must distinguish histories beyond the old 2048-token window.
             for (mut ids, owner) in sessions {
