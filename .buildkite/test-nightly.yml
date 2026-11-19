@@ -271,6 +271,9 @@ steps:
     mirror_hardwares: mi300_2
     command: |
       bash -euo pipefail <<'BASH'
+      EVIDENCE_DIR=/workdir/target/ci-logs/kv-aware-rocm
+      rm -rf "$$EVIDENCE_DIR"
+      mkdir -p "$$EVIDENCE_DIR"
       timeout --signal=TERM --kill-after=30s 600 bash .buildkite/scripts/install_packages.sh router-bin
       # Pin the dependency versions resolved during manual validation against
       # this image digest; they are installed packages, not image assertions.
@@ -287,9 +290,7 @@ steps:
       export KV_AWARE_E2E_MODEL=Qwen/Qwen3-0.6B
       export KV_AWARE_KV_EVENTS=1 KV_AWARE_KV_EVENTS_REPLAY=1
       export KV_AWARE_WORKER_SERVE_EXTRA="--enable-prefix-caching --enable-log-requests --enforce-eager --gpu-memory-utilization 0.4 --max-model-len 4096"
-      export TMPDIR=/workdir/target/ci-logs/kv-aware-rocm
-      rm -rf "$$TMPDIR"
-      mkdir -p "$$TMPDIR"
+      export TMPDIR="$$EVIDENCE_DIR"
       timeout --signal=TERM --kill-after=120s 1800 \
         python3 -m pytest tests/python/e2e/function/kv_aware/test_kv_aware_prefix_cache.py \
         --confcutdir=tests/python/e2e/function/kv_aware \

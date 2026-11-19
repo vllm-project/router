@@ -1,13 +1,28 @@
 """CPU checks for the functional E2E worker process boundary."""
 
 import os
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+import yaml
 
 from tests.python.e2e.function.helpers import launch
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_rocm_lane_invalidates_evidence_before_setup():
+    pipeline = yaml.safe_load((ROOT / ".buildkite/test-nightly.yml").read_text())
+    command = next(
+        step["command"]
+        for step in pipeline["steps"]
+        if isinstance(step, dict) and step.get("key") == "rocm-kv-aware-e2e"
+    )
+    cleanup = command.index('rm -rf "$$EVIDENCE_DIR"')
+    assert cleanup < command.index("install_packages.sh router-bin")
+    assert cleanup < command.index("python3 -m pip install")
 
 
 @pytest.mark.parametrize(
