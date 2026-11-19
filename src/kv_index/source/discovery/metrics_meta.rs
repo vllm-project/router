@@ -26,7 +26,7 @@ pub(crate) struct EngineCacheConfig {
 impl EngineCacheConfig {
     /// Effective attention unit, or the configured unit when absent.
     pub(crate) fn hash_unit(&self) -> Option<u32> {
-        self.effective_attention_block_size.or(self.block_size)
+        super::effective_block_size(self.effective_attention_block_size, self.block_size)
     }
 }
 
@@ -61,20 +61,18 @@ pub(crate) fn parse_cache_config_info(text: &str) -> BTreeMap<u32, EngineCacheCo
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(0);
         let entry = engines.entry(engine).or_default();
-        entry.block_size = positive(labels.get("block_size"));
-        entry.effective_attention_block_size =
-            positive(labels.get("effective_attention_block_size"));
+        entry.block_size = labels
+            .get("block_size")
+            .and_then(|value| value.parse().ok());
+        entry.effective_attention_block_size = labels
+            .get("effective_attention_block_size")
+            .and_then(|value| value.parse().ok());
         entry.kv_cache_layout = labels
             .get("kv_cache_layout")
             .filter(|layout| !is_unset(layout))
             .cloned();
     });
     engines
-}
-
-fn positive(value: Option<&String>) -> Option<u32> {
-    let value = value?;
-    value.parse::<u32>().ok().filter(|size| *size > 0)
 }
 
 /// vLLM serializes an unset `CacheConfig` field as the string `None`.

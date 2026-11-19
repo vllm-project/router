@@ -39,8 +39,8 @@ pub use source::events::event_stream::{
 pub use source::SourceError;
 pub use storage::KvBlockIndexer;
 pub use types::{
-    CacheOwnerId, ClearScope, HashMode, Locality, ResidencyOwner, RoutableTarget, SourceId,
-    StorageTier, TierMatch,
+    CacheOwnerId, ClearScope, Locality, ResidencyOwner, RoutableTarget, SourceId, StorageTier,
+    TierMatch,
 };
 pub use wire::{AllBlocksCleared, BlockRemoved, BlockStored, KVEvent, KVEventBatch};
 

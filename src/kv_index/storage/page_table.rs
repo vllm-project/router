@@ -1,12 +1,17 @@
 //! Hash-addressed page facts; reverse memberships live in the source transaction.
 
 use std::borrow::{Borrow, Cow};
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
-use super::records::Residency;
-use super::*;
+use dashmap::DashMap;
 use hashbrown::hash_map::EntryRef;
+
+use super::{records::Residency, Fast, PageWriteError, SourceLock, SourceVersion};
+use crate::kv_hash::SequenceHash;
+use crate::kv_index::types::{ResidencyOwner, RoutableTarget, StorageTier, TierBits};
 
 #[derive(PartialEq, Eq)]
 struct PageKey {
@@ -55,7 +60,8 @@ impl From<&str> for Namespace {
     }
 }
 
-type Namespaces<T> = hashbrown::HashMap<Namespace, T, Fast>;
+// Store borrows the namespace and owner keys before allocating them on a miss.
+type Namespaces = hashbrown::HashMap<Namespace, Pages, Fast>;
 pub(super) type ActivePages = hashbrown::HashMap<Arc<ResidencyOwner>, OwnerPages, Fast>;
 
 struct PageOwner {
@@ -155,7 +161,7 @@ impl Holders {
 pub(super) struct OwnerPages {
     owner: Arc<PageOwner>,
     base: Pages,
-    named: Namespaces<Pages>,
+    named: Namespaces,
     // Count non-device tier claims, including named pages and mixed-tier pages.
     non_device_tiers: usize,
 }
@@ -673,7 +679,7 @@ impl PageTable {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::kv_index::{CacheGroup, GroupRule};
+    use crate::kv_index::{CacheGroup, GroupRule, KvBlockIndexer};
 
     fn owner(name: &str) -> ResidencyOwner {
         ResidencyOwner::Worker {

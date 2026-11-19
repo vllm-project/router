@@ -46,7 +46,8 @@ pub(super) struct LifecycleState {
     pub(super) info: Option<WorkerKvInfo>,
     pub(super) base_models: HashSet<String>,
     pub(super) descriptor: Option<WorkerDescriptor>,
-    pub(super) checked: Instant,
+    // None schedules immediate descriptor discovery after a layout change.
+    pub(super) checked: Option<Instant>,
     pub(super) probe_failures: u8,
     pub(super) trusted: bool,
     pub(super) verified_at: Instant,
@@ -74,7 +75,7 @@ impl WorkerLifecycle {
                 info: None,
                 base_models: HashSet::new(),
                 descriptor,
-                checked: Instant::now(),
+                checked: Some(Instant::now()),
                 probe_failures: 0,
                 trusted: true,
                 verified_at: Instant::now(),
@@ -101,12 +102,14 @@ impl WorkerLifecycle {
 
     pub(super) fn refresh_due(&self) -> bool {
         let state = self.state.lock();
-        state.checked.elapsed()
-            >= if state.info.is_some() && (!self.layout || self.trusted(&state)) {
+        state.checked.is_none_or(|checked| {
+            let interval = if state.info.is_some() && (!self.layout || self.trusted(&state)) {
                 REFRESH_INTERVAL
             } else {
                 CONTROL_TIMEOUT
-            }
+            };
+            checked.elapsed() >= interval
+        })
     }
 
     pub(super) fn layout_rebind_due(&self) -> bool {
@@ -114,13 +117,16 @@ impl WorkerLifecycle {
             return false;
         }
         let state = self.state.lock();
-        !state.trusted && state.checked.elapsed() >= CONTROL_TIMEOUT
+        !state.trusted
+            && state
+                .checked
+                .is_none_or(|checked| checked.elapsed() >= CONTROL_TIMEOUT)
     }
 
     /// Descriptor probes run every 30s; three failures retire an installed owner.
     pub(super) fn observe_descriptor(&self, descriptor: Option<&WorkerDescriptor>) -> SourceAction {
         let mut state = self.state.lock();
-        state.checked = Instant::now();
+        state.checked = Some(Instant::now());
         match descriptor {
             Some(descriptor)
                 if state.info.is_some()
@@ -157,7 +163,9 @@ impl WorkerLifecycle {
     pub(super) fn observe_layout(&self, outcome: &StaticHybridMatch) -> SourceAction {
         let mut state = self.state.lock();
         if !self.active.load(Ordering::Acquire) || !probe_keeps_trust(outcome) {
-            self.active.store(false, Ordering::Release);
+            if self.active.swap(false, Ordering::AcqRel) {
+                state.checked = None;
+            }
             state.trusted = false;
             state.base_models.clear();
             if state.info.take().is_some() {

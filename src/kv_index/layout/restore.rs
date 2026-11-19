@@ -76,7 +76,8 @@ pub(super) fn restore_boundary(
                 max_reusable_tokens.saturating_add(drop_unit)
             };
             let proof = cursors[index].predecessor(lookup_cap);
-            // vLLM drops the last unit even when the dense hit ends below the cap.
+            // vLLM's FullAttentionManager drops one unit even below the cap.
+            // https://github.com/vllm-project/vllm/blob/v0.33.0/vllm/v1/core/single_type_kv_cache_manager.py#L825-L835
             Some((index, proof, proof.saturating_sub(drop_unit)))
         }
     };

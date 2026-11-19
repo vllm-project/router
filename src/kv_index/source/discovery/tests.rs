@@ -64,6 +64,23 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
     assert!(!provider.is_trusted());
 }
 
+#[test]
+fn changed_layout_rebinds_without_waiting_for_the_descriptor_interval() {
+    let active = Arc::new(AtomicBool::new(true));
+    let lifecycle = WorkerLifecycle::new(active, true, None);
+    assert!(!lifecycle.layout_rebind_due());
+    assert_eq!(
+        lifecycle.observe_layout(&StaticHybridMatch::Differs),
+        SourceAction::Stop
+    );
+    assert!(lifecycle.layout_rebind_due());
+    assert!(lifecycle.refresh_due());
+
+    assert_eq!(lifecycle.observe_descriptor(None), SourceAction::Keep);
+    assert!(!lifecycle.layout_rebind_due());
+    assert!(!lifecycle.refresh_due());
+}
+
 use super::lifecycle::SourceAction;
 use super::probe::{grpc_kv_event_source_entries, worker_descriptor};
 use super::reconcile::{bound_source_moved, probe_keeps_trust, probe_renews_trust, BoundSource};
@@ -336,19 +353,19 @@ fn warnings_name_the_transport_that_was_probed() {
 
 #[test]
 fn zero_block_size_is_treated_as_missing() {
-    let server_info = ServerInfo {
-        kv_block_size: Some(0),
-        effective_attention_block_size: Some(16),
-        ..Default::default()
-    };
-    assert_eq!(discovered_block_size(&server_info), Some(16));
-
-    let server_info = ServerInfo {
-        kv_block_size: Some(0),
-        effective_attention_block_size: Some(0),
-        ..Default::default()
-    };
-    assert_eq!(discovered_block_size(&server_info), None);
+    for (configured, effective, expected) in [
+        (8, 16, Some(16)),
+        (0, 16, Some(16)),
+        (8, 0, Some(8)),
+        (0, 0, None),
+    ] {
+        let server_info = ServerInfo {
+            kv_block_size: Some(configured),
+            effective_attention_block_size: Some(effective),
+            ..Default::default()
+        };
+        assert_eq!(discovered_block_size(&server_info), expected);
+    }
 }
 
 #[test]
@@ -1026,7 +1043,7 @@ async fn exercise_static_hybrid(pd: bool) {
     assert!(provider.matches(&prompt, 528, None, 0).is_empty());
     if pd {
         let revision = supervisor.worker_registrations()[&worker_url].revision;
-        hybrid.lifecycle.state.lock().checked = Instant::now() - Duration::from_secs(30);
+        hybrid.lifecycle.state.lock().checked = Some(Instant::now() - Duration::from_secs(30));
         let refreshed = supervisor
             .refresh_workers(&HashSet::from([worker_url.clone()]))
             .await;
@@ -1707,7 +1724,7 @@ async fn metrics_only_worker_supplies_cache_metadata() {
         .await
         .unwrap();
     assert_eq!(info.kv_block_size, Some(16));
-    assert_eq!(info.effective_attention_block_size, Some(16));
+    assert_eq!(discovered_block_size(&info), Some(16));
     assert_eq!(info.model_id.as_deref(), Some("mock-model"));
     server.abort();
 }
@@ -1861,7 +1878,7 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
     let bases = HashSet::from([base.clone()]);
     let rewind = || {
         supervisor.lifecycles.lock()[&base].state.lock().checked =
-            Instant::now() - REFRESH_INTERVAL - CONTROL_TIMEOUT;
+            Some(Instant::now() - REFRESH_INTERVAL - CONTROL_TIMEOUT);
     };
     let initial = supervisor.refresh_workers(&bases).await;
     assert!(initial[&base].info.is_some());

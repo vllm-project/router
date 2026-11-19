@@ -457,7 +457,6 @@ async fn query_metrics_metadata(
         model_id,
         model_path: model_path.flatten(),
         kv_block_size: hash_unit,
-        effective_attention_block_size: hash_unit,
         ..Default::default()
     })
 }

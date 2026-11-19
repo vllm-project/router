@@ -89,24 +89,6 @@ impl ResidencyOwner {
 /// Names one event source — a worker publisher.
 pub type SourceId = Arc<str>;
 
-/// Compatibility values for the advisory KV event observer configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HashMode {
-    PythonHashSeed,
-    Sha256,
-    XxhashCbor,
-}
-
-impl HashMode {
-    pub fn parse_config(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "python_hash_seed" | "pythonhashseed" => Self::PythonHashSeed,
-            "xxhash_cbor" | "xxhashcbor" => Self::XxhashCbor,
-            _ => Self::Sha256,
-        }
-    }
-}
-
 /// Storage medium holding a residency. Decoded from the engine `medium` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StorageTier {

@@ -17,7 +17,7 @@ use crate::config::StaticKvEventSources;
 use crate::kv_index::storage::KvBlockIndexer;
 use crate::kv_index::EventSubscriberHandle;
 use crate::kv_index::{CacheCapabilities, GroupCapability, RankCapability};
-use crate::kv_index::{HashMode, IngestionSignal, SourceId};
+use crate::kv_index::{IngestionSignal, SourceId};
 use crate::protocols::worker_spec::ServerInfo;
 
 mod lifecycle;
@@ -179,14 +179,7 @@ impl std::fmt::Debug for KvIndexSupervisor {
 }
 
 impl KvIndexSupervisor {
-    /// Observe event continuity for existing advisory clients.
-    pub fn new(
-        client: reqwest::Client,
-        _hash_mode: HashMode,
-    ) -> (Self, mpsc::Receiver<IngestionSignal>) {
-        Self::new_observer(client)
-    }
-
+    /// Observe event continuity without decoding cache identities.
     pub(crate) fn new_observer(client: reqwest::Client) -> (Self, mpsc::Receiver<IngestionSignal>) {
         let (mut supervisor, signals) = Self::indexed(client);
         supervisor.observers = Some(Mutex::new(HashMap::new()));
@@ -743,18 +736,11 @@ async fn discover_full_attention_http_worker(
 
 fn native_worker_discovery(
     worker_url: &str,
-    mut server_info: Result<ServerInfo, String>,
+    server_info: Result<ServerInfo, String>,
     sources: Result<KvEventSourcesResponse, SourcesUnavailable>,
     model_id: Result<Option<String>, String>,
     layout: Result<Option<CacheCapabilities>, String>,
 ) -> WorkerDiscovery {
-    // Both native full-attention admission and policy scoring use the engine's
-    // effective attention unit when it differs from the configured size.
-    if let Ok(info) = &mut server_info {
-        if let Some(size) = info.effective_attention_block_size.filter(|size| *size > 0) {
-            info.kv_block_size = Some(size);
-        }
-    }
     let (hybrid, assumed_plain_full) = match (&server_info, &sources, &model_id, layout) {
         (Ok(info), Ok(sources), Ok(Some(model)), Ok(Some(layout))) => {
             let engine_model = layout_model(info, model, &layout);
@@ -978,14 +964,16 @@ fn worker_host(worker_url: &str) -> Option<String> {
 }
 
 fn discovered_block_size(server_info: &ServerInfo) -> Option<u32> {
-    server_info
-        .kv_block_size
-        .filter(|size| *size > 0)
-        .or_else(|| {
-            server_info
-                .effective_attention_block_size
-                .filter(|size| *size > 0)
-        })
+    effective_block_size(
+        server_info.effective_attention_block_size,
+        server_info.kv_block_size,
+    )
+}
+
+fn effective_block_size(effective: Option<u32>, configured: Option<u32>) -> Option<u32> {
+    effective
+        .filter(|&size| size != 0)
+        .or_else(|| configured.filter(|&size| size != 0))
 }
 
 mod metrics_meta;
