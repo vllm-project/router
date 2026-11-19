@@ -503,6 +503,7 @@ mod tests {
             "http://worker1:8080".to_string(),
             labels,
             CircuitBreakerConfig::default(),
+            None,
         );
 
         // Register worker (WorkerFactory returns Box<dyn Worker>, convert to Arc)
@@ -536,6 +537,7 @@ mod tests {
             "http://worker1:8080".to_string(),
             labels1,
             CircuitBreakerConfig::default(),
+            None,
         );
 
         let mut labels2 = HashMap::new();
@@ -544,6 +546,7 @@ mod tests {
             "http://worker2:8080".to_string(),
             labels2,
             CircuitBreakerConfig::default(),
+            None,
         );
 
         let mut labels3 = HashMap::new();
@@ -552,6 +555,7 @@ mod tests {
             "http://worker3:8080".to_string(),
             labels3,
             CircuitBreakerConfig::default(),
+            None,
         );
 
         // Register workers

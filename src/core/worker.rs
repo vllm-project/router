@@ -755,9 +755,11 @@ impl WorkerFactory {
         url: String,
         labels: std::collections::HashMap<String, String>,
         circuit_breaker_config: CircuitBreakerConfig,
+        api_key: Option<Arc<str>>,
     ) -> Box<dyn Worker> {
         let mut worker = BasicWorker::new(url.clone(), WorkerType::Regular)
-            .with_circuit_breaker_config(circuit_breaker_config);
+            .with_circuit_breaker_config(circuit_breaker_config)
+            .with_worker_api_key(api_key);
 
         // Add labels to metadata
         worker.metadata.labels = labels;
@@ -771,9 +773,11 @@ impl WorkerFactory {
         bootstrap_port: Option<u16>,
         labels: std::collections::HashMap<String, String>,
         circuit_breaker_config: CircuitBreakerConfig,
+        api_key: Option<Arc<str>>,
     ) -> Box<dyn Worker> {
         let mut worker = BasicWorker::new(url.clone(), WorkerType::Prefill { bootstrap_port })
-            .with_circuit_breaker_config(circuit_breaker_config);
+            .with_circuit_breaker_config(circuit_breaker_config)
+            .with_worker_api_key(api_key);
 
         // Add labels to metadata
         worker.metadata.labels = labels;
@@ -786,9 +790,11 @@ impl WorkerFactory {
         url: String,
         labels: std::collections::HashMap<String, String>,
         circuit_breaker_config: CircuitBreakerConfig,
+        api_key: Option<Arc<str>>,
     ) -> Box<dyn Worker> {
         let mut worker = BasicWorker::new(url.clone(), WorkerType::Decode)
-            .with_circuit_breaker_config(circuit_breaker_config);
+            .with_circuit_breaker_config(circuit_breaker_config)
+            .with_worker_api_key(api_key);
 
         // Add labels to metadata
         worker.metadata.labels = labels;

@@ -520,6 +520,7 @@ fn build_dp_workers(
     worker_type: WorkerType,
     circuit_breaker_config: &CircuitBreakerConfig,
     health_config: Option<&HealthConfig>,
+    api_key: Option<Arc<str>>,
 ) -> Result<Vec<Arc<dyn Worker>>, String> {
     let (base_url, _) = dp_utils::parse_worker_url(url);
 
@@ -527,7 +528,8 @@ fn build_dp_workers(
     // IPv6+DP URL corruption where HTTP clients read @N as userinfo (RFC 3986).
     let dp_worker = |rank: usize| -> Arc<dyn Worker> {
         let worker = DPAwareWorker::new(base_url.clone(), rank, dp_size, worker_type.clone())
-            .with_circuit_breaker_config(circuit_breaker_config.clone());
+            .with_circuit_breaker_config(circuit_breaker_config.clone())
+            .with_worker_api_key(api_key.clone());
         let worker = match health_config {
             Some(config) => worker.with_health_config(config.clone()),
             None => worker,
@@ -542,7 +544,8 @@ fn build_dp_workers(
             None => {
                 let worker = BasicWorker::new(url.to_string(), worker_type.clone())
                     .with_dp_size(dp_size)
-                    .with_circuit_breaker_config(circuit_breaker_config.clone());
+                    .with_circuit_breaker_config(circuit_breaker_config.clone())
+                    .with_worker_api_key(api_key.clone());
                 let worker = match health_config {
                     Some(config) => worker.with_health_config(config.clone()),
                     None => worker,
@@ -767,8 +770,7 @@ impl PdRouterBase {
             &[url.to_string()],
             self.worker_startup_timeout_secs,
             self.worker_startup_check_interval_secs,
-            // PD health checks do not send the API key yet.
-            None,
+            self.api_key.as_deref(),
         )
         .await
         .map_err(|_| PDRouterError::HealthCheckFailed {
@@ -985,6 +987,7 @@ impl PdRouterBase {
             worker_type,
             &self.circuit_breaker_config,
             None,
+            self.api_key.as_deref().map(Arc::from),
         )
         .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
@@ -1175,10 +1178,6 @@ impl PdRouterBase {
             window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
-        if ctx.router_config.api_key.is_some() {
-            warn!("--api-key is not applied to P/D worker health checks yet");
-        }
-
         // Workers must be up before they can report their engine count.
         let prefill_base_urls: Vec<String> =
             prefill_urls.iter().map(|(url, _)| url.clone()).collect();
@@ -1188,8 +1187,7 @@ impl PdRouterBase {
                     urls,
                     ctx.router_config.worker_startup_timeout_secs,
                     ctx.router_config.worker_startup_check_interval_secs,
-                    // PD health checks do not send the API key yet.
-                    None,
+                    ctx.router_config.api_key.as_deref(),
                 )
                 .await?;
             }
@@ -1203,6 +1201,7 @@ impl PdRouterBase {
             failure_threshold: ctx.router_config.health_check.failure_threshold,
             success_threshold: ctx.router_config.health_check.success_threshold,
         };
+        let worker_api_key: Option<Arc<str>> = ctx.router_config.api_key.as_deref().map(Arc::from);
 
         let prefill_workers = prefill_urls.iter().map(|(url, bootstrap_port)| {
             (
@@ -1221,6 +1220,7 @@ impl PdRouterBase {
                 worker_type,
                 &core_cb_config,
                 Some(&health_config),
+                worker_api_key.clone(),
             )? {
                 ctx.worker_registry.register(worker);
             }
@@ -1874,6 +1874,128 @@ mod tests {
         let worker = BasicWorker::new(url, worker_type);
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    async fn start_health_auth_mock_server(
+        api_key: Option<&str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{http::header::AUTHORIZATION, routing::get, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let expected = api_key.map(|key| format!("Bearer {key}"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = AxumRouter::new().route(
+            "/health",
+            get(move |headers: HeaderMap| async move {
+                let sent = headers.get(AUTHORIZATION).map(|value| value.as_bytes());
+                if sent == expected.as_deref().map(str::as_bytes) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    #[tokio::test]
+    async fn test_pd_health_checks_send_api_key() {
+        use crate::config::RouterConfig;
+        use crate::server::AppContext;
+
+        let (prefill_url, prefill_server) = start_health_auth_mock_server(Some("worker-key")).await;
+        let (decode_url, decode_server) = start_health_auth_mock_server(Some("worker-key")).await;
+        let config = RouterConfig {
+            api_key: Some("worker-key".to_string()),
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 2,
+            ..Default::default()
+        };
+        let ctx = Arc::new(AppContext::new(config, Client::new(), 10, None, vec![]).unwrap());
+        PdRouterBase::new(
+            vec![(prefill_url.clone(), None)],
+            vec![decode_url.clone()],
+            &ctx,
+        )
+        .await
+        .expect("P/D startup health should send --api-key");
+
+        let workers = ctx.worker_registry.get_all();
+        assert!(
+            !workers.is_empty(),
+            "runtime workers must exist so check_health_async covers more than startup"
+        );
+        for worker in &workers {
+            worker.check_health_async().await.unwrap();
+        }
+
+        prefill_server.abort();
+        decode_server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_pd_health_checks_send_no_authorization_without_api_key() {
+        use crate::config::RouterConfig;
+        use crate::server::AppContext;
+
+        let (prefill_url, prefill_server) = start_health_auth_mock_server(None).await;
+        let (decode_url, decode_server) = start_health_auth_mock_server(None).await;
+        let config = RouterConfig {
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            ..Default::default()
+        };
+        let ctx = Arc::new(AppContext::new(config, Client::new(), 10, None, vec![]).unwrap());
+        PdRouterBase::new(vec![(prefill_url, None)], vec![decode_url], &ctx)
+            .await
+            .expect("P/D startup health should omit Authorization when --api-key is unset");
+
+        prefill_server.abort();
+        decode_server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_pd_startup_reports_rejected_api_key() {
+        use crate::config::RouterConfig;
+        use crate::server::AppContext;
+
+        let (url, server) = start_health_auth_mock_server(Some("worker-key")).await;
+        let config = RouterConfig {
+            api_key: Some("other-key".to_string()),
+            worker_startup_timeout_secs: 1,
+            worker_startup_check_interval_secs: 1,
+            ..Default::default()
+        };
+        let ctx = Arc::new(AppContext::new(config, Client::new(), 10, None, vec![]).unwrap());
+        let error = PdRouterBase::new(vec![(url, None)], vec![], &ctx)
+            .await
+            .unwrap_err();
+        assert!(error.contains("401"), "{error}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_pd_add_server_health_sends_api_key() {
+        let (url, server) = start_health_auth_mock_server(Some("worker-key")).await;
+        let mut router = create_test_pd_router();
+        router.api_key = Some("worker-key".to_string());
+        router
+            .add_prefill_server(url.clone(), None)
+            .await
+            .expect("add_prefill_server health should send --api-key");
+        router
+            .worker_registry
+            .get_by_url(&url)
+            .unwrap()
+            .check_health_async()
+            .await
+            .unwrap();
+        server.abort();
     }
 
     // ============= Worker Management Tests =============

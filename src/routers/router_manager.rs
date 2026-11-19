@@ -184,22 +184,29 @@ impl RouterManager {
             labels.insert("cost".to_string(), cost.to_string());
         }
 
+        // IGW /workers is itself authorized. Operators who set --api-key are
+        // registering a trusted worker fleet, so health checks use the same
+        // backend credential as the regular and P/D routers.
+        let api_key = self.config.api_key.as_deref().map(Arc::from);
         let worker = match config.worker_type.as_deref() {
             Some("prefill") => WorkerFactory::create_prefill_with_labels(
                 config.url.clone(),
                 config.bootstrap_port,
                 labels.clone(),
                 CircuitBreakerConfig::default(),
+                api_key,
             ),
             Some("decode") => WorkerFactory::create_decode_with_labels(
                 config.url.clone(),
                 labels.clone(),
                 CircuitBreakerConfig::default(),
+                api_key,
             ),
             _ => WorkerFactory::create_regular_with_labels(
                 config.url.clone(),
                 labels.clone(),
                 CircuitBreakerConfig::default(),
+                api_key,
             ),
         };
 
@@ -885,5 +892,134 @@ impl std::fmt::Debug for RouterManager {
             .field("workers_count", &self.worker_registry.get_all().len())
             .field("default_router", &*self.default_router.read().unwrap())
             .finish()
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+    use crate::config::RouterConfig;
+    use crate::protocols::worker_spec::WorkerConfigRequest;
+    use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
+    use std::collections::HashMap;
+
+    async fn start_health_auth_mock_server(
+        api_key: Option<&str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::get, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let expected = api_key.map(|key| format!("Bearer {key}"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = AxumRouter::new().route(
+            "/health",
+            get(move |headers: HeaderMap| async move {
+                let sent = headers.get(AUTHORIZATION).map(|value| value.as_bytes());
+                if sent == expected.as_deref().map(str::as_bytes) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    fn worker_request(url: String, worker_type: Option<&str>) -> WorkerConfigRequest {
+        WorkerConfigRequest {
+            url,
+            model_id: Some("test-model".to_string()),
+            priority: None,
+            cost: None,
+            worker_type: worker_type.map(str::to_owned),
+            bootstrap_port: None,
+            labels: HashMap::new(),
+        }
+    }
+
+    async fn assert_igw_health_sends_key(api_key: Option<&str>, worker_type: Option<&str>) {
+        let (url, server) = start_health_auth_mock_server(api_key).await;
+        let config = RouterConfig {
+            api_key: api_key.map(str::to_owned),
+            enable_igw: true,
+            ..Default::default()
+        };
+        let manager = RouterManager::new(
+            config,
+            reqwest::Client::new(),
+            Arc::new(crate::core::WorkerRegistry::new()),
+            Arc::new(crate::policies::PolicyRegistry::new(
+                crate::config::PolicyConfig::RoundRobin,
+            )),
+        );
+        manager
+            .add_worker(worker_request(url.clone(), worker_type))
+            .await
+            .unwrap();
+        manager
+            .worker_registry
+            .get_by_url(&url)
+            .unwrap()
+            .check_health_async()
+            .await
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_igw_regular_health_checks_send_api_key() {
+        assert_igw_health_sends_key(Some("worker-key"), None).await;
+    }
+
+    #[tokio::test]
+    async fn test_igw_prefill_health_checks_send_api_key() {
+        assert_igw_health_sends_key(Some("worker-key"), Some("prefill")).await;
+    }
+
+    #[tokio::test]
+    async fn test_igw_decode_health_checks_send_api_key() {
+        assert_igw_health_sends_key(Some("worker-key"), Some("decode")).await;
+    }
+
+    #[tokio::test]
+    async fn test_igw_health_checks_send_no_authorization_without_api_key() {
+        assert_igw_health_sends_key(None, None).await;
+    }
+
+    #[tokio::test]
+    async fn test_igw_health_checks_reject_mismatched_api_key() {
+        let (url, server) = start_health_auth_mock_server(Some("worker-key")).await;
+        let config = RouterConfig {
+            api_key: Some("other-key".to_string()),
+            enable_igw: true,
+            ..Default::default()
+        };
+        let manager = RouterManager::new(
+            config,
+            reqwest::Client::new(),
+            Arc::new(crate::core::WorkerRegistry::new()),
+            Arc::new(crate::policies::PolicyRegistry::new(
+                crate::config::PolicyConfig::RoundRobin,
+            )),
+        );
+        manager
+            .add_worker(worker_request(url.clone(), None))
+            .await
+            .unwrap();
+        let error = manager
+            .worker_registry
+            .get_by_url(&url)
+            .unwrap()
+            .check_health_async()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("401"), "{error}");
+        server.abort();
     }
 }
