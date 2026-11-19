@@ -327,6 +327,12 @@ ECExampleConnector need no address map. DP=1 keeps the unsuffixed keys shown abo
 The shared P/D discovery path also rejects invalid candidate snapshots instead
 of routing through a partially filtered pool.
 
+For Mooncake PUSH, the startup map fixes the allowed consumer URLs. Runtime
+worker-add operations reject P/PD URLs absent from this map, after DP expansion
+or discovery and before registering any rank. Removing a configured consumer
+and re-adding its original resolved URL(s) is supported. Decode workers and
+address-map-free NIXL PULL/ECExampleConnector registration need no EC mapping.
+
 ```bash
 cargo test --features cpu,ready --test test_pd_routing test_epd_handoff
 ```

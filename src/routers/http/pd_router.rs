@@ -515,6 +515,8 @@ pub struct PdRouterBase {
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub client: Client,
     api_key: Option<String>,
+    // Mooncake EPD permits only consumer URLs present in the startup map.
+    consumer_zmq_addrs: HashMap<String, String>,
     pub circuit_breaker_config: CircuitBreakerConfig,
     // Fallback DP size for servers that report no engine metrics
     pub dp_size: usize,
@@ -993,6 +995,15 @@ impl PdRouterBase {
         )
         .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
+        // Discovery determines the actual rank URLs. Check every Prefill before
+        // registering any of them; Decode workers do not consume embeddings.
+        for worker in &workers {
+            if matches!(worker.worker_type(), WorkerType::Prefill { .. }) {
+                super::epd::validate_consumer_registration(&self.consumer_zmq_addrs, worker.url())
+                    .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
+            }
+        }
+
         if workers
             .iter()
             .any(|worker| self.worker_registry.get_by_url(worker.url()).is_some())
@@ -1258,6 +1269,12 @@ impl PdRouterBase {
             load_monitor_handle,
             client: ctx.client.clone(),
             api_key: ctx.router_config.api_key.clone(),
+            consumer_zmq_addrs: ctx
+                .router_config
+                .epd
+                .as_ref()
+                .map(|config| config.consumer_zmq_addrs.clone())
+                .unwrap_or_default(),
             circuit_breaker_config: core_cb_config,
             dp_size: fallback_dp_size,
         })
@@ -1792,6 +1809,7 @@ mod tests {
             load_monitor_handle: None,
             client: Client::new(),
             api_key: None,
+            consumer_zmq_addrs: HashMap::new(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size: 1,
         }
@@ -1813,6 +1831,7 @@ mod tests {
             load_monitor_handle: None,
             client: Client::new(),
             api_key: None,
+            consumer_zmq_addrs: HashMap::new(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size,
         }

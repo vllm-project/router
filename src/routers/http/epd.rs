@@ -13,6 +13,18 @@ use uuid::Uuid;
 
 type EpdError = (StatusCode, String);
 
+pub(super) fn validate_consumer_registration(
+    consumer_zmq_addrs: &HashMap<String, String>,
+    url: &str,
+) -> Result<(), String> {
+    if !consumer_zmq_addrs.is_empty() && !consumer_zmq_addrs.contains_key(url) {
+        return Err(format!(
+            "Mooncake EPD does not support adding consumer URL {url} outside the startup consumer_zmq_addrs map; only configured consumer URLs can be re-registered"
+        ));
+    }
+    Ok(())
+}
+
 struct MediaItem {
     message_index: usize,
     content_index: usize,
@@ -117,6 +129,10 @@ fn cancel_ec_transfers(control_addr: &str, transfer_ids: &[String]) -> anyhow::R
 }
 
 impl EncoderStage {
+    pub(super) fn validate_consumer_registration(&self, url: &str) -> Result<(), String> {
+        validate_consumer_registration(&self.config.consumer_zmq_addrs, url)
+    }
+
     pub(super) fn validate_consumer_url(&self, url: &str) -> Result<(), String> {
         let consumer_base = super::dp_utils::parse_worker_url(url).0;
         let canonical_consumer = canonical_epd_base_url(&consumer_base);

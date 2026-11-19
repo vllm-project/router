@@ -2234,6 +2234,9 @@ impl Router {
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
         if let Some(epd) = &self.epd {
             epd.validate_consumer_url(worker_url)?;
+            if self.intra_node_data_parallel_size <= 1 {
+                epd.validate_consumer_registration(worker_url)?;
+            }
         }
 
         let mut urls = self.get_worker_urls();
@@ -2282,6 +2285,12 @@ impl Router {
                         )
                         .await
                         .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?;
+                        // Validate the whole batch before any rank or policy is registered.
+                        if let Some(epd) = &self.epd {
+                            for dp_url in &dp_url_vec {
+                                epd.validate_consumer_registration(dp_url)?;
+                            }
+                        }
                         let mut worker_added: bool = false;
                         let mut kv_discovery_attempted = false;
                         let mut kv_info = None;

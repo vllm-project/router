@@ -482,6 +482,219 @@ async fn pd_epd_dp_add_decode_rejects_encode_urls() {
     assert_pd_epd_dp_add_rejects_encode_url(false).await;
 }
 
+async fn assert_mooncake_epd_consumer_registration(pd: bool, dp_size: usize, pinned: bool) {
+    let metrics = (0..dp_size)
+        .map(|rank| format!("vllm:requests{{engine=\"{rank}\"}} 0\n"))
+        .collect::<String>();
+    let backend = Router::new().fallback(move |uri: axum::http::Uri| {
+        let metrics = metrics.clone();
+        async move {
+            if pd && uri.path().ends_with("/metrics") {
+                metrics
+            } else {
+                "ok".into()
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let backend = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    let consumer_base = format!("{base}/consumer");
+    let consumer_url = if pinned {
+        format!("{consumer_base}@0")
+    } else {
+        consumer_base.clone()
+    };
+    let consumer_urls = if pinned || dp_size == 1 {
+        vec![consumer_url.clone()]
+    } else {
+        (0..dp_size)
+            .map(|rank| format!("{consumer_base}@{rank}"))
+            .collect()
+    };
+    let config = RouterConfig {
+        mode: if pd {
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(consumer_url.clone(), None)],
+                decode_urls: vec![format!("{base}/decode")],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            }
+        } else {
+            RoutingMode::Regular {
+                worker_urls: vec![consumer_url.clone()],
+            }
+        },
+        policy: PolicyConfig::RoundRobin,
+        // PD must use the discovered size rather than this fallback.
+        intra_node_data_parallel_size: if pd { 1 } else { dp_size },
+        epd: Some(EpdConfig {
+            encoder_urls: vec![format!("{base}/encoder")],
+            encode_policy: Some(PolicyConfig::RoundRobin),
+            consumer_zmq_addrs: consumer_urls
+                .iter()
+                .map(|url| (url.clone(), "tcp://127.0.0.1:14579".into()))
+                .collect(),
+        }),
+        worker_startup_timeout_secs: 5,
+        ..RouterConfig::default()
+    };
+    ConfigValidator::validate(&config).unwrap();
+    let context =
+        Arc::new(AppContext::new(config, reqwest::Client::new(), 64, None, vec![]).unwrap());
+    let router: Arc<dyn RouterTrait> =
+        Arc::from(RouterFactory::create_router(&context).await.unwrap());
+    let app = build_app_with_request_tracing(
+        Arc::new(AppState {
+            router: router.clone(),
+            context: context.clone(),
+            concurrency_queue_tx: None,
+            router_manager: None,
+        }),
+        1024 * 1024,
+        vec![],
+        vec![],
+        false,
+        false,
+    );
+    let add = |url: &str| {
+        Request::post("/workers")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"url": url, "worker_type": "regular"}).to_string(),
+            ))
+            .unwrap()
+    };
+    let initial_workers = context.worker_registry.get_all();
+    let initial_counts = context.policy_registry.get_worker_counts();
+    let new_url = format!("{base}/new");
+    let error = if pd {
+        let result = router
+            .as_any()
+            .downcast_ref::<VllmPDRouter>()
+            .unwrap()
+            .add_prefill_server(new_url.clone(), None)
+            .await;
+        match result {
+            Err(PDRouterError::InvalidConfiguration { reason }) => reason,
+            other => panic!("must reject an unmapped consumer: {other:?}"),
+        }
+    } else {
+        let response = app.clone().oneshot(add(&new_url)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(error["code"], "ADD_WORKER_FAILED");
+        error["error"].as_str().unwrap().to_owned()
+    };
+    assert!(error.contains("Mooncake EPD"), "{error}");
+    assert!(error.contains("consumer_zmq_addrs"), "{error}");
+    assert!(error.contains(&new_url), "{error}");
+    assert_eq!(
+        context.worker_registry.get_all().len(),
+        initial_workers.len()
+    );
+    assert_eq!(context.policy_registry.get_worker_counts(), initial_counts);
+    for worker in &initial_workers {
+        assert!(Arc::ptr_eq(
+            worker,
+            &context.worker_registry.get_by_url(worker.url()).unwrap()
+        ));
+    }
+
+    // Removing a consumer leaves its startup EC mapping available for rejoining.
+    if pd {
+        router
+            .as_any()
+            .downcast_ref::<VllmPDRouter>()
+            .unwrap()
+            .remove_prefill_server(&consumer_url)
+            .await
+            .unwrap();
+    } else {
+        let encoded_url: String =
+            url::form_urlencoded::byte_serialize(consumer_base.as_bytes()).collect();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/workers/{encoded_url}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    for url in &consumer_urls {
+        assert!(context.worker_registry.get_by_url(url).is_none());
+    }
+
+    if pinned {
+        // @0 has a mapping, but adding the bare URL also introduces unmapped @1.
+        // Reject the entire batch before @0 or policy state can be registered.
+        let removed_count = context.worker_registry.get_all().len();
+        let removed_policy_counts = context.policy_registry.get_worker_counts();
+        let error = if pd {
+            router
+                .as_any()
+                .downcast_ref::<VllmPDRouter>()
+                .unwrap()
+                .add_prefill_server(consumer_base.clone(), None)
+                .await
+                .unwrap_err()
+                .to_string()
+        } else {
+            let response = app.clone().oneshot(add(&consumer_base)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            String::from_utf8(
+                to_bytes(response.into_body(), 16384)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap()
+        };
+        assert!(error.contains(&format!("{consumer_base}@1")), "{error}");
+        assert_eq!(context.worker_registry.get_all().len(), removed_count);
+        assert_eq!(
+            context.policy_registry.get_worker_counts(),
+            removed_policy_counts
+        );
+    }
+
+    if pd {
+        let pd_router = router.as_any().downcast_ref::<VllmPDRouter>().unwrap();
+        pd_router
+            .add_prefill_server(consumer_url.clone(), None)
+            .await
+            .unwrap();
+        // Decode is not an embedding consumer and needs no EC mapping.
+        pd_router.add_decode_server(new_url.clone()).await.unwrap();
+    } else {
+        let response = app.oneshot(add(&consumer_url)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    for url in &consumer_urls {
+        assert!(context.worker_registry.get_by_url(url).is_some());
+    }
+    backend.abort();
+}
+
+#[tokio::test]
+async fn regular_mooncake_epd_runtime_consumers_use_startup_map() {
+    for (dp_size, pinned) in [(1, false), (2, false), (2, true)] {
+        assert_mooncake_epd_consumer_registration(false, dp_size, pinned).await;
+    }
+}
+
+#[tokio::test]
+async fn pd_mooncake_epd_runtime_consumers_use_startup_map() {
+    for (dp_size, pinned) in [(1, false), (2, false), (2, true)] {
+        assert_mooncake_epd_consumer_registration(true, dp_size, pinned).await;
+    }
+}
+
 async fn assert_pd_epd_http_delete_cleans_policy(prefill_first: bool) {
     let cache_config = PolicyConfig::CacheAware {
         cache_threshold: 0.3,
