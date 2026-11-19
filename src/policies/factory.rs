@@ -1,11 +1,15 @@
 //! Factory for creating load balancing policies
 
+use super::kv_transfer_capability::parse_static_capabilities;
+use super::CostRuleTransferPlanner;
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, CostParams, KvAffinityTable,
     KvAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy,
     RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
 };
+use crate::config::types::{KvTransferConfig, KvTransferMode};
 use crate::config::PolicyConfig;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 /// Factory for creating policy instances
@@ -48,6 +52,7 @@ impl PolicyFactory {
                 kv_penalty_host,
                 kv_penalty_external,
                 kv_penalty_disk,
+                kv_transfer,
                 ..
             } => {
                 let mut policy = KvAwarePolicy::new(CostParams {
@@ -63,7 +68,11 @@ impl PolicyFactory {
                 if let Some(table) = kv_affinity_table {
                     policy = policy.with_shared_affinity(Arc::clone(table));
                 }
-                Arc::new(policy)
+                Arc::new(Self::apply_kv_transfer(
+                    policy,
+                    kv_transfer.as_deref(),
+                    None,
+                ))
             }
             PolicyConfig::ConsistentHash { virtual_nodes: _ } => {
                 // Note: virtual_nodes parameter is available but not currently used
@@ -73,6 +82,45 @@ impl PolicyFactory {
             PolicyConfig::StickyLeastLoaded => Arc::new(StickyLeastLoadedPolicy::new()),
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
         }
+    }
+
+    /// Install the transfer planner and static capabilities when the
+    /// config asks for it. Shared by the factory and the registry. With no
+    /// block or `mode: off` the policy is returned untouched.
+    ///
+    /// In active mode, `peer_fetch_enabled` is the kill switch flag to share
+    /// (the registry passes its own so one switch covers every policy it
+    /// builds); `None` gives the policy a flag of its own.
+    pub(crate) fn apply_kv_transfer(
+        policy: KvAwarePolicy,
+        config: Option<&KvTransferConfig>,
+        peer_fetch_enabled: Option<&Arc<AtomicBool>>,
+    ) -> KvAwarePolicy {
+        let Some(config) = config.filter(|c| c.mode != KvTransferMode::Off) else {
+            return policy;
+        };
+        // Validation rejects bad capability tables at startup; a failure here
+        // means the config skipped validation, so fall back to no declarations.
+        let capabilities = match parse_static_capabilities(&config.capabilities) {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                tracing::warn!(%error, "ignoring invalid kv_transfer capabilities");
+                Default::default()
+            }
+        };
+        let policy = policy.with_transfer_planner(Arc::new(CostRuleTransferPlanner {
+            policy: config.transfer_policy(),
+        }));
+        policy.register_static_capabilities(capabilities);
+        if config.mode == KvTransferMode::Active {
+            return match peer_fetch_enabled {
+                Some(flag) => {
+                    policy.with_shared_peer_fetch(config.max_inflight_per_source, Arc::clone(flag))
+                }
+                None => policy.with_peer_fetch(config.max_inflight_per_source),
+            };
+        }
+        policy
     }
 
     /// Create a policy by name (for dynamic loading)
@@ -137,6 +185,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                kv_transfer: None,
             },
             None,
         );
@@ -168,6 +217,7 @@ mod tests {
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.3,
             static_kv_event_sources: Default::default(),
+            kv_transfer: None,
         };
 
         // Without a shared table the factory-built policy must NOT report

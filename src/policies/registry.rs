@@ -6,12 +6,14 @@
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, CostParams, KvAffinityTable,
-    KvAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy,
-    RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
+    KvAwarePolicy, LoadBalancingPolicy, PolicyFactory, PowerOfTwoPolicy, RandomPolicy,
+    RendezvousHashPolicy, RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
 };
-use crate::config::types::PolicyConfig;
+use crate::config::types::{KvTransferConfig, PolicyConfig};
+use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -36,6 +38,43 @@ pub struct PolicyRegistry {
     /// Affinity table shared by every KV-aware policy this registry creates,
     /// bounding affinity state across models.
     kv_affinity_table: Arc<KvAffinityTable>,
+
+    /// `kv_transfer` block of the main `kv_aware` policy config, applied to
+    /// hint-created `kv_aware` policies. `None` when the main policy is not
+    /// `kv_aware` or has no block.
+    kv_transfer: Option<Arc<KvTransferConfig>>,
+
+    /// Active-mode peer fetch kill switch, shared by every active-mode
+    /// `kv_aware` policy this registry builds (the default policy and
+    /// hint-created ones), so one store flips all of them, including
+    /// policies created later. Starts enabled.
+    peer_fetch_enabled: Arc<AtomicBool>,
+
+    /// Serializes kill switch writers, so a write and the status it returns
+    /// (and anything recorded from that status) are one step: two racing
+    /// writers cannot report a state other than the one left in the flag.
+    peer_fetch_lock: Arc<Mutex<()>>,
+}
+
+/// Peer fetch kill switch state, as reported by the admin endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PeerFetchStatus {
+    /// The registry's shared flag.
+    pub enabled: bool,
+    /// Distinct active-mode `kv_aware` policy instances; empty when no
+    /// policy is active.
+    pub policies: Vec<PeerFetchPolicyStatus>,
+}
+
+/// One active-mode `kv_aware` policy instance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PeerFetchPolicyStatus {
+    /// Model ids mapped to this instance, sorted.
+    pub models: Vec<String>,
+    /// Whether this instance is the registry's default policy.
+    pub default: bool,
+    /// Whether this instance currently grants peer fetches.
+    pub enabled: bool,
 }
 
 impl PolicyRegistry {
@@ -50,8 +89,18 @@ impl PolicyRegistry {
         affinity_ttl: Option<Duration>,
     ) -> Self {
         let kv_affinity_table = Arc::new(KvAffinityTable::with_ttl(affinity_ttl));
-        let default_policy =
-            Self::create_policy_from_config(&default_policy_config, &kv_affinity_table);
+        let peer_fetch_enabled = Arc::new(AtomicBool::new(true));
+        let default_policy = Self::create_policy_from_config(
+            &default_policy_config,
+            &kv_affinity_table,
+            &peer_fetch_enabled,
+        );
+        let kv_transfer = match &default_policy_config {
+            PolicyConfig::KvAware { kv_transfer, .. } => {
+                kv_transfer.as_deref().cloned().map(Arc::new)
+            }
+            _ => None,
+        };
 
         Self {
             model_policies: Arc::new(RwLock::new(HashMap::new())),
@@ -60,6 +109,9 @@ impl PolicyRegistry {
             prefill_policy: Arc::new(RwLock::new(None)),
             decode_policy: Arc::new(RwLock::new(None)),
             kv_affinity_table,
+            kv_transfer,
+            peer_fetch_enabled,
+            peer_fetch_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -195,9 +247,11 @@ impl PolicyRegistry {
             "round_robin" => Arc::new(RoundRobinPolicy::new()),
             "random" => Arc::new(RandomPolicy::new()),
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
-            "kv_aware" => Arc::new(
+            "kv_aware" => Arc::new(PolicyFactory::apply_kv_transfer(
                 KvAwarePolicy::default().with_shared_affinity(Arc::clone(&self.kv_affinity_table)),
-            ),
+                self.kv_transfer.as_deref(),
+                Some(&self.peer_fetch_enabled),
+            )),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             "consistent_hash" => Arc::new(ConsistentHashPolicy::new()),
             "sticky_least_loaded" => Arc::new(StickyLeastLoadedPolicy::new()),
@@ -213,6 +267,7 @@ impl PolicyRegistry {
     fn create_policy_from_config(
         config: &PolicyConfig,
         kv_affinity_table: &Arc<KvAffinityTable>,
+        peer_fetch_enabled: &Arc<AtomicBool>,
     ) -> Arc<dyn LoadBalancingPolicy> {
         match config {
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
@@ -238,8 +293,9 @@ impl PolicyRegistry {
                 kv_penalty_host,
                 kv_penalty_external,
                 kv_penalty_disk,
+                kv_transfer,
                 ..
-            } => Arc::new(
+            } => Arc::new(PolicyFactory::apply_kv_transfer(
                 KvAwarePolicy::new(CostParams {
                     router_temperature: *router_temperature,
                     transfer_credits: TransferCredits {
@@ -251,7 +307,9 @@ impl PolicyRegistry {
                     ..CostParams::default()
                 })
                 .with_shared_affinity(Arc::clone(kv_affinity_table)),
-            ),
+                kv_transfer.as_deref(),
+                Some(peer_fetch_enabled),
+            )),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
             PolicyConfig::StickyLeastLoaded => Arc::new(StickyLeastLoadedPolicy::new()),
@@ -271,6 +329,97 @@ impl PolicyRegistry {
     /// Get worker counts per model
     pub fn get_worker_counts(&self) -> HashMap<String, usize> {
         self.model_worker_counts.read().unwrap().clone()
+    }
+
+    /// Runtime kill switch for active-mode peer KV fetch. Stores to the flag
+    /// shared by every active-mode `kv_aware` policy this registry built or
+    /// will build, so it takes effect for selections made after the call;
+    /// in-flight fetches finish normally. Policies not built active are
+    /// unaffected. Returns the resulting status.
+    pub fn set_peer_fetch_enabled(&self, enabled: bool) -> PeerFetchStatus {
+        let _guard = self
+            .peer_fetch_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.peer_fetch_enabled.store(enabled, Ordering::Release);
+        self.peer_fetch_status()
+    }
+
+    /// [`set_peer_fetch_enabled`](Self::set_peer_fetch_enabled), but only
+    /// when at least one policy is in active mode; `None` (flag unchanged)
+    /// otherwise. On success it also sets the
+    /// `vllm_router_kv_transfer_peer_fetch_enabled` gauge and logs the new
+    /// state at warn. The check, the store, the status, the gauge and the
+    /// log happen under one lock, so concurrent callers are applied one after
+    /// the other and the gauge always matches the flag.
+    pub fn set_peer_fetch_enabled_if_active(&self, enabled: bool) -> Option<PeerFetchStatus> {
+        let _guard = self
+            .peer_fetch_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.peer_fetch_status().policies.is_empty() {
+            return None;
+        }
+        self.peer_fetch_enabled.store(enabled, Ordering::Release);
+        let status = self.peer_fetch_status();
+        crate::metrics::RouterMetrics::set_kv_transfer_peer_fetch_enabled(status.enabled);
+        warn!(
+            enabled = status.enabled,
+            "KV transfer peer fetch {} for all active-mode kv_aware policies",
+            if status.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        Some(status)
+    }
+
+    /// The kill switch flag and every distinct active-mode `kv_aware`
+    /// policy instance (default and per-model), with the models mapped to
+    /// each. PD prefill/decode policies are not built by the registry and
+    /// are not listed.
+    pub fn peer_fetch_status(&self) -> PeerFetchStatus {
+        let enabled = self.peer_fetch_enabled.load(Ordering::Acquire);
+        let mut entries: Vec<(Arc<dyn LoadBalancingPolicy>, PeerFetchPolicyStatus)> = Vec::new();
+        let mut add = |policy: &Arc<dyn LoadBalancingPolicy>, model: Option<&str>| {
+            let Some(kv) = policy
+                .as_any()
+                .downcast_ref::<KvAwarePolicy>()
+                .filter(|kv| kv.is_peer_fetch_active_mode())
+            else {
+                return;
+            };
+            let index = match entries.iter().position(|(p, _)| Arc::ptr_eq(p, policy)) {
+                Some(index) => index,
+                None => {
+                    entries.push((
+                        Arc::clone(policy),
+                        PeerFetchPolicyStatus {
+                            models: Vec::new(),
+                            default: Arc::ptr_eq(policy, &self.default_policy),
+                            enabled: kv.peer_fetch_enabled(),
+                        },
+                    ));
+                    entries.len() - 1
+                }
+            };
+            if let Some(model) = model {
+                entries[index].1.models.push(model.to_string());
+            }
+        };
+        add(&self.default_policy, None);
+        for (model, policy) in self.model_policies.read().unwrap().iter() {
+            add(policy, Some(model));
+        }
+        let policies = entries
+            .into_iter()
+            .map(|(_, mut status)| {
+                status.models.sort();
+                status
+            })
+            .collect();
+        PeerFetchStatus { enabled, policies }
     }
 
     /// Mark a session as finished across all registered policies.
@@ -412,5 +561,142 @@ mod tests {
         // Get default directly
         let default = registry.get_default_policy();
         assert_eq!(default.name(), "round_robin");
+    }
+
+    fn kv_aware_main(kv_transfer: Option<crate::config::types::KvTransferConfig>) -> PolicyConfig {
+        PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+            kv_transfer: kv_transfer.map(Box::new),
+        }
+    }
+
+    #[test]
+    fn hint_created_kv_aware_inherits_main_shadow_planner() {
+        use crate::config::types::KvTransferMode::{Off, Shadow};
+        let block = |mode| crate::config::types::KvTransferConfig {
+            mode,
+            ..Default::default()
+        };
+        let cases = [
+            (kv_aware_main(Some(block(Shadow))), true),
+            (kv_aware_main(Some(block(Off))), false),
+            (kv_aware_main(None), false),
+            (PolicyConfig::RoundRobin, false),
+        ];
+        for (main, expect_planner) in cases {
+            let registry = PolicyRegistry::new(main);
+            let policy = registry.on_worker_added("m", Some("kv_aware"));
+            let policy = policy
+                .as_any()
+                .downcast_ref::<KvAwarePolicy>()
+                .expect("kv_aware policy");
+            assert_eq!(policy.has_transfer_planner(), expect_planner);
+        }
+    }
+
+    fn active_block() -> crate::config::types::KvTransferConfig {
+        crate::config::types::KvTransferConfig {
+            mode: crate::config::types::KvTransferMode::Active,
+            ..Default::default()
+        }
+    }
+
+    fn kv(policy: &Arc<dyn LoadBalancingPolicy>) -> &KvAwarePolicy {
+        policy
+            .as_any()
+            .downcast_ref::<KvAwarePolicy>()
+            .expect("kv_aware policy")
+    }
+
+    #[test]
+    fn peer_fetch_flag_is_shared_by_default_and_hint_created_policies() {
+        let registry = PolicyRegistry::new(kv_aware_main(Some(active_block())));
+        let default = registry.get_default_policy();
+        let hinted = registry.on_worker_added("hinted", Some("kv_aware"));
+        assert!(!Arc::ptr_eq(&default, &hinted));
+        assert!(kv(&default).peer_fetch_enabled());
+        assert!(kv(&hinted).peer_fetch_enabled());
+
+        let status = registry.set_peer_fetch_enabled(false);
+        assert!(!status.enabled);
+        assert!(!kv(&default).peer_fetch_enabled());
+        assert!(!kv(&hinted).peer_fetch_enabled());
+        assert!(status.policies.iter().all(|policy| !policy.enabled));
+
+        // A policy's own setter stores to the same shared flag.
+        assert!(kv(&hinted).set_peer_fetch_enabled(true));
+        assert!(kv(&default).peer_fetch_enabled());
+        assert!(registry.peer_fetch_status().enabled);
+    }
+
+    #[test]
+    fn hint_created_policy_after_disable_starts_disabled() {
+        let registry = PolicyRegistry::new(kv_aware_main(Some(active_block())));
+        registry.set_peer_fetch_enabled(false);
+        let late = registry.on_worker_added("late", Some("kv_aware"));
+        assert!(kv(&late).is_peer_fetch_active_mode());
+        assert!(!kv(&late).peer_fetch_enabled());
+
+        registry.set_peer_fetch_enabled(true);
+        assert!(kv(&late).peer_fetch_enabled());
+    }
+
+    #[test]
+    fn peer_fetch_status_lists_each_active_instance_once() {
+        let registry = PolicyRegistry::new(kv_aware_main(Some(active_block())));
+        // Two models share the default instance; one has its own.
+        registry.on_worker_added("m2", None);
+        registry.on_worker_added("m1", None);
+        registry.on_worker_added("m1", None);
+        registry.on_worker_added("own", Some("kv_aware"));
+        // Not kv_aware: not listed.
+        registry.on_worker_added("rr", Some("round_robin"));
+
+        let mut status = registry.peer_fetch_status();
+        status.policies.sort_by_key(|policy| !policy.default);
+        assert_eq!(
+            status,
+            PeerFetchStatus {
+                enabled: true,
+                policies: vec![
+                    PeerFetchPolicyStatus {
+                        models: vec!["m1".into(), "m2".into()],
+                        default: true,
+                        enabled: true,
+                    },
+                    PeerFetchPolicyStatus {
+                        models: vec!["own".into()],
+                        default: false,
+                        enabled: true,
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn policies_not_built_active_are_not_listed() {
+        use crate::config::types::KvTransferMode::{Off, Shadow};
+        let block = |mode| crate::config::types::KvTransferConfig {
+            mode,
+            ..Default::default()
+        };
+        for main in [
+            kv_aware_main(Some(block(Shadow))),
+            kv_aware_main(Some(block(Off))),
+            kv_aware_main(None),
+            PolicyConfig::RoundRobin,
+        ] {
+            let registry = PolicyRegistry::new(main);
+            registry.on_worker_added("default", None);
+            registry.on_worker_added("hinted", Some("kv_aware"));
+            let status = registry.set_peer_fetch_enabled(false);
+            assert!(status.policies.is_empty(), "{status:?}");
+            assert!(!status.enabled);
+        }
     }
 }

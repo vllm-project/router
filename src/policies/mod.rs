@@ -13,6 +13,8 @@ mod consistent_hash;
 mod factory;
 pub(crate) mod hash_key;
 mod kv_aware;
+mod kv_transfer;
+pub mod kv_transfer_capability;
 mod power_of_two;
 mod random;
 mod registry;
@@ -34,9 +36,13 @@ pub use kv_aware::{
     MultiplicativeScorer, Picker, PrefillWorkEstimate, Scorer, SelectionError, SlotManager,
     StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits, WorkerTokenInputs,
 };
+#[cfg(test)]
+pub(crate) use kv_transfer::PeerFetchLimiter;
+pub(crate) use kv_transfer::{CostRuleTransferPlanner, PeerFetchPermit};
+pub use kv_transfer::{PeerEndpoint, TransferCapability, TransferPolicy};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
-pub use registry::PolicyRegistry;
+pub use registry::{PeerFetchPolicyStatus, PeerFetchStatus, PolicyRegistry};
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
 pub use sticky_least_loaded::StickyLeastLoadedPolicy;
