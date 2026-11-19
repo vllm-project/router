@@ -106,6 +106,44 @@ fn test_prompt_input_int_batch() {
 }
 
 #[test]
+fn test_prompt_input_singleton_int_batch_routes_like_flat_int_array() {
+    let flat: CompletionRequest =
+        serde_json::from_str(r#"{"model": "test-model", "prompt": [1, 2], "max_tokens": 100}"#)
+            .unwrap();
+    let batch: CompletionRequest =
+        serde_json::from_str(r#"{"model": "test-model", "prompt": [[1, 2]], "max_tokens": 100}"#)
+            .unwrap();
+    assert!(matches!(flat.prompt, PromptInput::IntArray(_)));
+    assert!(matches!(batch.prompt, PromptInput::IntBatch(_)));
+
+    // Legacy routing text: identical prompts must hash to the same worker.
+    assert_eq!(
+        flat.prompt.extract_text_for_routing(),
+        batch.prompt.extract_text_for_routing()
+    );
+    assert_eq!(flat.prompt.extract_text_for_routing(), "token_ids:2");
+
+    // gRPC routing text: the flat form yields no text, so the singleton
+    // batch must match instead of falling through to the batch form.
+    assert_eq!(flat.extract_text_for_grpc_routing(), "");
+    assert_eq!(
+        batch.extract_text_for_grpc_routing(),
+        flat.extract_text_for_grpc_routing()
+    );
+
+    // A multi-element batch keeps the batch representation on both paths.
+    let multi: CompletionRequest = serde_json::from_str(
+        r#"{"model": "test-model", "prompt": [[1, 2], [3]], "max_tokens": 100}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        multi.prompt.extract_text_for_routing(),
+        "token_ids_batch:2:3"
+    );
+    assert_eq!(multi.extract_text_for_grpc_routing(), "token_ids_batch:2:3");
+}
+
+#[test]
 fn test_prompt_input_serialization_roundtrip_string() {
     let req = CompletionRequest {
         model: Some("test-model".to_string()),
