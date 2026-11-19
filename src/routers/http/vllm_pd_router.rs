@@ -4137,6 +4137,228 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cross_dialect_pd_usage_keeps_prefill_counts_and_details_together() {
+        use crate::kv_observation::test_helpers::{has_outcome, prediction};
+        let completions_prefill = json!({"usage": {
+            "prompt_tokens": 64,
+            "prompt_tokens_details": {"cached_tokens": 48, "audio_tokens": 3},
+            "completion_tokens": 1, "completion_tokens_details": {"reasoning_tokens": 99}
+        }});
+        let responses_prefill = json!({"usage": {
+            "prompt_tokens": 32,
+            "prompt_tokens_details": {"cached_tokens": 16, "audio_tokens": 11},
+            "input_tokens": 64,
+            "input_tokens_details": {"cached_tokens": 48, "audio_tokens": 3},
+            "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": 99}
+        }, "kv_transfer_params": {"large_metadata": "not part of usage"}});
+        let nested_prefill = json!({"response": responses_prefill});
+        for (prefill, responses, output_only) in [
+            (responses_prefill.clone(), false, false),
+            (nested_prefill.clone(), false, false),
+            (completions_prefill.clone(), true, false),
+            (responses_prefill, false, true),
+            (nested_prefill, false, true),
+            (completions_prefill, true, true),
+        ] {
+            let (input, details, output, output_details, path) = if responses {
+                (
+                    "input_tokens",
+                    "input_tokens_details",
+                    "output_tokens",
+                    "output_tokens_details",
+                    "/v1/responses",
+                )
+            } else {
+                (
+                    "prompt_tokens",
+                    "prompt_tokens_details",
+                    "completion_tokens",
+                    "completion_tokens_details",
+                    "/v1/completions",
+                )
+            };
+            let mut decode = json!({"usage": {
+                input: 100, details: {"cached_tokens": 8, "audio_tokens": 99, "decode_detail": 7},
+                output: 8, output_details: {"reasoning_tokens": 5},
+                "total_tokens": 108, "future": 9
+            }, "future_response": true});
+            let usage = usage_merge::usage_object_mut(&mut decode).unwrap();
+            if output_only {
+                usage.remove(input);
+                usage.remove(details);
+            }
+            if responses {
+                usage.insert("prompt_tokens_details".into(), json!({"cached_tokens": 4}));
+            }
+            let event = format!("data: {decode}\n\ndata: [DONE]\n\n");
+            let server = spawn_test_server(axum::Router::new().fallback(move || {
+                let event = event.clone();
+                async move { ([("content-type", "text/event-stream")], event) }
+            }))
+            .await;
+            for streaming in [false, true] {
+                let recorder =
+                    metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+                let handle = recorder.handle();
+                let _recorder = metrics::set_default_local_recorder(&recorder);
+                let attempt = KvRouteAttempt::new(prediction());
+                let response = if streaming {
+                    finalize_decode_stream(
+                        reqwest::get(&server).await.unwrap(),
+                        Some(&prefill),
+                        path,
+                        Some(&attempt),
+                    )
+                } else {
+                    finalize_decode_body(
+                        StatusCode::OK,
+                        HeaderMap::new(),
+                        Bytes::from(decode.to_string()),
+                        Some(&prefill),
+                        path,
+                        false,
+                        Some(&attempt),
+                    )
+                }
+                .unwrap();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let value: Value = if streaming {
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    serde_json::from_str(
+                        text.lines()
+                            .find_map(|line| line.strip_prefix("data: "))
+                            .unwrap(),
+                    )
+                    .unwrap()
+                } else {
+                    serde_json::from_slice(&bytes).unwrap()
+                };
+                let usage = usage_merge::usage_object(&value).unwrap();
+                assert_eq!(usage[input], 64);
+                assert_eq!(usage[details]["cached_tokens"], 48);
+                assert!(
+                    usage[details]["cached_tokens"].as_u64().unwrap()
+                        <= usage[input].as_u64().unwrap()
+                );
+                assert_eq!(usage[details]["audio_tokens"], 3);
+                if !output_only {
+                    assert_eq!(usage[details]["decode_detail"], 7);
+                }
+                assert_eq!(usage[output], 8);
+                assert_eq!(usage[output_details]["reasoning_tokens"], 5);
+                assert_eq!(usage["total_tokens"], 72);
+                assert_eq!(usage["future"], 9);
+                assert_eq!(value["future_response"], true);
+                if responses {
+                    assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 4);
+                }
+                drop(attempt);
+                let metrics = handle.render();
+                assert!(has_outcome(&metrics, "observed", "none"), "{metrics}");
+                assert!(
+                    metrics
+                        .lines()
+                        .any(|line| line == "vllm_router_kv_actual_cached_tokens_sum 48"),
+                    "{metrics}"
+                );
+                assert!(metrics.lines().any(|line| line == "vllm_router_kv_cached_token_absolute_error_sum{direction=\"underpredicted\"} 16"), "{metrics}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn details_only_prefill_cache_respects_explicit_decode_input() {
+        use crate::kv_observation::test_helpers::{has_outcome, prediction};
+        let prefill = json!({"usage": {"prompt_tokens_details": {"cached_tokens": 48}}});
+        for input in [1, 64] {
+            let decode = json!({"usage": {"input_tokens": input,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 8, "total_tokens": input + 8}});
+            let original = Bytes::from(format!(" \n{decode}\n "));
+            let event = format!("data: {decode}\n\ndata: [DONE]\n\n");
+            let expected_stream = Bytes::copy_from_slice(event.as_bytes());
+            let server = spawn_test_server(axum::Router::new().fallback(move || {
+                let event = event.clone();
+                async move { ([("content-type", "text/event-stream")], event) }
+            }))
+            .await;
+            for streaming in [false, true] {
+                let recorder =
+                    metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+                let handle = recorder.handle();
+                let _recorder = metrics::set_default_local_recorder(&recorder);
+                let attempt = KvRouteAttempt::new(prediction());
+                let response = if streaming {
+                    finalize_decode_stream(
+                        reqwest::get(&server).await.unwrap(),
+                        Some(&prefill),
+                        "/v1/responses",
+                        Some(&attempt),
+                    )
+                } else {
+                    finalize_decode_body(
+                        StatusCode::OK,
+                        HeaderMap::new(),
+                        original.clone(),
+                        Some(&prefill),
+                        "/v1/responses",
+                        false,
+                        Some(&attempt),
+                    )
+                }
+                .unwrap();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                drop(attempt);
+                let metrics = handle.render();
+                if input == 1 {
+                    assert_eq!(
+                        bytes,
+                        if streaming {
+                            expected_stream.clone()
+                        } else {
+                            original.clone()
+                        }
+                    );
+                    assert!(
+                        has_outcome(&metrics, "unavailable", "pd_usage_not_comparable"),
+                        "{metrics}"
+                    );
+                    assert!(!metrics.contains("vllm_router_kv_actual_cached_tokens_count"));
+                    assert!(!metrics.contains("vllm_router_kv_predicted_cached_tokens_count"));
+                } else {
+                    let value: Value = if streaming {
+                        let text = std::str::from_utf8(&bytes).unwrap();
+                        serde_json::from_str(
+                            text.lines()
+                                .find_map(|line| line.strip_prefix("data: "))
+                                .unwrap(),
+                        )
+                        .unwrap()
+                    } else {
+                        serde_json::from_slice(&bytes).unwrap()
+                    };
+                    let usage = usage_merge::usage_object(&value).unwrap();
+                    assert_eq!(usage["input_tokens"], 64);
+                    assert_eq!(usage["input_tokens_details"]["cached_tokens"], 48);
+                    assert_eq!(usage["output_tokens"], 8);
+                    assert_eq!(usage["total_tokens"], 72);
+                    assert!(has_outcome(&metrics, "observed", "none"), "{metrics}");
+                    assert!(
+                        metrics
+                            .lines()
+                            .any(|line| line == "vllm_router_kv_actual_cached_tokens_sum 48"),
+                        "{metrics}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn pd_sse_passthrough_invalidates_earlier_usage() {
         use crate::kv_observation::KvRoutePrediction;
         let usage =

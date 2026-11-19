@@ -39,7 +39,21 @@ pub(super) fn reconcile_usage(
     cached: Option<u64>,
     prefill: Option<&Value>,
 ) -> Result<bool, &'static str> {
-    let (_, details_key, _) = usage_merge::usage_dialect(response, prefill).keys();
+    let (input_key, details_key, _) = usage_merge::usage_dialect(response, prefill).keys();
+    // Prefill's input count is authoritative even when cache merging runs first.
+    // With details-only Prefill usage, do not write a count that contradicts an
+    // explicit Decode input count. A missing bound still supports details-only usage.
+    let input = prefill
+        .and_then(|value| {
+            let (input, _, _) = usage_merge::usage_dialect(value, None).keys();
+            usage_merge::usage_object(value)?.get(input)
+        })
+        .or_else(|| usage_merge::usage_object(response)?.get(input_key));
+    if let (Some(count), Some(input)) = (cached, input) {
+        if input.as_u64().is_none_or(|input| count > input) {
+            return Err("Cached tokens are incompatible with the reported input count");
+        }
+    }
     let Some(usage) = usage_merge::usage_object_mut(response) else {
         return if cached.is_some() {
             Err("Decode response has no usage object")
