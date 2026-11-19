@@ -73,6 +73,15 @@ class SharedGpuPipelineTest(unittest.TestCase):
         presets = uploader.load_presets()
         for name in ("test-merge.yml", "test-nightly.yml"):
             path = ROOT / ".buildkite" / name
+            source = yaml.safe_load(path.read_text())
+            execution_minutes = {
+                step["key"]: step.get(
+                    "shared_gpu_timeout_in_minutes",
+                    step.get("timeout_in_minutes", 60),
+                )
+                for step in leaves(source["steps"])
+                if "shared_gpu_count" in step
+            }
             normal = list(leaves(yaml.safe_load(uploader.render(path))["steps"]))
             shared = list(
                 leaves(yaml.safe_load(uploader.render(path, rocm_shared=True))["steps"])
@@ -89,7 +98,7 @@ class SharedGpuPipelineTest(unittest.TestCase):
                 self.assertEqual(after["env"]["AMD_CI_GPU_COUNT"], "2")
                 self.assertIn("shared GPU admission hook is missing", after["command"])
                 self.assertIn(
-                    f"{before['timeout_in_minutes'] * 60} bash", after["command"]
+                    f"{execution_minutes[after['key']] * 60} bash", after["command"]
                 )
                 self.assertEqual(after["artifact_paths"], before["artifact_paths"])
             self.assertEqual(len(changed), 1, changed)
