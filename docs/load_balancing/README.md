@@ -234,6 +234,8 @@ Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyon
    - Route to worker with lowest load (shortest queue)
    - Still updates the tree to maintain cache state
 
+HTTP workers prepare each request's token IDs (render or `/tokenize`) within `--prefix-preparation-timeout-ms` (default 1000). A worker that misses the budget cannot be compared, so the request goes to the least loaded worker; if busy workers render slowly, raise the budget.
+
 ### Best For
 
 - Workloads with repeated prompt prefixes (system prompts, few-shot examples)
@@ -253,7 +255,7 @@ vllm-router --policy kv_aware \
   --worker-urls grpc://worker1:8000 grpc://worker2:8000
 ```
 
-Enable KV events on the workers. HTTP text requests also need a render endpoint or, for simple prompts, `/tokenize`. Without usable KV information, routing falls back to load.
+Enable KV events on the workers. HTTP text requests also need a render endpoint or, for simple prompts, `/tokenize`. Without usable KV information, routing falls back to load. Each worker gets `--prefix-preparation-timeout-ms` (default 1000) to prepare a request; a worker that answers later is counted as `preparation_timeout` in `vllm_router_kv_routing_inputs_total`.
 
 For regular pools without event discovery, configure `--kv-event-source WORKER_URL=tcp://HOST:PORT` per worker, plus matching `--kv-event-model` and `--kv-event-block-size`.
 

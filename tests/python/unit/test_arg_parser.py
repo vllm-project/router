@@ -573,6 +573,19 @@ class TestParseRouterArgs:
         with pytest.raises(ValueError, match="kv_aware_session_affinity_ttl_secs"):
             RouterArgs(kv_aware_session_affinity_ttl_secs=ttl)._validate_router_args()
 
+    def test_prefix_preparation_timeout_parses_and_forwards(self):
+        assert parse_router_args([]).prefix_preparation_timeout_ms == 1000
+        args = parse_router_args(["--prefix-preparation-timeout-ms", "2500"])
+        assert args.prefix_preparation_timeout_ms == 2500
+        with patch("vllm_router.router._Router") as native_router:
+            Router.from_args(args)
+        assert native_router.call_args.kwargs["prefix_preparation_timeout_ms"] == 2500
+
+    @pytest.mark.parametrize("ms", [0, -1, 60_001])
+    def test_prefix_preparation_timeout_rejects_invalid_values(self, ms):
+        with pytest.raises(ValueError, match="prefix_preparation_timeout_ms"):
+            RouterArgs(prefix_preparation_timeout_ms=ms)._validate_router_args()
+
     def test_kv_aware_is_a_pd_stage_policy(self):
         for stage in ["prefill", "decode"]:
             args = parse_router_args([f"--{stage}-policy", "kv_aware"])
