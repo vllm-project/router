@@ -13,9 +13,9 @@ if str(SCENARIO_DIR) not in sys.path:
 from case_loader import (  # noqa: E402
     case_at_concurrency,
     cell_output_dir,
-    cell_results_summary_path,
     cell_run_suffix,
     load_case,
+    router_policy_result_path,
 )
 from stack_launcher import run_router_policy_cell  # noqa: E402
 
@@ -24,15 +24,17 @@ def _run_cell(case_file: Path, concurrency: int) -> Path:
     case = case_at_concurrency(load_case(case_file), concurrency)
     run_suffix = cell_run_suffix()
     out = cell_output_dir(case, run_suffix=run_suffix)
-    summary = cell_results_summary_path(case, run_suffix=run_suffix)
     cell_out = run_router_policy_cell(
         case_file,
         concurrency=concurrency,
         out_dir=out,
         run_suffix=run_suffix,
-        results_summary=summary,
     )
-    assert summary.is_file(), f"missing results summary copy {summary}"
+    stats = json.loads((cell_out / "calibration.json").read_text(encoding="utf-8"))
+    summary = router_policy_result_path(
+        stats["router_policy"], stats["concurrency"], stats["task_num"], run_suffix
+    )
+    assert summary.is_file(), f"missing results JSON {summary}"
     return cell_out
 
 

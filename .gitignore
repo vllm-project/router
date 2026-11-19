@@ -25,6 +25,10 @@ target
 
 # Local test cache
 .tokenizer_cache/
+
+# Generated e2e results and diagnostic files
+tests/python/e2e/results/
+tests/python/e2e/run/
 # Python virtual environment
 .venv/
 
