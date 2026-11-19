@@ -11,7 +11,7 @@ use tracing::info;
 use super::probe::WorkerDescriptor;
 use super::reconcile::{
     native_full_sources_match, probe_keeps_trust, probe_renews_trust, static_hybrid_sources_match,
-    BoundSources, StaticHybridMatch,
+    BoundSource, BoundSources, StaticHybridMatch,
 };
 use super::{CacheKey, KvIndexSupervisor, WorkerKvInfo, WorkerSubs};
 use crate::kv_index::subscriber::EventSource;
@@ -247,9 +247,23 @@ impl KvIndexSupervisor {
         worker_url: &str,
         mut handles: Vec<Arc<EventSubscriberHandle>>,
         targets: Vec<(EventSource, Arc<SourceBinding>)>,
-        bound: Arc<BoundSources>,
         capability: CacheCapabilities,
+        assumed_plain_full: bool,
     ) {
+        // Revalidate only publishers with an installed subscriber.
+        let bound: BoundSources = targets
+            .iter()
+            .map(|(source, _)| {
+                (
+                    source.dp_rank,
+                    BoundSource {
+                        endpoint: source.pub_endpoint.clone(),
+                        replay_endpoint: source.replay_endpoint.clone(),
+                        topic: source.topic.clone(),
+                    },
+                )
+            })
+            .collect();
         let provider = Arc::downgrade(provider);
         let probe_ctx = self.ctx.clone();
         let client = self.client.clone();
@@ -298,7 +312,7 @@ impl KvIndexSupervisor {
                         &client,
                         &worker,
                         api_key.as_deref(),
-                        &capability,
+                        (!assumed_plain_full).then_some(&capability),
                         &bound,
                     )
                     .await

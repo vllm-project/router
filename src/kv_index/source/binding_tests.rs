@@ -22,6 +22,79 @@ fn target() -> RoutableTarget {
 }
 
 #[test]
+fn inferred_full_waits_for_root_evidence_after_a_replay_restart() {
+    use crate::kv_index::source::test_support::{full_binding, full_store};
+
+    let index = full_binding(target(), 16).require_root_proof();
+    let tokens: Vec<_> = (0..33).collect();
+    let root = full_store(&tokens[..32], 16, None);
+    let mut suffix = root.clone();
+    suffix.parent_block_hash = Some(ExternalBlockHash::Bytes(vec![7; 32]));
+    let suffix = event_batch(1.0, vec![KVEvent::BlockStored(suffix)]);
+    let root = event_batch(2.0, vec![KVEvent::BlockStored(root)]);
+
+    index.begin_replay(0);
+    index.finish_replay(0).unwrap();
+    index.apply_batch(0, &suffix).unwrap();
+    assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 0);
+    index.apply_batch(1, &root).unwrap();
+    assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 32);
+
+    index.begin_replay(0);
+    index.apply_batch(0, &suffix).unwrap();
+    index.finish_replay(1).unwrap();
+    assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 0);
+    index.apply_batch(1, &root).unwrap();
+    assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 32);
+}
+
+#[test]
+fn inferred_full_revokes_credit_on_an_incompatible_root_or_event_shape() {
+    use crate::kv_index::source::test_support::{full_binding, full_store};
+
+    let tokens: Vec<_> = (0..33).collect();
+    let first = full_store(&tokens[..32], 16, None);
+    for (case, expected) in [
+        ("root", SourceError::RootHashMismatch),
+        ("group", SourceError::InvalidBatch),
+        ("block size", SourceError::InvalidBatch),
+        ("cache kind", SourceError::InvalidBatch),
+        ("lookahead", SourceError::InvalidBatch),
+    ] {
+        let index = full_binding(target(), 16).require_root_proof();
+        index.begin_empty(0);
+        index
+            .apply_batch(
+                0,
+                &event_batch(1.0, vec![KVEvent::BlockStored(first.clone())]),
+            )
+            .unwrap();
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 32);
+
+        let mut wrong = first.clone();
+        match case {
+            "root" => {
+                let different_root = BlockKeyGenerator::new(16, 42);
+                wrong.block_hashes[0] = ExternalBlockHash::Bytes(
+                    different_root.generate_block_keys(&tokens[..16])[0].to_vec(),
+                );
+            }
+            "group" => wrong.group_idx = Some(1),
+            "block size" => wrong.block_size = 8,
+            "cache kind" => wrong.kv_cache_spec_kind = Some("mla_attention".into()),
+            "lookahead" => wrong.lookahead_token_ids = Some(vec![vec![1]; 2]),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            index.apply_batch(1, &event_batch(2.0, vec![KVEvent::BlockStored(wrong)])),
+            Err(expected),
+            "{case}"
+        );
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 0, "{case}");
+    }
+}
+
+#[test]
 fn full_and_checkpoint_layouts_share_hash_pages_but_preserve_tier_scoring() {
     use crate::kv_index::{KvBlockIndexer, StorageTier};
     use crate::policies::TieredMatchProvider;

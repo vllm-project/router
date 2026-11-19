@@ -13,6 +13,8 @@ pub enum SourceError {
     InvalidBatch,
     /// The publisher's integer hashes cannot address the declared SHA256 chain.
     IntBlockHashes,
+    /// A first-block event disagrees with the inferred SHA256-CBOR root.
+    RootHashMismatch,
     Capacity,
 }
 

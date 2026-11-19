@@ -513,7 +513,8 @@ async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
         }})));
         let info = json!({
             "model_id": "served-alias", "model_path": "full-model",
-            "instance_id": "boot-1", "kv_block_size": 8
+            "instance_id": "boot-1", "kv_block_size": 8,
+            "effective_attention_block_size": if algorithm.is_none() { 16 } else { 8 }
         });
         let layout = algorithm.map(|algorithm| {
             let mut layout = plain_full_layout("full-model", topic, 8);
@@ -540,13 +541,31 @@ async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
         let (worker, server) = source_boundary_worker_with_routes(app, info, sources.clone()).await;
         let (supervisor, _signals) =
             KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
+        let discovered = supervisor.discover(&worker).await;
+        let assumed = algorithm.is_none();
+        assert_eq!(discovered.assumed_plain_full, assumed);
+        if assumed {
+            let layout = discovered.hybrid.unwrap();
+            let rank = &layout.ranks[0];
+            assert!(rank.is_plain_full_attention());
+            assert_eq!(rank.hash_seed.as_deref(), Some("vllm-none-hash"));
+            assert_eq!(rank.hash_block_size, Some(16));
+        }
+
         let registered = supervisor.on_worker_added(&worker).await.unwrap();
-        assert_eq!(registered.cache_key.is_some(), native, "{algorithm:?}");
         assert_eq!(
-            supervisor.match_provider_for_worker(&worker).is_some(),
-            native,
+            registered.cache_key.is_some(),
+            native || assumed,
             "{algorithm:?}"
         );
+        assert_eq!(
+            supervisor.match_provider_for_worker(&worker).is_some(),
+            native || assumed,
+            "{algorithm:?}"
+        );
+        if assumed {
+            assert_eq!(registered.block_size, Some(16));
+        }
         if native {
             assert_eq!(registered.ranks, [0]);
             assert_eq!(registered.cache_key.unwrap().model.as_ref(), "served-alias");
@@ -826,6 +845,7 @@ async fn hybrid_discovery_binds_only_ranks_for_the_worker_model() {
         sources: Ok(sources.clone()),
         model_id: Ok(Some("qwen".into())),
         hybrid: Some(capability),
+        assumed_plain_full: false,
     };
     let (supervisor, _signals) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
     let worker_url = "http://127.0.0.1:8080";
@@ -1101,6 +1121,7 @@ fn declared_full_worker(
         )])),
         model_id: Ok(Some(model.into())),
         hybrid: Some(layout),
+        assumed_plain_full: false,
     }
 }
 
@@ -1714,7 +1735,7 @@ async fn metrics_only_worker_supplies_cache_metadata() {
 }
 
 #[tokio::test]
-async fn cache_metrics_and_event_addresses_do_not_prove_a_hash_contract() {
+async fn cache_metrics_without_a_replay_source_do_not_bind_default_layout() {
     use axum::routing::get;
 
     let context = zmq::Context::new();
@@ -1772,6 +1793,7 @@ fn descriptor_refresh_covers_identity_changes_and_failure_threshold() {
             sources: Ok(HashMap::new()),
             model_id: Ok(Some("model".into())),
             hybrid: None,
+            assumed_plain_full: false,
         })
         .unwrap()
     };

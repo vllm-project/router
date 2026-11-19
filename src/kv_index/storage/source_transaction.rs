@@ -198,6 +198,7 @@ pub(crate) struct StreamState {
     pub(crate) next_seq: Option<u64>,
     pub(crate) lease_id: u64,
     pub(crate) phase: StreamPhase,
+    pub(crate) root_verified: bool,
     pub(crate) rejection_reported: bool,
 }
 
@@ -224,6 +225,7 @@ impl StreamState {
             next_seq: None,
             lease_id: 0,
             phase: StreamPhase::Retired,
+            root_verified: false,
             rejection_reported: false,
         }
     }
@@ -257,6 +259,7 @@ impl StreamState {
     pub(crate) fn reset(&mut self, next_seq: Option<u64>, visible: bool) {
         self.bump_generation();
         self.next_seq = next_seq;
+        self.root_verified = false;
         self.phase = if visible {
             StreamPhase::Live
         } else if next_seq.is_some() {

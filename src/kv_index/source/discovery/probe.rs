@@ -25,6 +25,7 @@ pub(super) struct WorkerDescriptor {
     sources: Option<KvEventSourcesResponse>,
     model_id: Result<Option<String>, String>,
     hybrid: Option<CacheCapabilities>,
+    assumed_plain_full: bool,
 }
 
 pub(super) fn worker_descriptor(worker: &WorkerDiscovery) -> Result<WorkerDescriptor, String> {
@@ -39,6 +40,7 @@ pub(super) fn worker_descriptor(worker: &WorkerDiscovery) -> Result<WorkerDescri
         sources,
         model_id: worker.model_id.clone(),
         hybrid: worker.hybrid.clone(),
+        assumed_plain_full: worker.assumed_plain_full,
     })
 }
 
@@ -202,11 +204,15 @@ pub(super) async fn fetch_native_full_sources(
             };
         let rank_count = response.sources.len();
         let sources = grpc_kv_event_source_entries(worker_url, response.sources);
+        if sources.len() != rank_count {
+            return (Ok(sources), Err("invalid KV event source ranks".into()));
+        }
         let layout = match response.kv_routing_capabilities.as_deref() {
-            Some(bytes) if sources.len() == rank_count => serde_json::from_slice(bytes)
+            Some(bytes) => serde_json::from_slice(bytes)
                 .map_err(|error| format!("kv_routing_capabilities parse: {error}"))
-                .and_then(parse_native_full_layout),
-            _ => Ok(None),
+                .and_then(parse_native_full_layout)
+                .map(Some),
+            None => Ok(None),
         };
         return (Ok(sources), layout);
     }
@@ -245,11 +251,12 @@ async fn fetch_http_full_layout(
         .json()
         .await
         .map_err(|error| format!("kv_routing_capabilities parse: {error}"))?;
-    parse_native_full_layout(body)
+    parse_native_full_layout(body).map(Some)
 }
 
 /// Automatic discovery accepts only a complete plain full-attention contract.
-fn parse_native_full_layout(body: serde_json::Value) -> Result<Option<CacheCapabilities>, String> {
+/// Invalid or incompatible declarations are distinct from an absent endpoint.
+fn parse_native_full_layout(body: serde_json::Value) -> Result<CacheCapabilities, String> {
     // An explicitly empty list and null transfer show this worker is plain.
     // An omitted field provides no evidence of what the exporter checked.
     if !body
@@ -266,7 +273,7 @@ fn parse_native_full_layout(body: serde_json::Value) -> Result<Option<CacheCapab
                         .all(|rank| rank.get("transfer").is_some_and(serde_json::Value::is_null))
             })
     {
-        return Ok(None);
+        return Err("worker did not confirm a plain cache capability".into());
     }
     let mut capability: CacheCapabilities =
         serde_json::from_value(body).map_err(|e| format!("kv_routing_capabilities parse: {e}"))?;
@@ -275,10 +282,10 @@ fn parse_native_full_layout(body: serde_json::Value) -> Result<Option<CacheCapab
         .iter()
         .any(|rank| rank.declared_groups != Some(1) || !rank.is_plain_full_attention())
     {
-        return Ok(None);
+        return Err("worker does not declare a single full-attention group".into());
     }
     capability.ranks.sort_unstable_by_key(|rank| rank.rank);
-    Ok(Some(capability))
+    Ok(capability)
 }
 
 impl From<crate::backend::control::KvEventSourcesError> for SourcesUnavailable {

@@ -17,6 +17,7 @@ pub(super) enum PreparedEvent<'a> {
         incremental: bool,
         namespace: Option<&'a str>,
         hashes: Vec<SequenceHash>,
+        proves_root: bool,
     },
     Remove {
         group: u32,
@@ -41,6 +42,7 @@ impl PreparedEvent<'_> {
                 incremental,
                 namespace,
                 hashes,
+                ..
             } => tx.store_hash_pages(
                 owner,
                 group,
@@ -110,10 +112,14 @@ impl SourceBinding {
                     Ok(Some(event)) => prepared.push(event),
                     Ok(None) => {}
                     // An unsupported adapter cannot revoke base-model facts.
-                    Err(SourceError::InvalidBatch) if store.lora_name.is_some() => {}
+                    Err(SourceError::InvalidBatch)
+                        if !self.requires_root_proof && store.lora_name.is_some() => {}
                     Err(error) => return Err(error),
                 },
                 KVEvent::BlockRemoved(remove) => {
+                    if self.requires_root_proof && remove.group_idx != Some(0) {
+                        return Err(SourceError::InvalidBatch);
+                    }
                     if remove.ownership.is_some() {
                         continue;
                     }
@@ -176,6 +182,20 @@ impl SourceBinding {
             Err(error) => return Self::fail(state, tx, &self.owner, error),
         };
         for event in prepared {
+            if self.requires_root_proof && !state.root_verified {
+                if let PreparedEvent::Store { proves_root, .. } = &event {
+                    if !proves_root {
+                        continue;
+                    }
+                    state.root_verified = true;
+                    tracing::debug!(
+                        source = %self.target.instance_id,
+                        rank = self.target.dp_rank,
+                        seq,
+                        "verified default KV hash root"
+                    );
+                }
+            }
             let clear = matches!(event, PreparedEvent::Clear);
             if event.apply(tx, &self.owner, self.max_entries).is_err() {
                 return Self::fail(state, tx, &self.owner, SourceError::Capacity);
@@ -192,8 +212,18 @@ impl SourceBinding {
         &self,
         store: &'a BlockStored,
     ) -> Result<Option<PreparedEvent<'a>>, SourceError> {
+        if self.requires_root_proof
+            && (store.group_idx != Some(0)
+                || store.kv_cache_spec_kind.as_deref() != Some("full_attention")
+                || store.kv_cache_spec_sliding_window.is_some()
+                || store.lookahead_token_ids.is_some()
+                || store.block_size as usize != self.keys.block_size())
+        {
+            return Err(SourceError::InvalidBatch);
+        }
         let namespace = store.lora_name.as_deref();
         if namespace.is_some_and(|name| self.adapter_path(name).is_none())
+            || (self.requires_root_proof && store.lora_id.is_some())
             || store.ownership.is_some()
         {
             return Ok(None);
@@ -226,12 +256,21 @@ impl SourceBinding {
             .map(sequence_hash)
             .collect::<Option<Vec<_>>>()
             .ok_or(SourceError::InvalidBatch)?;
+        let incremental = native_device(store.ownership.as_deref(), store.medium.as_deref());
+        let proves_root = self.requires_root_proof
+            && namespace.is_none()
+            && incremental
+            && store.parent_block_hash.is_none();
+        if proves_root && self.keys.plain_root_block(&store.token_ids).as_ref() != hashes.first() {
+            return Err(SourceError::RootHashMismatch);
+        }
         Ok(Some(PreparedEvent::Store {
             group: group.group_idx,
             tier,
             namespace,
-            incremental: native_device(store.ownership.as_deref(), store.medium.as_deref()),
+            incremental,
             hashes,
+            proves_root,
         }))
     }
 

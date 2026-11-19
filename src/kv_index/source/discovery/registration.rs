@@ -9,7 +9,6 @@ use tracing::{debug, info, warn};
 
 use super::lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
 use super::probe::{layout_model, worker_descriptor};
-use super::reconcile::{BoundSource, BoundSources};
 use super::{
     discovered_block_size, event_source_label, events_enabled, metadata_source_label,
     resolve_endpoint, worker_host, CacheKey, KvIndexSupervisor, LiveSource, SourcesProbe,
@@ -44,6 +43,7 @@ impl KvIndexSupervisor {
         base_models: HashSet<String>,
     ) -> Result<WorkerKvInfo, String> {
         let descriptor = worker_descriptor(&discovery).ok();
+        let assumed_plain_full = discovery.assumed_plain_full;
         let grpc = crate::backend::is_grpc_url(worker_url);
         let full_attention_http =
             !grpc && self.full_attention_http && self.resolved_static_source(worker_url).is_none();
@@ -195,6 +195,11 @@ impl KvIndexSupervisor {
         event_sources.retain(|source| {
             match capability.bind_worker_source(source, engine_model, 1_000_000) {
                 Ok(binding) => {
+                    let binding = if assumed_plain_full {
+                        binding.require_root_proof()
+                    } else {
+                        binding
+                    };
                     bindings.insert(
                         source.dp_rank,
                         binding.with_mooncake_prefill(self.mooncake_prefill),
@@ -338,20 +343,6 @@ impl KvIndexSupervisor {
             ranks.push(rank);
         }
 
-        // Revalidate only publishers with an installed subscriber.
-        let bound_sources: BoundSources = targets
-            .iter()
-            .map(|(source, _)| {
-                (
-                    source.dp_rank,
-                    BoundSource {
-                        endpoint: source.pub_endpoint.clone(),
-                        replay_endpoint: source.replay_endpoint.clone(),
-                        topic: source.topic.clone(),
-                    },
-                )
-            })
-            .collect();
         let provider = Arc::new(LayoutWorkerProvider {
             indexes,
             lifecycle: lifecycle.clone(),
@@ -361,8 +352,8 @@ impl KvIndexSupervisor {
             worker_url,
             handles.clone(),
             targets,
-            Arc::new(bound_sources),
             capability,
+            assumed_plain_full,
         );
 
         workers.insert(

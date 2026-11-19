@@ -15,8 +15,8 @@ use tracing::{debug, info, warn};
 
 use crate::config::StaticKvEventSources;
 use crate::kv_index::storage::KvBlockIndexer;
-use crate::kv_index::CacheCapabilities;
 use crate::kv_index::EventSubscriberHandle;
+use crate::kv_index::{CacheCapabilities, GroupCapability, RankCapability};
 use crate::kv_index::{HashMode, IngestionSignal, SourceId};
 use crate::protocols::worker_spec::ServerInfo;
 
@@ -90,6 +90,7 @@ pub(crate) struct WorkerDiscovery {
     /// silently turning the worker URL into a cache identity.
     model_id: Result<Option<String>, String>,
     pub(crate) hybrid: Option<CacheCapabilities>,
+    pub(super) assumed_plain_full: bool,
 }
 
 /// What the optional KV event source control probe found. A 404/405 means the
@@ -532,6 +533,7 @@ fn failed_hybrid_discovery(error: String) -> WorkerDiscovery {
         }),
         model_id: Err(error),
         hybrid: None,
+        assumed_plain_full: false,
     }
 }
 
@@ -593,6 +595,7 @@ async fn discover_worker(
             sources: fetch_kv_event_sources(client, worker_url, api_key).await,
             model_id: Ok(Some(worker_url.to_string())),
             hybrid: None,
+            assumed_plain_full: false,
         };
     }
     discover_full_attention_http_worker(client, worker_url, api_key).await
@@ -669,6 +672,7 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         sources: Ok(sources),
         model_id: Ok(Some(model)),
         hybrid: config.hybrid.clone(),
+        assumed_plain_full: false,
     }
 }
 
@@ -737,12 +741,12 @@ async fn discover_full_attention_http_worker(
 
 fn native_worker_discovery(
     worker_url: &str,
-    server_info: Result<ServerInfo, String>,
+    mut server_info: Result<ServerInfo, String>,
     sources: Result<KvEventSourcesResponse, SourcesUnavailable>,
     model_id: Result<Option<String>, String>,
     layout: Result<Option<CacheCapabilities>, String>,
 ) -> WorkerDiscovery {
-    let hybrid = match (&server_info, &sources, &model_id, layout) {
+    let (hybrid, assumed_plain_full) = match (&mut server_info, &sources, &model_id, layout) {
         (Ok(info), Ok(sources), Ok(Some(model)), Ok(Some(layout))) => {
             let engine_model = layout_model(info, model, &layout);
             let mut active = sources.iter().filter(|(_, source)| events_enabled(source));
@@ -771,16 +775,103 @@ fn native_worker_discovery(
                     "using discovered full-attention KV hash contract"
                 );
             }
-            matches.then_some(layout)
+            (matches.then_some(layout), false)
         }
-        _ => None,
+        (Ok(info), Ok(sources), Ok(Some(model)), Ok(None)) => {
+            let layout = synthesize_plain_full_layout(info, sources, model);
+            if let Some(layout) = &layout {
+                // The index and policy must use the same effective hash unit.
+                info.kv_block_size = layout.ranks[0].hash_block_size;
+                debug!(
+                    worker_url,
+                    "checking the default full-attention KV hash contract"
+                );
+            }
+            let assumed = layout.is_some();
+            (layout, assumed)
+        }
+        (_, _, _, Err(error)) => {
+            debug!(worker_url, %error, "worker cache capability is incompatible");
+            (None, false)
+        }
+        _ => (None, false),
     };
     WorkerDiscovery {
         server_info,
         sources,
         model_id,
         hybrid,
+        assumed_plain_full,
     }
+}
+
+/// Omitting a layout declares ordinary single-group attention. Root and block
+/// size still require matching store events before the source can earn credit.
+fn synthesize_plain_full_layout(
+    info: &ServerInfo,
+    sources: &KvEventSourcesResponse,
+    model: &str,
+) -> Option<CacheCapabilities> {
+    // The HTTP discovery error path may substitute the URL as a model name.
+    server_model_id(info)?;
+    let size = info
+        .effective_attention_block_size
+        .filter(|size| *size > 0)
+        .or_else(|| discovered_block_size(info))?;
+    let mut ranks = sources
+        .iter()
+        .filter(|(_, source)| events_enabled(source))
+        .map(|(key, source)| {
+            let rank = key.parse::<u32>().ok()?;
+            if key != &rank.to_string()
+                || source.topic.is_empty()
+                || source.replay_endpoint.as_deref().is_none_or(str::is_empty)
+            {
+                return None;
+            }
+            Some(RankCapability {
+                rank,
+                declared_groups: Some(1),
+                model: model.to_owned(),
+                weight_version: "default".into(),
+                weight_identity: None,
+                publisher_topic: Some(source.topic.clone()),
+                instance_topic: true,
+                hash_algorithm: "sha256_cbor".into(),
+                root_hash: None,
+                hash_seed: Some("vllm-none-hash".into()),
+                full_hashes: true,
+                hash_block_size: Some(size),
+                partial_hash_hits: false,
+                hash_lookahead_tokens: 0,
+                speculative_tokens: 0,
+                tail_drop_groups: None,
+                prefix_caching: true,
+                groups: vec![GroupCapability {
+                    group_idx: 0,
+                    kind: "full_attention".into(),
+                    spec_type: "FullAttentionSpec".into(),
+                    block_size: size,
+                    sliding_window: None,
+                    prefix_cacheable: true,
+                    prefix_replay_tokens: 0,
+                    mamba_cache_mode: None,
+                    prefill_checkpoint_alignment: None,
+                    tokens_per_state: None,
+                    cache_role: None,
+                }],
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if ranks.is_empty() {
+        return None;
+    }
+    ranks.sort_unstable_by_key(|rank| rank.rank);
+    Some(CacheCapabilities {
+        schema_version: 1,
+        adapters: Vec::new(),
+        ranks,
+    })
 }
 
 /// Build a discovery result purely from static configuration, without

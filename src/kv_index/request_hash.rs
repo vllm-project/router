@@ -78,6 +78,15 @@ impl BlockKeyGenerator {
         self.keys_after_with_extra(self.none_hash, token_ids, None)
     }
 
+    /// Recompute a plain first block with the same encoding as request lookup.
+    pub(crate) fn plain_root_block(&self, token_ids: &[u32]) -> Option<SequenceHash> {
+        if self.lookahead_tokens != 0 {
+            return None;
+        }
+        let block = token_ids.get(..self.block_size)?;
+        Some(hash_block(&self.none_hash, block, None, &[]))
+    }
+
     /// The same chain for one LoRA adapter. vLLM hashes each adapter block with
     /// `[["lora", name, path]]` as extra keys, where `path` is the string the
     /// engine was launched with, so this reproduces the adapter's chain instead

@@ -130,6 +130,18 @@ impl EventStream {
                             );
                         }
                     }
+                    SourceError::RootHashMismatch => {
+                        if !state.rejection_reported {
+                            state.rejection_reported = true;
+                            tracing::warn!(
+                                source = %self.index.target.instance_id,
+                                rank = self.index.target.dp_rank,
+                                seq,
+                                error = ?error,
+                                "default KV hash root does not match; routing by load. Use sha256_cbor with PYTHONHASHSEED unset, or declare the worker's actual layout and seed."
+                            );
+                        }
+                    }
                     _ => tracing::warn!(seq, error = ?error, "KV event batch rejected"),
                 }
                 state.phase = Phase::Replaying;

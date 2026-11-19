@@ -276,13 +276,14 @@ pub(super) struct BoundSource {
 /// rank. Used to notice a publisher that moved while keeping its identity.
 pub(super) type BoundSources = HashMap<u32, BoundSource>;
 
-/// An automatically discovered layout stays trusted only while the worker
-/// keeps reporting both the same layout and the same live publishers.
+/// Check that the bound publishers and their reported layout are unchanged.
+/// A default layout has no worker report. Its hash and block size are checked
+/// in the publisher's event stream, bound to the topic for this boot.
 pub(super) async fn native_full_sources_match(
     client: &reqwest::Client,
     worker: &str,
     api_key: Option<&str>,
-    expected: &CacheCapabilities,
+    expected: Option<&CacheCapabilities>,
     bound: &BoundSources,
 ) -> StaticHybridMatch {
     let timeout = Duration::from_secs(2);
@@ -297,7 +298,7 @@ pub(super) async fn native_full_sources_match(
     let Some(host) = worker_host(worker) else {
         return StaticHybridMatch::Differs;
     };
-    if layout.as_ref() == Some(expected) && bound_sources_match(&host, bound, &sources) {
+    if layout.as_ref() == expected && bound_sources_match(&host, bound, &sources) {
         StaticHybridMatch::Matches
     } else {
         StaticHybridMatch::Differs

@@ -60,6 +60,7 @@ pub struct SourceBinding {
     pub(in crate::kv_index) max_entries: usize,
     pub(in crate::kv_index) partial_hash_hits: bool,
     pub(in crate::kv_index) strict_event_block_size: bool,
+    pub(in crate::kv_index) requires_root_proof: bool,
     /// The same domain index used by full-attention workers. Layout and stream
     /// state live here; cache residency lives only in this shared index.
     pub(in crate::kv_index) index: Arc<KvBlockIndexer>,
@@ -115,6 +116,7 @@ impl SourceBinding {
             max_entries,
             partial_hash_hits: false,
             strict_event_block_size: false,
+            requires_root_proof: false,
             index: Arc::new(KvBlockIndexer::new()),
             owner,
             control: Arc::new(StreamControl::default()),
@@ -132,6 +134,13 @@ impl SourceBinding {
             })
             .unwrap_or(true));
         self.index = index;
+        self
+    }
+
+    /// An inferred plain layout needs a Store proving the actual hash root.
+    pub(in crate::kv_index) fn require_root_proof(mut self) -> Self {
+        self.requires_root_proof = true;
+        self.strict_event_block_size = true;
         self
     }
 
