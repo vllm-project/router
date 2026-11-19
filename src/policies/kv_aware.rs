@@ -86,12 +86,25 @@ pub struct DecodeWorkEstimate {
 /// another. Without this the Decode estimate re-hashes the prompt the Prefill
 /// estimate just hashed, which is linear in prompt length on the admission
 /// path.
-///
-/// The prompt index is not enough: the P/D pair renders each backend separately, so
-/// index 0 of two backends can be different token streams. Keying by the ids keeps
-/// the "hash each prompt once per request" property while never returning hashes
-/// computed for a different rendering.
-pub type PromptHashes = HashMap<(u32, u64), Arc<[Arc<str>]>>;
+#[derive(Default)]
+pub struct PromptHashes {
+    map: HashMap<(u32, u64), Arc<[Arc<str>]>>,
+}
+
+impl PromptHashes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Hashes `tokens` for `block_size`, memoized so one backend's rendering is
+    /// never reused for a different prompt content.
+    pub fn hashes_for(&mut self, block_size: u32, tokens: &[u32]) -> &Arc<[Arc<str>]> {
+        let key = (block_size, prompt_fingerprint(tokens));
+        self.map
+            .entry(key)
+            .or_insert_with(|| Arc::from(KvAwarePolicy::local_hashes(tokens, block_size)))
+    }
+}
 
 /// FNV-1a over the rendered ids, mixed with the length so a prefix cannot collide
 /// with the longer prompt that starts with it.
@@ -1171,24 +1184,6 @@ impl KvAwarePolicy {
         crate::kv_index::local_block_hash_strings(token_ids, block_size, lora_name)
     }
 
-    /// Block hashes of one prompt, computed at most once per request.
-    ///
-    /// The Prefill and Decode estimates walk the same prompt with the same block
-    /// size, so hashing it twice is pure duplication: it is linear in prompt
-    /// length and the Decode side exists only to price reuse. The key is
-    /// `(block_size, prompt content)`, so a backend that rendered a different
-    /// token stream never reuses another rendering's hashes.
-    fn hashes_for<'h>(
-        cache: &'h mut PromptHashes,
-        block_size: u32,
-        tokens: &[u32],
-    ) -> &'h Arc<[Arc<str>]> {
-        let key = (block_size, prompt_fingerprint(tokens));
-        cache
-            .entry(key)
-            .or_insert_with(|| Arc::from(Self::local_hashes(tokens, block_size)))
-    }
-
     /// The index query alone, for callers that already hold the hashes.
     fn placement_matches_with(
         binding: &TargetBinding,
@@ -1871,7 +1866,7 @@ impl KvAwareOps for KvAwarePolicy {
                         query_cache
                             .entry(key)
                             .or_insert_with(|| {
-                                let local = Self::hashes_for(hashes, binding.block_size, tokens);
+                                let local = hashes.hashes_for(binding.block_size, tokens);
                                 Self::placement_matches_with(&binding, local)
                             })
                             .as_slice()
@@ -1947,7 +1942,7 @@ impl KvAwareOps for KvAwarePolicy {
                     let hits = query_cache
                         .entry(key)
                         .or_insert_with(|| {
-                            let local = Self::hashes_for(hashes, binding.block_size, tokens);
+                            let local = hashes.hashes_for(binding.block_size, tokens);
                             Self::placement_matches_with(&binding, local)
                         })
                         .as_slice();

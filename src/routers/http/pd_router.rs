@@ -756,7 +756,7 @@ impl PdRouterBase {
                 !defer,
             )
         };
-        let reserve_decode = context.route != super::pd_types::HEALTH_PROBE_ROUTE;
+        let reserve_decode = !context.probe;
         let admitted = if defer {
             self.pd_load.admit_deferred(select)
         } else {
@@ -1580,6 +1580,7 @@ impl PdRouterBase {
             cache_salt: None,
             decode_context: None,
             route: "/health_generate",
+            probe: true,
         };
         let (selection, _attempt) =
             match self.select_and_admit(prefill_workers, decode_workers, &context) {
@@ -2112,6 +2113,7 @@ mod tests {
             cache_salt: None,
             decode_context: None,
             route: "/health_generate",
+            probe: true,
         };
         let (selection, attempt) = router
             .select_and_admit(&prefill_workers, &decode_workers, &context)
@@ -2142,6 +2144,7 @@ mod tests {
             cache_salt: None,
             decode_context: None,
             route: "/health_generate",
+            probe: true,
         };
         assert!(router.select_and_admit(&empty, &empty, &context).is_none());
         assert!(router.pd_load.snapshot().is_empty());
@@ -2986,6 +2989,7 @@ mod admission_tests {
             cache_salt: None,
             decode_context: None,
             route: "/v1/completions",
+            probe: false,
         }
     }
 
@@ -3052,6 +3056,7 @@ mod admission_tests {
             cache_salt: None,
             decode_context: None,
             route: "/v1/completions",
+            probe: false,
         }
     }
 
@@ -3803,6 +3808,7 @@ mod admission_tests {
                 cache_salt: None,
                 decode_context: None,
                 route: "/v1/completions",
+                probe: false,
             }
         }
 

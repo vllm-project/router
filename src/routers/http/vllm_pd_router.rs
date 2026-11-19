@@ -1248,6 +1248,7 @@ impl VllmPDRouter {
             cache_salt,
             decode_context: decode_context.as_ref(),
             route: path,
+            probe: false,
         };
         // Existing deployments configure a common connector. Discovery parses
         // registrations with that connector; no new pair compatibility is
@@ -1435,6 +1436,7 @@ impl VllmPDRouter {
             cache_salt: input.cache_salt.as_deref(),
             decode_context: decode_context.as_ref(),
             route: &input.route,
+            probe: false,
         };
         let committed = self.pd_router.pd_load.commit_decode(attempt, |loads| {
             super::pd_router::select_decode_stage(

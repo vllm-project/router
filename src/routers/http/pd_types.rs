@@ -196,12 +196,10 @@ pub struct PdRequestContext<'a> {
     /// context tokens, or on request counts when those are unknown too.
     pub decode_context: Option<&'a HashMap<String, u64>>,
     pub route: &'a str,
+    /// True when this admission is a health probe: it takes a pair but starts
+    /// no sequence, so it must not reserve Decode occupancy.
+    pub probe: bool,
 }
-
-/// The route a probe uses. It takes a pair but starts no sequence, so it must
-/// not reserve Decode occupancy: an unknown reservation there would flip the
-/// whole pool to request counts for the length of every probe.
-pub(super) const HEALTH_PROBE_ROUTE: &str = "/health_generate";
 
 /// Prompt tokens a Prefill decision established, including credited prefix.
 fn prompt_tokens(prefill: &StageDecision) -> Option<u64> {
