@@ -306,26 +306,15 @@ Use the same vLLM release for the engine and its gRPC frontend. In all versions 
 | [0.33.0](https://github.com/vllm-project/vllm/tree/v0.33.0) | `/kv_event_sources` | Adds nonzero hash lookahead. Model recipes use this release. |
 | [0.34.0](https://github.com/vllm-project/vllm/tree/v0.34.0) | `/kv_event_sources` | Nonzero hash lookahead. The default block size is 64 tokens if the backend has no preferred size. |
 
-
 ## CLI options
 
 | Option | Value format or example | Rust type | Default | Description |
 | --- | --- | --- | --- | --- |
-| `--policy` | `kv_aware` | enum | `cache_aware` | Selects the colocated policy and the fallback policy for both P/D stages. |
-| `--worker-urls` | `http://worker:8000` or `grpc://worker:50051` | list of strings | `[]` | Registers colocated workers. Use one transport per pool. |
 | `--kv-hybrid-layout` | `layout.json` | path | unset | Loads a colocated full- or hybrid-attention layout keyed by worker URL. |
 | `--kv-event-source` | `WORKER_URL=ENDPOINT[,ENDPOINT...]` | string, repeatable | `[]` | Supplies live ZMQ addresses when event discovery is unavailable. |
 | `--kv-event-replay-source` | `WORKER_URL=ENDPOINT[,ENDPOINT...]` | string, repeatable | `[]` | Supplies replay addresses for a matching static live source. |
 | `--kv-event-block-size` | `16` | `u32` | `16` | Sets the block size in tokens for static colocated sources. |
 | `--kv-event-model` | `qwen3` | string | unset | Sets the served model name when using static colocated sources. |
-| `--intra-node-data-parallel-size` | `4` | `usize` | `1` | Sets the data-parallel rank count per worker URL. List event endpoints in rank order. |
-| `--vllm-pd-disaggregation` | no value | flag | `false` | Enables vLLM P/D disaggregation. |
-| `--prefill` | `URL [PORT or none]` | URL with optional `u16` port, repeatable | `[]` | Adds a Prefill worker. The optional port is for connector bootstrap. |
-| `--decode` | `URL` | string, repeatable | `[]` | Adds a Decode worker. |
-| `--prefill-policy` | `kv_aware` | enum | inherits `--policy` | Enables KV-aware prefix routing on Prefill. |
-| `--decode-policy` | `round_robin` or `kv_aware` | enum | inherits `--policy` | Sets the Decode policy. See [Decode load and affinity](README.md#pd-decode-load). |
-| `--kv-connector` | `nixl`, `mooncake`, `moriio` | enum | `nixl` | Matches the workers' P/D transfer connector. MoRI-IO requires vLLM ZMQ service discovery. |
-| `--vllm-discovery-address` | `0.0.0.0:30001` | string | unset | Listens for vLLM ZMQ worker registrations in P/D. |
 | `--pd-hybrid-config` | `pd-layout.json` | path | unset | Supplies Prefill sources, their layouts and compatible Decode URLs. |
 | `--pd-kv-events` | `WORKER_URL=ENDPOINT[,ENDPOINT...]` | string, repeatable | `[]` | Supplies live publishers for 16-token P/D sources without a declared layout. |
 | `--router-temperature` | finite value ≥ `0` | `f64` | `0.0` | Samples more broadly with higher values in colocated routing and P/D Prefill. Zero selects the lowest-cost worker. |
@@ -333,7 +322,6 @@ Use the same vLLM release for the engine and its gRPC frontend. In all versions 
 | `--kv-penalty-external` | `0.0` to `1.0` | `f64` | `0.6` | Sets the fraction for a hit in external storage. |
 | `--kv-penalty-disk` | `0.0` to `1.0` | `f64` | `0.3` | Sets the fraction for a hit on disk. |
 | `--kv-aware-session-affinity-ttl-secs` | `1` to `31536000` seconds | `u64` | unset | Enables session affinity until the idle timeout. In P/D it applies to Decode. |
-| `--prometheus-port` | `29000` | `u16` | `29000` | Sets the Router metrics port used in the reuse check. |
 
 For session affinity, send the same `x-session-id` or `session_params.session_id` on each turn. See the [CLI reference](../cli_reference.md) for launcher availability and other Router options.
 

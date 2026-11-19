@@ -56,7 +56,7 @@ pub(crate) fn record_signal_loss() {
     SIGNAL_LOSS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
-/// Ingestion progress and continuity signals. Loss also fences the index
+/// Ingestion continuity signals. Loss also fences the index
 /// synchronously, independently of this advisory channel.
 #[derive(Debug, Clone)]
 pub enum IngestionSignal {
@@ -65,18 +65,10 @@ pub enum IngestionSignal {
         dp_rank: u32,
         reason: &'static str,
     },
-    Advance {
-        source: SourceId,
-        last_seq: i64,
-    },
     Gap {
         source: SourceId,
         from_seq: i64,
         to_seq: i64,
-    },
-    ReplayApplied {
-        source: SourceId,
-        replay_seq: i64,
     },
     IncarnationReset {
         source: SourceId,

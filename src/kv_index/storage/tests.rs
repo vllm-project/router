@@ -232,3 +232,58 @@ fn retiring_many_sources_reclaims_gates_without_erasing_other_owners() {
     assert!(index.suspended_sources.is_empty());
     assert!(visible_tiers(&index, &keep, 0, key).contains(StorageTier::Device));
 }
+
+#[test]
+fn worker_clear_and_pool_eviction_remove_only_their_own_facts() {
+    let index = KvBlockIndexer::new();
+    let worker = worker("worker", 0);
+    let pool = |id| ResidencyOwner::CacheOwner {
+        pool_id: Arc::from(id),
+        source: worker.target().instance_id,
+        dp_rank: 0,
+    };
+    let first = pool("first");
+    let second = pool("second");
+    let key = [5; 32];
+    store(&index, &worker, 0, key, StorageTier::Device);
+    store(&index, &first, 0, key, StorageTier::External);
+    store(&index, &second, 0, key, StorageTier::External);
+
+    index.with_source_batch(&worker.target(), |tx| tx.clear_owner_exact(&worker));
+    assert_eq!(visible_tiers(&index, &worker, 0, key), TierBits::default());
+    assert!(visible_tiers(&index, &first, 0, key).contains(StorageTier::External));
+    assert!(visible_tiers(&index, &second, 0, key).contains(StorageTier::External));
+
+    index.with_source_batch(&worker.target(), |tx| {
+        tx.remove_hash_pages(&first, 0, StorageTier::External, &[key], false);
+    });
+    assert_eq!(visible_tiers(&index, &first, 0, key), TierBits::default());
+    assert!(visible_tiers(&index, &second, 0, key).contains(StorageTier::External));
+}
+
+#[test]
+fn page_positions_are_independent_of_store_batch_boundaries() {
+    let owner = worker("a", 0);
+    let stored = [[1; 32], [2; 32], [3; 32], [4; 32], [5; 32], [6; 32]];
+    // Collect the same hash twice and place a miss between two hits.
+    let requested = [stored[0], stored[1], stored[1], [0; 32], stored[4]];
+    let hit = TierBits(TierBits::bit(StorageTier::Device));
+    for shape in [&[4, 2][..], &[1; 6][..], &[2; 3][..]] {
+        let index = KvBlockIndexer::new();
+        let mut pages = stored.as_slice();
+        for &count in shape {
+            let (chunk, rest) = pages.split_at(count);
+            index.with_source_batch(&owner.target(), |tx| {
+                tx.store_hash_pages(&owner, 0, StorageTier::Device, None, chunk, true, 8)
+                    .unwrap()
+            });
+            pages = rest;
+        }
+
+        let evidence = index.collect_hash_pages(0, &requested);
+        assert_eq!(
+            evidence.for_owner(&owner).as_ref(),
+            &[hit, hit, hit, TierBits::default(), hit],
+        );
+    }
+}

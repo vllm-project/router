@@ -498,12 +498,13 @@ async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
     use serde_json::json;
 
     let topic = "kv/full-boot-1";
-    for (algorithm, declared_groups, declare_adapters, native) in [
-        (None, None, false, false),
-        (Some("sha256"), Some(1), true, false),
-        (Some("sha256_cbor"), None, true, false),
-        (Some("sha256_cbor"), Some(1), false, false),
-        (Some("sha256_cbor"), Some(1), true, true),
+    for (algorithm, declared_groups, size, declare_empty_fields, native) in [
+        (None, None, 16, false, false),
+        (Some("sha256"), Some(1), 16, true, false),
+        (Some("sha256_cbor"), None, 16, true, false),
+        (Some("sha256_cbor"), Some(1), 8, true, false),
+        (Some("sha256_cbor"), Some(1), 16, false, true),
+        (Some("sha256_cbor"), Some(1), 16, true, true),
     ] {
         let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
         let sources = Arc::new(Mutex::new(json!({"0": {
@@ -514,15 +515,19 @@ async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
         let info = json!({
             "model_id": "served-alias", "model_path": "full-model",
             "instance_id": "boot-1", "kv_block_size": 8,
-            "effective_attention_block_size": if algorithm.is_none() { 16 } else { 8 }
+            "effective_attention_block_size": 16
         });
         let layout = algorithm.map(|algorithm| {
-            let mut layout = plain_full_layout("full-model", topic, 8);
+            let mut layout = plain_full_layout("full-model", topic, size);
             layout.ranks[0].hash_algorithm = algorithm.to_owned();
             layout.ranks[0].declared_groups = declared_groups;
             let mut layout = automatic_layout(layout);
-            if !declare_adapters {
+            if !declare_empty_fields {
                 layout.as_object_mut().unwrap().remove("adapters");
+                layout["ranks"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("transfer");
             }
             layout
         });
@@ -563,13 +568,21 @@ async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
             native || assumed,
             "{algorithm:?}"
         );
-        if assumed {
+        if native || assumed {
             assert_eq!(registered.block_size, Some(16));
         }
         if native {
             assert_eq!(registered.ranks, [0]);
             assert_eq!(registered.cache_key.unwrap().model.as_ref(), "served-alias");
+        }
+        if native && declare_empty_fields {
             let provider = supervisor.workers.lock()[&worker].provider.clone();
+            provider
+                .lifecycle
+                .state
+                .lock()
+                .base_models
+                .insert("old-alias".into());
             let verified_at = provider.lifecycle.state.lock().verified_at;
             tokio::time::timeout(Duration::from_secs(5), async {
                 while provider.lifecycle.state.lock().verified_at == verified_at {
@@ -595,8 +608,14 @@ async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
             })
             .await
             .expect("monitor did not revoke the changed hash contract");
+            assert!(!provider.lifecycle.active.load(Ordering::Acquire));
             assert!(!supervisor.workers_have_cache_bindings([(worker.as_str(), 0)].into_iter()));
             assert!(supervisor.worker_registrations()[&worker].info.is_none());
+            assert!(
+                !supervisor
+                    .worker_model_eligibility(std::slice::from_ref(&worker), Some("old-alias"))
+                    [&worker]
+            );
             let refreshed = supervisor.refresh_discovered_workers().await;
             assert!(refreshed[&worker]
                 .provider
@@ -1681,7 +1700,7 @@ async fn spawn_metrics_only_worker(router: axum::Router) -> (String, tokio::task
 #[tokio::test]
 async fn metrics_only_worker_supplies_cache_metadata() {
     let metrics = "vllm:cache_config_info{engine=\"0\"} 1.0\n\
-        vllm:cache_config_info{block_size=\"16\",effective_attention_block_size=\"16\",engine=\"1\"} 1.0\n";
+        vllm:cache_config_info{block_size=\"8\",effective_attention_block_size=\"16\",engine=\"1\"} 1.0\n";
     let (worker, server) = spawn_metrics_only_worker(metrics_and_models_router(metrics)).await;
 
     let info = query_worker_metadata(&reqwest::Client::new(), &worker, None)

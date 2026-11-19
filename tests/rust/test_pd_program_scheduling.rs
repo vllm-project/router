@@ -375,7 +375,11 @@ async fn no_identity_and_disabled_feature_keep_native_round_robin() {
 
 #[test]
 fn pd_requires_explicit_capacity_and_rejects_unverified_modes() {
-    let valid: ProgramSchedulingConfig = serde_json::from_value(json!({"pd":{}})).unwrap();
+    let valid: ProgramSchedulingConfig =
+        serde_json::from_value(json!({"pd": {"kv_hash_mode": "xxhash_cbor"}})).unwrap();
+    assert!(serde_json::to_value(&valid).unwrap()["pd"]
+        .get("kv_hash_mode")
+        .is_none());
     let mut config = RouterConfig {
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://p:8000".into(), None)],
@@ -392,14 +396,13 @@ fn pd_requires_explicit_capacity_and_rejects_unverified_modes() {
     program.token_capacity_per_dp_rank = Some(100000);
     program.enable_batch_gain_admission = false;
     assert!(ConfigValidator::validate(&config).is_ok());
-    for mutation in 0..4 {
+    for mutation in 0..3 {
         let mut bad = config.clone();
         let program = bad.program_scheduling.as_mut().unwrap();
         match mutation {
             0 => program.binding_only = true,
             1 => program.enable_batch_gain_admission = true,
-            2 => program.pd.max_prefill_requests_per_target = 0,
-            _ => program.pd.kv_hash_mode = "unknown".into(),
+            _ => program.pd.max_prefill_requests_per_target = 0,
         }
         assert!(ConfigValidator::validate(&bad).is_err());
     }

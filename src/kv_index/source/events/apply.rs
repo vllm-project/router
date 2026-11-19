@@ -8,7 +8,7 @@ use crate::kv_index::{
     KVEvent, KVEventBatch, ResidencyOwner, SourceBinding, SourceError, StorageTier,
 };
 
-use super::validate::{native_device, publishes_int_hash, sequence_hash, validate_store};
+use super::validate::{publishes_int_hash, sequence_hash, validate_store};
 
 pub(super) enum PreparedEvent<'a> {
     Store {
@@ -143,10 +143,7 @@ impl SourceBinding {
                     prepared.push(PreparedEvent::Remove {
                         group: remove.group_idx.expect("validated group"),
                         tier,
-                        incremental: native_device(
-                            remove.ownership.as_deref(),
-                            remove.medium.as_deref(),
-                        ),
+                        incremental: tier == StorageTier::Device,
                         hashes,
                     });
                 }
@@ -171,6 +168,7 @@ impl SourceBinding {
         if seq != next_seq || seq == u64::MAX {
             return Self::fail(state, tx, &self.owner, SourceError::Sequence);
         }
+        // The vLLM publisher stamps every batch with its configured DP rank.
         if batch.data_parallel_rank != Some(self.target.dp_rank)
             || !batch.ts.is_finite()
             || batch.ts < 0.0
@@ -185,6 +183,8 @@ impl SourceBinding {
             if self.requires_root_proof && !state.root_verified {
                 if let PreparedEvent::Store { proves_root, .. } = &event {
                     if !proves_root {
+                        // Verified native hashing starts at a root store. A
+                        // suffix from replay cannot establish that contract.
                         continue;
                     }
                     state.root_verified = true;
@@ -256,7 +256,7 @@ impl SourceBinding {
             .map(sequence_hash)
             .collect::<Option<Vec<_>>>()
             .ok_or(SourceError::InvalidBatch)?;
-        let incremental = native_device(store.ownership.as_deref(), store.medium.as_deref());
+        let incremental = tier == StorageTier::Device;
         let proves_root = self.requires_root_proof
             && namespace.is_none()
             && incremental

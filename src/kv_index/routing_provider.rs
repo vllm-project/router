@@ -48,6 +48,7 @@ impl crate::policies::TieredMatchProvider for SourceBinding {
         }
         if self.groups.len() == 1
             && self.groups[0].kind == crate::kv_index::GroupRule::FullAttention
+            && !self.partial_hash_hits
             && self.replay_tokens == 0
             && self.tail_drop_group.is_none()
         {

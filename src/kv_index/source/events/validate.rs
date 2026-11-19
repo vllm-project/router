@@ -4,10 +4,6 @@ use crate::kv_index::layout::{CacheGroup, GroupRule};
 use crate::kv_index::wire::extra_keys_match;
 use crate::kv_index::wire::{BlockStored, ExternalBlockHash, KVEvent};
 
-pub(super) fn native_device(ownership: Option<&str>, medium: Option<&str>) -> bool {
-    ownership.is_none() && matches!(medium, None | Some("GPU"))
-}
-
 pub(super) fn sequence_hash(hash: &ExternalBlockHash) -> Option<SequenceHash> {
     match hash {
         ExternalBlockHash::Bytes(bytes) => bytes.as_slice().try_into().ok(),

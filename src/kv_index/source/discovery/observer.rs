@@ -117,7 +117,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::kv_index::source::test_support::{event_payload, full_store};
-    use crate::kv_index::{wire::ExternalBlockHash, HashMode, IngestionSignal, KVEvent};
+    use crate::kv_index::{wire::ExternalBlockHash, IngestionSignal, KVEvent};
 
     #[tokio::test]
     async fn advisory_observer_tracks_loss_without_a_cache_contract() {
@@ -147,8 +147,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let worker_url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let (supervisor, mut signals) =
-            KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+        let (supervisor, mut signals) = KvIndexSupervisor::new_observer(reqwest::Client::new());
 
         let info = supervisor.on_worker_added(&worker_url).await.unwrap();
         assert_eq!(info.ranks, vec![0]);

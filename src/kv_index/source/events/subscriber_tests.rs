@@ -410,6 +410,60 @@ async fn first_live_batch_overlaps_only_the_same_replayed_payload() {
 }
 
 #[tokio::test]
+async fn malformed_live_batch_can_recover_through_replay() {
+    let tcp = TcpReplay::new();
+    let index = Arc::new(full_binding(target("malformed-live"), BLOCK_SIZE));
+    let (tx, mut signals) = mpsc::channel(8);
+    let _handle = tcp.start(index.clone(), Some(tx));
+    let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
+    let empty = batch_payload(&[]);
+
+    tcp.subscribed().await;
+    tcp.history(&tcp.request(0).await, &[]);
+    tcp.live(0, &store);
+    wait_until(|| credit(&index) == 4).await;
+
+    tcp.live(1, &[0xc1]);
+    assert!(matches!(
+        signal(&mut signals).await,
+        IngestionSignal::Invalidated {
+            reason: "invalid live KV event batch",
+            ..
+        }
+    ));
+    let insufficient = tcp.request(0).await;
+    assert_eq!(credit(&index), 0);
+    tcp.history(&insufficient, &[(0, &store)]);
+
+    let replay = tcp.request(0).await;
+    assert_eq!(credit(&index), 0);
+    tcp.history(&replay, &[(0, &store), (1, &empty)]);
+    wait_until(|| credit(&index) == 4 && next_seq(&index) == Some(2)).await;
+}
+
+#[tokio::test]
+async fn idle_subscriber_shutdown_retires_its_source() {
+    let tcp = TcpReplay::new();
+    let index = Arc::new(full_binding(target("idle-shutdown"), BLOCK_SIZE));
+    let (tx, mut signals) = mpsc::channel(8);
+    let handle = tcp.start(index.clone(), Some(tx));
+    let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
+
+    tcp.subscribed().await;
+    tcp.history(&tcp.request(0).await, &[]);
+    tcp.live(0, &store);
+    wait_until(|| credit(&index) == 4 && next_seq(&index) == Some(1)).await;
+
+    handle.shutdown();
+    let signal = tokio::time::timeout(Duration::from_secs(4), signals.recv())
+        .await
+        .expect("idle subscriber did not stop");
+    assert!(signal.is_none());
+    assert_eq!(next_seq(&index), None);
+    assert_eq!(credit(&index), 0);
+}
+
+#[tokio::test]
 async fn live_sequence_without_room_for_a_successor_fences_cache() {
     let tcp = TcpReplay::new();
     let index = Arc::new(full_binding(target("overflow"), BLOCK_SIZE));

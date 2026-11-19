@@ -24,9 +24,9 @@ pub(crate) struct EngineCacheConfig {
 }
 
 impl EngineCacheConfig {
-    /// Tokens covered by one hashed block, preferring the cache block size.
+    /// Effective attention unit, or the configured unit when absent.
     pub(crate) fn hash_unit(&self) -> Option<u32> {
-        self.block_size.or(self.effective_attention_block_size)
+        self.effective_attention_block_size.or(self.block_size)
     }
 }
 
@@ -130,14 +130,21 @@ mod tests {
 
     #[test]
     fn refuses_mixed_block_sizes() {
-        let metrics = r#"
+        for metrics in [
+            r#"
 vllm:cache_config_info{block_size="16",engine="0"} 1.0
 vllm:cache_config_info{block_size="32",engine="1"} 1.0
-"#;
-        assert_eq!(
-            shared_hash_unit(&parse_cache_config_info(metrics)),
-            Err(vec![16, 32])
-        );
+"#,
+            r#"
+vllm:cache_config_info{block_size="8",effective_attention_block_size="16",engine="0"} 1.0
+vllm:cache_config_info{block_size="8",effective_attention_block_size="32",engine="1"} 1.0
+"#,
+        ] {
+            assert_eq!(
+                shared_hash_unit(&parse_cache_config_info(metrics)),
+                Err(vec![16, 32])
+            );
+        }
         let agreed =
             parse_cache_config_info(r#"vllm:cache_config_info{block_size="16",engine="0"} 1.0"#);
         assert_eq!(shared_hash_unit(&agreed), Ok(Some(16)));

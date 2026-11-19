@@ -143,7 +143,6 @@ Upstream failures are forwarded unchanged: if a prefill or decode target rejects
 | `prefill_kv_high_watermark` | `0.85` | when P KV usage is above it, tighten the Program-count cap back to the P permit count; `0` disables |
 | `prefill_kv_window_seconds` | `10.0` | sampling window for the P watermark guard |
 | `kv_events` | `false` | subscribe to KV events for advisory residency; never authorizes a transfer |
-| `kv_hash_mode` | `sha256` | `sha256`, `python_hash_seed`, `xxhash_cbor` |
 
 ### `pd` — warm remote KV reuse
 

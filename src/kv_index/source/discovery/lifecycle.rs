@@ -157,7 +157,9 @@ impl WorkerLifecycle {
     pub(super) fn observe_layout(&self, outcome: &StaticHybridMatch) -> SourceAction {
         let mut state = self.state.lock();
         if !self.active.load(Ordering::Acquire) || !probe_keeps_trust(outcome) {
+            self.active.store(false, Ordering::Release);
             state.trusted = false;
+            state.base_models.clear();
             if state.info.take().is_some() {
                 state.revision = crate::kv_index::next_owner_incarnation();
             }

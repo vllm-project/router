@@ -437,7 +437,10 @@ mod frame_tests {
         assert_eq!(live_sequence(&[b"kv".to_vec()], b"kv"), Err(()));
         let mut frames = vec![b"kv".to_vec(), 42_i64.to_be_bytes().to_vec(), vec![]];
         assert_eq!(live_sequence(&frames, b"kv"), Ok(Some(42)));
-        frames[1].push(0);
+        assert_eq!(live_sequence(&frames[..2], b"kv"), Err(()));
+        frames[1].pop();
+        assert_eq!(live_sequence(&frames, b"kv"), Err(()));
+        frames[1].resize(9, 0);
         assert_eq!(live_sequence(&frames, b"kv"), Err(()));
     }
 
@@ -445,6 +448,7 @@ mod frame_tests {
     fn replay_envelope_and_end_sentinel_are_preserved() {
         let mut frames = vec![vec![], vec![], (-1_i64).to_be_bytes().to_vec(), vec![]];
         assert_eq!(replay_frame(&frames), Some((-1, &[][..], &[][..])));
+        assert_eq!(replay_frame(&frames[..3]), None);
         frames[0].push(1);
         assert_eq!(replay_frame(&frames), None);
         frames[0].clear();

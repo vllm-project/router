@@ -4,7 +4,7 @@ use super::pd_warm_remote::{PdResponseContext, PdWarmRemoteRuntime};
 use super::program_adapter::ProgramCompletion;
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
 use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerRegistry, WorkerType};
-use crate::kv_index::{HashMode, KvIndexSupervisor};
+use crate::kv_index::KvIndexSupervisor;
 use crate::program_scheduling::{
     max_prometheus_gauge, sum_prometheus_gauge, BackendObservationProvider, ProgramIdentity,
     ProgramScheduler, ProgramSchedulerConfig, ProgramTarget, ScheduleError,
@@ -74,7 +74,6 @@ impl PdProgramRuntime {
             ctx.client.clone(),
             ctx.router_config.api_key.clone(),
         );
-        let kv_config = config.pd.clone();
         let mut default_headers = HeaderMap::new();
         if let Some(key) = &ctx.router_config.api_key {
             if let Ok(value) = format!("Bearer {key}").parse() {
@@ -90,13 +89,10 @@ impl PdProgramRuntime {
         let kv_services = services.clone();
         let kv_interval = scheduler.metrics_interval().max(Duration::from_secs(1));
         let kv_warm_remote = warm_remote.clone();
-        let kv_observer = if kv_config.kv_events {
+        let kv_observer = if config.pd.kv_events {
             Some(
                 tokio::spawn(async move {
-                    let (supervisor, mut signals) = KvIndexSupervisor::new(
-                        kv_client,
-                        HashMode::parse_config(&kv_config.kv_hash_mode),
-                    );
+                    let (supervisor, mut signals) = KvIndexSupervisor::new_observer(kv_client);
                     let mut previous = BTreeSet::new();
                     let mut subscribed = BTreeSet::new();
                     let mut loss_epoch = crate::kv_index::signal_loss_epoch();
@@ -107,20 +103,17 @@ impl PdProgramRuntime {
                         while let Ok(signal) = signals.try_recv() {
                             use crate::kv_index::IngestionSignal;
                             if let Some(warm_remote) = &kv_warm_remote {
-                                let invalidation = match signal {
+                                let (source, rank) = match signal {
                                     IngestionSignal::Invalidated {
                                         source, dp_rank, ..
-                                    } => Some((source, Some(dp_rank as usize))),
+                                    } => (source, Some(dp_rank as usize)),
                                     IngestionSignal::Gap { source, .. }
                                     | IngestionSignal::IncarnationReset { source, .. } => {
-                                        Some((source, None))
+                                        (source, None)
                                     }
-                                    _ => None,
                                 };
-                                if let Some((source, rank)) = invalidation {
-                                    for url in supervisor.worker_urls_for_source(&source) {
-                                        warm_remote.invalidate_target(&url, rank);
-                                    }
+                                for url in supervisor.worker_urls_for_source(&source) {
+                                    warm_remote.invalidate_target(&url, rank);
                                 }
                             }
                         }
@@ -900,8 +893,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let (supervisor, _signals) =
-            KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+        let (supervisor, _signals) = KvIndexSupervisor::new_observer(reqwest::Client::new());
         let urls = BTreeSet::from([format!("http://{address}")]);
         let mut previous = BTreeSet::new();
         let mut subscribed = BTreeSet::new();

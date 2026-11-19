@@ -211,6 +211,9 @@ impl Default for PredictionProfileConfig {
 pub struct PdProgramSchedulingConfig {
     /// Event residency is advisory and never authorizes a warm transfer.
     pub kv_events: bool,
+    /// Compatibility field for existing Program scheduling configurations.
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
     pub kv_hash_mode: String,
     pub max_prefill_requests_per_target: usize,
     /// Only bounded explicit TTL is supported; otherwise Acting TTL is zero.

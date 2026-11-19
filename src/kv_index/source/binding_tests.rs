@@ -322,6 +322,21 @@ fn single_full_attention_group_credits_only_published_partial_pages() {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].segments, [(0, end)]);
         assert_eq!(index.reusable_tokens(&tokens, 32), 32);
+        if partial {
+            index
+                .apply_batch(
+                    1,
+                    &event_batch(
+                        1.0,
+                        vec![gpu_remove(
+                            Some(0),
+                            vec![ExternalBlockHash::Bytes(hashes[1].to_vec())],
+                        )],
+                    ),
+                )
+                .unwrap();
+            assert!(index.matches(&tokens, 16, None, 0).is_empty());
+        }
     }
 }
 
@@ -403,23 +418,17 @@ fn incremental_second_copy_survives_first_remove() {
     let index = SourceBinding::new(target(), groups(), 528, 0, 8).unwrap();
     index.begin_empty(0);
     let mut batch = qwen_batch();
-    batch.events.push(KVEvent::BlockStored(gpu_store(
-        3,
-        "full_attention",
-        528,
-        &tokens[..528],
-        &[hash],
-    )));
+    let mut copy = gpu_store(3, "full_attention", 528, &tokens[..528], &[hash]);
+    copy.medium = Some("NPU".into());
+    batch.events.push(KVEvent::BlockStored(copy));
     assert_eq!(index.apply_batch(0, &batch), Ok(()));
     assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 528);
 
-    let removal = event_batch(
-        1.0,
-        vec![gpu_remove(
-            Some(3),
-            vec![ExternalBlockHash::Bytes(hash.to_vec())],
-        )],
-    );
+    let mut removal = gpu_remove(Some(3), vec![ExternalBlockHash::Bytes(hash.to_vec())]);
+    if let KVEvent::BlockRemoved(event) = &mut removal {
+        event.medium = Some("ASCEND".into());
+    }
+    let removal = event_batch(1.0, vec![removal]);
     assert_eq!(index.apply_batch(1, &removal), Ok(()));
     assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 528);
     assert_eq!(index.apply_batch(2, &removal), Ok(()));

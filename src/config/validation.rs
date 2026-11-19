@@ -758,14 +758,10 @@ impl ConfigValidator {
                     || program.enable_batch_gain_admission
                     || program.token_capacity_per_dp_rank.is_none()
                     || program.pd.max_prefill_requests_per_target == 0
-                    || program.pd.max_prefill_requests_per_target > u32::MAX as usize
-                    || !matches!(
-                        program.pd.kv_hash_mode.as_str(),
-                        "sha256" | "python_hash_seed" | "xxhash_cbor"
-                    ))
+                    || program.pd.max_prefill_requests_per_target > u32::MAX as usize)
             {
                 return Err(ConfigError::IncompatibleConfig {
-                    reason: "PD scheduling requires per-rank capacity, positive bounded P concurrency and a known KV hash mode; binding_only and uncalibrated batch gain are unsupported".to_string(),
+                    reason: "PD scheduling requires per-rank capacity and positive bounded P concurrency. Binding-only mode and uncalibrated batch gain are unsupported".to_string(),
                 });
             }
         }

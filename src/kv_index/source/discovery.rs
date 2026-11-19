@@ -184,6 +184,10 @@ impl KvIndexSupervisor {
         client: reqwest::Client,
         _hash_mode: HashMode,
     ) -> (Self, mpsc::Receiver<IngestionSignal>) {
+        Self::new_observer(client)
+    }
+
+    pub(crate) fn new_observer(client: reqwest::Client) -> (Self, mpsc::Receiver<IngestionSignal>) {
         let (mut supervisor, signals) = Self::indexed(client);
         supervisor.observers = Some(Mutex::new(HashMap::new()));
         (supervisor, signals)
@@ -297,9 +301,7 @@ impl KvIndexSupervisor {
             return exact;
         }
         per_rank.sort_by_key(|(rank, _)| *rank);
-        let mut merged = exact
-            .or_else(|| per_rank.first().map(|(_, source)| (*source).clone()))
-            .expect("per-rank declarations are non-empty");
+        let mut merged = exact.or_else(|| per_rank.first().map(|(_, source)| (*source).clone()))?;
         // Every rank publishes its own endpoints: collect them instead of
         // keeping only the first non-empty list, or the second rank's publisher
         // and replay channel are silently dropped.
@@ -746,7 +748,14 @@ fn native_worker_discovery(
     model_id: Result<Option<String>, String>,
     layout: Result<Option<CacheCapabilities>, String>,
 ) -> WorkerDiscovery {
-    let (hybrid, assumed_plain_full) = match (&mut server_info, &sources, &model_id, layout) {
+    // Both native full-attention admission and policy scoring use the engine's
+    // effective attention unit when it differs from the configured size.
+    if let Ok(info) = &mut server_info {
+        if let Some(size) = info.effective_attention_block_size.filter(|size| *size > 0) {
+            info.kv_block_size = Some(size);
+        }
+    }
+    let (hybrid, assumed_plain_full) = match (&server_info, &sources, &model_id, layout) {
         (Ok(info), Ok(sources), Ok(Some(model)), Ok(Some(layout))) => {
             let engine_model = layout_model(info, model, &layout);
             let mut active = sources.iter().filter(|(_, source)| events_enabled(source));
@@ -779,9 +788,7 @@ fn native_worker_discovery(
         }
         (Ok(info), Ok(sources), Ok(Some(model)), Ok(None)) => {
             let layout = synthesize_plain_full_layout(info, sources, model);
-            if let Some(layout) = &layout {
-                // The index and policy must use the same effective hash unit.
-                info.kv_block_size = layout.ranks[0].hash_block_size;
+            if layout.is_some() {
                 debug!(
                     worker_url,
                     "checking the default full-attention KV hash contract"
@@ -814,10 +821,7 @@ fn synthesize_plain_full_layout(
 ) -> Option<CacheCapabilities> {
     // The HTTP discovery error path may substitute the URL as a model name.
     server_model_id(info)?;
-    let size = info
-        .effective_attention_block_size
-        .filter(|size| *size > 0)
-        .or_else(|| discovered_block_size(info))?;
+    let size = discovered_block_size(info)?;
     let mut ranks = sources
         .iter()
         .filter(|(_, source)| events_enabled(source))

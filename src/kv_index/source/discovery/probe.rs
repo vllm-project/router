@@ -257,12 +257,10 @@ async fn fetch_http_full_layout(
 /// Automatic discovery accepts only a complete plain full-attention contract.
 /// Invalid or incompatible declarations are distinct from an absent endpoint.
 fn parse_native_full_layout(body: serde_json::Value) -> Result<CacheCapabilities, String> {
-    // An explicitly empty list and null transfer show this worker is plain.
-    // An omitted field provides no evidence of what the exporter checked.
+    // A plain capability may omit the empty adapter list and null transfer.
     if !body
         .get("adapters")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(Vec::is_empty)
+        .is_none_or(|adapters| adapters.as_array().is_some_and(Vec::is_empty))
         || !body
             .get("ranks")
             .and_then(serde_json::Value::as_array)
@@ -270,7 +268,7 @@ fn parse_native_full_layout(body: serde_json::Value) -> Result<CacheCapabilities
                 !ranks.is_empty()
                     && ranks
                         .iter()
-                        .all(|rank| rank.get("transfer").is_some_and(serde_json::Value::is_null))
+                        .all(|rank| rank.get("transfer").is_none_or(serde_json::Value::is_null))
             })
     {
         return Err("worker did not confirm a plain cache capability".into());
@@ -440,11 +438,9 @@ async fn query_metrics_metadata(
     if engines.is_empty() {
         return Err("metrics: no vllm:cache_config_info series".to_string());
     }
-    if let Err(units) = metrics_meta::shared_hash_unit(&engines) {
-        return Err(format!(
-            "metrics: engines disagree on block size {units:?} — refusing to index"
-        ));
-    }
+    let hash_unit = metrics_meta::shared_hash_unit(&engines).map_err(|units| {
+        format!("metrics: engines disagree on block size {units:?} — refusing to index")
+    })?;
     if let Some(layout) = engines
         .values()
         .find_map(|engine| engine.kv_cache_layout.as_deref())
@@ -460,10 +456,8 @@ async fn query_metrics_metadata(
     Ok(ServerInfo {
         model_id,
         model_path: model_path.flatten(),
-        kv_block_size: engines.values().find_map(|engine| engine.block_size),
-        effective_attention_block_size: engines
-            .values()
-            .find_map(|engine| engine.effective_attention_block_size),
+        kv_block_size: hash_unit,
+        effective_attention_block_size: hash_unit,
         ..Default::default()
     })
 }
