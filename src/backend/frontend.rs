@@ -84,6 +84,13 @@ impl EngineFrontend {
         }
     }
 
+    /// Send this worker API key as `authorization` metadata on every gRPC
+    /// request (inference, Control.Abort), mirroring the HTTP path.
+    pub fn with_api_key(mut self, api_key: Option<Arc<str>>) -> Self {
+        self.grpc = self.grpc.with_api_key(api_key);
+        self
+    }
+
     /// Enable L0 with a shared budget across models.
     pub fn with_tokenizer_cache(
         request_timeout: Duration,

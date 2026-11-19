@@ -450,7 +450,8 @@ impl Worker for BasicWorker {
             }
             ConnectionMode::Grpc => {
                 let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
-                crate::backend::check_grpc_health(self.url(), timeout).await
+                crate::backend::check_grpc_health(self.url(), self.api_key.as_deref(), timeout)
+                    .await
             }
         };
 

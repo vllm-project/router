@@ -11,9 +11,14 @@ use tonic_health::pb::health_client::HealthClient;
 use tonic_health::pb::HealthCheckRequest;
 
 use super::detect::grpc_connect_uri;
+use super::set_bearer_auth;
 
 /// `Ok(())` when `grpc.health.v1` reports `SERVING`.
-pub async fn check_grpc_health(worker_url: &str, timeout: Duration) -> Result<(), String> {
+pub async fn check_grpc_health(
+    worker_url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<(), String> {
     let uri = grpc_connect_uri(worker_url)?;
     let channel = Channel::from_shared(uri.clone())
         .map_err(|e| format!("invalid grpc uri {uri}: {e}"))?
@@ -23,15 +28,14 @@ pub async fn check_grpc_health(worker_url: &str, timeout: Duration) -> Result<()
         .await
         .map_err(|e| format!("grpc health connect {uri}: {e}"))?;
     let mut client = HealthClient::new(channel);
-    let resp = tokio::time::timeout(
-        timeout,
-        client.check(HealthCheckRequest {
-            service: String::new(),
-        }),
-    )
-    .await
-    .map_err(|_| format!("grpc health check timeout {uri}"))?
-    .map_err(|e| format!("grpc health check {uri}: {e}"))?;
+    let mut request = tonic::Request::new(HealthCheckRequest {
+        service: String::new(),
+    });
+    set_bearer_auth(&mut request, api_key);
+    let resp = tokio::time::timeout(timeout, client.check(request))
+        .await
+        .map_err(|_| format!("grpc health check timeout {uri}"))?
+        .map_err(|e| format!("grpc health check {uri}: {e}"))?;
     match ServingStatus::try_from(resp.into_inner().status) {
         Ok(ServingStatus::Serving) => Ok(()),
         Ok(other) => Err(format!("grpc health {uri}: {other:?}")),
@@ -44,9 +48,10 @@ pub async fn check_grpc_health(worker_url: &str, timeout: Duration) -> Result<()
 /// this, since exceeding `limit` takes a slow TCP connect.
 pub(crate) async fn check_grpc_health_within(
     worker_url: &str,
+    api_key: Option<&str>,
     limit: Duration,
 ) -> Result<(), String> {
-    tokio::time::timeout(limit, check_grpc_health(worker_url, limit))
+    tokio::time::timeout(limit, check_grpc_health(worker_url, api_key, limit))
         .await
         .unwrap_or_else(|_| Err(format!("grpc health check timed out: {worker_url}")))
 }

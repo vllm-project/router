@@ -434,7 +434,8 @@ impl Router {
         } else {
             crate::backend::EngineFrontend::from_env(request_timeout)
                 .map_err(|error| format!("tokenizer cache: {error}"))?
-        };
+        }
+        .with_api_key(ctx.router_config.api_key.as_deref().map(Arc::from));
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
         if !worker_urls.is_empty() {
             Self::wait_for_healthy_workers(
@@ -1289,7 +1290,13 @@ impl Router {
 
                 let check_health = tokio::spawn(async move {
                     if crate::backend::is_grpc_url(&url_clone) {
-                        match check_grpc_health_within(&url_clone, probe_timeout).await {
+                        match check_grpc_health_within(
+                            &url_clone,
+                            api_key.as_deref(),
+                            probe_timeout,
+                        )
+                        .await
+                        {
                             Ok(()) => None,
                             Err(e) => Some((url_clone, e)),
                         }
@@ -1406,7 +1413,13 @@ impl Router {
         };
 
         if crate::backend::is_grpc_url(health_url) {
-            return match check_grpc_health_within(health_url, Duration::from_secs(2)).await {
+            return match check_grpc_health_within(
+                health_url,
+                self.api_key.as_deref(),
+                Duration::from_secs(2),
+            )
+            .await
+            {
                 Ok(()) => StatusCode::OK.into_response(),
                 Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
             };
@@ -2663,7 +2676,12 @@ impl Router {
             let health_result = if crate::backend::is_grpc_url(worker_url) {
                 // No test covers this limit: it shortens a 2 s probe, so a test
                 // would hinge on a sub-second wall-clock bound.
-                check_grpc_health_within(worker_url, budget.probe(Duration::from_secs(2))).await
+                check_grpc_health_within(
+                    worker_url,
+                    self.api_key.as_deref(),
+                    budget.probe(Duration::from_secs(2)),
+                )
+                .await
             } else {
                 let health_url = format!("{}/health", worker_url);
                 match worker_get(&client, &health_url, self.api_key.as_deref())

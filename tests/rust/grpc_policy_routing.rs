@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::create_test_context;
-use common::mock_vllm_rs::{MockVllmRs, MockVllmRsServer};
+use common::mock_vllm_rs::{AuthorizationCheck, MockVllmRs, MockVllmRsServer};
 use serde_json::{json, Value};
 use vllm_router_rs::config::{PolicyConfig, RouterConfig, RoutingMode};
 use vllm_router_rs::protocols::spec::CompletionRequest;
@@ -546,5 +546,100 @@ async fn power_of_two_prefers_the_less_loaded_worker() {
     assert_eq!(
         avoided, 12,
         "power-of-two should avoid the in-flight worker"
+    );
+}
+
+/// The router answers `--api-key` on every gRPC exchange: the startup wait
+/// and `/health` probe grpc.health.v1 with the key, and Generate carries it
+/// as `authorization` metadata (issue #587).
+#[tokio::test]
+async fn api_key_reaches_grpc_health_checks_and_generate() {
+    let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        authorization: AuthorizationCheck::Bearer("worker-secret".to_string()),
+        health_authorization: AuthorizationCheck::Bearer("worker-secret".to_string()),
+        ..MockVllmRs::default()
+    })
+    .await;
+    let urls = vec![server.grpc_url.clone()];
+    let mut cfg = config(urls.clone(), PolicyConfig::RoundRobin);
+    cfg.api_key = Some("worker-secret".to_string());
+    let router = Router::new(urls, &create_test_context(cfg))
+        .await
+        .expect("the startup grpc health check must pass with the api key");
+    router.pin_test_token_ids(vec![1]);
+
+    let response = router.send_health_check(&server.grpc_url).await;
+    assert!(
+        response.status().is_success(),
+        "the manual health probe must carry the api key too"
+    );
+
+    complete(
+        &router,
+        std::slice::from_ref(&server),
+        prompt(&[1], json!({})),
+    )
+    .await;
+    let captured = server.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].authorization.as_deref(),
+        Some("Bearer worker-secret"),
+        "generate must send the api key as authorization metadata"
+    );
+}
+
+/// Without `--api-key` no `authorization` metadata is sent at all.
+#[tokio::test]
+async fn without_api_key_no_authorization_metadata_is_sent() {
+    let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        authorization: AuthorizationCheck::Absent,
+        health_authorization: AuthorizationCheck::Absent,
+        ..MockVllmRs::default()
+    })
+    .await;
+    let urls = vec![server.grpc_url.clone()];
+    let router = Router::new(
+        urls.clone(),
+        &create_test_context(config(urls, PolicyConfig::RoundRobin)),
+    )
+    .await
+    .expect("grpc health must pass without credentials");
+    router.pin_test_token_ids(vec![1]);
+
+    complete(
+        &router,
+        std::slice::from_ref(&server),
+        prompt(&[1], json!({})),
+    )
+    .await;
+    let captured = server.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].authorization, None,
+        "no authorization metadata may be invented without --api-key"
+    );
+}
+
+/// A wrong key surfaces as a failed startup wait, as on the HTTP path.
+#[tokio::test]
+async fn wrong_api_key_fails_the_grpc_startup_health_check() {
+    let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        authorization: AuthorizationCheck::Bearer("worker-secret".to_string()),
+        health_authorization: AuthorizationCheck::Bearer("worker-secret".to_string()),
+        ..MockVllmRs::default()
+    })
+    .await;
+    let urls = vec![server.grpc_url.clone()];
+    let mut cfg = config(urls.clone(), PolicyConfig::RoundRobin);
+    cfg.api_key = Some("other-key".to_string());
+    let error = Router::new(urls, &create_test_context(cfg))
+        .await
+        .expect_err("a wrong key must fail the startup wait");
+    assert!(
+        error
+            .to_ascii_lowercase()
+            .contains("authentication credentials"),
+        "the rejection should surface in the startup error: {error}"
     );
 }

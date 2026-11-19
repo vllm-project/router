@@ -3169,7 +3169,8 @@ impl VllmPDRouter {
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
-                grpc_frontend: crate::backend::EngineFrontend::new(),
+                grpc_frontend: crate::backend::EngineFrontend::new()
+                    .with_api_key(ctx.router_config.api_key.as_deref().map(Arc::from)),
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -3189,7 +3190,8 @@ impl VllmPDRouter {
                     .map_err(|error| format!("tokenizer cache: {error}"))?
             } else {
                 crate::backend::EngineFrontend::with_request_timeout(request_timeout)
-            };
+            }
+            .with_api_key(ctx.router_config.api_key.as_deref().map(Arc::from));
 
             // Create underlying PD router with provided worker lists
             let grpc_workers: Vec<String> = prefill_urls

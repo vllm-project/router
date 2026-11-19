@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 
 use common::create_test_context;
-use common::mock_vllm_rs::{MockVllmRs, MockVllmRsServer};
+use common::mock_vllm_rs::{AuthorizationCheck, MockVllmRs, MockVllmRsServer};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde_json::{json, Value};
 use vllm_router_rs::backend::EngineFrontend;
@@ -77,7 +77,15 @@ async fn pd_router_with_pools(
     dp_size: usize,
     prefill_policy: PolicyConfig,
 ) -> VllmPDRouter {
-    pd_router_with_kv_sources(prefills, decode, dp_size, prefill_policy, HashMap::new()).await
+    pd_router_with_kv_sources(
+        prefills,
+        decode,
+        dp_size,
+        prefill_policy,
+        HashMap::new(),
+        None,
+    )
+    .await
 }
 
 async fn pd_router_with_kv_sources(
@@ -86,6 +94,7 @@ async fn pd_router_with_kv_sources(
     dp_size: usize,
     prefill_policy: PolicyConfig,
     pd_kv_event_sources: HashMap<String, PdKvEventSources>,
+    api_key: Option<String>,
 ) -> VllmPDRouter {
     metrics();
     let prefill_urls: Vec<(String, Option<u16>)> = prefills
@@ -105,6 +114,7 @@ async fn pd_router_with_kv_sources(
         kv_connector: KvConnector::Nixl,
         worker_startup_timeout_secs: 5,
         intra_node_data_parallel_size: dp_size,
+        api_key,
         ..RouterConfig::default()
     };
     vllm_router_rs::config::ConfigValidator::validate(&config).unwrap();
@@ -785,9 +795,15 @@ async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
             kv_penalty_disk: 0.4,
             static_kv_event_sources: Default::default(),
         };
-        let router =
-            pd_router_with_kv_sources(&[&prefills[0], &prefills[1]], &decode, 1, policy, sources)
-                .await;
+        let router = pd_router_with_kv_sources(
+            &[&prefills[0], &prefills[1]],
+            &decode,
+            1,
+            policy,
+            sources,
+            None,
+        )
+        .await;
         let prompt: Vec<u32> = (0..33).collect();
         router.pin_test_token_ids(prompt.clone());
 
@@ -1459,4 +1475,58 @@ async fn send_chat(
         p.last().unwrap().token_ids.clone(),
         d.last().unwrap().token_ids.clone(),
     )
+}
+
+/// Both gRPC legs answer `--api-key`: the unary prefill `Generate` and the
+/// decode `GenerateStream` carry the key as `authorization` metadata
+/// (issue #587). The startup health wait keeps its #578 behaviour, so the
+/// mock leaves `grpc.health.v1` open.
+async fn pd_router_with_api_key(
+    prefill: &MockVllmRsServer,
+    decode: &MockVllmRsServer,
+    api_key: &str,
+) -> VllmPDRouter {
+    let router = pd_router_with_kv_sources(
+        &[prefill],
+        decode,
+        1,
+        PolicyConfig::RoundRobin,
+        HashMap::new(),
+        Some(api_key.to_string()),
+    )
+    .await;
+    router.pin_test_token_ids(vec![1, 2, 3]);
+    router
+}
+
+#[tokio::test]
+async fn grpc_pd_sends_the_api_key_on_both_legs() {
+    let check = AuthorizationCheck::Bearer("worker-secret".to_string());
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        finish_kv_transfer_params: Some(prefill_kv()),
+        authorization: check.clone(),
+        ..MockVllmRs::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        authorization: check,
+        ..MockVllmRs::default()
+    })
+    .await;
+    let router = pd_router_with_api_key(&prefill, &decode, "worker-secret").await;
+
+    let response = router.route_chat(None, &chat(false), None).await;
+    assert!(response.status().is_success());
+
+    for (leg, captured) in [
+        ("prefill", prefill.captured()),
+        ("decode", decode.captured()),
+    ] {
+        assert_eq!(captured.len(), 1, "{leg} leg");
+        assert_eq!(
+            captured[0].authorization.as_deref(),
+            Some("Bearer worker-secret"),
+            "{leg} leg must send the api key as authorization metadata"
+        );
+    }
 }

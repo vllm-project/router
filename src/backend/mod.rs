@@ -40,6 +40,28 @@ pub fn stages_enabled() -> bool {
     )
 }
 
+/// Metadata key carrying the worker credential on gRPC requests, mirroring
+/// the HTTP `Authorization` header set by `worker_get`.
+pub(crate) const AUTHORIZATION_METADATA: &str = "authorization";
+
+/// Attach the router's API key as a `Bearer` token on a gRPC request — the
+/// counterpart of `worker_get`'s `bearer_auth` on the HTTP path. No metadata
+/// is sent when no key is configured; a key that is not valid ASCII metadata
+/// is skipped with a warning.
+pub(crate) fn set_bearer_auth<T>(request: &mut tonic::Request<T>, api_key: Option<&str>) {
+    if let Some(key) = api_key {
+        match format!("Bearer {key}").parse() {
+            Ok(value) => {
+                request.metadata_mut().insert(AUTHORIZATION_METADATA, value);
+            }
+            Err(error) => tracing::warn!(
+                error = %error,
+                "worker api key is not valid gRPC metadata; sending no authorization"
+            ),
+        }
+    }
+}
+
 pub use completion::{
     prepare_completion, prepare_completion_classified, validate_completion_tokenizer_definition,
     CompletionPreparationError,
