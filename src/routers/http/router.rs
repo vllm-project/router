@@ -1,5 +1,5 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
-use super::peer_fetch::{apply_peer_fetch, PeerFetchApply};
+use super::peer_fetch::{apply_peer_fetch, wants_prompt_logprobs, PeerFetchApply};
 use super::program_adapter::ProgramCompletion;
 use crate::backend::health::check_grpc_health_within;
 use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
@@ -1428,6 +1428,7 @@ impl Router {
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
+        transfer: bool,
     ) -> Option<SelectedWorker> {
         if available.is_empty() {
             return None;
@@ -1449,6 +1450,7 @@ impl Router {
                 affinity_key,
                 excluded_workers,
                 eligibility,
+                transfer,
             )?;
             return Some(SelectedWorker {
                 worker: available.get(receipt.worker_index)?.clone(),
@@ -1703,6 +1705,9 @@ impl Router {
                             &workers,
                         )
                     });
+                // The engine computes every prompt token for these requests, so
+                // a peer fetch could not help: keep placement, plan no fetch.
+                let transfer = !wants_prompt_logprobs(typed_req.grpc_request());
                 let selected_worker = if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
@@ -1732,6 +1737,7 @@ impl Router {
                             affinity_key.as_ref(),
                             &[],
                             eligibility.as_deref(),
+                            transfer,
                         )
                     });
                     Some(SelectedWorker { worker, kv_receipt })
@@ -1751,6 +1757,7 @@ impl Router {
                         cache_salt,
                         affinity_key.as_ref(),
                         &excluded_workers,
+                        transfer,
                     )
                 };
                 let SelectedWorker { worker, kv_receipt } = match selected_worker {
@@ -7142,6 +7149,7 @@ mod tests {
                     None,
                     None,
                     &[],
+                    true,
                 )
                 .expect("Should select a worker");
             selected_urls.push(worker.worker.url().to_string());
@@ -7183,6 +7191,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                true,
             )
             .expect("Should select the remaining healthy worker");
 
@@ -7215,6 +7224,7 @@ mod tests {
             None,
             None,
             &[],
+            true,
         );
         assert!(
             result.is_none(),
@@ -7238,6 +7248,7 @@ mod tests {
                     None,
                     None,
                     excluded,
+                    true,
                 )
                 .expect("Should select a worker")
                 .worker
@@ -7270,6 +7281,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                true,
             ) {
                 worker_urls_seen.insert(worker.worker.url().to_string());
             }

@@ -226,6 +226,9 @@ pub(crate) enum TransferSkip {
     SessionBinding,
     /// Used by the call site: the request has no token ids to match.
     MissingTokens,
+    /// Used by the call site: the client asked for `prompt_logprobs`, so the
+    /// engine computes every prompt token and reads no external KV.
+    PromptLogprobs,
 }
 
 impl TransferSkip {
@@ -244,6 +247,7 @@ impl TransferSkip {
             Self::CostRule => "cost_rule",
             Self::SessionBinding => "session_binding",
             Self::MissingTokens => "missing_tokens",
+            Self::PromptLogprobs => "prompt_logprobs",
         }
     }
 }
