@@ -248,8 +248,6 @@ Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyon
 
 HTTP Completion uses the existing [Direct/Worker input preparation](http_completion_kv.md), without local tokenizer assets. Unmodeled identities and unqualified targets stay routable without cache credit.
 
-With P/D disaggregation, the Decode stage is priced by the KV it must newly hold, and that price is reduced only by blocks the chosen Decode engine already has on the device; host and disk tiers still need a GPU block on arrival, so they are not credited. Decode credit therefore needs to see the Decode engine's own KV events: keep the Decode pool to `--pd-kv-events` sources configured at start-up. A Decode worker that joins later through service discovery is routable, but it does not receive Decode prefix credit until such a source exists for it.
-
 ```bash
 vllm-router --policy kv_aware \
   --worker-urls grpc://worker1:8000 grpc://worker2:8000
@@ -269,13 +267,13 @@ vllm-router --vllm-pd-disaggregation \
 
 Prefill selection considers reusable KV and current work. Decode selection favors the least busy worker. Both stages inherit `--policy` unless overridden.
 
-Decode ranks candidates by the logical context tokens they already hold, not by their pending plus active request count. Request counts are a poor proxy for KV pressure in long conversations: two 64K sequences and four 4K sequences are both "a few requests" but differ eightfold in KV. The comparison needs a known prompt length for every candidate, so any admitted request the router could not measure keeps the whole pool on request counts.
+Decode ranks candidates by logical context tokens, not by request count: a few long sequences and many short ones both look "busy" by count but differ in KV. A request whose prompt length the router could not measure keeps the whole pool on request counts.
 
 Configure the engines' P/D connector and enable prefix caching and KV events on prefill workers. For native Python vLLM metadata discovery, set `VLLM_SERVER_DEV_MODE=1`.
 
 If event discovery is unavailable, add `--pd-kv-events http://prefill:8000=tcp://prefill:5557` for each prefill worker.
 
-Decode is charged only for the context it newly allocates, which needs to know which blocks a Decode engine already holds. Enable KV events there too (`--kv-events-config` with `enable_kv_cache_events`) and point the flag at those workers, e.g. `--pd-kv-events http://decode:8000=tcp://decode:5557`. Without a Decode source every candidate's cache identity stays unverified: the marginal figure is withheld, ranking stays on full context tokens, and the decision metric reports `context_tokens` rather than `context_tokens_marginal`. A source is only accepted for a stage whose policy is `kv_aware`.
+Decode is charged only for the context it newly allocates. To credit blocks a Decode engine already holds, enable KV events on Decode workers too (`--kv-events-config` with `enable_kv_cache_events`) and point `--pd-kv-events` at them. Marginal credit applies only when the prompt arrives as token IDs (gRPC, or an explicit token-id prompt); ordinary HTTP string or chat requests fall back to full context tokens, and the decision metric reports `context_tokens` rather than `context_tokens_marginal`.
 
 ### Session affinity
 
