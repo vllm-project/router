@@ -1,11 +1,10 @@
 use crate::routers::RouterTrait;
 
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
     api::Api,
-    runtime::watcher::{watcher, Config},
-    runtime::WatchStreamExt,
+    runtime::watcher::{watcher, Config, Event},
     Client,
 };
 use std::collections::HashMap;
@@ -294,86 +293,25 @@ pub async fn start_service_discovery(
 
         debug!("K8s service discovery initialized");
 
-        // Create Arcs for configuration data
-        let config_arc = Arc::new(config.clone());
-        let port = config.port;
-
         let mut retry_delay = Duration::from_secs(1);
         const MAX_RETRY_DELAY: Duration = Duration::from_secs(300); // 5 minutes max
 
         loop {
-            // Create a watcher with the proper parameters according to the kube-rs API
-            let watcher_config = Config::default();
-            let watcher_stream = watcher(pods.clone(), watcher_config).applied_objects();
-
-            // Clone Arcs for the closures
-            let config_clone = Arc::clone(&config_arc);
-            let tracked_pods_clone = Arc::clone(&tracked_pods);
-
-            // Stream firewall: only allow pods that match the selector or are currently tracked
-            let filtered_stream = watcher_stream.filter_map(move |obj_res| {
-                let config_inner = Arc::clone(&config_clone);
-                let tracked_pods_inner = Arc::clone(&tracked_pods_clone);
-
-                async move {
-                    match obj_res {
-                        Ok(pod) => {
-                            let is_allowed = tracked_pods_inner.lock().is_ok_and(|tracked| {
-                                PodInfo::should_allow_event(&pod, &config_inner, &tracked)
-                            });
-
-                            if is_allowed {
-                                Some(Ok(pod))
-                            } else {
-                                None
-                            }
-                        }
-                        Err(e) => Some(Err(e)),
+            let stream = watcher(pods.clone(), Config::default());
+            futures::pin_mut!(stream);
+            // This buffer belongs to a single watch attempt. An error or EOF discards
+            // an incomplete list without changing the live registry.
+            let mut snapshot = HashMap::new();
+            let result = loop {
+                match stream.try_next().await {
+                    Ok(Some(event)) => {
+                        process_watch_event(event, &mut snapshot, &config, &tracked_pods, &router)
+                            .await;
                     }
+                    other => break other,
                 }
-            });
-
-            // Clone again for the next closure
-            let tracked_pods_clone2 = Arc::clone(&tracked_pods);
-            let router_clone = Arc::clone(&router);
-            let config_clone2 = Arc::clone(&config_arc);
-
-            match filtered_stream
-                .try_for_each(move |pod| {
-                    let tracked_pods_inner = Arc::clone(&tracked_pods_clone2);
-                    let router_inner = Arc::clone(&router_clone);
-                    let config_inner = Arc::clone(&config_clone2);
-
-                    async move {
-                        let pod_info = PodInfo::from_pod(&pod, Some(&config_inner));
-
-                        if let Some(pod_info) = pod_info {
-                            let should_include = PodInfo::should_include(&pod, &config_inner);
-                            if pod.metadata.deletion_timestamp.is_some() {
-                                handle_pod_deletion(
-                                    &pod_info,
-                                    tracked_pods_inner,
-                                    router_inner,
-                                    config_inner.pd_mode,
-                                )
-                                .await;
-                            } else {
-                                handle_pod_event(
-                                    &pod_info,
-                                    tracked_pods_inner,
-                                    router_inner,
-                                    port,
-                                    config_inner.pd_mode,
-                                    should_include,
-                                )
-                                .await;
-                            }
-                        }
-                        Ok(())
-                    }
-                })
-                .await
-            {
+            };
+            match result {
                 Ok(_) => {
                     // Reset retry delay on success
                     retry_delay = Duration::from_secs(1);
@@ -394,13 +332,119 @@ pub async fn start_service_discovery(
             // If the watcher exits for some reason, wait a bit before restarting
             warn!(
                 "Kubernetes watcher exited, restarting in {} seconds",
-                config_arc.check_interval.as_secs()
+                config.check_interval.as_secs()
             );
-            time::sleep(config_arc.check_interval).await;
+            time::sleep(config.check_interval).await;
         }
     });
 
     Ok(handle)
+}
+
+type PodTracker = Arc<Mutex<HashMap<String, TrackedPod>>>;
+
+async fn process_watch_event(
+    event: Event<Pod>,
+    snapshot: &mut HashMap<String, PodInfo>,
+    config: &ServiceDiscoveryConfig,
+    tracked: &PodTracker,
+    router: &Arc<dyn RouterTrait>,
+) {
+    match event {
+        Event::Init => snapshot.clear(),
+        Event::InitApply(pod) => {
+            if pod.metadata.deletion_timestamp.is_none() && PodInfo::should_include(&pod, config) {
+                if let Some(info) =
+                    PodInfo::from_pod(&pod, Some(config)).filter(PodInfo::is_healthy)
+                {
+                    snapshot.insert(info.pod_key(), info);
+                }
+            }
+        }
+        Event::InitDone => {
+            // Evict before adding: another pod may now own the same worker URL.
+            // Diff the discovery tracker, never the whole (possibly manual) registry.
+            let stale = {
+                let Ok(mut tracked) = tracked.lock() else {
+                    return;
+                };
+                tracked
+                    .extract_if(|key, old| {
+                        !snapshot
+                            .get(key)
+                            .is_some_and(|pod| old.matches(pod, &pod.worker_url(config.port)))
+                    })
+                    .map(|(_, old)| old)
+                    .collect::<Vec<_>>()
+            };
+            for old in stale {
+                remove_worker_from_router(&old.worker_url, old.pod_type, router, config.pd_mode)
+                    .await;
+            }
+            for (_, pod) in snapshot.drain() {
+                handle_pod_event(
+                    &pod,
+                    tracked.clone(),
+                    router.clone(),
+                    config.port,
+                    config.pd_mode,
+                    true,
+                )
+                .await;
+            }
+        }
+        Event::Apply(pod) => {
+            if !tracked
+                .lock()
+                .is_ok_and(|tracked| PodInfo::should_allow_event(&pod, config, &tracked))
+            {
+                return;
+            }
+            if pod.metadata.deletion_timestamp.is_some() {
+                delete_pod_by_metadata(&pod, tracked, router, config.pd_mode).await;
+            } else if let Some(info) = PodInfo::from_pod(&pod, Some(config)) {
+                handle_pod_event(
+                    &info,
+                    tracked.clone(),
+                    router.clone(),
+                    config.port,
+                    config.pd_mode,
+                    PodInfo::should_include(&pod, config),
+                )
+                .await;
+            }
+        }
+        Event::Delete(pod) => delete_pod_by_metadata(&pod, tracked, router, config.pd_mode).await,
+    }
+}
+
+impl TrackedPod {
+    fn matches(&self, info: &PodInfo, url: &str) -> bool {
+        self.worker_url == url
+            && self.pod_type == info.pod_type
+            && (info.uid.is_none() || self.uid == info.uid)
+    }
+}
+
+async fn delete_pod_by_metadata(
+    pod: &Pod,
+    tracked: &PodTracker,
+    router: &Arc<dyn RouterTrait>,
+    pd_mode: bool,
+) {
+    let key = PodInfo::pod_key_from_meta(
+        pod.metadata.namespace.as_deref(),
+        pod.metadata.name.as_deref(),
+    );
+    remove_registration(
+        &key,
+        pod.metadata.uid.as_deref(),
+        tracked,
+        router,
+        pd_mode,
+        "deletion",
+    )
+    .await;
 }
 
 async fn handle_pod_event(
@@ -428,11 +472,7 @@ async fn handle_pod_event(
             match tracker.entry(pod_info.pod_key()) {
                 std::collections::hash_map::Entry::Occupied(mut occ) => {
                     let existing = occ.get();
-                    let is_same = existing.worker_url == worker_url
-                        && existing.pod_type == pod_info.pod_type
-                        && (pod_info.uid.is_none() || existing.uid == pod_info.uid);
-
-                    if is_same {
+                    if existing.matches(pod_info, &worker_url) {
                         (false, None) // Exact duplicate: safe no-op
                     } else {
                         // Stale registration: pod was replaced (new IP or UID) or PD role flipped!
@@ -513,23 +553,23 @@ async fn handle_pod_event(
     } else {
         // Pod is either unhealthy (e.g. Ready=False) or no longer matches selector.
         // If it was previously tracked, remove it from the router and tracking set.
-        remove_tracked_pod(pod_info, tracked_pods, router, pd_mode, "ineligible").await;
+        remove_registration(
+            &pod_info.pod_key(),
+            pod_info.uid.as_deref(),
+            &tracked_pods,
+            &router,
+            pd_mode,
+            "ineligible",
+        )
+        .await;
     }
 }
 
-async fn handle_pod_deletion(
-    pod_info: &PodInfo,
-    tracked_pods: Arc<Mutex<HashMap<String, TrackedPod>>>,
-    router: Arc<dyn RouterTrait>,
-    pd_mode: bool,
-) {
-    remove_tracked_pod(pod_info, tracked_pods, router, pd_mode, "deletion").await;
-}
-
-async fn remove_tracked_pod(
-    pod_info: &PodInfo,
-    tracked_pods: Arc<Mutex<HashMap<String, TrackedPod>>>,
-    router: Arc<dyn RouterTrait>,
+async fn remove_registration(
+    key: &str,
+    uid: Option<&str>,
+    tracked_pods: &PodTracker,
+    router: &Arc<dyn RouterTrait>,
     pd_mode: bool,
     reason: &str,
 ) {
@@ -544,7 +584,15 @@ async fn remove_tracked_pod(
                 return;
             }
         };
-        tracked.remove(&pod_info.pod_key())
+        if tracked.get(key).is_some_and(|old| {
+            old.uid
+                .as_deref()
+                .zip(uid)
+                .is_some_and(|(old_uid, uid)| old_uid != uid)
+        }) {
+            return; // A delayed deletion must not evict a same-name replacement.
+        }
+        tracked.remove(key)
     };
 
     if let Some(registered) = registered {
@@ -553,13 +601,13 @@ async fn remove_tracked_pod(
         let url = &registered.worker_url;
         info!(
             "Removing pod ({}): {} | type: {:?} | url: {}",
-            reason, pod_info.name, registered.pod_type, url
+            reason, key, registered.pod_type, url
         );
-        remove_worker_from_router(url, registered.pod_type, &router, pd_mode).await;
+        remove_worker_from_router(url, registered.pod_type, router, pd_mode).await;
     } else {
         debug!(
-            "Pod {} event for untracked/already removed pod: {} (type: {:?})",
-            reason, pod_info.name, pod_info.pod_type
+            "Pod {} event for untracked/already removed pod: {}",
+            reason, key
         );
     }
 }
@@ -722,6 +770,111 @@ mod tests {
 
         let router = Router::new(vec![], &app_context).await.unwrap();
         Arc::new(router) as Arc<dyn RouterTrait>
+    }
+
+    async fn handle_pod_deletion(
+        pod_info: &PodInfo,
+        tracked: PodTracker,
+        router: Arc<dyn RouterTrait>,
+        pd_mode: bool,
+    ) {
+        remove_registration(
+            &pod_info.pod_key(),
+            pod_info.uid.as_deref(),
+            &tracked,
+            &router,
+            pd_mode,
+            "deletion",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn relist_commits_only_at_init_done_and_handles_reused_worker_url() {
+        // Use the same reachable address for two distinct Pods: evictions must
+        // be completed before the new registration attempts to claim that URL.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ServiceDiscoveryConfig {
+            port: listener.local_addr().unwrap().port(),
+            selector: HashMap::from([("app".into(), "worker".into())]),
+            ..Default::default()
+        };
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(|| async { "OK" });
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let router = create_test_router().await;
+        let tracked = PodTracker::default();
+        let mut snapshot = HashMap::new();
+        let mut old = create_k8s_pod(
+            Some("old"),
+            Some("127.0.0.1"),
+            Some("Running"),
+            Some("True"),
+            None,
+        );
+        old.metadata.labels = Some(config.selector.clone().into_iter().collect());
+        let mut new = old.clone();
+        new.metadata.name = Some("new".into());
+        new.metadata.uid = Some("new-uid".into());
+        let url = format!("http://127.0.0.1:{}", config.port);
+        // Intentionally restart a partial list. Its candidate must never reach the registry.
+        process_watch_event(
+            Event::Apply(old.clone()),
+            &mut snapshot,
+            &config,
+            &tracked,
+            &router,
+        )
+        .await;
+        for event in [
+            Event::Init,
+            Event::InitApply(new.clone()),
+            Event::Init,
+            Event::InitApply(old.clone()),
+            Event::InitDone,
+        ] {
+            process_watch_event(event, &mut snapshot, &config, &tracked, &router).await;
+            assert_eq!(
+                router.get_worker_urls().as_slice(),
+                std::slice::from_ref(&url)
+            );
+            assert!(tracked.lock().unwrap().contains_key("/old"));
+        }
+        for event in [Event::Init, Event::InitApply(new.clone()), Event::InitDone] {
+            process_watch_event(event, &mut snapshot, &config, &tracked, &router).await;
+        }
+        assert_eq!(
+            router.get_worker_urls().as_slice(),
+            std::slice::from_ref(&url)
+        );
+        assert_eq!(tracked.lock().unwrap().len(), 1);
+        assert!(tracked.lock().unwrap().contains_key("/new"));
+
+        // A late delete with a stale UID must not remove this replacement.
+        old.metadata.name = new.metadata.name.clone();
+        old.status = None;
+        process_watch_event(
+            Event::Delete(old),
+            &mut snapshot,
+            &config,
+            &tracked,
+            &router,
+        )
+        .await;
+        assert_eq!(
+            router.get_worker_urls().as_slice(),
+            std::slice::from_ref(&url)
+        );
+        // An empty snapshot evicts the discovered worker but not a manually
+        // registered URL backed by the same HTTP server.
+        let manual = format!("http://localhost:{}", config.port);
+        router.add_worker(&manual).await.unwrap();
+        for event in [Event::Init, Event::InitDone] {
+            process_watch_event(event, &mut snapshot, &config, &tracked, &router).await;
+        }
+        assert_eq!(router.get_worker_urls(), [manual]);
     }
 
     // Helper to create a PD config for testing
