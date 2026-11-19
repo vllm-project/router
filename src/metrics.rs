@@ -91,7 +91,7 @@ pub fn init_metrics() {
         "vllm_router_kv_transfer_requests_total",
         "Active-mode KV transfer requests: sent with peer fetch params, or why not \
          (no_peer_endpoint, inflight_cap, grpc_destination, registration_changed, \
-         client_params_present, invalid_body)"
+         client_params_present, prompt_logprobs, invalid_body)"
     );
     describe_gauge!(
         "vllm_router_kv_transfer_peer_fetch_enabled",
@@ -601,8 +601,8 @@ impl RouterMetrics {
         counter!("vllm_router_kv_transfer_plans_total", "outcome" => outcome).increment(1);
     }
     /// Active-mode outcome for a planned request: `sent`, `no_peer_endpoint`,
-    /// `inflight_cap`, `registration_changed`, `client_params_present` or
-    /// `invalid_body`.
+    /// `inflight_cap`, `registration_changed`, `client_params_present`,
+    /// `prompt_logprobs` or `invalid_body`.
     pub fn record_kv_transfer_request(outcome: &'static str) {
         counter!("vllm_router_kv_transfer_requests_total", "outcome" => outcome).increment(1);
     }

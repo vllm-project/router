@@ -18,6 +18,10 @@ pub(super) enum PeerFetchApply {
     Applied,
     /// The client already sent `kv_transfer_params`; the body is untouched.
     ClientParamsPresent,
+    /// The client asked for `prompt_logprobs`; the body is untouched. The
+    /// engine has to compute every prompt token for those, so it never reads
+    /// external KV and a fetch could not help.
+    PromptLogprobs,
     /// The body is not a JSON object; it is untouched.
     InvalidBody,
 }
@@ -28,6 +32,7 @@ impl PeerFetchApply {
         match self {
             Self::Applied => "sent",
             Self::ClientParamsPresent => "client_params_present",
+            Self::PromptLogprobs => "prompt_logprobs",
             Self::InvalidBody => "invalid_body",
         }
     }
@@ -49,7 +54,8 @@ fn peer_fetch_params(source: &PeerEndpoint) -> Value {
 
 /// Add `kv_transfer_params` for a fetch from `source` to `body`, unless the
 /// client supplied its own (an explicit `null` counts as absent, as it does for
-/// the engine). Pure: callers pass a fresh copy of the client's body for each
+/// the engine) or asked for `prompt_logprobs` (also an explicit `null` counts as
+/// absent). Pure: callers pass a fresh copy of the client's body for each
 /// attempt, so a retry never inherits another destination's params.
 pub(super) fn apply_peer_fetch(body: &mut Value, source: &PeerEndpoint) -> PeerFetchApply {
     let Some(object): Option<&mut Map<String, Value>> = body.as_object_mut() else {
@@ -60,6 +66,12 @@ pub(super) fn apply_peer_fetch(body: &mut Value, source: &PeerEndpoint) -> PeerF
         .is_some_and(|params| !params.is_null())
     {
         return PeerFetchApply::ClientParamsPresent;
+    }
+    if object
+        .get("prompt_logprobs")
+        .is_some_and(|logprobs| !logprobs.is_null())
+    {
+        return PeerFetchApply::PromptLogprobs;
     }
     object.insert("kv_transfer_params".to_owned(), peer_fetch_params(source));
     PeerFetchApply::Applied
@@ -130,6 +142,30 @@ mod tests {
             PeerFetchApply::Applied
         );
         assert_eq!(body["kv_transfer_params"]["peer_lookup"], json!(true));
+    }
+
+    #[test]
+    fn prompt_logprobs_requests_are_left_alone() {
+        // Zero is a real request for prompt logprobs, so only null is absent.
+        for logprobs in [json!(0), json!(5)] {
+            let original = json!({"prompt": "hi", "prompt_logprobs": logprobs});
+            let mut body = original.clone();
+            assert_eq!(
+                apply_peer_fetch(&mut body, &endpoint()),
+                PeerFetchApply::PromptLogprobs
+            );
+            assert_eq!(body, original);
+        }
+        assert_eq!(PeerFetchApply::PromptLogprobs.label(), "prompt_logprobs");
+    }
+
+    #[test]
+    fn null_prompt_logprobs_count_as_absent() {
+        let mut body = json!({"prompt": "hi", "prompt_logprobs": null});
+        assert_eq!(
+            apply_peer_fetch(&mut body, &endpoint()),
+            PeerFetchApply::Applied
+        );
     }
 
     #[test]

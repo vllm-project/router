@@ -141,6 +141,7 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 | Source has no engine-reported peer address | `no_peer_endpoint` |
 | Source already has `max_inflight_per_source` fetches in flight | `inflight_cap` |
 | Client sent its own `kv_transfer_params` | `client_params_present` |
+| Client set `prompt_logprobs` (the engine computes every prompt token for these, so it reads no external KV) | `prompt_logprobs` |
 | Body is not a JSON object | `invalid_body` |
 | Otherwise | `sent` |
 
@@ -248,7 +249,7 @@ Each successful `POST` is logged at `WARN` with the new state and sets `vllm_rou
 | Metric | Labels | Meaning |
 |---|---|---|
 | `vllm_router_kv_transfer_plans_total` | `outcome` | One per selection: `planned` or a skip label from the tables above |
-| `vllm_router_kv_transfer_requests_total` | `outcome` | Active mode only, one per planned request: `sent`, `grpc_destination`, `registration_changed`, `no_peer_endpoint`, `inflight_cap`, `client_params_present`, `invalid_body` |
+| `vllm_router_kv_transfer_requests_total` | `outcome` | Active mode only, one per planned request: `sent`, `grpc_destination`, `registration_changed`, `no_peer_endpoint`, `inflight_cap`, `client_params_present`, `prompt_logprobs`, `invalid_body` |
 | `vllm_router_kv_transfer_estimated_saved_ms` | none | `saved_ms` of each planned transfer |
 | `vllm_router_kv_transfer_estimated_cost_ms` | `path` = `fetch` or `wait` | Both estimates, whenever the cost rule was evaluated |
 | `vllm_router_kv_transfer_peer_fetch_enabled` | none | Gauge: 1 while the kill switch lets active-mode policies fetch, 0 while it stops them. Set at startup when the main policy is in active mode, and on each successful `POST /kv_transfer/peer_fetch` |
