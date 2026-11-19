@@ -689,27 +689,31 @@ async fn wait_for(mut condition: impl FnMut() -> bool) {
     .unwrap();
 }
 
-#[tokio::test]
-async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
+async fn event_sources_worker(
+    sources: Arc<Mutex<serde_json::Value>>,
+) -> (String, tokio::task::JoinHandle<()>) {
     use axum::{routing::get, Json, Router};
 
-    let sources = Arc::new(tokio::sync::RwLock::new(serde_json::json!({
-        "0": {"endpoint":"tcp://*:5557", "replay_endpoint":"tcp://*:5558", "topic":"boot-1-rank-0", "publisher":"zmq"},
-        "1": {"endpoint":"tcp://*:5559", "replay_endpoint":"tcp://*:5560", "topic":"boot-1-rank-1", "publisher":"zmq"}
-    })));
     let app = Router::new().route(
         "/kv_event_sources",
-        get({
-            let sources = sources.clone();
-            move || {
-                let sources = sources.clone();
-                async move { Json(sources.read().await.clone()) }
-            }
+        get(move || {
+            let sources = sources.lock().clone();
+            async move { Json(sources) }
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let worker = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (worker, task)
+}
+
+#[tokio::test]
+async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
+    let sources = Arc::new(Mutex::new(serde_json::json!({
+        "0": {"endpoint":"tcp://*:5557", "replay_endpoint":"tcp://*:5558", "topic":"boot-1-rank-0", "publisher":"zmq"},
+        "1": {"endpoint":"tcp://*:5559", "replay_endpoint":"tcp://*:5560", "topic":"boot-1-rank-1", "publisher":"zmq"}
+    })));
+    let (worker, task) = event_sources_worker(sources.clone()).await;
     let mut layout = capability("model", "boot-1-rank-0", 16, serde_json::json!([]));
     layout.ranks[0].root_hash = None;
     let mut second = layout.ranks[0].clone();
@@ -732,7 +736,7 @@ async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
         static_hybrid_sources_match(&client, &worker, None, &config, None).await,
         StaticHybridMatch::Matches
     );
-    sources.write().await["1"]["topic"] = serde_json::json!("boot-2-rank-1");
+    sources.lock()["1"]["topic"] = serde_json::json!("boot-2-rank-1");
     assert_eq!(
         static_hybrid_sources_match(&client, &worker, None, &config, None).await,
         StaticHybridMatch::Differs
@@ -749,7 +753,7 @@ async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
         static_hybrid_sources_match(&client, &worker, None, &config, Some(&installed)).await,
         StaticHybridMatch::Matches
     );
-    sources.write().await["0"]["topic"] = serde_json::json!("boot-2-rank-0");
+    sources.lock()["0"]["topic"] = serde_json::json!("boot-2-rank-0");
     assert_eq!(
         static_hybrid_sources_match(&client, &worker, None, &config, Some(&installed)).await,
         StaticHybridMatch::Differs
@@ -759,24 +763,10 @@ async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
 
 #[tokio::test]
 async fn layout_only_sources_retire_when_the_engine_changes_its_topic() {
-    use axum::{routing::get, Json, Router};
-
-    let sources = Arc::new(tokio::sync::RwLock::new(serde_json::json!({
+    let sources = Arc::new(Mutex::new(serde_json::json!({
         "0": {"endpoint":"tcp://*:5557", "replay_endpoint":"tcp://*:5558", "topic":"kv-hybrid", "publisher":"zmq"}
     })));
-    let app = Router::new().route(
-        "/kv_event_sources",
-        get({
-            let sources = sources.clone();
-            move || {
-                let sources = sources.clone();
-                async move { Json(sources.read().await.clone()) }
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let worker = format!("http://{}", listener.local_addr().unwrap());
-    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (worker, task) = event_sources_worker(sources.clone()).await;
     let mut layout = capability("model", "kv-hybrid", 16, serde_json::json!([]));
     layout.ranks[0].root_hash = None;
     // A layout-only binding declares no endpoints; the engine names them.
@@ -794,13 +784,13 @@ async fn layout_only_sources_retire_when_the_engine_changes_its_topic() {
         StaticHybridMatch::Matches
     );
     // A restarted engine that advertises a new topic belongs to another boot.
-    sources.write().await["0"]["topic"] = serde_json::json!("kv-hybrid-boot-2");
+    sources.lock()["0"]["topic"] = serde_json::json!("kv-hybrid-boot-2");
     assert_eq!(
         static_hybrid_sources_match(&client, &worker, None, &config, None).await,
         StaticHybridMatch::Differs
     );
     // An engine that advertises nothing cannot keep the old binding alive.
-    *sources.write().await = serde_json::json!({});
+    *sources.lock() = serde_json::json!({});
     assert_eq!(
         static_hybrid_sources_match(&client, &worker, None, &config, None).await,
         StaticHybridMatch::Differs
@@ -1591,63 +1581,32 @@ async fn rank_pinned_static_source_binds_its_own_rank() {
 /// serves since 0.31.0). The declaration still supplies identity, groups
 /// and the hash block size.
 #[tokio::test]
-async fn layout_without_endpoints_discovers_publishers() {
-    let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
-    let (worker, task) = layout_worker(endpoint, replay_endpoint, "kv-hybrid").await;
-    let config = layout_only_sources("kv-hybrid", 8, "layout-only");
-    let (supervisor, _signals) = KvIndexSupervisor::indexed(reqwest::Client::new());
-    let supervisor = supervisor.with_static_sources(HashMap::from([(worker.clone(), config)]));
+async fn layout_without_endpoints_discovers_publishers_for_the_declared_topic() {
+    for (topic, matches) in [("kv-hybrid", true), ("kv-rebooted", false)] {
+        let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
+        let sources = Arc::new(Mutex::new(serde_json::json!({
+            "0": {"endpoint": endpoint, "replay_endpoint": replay_endpoint,
+                  "topic": topic, "publisher": "zmq", "encoding": "msgpack",
+                  "schema_version": 1, "enable_kv_cache_events": true}
+        })));
+        let (worker, task) = event_sources_worker(sources).await;
+        let config = layout_only_sources("kv-hybrid", 8, "layout-only");
+        let (supervisor, _signals) = KvIndexSupervisor::indexed(reqwest::Client::new());
+        let supervisor = supervisor.with_static_sources(HashMap::from([(worker.clone(), config)]));
 
-    let info = supervisor.on_worker_added(&worker).await.unwrap();
-    assert_eq!(info.block_size, Some(8));
-    assert_eq!(info.ranks, vec![0]);
-    assert_eq!(info.cache_key.unwrap().model.as_ref(), "layout-only");
-    assert!(supervisor.match_provider_for_worker(&worker).is_some());
-    task.abort();
-}
-
-/// A publisher advertising another topic belongs to a different boot: the
-/// declared layout must not subscribe to it.
-#[tokio::test]
-async fn layout_rejects_a_publisher_with_another_topic() {
-    let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
-    let (worker, task) = layout_worker(endpoint, replay_endpoint, "kv-rebooted").await;
-
-    let config = layout_only_sources("kv-hybrid", 8, "layout-only");
-    let (supervisor, _signals) = KvIndexSupervisor::indexed(reqwest::Client::new());
-    let supervisor = supervisor.with_static_sources(HashMap::from([(worker.clone(), config)]));
-
-    let info = supervisor.on_worker_added(&worker).await;
-    assert!(info.map(|info| info.ranks.is_empty()).unwrap_or(true));
-    task.abort();
-}
-
-/// Engine stub that reports one publisher for rank 0 under `topic`.
-async fn layout_worker(
-    endpoint: String,
-    replay_endpoint: String,
-    topic: &'static str,
-) -> (String, tokio::task::JoinHandle<()>) {
-    use axum::{routing::get, Json, Router};
-
-    let app = Router::new().route(
-        "/kv_event_sources",
-        get(move || {
-            let endpoint = endpoint.clone();
-            let replay_endpoint = replay_endpoint.clone();
-            async move {
-                Json(serde_json::json!({
-                    "0": {"endpoint": endpoint, "replay_endpoint": replay_endpoint,
-                          "topic": topic, "publisher": "zmq", "encoding": "msgpack",
-                          "schema_version": 1, "enable_kv_cache_events": true}
-                }))
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let worker = format!("http://{}", listener.local_addr().unwrap());
-    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (worker, task)
+        let info = supervisor.on_worker_added(&worker).await;
+        if matches {
+            let info = info.unwrap();
+            assert_eq!(info.block_size, Some(8));
+            assert_eq!(info.ranks, vec![0]);
+            assert_eq!(info.cache_key.unwrap().model.as_ref(), "layout-only");
+            assert!(supervisor.match_provider_for_worker(&worker).is_some());
+        } else {
+            assert!(info.map(|info| info.ranks.is_empty()).unwrap_or(true));
+            assert!(supervisor.match_provider_for_worker(&worker).is_none());
+        }
+        task.abort();
+    }
 }
 
 /// One PUB and one ROUTER endpoint, like a real rank's ZMQ pair.

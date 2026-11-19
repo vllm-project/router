@@ -7,14 +7,16 @@ Clients send OpenAI HTTP requests to the Router with either HTTP or gRPC workers
 | Deployment | Layout JSON to pass to the Router |
 | --- | --- |
 | [Ordinary single-group full attention](#colocated-prefill-and-decode), HTTP or gRPC | Omit the layout. The Router derives group 0 and verifies the default hash root. |
-| [Hybrid attention](#hybrid-attention-models), sliding-window attention or speculative decoding | Pass the worker's layout with `--kv-hybrid-layout`. |
+| Hybrid or sliding-window attention, speculative decoding, or custom hash seed | Pass an [explicit layout](#explicit-layouts) with `--kv-hybrid-layout`. |
 | [P/D disaggregation](#pd-routing), HTTP or gRPC | Pass [`pd-layout.json`](#pd-layout) with `--pd-hybrid-config` for this guide's `sha256_cbor` Prefill setup. |
 
-To upgrade an existing deployment, check that your workers use `sha256_cbor`, publish 32-byte hashes, and expose a replay endpoint. Update the [worker settings](#1-prepare-the-worker-settings) and restart affected workers if any of these settings change. Use the table above to choose the Router layout option. The Router rebuilds its in-memory index from replay and live events, so there is no index file to migrate.
+To upgrade, apply the worker settings below and restart workers whose hash or publisher settings change. The Router rebuilds its in-memory index from live and replay events.
 
 ## Colocated prefill and decode
 
-Each worker handles the entire request. The walkthrough uses one Qwen3-4B-Instruct-2507 worker, vLLM 0.33.0, and the Rust `vllm-router` binary. Check [version compatibility](#versions) if you use another release.
+Each worker handles the entire request. The walkthrough uses one Qwen3-4B-Instruct-2507 worker, vLLM 0.33.0, and the Rust `vllm-router` binary. Check [version compatibility](#versions) for other releases.
+
+Omitting the layout declares ordinary single-group full attention. With a standard worker, the Router validates the default hash root and block size against a first-block event from live or replay. Until it can verify the source, it routes by load with zero cache credit.
 
 ### 1. Prepare the worker settings
 
@@ -32,48 +34,9 @@ For multiple worker processes on the same host, set a distinct live `endpoint` i
 
 On vLLM 0.30.0, use a fixed replay endpoint such as `tcp://*:5558` for one rank.
 
-#### Explicit layouts
-
-Skip this section for ordinary single-group full attention. Omitting the file declares that the worker uses that layout and ordinary prefix reuse. With standard vLLM, the Router waits for a first-block event that matches the discovered block size and the default `sha256_cbor` root. Until then, or if it observes incompatible events, it routes by load. Replay must include a verifiable first-block event before the Router can credit cached blocks.
-
-Use an explicit layout for hybrid, sliding-window, or speculative decoding, and for a custom hash seed. This one-group example writes `layout.json` with the generated topic. Set `WORKER_URL` to `grpc://127.0.0.1:50051` for gRPC. Adapt the fields to the running model and its cache groups.
-
-```bash
-WORKER_URL=http://127.0.0.1:8000
-cat > layout.json <<EOF
-{
-  "$WORKER_URL": {
-    "schema_version": 1,
-    "ranks": [
-      {
-        "rank": 0,
-        "model": "qwen3",
-        "weight_version": "default",
-        "publisher_topic": "$KV_TOPIC",
-        "instance_topic": true,
-        "hash_algorithm": "sha256_cbor",
-        "hash_seed": "vllm-none-hash",
-        "full_hashes": true,
-        "hash_block_size": 16,
-        "hash_lookahead_tokens": 0,
-        "speculative_tokens": 0,
-        "prefix_caching": true,
-        "declared_groups": 1,
-        "groups": [
-          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 16, "prefix_cacheable": true, "prefix_replay_tokens": 0}
-        ]
-      }
-    ]
-  }
-}
-EOF
-```
-
-The sample uses the vLLM default seed with `PYTHONHASHSEED` unset. If the worker sets `PYTHONHASHSEED=42`, use `"hash_seed": "42"`. You can also supply the engine's 64-digit hexadecimal `root_hash`. The two fields must agree when both are present. For LoRA, add `"adapters": [{"name": "my-adapter", "path": "/models/my-adapter"}]` alongside `ranks` and use the path from `--lora-modules`.
-
 ### 2. Start the worker and Router
 
-Choose one transport. Run the worker and Router in separate terminals. If you created `layout.json`, append `--kv-hybrid-layout layout.json` to the Router command.
+Choose one transport. Run the worker and Router in separate terminals. For an [explicit layout](#explicit-layouts), append `--kv-hybrid-layout layout.json` to the Router command.
 
 #### HTTP workers
 
@@ -133,15 +96,50 @@ request && sleep 1 && before=$(hits) && request && after=$(hits) &&
   printf 'Router KV-aware hits: %s → %s\n' "$before" "$after"
 ```
 
-An increase such as `0 → 1` confirms a hit in the Router's index. Use an idle pool for the check, and retry the last request if events are still arriving. The Router uses its current event view to estimate reuse. If it cannot verify a compatible source or request identity, traffic still routes by load with zero cache credit.
-
-Compare the worker counter below before and after the repeat to measure actual reuse. For P/D, check the Prefill worker.
+The Router counter measures prefix matches in its event index. Use an idle pool and repeat the last request if events are still arriving. Requests with an unsupported cache identity still route by load with zero cache credit. To measure actual reuse, compare the worker counter before and after the repeat. For P/D disaggregation, check Prefill.
 
 ```bash
 curl -fsS http://127.0.0.1:8000/metrics | grep '^vllm:prefix_cache_hits_total'
 ```
 
 Both worker transports accept `/v1/chat/completions` through the Router. On gRPC, `/v1/completions` accepts one flat token-ID array as shown above.
+
+## Explicit layouts
+
+Use this template to write `layout.json` with the generated topic. Set `WORKER_URL` to `grpc://127.0.0.1:50051` for gRPC. Adapt the fields to the running model and its cache groups.
+
+```bash
+WORKER_URL=http://127.0.0.1:8000
+cat > layout.json <<EOF
+{
+  "$WORKER_URL": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "model": "qwen3",
+        "weight_version": "default",
+        "publisher_topic": "$KV_TOPIC",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "hash_seed": "vllm-none-hash",
+        "full_hashes": true,
+        "hash_block_size": 16,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 0,
+        "prefix_caching": true,
+        "declared_groups": 1,
+        "groups": [
+          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 16, "prefix_cacheable": true, "prefix_replay_tokens": 0}
+        ]
+      }
+    ]
+  }
+}
+EOF
+```
+
+The sample uses the vLLM default seed with `PYTHONHASHSEED` unset. If the worker sets `PYTHONHASHSEED=42`, use `"hash_seed": "42"`. You can also supply the engine's 64-digit hexadecimal `root_hash`. The two fields must agree when both are present. For LoRA, add `"adapters": [{"name": "my-adapter", "path": "/models/my-adapter"}]` alongside `ranks` and use the path from `--lora-modules`.
 
 ## Hybrid attention models
 
@@ -298,17 +296,16 @@ Save this as `pd-layout.json`. Replace the empty `hybrid` object with the value 
 
 ## Versions
 
-Use the same vLLM release for the engine and its gRPC frontend. In colocated deployments, supply event addresses as shown below.
+Use the same vLLM release for the engine and its gRPC frontend. In all versions below, gRPC discovers live and replay addresses through `GetKvEventSources`.
 
-| vLLM release | Colocated HTTP | Colocated gRPC | Hybrid or speculative decoding |
-| --- | --- | --- | --- |
-| [0.30.0](https://github.com/vllm-project/vllm/tree/v0.30.0) | Pass [static live and replay addresses](#static-event-endpoints). | `GetKvEventSources` supplies both addresses. | Use layouts with zero hash lookahead. The V4.1 bounded-replay recipe requires 0.31 or newer. |
-| [0.31.0](https://github.com/vllm-project/vllm/tree/v0.31.0) | `/kv_event_sources` supplies both addresses. | Same as 0.30.0. | Adds V4.1 bounded replay. Use layouts with zero hash lookahead. |
-| [0.32.0](https://github.com/vllm-project/vllm/tree/v0.32.0) | Same as 0.31.0. | Same as 0.30.0. | Same KV event and layout options as 0.31.0. |
-| [0.33.0](https://github.com/vllm-project/vllm/tree/v0.33.0) | Same as 0.31.0. | Same as 0.30.0. | Adds events for nonzero hash lookahead. Use this release for the model recipes above. |
-| [0.34.0](https://github.com/vllm-project/vllm/tree/v0.34.0) | Same as 0.31.0. | Same as 0.30.0. | Uses 64-token blocks by default when the backend has no preferred size. Match the layout to the worker's resolved block size. |
+| vLLM release | HTTP event discovery | Layout support |
+| --- | --- | --- |
+| [0.30.0](https://github.com/vllm-project/vllm/tree/v0.30.0) | Pass a layout and [static addresses](#static-event-endpoints). | Zero hash lookahead. |
+| [0.31.0](https://github.com/vllm-project/vllm/tree/v0.31.0) | `/kv_event_sources` | Zero hash lookahead and V4.1 bounded replay. |
+| [0.32.0](https://github.com/vllm-project/vllm/tree/v0.32.0) | `/kv_event_sources` | Zero hash lookahead and V4.1 bounded replay. |
+| [0.33.0](https://github.com/vllm-project/vllm/tree/v0.33.0) | `/kv_event_sources` | Adds nonzero hash lookahead. Model recipes use this release. |
+| [0.34.0](https://github.com/vllm-project/vllm/tree/v0.34.0) | `/kv_event_sources` | Nonzero hash lookahead. The default block size is 64 tokens if the backend has no preferred size. |
 
-Ordinary single-group full attention uses the default layout when the Router can discover its event sources. In P/D disaggregation, this guide includes the Prefill addresses in [`pd-layout.json`](#pd-layout). For models using future tokens in cached-block hashes, such as the [Qwen3.8 MTP example](#qwen38-27b), set the actual hash lookahead in the layout.
 
 ## CLI options
 
