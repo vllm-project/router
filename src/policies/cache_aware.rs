@@ -498,7 +498,7 @@ impl CacheAwarePolicy {
             {
                 return Some((idx, false));
             }
-            return healthy.first().copied().map(|idx| (idx, true));
+            return Self::least_loaded(workers, healthy).map(|idx| (idx, true));
         }
         Self::least_loaded(workers, healthy).map(|idx| (idx, false))
     }
