@@ -247,7 +247,8 @@ proto media fields and adding parity tests against vLLM HTTP behavior.
 
 ## P/D Disaggregation
 
-`--vllm-pd-disaggregation` accepts all-`grpc://` prefill and decode pools.
+`--vllm-pd-disaggregation` accepts static all-`grpc://` prefill and decode pools
+for `/v1/chat/completions` and flat token-ID `/v1/completions` requests.
 The router sends P a unary one-token `Generate` and D a `GenerateStream`, both
 carrying the connector's JSON in `GenerateRequest.kv.kv_transfer_params`.
 P's `FinishInfo.kv_transfer_params` is handed to D. NIXL push mode runs both
@@ -273,11 +274,8 @@ worker's gRPC control service, and `/health_generate` returns `501`.
 cache reset. `power_of_two` uses the router's own in-flight counts, since
 `grpc://` workers serve no HTTP `/get_load`.
 
-`--prefill-policy kv_aware` and `cache_aware` score the token ids the router
-sends P, so gRPC P/D needs no HTTP `/tokenize`. KV event sources come from
-each prefill's `Control.GetKvEventSources`, or from
-`--pd-kv-events grpc://prefill:50051=tcp://prefill:5557` when the worker does
-not report them.
+`--prefill-policy kv_aware` and `cache_aware` use the token IDs sent to prefill.
+For KV event and hybrid layout setup, see [KV-aware P/D routing](../load_balancing/http_completion_kv.md#pd-routing).
 
 ## Backend Modules
 

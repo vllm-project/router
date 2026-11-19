@@ -5,13 +5,27 @@ use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, StaticKvEventSources,
+    TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
 use vllm_router_rs::service_discovery::ServiceDiscoveryConfig;
 
 type PrefillArgs = (String, Option<u16>);
+
+fn read_json_config<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+    description: &str,
+) -> ConfigResult<T> {
+    let data = std::fs::read(path).map_err(|error| ConfigError::ValidationFailed {
+        reason: format!("cannot read {description} {}: {error}", path.display()),
+    })?;
+    serde_json::from_slice(&data).map_err(|error| ConfigError::ValidationFailed {
+        reason: format!("invalid {description} {}: {error}", path.display()),
+    })
+}
+
 fn split_prefill_args_from_others(
     args: impl IntoIterator<Item = String>,
 ) -> Result<(Vec<PrefillArgs>, Vec<String>), String> {
@@ -149,9 +163,9 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
 
-    /// Statically configured KV event sources as
-    /// "PREFILL_URL=ZMQ_PUB_ENDPOINT[,ENDPOINT...]"; the Nth endpoint is DP
-    /// rank N. Can be specified multiple times, once per prefill worker.
+    /// Static KV event publishers for KV-aware prefill or decode workers.
+    /// Specify "URL=ZMQ_PUB_ENDPOINT[,ENDPOINT...]" once per worker in DP-rank
+    /// order. Block size defaults to 16.
     /// Replay endpoints, block size, and model are only configurable via the
     /// YAML/JSON config file.
     #[arg(
@@ -160,6 +174,9 @@ struct CliArgs {
         value_name = "URL=ENDPOINT[,ENDPOINT...]"
     )]
     pd_kv_events: Vec<String>,
+    /// Experimental P/D version of `--kv-hybrid-layout`, keyed by prefill URL.
+    #[arg(long)]
+    pd_hybrid_config: Option<std::path::PathBuf>,
 
     /// Specific policy for prefill nodes in PD mode. kv_aware uses the prefill load profile.
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
@@ -218,13 +235,9 @@ struct CliArgs {
     /// Shared model identity for workers using static event publishers.
     #[arg(long)]
     kv_event_model: Option<String>,
-    /// Require complete KV event recovery before restoring placement credit.
-    /// External pool tiers stay uncredited until an independent pool baseline exists.
-    /// Sources can remain in fallback; requests stay routable without cache credit.
-    /// After retry exhaustion, an operator-initiated worker KV clear restores worker-local credit.
-    /// Monitor vllm_router_kv_source_recovery_state and vllm_router_kv_source_recovery_transitions_total.
-    #[arg(long, default_value_t = false)]
-    kv_event_strict_recovery: bool,
+    /// Cache layout JSON for hybrid attention models, keyed by worker URL.
+    #[arg(long)]
+    kv_hybrid_layout: Option<std::path::PathBuf>,
     /// Transfer credit for host-resident KV blocks.
     #[arg(long, default_value_t = 0.8)]
     kv_penalty_host: f64,
@@ -487,12 +500,38 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
-        let static_kv_event_sources = vllm_router_rs::config::parse_static_kv_event_sources(
+        let mut static_kv_event_sources = vllm_router_rs::config::parse_static_kv_event_sources(
             &self.kv_event_source,
             &self.kv_event_replay_source,
             self.kv_event_block_size,
             self.kv_event_model.as_deref(),
         )?;
+        if let Some(path) = &self.kv_hybrid_layout {
+            let layouts: HashMap<String, vllm_router_rs::kv_index::CacheCapabilities> =
+                read_json_config(path, "hybrid layout")?;
+            for (worker, layout) in layouts {
+                // A layout without declared endpoints is legal: the engine can
+                // report its own publishers (gRPC GetKvEventSources, or the HTTP
+                // /kv_event_sources route since vLLM 0.31.0). Identity and the
+                // hash block size then come from the layout itself.
+                let source = static_kv_event_sources
+                    .entry(worker.clone())
+                    .or_insert_with(|| {
+                        let rank = layout.ranks.first();
+                        StaticKvEventSources {
+                            endpoints: Vec::new(),
+                            replay_endpoints: None,
+                            topic: rank
+                                .and_then(|rank| rank.publisher_topic.clone())
+                                .unwrap_or_default(),
+                            block_size: rank.and_then(|rank| rank.hash_block_size).unwrap_or(16),
+                            model: rank.map_or_else(|| worker.clone(), |rank| rank.model.clone()),
+                            hybrid: None,
+                        }
+                    });
+                source.hybrid = Some(layout);
+            }
+        }
         // Determine routing mode
         let mode = if self.enable_igw {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
@@ -626,7 +665,18 @@ impl CliArgs {
             self.program_scheduling_config_json.as_deref(),
         )?;
 
-        let pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
+        let mut pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
+        if let Some(path) = &self.pd_hybrid_config {
+            let configured: HashMap<String, PdKvEventSources> =
+                read_json_config(path, "PD hybrid config")?;
+            for (worker, source) in configured {
+                if pd_kv_event_sources.insert(worker.clone(), source).is_some() {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: format!("duplicate PD KV event source for '{worker}'"),
+                    });
+                }
+            }
+        }
 
         // Build RouterConfig
         Ok(RouterConfig {
@@ -640,7 +690,6 @@ impl CliArgs {
                 })?,
             mode,
             pd_kv_event_sources,
-            kv_event_strict_recovery: self.kv_event_strict_recovery,
             policy,
             connection_mode,
             host: self.host.clone(),

@@ -14,8 +14,8 @@ Both install an executable named `vllm-router`. Check which executable is on
 your `PATH` before copying flags between installations. Their options are
 similar, but they are not interchangeable. In particular:
 
-- Rust accepts `rendezvous_hash`; Python does not. Both support `kv_aware` in regular and P/D routing. Rust also exposes backend
-  selection, tracing, API-key validation URLs, history storage and profiling.
+- Both CLIs support `kv_aware` in regular and P/D routing. The [hybrid layout options](load_balancing/http_completion_kv.md#hybrid-attention-models) require the Rust binary.
+- Rust also exposes `rendezvous_hash`, backend selection, tracing, API-key validation URLs, history storage and profiling.
 - Python exposes `--mini-lb`, queue settings and the token bucket refill rate.
   The Rust CLI fixes queue size at `100`, queue timeout at `60` seconds, and
   leaves the refill rate unset (it falls back to `max_concurrent_requests`).
@@ -86,7 +86,7 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | `--kv-event-replay-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Replay endpoint(s) for a static KV-event source, same `WORKER_URL=ENDPOINT[,ENDPOINT...]` form. |
 | `--kv-event-block-size` | `u32` | `16` | `integer` | `16` | KV cache block size in tokens for workers registered through `--kv-event-source`. |
 | `--kv-event-model` | `string` | `unset` | `string` | `unset` | Model id advertised to static KV-event sources; `unset` keeps the served model id. |
-| `--kv-event-strict-recovery` | `flag` | `false` | `flag` | `false` | Opt in to authoritative KV history recovery. External pool tiers stay uncredited until an independent pool baseline exists. Requests stay routable in fallback; after retry exhaustion, an operator-initiated worker KV clear restores worker-local credit. Without strict mode, fresh observations can restore credit after history loss. |
+| `--kv-hybrid-layout` | `std::path::PathBuf` | `unset` | — | — | Hybrid-attention layout JSON, keyed by worker URL. [Setup](load_balancing/http_completion_kv.md#hybrid-attention-models). |
 
 The Rust CLI requires worker URLs in regular mode unless service discovery is
 enabled. The Python launcher permits an empty worker list without service
@@ -135,7 +135,8 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--decode` | `string (repeatable)` | `[]` | `string (repeatable)` | `unset` | Add one decode URL per occurrence: `--decode URL`. |
 | `--vllm-discovery-address` | `string` | `unset` | `string` | `unset` | ZMQ registration address for vLLM workers, e.g. `0.0.0.0:30001`. |
 | `--kv-connector` | `nixl, mooncake, moriio` | `nixl` | `nixl, mooncake, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. |
-| `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill or decode KV publishers as URL=ENDPOINT[,ENDPOINT...]; a source belongs to a stage whose policy is kv_aware. Endpoints follow DP-rank order; block size is 16. |
+| `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static KV publishers for a KV-aware prefill or decode stage. Use URL=ENDPOINT[,ENDPOINT...] in DP-rank order. Block size is 16. |
+| `--pd-hybrid-config` | `std::path::PathBuf` | `unset` | — | — | Experimental hybrid P/D configuration. [Setup](load_balancing/http_completion_kv.md#pd-routing). |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
 discovery. For static configuration, provide both prefill and decode workers:

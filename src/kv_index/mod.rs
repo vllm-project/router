@@ -1,35 +1,49 @@
 //! Multi-tier KV cache placement index, fed by engine events.
 
-mod admit;
-mod binding;
-mod decode;
+pub mod request_hash;
+mod routing_provider;
+pub(crate) use routing_provider::PromptKey;
+#[doc(hidden)]
+pub use routing_provider::RequestHashCache;
+pub(crate) mod source;
 
-use std::sync::Arc;
+pub use source::discovery;
+pub use source::events::{subscriber, wire};
+
+/// Local observation ownership only; this is not an authenticated engine epoch.
+/// Both ingestion paths use one allocator so delayed cleanup cannot cross modes.
+/// Stream generations instead fence snapshots across resets of the same owner.
+pub(crate) fn next_owner_incarnation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let value = NEXT.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(value, u64::MAX, "KV owner generation exhausted");
+    value
+}
 
 use sha2::{Digest, Sha256};
-pub mod discovery;
-mod endpoints;
-pub mod indexer;
-pub mod subscriber;
+pub(crate) mod layout;
+pub mod storage;
 pub mod types;
-pub mod wire;
 
-pub use admit::validate_device_batch;
-pub use decode::decode_batch;
 pub use discovery::{
     CacheKey, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, WorkerKvInfo,
 };
-pub(crate) use endpoints::canonical_endpoint;
-pub use endpoints::{parse_endpoint_mapping, resolve_endpoints};
-pub use indexer::{KvBlockIndexer, MatchQuery, TierMatch};
-pub use subscriber::local_hashes;
-pub(crate) use types::SourceRecoveryReason;
-pub use types::{
-    CacheOwnerId, ClearScope, HashMode, Locality, ResidencyOwner, RoutableTarget, SourceId,
-    StorageTier,
+pub use layout::{
+    common_reusable_tokens, AdapterCapability, CacheCapabilities, CacheGroup, GroupCapability,
+    GroupRule, GroupView, RankCapability,
 };
-#[cfg(all(test, feature = "cpu", feature = "ready"))]
-pub(crate) use types::{SourceRecoveryState, SourceRecoveryStatus};
+pub use source::binding::SourceBinding;
+pub(crate) use source::endpoints::canonical_endpoint;
+pub use source::events::decode::decode_batch;
+pub use source::events::event_stream::{
+    spawn_zmq, EventStream, EventSubscriberHandle, StreamError, StreamLease,
+};
+pub use source::SourceError;
+pub use storage::{KvBlockIndexer, MatchQuery, TierMatch};
+pub use types::{
+    CacheOwnerId, ClearScope, Locality, ResidencyOwner, RoutableTarget, SourceId, StorageTier,
+};
 pub use wire::{AllBlocksCleared, BlockRemoved, BlockStored, KVEvent, KVEventBatch};
 
 // Compatibility export; the consumer owns the port and the index implements it.
@@ -60,25 +74,7 @@ pub(crate) fn local_block_hashes(
         .collect()
 }
 
-pub(crate) fn local_block_hash_strings(
-    token_ids: &[u32],
-    block_size: u32,
-    lora_name: Option<&str>,
-) -> Vec<Arc<str>> {
-    local_block_hashes(token_ids, block_size, lora_name)
-        .into_iter()
-        .map(|digest| {
-            let mut value = String::with_capacity(digest.len() * 2);
-            for byte in digest {
-                use std::fmt::Write;
-                let _ = write!(value, "{byte:02x}");
-            }
-            Arc::from(value)
-        })
-        .collect()
-}
-
-/// Out-of-band loss fence: advisory queue overflow can never leave warm state trusted.
+// Out-of-band loss fence: advisory queue overflow can never leave warm state trusted.
 static SIGNAL_LOSS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub fn signal_loss_epoch() -> u64 {
     SIGNAL_LOSS_EPOCH.load(std::sync::atomic::Ordering::Acquire)
@@ -87,10 +83,16 @@ pub(crate) fn record_signal_loss() {
     SIGNAL_LOSS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
-/// Raw signals ingestion emits; the trust arbiter consumes these. The
-/// `EXACT`/`DEGRADED`/`FALLBACK` state machine is the trust arbiter's contract.
+/// Ingestion progress and continuity signals. Loss also fences the index
+/// synchronously, independently of this advisory channel.
 #[derive(Debug, Clone)]
 pub enum IngestionSignal {
+    Invalidated {
+        source: SourceId,
+        dp_rank: u32,
+        reason: &'static str,
+    },
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     Advance {
         source: SourceId,
         last_seq: i64,
@@ -99,10 +101,6 @@ pub enum IngestionSignal {
         source: SourceId,
         from_seq: i64,
         to_seq: i64,
-    },
-    ReplayApplied {
-        source: SourceId,
-        replay_seq: i64,
     },
     IncarnationReset {
         source: SourceId,

@@ -57,6 +57,15 @@ fn worker_counter(name: &str, worker: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn placement_hits() -> f64 {
+    let prefix = "vllm_router_kv_placement_lookups_total{result=\"hit\"} ";
+    metrics()
+        .render()
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix).and_then(|n| n.parse().ok()))
+        .unwrap_or(0.0)
+}
+
 async fn pd_router(prefill: &MockVllmRsServer, decode: &MockVllmRsServer) -> VllmPDRouter {
     pd_router_with_dp(prefill, decode, 1).await
 }
@@ -774,6 +783,8 @@ async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
                         replay_endpoints: None,
                         block_size: 16,
                         model: None,
+                        hybrid: None,
+                        compatible_decode_urls: Vec::new(),
                     },
                 )
             })
@@ -793,15 +804,16 @@ async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
 
         let warm = &prefills[warm_index];
         let cold = &prefills[1 - warm_index];
-        // The subscriber connects asynchronously; republish until a request
-        // lands on the warm prefill.
+        // A cold tie can select either worker, so wait for observed KV credit
+        // as well as selection of the prefill whose event was published.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 publishers[warm_index].store_blocks(&prompt[..32]);
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 let before = warm.captured().len();
+                let hits_before = placement_hits();
                 send_chat_ok(&router).await;
-                if warm.captured().len() > before {
+                if warm.captured().len() > before && placement_hits() > hits_before {
                     break;
                 }
             }
@@ -811,7 +823,12 @@ async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
 
         let (warm_before, cold_before) = (warm.captured().len(), cold.captured().len());
         for _ in 0..8 {
+            let hits_before = placement_hits();
             send_chat_ok(&router).await;
+            assert!(
+                placement_hits() > hits_before,
+                "placement lookup did not hit"
+            );
         }
         assert_eq!(
             warm.captured().len(),

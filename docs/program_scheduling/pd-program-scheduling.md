@@ -24,7 +24,7 @@ What this feature does **not** claim:
 
 ## Prerequisites
 
-1. **HTTP PD mode.** The Router is started with `--vllm-pd-disaggregation`, at least one `--prefill` target and at least one `--decode` target, and `--kv-connector nixl`.
+1. **HTTP PD mode.** Start the Router with `--vllm-pd-disaggregation`, at least one `--prefill` and `--decode` target, and `--kv-connector nixl`. Hybrid KV-aware P/D uses the [request-level setup](../load_balancing/http_completion_kv.md#pd-routing) with Program scheduling disabled.
 2. **Matching vLLM build.** The warm path speaks `vllm-0.28.0-pd-feedback-v1`: the engine must expose `GET /pd_capabilities` and return `kv_transfer_params` / `pd_feedback` for completed requests. `pd.protocol_revision` must match that revision.
 3. **Per-DP-rank token capacity.** `token_capacity_per_dp_rank` must equal the KV token capacity of one decode rank (for example `--kv-cache-memory-bytes / bytes_per_token`).
 4. **Program identity in requests** (see [Program identity](#program-identity)).
@@ -143,7 +143,6 @@ Upstream failures are forwarded unchanged: if a prefill or decode target rejects
 | `prefill_kv_high_watermark` | `0.85` | when P KV usage is above it, tighten the Program-count cap back to the P permit count; `0` disables |
 | `prefill_kv_window_seconds` | `10.0` | sampling window for the P watermark guard |
 | `kv_events` | `false` | subscribe to KV events for advisory residency; never authorizes a transfer |
-| `kv_hash_mode` | `sha256` | `sha256`, `python_hash_seed`, `xxhash_cbor` |
 
 ### `pd` — warm remote KV reuse
 

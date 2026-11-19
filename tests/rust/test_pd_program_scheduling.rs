@@ -392,17 +392,23 @@ fn pd_requires_explicit_capacity_and_rejects_unverified_modes() {
     program.token_capacity_per_dp_rank = Some(100000);
     program.enable_batch_gain_admission = false;
     assert!(ConfigValidator::validate(&config).is_ok());
-    for mutation in 0..4 {
+    for mutation in 0..3 {
         let mut bad = config.clone();
         let program = bad.program_scheduling.as_mut().unwrap();
         match mutation {
             0 => program.binding_only = true,
             1 => program.enable_batch_gain_admission = true,
-            2 => program.pd.max_prefill_requests_per_target = 0,
-            _ => program.pd.kv_hash_mode = "unknown".into(),
+            _ => program.pd.max_prefill_requests_per_target = 0,
         }
         assert!(ConfigValidator::validate(&bad).is_err());
     }
+    let old = serde_json::from_value::<ProgramSchedulingConfig>(
+        json!({"pd":{"kv_hash_mode":"python_hash_seed"}}),
+    )
+    .unwrap();
+    assert!(serde_json::to_value(old).unwrap()["pd"]
+        .get("kv_hash_mode")
+        .is_none());
     assert!(serde_json::from_value::<ProgramSchedulingConfig>(
         json!({"pd":{"bidirectional_multiturn":true}})
     )

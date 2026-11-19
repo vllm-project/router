@@ -1,9 +1,11 @@
-use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
+use super::completion_route::{prepare_completion_route, CompletionRoute};
 use super::program_adapter::{
     prepare_stream_usage_body, settle_grpc_response, ProgramCompletion, SseUsageStripper, StreamEnd,
 };
 use crate::backend::health::check_grpc_health_within;
-use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
+use crate::backend::preprocess::{
+    http_cache_read_fallback, prepare_completion_direct_inputs, prepare_http_kv_inputs,
+};
 use crate::backend::token_count::{
     client_token_ids_fingerprint, exact_prompt_tokens_from_json, prepared_chat_fingerprint,
 };
@@ -39,7 +41,7 @@ use crate::protocols::spec::{
 use crate::request_identity::{resolve_affinity_identity, IdentityFields};
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
-use crate::routers::{RouterTrait, WorkerManagement};
+use crate::routers::{reject_full_report, RouterTrait, WorkerManagement};
 use crate::token_estimator::{MomentumTokenEstimator, TokenEstimateScope};
 use axum::body::to_bytes;
 use axum::{
@@ -306,7 +308,6 @@ pub struct Router {
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     kv_index_supervisor: Option<Arc<crate::kv_index::KvIndexSupervisor>>,
-    _kv_signal_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     program_scheduler: Option<Arc<ProgramScheduler>>,
     _program_observation_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     program_targets_cache: Mutex<HashMap<String, ProgramTargetCacheEntry>>,
@@ -394,10 +395,7 @@ impl Router {
         let default_policy = ctx.policy_registry.get_default_policy();
         let pending_kv_supervisor = if kv_aware_ops(default_policy.as_ref()).is_some() {
             let (mut supervisor, signals) =
-                crate::kv_index::KvIndexSupervisor::new_http_full_attention(
-                    ctx.client.clone(),
-                    crate::kv_index::HashMode::Sha256,
-                );
+                crate::kv_index::KvIndexSupervisor::new_http_full_attention(ctx.client.clone());
             supervisor.set_api_key(ctx.router_config.api_key.clone());
             supervisor.set_strict_recovery(ctx.router_config.kv_event_strict_recovery);
             let static_sources = match &ctx.router_config.policy {
@@ -484,33 +482,42 @@ impl Router {
         };
         let worker_api_key: Option<Arc<str>> = ctx.router_config.api_key.as_deref().map(Arc::from);
         let mut kv_worker_info = HashMap::new();
-        let (kv_index_supervisor, kv_signal_handle) =
-            if let Some((supervisor, mut signals)) = pending_kv_supervisor {
-                let supervisor = Arc::new(supervisor);
-                for worker_url in &kv_discovery_urls {
-                    match supervisor.on_worker_added(worker_url).await {
-                        Ok(info) => {
-                            kv_worker_info.insert(worker_url.clone(), info);
-                        }
-                        Err(error) => warn!(
-                            worker_url,
-                            %error,
-                            "kv_aware discovery failed; worker will use load-only scoring"
-                        ),
+        let kv_index_supervisor = if let Some((supervisor, signals)) = pending_kv_supervisor {
+            drop(signals);
+            let supervisor = Arc::new(supervisor);
+            for worker_url in &kv_discovery_urls {
+                match supervisor.on_worker_added(worker_url).await {
+                    Ok(info) => {
+                        kv_worker_info.insert(worker_url.clone(), info);
                     }
+                    Err(error) => warn!(
+                        worker_url,
+                        %error,
+                        "kv_aware discovery failed; worker will use load-only scoring"
+                    ),
                 }
-                let signal_handle = Arc::new(tokio::spawn(async move {
-                    while signals.recv().await.is_some() {}
-                }));
-                (Some(supervisor), Some(signal_handle))
-            } else {
-                (None, None)
-            };
+            }
+            Some(supervisor)
+        } else {
+            None
+        };
         for url in &worker_urls {
-            // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-            // For now, create worker without model_id
+            let (base_url, dp_rank) = dp_utils::parse_worker_url(url);
+            // KV-aware placement distinguishes base aliases from adapter names.
+            // Other policies retain the original unlabeled worker behavior.
+            let labels = if kv_aware_ops(default_policy.as_ref()).is_some() {
+                crate::routers::served_model_labels(
+                    &ctx.client,
+                    &base_url,
+                    ctx.router_config.api_key.as_deref(),
+                    dp_rank,
+                    true,
+                )
+                .await
+            } else {
+                HashMap::new()
+            };
             let worker_arc: Arc<dyn Worker> = if dp_size > 1 {
-                let (base_url, dp_rank) = dp_utils::parse_worker_url(url);
                 Arc::new(
                     DPAwareWorker::new(
                         base_url,
@@ -518,6 +525,7 @@ impl Router {
                         dp_size,
                         WorkerType::Regular,
                     )
+                    .with_labels(labels)
                     .with_circuit_breaker_config(core_cb_config.clone())
                     .with_health_config(health_config.clone())
                     .with_worker_api_key(worker_api_key.clone()),
@@ -525,6 +533,7 @@ impl Router {
             } else {
                 Arc::new(
                     BasicWorker::new(url.clone(), WorkerType::Regular)
+                        .with_labels(labels)
                         .with_circuit_breaker_config(core_cb_config.clone())
                         .with_health_config(health_config.clone())
                         .with_worker_api_key(worker_api_key.clone()),
@@ -558,6 +567,35 @@ impl Router {
                     cache_aware.init_workers(std::slice::from_ref(&worker_dyn));
                 }
             }
+        }
+
+        if let Some(supervisor) = &kv_index_supervisor {
+            let supervisor = Arc::downgrade(supervisor);
+            let workers = ctx.worker_registry.clone();
+            let policies = ctx.policy_registry.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(crate::kv_index::discovery::CONTROL_TIMEOUT).await;
+                    let Some(supervisor) = supervisor.upgrade() else {
+                        break;
+                    };
+                    let registrations = supervisor.refresh_discovered_workers().await;
+                    if registrations.is_empty() {
+                        continue;
+                    }
+                    for worker in workers.get_by_type(&WorkerType::Regular) {
+                        let Some(registration) = registrations.get(worker.base_url()) else {
+                            continue;
+                        };
+                        Self::attach_kv_provider(
+                            &policies,
+                            worker.as_ref(),
+                            registration.info.as_ref(),
+                            registration.provider.clone(),
+                        );
+                    }
+                }
+            });
         }
 
         if let Some(config) = &ctx.router_config.epd {
@@ -749,7 +787,6 @@ impl Router {
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
             kv_index_supervisor,
-            _kv_signal_handle: kv_signal_handle,
             program_scheduler,
             _program_observation_handle: program_observation_handle,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -762,7 +799,10 @@ impl Router {
         self.frontend.pin_test_token_ids(token_ids);
     }
 
-    async fn discover_kv_worker(&self, worker_url: &str) -> Option<crate::kv_index::WorkerKvInfo> {
+    pub(crate) async fn discover_kv_worker(
+        &self,
+        worker_url: &str,
+    ) -> Option<crate::kv_index::WorkerKvInfo> {
         let supervisor = self.kv_index_supervisor.as_ref()?;
         let policy = self.policy_registry.get_default_policy();
         kv_aware_ops(policy.as_ref())?;
@@ -779,25 +819,45 @@ impl Router {
         }
     }
 
-    fn register_kv_target(
+    pub(crate) fn register_kv_target(
         &self,
         worker: &dyn Worker,
         info: Option<&crate::kv_index::WorkerKvInfo>,
     ) {
-        let policy = self.policy_registry.get_default_policy();
-        let Some(kv_aware) = kv_aware_ops(policy.as_ref()) else {
-            return;
-        };
         let provider = self
             .kv_index_supervisor
             .as_ref()
             .and_then(|supervisor| supervisor.match_provider_for_worker(worker.base_url()));
-        kv_aware.register_worker(worker, info, provider);
+        Self::attach_kv_provider(&self.policy_registry, worker, info, provider);
     }
 
-    fn remove_kv_worker(&self, worker_url: &str, target_urls: &[String]) {
-        if let Some(supervisor) = &self.kv_index_supervisor {
-            supervisor.on_worker_removed(worker_url);
+    fn attach_kv_provider(
+        policies: &PolicyRegistry,
+        worker: &dyn Worker,
+        info: Option<&crate::kv_index::WorkerKvInfo>,
+        provider: Option<Arc<dyn crate::policies::TieredMatchProvider>>,
+    ) {
+        let policy = policies.get_policy_or_default(worker.model_id());
+        let default = policies.get_default_policy();
+        if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
+            kv_aware.register_worker(worker, info, provider.clone());
+        }
+        if !Arc::ptr_eq(&policy, &default) {
+            if let Some(kv_aware) = kv_aware_ops(default.as_ref()) {
+                kv_aware.register_worker(worker, info, provider);
+            }
+        }
+    }
+
+    pub(crate) fn remove_kv_worker(&self, worker_url: &str, target_urls: &[String]) {
+        // A manager may remove one target while another rank still uses the
+        // same publisher. Retire the source only after its last regular target.
+        if !self.worker_registry.get_all().iter().any(|worker| {
+            worker.worker_type() == WorkerType::Regular && worker.base_url() == worker_url
+        }) {
+            if let Some(supervisor) = &self.kv_index_supervisor {
+                supervisor.on_worker_removed(worker_url);
+            }
         }
         let policy = self.policy_registry.get_default_policy();
         if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
@@ -1642,6 +1702,22 @@ impl Router {
         model_id: Option<&str>,
         raw_body: Option<axum::body::Bytes>,
     ) -> Response {
+        if self.kv_index_supervisor.is_some() {
+            // Check the bytes actually forwarded by the raw completion path.
+            // Typed requests can borrow their passthrough fields without
+            // serializing long prompts or multimodal payloads.
+            let raw_request = raw_body
+                .as_ref()
+                .and_then(|raw| serde_json::from_slice::<serde_json::Value>(raw).ok());
+            let identity = typed_req.affinity_identity();
+            let args = match raw_request.as_ref() {
+                Some(body) => body.get("vllm_xargs"),
+                None => identity.other.and_then(|other| other.get("vllm_xargs")),
+            };
+            if let Some(response) = reject_full_report(true, args) {
+                return response;
+            }
+        }
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let model_id = model_id
@@ -1826,7 +1902,38 @@ impl Router {
 
         // KV-aware retries may bypass a target without rewriting its binding.
         let failed_workers = Mutex::new(Vec::new());
-        let (lora_name, cache_salt) = typed_req.cache_identity();
+        // vLLM selects adapters through the request's `model`. A name this pool
+        // does not serve as a base model is an adapter, and the engine caches
+        // its blocks under that identity: the base model's chain is no evidence
+        // for it, so it carries the adapter identity into placement credit.
+        let (declared_lora, cache_salt) = typed_req.cache_identity();
+        let cache_read_fallback =
+            kv_aware_ops(self.policy_for_model(model_id).as_ref()).and_then(|_| match completion {
+                Some(completion) => completion.cache_read_fallback,
+                None => serde_json::to_value(typed_req)
+                    .map(|body| http_cache_read_fallback(&body))
+                    .unwrap_or(Some("unsupported_cache_read")),
+            });
+        if let Some(reason) = cache_read_fallback {
+            RouterMetrics::record_kv_placement_lookup(reason);
+        }
+        let lora_name = declared_lora.or_else(|| {
+            let requested = typed_req.get_model()?;
+            let workers = self.worker_registry.get_all();
+            // Without a served name nothing can be classified; keep the
+            // historical behavior instead of guessing.
+            let classified = workers.iter().any(|worker| {
+                worker
+                    .served_base_models()
+                    .iter()
+                    .any(|name| *name != "unknown")
+            });
+            (classified
+                && !workers
+                    .iter()
+                    .any(|worker| worker.serves_base_model(requested)))
+            .then_some(requested)
+        });
         let affinity_key = self
             .kv_aware_session_affinity_ttl_secs
             .filter(|_| kv_aware_ops(self.policy_for_model(model_id).as_ref()).is_some())
@@ -1944,13 +2051,7 @@ impl Router {
                         .map(KvRequestTokens::PerWorker)
                         .unwrap_or(KvRequestTokens::Shared(None))
                 };
-                let eligibility = completion
-                    .and_then(|completion| {
-                        placement_eligibility(
-                            completion,
-                            &workers,
-                        )
-                    });
+                let eligibility = cache_read_fallback.map(|_| vec![false; workers.len()]);
                 let selected_worker = if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
@@ -1964,13 +2065,7 @@ impl Router {
                     }) {
                         return Self::program_target_unavailable_response(route);
                     }
-                    let eligibility = completion
-                        .and_then(|completion| {
-                            placement_eligibility(
-                                completion,
-                                std::slice::from_ref(&worker),
-                            )
-                        });
+                    let eligibility = cache_read_fallback.map(|_| vec![false]);
                     let kv_receipt = kv_aware_ops(policy.as_ref()).and_then(|kv_aware| {
                         kv_aware.select_worker_with_qualified_inputs(
                             std::slice::from_ref(&worker),
@@ -2705,14 +2800,27 @@ impl Router {
                                 kv_discovery_attempted = true;
                             }
                             info!("Added worker: {}", dp_url);
-                            // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
                             let (base_url, dp_rank) = dp_utils::parse_worker_url(dp_url);
+                            let policy = self.policy_registry.get_default_policy();
+                            let labels = if kv_aware_ops(policy.as_ref()).is_some() {
+                                crate::routers::served_model_labels(
+                                    &self.client,
+                                    &base_url,
+                                    self.api_key.as_deref(),
+                                    dp_rank,
+                                    true,
+                                )
+                                .await
+                            } else {
+                                HashMap::new()
+                            };
                             let new_worker = DPAwareWorker::new(
                                 base_url,
                                 dp_rank.unwrap_or(0),
                                 self.intra_node_data_parallel_size,
                                 WorkerType::Regular,
                             )
+                            .with_labels(labels)
                             .with_circuit_breaker_config(self.circuit_breaker_config.clone())
                             .with_health_config(self.health_config.clone())
                             .with_worker_api_key(worker_api_key.clone());
@@ -2749,9 +2857,25 @@ impl Router {
                         let kv_info = self.discover_kv_worker(worker_url).await;
                         info!("Added worker: {}", worker_url);
 
-                        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
+                        // The registered name is what the engine serves, so an
+                        // adapter selected through `model` stays distinguishable
+                        // from a base-model alias.
+                        let policy = self.policy_registry.get_default_policy();
+                        let labels = if kv_aware_ops(policy.as_ref()).is_some() {
+                            crate::routers::served_model_labels(
+                                &self.client,
+                                worker_url,
+                                self.api_key.as_deref(),
+                                dp_utils::parse_worker_url(worker_url).1,
+                                true,
+                            )
+                            .await
+                        } else {
+                            HashMap::new()
+                        };
                         let new_worker =
                             BasicWorker::new(worker_url.to_string(), WorkerType::Regular)
+                                .with_labels(labels)
                                 .with_circuit_breaker_config(self.circuit_breaker_config.clone())
                                 .with_health_config(self.health_config.clone())
                                 .with_worker_api_key(worker_api_key.clone());
@@ -3374,6 +3498,10 @@ impl RouterTrait for Router {
         .into_response()
     }
 
+    fn monitors_kv_events(&self) -> bool {
+        self.kv_index_supervisor.is_some()
+    }
+
     fn router_type(&self) -> &'static str {
         "regular"
     }
@@ -3413,6 +3541,11 @@ impl RouterTrait for Router {
         method: &Method,
         body: serde_json::Value,
     ) -> Response {
+        if let Some(response) =
+            reject_full_report(self.kv_index_supervisor.is_some(), body.get("vllm_xargs"))
+        {
+            return response;
+        }
         debug!("Transparent proxy: routing {} {} to backend", method, path);
         let start = Instant::now();
 
@@ -3487,6 +3620,10 @@ impl RouterTrait for Router {
             .as_ref()
             .map(KvRequestTokens::PerWorker)
             .unwrap_or(KvRequestTokens::Shared(None));
+        let cache_read_fallback = kv_ops.and_then(|_| http_cache_read_fallback(&body));
+        if let Some(reason) = cache_read_fallback {
+            RouterMetrics::record_kv_placement_lookup(reason);
+        }
         let program_completion = if *method == Method::POST {
             match self
                 .acquire_program_completion_from_payload(
@@ -3513,25 +3650,28 @@ impl RouterTrait for Router {
                 .filter(|worker| worker.is_available())
                 .map(|worker| {
                     let kv_receipt = kv_ops.and_then(|ops| {
-                        ops.select_worker_with_inputs(
+                        ops.select_worker_with_qualified_inputs(
                             std::slice::from_ref(&worker),
                             request_tokens,
                             lora_name,
                             cache_salt,
                             affinity_key.as_ref(),
                             &[],
+                            cache_read_fallback.map(|_| &[false][..]),
                         )
                     });
                     SelectedWorker { worker, kv_receipt }
                 })
         } else if let Some(ops) = kv_ops {
-            ops.select_worker_with_inputs(
+            let eligibility = cache_read_fallback.map(|_| vec![false; workers.len()]);
+            ops.select_worker_with_qualified_inputs(
                 &workers,
                 request_tokens,
                 lora_name,
                 cache_salt,
                 affinity_key.as_ref(),
                 &[],
+                eligibility.as_deref(),
             )
             .map(|receipt| SelectedWorker {
                 worker: workers[receipt.worker_index].clone(),
@@ -3843,6 +3983,56 @@ mod tests {
     use crate::routers::http::program_adapter::MAX_SSE_LINE_BYTES;
     use std::collections::HashMap;
 
+    #[tokio::test]
+    async fn non_kv_policy_does_not_probe_model_metadata_on_worker_add() {
+        use crate::config::{PolicyConfig, RouterConfig};
+        use axum::routing::get;
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let app = axum::Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .fallback(get(move |request: Request| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().push(request.uri().path().to_owned());
+                    StatusCode::NOT_FOUND
+                }
+            }));
+        let mut servers = Vec::new();
+        let mut urls = Vec::new();
+        for _ in 0..2 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            urls.push(format!("http://{}", listener.local_addr().unwrap()));
+            let app = app.clone();
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+        }
+        let config = RouterConfig {
+            policy: PolicyConfig::RoundRobin,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            ..Default::default()
+        };
+        let ctx = Arc::new(
+            crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
+        );
+        let router = Router::new(vec![urls[0].clone()], &ctx).await.unwrap();
+        router.add_worker(&urls[1]).await.unwrap();
+        assert_eq!(router.worker_registry.get_all().len(), 2);
+        assert!(router
+            .worker_registry
+            .get_all()
+            .iter()
+            .all(|worker| worker.model_id() == "unknown"));
+        let paths = requests.lock();
+        assert!(paths.is_empty(), "non-health requests: {paths:?}");
+        for server in servers {
+            server.abort();
+        }
+    }
+
     struct CompletionResponseFixture {
         router: Arc<Router>,
         worker: Arc<dyn Worker>,
@@ -3937,9 +4127,6 @@ mod tests {
         let supervisor = router.kv_index_supervisor.as_ref().unwrap();
         assert!(supervisor.match_provider_for_worker(&worker).is_none());
         supervisor.shutdown();
-        if let Some(task) = &router._kv_signal_handle {
-            task.abort();
-        }
         if let Some(task) = &router._load_monitor_handle {
             task.abort();
         }
@@ -3953,20 +4140,19 @@ mod tests {
             probed,
             [
                 "/get_server_info",
+                "/get_server_info",
                 "/kv_event_sources",
                 "/metrics",
-                "/server_info"
+                "/metrics",
+                "/server_info",
+                "/server_info",
+                "/v1/models"
             ],
             "metadata requests: {requests:?}"
         );
-        for path in ["/get_server_info", "/kv_event_sources"] {
-            assert!(
-                requests.iter().any(|(actual_path, authorization)| {
-                    actual_path == path && authorization.is_none()
-                }),
-                "missing unauthenticated {path}: {requests:?}"
-            );
-        }
+        assert!(requests
+            .iter()
+            .all(|(_, authorization)| authorization.is_none()));
     }
 
     #[tokio::test]
@@ -3993,8 +4179,16 @@ mod tests {
     }
     #[tokio::test]
     async fn empty_router_retains_static_mapping_for_future_http_add_worker() {
+        for managed in [false, true] {
+            exercise_future_http_worker(managed).await;
+        }
+    }
+
+    async fn exercise_future_http_worker(managed: bool) {
         use crate::config::{PolicyConfig, RouterConfig};
         use crate::kv_index::{MatchQuery, StorageTier};
+        use crate::protocols::worker_spec::WorkerConfigRequest;
+        use crate::routers::router_manager::{RouterId, RouterManager};
         use axum::routing::get;
         use serde_json::json;
 
@@ -4008,6 +4202,7 @@ mod tests {
         let app = axum::Router::new().route("/health", get(|| async { "ok" }));
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let config = RouterConfig {
+            enable_igw: managed,
             policy: PolicyConfig::KvAware {
                 router_temperature: 0.0,
                 kv_penalty_host: 0.8,
@@ -4027,8 +4222,30 @@ mod tests {
         let ctx = Arc::new(
             crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
         );
-        let router = Router::new(vec![], &ctx).await.unwrap();
-        router.add_worker(&worker).await.unwrap();
+        let router = Arc::new(Router::new(vec![], &ctx).await.unwrap());
+        let manager = managed.then(|| {
+            let manager = RouterManager::new(
+                ctx.router_config.clone(),
+                ctx.client.clone(),
+                ctx.worker_registry.clone(),
+                ctx.policy_registry.clone(),
+            );
+            manager.register_router(RouterId::new("http-regular".into()), router.clone());
+            manager
+        });
+        if let Some(manager) = &manager {
+            let registration: WorkerConfigRequest = serde_json::from_value(json!({
+                "url": worker, "model_id": "future-model", "labels": {"policy": "kv_aware"}
+            }))
+            .unwrap();
+            manager.add_worker(registration.clone()).await.unwrap();
+            let mut other = registration;
+            other.url = format!("{worker}/other");
+            other.model_id = Some("other-model".into());
+            manager.add_worker(other).await.unwrap();
+        } else {
+            router.add_worker(&worker).await.unwrap();
+        }
         let supervisor = router.kv_index_supervisor.as_ref().unwrap();
         let provider = supervisor.match_provider_for_worker(&worker).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -4060,7 +4277,7 @@ mod tests {
             .unwrap();
         let query = MatchQuery {
             group_idx: 0,
-            local_hashes: crate::kv_index::local_block_hash_strings(&[1; 8], 8, None),
+            local_hashes: crate::kv_index::local_block_hashes(&[1; 8], 8, None),
             tiers_of_interest: vec![StorageTier::Device],
         };
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -4077,6 +4294,70 @@ mod tests {
         })
         .await
         .unwrap();
+        if let Some(manager) = &manager {
+            let target = router.available_workers(Some("future-model"));
+            let other = router.available_workers(Some("other-model"));
+            assert_eq!(target.len(), 1);
+            assert_eq!(other.len(), 1);
+            assert_eq!(target[0].url(), worker);
+            assert_ne!(target[0].url(), other[0].url());
+            let model = ctx.policy_registry.get_policy_or_default("future-model");
+            let default = ctx.policy_registry.get_default_policy();
+            assert!(!Arc::ptr_eq(&model, &default));
+            let prompts = [vec![1; 9]];
+            let remaining = |policy: &Arc<dyn LoadBalancingPolicy>, worker: &dyn Worker| {
+                kv_aware_ops(policy.as_ref())
+                    .unwrap()
+                    .estimate_prefill_work(
+                        &[(worker, &prompts, true)],
+                        &mut crate::policies::PromptHashes::new(),
+                    )[0]
+                .new_prefill_tokens
+            };
+            for policy in [&model, &default] {
+                assert_eq!(remaining(policy, target[0].as_ref()), 1);
+                assert_eq!(remaining(policy, other[0].as_ref()), 9);
+            }
+            let removed = rmp_serde::to_vec(&(
+                2.0,
+                [json!({
+                    "type": "BlockRemoved", "block_hashes": [1], "medium": "GPU"
+                })],
+                0u32,
+            ))
+            .unwrap();
+            publisher
+                .send_multipart([b"kv/future".as_slice(), &1i64.to_be_bytes(), &removed], 0)
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !provider.find_tiered_matches(&query).is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            for policy in [&model, &default] {
+                assert_eq!(remaining(policy, target[0].as_ref()), 9);
+            }
+            publisher
+                .send_multipart([b"kv/future".as_slice(), &2i64.to_be_bytes(), &payload], 0)
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while provider.find_tiered_matches(&query).is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            manager.remove_worker_from_registry(&worker).unwrap();
+            assert!(supervisor.match_provider_for_worker(&worker).is_none());
+            assert!(provider.find_tiered_matches(&query).is_empty());
+            assert!(router.available_workers(Some("future-model")).is_empty());
+            assert_eq!(router.available_workers(Some("other-model")).len(), 1);
+            for policy in [&model, &default] {
+                assert_eq!(remaining(policy, target[0].as_ref()), 9);
+            }
+        }
         supervisor.shutdown();
         task.abort();
     }
@@ -4167,8 +4448,11 @@ mod tests {
             let provider = supervisor.match_provider_for_worker(&worker).unwrap();
             {
                 let requests = requests.lock();
-                assert_eq!(requests.len(), 2, "metadata requests: {requests:?}");
-                for path in ["/get_server_info", "/kv_event_sources"] {
+                assert_eq!(requests.len(), 4, "metadata requests: {requests:?}");
+                assert!(requests.iter().all(|(_, authorization)| {
+                    authorization.as_deref() == Some("Bearer backend-key")
+                }));
+                for path in ["/get_server_info", "/kv_event_sources", "/v1/models"] {
                     assert!(
                         requests.iter().any(|(actual_path, authorization)| {
                             actual_path == path
@@ -4192,6 +4476,32 @@ mod tests {
             })
             .await
             .unwrap();
+            // A bound source first replays existing history before consuming
+            // live events. This fresh mock publisher has no earlier batches.
+            let request = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match replay.recv_multipart(zmq::DONTWAIT) {
+                        Ok(request) => break request,
+                        Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                        Err(error) => panic!("Router startup replay: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(request.last().unwrap(), &0i64.to_be_bytes());
+            replay
+                .send_multipart(
+                    [
+                        request[0].clone(),
+                        vec![],
+                        vec![],
+                        (-1i64).to_be_bytes().to_vec(),
+                        vec![],
+                    ],
+                    0,
+                )
+                .unwrap();
             let payload =
                 |hash: u32, token: u32, block_size: u32| {
                     rmp_serde::to_vec(&(1.0, [json!({
@@ -4202,7 +4512,7 @@ mod tests {
                 };
             let query = |token| MatchQuery {
                 group_idx: 0,
-                local_hashes: crate::kv_index::local_block_hash_strings(
+                local_hashes: crate::kv_index::local_block_hashes(
                     &vec![token; expected as usize],
                     expected,
                     None,
@@ -4332,9 +4642,6 @@ mod tests {
             })
             .await;
             supervisor.shutdown();
-            if let Some(task) = &router._kv_signal_handle {
-                task.abort();
-            }
             if let Some(task) = &router._load_monitor_handle {
                 task.abort();
             }
@@ -4743,10 +5050,8 @@ mod tests {
                 }
             }));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let (supervisor, mut signals) = crate::kv_index::KvIndexSupervisor::new_http_full_attention(
-            Client::new(),
-            crate::kv_index::HashMode::Sha256,
-        );
+        let (supervisor, mut signals) =
+            crate::kv_index::KvIndexSupervisor::new_http_full_attention(Client::new());
         let supervisor = Arc::new(supervisor);
         let info = supervisor.on_worker_added(worker.url()).await.unwrap();
         kv_aware_ops(policy.as_ref()).unwrap().register_worker(
@@ -4784,6 +5089,7 @@ mod tests {
             locality: Some("LOCAL".into()),
             ownership: None,
             session_id: None,
+            lookahead_token_ids: None,
         });
         let payload = rmp_serde::to_vec_named(&(0.0, vec![event], Some(0u32))).unwrap();
         publisher
@@ -5127,7 +5433,7 @@ mod tests {
         render_available: bool,
     ) -> HttpKvFixture {
         use crate::kv_index::{
-            CacheKey, HashMode, KvBlockIndexer, ResidencyOwner, RoutableTarget, StorageTier,
+            CacheKey, KvBlockIndexer, ResidencyOwner, RoutableTarget, StorageTier,
         };
         use crate::policies::KvAwarePolicy;
         use axum::{extract::OriginalUri, routing::post};
@@ -5188,7 +5494,6 @@ mod tests {
                 target.clone(),
                 CacheKey {
                     model: Arc::from("model"),
-                    hash_mode: HashMode::Sha256,
                     block_size: 2,
                 },
                 index.clone(),
@@ -5953,7 +6258,6 @@ mod tests {
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             kv_index_supervisor: None,
-            _kv_signal_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
             program_scheduler: None,
             _program_observation_handle: None,
@@ -5988,13 +6292,143 @@ mod tests {
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             kv_index_supervisor: None,
-            _kv_signal_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
         }
+    }
+
+    #[tokio::test]
+    async fn discovered_served_names_keep_transparent_program_fallback() {
+        use axum::{routing::get, Json};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let models_available = Arc::new(AtomicBool::new(true));
+        let available = models_available.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/models",
+                get(move |headers: HeaderMap| {
+                    let available = available.clone();
+                    async move {
+                        assert_eq!(headers["authorization"], "Bearer secret");
+                        assert_eq!(headers["X-data-parallel-rank"], "1");
+                        let status = if available.load(Ordering::Relaxed) {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        };
+                        (
+                            status,
+                            Json(serde_json::json!({"data": [
+                                {"id": "adapter", "parent": "base-model"},
+                                {"id": "base-model", "parent": null},
+                                {"id": "served-alias"}
+                            ]})),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/get_server_info",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "kv_block_size": 16, "served_model_aliases": ["metadata-alias"]
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let labels = crate::routers::served_model_labels(
+            &reqwest::Client::new(),
+            &url,
+            Some("secret"),
+            Some(1),
+            true,
+        )
+        .await;
+        let worker = BasicWorker::new(url.clone(), WorkerType::Regular).with_labels(labels);
+        assert_eq!(worker.model_id(), "unknown");
+        assert!(worker.serves_base_model("base-model"));
+        assert!(worker.serves_base_model("served-alias"));
+        assert!(worker.serves_base_model("metadata-alias"));
+        assert!(!worker.serves_base_model("adapter"));
+
+        let router = create_test_regular_router();
+        router.worker_registry.register(Arc::new(worker));
+        for name in ["base-model", "served-alias", "adapter"] {
+            let pool = router.resolved_program_model_pool(Some(name));
+            assert_eq!(pool.scheduler_key, PROGRAM_MODEL_POOL_FALLBACK);
+            assert_eq!(router.program_targets_for_model(&pool).len(), 3);
+        }
+        models_available.store(false, Ordering::Relaxed);
+        let labels = crate::routers::served_model_labels(
+            &reqwest::Client::new(),
+            &url,
+            Some("secret"),
+            Some(1),
+            true,
+        )
+        .await;
+        let worker = BasicWorker::new(url, WorkerType::Regular).with_labels(labels);
+        assert!(worker.serves_base_model("metadata-alias"));
+        assert!(!worker.serves_base_model("adapter"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn monitored_routes_reject_full_before_forwarding() {
+        let mut fixture =
+            http_kv_fixture([vec![vec![1, 2, 3, 4]], vec![vec![1, 2, 3, 4]]], 0, true).await;
+        let (supervisor, _signals) =
+            crate::kv_index::KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
+        fixture.router.kv_index_supervisor = Some(Arc::new(supervisor));
+        let chat = serde_json::json!({
+            "model": "local", "messages": [],
+            "vllm_xargs": {"kv_cache_report_mode": "full"}
+        });
+        let response = fixture
+            .router
+            .route_typed_request(
+                None,
+                &serde_json::from_value::<ChatCompletionRequest>(chat.clone()).unwrap(),
+                "/v1/chat/completions",
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let completion = serde_json::json!({
+            "model": "local", "prompt": [1, 2, 3, 4],
+            "vllm_xargs": {"kv_cache_report_mode": "full"}
+        });
+        let raw = bytes::Bytes::from(serde_json::to_vec(&completion).unwrap());
+        let response = fixture
+            .router
+            .route_completion_raw(
+                None,
+                Arc::new(serde_json::from_slice(&raw).unwrap()),
+                raw,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = fixture
+            .router
+            .route_transparent(None, "/custom", &Method::POST, chat.clone())
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(fixture.calls.lock().is_empty());
+
+        fixture.router.kv_index_supervisor = None;
+        let response = fixture
+            .router
+            .route_transparent(None, "/custom", &Method::POST, chat)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!fixture.calls.lock().is_empty());
     }
 
     #[test]
@@ -6581,7 +7015,7 @@ mod tests {
         }))
         .unwrap();
         let completion = CompletionRoute {
-            worker_credit: true,
+            cache_read_fallback: None,
             raw_body: None,
             echo: request.echo,
         };
@@ -6765,7 +7199,7 @@ mod tests {
             )
             .unwrap();
             let completion = CompletionRoute {
-                worker_credit: true,
+                cache_read_fallback: None,
                 raw_body: None,
                 echo,
             };
@@ -7465,7 +7899,6 @@ mod tests {
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             kv_index_supervisor: None,
-            _kv_signal_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
             program_scheduler: None,
             _program_observation_handle: None,

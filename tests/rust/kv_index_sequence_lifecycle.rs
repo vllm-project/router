@@ -6,6 +6,12 @@ use vllm_router_rs::kv_index::{
     ClearScope, KvBlockIndexer, MatchQuery, ResidencyOwner, StorageTier, TierMatch,
 };
 
+use sha2::{Digest, Sha256};
+
+fn content(label: &str) -> [u8; 32] {
+    Sha256::digest(label.as_bytes()).into()
+}
+
 fn prefix_depth(hit: &TierMatch) -> u32 {
     match hit.segments.first() {
         Some((0, end)) => *end,
@@ -33,18 +39,18 @@ fn second_owner_sequence_alias_is_removable() {
         owner_a,
         StorageTier::Device,
         None,
-        &[(Arc::from("i:900"), Arc::from("local"))],
+        &[(Arc::from("i:900"), content("local"))],
     );
     index.store(
         0,
         owner_b.clone(),
         StorageTier::Device,
         None,
-        &[(Arc::from("i:42"), Arc::from("local"))],
+        &[(Arc::from("i:42"), content("local"))],
     );
     let query = MatchQuery {
         group_idx: 0,
-        local_hashes: vec![Arc::from("local")],
+        local_hashes: vec![content("local")],
         tiers_of_interest: vec![StorageTier::Device],
     };
     assert_eq!(index.find_matches(&query).len(), 2);
@@ -75,10 +81,10 @@ fn pool(pool_id: &str, source: &str) -> ResidencyOwner {
     }
 }
 
-fn blocks(pairs: &[(&str, &str)]) -> Vec<(Arc<str>, Arc<str>)> {
+fn blocks(pairs: &[(&str, &str)]) -> Vec<(Arc<str>, [u8; 32])> {
     pairs
         .iter()
-        .map(|(seq, local)| (Arc::from(*seq), Arc::from(*local)))
+        .map(|(seq, local)| (Arc::from(*seq), content(local)))
         .collect()
 }
 
@@ -92,7 +98,7 @@ fn depth(
     index
         .find_matches(&MatchQuery {
             group_idx,
-            local_hashes: path.iter().map(|local| Arc::from(*local)).collect(),
+            local_hashes: path.iter().map(|local| content(local)).collect(),
             tiers_of_interest: vec![tier],
         })
         .iter()
@@ -244,7 +250,7 @@ fn same_owner_claim_survives_until_last_alias_is_removed() {
 }
 
 #[test]
-fn historical_alias_parents_follow_splits_and_interior_continuations() {
+fn retiring_one_wire_id_preserves_live_aliases_and_continuations() {
     let index = KvBlockIndexer::new();
     let a = worker("a", 3);
     let b = worker("b", 3);
@@ -262,7 +268,7 @@ fn historical_alias_parents_follow_splits_and_interior_continuations() {
         None,
         &blocks(&[("i:200", "x"), ("i:201", "y"), ("i:202", "z")]),
     );
-    // The parent is inside a compressed edge, not its last block.
+    // The new branch uses the middle page as its parent.
     index.store(
         0,
         b.clone(),
@@ -279,12 +285,38 @@ fn historical_alias_parents_follow_splits_and_interior_continuations() {
         3
     );
     index.remove(0, &b, StorageTier::Device, &[Arc::from("i:202")]);
-    // Removed aliases still locate topology after a split.
+    // Keep z resident under a second source-local alias, then remove i:102.
+    // Only the currently observed ID establishes the parent for a new store.
     index.store(
         0,
         a.clone(),
         StorageTier::Device,
-        Some(Arc::from("i:202")),
+        Some(Arc::from("i:101")),
+        &blocks(&[("i:104", "z")]),
+    );
+    index.remove(0, &a, StorageTier::Device, &[Arc::from("i:102")]);
+    index.store(
+        0,
+        a.clone(),
+        StorageTier::Device,
+        Some(Arc::from("i:102")),
+        &blocks(&[("i:105", "unproven")]),
+    );
+    assert_eq!(
+        depth(
+            &index,
+            0,
+            &a,
+            StorageTier::Device,
+            &["x", "y", "z", "unproven"]
+        ),
+        3
+    );
+    index.store(
+        0,
+        a.clone(),
+        StorageTier::Device,
+        Some(Arc::from("i:104")),
         &blocks(&[("i:103", "tail")]),
     );
     assert_eq!(
@@ -306,6 +338,45 @@ fn historical_alias_parents_follow_splits_and_interior_continuations() {
     assert_eq!(
         depth(&index, 0, &b, StorageTier::Device, &["x", "y", "branch"]),
         3
+    );
+}
+
+#[test]
+fn an_unknown_integer_parent_cannot_borrow_another_sources_path() {
+    let index = KvBlockIndexer::new();
+    let a = worker("a", 3);
+    let b = worker("b", 3);
+    index.store(
+        0,
+        a.clone(),
+        StorageTier::Device,
+        None,
+        &blocks(&[("i:100", "x"), ("i:101", "y"), ("i:102", "z")]),
+    );
+    index.store(
+        0,
+        b.clone(),
+        StorageTier::Device,
+        None,
+        &blocks(&[("i:200", "x"), ("i:201", "y"), ("i:202", "z")]),
+    );
+    index.remove(0, &b, StorageTier::Device, &[Arc::from("i:202")]);
+    index.store(
+        0,
+        a.clone(),
+        StorageTier::Device,
+        Some(Arc::from("i:202")),
+        &blocks(&[("i:103", "tail")]),
+    );
+    // The equal local path does not prove that a's unknown integer i:202
+    // denotes b's prefix. Crediting the suffix would fabricate that evidence.
+    assert_eq!(
+        depth(&index, 0, &a, StorageTier::Device, &["x", "y", "z", "tail"]),
+        3
+    );
+    assert_eq!(
+        depth(&index, 0, &b, StorageTier::Device, &["x", "y", "z", "tail"]),
+        2
     );
 }
 
@@ -488,7 +559,7 @@ fn interior_parent_cpu_segment_and_evictions_preserve_gpu_truth() {
     );
     let query = MatchQuery {
         group_idx: 0,
-        local_hashes: ["x", "y", "z"].iter().map(|s| Arc::from(*s)).collect(),
+        local_hashes: ["x", "y", "z"].map(content).to_vec(),
         tiers_of_interest: vec![StorageTier::Device, StorageTier::HostPinned],
     };
     let hits = index.find_matches(&query);
@@ -528,7 +599,7 @@ fn evicted_worker_does_not_beat_busy_worker_with_reusable_gpu_prefix() {
     let chain: Vec<_> = hashes[..3]
         .iter()
         .enumerate()
-        .map(|(i, local)| (Arc::from(format!("s{i}")), local.clone()))
+        .map(|(i, local)| (Arc::from(format!("s{i}")), *local))
         .collect();
     for name in ["a", "b"] {
         index.store(0, worker(name, 0), StorageTier::Device, None, &chain);

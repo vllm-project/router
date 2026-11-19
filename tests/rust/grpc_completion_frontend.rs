@@ -14,7 +14,7 @@ async fn grpc_prefix_selection_uses_the_ids_actually_dispatched() {
     use std::sync::Arc;
     use vllm_router_rs::config::{PolicyConfig, RouterConfig};
     use vllm_router_rs::kv_index::{
-        CacheKey, HashMode, KvBlockIndexer, ResidencyOwner, RoutableTarget, StorageTier,
+        CacheKey, KvBlockIndexer, ResidencyOwner, RoutableTarget, StorageTier,
     };
     use vllm_router_rs::policies::KvAwarePolicy;
     use vllm_router_rs::protocols::spec::ChatCompletionRequest;
@@ -83,7 +83,6 @@ async fn grpc_prefix_selection_uses_the_ids_actually_dispatched() {
                 },
                 CacheKey {
                     model: Arc::from("model"),
-                    hash_mode: HashMode::Sha256,
                     block_size: 2,
                 },
                 index.clone(),

@@ -6,6 +6,12 @@ use vllm_router_rs::kv_index::{
     ClearScope, KvBlockIndexer, MatchQuery, ResidencyOwner, StorageTier, TierMatch,
 };
 
+use sha2::{Digest, Sha256};
+
+fn content(label: &str) -> [u8; 32] {
+    Sha256::digest(label.as_bytes()).into()
+}
+
 fn prefix_depth(hit: &TierMatch) -> u32 {
     match hit.segments.first() {
         Some((0, end)) => *end,
@@ -28,8 +34,8 @@ fn a_partial_compressed_edge_match_must_not_skip_to_its_child() {
         StorageTier::Device,
         None,
         &[
-            (Arc::from("s1"), Arc::from("x")),
-            (Arc::from("s2"), Arc::from("y")),
+            (Arc::from("s1"), content("x")),
+            (Arc::from("s2"), content("y")),
         ],
     );
     index.store(
@@ -37,11 +43,11 @@ fn a_partial_compressed_edge_match_must_not_skip_to_its_child() {
         owner,
         StorageTier::Device,
         Some(Arc::from("s2")),
-        &[(Arc::from("s3"), Arc::from("z"))],
+        &[(Arc::from("s3"), content("z"))],
     );
     let hits = index.find_matches(&MatchQuery {
         group_idx: 0,
-        local_hashes: vec![Arc::from("x"), Arc::from("z")],
+        local_hashes: vec![content("x"), content("z")],
         tiers_of_interest: vec![StorageTier::Device],
     });
     assert_eq!(hits.len(), 1);
@@ -71,7 +77,7 @@ fn store(
         parent.map(Arc::from),
         &blocks
             .iter()
-            .map(|(seq, local)| (Arc::from(*seq), Arc::from(*local)))
+            .map(|(seq, local)| (Arc::from(*seq), content(local)))
             .collect::<Vec<_>>(),
     );
 }
@@ -79,7 +85,7 @@ fn store(
 fn query(group_idx: u32, hashes: &[&str], tiers: &[StorageTier]) -> MatchQuery {
     MatchQuery {
         group_idx,
-        local_hashes: hashes.iter().map(|hash| Arc::from(*hash)).collect(),
+        local_hashes: hashes.iter().map(|hash| content(hash)).collect(),
         tiers_of_interest: tiers.to_vec(),
     }
 }
@@ -667,9 +673,15 @@ fn target_rank_tier_and_group_claims_do_not_fill_each_others_gaps() {
         (&other_rank, StorageTier::Device),
         (&original, StorageTier::HostPinned),
     ] {
-        store(&index, 0, owner, tier, None, &[("s1", "x")]);
-        // This owner/tier has x and z, but no claim on the intervening y.
-        store(&index, 0, owner, tier, Some("s2"), &[("s3", "z")]);
+        store(
+            &index,
+            0,
+            owner,
+            tier,
+            None,
+            &[("s1", "x"), ("s2", "y"), ("s3", "z")],
+        );
+        index.remove(0, owner, tier, &[Arc::from("s2")]);
     }
     store(
         &index,

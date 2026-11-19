@@ -211,6 +211,8 @@ impl Default for PredictionProfileConfig {
 pub struct PdProgramSchedulingConfig {
     /// Event residency is advisory and never authorizes a warm transfer.
     pub kv_events: bool,
+    /// Accepted for existing configurations. Page lookup derives keys from events.
+    #[serde(skip_serializing)]
     pub kv_hash_mode: String,
     pub max_prefill_requests_per_target: usize,
     /// Only bounded explicit TTL is supported; otherwise Acting TTL is zero.
@@ -285,7 +287,7 @@ impl Default for PdProgramSchedulingConfig {
     fn default() -> Self {
         Self {
             kv_events: false,
-            kv_hash_mode: "sha256".to_string(),
+            kv_hash_mode: String::new(),
             max_prefill_requests_per_target: 1,
             explicit_ttl: false,
             exclusive_capacity_accounting: true,
@@ -1009,9 +1011,12 @@ pub enum ConnectionMode {
     Grpc,
 }
 
-/// Statically configured KV event sources for one prefill worker, used when
-/// the engine's HTTP control plane does not serve `/server_info` or
-/// `/kv_event_sources` (e.g. the `vllm-rs serve` frontend).
+/// Statically configured KV event sources for one prefill worker.
+///
+/// This is authoritative for engines that cannot report their own sources:
+/// the HTTP `/kv_event_sources` route exists only since vLLM 0.31.0, and
+/// OpenAI-compatible frontends never serve it. On v0.29/v0.30 a deployment
+/// must declare its sources here (or use the gRPC Control RPC).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PdKvEventSources {
     /// ZMQ PUB endpoints, one per data-parallel rank (index = rank).
@@ -1027,6 +1032,12 @@ pub struct PdKvEventSources {
     /// served-model check then relies on `/v1/models`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Router-managed cache layout for this prefill worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hybrid: Option<crate::kv_index::CacheCapabilities>,
+    /// Decode base URLs explicitly verified for this hybrid prefill worker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatible_decode_urls: Vec<String>,
 }
 
 fn default_pd_kv_block_size() -> u32 {
@@ -1196,6 +1207,9 @@ pub struct StaticKvEventSources {
     pub block_size: u32,
     /// Shared model identity across workers that serve the same model.
     pub model: String,
+    /// Router-managed hybrid layout and per-rank publisher identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hybrid: Option<crate::kv_index::CacheCapabilities>,
 }
 
 impl PolicyConfig {
@@ -1690,6 +1704,8 @@ mod tests {
                 replay_endpoints: Some(vec!["tcp://prefill:5558".to_string()]),
                 block_size: 32,
                 model: Some("m".to_string()),
+                hybrid: None,
+                compatible_decode_urls: Vec::new(),
             },
         );
         let json = serde_json::to_string(&config).unwrap();

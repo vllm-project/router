@@ -18,7 +18,8 @@ use crate::policies::{
     kv_aware_ops, AffinityKey, LoadBalancingPolicy, PolicyRegistry, WorkerTokenInputs,
 };
 use crate::program_scheduling::ProgramIdentity;
-use crate::routers::{header_utils, RouterTrait, WorkerManagement};
+use crate::protocols::spec::GrpcRequestRef;
+use crate::routers::{header_utils, reject_full_report, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -1237,6 +1238,7 @@ impl VllmPDRouter {
         // cache matches can be recomputed against the tree at dispatch.
         let decode_cache = decode_cache.map(Arc::new);
         let context = PdRequestContext {
+            hybrid_pairs: None,
             prefill_inputs: prefill_inputs.as_ref(),
             model_id,
             legacy_policy_input: text.as_deref(),
@@ -1425,6 +1427,7 @@ impl VllmPDRouter {
         candidates = self.live_decode_candidates(input.pool);
         Self::retain_commit_candidates(&mut candidates, input.model_id.as_deref(), pin);
         let context = PdRequestContext {
+            hybrid_pairs: None,
             prefill_inputs: None,
             model_id: input.model_id.as_deref(),
             legacy_policy_input: None,
@@ -1480,7 +1483,7 @@ impl VllmPDRouter {
         Ok(worker)
     }
 
-    /// Cheap opt-in gate: only Program-capable requests are serialized twice.
+    /// Cheap opt-in gate before Program admission.
     fn program_turn_enabled(
         &self,
         headers: Option<&HeaderMap>,
@@ -1491,6 +1494,54 @@ impl VllmPDRouter {
         })
     }
 
+    async fn route_openai<T: crate::protocols::spec::GenerationRequest + serde::Serialize>(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &T,
+        path: &str,
+    ) -> Response {
+        let other = body.affinity_identity().other;
+        if let Some(response) = reject_full_report(
+            self.pd_router.kv_state.is_some(),
+            other.and_then(|fields| fields.get("vllm_xargs")),
+        ) {
+            return response;
+        }
+        let grpc_request = body.grpc_request();
+        if let Some(GrpcRequestRef::Chat(chat)) = grpc_request {
+            if !self.use_discovery && self.uses_grpc_pools() {
+                return self.route_grpc_chat(headers, chat).await;
+            }
+        }
+        let mut request = match serde_json::to_value(body) {
+            Ok(request) => request,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Serialization error: {error}"),
+                )
+                    .into_response()
+            }
+        };
+        if other.is_some_and(|fields| self.program_turn_enabled(headers, fields)) {
+            if let Some(response) = self
+                .process_program_request(&mut request, path, headers)
+                .await
+            {
+                return response;
+            }
+        }
+        if let Some(GrpcRequestRef::Completion(completion)) = grpc_request {
+            if !self.use_discovery && self.uses_grpc_pools() {
+                return self
+                    .route_grpc_completion(headers, completion, request)
+                    .await;
+            }
+        }
+        self.route_transparent(headers, path, &Method::POST, request)
+            .await
+    }
+
     /// One Program turn: the scheduler binds D, P is selected per turn, and P
     /// capacity is bounded per target before dispatch.
     ///
@@ -1498,7 +1549,7 @@ impl VllmPDRouter {
     /// must fall back to native PD routing.
     async fn process_program_request(
         &self,
-        mut request: Value,
+        request: &mut Value,
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Option<Response> {
@@ -1525,7 +1576,7 @@ impl VllmPDRouter {
                 .collect::<Vec<_>>()
         };
         let completion = match runtime
-            .acquire(headers, &request, path, &decode_targets)
+            .acquire(headers, request, path, &decode_targets)
             .await
         {
             Ok(Some(completion)) => completion,
@@ -1572,7 +1623,7 @@ impl VllmPDRouter {
                     .map(|(_, worker)| worker.clone())
                     .collect::<Vec<_>>();
                 if let Some(index) =
-                    self.select_program_prefill_index(&prefill_workers, &request, path, headers)
+                    self.select_program_prefill_index(&prefill_workers, request, path, headers)
                 {
                     // The target and the worker it charges travel together, so
                     // execute() derives both from the same index.
@@ -1588,7 +1639,7 @@ impl VllmPDRouter {
                         warm_remote.clone(),
                         &self.pd_router.client,
                         &completion,
-                        &request,
+                        request,
                         path,
                         headers,
                         &prefills,
@@ -1625,7 +1676,7 @@ impl VllmPDRouter {
             }
         }
         let Some((prefill_id, prefill_worker)) = selected
-            .or_else(|| self.select_program_prefill(&prefill_candidates, &request, path, headers))
+            .or_else(|| self.select_program_prefill(&prefill_candidates, request, path, headers))
         else {
             RouterMetrics::record_pd_error("server_selection");
             return Some(program_unavailable(
@@ -1655,7 +1706,7 @@ impl VllmPDRouter {
             .admit_bound(prefill_worker.clone(), decode_worker.clone());
         let result = self
             .process_vllm_two_stage_request(
-                request,
+                request.take(),
                 prefill_worker,
                 decode_worker,
                 path,
@@ -3472,34 +3523,8 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        if !self.use_discovery && self.uses_grpc_pools() {
-            return self.route_grpc_chat(headers, body).await;
-        }
-        if self.program_turn_enabled(headers, &body.other) {
-            let request = match serde_json::to_value(body) {
-                Ok(request) => request,
-                Err(error) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-                }
-            };
-            if let Some(response) = self
-                .process_program_request(request, "/v1/chat/completions", headers)
-                .await
-            {
-                return response;
-            }
-        }
-        match serde_json::to_value(body) {
-            Ok(body) => {
-                self.route_transparent(headers, "/v1/chat/completions", &Method::POST, body)
-                    .await
-            }
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Serialization error: {error}"),
-            )
-                .into_response(),
-        }
+        self.route_openai(headers, body, "/v1/chat/completions")
+            .await
     }
 
     async fn route_completion(
@@ -3508,35 +3533,7 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        if self.program_turn_enabled(headers, &body.other) {
-            let request = match serde_json::to_value(body) {
-                Ok(request) => request,
-                Err(error) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-                }
-            };
-            if let Some(response) = self
-                .process_program_request(request, "/v1/completions", headers)
-                .await
-            {
-                return response;
-            }
-        }
-        match serde_json::to_value(body) {
-            Ok(request_json) if !self.use_discovery && self.uses_grpc_pools() => {
-                self.route_grpc_completion(headers, body, request_json)
-                    .await
-            }
-            Ok(body) => {
-                self.route_transparent(headers, "/v1/completions", &Method::POST, body)
-                    .await
-            }
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Serialization error: {error}"),
-            )
-                .into_response(),
-        }
+        self.route_openai(headers, body, "/v1/completions").await
     }
 
     async fn route_responses(
@@ -3639,6 +3636,10 @@ impl RouterTrait for VllmPDRouter {
         }
     }
 
+    fn monitors_kv_events(&self) -> bool {
+        self.pd_router.kv_state.is_some()
+    }
+
     fn router_type(&self) -> &'static str {
         "vllm_pd"
     }
@@ -3656,6 +3657,11 @@ impl RouterTrait for VllmPDRouter {
         method: &Method,
         body: serde_json::Value,
     ) -> Response {
+        if let Some(response) =
+            reject_full_report(self.pd_router.kv_state.is_some(), body.get("vllm_xargs"))
+        {
+            return response;
+        }
         // Only handle POST requests for inference
         if *method != Method::POST {
             return (
@@ -3858,6 +3864,54 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn monitored_pd_routes_reject_full_before_scheduling() {
+        let mut router = test_vllm_pd_router().await;
+        router.pd_router.kv_state = Some(
+            super::super::pd_kv_state::PdKvState::start(
+                reqwest::Client::new(),
+                None,
+                HashMap::new(),
+                router.kv_connector,
+                router.pd_router.worker_registry.clone(),
+                Some(Arc::new(crate::policies::KvAwarePolicy::default())),
+                None,
+            )
+            .await,
+        );
+        let chat = json!({"messages": [], "vllm_xargs": {"kv_cache_report_mode": "full"}});
+        let completion =
+            json!({"prompt": [1, 2, 3], "vllm_xargs": {"kv_cache_report_mode": "full"}});
+        let chat_req = serde_json::from_value(chat.clone()).unwrap();
+        let completion_req = serde_json::from_value(completion).unwrap();
+        assert_eq!(
+            router.route_chat(None, &chat_req, None).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            router
+                .route_completion(None, &completion_req, None)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            router
+                .route_transparent(None, "/custom", &Method::POST, chat.clone())
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        router.pd_router.kv_state = None;
+        assert_ne!(
+            router
+                .route_transparent(None, "/custom", &Method::POST, chat)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
 
     #[tokio::test]
     async fn prefill_body_limit_rejects_oversized_responses() {
@@ -5925,6 +5979,8 @@ mod tests {
                     replay_endpoints: None,
                     block_size: 16,
                     model: Some("m".to_owned()),
+                    hybrid: None,
+                    compatible_decode_urls: Vec::new(),
                 },
             )]),
             worker_startup_timeout_secs: 5,
@@ -6049,6 +6105,8 @@ mod tests {
                     replay_endpoints: None,
                     block_size: 16,
                     model: Some("m".to_owned()),
+                    hybrid: None,
+                    compatible_decode_urls: Vec::new(),
                 },
             )]),
             worker_startup_timeout_secs: 5,
