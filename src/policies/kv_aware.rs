@@ -901,6 +901,10 @@ impl TieredMatchProvider for EmptyMatchProvider {
     }
 }
 
+fn provider_id(provider: &Arc<dyn TieredMatchProvider>) -> usize {
+    Arc::as_ptr(provider) as *const () as usize
+}
+
 #[derive(Clone)]
 struct TargetBinding {
     target: RoutableTarget,
@@ -1466,7 +1470,7 @@ impl KvAwarePolicy {
                     }
                     let hits = query_cache
                         .entry((
-                            Arc::as_ptr(&binding.matches) as *const () as usize,
+                            provider_id(&binding.matches),
                             binding.cache_key.clone(),
                             *ids,
                         ))
@@ -1803,7 +1807,7 @@ impl KvAwareOps for KvAwarePolicy {
                     let hits = if verified {
                         query_cache
                             .entry((
-                                Arc::as_ptr(&binding.matches) as *const () as usize,
+                                provider_id(&binding.matches),
                                 binding.cache_key.clone(),
                                 tokens.as_slice(),
                             ))
