@@ -14,7 +14,7 @@ from ..helpers.pd_lifecycle import probe
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
-async def exercise(fault=None, output=None, cli=False, fragment=None):
+async def exercise(fault=None, output=None, cli=False, fragment=None, levels=(1, 2)):
     calls = []
 
     async def handler(request):
@@ -66,6 +66,17 @@ async def exercise(fault=None, output=None, cli=False, fragment=None):
                 )
                 if fault == "buffered_done":
                     await asyncio.sleep(0.02)  # terminal SSE buffered before HTTP EOF
+                return response
+            if fault in ("disconnect_truncated", "disconnect_buffered_error") and (
+                "-disconnect-0" in payload["prompt"]
+            ):
+                first = b'data: {"choices":[{"text":"blue","finish_reason":null}]}\n\n'
+                tail = (
+                    b'data: {"error":"transfer failed"}\n\n'
+                    if fault == "disconnect_buffered_error"
+                    else b""
+                )
+                await response.write(first + tail)
                 return response
             if fragment is not None:
                 first = b'data: {"choices":[{"text":"blue","finish_reason":null}]}\n\n'
@@ -127,7 +138,7 @@ async def exercise(fault=None, output=None, cli=False, fragment=None):
             probe(
                 f"http://127.0.0.1:{port}",
                 "test",
-                [1, 2],
+                list(levels),
                 1,
                 0.05 if fault == "stall" else 2,
                 output,
@@ -214,6 +225,17 @@ def test_disconnect_wave_allows_partial_untested(monkeypatch):
         "untested",
         "disconnected_after_text",
     ]
+
+
+@pytest.mark.parametrize("fault", ["disconnect_truncated", "disconnect_buffered_error"])
+def test_disconnect_tail_failure_is_not_masked_by_peer_success(fault):
+    result, _ = asyncio.run(exercise(fault, levels=(2,)))
+    assert not result["passed"]
+    disconnects = [r for r in result["results"] if r["phase"] == "disconnect"]
+    assert {r["outcome"] for r in disconnects} == {
+        "failed",
+        "disconnected_after_text",
+    }
 
 
 def test_unexpected_request_exception_is_reported(monkeypatch, tmp_path):

@@ -24,6 +24,51 @@ class DisconnectUntested(ValueError):
     """The response finished before the client could disconnect it."""
 
 
+def _buffered_sse_completed(buffered, eof):
+    """Validate complete buffered events and identify a finished response."""
+    lines = buffered.split(b"\n")
+    partial = lines.pop()
+    if eof and partial.strip():
+        raise ValueError("truncated buffered SSE line")
+    finished = False
+    done = False
+    for pending in lines:
+        pending = pending.strip()
+        if not pending or pending.startswith(b":"):
+            continue
+        if not pending.startswith(b"data:"):
+            raise ValueError("invalid buffered SSE line")
+        data = pending[5:].strip()
+        if done:
+            raise ValueError("buffered data after [DONE]")
+        if data == b"[DONE]":
+            done = True
+            continue
+        event = json.loads(data)
+        if not isinstance(event, dict) or "error" in event:
+            raise ValueError("invalid buffered SSE completion")
+        choices = event.get("choices")
+        if choices == [] and event.get("usage") is not None:
+            continue
+        if (
+            not isinstance(choices, list)
+            or len(choices) != 1
+            or not isinstance(choices[0], dict)
+            or not isinstance(choices[0].get("text"), str)
+        ):
+            raise ValueError("invalid buffered SSE choices")
+        reason = choices[0].get("finish_reason")
+        if reason is not None:
+            if reason not in ("stop", "length"):
+                raise ValueError("invalid buffered SSE finish_reason")
+            finished = True
+    if done and not finished:
+        raise ValueError("buffered stream ended without finish_reason")
+    if eof and not done:
+        raise ValueError("truncated SSE stream (missing [DONE])")
+    return finished or done
+
+
 async def request(session, url, model, mode, sequence):
     payload = {
         "model": model,
@@ -74,39 +119,17 @@ async def request(session, url, model, mode, sequence):
                     raise DisconnectUntested(
                         "first text already finished; cancellation untested"
                     )
-                # is_eof includes unread buffered bytes, unlike at_eof().
-                if response.content.is_eof():
-                    raise DisconnectUntested(
-                        "response already at EOF; cancellation untested"
-                    )
+                # is_eof includes unread buffered bytes, unlike at_eof(). Drain
+                # and validate them before classifying an EOF as normal completion.
+                eof = response.content.is_eof()
                 buffered = response.content.read_nowait()
-                # Only inspect complete lines. The final fragment may end inside
-                # JSON or a UTF-8 character; we close without waiting for it.
-                for pending in buffered.split(b"\n")[:-1]:
-                    pending = pending.strip()
-                    if not pending or pending.startswith(b":"):
-                        continue
-                    if not pending.startswith(b"data:"):
-                        raise ValueError(
-                            "invalid buffered SSE line; cancellation untested"
-                        )
-                    data = pending[5:].strip()
-                    if data == b"[DONE]":
-                        raise DisconnectUntested(
-                            "completion already buffered; cancellation untested"
-                        )
-                    event = json.loads(data)
-                    if not isinstance(event, dict) or "error" in event:
-                        raise ValueError("invalid buffered SSE completion")
-                    choices = event.get("choices", [])
-                    if not isinstance(choices, list) or any(
-                        not isinstance(c, dict) for c in choices
-                    ):
-                        raise ValueError("invalid buffered SSE choices")
-                    if any(c.get("finish_reason") is not None for c in choices):
-                        raise DisconnectUntested(
-                            "completion already buffered; cancellation untested"
-                        )
+                # Without EOF, leave a trailing partial line unclassified and
+                # disconnect immediately. With EOF, it must form a complete,
+                # normally terminated SSE response to count as untested.
+                if _buffered_sse_completed(buffered, eof):
+                    raise DisconnectUntested(
+                        "completion already buffered; cancellation untested"
+                    )
                 # Closing an unfinished response disconnects the HTTP client. This
                 # alone does not prove that the engine propagated the abort.
                 response.close()
