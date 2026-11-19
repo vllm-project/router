@@ -43,6 +43,8 @@ fn a_partial_compressed_edge_match_must_not_skip_to_its_child() {
         group_idx: 0,
         local_hashes: vec![Arc::from("x"), Arc::from("z")],
         tiers_of_interest: vec![StorageTier::Device],
+
+        request: None,
     });
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].segments, vec![(0, 1)], "y was not matched");
@@ -76,11 +78,12 @@ fn store(
     );
 }
 
-fn query(group_idx: u32, hashes: &[&str], tiers: &[StorageTier]) -> MatchQuery {
+fn query<'a>(group_idx: u32, hashes: &'a [&str], tiers: &[StorageTier]) -> MatchQuery<'a> {
     MatchQuery {
         group_idx,
         local_hashes: hashes.iter().map(|hash| Arc::from(*hash)).collect(),
         tiers_of_interest: tiers.to_vec(),
+        request: None,
     }
 }
 

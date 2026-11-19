@@ -5,9 +5,9 @@
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, CostParams, KvAffinityTable,
-    KvAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy,
-    RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
+    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, KvAffinityTable, KvAwarePolicy,
+    LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    StickyLeastLoadedPolicy,
 };
 use crate::config::types::PolicyConfig;
 use std::collections::HashMap;
@@ -233,25 +233,9 @@ impl PolicyRegistry {
                 };
                 Arc::new(CacheAwarePolicy::with_config(cache_config))
             }
-            PolicyConfig::KvAware {
-                router_temperature,
-                kv_penalty_host,
-                kv_penalty_external,
-                kv_penalty_disk,
-                ..
-            } => Arc::new(
-                KvAwarePolicy::new(CostParams {
-                    router_temperature: *router_temperature,
-                    transfer_credits: TransferCredits {
-                        device: 1.0,
-                        host_pinned: *kv_penalty_host,
-                        external: *kv_penalty_external,
-                        disk: *kv_penalty_disk,
-                    },
-                    ..CostParams::default()
-                })
-                .with_shared_affinity(Arc::clone(kv_affinity_table)),
-            ),
+            PolicyConfig::KvAware(config) => {
+                super::factory::build_kv_aware_policy(config, Some(kv_affinity_table))
+            }
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
             PolicyConfig::StickyLeastLoaded => Arc::new(StickyLeastLoadedPolicy::new()),

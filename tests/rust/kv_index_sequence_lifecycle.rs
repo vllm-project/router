@@ -46,6 +46,8 @@ fn second_owner_sequence_alias_is_removable() {
         group_idx: 0,
         local_hashes: vec![Arc::from("local")],
         tiers_of_interest: vec![StorageTier::Device],
+
+        request: None,
     };
     assert_eq!(index.find_matches(&query).len(), 2);
 
@@ -94,6 +96,8 @@ fn depth(
             group_idx,
             local_hashes: path.iter().map(|local| Arc::from(*local)).collect(),
             tiers_of_interest: vec![tier],
+
+            request: None,
         })
         .iter()
         .find(|hit| hit.target == owner.target())
@@ -490,6 +494,8 @@ fn interior_parent_cpu_segment_and_evictions_preserve_gpu_truth() {
         group_idx: 0,
         local_hashes: ["x", "y", "z"].iter().map(|s| Arc::from(*s)).collect(),
         tiers_of_interest: vec![StorageTier::Device, StorageTier::HostPinned],
+
+        request: None,
     };
     let hits = index.find_matches(&query);
     let cpu = hits

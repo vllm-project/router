@@ -157,6 +157,8 @@ fn same_source_rank_remove_and_clear_are_isolated() {
                 group_idx: 0,
                 local_hashes: local_keys(&[1, 2, 3, 4]),
                 tiers_of_interest: vec![StorageTier::Device],
+
+                request: None,
             })
             .into_iter()
             .map(|hit| {
@@ -234,6 +236,8 @@ fn absent_rank_uses_configured_source_and_explicit_zero_overrides_it() {
             group_idx: 0,
             local_hashes: local_keys(&[1, 2, 3, 4]),
             tiers_of_interest: vec![StorageTier::Device],
+
+            request: None,
         };
         let hits = index.find_matches(&query);
         assert_eq!(hits.len(), 1);
@@ -345,6 +349,8 @@ fn decode_admit_store_query_remove_and_clear_use_the_common_contract() {
         group_idx: 0,
         local_hashes: local_keys(&tokens),
         tiers_of_interest: vec![StorageTier::Device],
+
+        request: None,
     };
     let provider: &dyn TieredMatchProvider = &index;
     assert!(provider.find_tiered_matches(&query).is_empty());

@@ -47,13 +47,18 @@ fn cache_aware() -> PolicyConfig {
 }
 
 fn kv_aware() -> PolicyConfig {
-    PolicyConfig::KvAware {
+    PolicyConfig::KvAware(Box::new(vllm_router_rs::config::KvAwareConfig {
         router_temperature: 0.0,
         kv_penalty_host: 0.8,
         kv_penalty_external: 0.6,
         kv_penalty_disk: 0.3,
         static_kv_event_sources: Box::default(),
-    }
+        kv_index_backend: "local".to_string(),
+        conductor_url: None,
+        conductor_query_timeout_ms: 10,
+        conductor_hash_profile: None,
+        ..vllm_router_rs::config::KvAwareConfig::default()
+    }))
 }
 
 async fn workers(n: usize, delay: Duration) -> Vec<MockVllmRsServer> {
