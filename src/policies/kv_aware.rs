@@ -962,6 +962,10 @@ impl TieredMatchProvider for EmptyMatchProvider {
     }
 }
 
+fn provider_id(provider: &Arc<dyn TieredMatchProvider>) -> usize {
+    Arc::as_ptr(provider) as *const () as usize
+}
+
 #[derive(Clone)]
 struct TargetBinding {
     target: RoutableTarget,
@@ -1501,7 +1505,8 @@ impl KvAwarePolicy {
         if !has_tokens {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("missing_tokens");
         }
-        let mut query_cache: HashMap<(Option<CacheKey>, &[u32]), Vec<TierMatch>> = HashMap::new();
+        // The binding snapshot owns these provider Arcs for the memo lifetime.
+        let mut query_cache = HashMap::new();
         let mut grouped = Vec::with_capacity(bindings.len());
         let mut input_tokens = Vec::with_capacity(bindings.len());
         let mut prefill_tokens = Vec::with_capacity(bindings.len());
@@ -1517,7 +1522,11 @@ impl KvAwarePolicy {
                         continue;
                     }
                     let hits = query_cache
-                        .entry((binding.cache_key.clone(), ids))
+                        .entry((
+                            provider_id(&binding.matches),
+                            binding.cache_key.clone(),
+                            *ids,
+                        ))
                         .or_insert_with(|| {
                             if let Some(reason) = credit_fallback {
                                 crate::metrics::RouterMetrics::record_kv_placement_lookup(reason);
@@ -1850,13 +1859,23 @@ impl KvAwareOps for KvAwarePolicy {
                 let mut new_prefill_tokens = 0u64;
                 for tokens in prompts {
                     let hits = if verified {
-                        let key = (binding.cache_key.clone(), prompt_fingerprint(tokens));
+                        let key = (
+                            provider_id(&binding.matches),
+                            binding.cache_key.clone(),
+                            prompt_fingerprint(tokens),
+                        );
                         query_cache
                             .entry(key)
                             .or_insert_with(|| {
                                 let local = hashes.hashes_for(binding.block_size, tokens);
-                                Self::placement_matches_with(&binding, local)
+                                // Keep the allocation alive even if a later
+                                // input observes a replaced registration.
+                                (
+                                    binding.matches.clone(),
+                                    Self::placement_matches_with(&binding, local),
+                                )
                             })
+                            .1
                             .as_slice()
                     } else {
                         &[]
@@ -1926,13 +1945,21 @@ impl KvAwareOps for KvAwarePolicy {
                 };
                 let mut additional = 0u64;
                 for tokens in prompts {
-                    let key = (binding.cache_key.clone(), prompt_fingerprint(tokens));
+                    let key = (
+                        provider_id(&binding.matches),
+                        binding.cache_key.clone(),
+                        prompt_fingerprint(tokens),
+                    );
                     let hits = query_cache
                         .entry(key)
                         .or_insert_with(|| {
                             let local = hashes.hashes_for(binding.block_size, tokens);
-                            Self::placement_matches_with(&binding, local)
+                            (
+                                binding.matches.clone(),
+                                Self::placement_matches_with(&binding, local),
+                            )
                         })
+                        .1
                         .as_slice();
                     let matches: Vec<_> = hits
                         .iter()
@@ -3750,6 +3777,109 @@ mod tests {
         let released_at = Instant::now();
         acquired.release_ref();
         assert!(record.state.lock().idle_deadline.unwrap() >= released_at + ttl);
+    }
+
+    #[test]
+    fn placement_memos_keep_distinct_providers_and_reuse_shared_arcs() {
+        struct Matches {
+            calls: AtomicUsize,
+            hits: Vec<TierMatch>,
+        }
+        impl TieredMatchProvider for Matches {
+            fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.hits.clone()
+            }
+        }
+        let policy = KvAwarePolicy::default();
+        let workers = registered_worker_pair(&policy);
+        let first = Arc::new(Matches {
+            calls: AtomicUsize::new(0),
+            hits: Vec::new(),
+        });
+        let second = Arc::new(Matches {
+            calls: AtomicUsize::new(0),
+            hits: vec![tier_match(
+                &target(workers[1].url(), 0),
+                StorageTier::Device,
+                &[(0, 1)],
+            )],
+        });
+        let info = WorkerKvInfo {
+            cache_key: Some(CacheKey {
+                model: Arc::from("shared"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size: 2,
+            }),
+            ..Default::default()
+        };
+        for (worker, provider) in workers.iter().zip([
+            first.clone() as Arc<dyn TieredMatchProvider>,
+            second.clone(),
+        ]) {
+            policy.register_worker(worker.as_ref(), Some(&info), Some(provider));
+        }
+        let prompts = [vec![1, 2, 3, 4]];
+        for shared in [false, true] {
+            if shared {
+                policy.register_worker(workers[1].as_ref(), Some(&info), Some(first.clone()));
+            }
+            let calls_before = [
+                first.calls.load(Ordering::Relaxed),
+                second.calls.load(Ordering::Relaxed),
+            ];
+            // An exclusion fixes the selected target, not its placement credit.
+            let receipt = policy
+                .select_worker_with_receipt(
+                    &workers,
+                    Some(&prompts[0]),
+                    None,
+                    None,
+                    None,
+                    &[workers[0].url().to_owned()],
+                )
+                .unwrap();
+            let inputs = [
+                (workers[0].as_ref(), prompts.as_slice(), true),
+                (workers[1].as_ref(), prompts.as_slice(), true),
+            ];
+            let mut hashes = PromptHashes::new();
+            let prefill = policy.estimate_prefill_work(&inputs, &mut hashes);
+            let decode = policy.estimate_decode_work(&inputs, &mut hashes);
+            let expected = if shared { 4 } else { 2 };
+            let actual = (
+                receipt.new_prefill_tokens,
+                prefill
+                    .iter()
+                    .map(|estimate| estimate.new_prefill_tokens)
+                    .collect::<Vec<_>>(),
+                decode
+                    .iter()
+                    .map(|estimate| estimate.additional_tokens)
+                    .collect::<Vec<_>>(),
+            );
+            release_receipt(&workers, &receipt);
+            assert_eq!(
+                actual,
+                (expected, vec![4, expected], vec![Some(4), Some(expected)]),
+                "shared={shared}"
+            );
+            assert_eq!(receipt.worker_index, 1);
+            assert!(prefill.iter().all(|estimate| estimate.placement_verified));
+            assert_eq!(
+                [
+                    first.calls.load(Ordering::Relaxed) - calls_before[0],
+                    second.calls.load(Ordering::Relaxed) - calls_before[1],
+                ],
+                [3, if shared { 0 } else { 3 }],
+                "each request-local memo reuses only the same provider Arc"
+            );
+            assert_eq!(
+                policy.load.sample(&receipt.decision.target),
+                LoadSample::default()
+            );
+            assert_eq!(workers[1].load(), 0);
+        }
     }
 
     #[test]
