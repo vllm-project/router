@@ -103,6 +103,8 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+    # Maximum wait for a frame to enter the Rust router's downstream SSE queue.
+    sse_forward_stall_timeout_secs: int = 120
 
     @staticmethod
     def add_cli_args(
@@ -480,6 +482,12 @@ class RouterArgs:
             default=RouterArgs.request_timeout_secs,
             help="Request timeout in seconds",
         )
+        parser.add_argument(
+            f"--{prefix}sse-forward-stall-timeout-secs",
+            type=int,
+            default=RouterArgs.sse_forward_stall_timeout_secs,
+            help="Maximum time in seconds for an SSE frame to wait for downstream queue capacity",
+        )
         # Retry configuration
         parser.add_argument(
             f"--{prefix}retry-max-retries",
@@ -645,6 +653,9 @@ class RouterArgs:
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        if self.sse_forward_stall_timeout_secs <= 0:
+            raise ValueError("sse_forward_stall_timeout_secs must be > 0")
+
         if self.kv_aware_session_affinity_ttl_secs is not None and not (
             1 <= self.kv_aware_session_affinity_ttl_secs <= 31_536_000
         ):

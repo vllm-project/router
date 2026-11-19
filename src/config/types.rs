@@ -8,6 +8,13 @@ use crate::program_scheduling::{
     ProgramSchedulingEnableKey,
 };
 
+/// Default maximum wait for downstream SSE queue capacity.
+pub const DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS: u64 = 120;
+
+fn default_sse_forward_stall_timeout_secs() -> u64 {
+    DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS
+}
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -33,6 +40,9 @@ pub struct RouterConfig {
     pub max_payload_size: usize,
     /// Request timeout in seconds
     pub request_timeout_secs: u64,
+    /// Maximum time a single HTTP SSE frame may wait for downstream queue capacity.
+    #[serde(default = "default_sse_forward_stall_timeout_secs")]
+    pub sse_forward_stall_timeout_secs: u64,
     /// Worker startup timeout in seconds
     pub worker_startup_timeout_secs: u64,
     /// Worker health check interval in seconds
@@ -1306,6 +1316,7 @@ impl Default for RouterConfig {
             port: 3001,
             max_payload_size: 536_870_912, // 512MB
             request_timeout_secs: 1800,    // 30 minutes
+            sse_forward_stall_timeout_secs: DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS,
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 30,
             intra_node_data_parallel_size: 1,
@@ -2089,6 +2100,7 @@ mod tests {
             port: 3000,
             max_payload_size: 1048576,
             request_timeout_secs: 120,
+            sse_forward_stall_timeout_secs: DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS,
             worker_startup_timeout_secs: 60,
             worker_startup_check_interval_secs: 5,
             intra_node_data_parallel_size: 1,
@@ -2159,6 +2171,7 @@ mod tests {
             port: 3001,
             max_payload_size: 536870912,
             request_timeout_secs: 300,
+            sse_forward_stall_timeout_secs: DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS,
             worker_startup_timeout_secs: 180,
             worker_startup_check_interval_secs: 15,
             intra_node_data_parallel_size: 1,
@@ -2220,6 +2233,7 @@ mod tests {
             port: 8888,
             max_payload_size: 1024 * 1024 * 512, // 512MB
             request_timeout_secs: 900,
+            sse_forward_stall_timeout_secs: DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS,
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 20,
             intra_node_data_parallel_size: 1,

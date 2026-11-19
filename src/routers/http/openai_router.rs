@@ -1,6 +1,6 @@
 //! OpenAI router implementation (reqwest-based)
 
-use crate::config::CircuitBreakerConfig;
+use crate::config::{CircuitBreakerConfig, DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS};
 use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::protocols::spec::{
@@ -18,17 +18,17 @@ use futures_util::StreamExt;
 use std::{
     any::Any,
     sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
 
-const CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-// A per-hand-off wait budget; the upstream client's whole-request cap remains separate.
-const STREAM_FORWARD_STALL_TIMEOUT: std::time::Duration = CLIENT_TIMEOUT;
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Router for OpenAI backend
 #[derive(Debug)]
 pub struct OpenAIRouter {
     /// HTTP client for upstream OpenAI-compatible API
     client: reqwest::Client,
+    sse_forward_stall_timeout: Duration,
     /// Base URL for identification (no trailing slash)
     base_url: String,
     /// Circuit breaker
@@ -42,6 +42,19 @@ impl OpenAIRouter {
     pub async fn new(
         base_url: String,
         circuit_breaker_config: Option<CircuitBreakerConfig>,
+    ) -> Result<Self, String> {
+        Self::with_stall_timeout(
+            base_url,
+            circuit_breaker_config,
+            Duration::from_secs(DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS),
+        )
+        .await
+    }
+
+    pub(crate) async fn with_stall_timeout(
+        base_url: String,
+        circuit_breaker_config: Option<CircuitBreakerConfig>,
+        stall_timeout: Duration,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(CLIENT_TIMEOUT)
@@ -64,6 +77,7 @@ impl OpenAIRouter {
 
         Ok(Self {
             client,
+            sse_forward_stall_timeout: stall_timeout,
             base_url,
             circuit_breaker,
             healthy: AtomicBool::new(true),
@@ -342,7 +356,7 @@ impl super::super::RouterTrait for OpenAIRouter {
             let stream = resp.bytes_stream();
             // Bound each wait for downstream capacity, independently of stream age.
             let (forward, body_stream) = super::router::sse_forward_channel(
-                STREAM_FORWARD_STALL_TIMEOUT,
+                self.sse_forward_stall_timeout,
                 &self.base_url,
                 "/v1/chat/completions",
             );

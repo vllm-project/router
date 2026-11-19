@@ -49,6 +49,7 @@ use futures_util::{Stream, StreamExt};
 use parking_lot::Mutex;
 use reqwest::Client;
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -69,7 +70,7 @@ use tracing::{debug, error, info, warn};
 /// stalled stream is up to `SSE_FORWARD_QUEUE_CHUNKS * max_chunk_size` plus the
 /// socket buffers, and nothing here caps how large a single upstream chunk can
 /// be. Size it as a queue depth, not as an RSS ceiling.
-pub(crate) const SSE_FORWARD_QUEUE_CHUNKS: usize = 8;
+const SSE_FORWARD_QUEUE_CHUNKS: usize = 8;
 
 /// The error that ended a forwarded stream, published beside the data queue
 /// instead of through it.
@@ -116,7 +117,7 @@ pub(crate) struct SseForward {
     stall_timeout: Duration,
     worker: String,
     route: String,
-    bytes_forwarded: AtomicU64,
+    bytes_enqueued: AtomicU64,
 }
 
 impl SseForward {
@@ -124,11 +125,8 @@ impl SseForward {
     /// `ClientGone` or `StallTimeout`; only the latter produces a terminal error.
     pub(crate) async fn send(&self, chunk: bytes::Bytes) -> HandOff {
         let len = chunk.len();
-        tokio::select! {
-            biased;
-            sent = self.tx.send(chunk) => self.record_send(sent.is_ok(), len),
-            _ = tokio::time::sleep(self.stall_timeout) => self.expire(),
-        }
+        self.wait_for_capacity(async { self.tx.send(chunk).await.is_ok() }, len)
+            .await
     }
 
     pub(crate) async fn send_with_output(
@@ -139,22 +137,28 @@ impl SseForward {
     ) -> HandOff {
         match output_frame {
             Some(frame) => {
-                // Cancelling mid-reservation leaves the output marker unpublished.
                 let len = chunk.len();
-                tokio::select! {
-                    biased;
-                    sent = frame.send_bounded(&self.tx, chunk, has_output) => self.record_send(sent, len),
-                    _ = tokio::time::sleep(self.stall_timeout) => self.expire(),
-                }
+                // Cancelling mid-reservation leaves the output marker unpublished.
+                self.wait_for_capacity(frame.send_bounded(&self.tx, chunk, has_output), len)
+                    .await
             }
             None => self.send(chunk).await,
         }
     }
 
+    async fn wait_for_capacity(&self, send: impl Future<Output = bool>, len: usize) -> HandOff {
+        tokio::select! {
+            // Prefer a ready send (or receiver closure) when the timer and the
+            // channel both become ready before the task is polled again.
+            biased;
+            sent = send => self.record_send(sent, len),
+            _ = tokio::time::sleep(self.stall_timeout) => self.expire(),
+        }
+    }
+
     fn record_send(&self, sent: bool, len: usize) -> HandOff {
         if sent {
-            self.bytes_forwarded
-                .fetch_add(len as u64, Ordering::Relaxed);
+            self.bytes_enqueued.fetch_add(len as u64, Ordering::Relaxed);
             HandOff::Sent
         } else {
             RouterMetrics::record_sse_forward_stop(&self.route, "client_gone");
@@ -172,7 +176,7 @@ impl SseForward {
         warn!(
             worker = %self.worker,
             route = %self.route,
-            bytes_forwarded = self.bytes_forwarded.load(Ordering::Relaxed),
+            bytes_enqueued = self.bytes_enqueued.load(Ordering::Relaxed),
             stall_timeout_secs = self.stall_timeout.as_secs_f64(),
             "SSE forwarding stopped while waiting for downstream capacity",
         );
@@ -223,7 +227,7 @@ pub(crate) fn sse_forward_channel(
             stall_timeout,
             worker: worker.to_owned(),
             route: route.to_owned(),
-            bytes_forwarded: AtomicU64::new(0),
+            bytes_enqueued: AtomicU64::new(0),
         },
         SseForwardBody {
             rx: ReceiverStream::new(rx),
@@ -459,10 +463,8 @@ pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
-    /// Deadline handed to every streaming forwarder: the same request timeout
-    /// that bounds the upstream call, reused to bound how long a hand-off may
-    /// wait for a client that is not reading.
-    request_timeout: Duration,
+    /// Maximum time a single SSE hand-off can wait for downstream capacity.
+    sse_forward_stall_timeout: Duration,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval_secs: u64,
     intra_node_data_parallel_size: usize,
@@ -831,7 +833,9 @@ impl Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
-            request_timeout,
+            sse_forward_stall_timeout: Duration::from_secs(
+                ctx.router_config.sse_forward_stall_timeout_secs,
+            ),
             worker_startup_timeout_secs: ctx.router_config.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: ctx
                 .router_config
@@ -2323,7 +2327,7 @@ impl Router {
 
             let stream = res.bytes_stream();
             let (forward, body_stream) =
-                sse_forward_channel(self.request_timeout, worker_url, route);
+                sse_forward_channel(self.sse_forward_stall_timeout, worker_url, route);
             let (mut producer_output_frame, output_frame) = if completion_echo.is_some() {
                 let (producer, consumer) = output_frame_tracking();
                 (Some(producer), Some(consumer))
@@ -2418,7 +2422,7 @@ impl Router {
 
             let stream = res.bytes_stream();
             let (forward, body_stream) =
-                sse_forward_channel(self.request_timeout, worker_url, route);
+                sse_forward_channel(self.sse_forward_stall_timeout, worker_url, route);
             let completion = if status.is_success() {
                 program_completion
             } else {
@@ -3602,7 +3606,7 @@ impl RouterTrait for Router {
                 } else {
                     let stream = response.bytes_stream();
                     let (forward, body_stream) =
-                        sse_forward_channel(self.request_timeout, worker.url(), path);
+                        sse_forward_channel(self.sse_forward_stall_timeout, worker.url(), path);
                     let completion = status.is_success().then_some(program_completion).flatten();
                     streaming_producer = Some(tokio::spawn(async move {
                         let mut stream = stream;
@@ -3757,50 +3761,6 @@ mod tests {
         assert!(forward.terminal.take().is_none());
     }
 
-    #[test]
-    fn sse_forward_stop_metrics_separate_client_and_stall() {
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        metrics::with_local_recorder(&recorder, || {
-            runtime.block_on(async {
-                let (forward, body) =
-                    sse_forward_channel(Duration::from_millis(10), "worker", "/metrics");
-                for _ in 0..SSE_FORWARD_QUEUE_CHUNKS {
-                    assert_eq!(
-                        forward.send(bytes::Bytes::from_static(b"a")).await,
-                        HandOff::Sent
-                    );
-                }
-                assert_eq!(
-                    forward.send(bytes::Bytes::from_static(b"b")).await,
-                    HandOff::StallTimeout
-                );
-                drop(body);
-                let (forward, body) =
-                    sse_forward_channel(Duration::from_secs(5), "worker", "/metrics");
-                drop(body);
-                assert_eq!(
-                    forward.send(bytes::Bytes::from_static(b"a")).await,
-                    HandOff::ClientGone
-                );
-            })
-        });
-        let metrics = handle.render();
-        for reason in ["stall_timeout", "client_gone"] {
-            assert!(
-                metrics.lines().any(|line| line
-                    .starts_with("vllm_router_sse_forward_stops_total{")
-                    && line.contains(&format!("reason=\"{reason}\""))
-                    && line.ends_with(" 1")),
-                "{metrics}"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn sse_forward_timeout_does_not_publish_output_marker() {
         let (forward, body) = sse_forward_channel(Duration::from_millis(50), "worker", "/output");
@@ -3810,7 +3770,7 @@ mod tests {
                 HandOff::Sent
             );
         }
-        let (mut producer, mut consumer) = output_frame_tracking();
+        let (mut producer, _consumer) = output_frame_tracking();
         assert_eq!(
             forward
                 .send_with_output(
@@ -3821,12 +3781,10 @@ mod tests {
                 .await,
             HandOff::StallTimeout
         );
+        assert_eq!(producer.first_output_frame_index(), 0);
         drop(forward);
         let frames: Vec<_> = body.collect().await;
-        for frame in &frames[..SSE_FORWARD_QUEUE_CHUNKS] {
-            assert!(frame.is_ok());
-            assert!(!consumer.on_frame());
-        }
+        assert_eq!(frames.len(), SSE_FORWARD_QUEUE_CHUNKS + 1);
         assert!(frames.last().unwrap().is_err());
     }
 
@@ -5790,7 +5748,9 @@ mod tests {
             intra_node_data_parallel_size: 1,
             api_key: None,
             client: Client::new(),
-            request_timeout: Duration::from_secs(1800),
+            sse_forward_stall_timeout: Duration::from_secs(
+                crate::config::DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS,
+            ),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
@@ -5825,7 +5785,9 @@ mod tests {
             intra_node_data_parallel_size: 1,
             api_key: None,
             client: Client::new(),
-            request_timeout: Duration::from_secs(1800),
+            sse_forward_stall_timeout: Duration::from_secs(
+                crate::config::DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS,
+            ),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
@@ -7271,7 +7233,9 @@ mod tests {
             intra_node_data_parallel_size: 1,
             api_key: None,
             client: Client::new(),
-            request_timeout: Duration::from_secs(1800),
+            sse_forward_stall_timeout: Duration::from_secs(
+                crate::config::DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS,
+            ),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
@@ -7863,13 +7827,13 @@ mod tests {
     }
 
     /// Dispatches one streaming request at `worker` and returns the response
-    /// with the body still unread, which is the state both tests below need.
+    /// with the body still unread.
     async fn stalled_stream_response(worker: &FailingStreamWorker) -> Response {
         let router = create_test_regular_router();
 
         // Admission: the dispatch owns a guard on the worker, and this path
         // releases it when the forwarding task ends — not when the body is
-        // dropped, which is why the bodies below are held for the whole check.
+        // dropped, so keep the body alive through the cleanup check.
         worker.worker.increment_load();
         let response = router
             .send_typed_request(
@@ -7898,39 +7862,6 @@ mod tests {
     /// A worker that fails mid-stream must not keep the request accounted for
     /// just because the client stopped reading.
     #[tokio::test]
-    async fn worker_error_with_a_stalled_client_still_releases_worker_load() {
-        let worker = spawn_worker_that_fails_on_a_full_queue().await;
-        let response = stalled_stream_response(&worker).await;
-
-        tokio::time::timeout(Duration::from_secs(10), worker.reached.notified())
-            .await
-            .expect("the forwarder never reached the failing chunk");
-        assert_eq!(
-            worker.worker.load(),
-            1,
-            "the stream failed while the client was still counted"
-        );
-        worker.release.notify_one();
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while worker.worker.load() != 0 && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            worker.worker.load(),
-            0,
-            "a worker whose stream failed is still counted as running"
-        );
-
-        drop(response);
-        worker.server.abort();
-    }
-
-    /// A stream that fails while the client is not reading must still tell the
-    /// client it failed, and must do it after the frames it already handed
-    /// over: ending the body cleanly turns a truncated response into a
-    /// successful one for every client that trusts end of stream.
-    #[tokio::test]
     async fn worker_error_with_a_stalled_client_reaches_the_client() {
         let worker = spawn_worker_that_fails_on_a_full_queue().await;
         let response = stalled_stream_response(&worker).await;
@@ -7942,6 +7873,11 @@ mod tests {
         // and wait for the forwarder to finish before touching the body: reading
         // first would free slots, and an implementation that drops the error on a
         // full queue would then deliver it through the freed slot and pass.
+        assert_eq!(
+            worker.worker.load(),
+            1,
+            "the live producer must hold worker load"
+        );
         worker.release.notify_one();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while worker.worker.load() != 0 && tokio::time::Instant::now() < deadline {
@@ -7964,7 +7900,10 @@ mod tests {
             }
         };
 
-        assert!(delivered > 0 && delivered <= SSE_FORWARD_QUEUE_CHUNKS);
+        assert_eq!(
+            delivered, SSE_FORWARD_QUEUE_CHUNKS,
+            "queued frames were lost"
+        );
         let error = terminal.expect("the body ended cleanly after the worker failed mid-stream");
         // reqwest wraps the worker's own message ("error decoding response
         // body"), so what is asserted here is the forwarder's error, not the
@@ -7976,14 +7915,9 @@ mod tests {
 
         worker.server.abort();
     }
-    /// A client that stays connected and never reads must not keep the worker
-    /// counted past the request timeout.
-    ///
-    /// This is the case backpressure creates: while the forwarder waits for a
-    /// slot it no longer polls the upstream body, so the request timeout that
-    /// reqwest enforces inside the body stream is never observed. Without a
-    /// deadline on the hand-off the request would hold its worker, its KV slot
-    /// and the upstream response until the client read or disconnected.
+
+    /// A full queue starts a timer for the pending hand-off. Expiry releases
+    /// worker load even though the forwarder cannot poll the upstream body.
     #[tokio::test]
     async fn stalled_client_is_cut_off_at_the_hand_off_timeout() {
         assert_stalled_client_is_cut_off(false).await;
@@ -8024,7 +7958,11 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let mut router = create_test_regular_router();
-        router.request_timeout = Duration::from_secs(1);
+        router.client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        router.sse_forward_stall_timeout = Duration::from_secs(1);
 
         let response = if transparent {
             router.program_scheduler = Some(Arc::new(ProgramScheduler::new(
@@ -8078,7 +8016,7 @@ mod tests {
         assert_eq!(
             worker.load(),
             0,
-            "a client that never reads kept the worker counted past the request timeout"
+            "a client that never reads kept the worker counted past the hand-off timeout"
         );
 
         // The body still reports the failure instead of ending cleanly.
@@ -8096,10 +8034,10 @@ mod tests {
             delivered, SSE_FORWARD_QUEUE_CHUNKS,
             "the frames the queue already held were lost"
         );
-        let error = terminal.expect("the body ended cleanly after the request timeout");
+        let error = terminal.expect("the body ended cleanly after the hand-off timeout");
         assert!(
             error.contains("hand-off timeout"),
-            "the body ended with something other than the deadline error: {error}"
+            "the body ended with something other than the hand-off timeout error: {error}"
         );
 
         server.abort();

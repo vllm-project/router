@@ -30,6 +30,8 @@ fn config(urls: Vec<String>, policy: PolicyConfig) -> RouterConfig {
         worker_startup_timeout_secs: 5,
         worker_startup_check_interval_secs: 30,
         request_timeout_secs: 30,
+        sse_forward_stall_timeout_secs:
+            vllm_router_rs::config::DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS,
         disable_retries: true,
         disable_circuit_breaker: true,
         ..RouterConfig::default()

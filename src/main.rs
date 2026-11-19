@@ -6,6 +6,7 @@ use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
     ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -326,6 +327,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 1800)]
     request_timeout_secs: u64,
 
+    /// Maximum time in seconds for an SSE frame to wait for downstream queue capacity
+    #[arg(long, default_value_t = DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS)]
+    sse_forward_stall_timeout_secs: u64,
+
     /// Idle timeout in seconds for pooled backend HTTP connections. Should be
     /// lower than the backend's keep-alive timeout (vLLM defaults to 5s); 0
     /// disables connection reuse entirely
@@ -638,6 +643,7 @@ impl CliArgs {
             port: self.port,
             max_payload_size: self.max_payload_size,
             request_timeout_secs: self.request_timeout_secs,
+            sse_forward_stall_timeout_secs: self.sse_forward_stall_timeout_secs,
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: self.worker_startup_check_interval,
             intra_node_data_parallel_size: self.intra_node_data_parallel_size,
@@ -853,6 +859,33 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_stall_timeout_can_be_tuned_independently() {
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--worker-urls",
+            "http://127.0.0.1:8000",
+            "--request-timeout-secs",
+            "900",
+            "--sse-forward-stall-timeout-secs",
+            "75",
+        ])
+        .unwrap();
+        let config = args.to_router_config(Vec::new()).unwrap();
+        assert_eq!(config.request_timeout_secs, 900);
+        assert_eq!(config.sse_forward_stall_timeout_secs, 75);
+        assert!(config.validate().is_ok());
+        let zero_budget = RouterConfig {
+            sse_forward_stall_timeout_secs: 0,
+            ..config
+        };
+        assert!(matches!(
+            zero_budget.validate(),
+            Err(ConfigError::InvalidValue { field, .. })
+                if field == "sse_forward_stall_timeout_secs"
+        ));
+    }
 
     #[test]
     fn parses_pd_kv_aware_with_affinity_ttl() {

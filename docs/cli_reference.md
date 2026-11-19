@@ -54,6 +54,7 @@ width. `f32` and `f64` are floating-point values. Python's `integer` and
 | `--version` | `flag` | `n/a` | — | — | Print the Rust binary version and exit; `-V` is also accepted. |
 | `--max-payload-size` | `usize` | `536870912` | `integer` | `536870912` | Maximum request body size in bytes; the default is 512 MiB. |
 | `--request-timeout-secs` | `u64` | `1800` | `integer` | `1800` | Request timeout in seconds. |
+| `--sse-forward-stall-timeout-secs` | `u64` | `DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS` | `integer` | `120` | Maximum wait for downstream queue capacity on each bounded HTTP SSE hand-off. Defaults to 120 seconds. Must be greater than 0. Independent of the upstream request timeout. |
 | `--pool-idle-timeout-secs` | `u64` | `2` | — | — | Idle lifetime for pooled backend HTTP connections in seconds; 0 disables reuse. |
 | `--max-concurrent-requests` | `usize` | `32768` | `integer` | `32768` | Token bucket capacity for request admission; does not enforce a hard limit on in-flight requests. |
 | `--queue-size` | — | — | `integer` | `100` | Pending request queue capacity; `0` disables queuing and returns 429 when full. |

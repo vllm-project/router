@@ -802,6 +802,8 @@ mod test_pd_routing {
                 port: 3001,
                 max_payload_size: 1024 * 1024,
                 request_timeout_secs: 60,
+                sse_forward_stall_timeout_secs:
+                    vllm_router_rs::config::DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS,
                 worker_startup_timeout_secs: 10,
                 worker_startup_check_interval_secs: 1,
                 intra_node_data_parallel_size: 1,
