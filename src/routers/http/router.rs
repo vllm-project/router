@@ -1558,7 +1558,10 @@ impl Router {
             (Some(crate::backend::WorkerPoolKind::Http), Some(GrpcRequestRef::Chat(_))) => true,
             _ => false,
         };
-        let history = if self.kv_aware_completion_history && history_eligible {
+        let history = if self.kv_aware_completion_history
+            && history_eligible
+            && typed_req.cache_identity() == (None, None)
+        {
             typed_req
                 .get_model()
                 .filter(|m| !m.is_empty() && model_id.is_none_or(|id| id == *m))
@@ -5308,37 +5311,63 @@ mod tests {
                 assert!(f.workers.iter().all(|w| w.load() == 0), "{path}");
             }
         }
-        // The shared HTTP input preparation, not a Chat-specific field list,
-        // keeps unmodelled adapter identity out of history while forwarding it.
-        for w in &f.workers {
-            register_history_target(kv, w, kv.target_for_worker(w.as_ref()), "model", 16);
-        }
+        // Exercise identity gating on the real Chat caller, before capture.
         f.workers[0].set_healthy(false);
-        let raw = json!({
-            "model":"model", "messages":[{"role":"user","content":"hello"}],
-            "prompt_adapter_request":{"id":7}
-        });
-        let response = app
-            .oneshot(
-                Request::post("/v1/chat/completions")
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(raw.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(selected_http_worker(response).await, 1);
-        // Chat retains typed forwarding, including serialized defaults; the
-        // unmodelled extension must still reach the backend.
-        let expected =
-            serde_json::to_value(serde_json::from_value::<ChatCompletionRequest>(raw).unwrap())
+        for (field, value, expected_tokens) in [
+            ("prompt_adapter_request", json!({"id":7}), 0),
+            ("lora_name", json!("adapter"), 0),
+            ("cache_salt", json!("tenant"), 33),
+        ] {
+            for w in &f.workers {
+                register_history_target(kv, w, kv.target_for_worker(w.as_ref()), "model", 16);
+            }
+            let mut raw = json!({
+                "model":"model", "messages":[{"role":"user","content":"hello"}]
+            });
+            raw[field] = value;
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/v1/chat/completions")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(raw.to_string()))
+                        .unwrap(),
+                )
+                .await
                 .unwrap();
-        assert_eq!(f.calls.lock().last().unwrap().2, expected);
-        assert_eq!(
-            kv.observed_completion_prefix(f.workers[1].as_ref(), &ids),
-            0
-        );
-        assert!(f.workers.iter().all(|w| w.load() == 0));
+            assert_eq!(selected_http_worker(response).await, 1, "{field}");
+            // Typed forwarding includes defaults and retains the exact identity.
+            let expected =
+                serde_json::to_value(serde_json::from_value::<ChatCompletionRequest>(raw).unwrap())
+                    .unwrap();
+            assert_eq!(f.calls.lock().last().unwrap().2, expected, "{field}");
+            assert_eq!(
+                kv.observed_completion_prefix(f.workers[1].as_ref(), &ids),
+                0,
+                "{field}"
+            );
+            assert_eq!(
+                f.loads.lock().last().copied(),
+                Some((
+                    1,
+                    crate::policies::LoadSample {
+                        active_prefill_tokens: expected_tokens,
+                        active_requests: 1,
+                    }
+                )),
+                "{field}"
+            );
+            for w in &f.workers {
+                assert_eq!(w.load(), 0, "{field}");
+                assert_eq!(
+                    kv.slot_manager()
+                        .unwrap()
+                        .sample(&kv.target_for_worker(w.as_ref())),
+                    crate::policies::LoadSample::default(),
+                    "{field}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
