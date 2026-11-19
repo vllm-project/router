@@ -168,7 +168,11 @@ vllm-router --api-key-validation-urls https://codebase.helmholtz.cloud/api/v4/us
 
 ### Metrics
 
-Prometheus metrics endpoint available at `127.0.0.1:29000` by default.
+Prometheus metrics endpoint available at `127.0.0.1:29000` by default. The
+router's HTTP port serves the same registry at `/metrics`.
+
+> [!NOTE]
+> Anyone who can call the router's API can read it, so a loopback `--prometheus-host` no longer keeps metrics local.
 
 ```bash
 # Custom metrics configuration

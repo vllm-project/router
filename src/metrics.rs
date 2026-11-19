@@ -1,5 +1,5 @@
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -427,6 +427,24 @@ pub fn init_metrics() {
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
+    prometheus_builder(config)
+        .install()
+        .expect("failed to install Prometheus metrics exporter");
+}
+
+/// Like [`start_prometheus`], but must run inside a Tokio runtime, and also
+/// returns a handle on the same registry.
+pub(crate) fn start_prometheus_with_handle(config: PrometheusConfig) -> PrometheusHandle {
+    let (recorder, exporter) = prometheus_builder(config)
+        .build()
+        .expect("failed to build Prometheus metrics exporter");
+    let handle = recorder.handle();
+    tokio::spawn(exporter);
+    metrics::set_global_recorder(recorder).expect("failed to install Prometheus metrics recorder");
+    handle
+}
+
+fn prometheus_builder(config: PrometheusConfig) -> PrometheusBuilder {
     // Initialize metric descriptions
     init_metrics();
 
@@ -449,8 +467,6 @@ pub fn start_prometheus(config: PrometheusConfig) {
     builder
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
-        .install()
-        .expect("failed to install Prometheus metrics exporter");
 }
 
 fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuilder {
