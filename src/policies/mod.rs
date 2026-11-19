@@ -4,6 +4,7 @@
 //! across both regular and prefill-decode (PD) routing modes.
 
 use crate::core::{Worker, WorkerLoadGuard};
+use rand::Rng;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -252,6 +253,19 @@ impl Default for CacheAwareConfig {
             eviction_interval_secs: 30,
             max_tree_size: 1 << 25,
         }
+    }
+}
+
+/// Picks uniformly among tied candidates.
+///
+/// Equal scores carry no ranking evidence. Keeping the first candidate would
+/// encode slice order as a preference: with an idle pool every cold request of
+/// the same length has one cost, and all of them would land on the same worker.
+pub(crate) fn pick_tied(candidates: &[usize]) -> Option<usize> {
+    match candidates {
+        [] => None,
+        [only] => Some(*only),
+        _ => Some(candidates[rand::rng().random_range(0..candidates.len())]),
     }
 }
 

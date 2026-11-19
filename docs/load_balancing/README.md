@@ -234,6 +234,10 @@ Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyon
    - Route to worker with lowest load (shortest queue)
    - Still updates the tree to maintain cache state
 
+When several eligible workers share the lowest load, `cache_aware` picks
+uniformly at random among them instead of always taking the first worker in
+pool order.
+
 ### Best For
 
 - Workloads with repeated prompt prefixes (system prompts, few-shot examples)

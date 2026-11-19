@@ -63,7 +63,7 @@
 */
 
 use super::{
-    get_healthy_worker_indices, CacheAwareConfig, KvRequestTokens, LoadBalancingPolicy,
+    get_healthy_worker_indices, pick_tied, CacheAwareConfig, KvRequestTokens, LoadBalancingPolicy,
     RequestHeaders, SelectionContext, WorkerTokenInputs,
 };
 use crate::core::{Worker, WorkerLoadGuard};
@@ -363,10 +363,12 @@ impl CacheAwarePolicy {
             .map(|(_, rate)| *rate)
             .fold(0.0_f64, f64::max);
         let use_prefix = !imbalanced && best_rate > self.config.cache_threshold as f64;
-        let position = (0..healthy.len())
+        let eligible: Vec<usize> = (0..healthy.len())
             .filter(|&i| !use_prefix || matches[i].1 == best_rate)
-            .min_by_key(|&i| workers[healthy[i]].load())?;
-        let index = healthy[position];
+            .map(|i| healthy[i])
+            .collect();
+        let index = Self::least_loaded(workers, &eligible)?;
+        let position = healthy.iter().position(|&idx| idx == index)?;
         for key in &matches[position].0 {
             prepared.tree.insert(key, workers[index].url());
         }
@@ -445,11 +447,23 @@ impl CacheAwarePolicy {
             && (max as f32) > (min as f32 * self.config.balance_rel_threshold)
     }
 
+    /// Returns a worker index from `healthy`. Reads each load once and picks
+    /// uniformly among the lowest. `healthy` is a slice of worker indices, or
+    /// of positions into another index list after the caller has mapped them.
     fn least_loaded(workers: &[Arc<dyn Worker>], healthy: &[usize]) -> Option<usize> {
-        healthy
-            .iter()
-            .min_by_key(|&&idx| workers[idx].load())
-            .copied()
+        let mut min_load = usize::MAX;
+        let mut tied = Vec::new();
+        for &idx in healthy {
+            let load = workers[idx].load();
+            if load < min_load {
+                min_load = load;
+                tied.clear();
+                tied.push(idx);
+            } else if load == min_load {
+                tied.push(idx);
+            }
+        }
+        pick_tied(&tied)
     }
 
     /// Choose using an approximate affinity observation, but current eligibility
@@ -476,7 +490,7 @@ impl CacheAwarePolicy {
             {
                 return Some((idx, false));
             }
-            return healthy.first().copied().map(|idx| (idx, true));
+            return Self::least_loaded(workers, healthy).map(|idx| (idx, true));
         }
         Self::least_loaded(workers, healthy).map(|idx| (idx, false))
     }
@@ -1492,5 +1506,51 @@ mod tests {
                 .target_id,
             "rank-0"
         );
+    }
+
+    /// Selects 64 times and records which workers were chosen.
+    /// A two-way tie misses a given candidate with probability 2^-64; the two
+    /// events are disjoint, so this check fails with probability 2^-63.
+    fn collect_equal_load_choices(n: usize) -> [usize; 2] {
+        let (policy, workers) = cache_fixture(
+            2,
+            CacheAwareConfig {
+                eviction_interval_secs: 0,
+                ..Default::default()
+            },
+        );
+        let mut seen = [0usize; 2];
+        for _ in 0..n {
+            let idx = policy
+                .select_prepared(&workers, None, "regular")
+                .expect("idle pool has healthy workers");
+            seen[idx] += 1;
+        }
+        seen
+    }
+
+    #[test]
+    fn equal_load_prefix_miss_does_not_always_pick_the_first_worker() {
+        let seen = collect_equal_load_choices(64);
+        assert!(
+            seen[0] > 0 && seen[1] > 0,
+            "equal-load cache_aware choices must use both workers: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn unique_lowest_load_still_wins() {
+        let (policy, workers) = cache_fixture(
+            3,
+            CacheAwareConfig {
+                eviction_interval_secs: 0,
+                ..Default::default()
+            },
+        );
+        workers[0].increment_load();
+        workers[2].increment_load();
+        for _ in 0..16 {
+            assert_eq!(policy.select_prepared(&workers, None, "regular"), Some(1));
+        }
     }
 }
