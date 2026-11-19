@@ -7,7 +7,7 @@ use kube::{
     runtime::watcher::{watcher, Config, Event},
     Client,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
 use rustls;
@@ -127,10 +127,10 @@ impl PodInfo {
 
     /// Check if a pod event should be allowed through the watcher stream firewall.
     /// Returns true if the pod matches the selector or is currently in the tracked set.
-    fn should_allow_event(
+    fn should_allow_event<T>(
         pod: &Pod,
         config: &ServiceDiscoveryConfig,
-        tracked_pods: &HashMap<String, TrackedPod>,
+        tracked_pods: &HashMap<String, T>,
     ) -> bool {
         let pod_key = Self::pod_key_from_meta(
             pod.metadata.namespace.as_deref(),
@@ -293,6 +293,7 @@ pub async fn start_service_discovery(
 
         debug!("K8s service discovery initialized");
 
+        let mut membership = PodMembership::default();
         let mut retry_delay = Duration::from_secs(1);
         const MAX_RETRY_DELAY: Duration = Duration::from_secs(300); // 5 minutes max
 
@@ -301,12 +302,18 @@ pub async fn start_service_discovery(
             futures::pin_mut!(stream);
             // This buffer belongs to a single watch attempt. An error or EOF discards
             // an incomplete list without changing the live registry.
-            let mut snapshot = HashMap::new();
+            membership.snapshot = PodClaims::default();
             let result = loop {
                 match stream.try_next().await {
                     Ok(Some(event)) => {
-                        process_watch_event(event, &mut snapshot, &config, &tracked_pods, &router)
-                            .await;
+                        process_watch_event(
+                            event,
+                            &mut membership,
+                            &config,
+                            &tracked_pods,
+                            &router,
+                        )
+                        .await;
                     }
                     other => break other,
                 }
@@ -343,78 +350,164 @@ pub async fn start_service_discovery(
 
 type PodTracker = Arc<Mutex<HashMap<String, TrackedPod>>>;
 
+// The registry identifies workers by URL, while Kubernetes identifies Pods by
+// namespace/name and UID. Keep eligible aliases even if they cannot currently
+// own the URL. A discovery instance uses one fixed port, so IP identifies a URL.
+#[derive(Default)]
+struct PodClaims {
+    pods: HashMap<String, PodInfo>,
+    by_ip: HashMap<IpAddr, BTreeSet<String>>,
+}
+
+impl PodClaims {
+    fn insert(&mut self, pod: PodInfo) -> Option<IpAddr> {
+        let key = pod.pod_key();
+        let old_ip = self.remove(&key, None);
+        self.by_ip.entry(pod.ip).or_default().insert(key.clone());
+        self.pods.insert(key, pod);
+        old_ip
+    }
+
+    fn remove(&mut self, key: &str, uid: Option<&str>) -> Option<IpAddr> {
+        let pod = self.pods.get(key)?;
+        if uid.zip(pod.uid.as_deref()).is_some_and(|(a, b)| a != b) {
+            return None;
+        }
+        let ip = self.pods.remove(key)?.ip;
+        if let Some(keys) = self.by_ip.get_mut(&ip) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.by_ip.remove(&ip);
+            }
+        }
+        Some(ip)
+    }
+
+    fn owner(&self, ip: IpAddr, incumbent: Option<&String>) -> Option<&String> {
+        let keys = self.by_ip.get(&ip)?;
+        // Keep the incumbent while eligible. With no incumbent, use a stable
+        // tie breaker; neither LIST ordering nor watch arrival proves Pod age.
+        incumbent
+            .and_then(|key| keys.get(key))
+            .or_else(|| keys.first())
+    }
+}
+
+#[derive(Default)]
+struct PodMembership {
+    claims: PodClaims,
+    // Elected, not necessarily installed: failed adds are absent from PodTracker
+    // and the next reconciliation of this endpoint retries registration.
+    owners: HashMap<IpAddr, String>,
+    snapshot: PodClaims,
+}
+
+impl PodMembership {
+    async fn reconcile(
+        &mut self,
+        changed: impl IntoIterator<Item = IpAddr>,
+        config: &ServiceDiscoveryConfig,
+        tracked: &PodTracker,
+        router: &Arc<dyn RouterTrait>,
+    ) {
+        let mut desired = Vec::new();
+        // Finish all retirements first, including when two Pods swap URLs.
+        for ip in changed {
+            let owner = self.claims.owner(ip, self.owners.get(&ip)).cloned();
+            if self.owners.get(&ip) != owner.as_ref() {
+                if let Some(previous) = self.owners.remove(&ip) {
+                    remove_registration(
+                        &previous,
+                        None,
+                        tracked,
+                        router,
+                        config.pd_mode,
+                        "ownership change",
+                    )
+                    .await;
+                }
+            }
+            if let Some(key) = owner {
+                desired.push((ip, key));
+            }
+        }
+        for (ip, key) in desired {
+            let pod = &self.claims.pods[&key];
+            handle_pod_event(
+                pod,
+                tracked.clone(),
+                router.clone(),
+                config.port,
+                config.pd_mode,
+                true,
+            )
+            .await;
+            self.owners.insert(ip, key);
+        }
+    }
+}
+
 async fn process_watch_event(
     event: Event<Pod>,
-    snapshot: &mut HashMap<String, PodInfo>,
+    membership: &mut PodMembership,
     config: &ServiceDiscoveryConfig,
     tracked: &PodTracker,
     router: &Arc<dyn RouterTrait>,
 ) {
+    let removed = |pod: &Pod, members: &mut PodClaims| {
+        let key = PodInfo::pod_key_from_meta(
+            pod.metadata.namespace.as_deref(),
+            pod.metadata.name.as_deref(),
+        );
+        members.remove(&key, pod.metadata.uid.as_deref())
+    };
     match event {
-        Event::Init => snapshot.clear(),
+        Event::Init => membership.snapshot = PodClaims::default(),
         Event::InitApply(pod) => {
             if pod.metadata.deletion_timestamp.is_none() && PodInfo::should_include(&pod, config) {
                 if let Some(info) =
                     PodInfo::from_pod(&pod, Some(config)).filter(PodInfo::is_healthy)
                 {
-                    snapshot.insert(info.pod_key(), info);
+                    membership.snapshot.insert(info);
                 }
             }
         }
         Event::InitDone => {
-            // Evict before adding: another pod may now own the same worker URL.
-            // Diff the discovery tracker, never the whole (possibly manual) registry.
-            let stale = {
-                let Ok(mut tracked) = tracked.lock() else {
-                    return;
-                };
-                tracked
-                    .extract_if(|key, old| {
-                        !snapshot
-                            .get(key)
-                            .is_some_and(|pod| old.matches(pod, &pod.worker_url(config.port)))
-                    })
-                    .map(|(_, old)| old)
-                    .collect::<Vec<_>>()
-            };
-            for old in stale {
-                remove_worker_from_router(&old.worker_url, old.pod_type, router, config.pd_mode)
-                    .await;
-            }
-            for (_, pod) in snapshot.drain() {
-                handle_pod_event(
-                    &pod,
-                    tracked.clone(),
-                    router.clone(),
-                    config.port,
-                    config.pd_mode,
-                    true,
-                )
-                .await;
-            }
+            membership.claims = std::mem::take(&mut membership.snapshot);
+            let ips = membership
+                .claims
+                .by_ip
+                .keys()
+                .chain(membership.owners.keys())
+                .copied()
+                .collect::<HashSet<_>>();
+            membership.reconcile(ips, config, tracked, router).await;
         }
         Event::Apply(pod) => {
-            if !tracked
-                .lock()
-                .is_ok_and(|tracked| PodInfo::should_allow_event(&pod, config, &tracked))
-            {
+            if !PodInfo::should_allow_event(&pod, config, &membership.claims.pods) {
                 return;
             }
             if pod.metadata.deletion_timestamp.is_some() {
-                delete_pod_by_metadata(&pod, tracked, router, config.pd_mode).await;
+                if let Some(ip) = removed(&pod, &mut membership.claims) {
+                    membership.reconcile([ip], config, tracked, router).await;
+                }
             } else if let Some(info) = PodInfo::from_pod(&pod, Some(config)) {
-                handle_pod_event(
-                    &info,
-                    tracked.clone(),
-                    router.clone(),
-                    config.port,
-                    config.pd_mode,
-                    PodInfo::should_include(&pod, config),
-                )
-                .await;
+                if info.is_healthy() && PodInfo::should_include(&pod, config) {
+                    let ip = info.ip;
+                    let old = membership.claims.insert(info).filter(|old| *old != ip);
+                    membership
+                        .reconcile(old.into_iter().chain([ip]), config, tracked, router)
+                        .await;
+                } else if let Some(ip) = removed(&pod, &mut membership.claims) {
+                    membership.reconcile([ip], config, tracked, router).await;
+                }
             }
         }
-        Event::Delete(pod) => delete_pod_by_metadata(&pod, tracked, router, config.pd_mode).await,
+        Event::Delete(pod) => {
+            if let Some(ip) = removed(&pod, &mut membership.claims) {
+                membership.reconcile([ip], config, tracked, router).await;
+            }
+        }
     }
 }
 
@@ -424,27 +517,6 @@ impl TrackedPod {
             && self.pod_type == info.pod_type
             && (info.uid.is_none() || self.uid == info.uid)
     }
-}
-
-async fn delete_pod_by_metadata(
-    pod: &Pod,
-    tracked: &PodTracker,
-    router: &Arc<dyn RouterTrait>,
-    pd_mode: bool,
-) {
-    let key = PodInfo::pod_key_from_meta(
-        pod.metadata.namespace.as_deref(),
-        pod.metadata.name.as_deref(),
-    );
-    remove_registration(
-        &key,
-        pod.metadata.uid.as_deref(),
-        tracked,
-        router,
-        pd_mode,
-        "deletion",
-    )
-    .await;
 }
 
 async fn handle_pod_event(
@@ -738,10 +810,9 @@ mod tests {
     }
 
     // Helper to create a Router instance for testing event handlers
-    async fn create_test_router() -> Arc<dyn RouterTrait> {
+    fn test_context() -> Arc<crate::server::AppContext> {
         use crate::config::RouterConfig;
         use crate::middleware::TokenBucket;
-        use crate::routers::http::router::Router;
         use crate::server::AppContext;
 
         // Create a minimal RouterConfig for testing with very short timeout
@@ -751,7 +822,7 @@ mod tests {
         }; // Very short timeout for tests
 
         // Create AppContext with minimal components
-        let app_context = Arc::new(AppContext {
+        Arc::new(AppContext {
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
             rate_limiter: Arc::new(TokenBucket::new(1000, 1000)),
@@ -766,9 +837,12 @@ mod tests {
             response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
             api_key_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             api_key_validation_urls: Arc::new(Vec::new()),
-        });
+        })
+    }
 
-        let router = Router::new(vec![], &app_context).await.unwrap();
+    async fn create_test_router() -> Arc<dyn RouterTrait> {
+        use crate::routers::http::router::Router;
+        let router = Router::new(vec![], &test_context()).await.unwrap();
         Arc::new(router) as Arc<dyn RouterTrait>
     }
 
@@ -806,7 +880,7 @@ mod tests {
 
         let router = create_test_router().await;
         let tracked = PodTracker::default();
-        let mut snapshot = HashMap::new();
+        let mut snapshot = PodMembership::default();
         let mut old = create_k8s_pod(
             Some("old"),
             Some("127.0.0.1"),
@@ -875,6 +949,84 @@ mod tests {
             process_watch_event(event, &mut snapshot, &config, &tracked, &router).await;
         }
         assert_eq!(router.get_worker_urls(), [manual]);
+    }
+
+    // These three actual router implementations have different duplicate-add
+    // behavior. The discovery layer must never register both owners at once.
+    #[tokio::test]
+    async fn overlapping_url_survives_delete_and_relist() {
+        use crate::routers::{http::vllm_pd_router::VllmPDRouter, router_manager::RouterManager};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(|| async { axum::Json(serde_json::json!({})) });
+            axum::serve(listener, app).await.unwrap();
+        });
+        for mode in ["http", "igw", "pd"] {
+            let ctx = test_context();
+            let router: Arc<dyn RouterTrait> = match mode {
+                "http" => create_test_router().await,
+                "igw" => Arc::new(RouterManager::new(
+                    ctx.router_config.clone(),
+                    ctx.client.clone(),
+                    ctx.worker_registry.clone(),
+                    ctx.policy_registry.clone(),
+                )),
+                _ => Arc::new(VllmPDRouter::new(vec![], vec![], None, &ctx).await.unwrap()),
+            };
+            let config = ServiceDiscoveryConfig {
+                port,
+                pd_mode: mode == "pd",
+                selector: HashMap::from([("app".into(), "vllm".into())]),
+                ..create_pd_config()
+            };
+            let old = create_pd_k8s_pod("old", "127.0.0.1", "prefill", Some(9001));
+            let mut new = create_pd_k8s_pod("new", "127.0.0.1", "decode", None);
+            new.metadata.uid = Some("new-uid".into());
+            let url = format!("http://127.0.0.1:{port}");
+            for relist in [false, true] {
+                let mut state = PodMembership::default();
+                let tracked = PodTracker::default();
+                let mut events = vec![Event::Apply(old.clone()), Event::Apply(new.clone())];
+                // A relist containing both also must not create duplicate owners,
+                // even if its iteration order differs from the original watch.
+                events.extend([
+                    Event::Init,
+                    Event::InitApply(new.clone()),
+                    Event::InitApply(old.clone()),
+                    Event::InitDone,
+                ]);
+                if relist {
+                    events.extend([Event::Init, Event::InitApply(new.clone()), Event::InitDone]);
+                } else {
+                    events.push(Event::Delete(old.clone()));
+                }
+                events.push(Event::Delete(old.clone())); // delayed duplicate Delete
+                for event in events {
+                    process_watch_event(event, &mut state, &config, &tracked, &router).await;
+                    assert_eq!(router.get_worker_urls().len(), 1, "{mode}, relist={relist}");
+                }
+                assert_eq!(tracked.lock().unwrap()["/new"].uid, new.metadata.uid);
+                if mode == "pd" {
+                    assert!(ctx.worker_registry.get_prefill_workers().is_empty());
+                    assert_eq!(ctx.worker_registry.get_decode_workers().len(), 1);
+                } else {
+                    assert_eq!(
+                        router.get_worker_urls().as_slice(),
+                        std::slice::from_ref(&url)
+                    );
+                }
+                process_watch_event(
+                    Event::Delete(new.clone()),
+                    &mut state,
+                    &config,
+                    &tracked,
+                    &router,
+                )
+                .await;
+                assert!(router.get_worker_urls().is_empty());
+            }
+        }
     }
 
     // Helper to create a PD config for testing
