@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import re
 import statistics
 from contextlib import redirect_stdout
@@ -12,11 +11,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from case_loader import cell_run_suffix, router_policy_result_path
+from tests.python.e2e.perf.result_metadata import add_missing_metadata
+
 if TYPE_CHECKING:
     from stack_launcher import RouterPolicyStack
 
 METRIC = re.compile(r"^([a-zA-Z0-9_:]+)(\{[^}]*\})?\s+([0-9.eE+-]+)$")
-RESULTS_SUMMARY_ENV = "AGENTX_RESULTS_SUMMARY"
 
 
 def print_artifacts(
@@ -36,11 +37,8 @@ def print_artifacts(
 
 
 def _write_results_summary_from_calibration(out: Path) -> list[tuple[str, Path]]:
-    """Copy calibration.json only when its ``ok`` field is true."""
+    """Copy calibration.json to the results dir only when its ``ok`` field is true."""
 
-    raw = os.environ.get(RESULTS_SUMMARY_ENV, "").strip()
-    if not raw:
-        return []
     cal = out / "calibration.json"
     if not cal.is_file():
         return []
@@ -50,35 +48,23 @@ def _write_results_summary_from_calibration(out: Path) -> list[tuple[str, Path]]
         return []
     if not isinstance(stats, dict) or stats.get("ok") is not True:
         return []
-    dest = Path(raw)
+    required = ("router_policy", "concurrency", "task_num")
+    if any(key not in stats for key in required):
+        return []
+    dest = router_policy_result_path(
+        stats["router_policy"],
+        stats["concurrency"],
+        stats["task_num"],
+        cell_run_suffix(),
+    )
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(cal.read_text(encoding="utf-8"), encoding="utf-8")
-    return [("results_summary.json", dest)]
+    return [("results_json", dest)]
 
 
-def _flush_log_handles(run: RouterPolicyStack) -> None:
-    if run.replay_log_fp is None:
-        return
-    try:
-        run.replay_log_fp.flush()
-    except (OSError, ValueError):
-        pass
+def _publish_cell_summary(text: str) -> None:
+    """Print the cell summary. Worker, router, and replay lines already went to stderr."""
 
-
-def _publish_beside_replay_result(run: RouterPolicyStack, text: str) -> None:
-    """Append the cell summary to replay.log, right after agentinfer's Replay result."""
-
-    out = run.out
-    _flush_log_handles(run)
-    replay_log = out / "replay.log"
-    if replay_log.is_file():
-        with replay_log.open("a", encoding="utf-8") as fp:
-            if text and not text.startswith("\n"):
-                fp.write("\n")
-            fp.write(text)
-            if text and not text.endswith("\n"):
-                fp.write("\n")
-            fp.flush()
     print(text, end="" if text.endswith("\n") else "\n", flush=True)
 
 
@@ -93,7 +79,6 @@ def emit_run_summary(
 
     out = run.out
     workers = run.case.worker_count
-    _flush_log_handles(run)
     summary_extra = _write_results_summary_from_calibration(out)
     failed = False
     buf = io.StringIO()
@@ -112,7 +97,7 @@ def emit_run_summary(
                 )
             else:
                 print("DIAGNOSTIC cell was not ok", flush=True)
-    _publish_beside_replay_result(run, buf.getvalue())
+    _publish_cell_summary(buf.getvalue())
     if failed:
         raise SystemExit(1)
 
@@ -172,7 +157,7 @@ def _makespan_seconds(ok_rows: list[dict[str, Any]]) -> float | None:
 
 
 def _quantiles(values: list[float]) -> dict[str, Any]:
-    """Linear-interpolation mean / p50 / p95 / p99, same as the orig128 report."""
+    """Quantiles and the actual sample count, same as the orig128 report."""
 
     return {
         "n": len(values),
@@ -306,7 +291,6 @@ def write_calibration(
     output_tokens = sum(r.get("output_tokens") or 0 for r in ok)
     makespan = _makespan_seconds(ok)
     stats = {
-        "router_policy": case.policy,
         "arm": case.policy,
         "returncode": replay_rc,
         "wall_seconds": wall_seconds,
@@ -359,6 +343,14 @@ def write_calibration(
             ),
         ),
     }
+    stats = add_missing_metadata(
+        stats,
+        {
+            "router_policy": case.policy,
+            "concurrency": case.concurrency,
+            "task_num": case.task_num,
+        },
+    )
     (run.out / "calibration.json").write_text(json.dumps(stats, indent=2))
     emit_run_summary(
         run,
