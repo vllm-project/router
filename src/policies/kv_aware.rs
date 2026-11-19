@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use rand::Rng;
 use sha2::{Digest as _, Sha256};
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
+use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::kv_index::{CacheKey, MatchQuery, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo};
 use crate::request_identity::StableIdentity;
@@ -1017,19 +1017,6 @@ impl Picker for TemperaturePicker {
     }
 }
 
-/// Picks uniformly among tied candidates.
-///
-/// Equal scores carry no ranking evidence. Keeping the first candidate would
-/// encode slice order as a preference: with an idle pool every cold request of
-/// the same length has one cost, and all of them would land on the same worker.
-fn pick_tied(candidates: &[usize]) -> Option<usize> {
-    match candidates {
-        [] => None,
-        [only] => Some(*only),
-        _ => Some(candidates[rand::rng().random_range(0..candidates.len())]),
-    }
-}
-
 /// Picks uniformly among the candidates that share the lowest cost.
 ///
 /// The ranking still decides which candidates are eligible; chance only
@@ -1855,6 +1842,7 @@ impl KvAwarePolicy {
         if !has_tokens {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("missing_tokens");
         }
+        // The binding snapshot owns these provider Arcs for the memo lifetime.
         let mut query_cache = HashMap::new();
         let mut grouped = Vec::with_capacity(bindings.len());
         let mut input_tokens = Vec::with_capacity(bindings.len());
@@ -3968,109 +3956,6 @@ mod tests {
     }
 
     #[test]
-    fn placement_memos_keep_distinct_providers_and_reuse_shared_arcs() {
-        struct Matches {
-            calls: AtomicUsize,
-            hits: Vec<TierMatch>,
-        }
-        impl TieredMatchProvider for Matches {
-            fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
-                self.calls.fetch_add(1, Ordering::Relaxed);
-                self.hits.clone()
-            }
-        }
-        let policy = KvAwarePolicy::default();
-        let workers = registered_worker_pair(&policy);
-        let first = Arc::new(Matches {
-            calls: AtomicUsize::new(0),
-            hits: Vec::new(),
-        });
-        let second = Arc::new(Matches {
-            calls: AtomicUsize::new(0),
-            hits: vec![tier_match(
-                &target(workers[1].url(), 0),
-                StorageTier::Device,
-                &[(0, 1)],
-            )],
-        });
-        let info = WorkerKvInfo {
-            cache_key: Some(CacheKey {
-                model: Arc::from("shared"),
-                hash_mode: crate::kv_index::HashMode::Sha256,
-                block_size: 2,
-            }),
-            ..Default::default()
-        };
-        for (worker, provider) in workers.iter().zip([
-            first.clone() as Arc<dyn TieredMatchProvider>,
-            second.clone(),
-        ]) {
-            policy.register_worker(worker.as_ref(), Some(&info), Some(provider));
-        }
-        let prompts = [vec![1, 2, 3, 4]];
-        for shared in [false, true] {
-            if shared {
-                policy.register_worker(workers[1].as_ref(), Some(&info), Some(first.clone()));
-            }
-            let calls_before = [
-                first.calls.load(Ordering::Relaxed),
-                second.calls.load(Ordering::Relaxed),
-            ];
-            // An exclusion fixes the selected target, not its placement credit.
-            let receipt = policy
-                .select_worker_with_receipt(
-                    &workers,
-                    Some(&prompts[0]),
-                    None,
-                    None,
-                    None,
-                    &[workers[0].url().to_owned()],
-                )
-                .unwrap();
-            let inputs = [
-                (workers[0].as_ref(), prompts.as_slice(), true),
-                (workers[1].as_ref(), prompts.as_slice(), true),
-            ];
-            let mut hashes = PromptHashes::new();
-            let prefill = policy.estimate_prefill_work(&inputs, &mut hashes);
-            let decode = policy.estimate_decode_work(&inputs, &mut hashes);
-            let expected = if shared { 4 } else { 2 };
-            let actual = (
-                receipt.new_prefill_tokens,
-                prefill
-                    .iter()
-                    .map(|estimate| estimate.new_prefill_tokens)
-                    .collect::<Vec<_>>(),
-                decode
-                    .iter()
-                    .map(|estimate| estimate.additional_tokens)
-                    .collect::<Vec<_>>(),
-            );
-            release_receipt(&workers, &receipt);
-            assert_eq!(
-                actual,
-                (expected, vec![4, expected], vec![Some(4), Some(expected)]),
-                "shared={shared}"
-            );
-            assert_eq!(receipt.worker_index, 1);
-            assert!(prefill.iter().all(|estimate| estimate.placement_verified));
-            assert_eq!(
-                [
-                    first.calls.load(Ordering::Relaxed) - calls_before[0],
-                    second.calls.load(Ordering::Relaxed) - calls_before[1],
-                ],
-                [3, if shared { 0 } else { 3 }],
-                "each request-local memo reuses only the same provider Arc"
-            );
-            assert_eq!(
-                policy.load.sample(&receipt.decision.target),
-                LoadSample::default()
-            );
-            assert_eq!(workers[1].load(), 0);
-        }
-    }
-
-    #[test]
     fn completion_history_shared_grpc_input_keeps_identity_and_full_charge() {
         let policy = KvAwarePolicy::default();
         let workers: Vec<Arc<dyn Worker>> = ["grpc://a", "grpc://b"]
@@ -4932,6 +4817,109 @@ mod tests {
         let released_at = Instant::now();
         acquired.release_ref();
         assert!(record.state.lock().idle_deadline.unwrap() >= released_at + ttl);
+    }
+
+    #[test]
+    fn placement_memos_keep_distinct_providers_and_reuse_shared_arcs() {
+        struct Matches {
+            calls: AtomicUsize,
+            hits: Vec<TierMatch>,
+        }
+        impl TieredMatchProvider for Matches {
+            fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.hits.clone()
+            }
+        }
+        let policy = KvAwarePolicy::default();
+        let workers = registered_worker_pair(&policy);
+        let first = Arc::new(Matches {
+            calls: AtomicUsize::new(0),
+            hits: Vec::new(),
+        });
+        let second = Arc::new(Matches {
+            calls: AtomicUsize::new(0),
+            hits: vec![tier_match(
+                &target(workers[1].url(), 0),
+                StorageTier::Device,
+                &[(0, 1)],
+            )],
+        });
+        let info = WorkerKvInfo {
+            cache_key: Some(CacheKey {
+                model: Arc::from("shared"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size: 2,
+            }),
+            ..Default::default()
+        };
+        for (worker, provider) in workers.iter().zip([
+            first.clone() as Arc<dyn TieredMatchProvider>,
+            second.clone(),
+        ]) {
+            policy.register_worker(worker.as_ref(), Some(&info), Some(provider));
+        }
+        let prompts = [vec![1, 2, 3, 4]];
+        for shared in [false, true] {
+            if shared {
+                policy.register_worker(workers[1].as_ref(), Some(&info), Some(first.clone()));
+            }
+            let calls_before = [
+                first.calls.load(Ordering::Relaxed),
+                second.calls.load(Ordering::Relaxed),
+            ];
+            // An exclusion fixes the selected target, not its placement credit.
+            let receipt = policy
+                .select_worker_with_receipt(
+                    &workers,
+                    Some(&prompts[0]),
+                    None,
+                    None,
+                    None,
+                    &[workers[0].url().to_owned()],
+                )
+                .unwrap();
+            let inputs = [
+                (workers[0].as_ref(), prompts.as_slice(), true),
+                (workers[1].as_ref(), prompts.as_slice(), true),
+            ];
+            let mut hashes = PromptHashes::new();
+            let prefill = policy.estimate_prefill_work(&inputs, &mut hashes);
+            let decode = policy.estimate_decode_work(&inputs, &mut hashes);
+            let expected = if shared { 4 } else { 2 };
+            let actual = (
+                receipt.new_prefill_tokens,
+                prefill
+                    .iter()
+                    .map(|estimate| estimate.new_prefill_tokens)
+                    .collect::<Vec<_>>(),
+                decode
+                    .iter()
+                    .map(|estimate| estimate.additional_tokens)
+                    .collect::<Vec<_>>(),
+            );
+            release_receipt(&workers, &receipt);
+            assert_eq!(
+                actual,
+                (expected, vec![4, expected], vec![Some(4), Some(expected)]),
+                "shared={shared}"
+            );
+            assert_eq!(receipt.worker_index, 1);
+            assert!(prefill.iter().all(|estimate| estimate.placement_verified));
+            assert_eq!(
+                [
+                    first.calls.load(Ordering::Relaxed) - calls_before[0],
+                    second.calls.load(Ordering::Relaxed) - calls_before[1],
+                ],
+                [3, if shared { 0 } else { 3 }],
+                "each request-local memo reuses only the same provider Arc"
+            );
+            assert_eq!(
+                policy.load.sample(&receipt.decision.target),
+                LoadSample::default()
+            );
+            assert_eq!(workers[1].load(), 0);
+        }
     }
 
     #[test]

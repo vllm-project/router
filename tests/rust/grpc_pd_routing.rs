@@ -433,12 +433,16 @@ async fn check_grpc_deferred_decode(cache_aware: bool, new_worker: bool) {
         let router = router.clone();
         tokio::spawn(async move { router.route_chat(None, &chat(false), None).await })
     };
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while if new_worker {
-            d1.captured().is_empty()
-        } else {
-            d0.captured().is_empty()
-        } {
+    // With two decode workers, cache-aware breaks the cold load tie at random,
+    // so record which worker the second request warmed.
+    let warmed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !new_worker && !d0.captured().is_empty() {
+                return &d0;
+            }
+            if (new_worker || cache_aware) && !d1.captured().is_empty() {
+                return &d1;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -463,7 +467,7 @@ async fn check_grpc_deferred_decode(cache_aware: bool, new_worker: bool) {
         );
     } else if cache_aware {
         assert_eq!(
-            d0.captured().len(),
+            warmed.captured().len(),
             2,
             "the first request must see the prefix warmed while prefill waited"
         );
