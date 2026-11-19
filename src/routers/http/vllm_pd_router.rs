@@ -3266,6 +3266,10 @@ impl VllmPDRouter {
         url: String,
         bootstrap_port: Option<u16>,
     ) -> Result<String, PDRouterError> {
+        if let Some(epd) = &self.epd {
+            epd.validate_consumer_url(&url)
+                .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
+        }
         self.evict_nixl_info(&url);
         self.pd_router.add_prefill_server(url, bootstrap_port).await
     }
@@ -3273,6 +3277,10 @@ impl VllmPDRouter {
     /// Add a decode server to the router
     /// Delegates to the underlying PdRouterBase
     pub async fn add_decode_server(&self, url: String) -> Result<String, PDRouterError> {
+        if let Some(epd) = &self.epd {
+            epd.validate_consumer_url(&url)
+                .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
+        }
         self.pd_router.add_decode_server(url).await
     }
 

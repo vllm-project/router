@@ -14,6 +14,7 @@ use vllm_router_rs::{
     core::WorkerType,
     policies::{CacheAwareCandidate, CacheAwarePolicy, LoadBalancingPolicy},
     routers::{
+        http::{pd_types::PDRouterError, vllm_pd_router::VllmPDRouter},
         router_manager::{RouterId, RouterManager},
         RouterFactory, RouterTrait,
     },
@@ -370,6 +371,115 @@ async fn regular_epd_dp_http_delete_removes_exact_encode_worker() {
 #[tokio::test]
 async fn pd_epd_workers_list_to_detail() {
     assert_epd_list_to_detail(true).await;
+}
+
+async fn assert_pd_epd_dp_add_rejects_encode_url(prefill: bool) {
+    let backend = Router::new().fallback(|| async { "ok" });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let backend = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    let prefill_url = format!("{base}/p");
+    let decode_url = format!("{base}/d");
+    let encoder_url = format!("{base}/e");
+    let config = RouterConfig {
+        mode: RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![(prefill_url.clone(), None)],
+            decode_urls: vec![decode_url.clone()],
+            prefill_policy: None,
+            decode_policy: None,
+            discovery_address: None,
+        },
+        policy: PolicyConfig::RoundRobin,
+        intra_node_data_parallel_size: 2,
+        epd: Some(EpdConfig {
+            encoder_urls: vec![encoder_url.clone()],
+            encode_policy: Some(PolicyConfig::RoundRobin),
+            consumer_zmq_addrs: Default::default(),
+        }),
+        worker_startup_timeout_secs: 5,
+        ..RouterConfig::default()
+    };
+    ConfigValidator::validate(&config).unwrap();
+    let context =
+        Arc::new(AppContext::new(config, reqwest::Client::new(), 64, None, vec![]).unwrap());
+    let router = RouterFactory::create_router(&context).await.unwrap();
+    let pd_router = router.as_any().downcast_ref::<VllmPDRouter>().unwrap();
+    let mut consumer_urls = router.get_worker_urls();
+    consumer_urls.sort();
+    assert_eq!(
+        consumer_urls,
+        vec![
+            format!("{decode_url}@0"),
+            format!("{decode_url}@1"),
+            format!("{prefill_url}@0"),
+            format!("{prefill_url}@1"),
+        ]
+    );
+    let initial_counts = context.policy_registry.get_worker_counts();
+    let encoder = context.worker_registry.get_by_url(&encoder_url).unwrap();
+
+    // Call the role-specific entry points directly: static E/P/D bypasses
+    // Regular Router::add_worker, and DP registration checks expanded keys.
+    for add_url in [
+        encoder_url.clone(),
+        format!("{encoder_url}/"),
+        format!("{encoder_url}@1"),
+        format!("{encoder_url}/@1"),
+    ] {
+        let result = if prefill {
+            pd_router.add_prefill_server(add_url.clone(), None).await
+        } else {
+            pd_router.add_decode_server(add_url.clone()).await
+        };
+        assert!(
+            matches!(result, Err(PDRouterError::InvalidConfiguration { ref reason })
+                if reason.contains("Encode and consumer")),
+            "must reject Encode URL {add_url}: {result:?}"
+        );
+        assert_eq!(context.worker_registry.get_all().len(), 5);
+        let retained_encoder = context.worker_registry.get_by_url(&encoder_url).unwrap();
+        assert!(Arc::ptr_eq(&encoder, &retained_encoder));
+        assert_eq!(retained_encoder.worker_type(), WorkerType::Encode);
+        let mut routing_urls = router.get_worker_urls();
+        routing_urls.sort();
+        assert_eq!(routing_urls, consumer_urls);
+        assert_eq!(context.policy_registry.get_worker_counts(), initial_counts);
+    }
+
+    // A distinct consumer URL must still register with its requested role.
+    let new_url = format!("{base}/new");
+    let expected_role = if prefill {
+        pd_router
+            .add_prefill_server(new_url.clone(), Some(12345))
+            .await
+            .unwrap();
+        WorkerType::Prefill {
+            bootstrap_port: Some(12345),
+        }
+    } else {
+        pd_router.add_decode_server(new_url.clone()).await.unwrap();
+        WorkerType::Decode
+    };
+    for rank in 0..2 {
+        let worker = context
+            .worker_registry
+            .get_by_url(&format!("{new_url}@{rank}"))
+            .unwrap();
+        assert_eq!(worker.worker_type(), expected_role);
+        assert_eq!(worker.dp_rank(), Some(rank));
+        assert_eq!(worker.dp_size(), Some(2));
+    }
+    backend.abort();
+}
+
+#[tokio::test]
+async fn pd_epd_dp_add_prefill_rejects_encode_urls() {
+    assert_pd_epd_dp_add_rejects_encode_url(true).await;
+}
+
+#[tokio::test]
+async fn pd_epd_dp_add_decode_rejects_encode_urls() {
+    assert_pd_epd_dp_add_rejects_encode_url(false).await;
 }
 
 async fn assert_pd_epd_http_delete_cleans_policy(prefill_first: bool) {
