@@ -28,8 +28,7 @@ pub use discovery::{
     CacheKey, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, WorkerKvInfo,
 };
 pub use layout::{
-    common_reusable_tokens, AdapterCapability, CacheCapabilities, CacheGroup, GroupCapability,
-    GroupRule, GroupView, RankCapability,
+    AdapterCapability, CacheCapabilities, CacheGroup, GroupCapability, GroupRule, RankCapability,
 };
 pub use source::binding::SourceBinding;
 pub(crate) use source::endpoints::canonical_endpoint;

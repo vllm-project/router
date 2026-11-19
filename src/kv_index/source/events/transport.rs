@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::io;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+
 pub(super) const IDLE_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Bound retries while an event source or its replay endpoint is unavailable.
@@ -400,26 +402,27 @@ pub(in crate::kv_index) fn live_sequence(
     {
         return Ok(None);
     }
-    if frames.len() != 3 || frames[1].len() != 8 {
+    let [_, seq, _] = frames else {
         return Err(());
-    }
-    Ok(Some(read_seq(&frames[1])))
+    };
+    Ok(Some(i64::from_be_bytes(
+        seq.as_slice().try_into().map_err(|_| ())?,
+    )))
 }
 
 /// A replay reply carries `[empty, topic, sequence, payload]`.
 pub(in crate::kv_index) fn replay_frame(frames: &[Vec<u8>]) -> Option<(i64, &[u8], &[u8])> {
-    if frames.len() != 4 || !frames[0].is_empty() || frames[2].len() != 8 {
+    let [envelope, topic, seq, payload] = frames else {
+        return None;
+    };
+    if !envelope.is_empty() {
         return None;
     }
-    Some((read_seq(&frames[2]), &frames[1], &frames[3]))
-}
-
-pub(in crate::kv_index) fn read_seq(bytes: &[u8]) -> i64 {
-    if bytes.len() >= 8 {
-        i64::from_be_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
-    } else {
-        -1
-    }
+    Some((
+        i64::from_be_bytes(seq.as_slice().try_into().ok()?),
+        topic,
+        payload,
+    ))
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -450,25 +453,19 @@ mod frame_tests {
     }
 }
 
-fn payload_fingerprint(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
+pub(super) type ReplayOverlap = HashMap<u64, [u8; 32]>;
 
-pub(super) fn remember_replay(replayed: &mut HashMap<u64, u64>, seq: u64, payload: &[u8]) {
-    replayed.insert(seq, payload_fingerprint(payload));
+pub(super) fn remember_replay(replayed: &mut ReplayOverlap, seq: u64, payload: &[u8]) {
+    // Verify the payload as well as the sequence without buffering entire batches.
+    replayed.insert(seq, Sha256::digest(payload).into());
     if replayed.len() > 4096 {
         let floor = seq.saturating_sub(2048);
         replayed.retain(|known, _| *known >= floor);
     }
 }
 
-pub(super) fn replay_overlap(replayed: &HashMap<u64, u64>, seq: u64, payload: &[u8]) -> bool {
+pub(super) fn replay_overlap(replayed: &ReplayOverlap, seq: u64, payload: &[u8]) -> bool {
     replayed
         .get(&seq)
-        .is_some_and(|known| *known == payload_fingerprint(payload))
+        .is_some_and(|known| *known == <[u8; 32]>::from(Sha256::digest(payload)))
 }

@@ -448,7 +448,6 @@ impl SourceBinding {
         };
         let claims: Vec<_> = claims.into_iter().map(PageTiers::expanded).collect();
         let (credited, tier) = crate::kv_index::layout::credit_from_pages(
-            &self.target,
             &self.groups,
             &claims,
             self.keys.block_size(),

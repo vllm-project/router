@@ -55,7 +55,6 @@ pub(super) struct LifecycleState {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SourceAction {
     Keep,
-    Expire,
     Recover,
     Rebuild,
     Stop,
@@ -159,6 +158,9 @@ impl WorkerLifecycle {
         let mut state = self.state.lock();
         if !self.active.load(Ordering::Acquire) || !probe_keeps_trust(outcome) {
             state.trusted = false;
+            if state.info.take().is_some() {
+                state.revision = crate::kv_index::next_owner_incarnation();
+            }
             return SourceAction::Stop;
         }
         if probe_renews_trust(outcome) {
@@ -166,9 +168,6 @@ impl WorkerLifecycle {
             if !state.trusted {
                 return SourceAction::Recover;
             }
-        } else if state.verified_at.elapsed() > LAYOUT_FRESHNESS && state.trusted {
-            state.trusted = false;
-            return SourceAction::Expire;
         }
         SourceAction::Keep
     }
@@ -318,9 +317,6 @@ impl KvIndexSupervisor {
                     SourceAction::Stop => {
                         invalidate(&handles);
                         break;
-                    }
-                    SourceAction::Expire => {
-                        invalidate(&handles);
                     }
                     SourceAction::Recover => {
                         handles.clear();

@@ -209,6 +209,49 @@ fn partial_stores_restore_the_joint_boundary_and_survive_tier_removal() {
     assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 1136);
 }
 
+#[test]
+fn single_full_attention_group_credits_only_published_partial_pages() {
+    use crate::policies::TieredMatchProvider;
+
+    let tokens: Vec<u32> = (0..49).collect();
+    let hashes = BlockKeyGenerator::new(16, 0).generate_block_keys(&tokens);
+    let group = CacheGroup {
+        group_idx: 0,
+        block_size: 32,
+        kind: GroupRule::FullAttention,
+    };
+    let batch = event_batch(
+        1.0,
+        vec![
+            KVEvent::BlockStored(gpu_store(
+                0,
+                "full_attention",
+                32,
+                &tokens[..32],
+                &hashes[1..2],
+            )),
+            KVEvent::BlockStored(gpu_store(
+                0,
+                "full_attention",
+                16,
+                &tokens[32..48],
+                &hashes[2..3],
+            )),
+        ],
+    );
+    for (partial, end) in [(false, 2), (true, 3)] {
+        let index = SourceBinding::new(target(), vec![group], 16, 0, 8)
+            .unwrap()
+            .with_partial_hash_hits(partial);
+        index.begin_empty(0);
+        assert_eq!(index.apply_batch(0, &batch), Ok(()));
+        let matches = index.matches(&tokens, 16, None, 0);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].segments, [(0, end)]);
+        assert_eq!(index.reusable_tokens(&tokens, 32), 32);
+    }
+}
+
 fn checkpoint_groups(block_size: u32, attention: GroupRule) -> Vec<CacheGroup> {
     (0..4)
         .map(|group_idx| CacheGroup {

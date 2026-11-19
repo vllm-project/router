@@ -1,6 +1,5 @@
 //! ZMQ SUB + DEALER replay subscriber, one task per (worker, rank).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,7 +7,9 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use super::event_stream::{EventStream, StreamLease};
-use super::transport::{live_sequence, retry_backoff, ConnectionMonitor, IDLE_REPLAY_INTERVAL};
+use super::transport::{
+    live_sequence, retry_backoff, ConnectionMonitor, ReplayOverlap, IDLE_REPLAY_INTERVAL,
+};
 use crate::kv_index::IngestionSignal;
 
 /// The signed sentinel ending a replay stream: `seq = -1`.
@@ -92,9 +93,8 @@ impl Subscriber {
 
     fn resume(&self, last: i64) -> Result<(), ()> {
         self.binding.as_ref().map_or(Ok(()), |(stream, lease)| {
-            stream
-                .finish_replay(*lease, (last + 1) as u64)
-                .map_err(|_| ())
+            let next = last.checked_add(1).ok_or(())?;
+            stream.finish_replay(*lease, next as u64).map_err(|_| ())
         })
     }
 
@@ -143,7 +143,7 @@ impl Subscriber {
         ctx: &zmq::Context,
         mut last: i64,
         through: Option<i64>,
-        mut replayed: Option<&mut HashMap<u64, u64>>,
+        replayed: &mut ReplayOverlap,
         socket: &mut Option<zmq::Socket>,
         reconcile: bool,
         shutdown: &broadcast::Receiver<()>,
@@ -175,8 +175,8 @@ impl Subscriber {
         {
             match dealer.recv_multipart(zmq::DONTWAIT) {
                 Ok(frames) => {
-                    let (seq, frame_topic, payload) = super::transport::replay_frame(&frames)?;
-                    if seq == END_SEQ && frame_topic.is_empty() && payload.is_empty() {
+                    let (wire_seq, frame_topic, payload) = super::transport::replay_frame(&frames)?;
+                    if wire_seq == END_SEQ && frame_topic.is_empty() && payload.is_empty() {
                         // Publish only a complete replay that covers the observed gap.
                         if through.is_some_and(|required| next <= required) {
                             return None;
@@ -184,7 +184,10 @@ impl Subscriber {
                         *socket = Some(dealer);
                         return Some(last);
                     }
-                    let seq = u64::try_from(seq).ok()?;
+                    if !(0..i64::MAX).contains(&wire_seq) {
+                        return None;
+                    }
+                    let seq = wire_seq as u64;
                     if frame_topic != topic.as_bytes() {
                         return None;
                     }
@@ -197,11 +200,9 @@ impl Subscriber {
                         self.invalidated("idle replay found unapplied events");
                     }
                     self.apply(seq, payload).ok()?;
-                    if let Some(replayed) = replayed.as_deref_mut() {
-                        super::transport::remember_replay(replayed, seq, payload);
-                    }
-                    last = i64::try_from(seq).ok()?;
-                    next = seq.checked_add(1)?;
+                    super::transport::remember_replay(replayed, seq, payload);
+                    last = wire_seq;
+                    next = seq + 1;
                 }
                 Err(zmq::Error::EAGAIN) => tokio::time::sleep(Duration::from_millis(1)).await,
                 Err(error) => {
@@ -270,7 +271,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
             // Catch up by replay until a live frame confirms the SUB handoff.
             let mut bootstrap = can_replay;
             let mut allow_overlap = bootstrap;
-            let mut replayed = HashMap::new();
+            let mut replayed = ReplayOverlap::new();
             let mut replay_socket = None;
             let mut next_catchup = tokio::time::Instant::now();
             let mut next_idle_replay = tokio::time::Instant::now() + IDLE_REPLAY_INTERVAL;
@@ -357,7 +358,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             &ctx,
                             last_seq,
                             recovery_through,
-                            Some(&mut replayed),
+                            &mut replayed,
                             &mut replay_socket,
                             idle_reconcile,
                             &shutdown_rx,
@@ -435,7 +436,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     match sub.socket().recv_multipart(zmq::DONTWAIT) {
                         Ok(frames) => {
                             let seq = match live_sequence(&frames, topic.as_bytes()) {
-                                Ok(Some(seq)) if seq >= 0 => seq,
+                                Ok(Some(seq)) if (0..i64::MAX).contains(&seq) => seq,
                                 Ok(None) => {
                                     tokio::task::yield_now().await;
                                     continue 'live;
@@ -490,7 +491,8 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                 suspended = true;
                                 break 'live_batch (Some(seq), allow_overlap);
                             }
-                            if (can_replay || last_seq >= 0) && seq > last_seq + 1 {
+                            let expected = last_seq + 1; // Every accepted sequence leaves room.
+                            if (can_replay || last_seq >= 0) && seq > expected {
                                 if subscriber.invalidate(true).is_err() {
                                     break 'live;
                                 }
@@ -498,7 +500,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                     &subscriber.signals,
                                     IngestionSignal::Gap {
                                         source: source_id.clone(),
-                                        from_seq: last_seq + 1,
+                                        from_seq: expected,
                                         to_seq: seq - 1,
                                     },
                                 );

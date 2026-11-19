@@ -40,7 +40,7 @@ impl EventStream {
 
     /// The caller must first establish that sequence zero represents an empty
     /// cache for the authenticated publisher's current incarnation.
-    pub fn begin_replay(&self) -> StreamLease {
+    pub fn begin_replay(&self) -> Result<StreamLease, StreamError> {
         self.index
             .with_active_binding(|| {
                 self.index.with_stream_batch(|state, tx| {
@@ -49,7 +49,7 @@ impl EventStream {
                     lease
                 })
             })
-            .unwrap_or(StreamLease(0))
+            .ok_or(StreamError::Index(SourceError::Untrusted))
     }
 
     pub(super) fn restart_replay(&self, lease: StreamLease, loss: bool) -> Result<(), StreamError> {
@@ -256,7 +256,9 @@ pub(in crate::kv_index::source) fn spawn_zmq_with_signals(
     if source.topic.is_empty() || source.pub_endpoint.is_empty() {
         return Err("an incarnation-bound topic and publisher are required");
     }
-    let lease = stream.begin_replay();
+    let lease = stream
+        .begin_replay()
+        .map_err(|_| "KV source is no longer active")?;
     let subscriber = super::subscriber::spawn(source, stream.clone(), lease, ctx, signals);
     Ok(EventSubscriberHandle {
         subscriber,
@@ -362,6 +364,27 @@ mod tests {
     }
 
     #[test]
+    fn inactive_binding_rejects_replay_before_allocating_a_lease() {
+        use crate::kv_index::source::binding::SourceLease;
+
+        let index = qwen_index(
+            RoutableTarget {
+                instance_id: Arc::from("worker"),
+                dp_rank: 0,
+            },
+            8,
+        )
+        .with_source_binding(SourceLease {
+            strict_rank: Arc::new(parking_lot::Mutex::new(true)),
+            active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        assert_eq!(
+            EventStream::new(Arc::new(index)).begin_replay(),
+            Err(StreamError::Index(SourceError::Untrusted))
+        );
+    }
+
+    #[test]
     fn repeated_retire_does_not_clear_a_replacement_stream() {
         let index = Arc::new(qwen_index(
             RoutableTarget {
@@ -371,12 +394,12 @@ mod tests {
             8,
         ));
         let old = EventStream::new(index.clone());
-        let old_lease = old.begin_replay();
+        let old_lease = old.begin_replay().unwrap();
         old.retire(old_lease).unwrap();
         old.retire(old_lease).unwrap();
         assert!(!old.is_active(old_lease));
         let replacement = EventStream::new(index.clone());
-        let replacement_lease = replacement.begin_replay();
+        let replacement_lease = replacement.begin_replay().unwrap();
         assert_ne!(old_lease, replacement_lease);
         let payload = &crate::kv_index::source::binding::tests::qwen35_payload();
         replacement
@@ -399,8 +422,8 @@ mod tests {
             8,
         ));
         let stream = EventStream::new(index.clone());
-        let first = stream.begin_replay();
-        let current = stream.begin_replay();
+        let first = stream.begin_replay().unwrap();
+        let current = stream.begin_replay().unwrap();
         let payload = &crate::kv_index::source::binding::tests::qwen35_payload();
         let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
         assert_eq!(

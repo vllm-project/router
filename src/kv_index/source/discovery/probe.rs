@@ -250,6 +250,8 @@ async fn fetch_http_full_layout(
 
 /// Automatic discovery accepts only a complete plain full-attention contract.
 fn parse_native_full_layout(body: serde_json::Value) -> Result<Option<CacheCapabilities>, String> {
+    // An explicitly empty list and null transfer show this worker is plain.
+    // An omitted field provides no evidence of what the exporter checked.
     if !body
         .get("adapters")
         .and_then(serde_json::Value::as_array)
@@ -344,52 +346,40 @@ pub(crate) async fn query_worker_metadata(
     api_key: Option<&str>,
 ) -> Result<ServerInfo, String> {
     let mut attempts: Vec<String> = Vec::new();
+    let record_metadata = |path, result: Result<ServerInfo, String>| {
+        let info = result?;
+        let size = discovered_block_size(&info).ok_or_else(|| format!("{path}: no block_size"))?;
+        info!("kv_index {worker_url}: worker cache metadata from /{path} (block_size={size})");
+        Ok(info)
+    };
 
     // 1. Multi-backend control metadata. Absent from stock vLLM.
-    match query_worker_json::<ServerInfo>(client, worker_url, "get_server_info", true, api_key)
-        .await
-    {
-        Ok(info) if discovered_block_size(&info).is_some() => {
-            info!(
-                "kv_index {}: worker cache metadata from /get_server_info (block_size={})",
-                worker_url,
-                discovered_block_size(&info).unwrap_or_default()
-            );
-            return Ok(info);
-        }
-        Ok(_) => attempts.push("get_server_info: no block_size".to_string()),
+    match record_metadata(
+        "get_server_info",
+        query_worker_json(client, worker_url, "get_server_info", true, api_key).await,
+    ) {
+        Ok(info) => return Ok(info),
         Err(error) => attempts.push(error),
     }
 
     // 2. Native engine configuration. Requires VLLM_SERVER_DEV_MODE=1.
-    match query_server_info_json(client, worker_url, api_key).await {
-        Ok(info) if discovered_block_size(&info).is_some() => {
-            info!(
-                "kv_index {}: worker cache metadata from /server_info (block_size={})",
-                worker_url,
-                discovered_block_size(&info).unwrap_or_default()
-            );
-            return Ok(info);
-        }
-        Ok(_) => attempts.push("server_info: no block_size".to_string()),
+    match record_metadata(
+        "server_info",
+        query_server_info_json(client, worker_url, api_key).await,
+    ) {
+        Ok(info) => return Ok(info),
         Err(error) => attempts.push(error),
     }
 
     // 3. Prometheus scrape. Always on, no dev mode required.
-    match query_metrics_metadata(client, worker_url, api_key).await {
-        Ok(info) if discovered_block_size(&info).is_some() => {
-            info!(
-                "kv_index {}: worker cache metadata from /metrics (block_size={})",
-                worker_url,
-                discovered_block_size(&info).unwrap_or_default()
-            );
-            return Ok(info);
-        }
-        Ok(_) => attempts.push("metrics: no block_size".to_string()),
-        Err(error) => attempts.push(error),
-    }
-
-    Err(attempts.join("; "))
+    record_metadata(
+        "metrics",
+        query_metrics_metadata(client, worker_url, api_key).await,
+    )
+    .map_err(|error| {
+        attempts.push(error);
+        attempts.join("; ")
+    })
 }
 
 /// Engine configuration exposed by `vllm serve` behind `VLLM_SERVER_DEV_MODE=1`.
@@ -440,15 +430,18 @@ async fn query_metrics_metadata(
 ) -> Result<ServerInfo, String> {
     let text = query_worker_text(client, worker_url, "metrics", true, api_key).await?;
     let engines = metrics_meta::parse_cache_config_info(&text);
-    let Some((_, first)) = engines.iter().next() else {
+    if engines.is_empty() {
         return Err("metrics: no vllm:cache_config_info series".to_string());
-    };
+    }
     if let Err(units) = metrics_meta::shared_hash_unit(&engines) {
         return Err(format!(
             "metrics: engines disagree on block size {units:?} — refusing to index"
         ));
     }
-    if let Some(layout) = first.kv_cache_layout.as_deref() {
+    if let Some(layout) = engines
+        .values()
+        .find_map(|engine| engine.kv_cache_layout.as_deref())
+    {
         info!(
             "kv_index {}: engine declares kv_cache_layout={} (hybrid layouts are not derived from metrics yet)",
             worker_url, layout
@@ -460,8 +453,10 @@ async fn query_metrics_metadata(
     Ok(ServerInfo {
         model_id,
         model_path: model_path.flatten(),
-        kv_block_size: first.block_size,
-        effective_attention_block_size: first.effective_attention_block_size,
+        kv_block_size: engines.values().find_map(|engine| engine.block_size),
+        effective_attention_block_size: engines
+            .values()
+            .find_map(|engine| engine.effective_attention_block_size),
         ..Default::default()
     })
 }
@@ -486,14 +481,6 @@ async fn query_served_model(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
     Some((id.to_owned(), path))
-}
-
-pub(crate) async fn query_pd_server_info(
-    client: &reqwest::Client,
-    worker_url: &str,
-    api_key: Option<&str>,
-) -> Result<ServerInfo, String> {
-    query_worker_metadata(client, worker_url, api_key).await
 }
 
 pub(crate) async fn query_pd_kv_event_sources(

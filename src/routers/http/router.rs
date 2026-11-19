@@ -308,6 +308,7 @@ pub struct Router {
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     kv_index_supervisor: Option<Arc<crate::kv_index::KvIndexSupervisor>>,
+    kv_reconcile_handle: Option<tokio::task::JoinHandle<()>>,
     program_scheduler: Option<Arc<ProgramScheduler>>,
     _program_observation_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     program_targets_cache: Mutex<HashMap<String, ProgramTargetCacheEntry>>,
@@ -377,6 +378,14 @@ impl StartupBudget {
     /// Sleep before the next probe.
     fn backoff(&self) -> Duration {
         self.interval.min(self.remaining())
+    }
+}
+
+impl Drop for Router {
+    fn drop(&mut self) {
+        if let Some(task) = &self.kv_reconcile_handle {
+            task.abort();
+        }
     }
 }
 
@@ -568,35 +577,6 @@ impl Router {
             }
         }
 
-        if let Some(supervisor) = &kv_index_supervisor {
-            let supervisor = Arc::downgrade(supervisor);
-            let workers = ctx.worker_registry.clone();
-            let policies = ctx.policy_registry.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(crate::kv_index::discovery::CONTROL_TIMEOUT).await;
-                    let Some(supervisor) = supervisor.upgrade() else {
-                        break;
-                    };
-                    let registrations = supervisor.refresh_discovered_workers().await;
-                    if registrations.is_empty() {
-                        continue;
-                    }
-                    for worker in workers.get_by_type(&WorkerType::Regular) {
-                        let Some(registration) = registrations.get(worker.base_url()) else {
-                            continue;
-                        };
-                        Self::attach_kv_provider(
-                            &policies,
-                            worker.as_ref(),
-                            registration.info.as_ref(),
-                            registration.provider.clone(),
-                        );
-                    }
-                }
-            });
-        }
-
         if let Some(config) = &ctx.router_config.epd {
             super::epd::EncoderStage::validate_consumers(
                 config,
@@ -761,6 +741,35 @@ impl Router {
             }))
         });
 
+        let kv_reconcile_handle = kv_index_supervisor.as_ref().map(|supervisor| {
+            let supervisor = Arc::downgrade(supervisor);
+            let workers = ctx.worker_registry.clone();
+            let policies = ctx.policy_registry.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(crate::kv_index::discovery::CONTROL_TIMEOUT).await;
+                    let Some(supervisor) = supervisor.upgrade() else {
+                        break;
+                    };
+                    let registrations = supervisor.refresh_discovered_workers().await;
+                    if registrations.is_empty() {
+                        continue;
+                    }
+                    for worker in workers.get_by_type(&WorkerType::Regular) {
+                        let Some(registration) = registrations.get(worker.base_url()) else {
+                            continue;
+                        };
+                        Self::attach_kv_provider(
+                            &policies,
+                            worker.as_ref(),
+                            registration.info.as_ref(),
+                            registration.provider.clone(),
+                        );
+                    }
+                }
+            })
+        });
+
         Ok(Router {
             epd: ctx
                 .router_config
@@ -786,6 +795,7 @@ impl Router {
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
             kv_index_supervisor,
+            kv_reconcile_handle,
             program_scheduler,
             _program_observation_handle: program_observation_handle,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -848,20 +858,35 @@ impl Router {
         }
     }
 
-    pub(crate) fn remove_kv_worker(&self, worker_url: &str, target_urls: &[String]) {
+    pub(crate) fn remove_kv_workers(&self, removed: &[Arc<dyn Worker>]) {
+        let Some(first) = removed.first() else { return };
+        let base = first.base_url();
         // A manager may remove one target while another rank still uses the
         // same publisher. Retire the source only after its last regular target.
-        if !self.worker_registry.get_all().iter().any(|worker| {
-            worker.worker_type() == WorkerType::Regular && worker.base_url() == worker_url
-        }) {
+        if !self
+            .worker_registry
+            .get_by_type(&WorkerType::Regular)
+            .iter()
+            .any(|worker| worker.base_url() == base)
+        {
             if let Some(supervisor) = &self.kv_index_supervisor {
-                supervisor.on_worker_removed(worker_url);
+                supervisor.on_worker_removed(base);
             }
         }
-        let policy = self.policy_registry.get_default_policy();
+        for worker in removed {
+            Self::unregister_kv_target(&self.policy_registry, worker.as_ref());
+        }
+    }
+
+    pub(crate) fn unregister_kv_target(policies: &PolicyRegistry, worker: &dyn Worker) {
+        let policy = policies.get_policy_or_default(worker.model_id());
+        let default = policies.get_default_policy();
         if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
-            for target_url in target_urls {
-                kv_aware.unregister_worker(target_url);
+            kv_aware.unregister_worker(worker.url());
+        }
+        if !Arc::ptr_eq(&policy, &default) {
+            if let Some(kv_aware) = kv_aware_ops(default.as_ref()) {
+                kv_aware.unregister_worker(worker.url());
             }
         }
     }
@@ -1623,6 +1648,59 @@ impl Router {
             .collect()
     }
 
+    fn inferred_lora_name<'a>(workers: &[Arc<dyn Worker>], requested: &'a str) -> Option<&'a str> {
+        // vLLM selects adapters through model. An incomplete set of base
+        // aliases leaves the identity unclassified.
+        (!workers.is_empty()
+            && workers.iter().all(|worker| {
+                let served = worker.served_base_models();
+                served
+                    .iter()
+                    .any(|name| !name.is_empty() && *name != UNLABELED_WORKER_MODEL_ID)
+                    && !served.contains(&requested)
+            }))
+        .then_some(requested)
+    }
+
+    fn kv_placement_eligibility(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        model: Option<&str>,
+        lora_name: Option<&str>,
+        skip_read: bool,
+    ) -> Option<Vec<bool>> {
+        if skip_read {
+            return Some(vec![false; workers.len()]);
+        }
+        let supervisor = self.kv_index_supervisor.as_ref()?;
+        let model = model?;
+        if lora_name.is_some()
+            || workers
+                .first()
+                .is_none_or(|worker| crate::backend::is_grpc_url(worker.base_url()))
+        {
+            return None;
+        }
+        let mut allowed: Vec<_> = workers
+            .iter()
+            .map(|worker| model != UNLABELED_WORKER_MODEL_ID && worker.serves_base_model(model))
+            .collect();
+        let missing: Vec<_> = workers
+            .iter()
+            .zip(&allowed)
+            .filter(|(_, allowed)| !**allowed)
+            .map(|(worker, _)| worker.base_url().to_owned())
+            .collect();
+        if missing.is_empty() {
+            return None;
+        }
+        let verified = supervisor.worker_model_eligibility(&missing, Some(model));
+        for (worker, allowed) in workers.iter().zip(&mut allowed) {
+            *allowed |= verified.get(worker.base_url()).copied().unwrap_or(false);
+        }
+        Some(allowed)
+    }
+
     /// Select worker for a specific model considering circuit breaker state
     #[allow(clippy::too_many_arguments)]
     fn select_worker_for_model(
@@ -1901,10 +1979,6 @@ impl Router {
 
         // KV-aware retries may bypass a target without rewriting its binding.
         let failed_workers = Mutex::new(Vec::new());
-        // vLLM selects adapters through the request's `model`. A name this pool
-        // does not serve as a base model is an adapter, and the engine caches
-        // its blocks under that identity: the base model's chain is no evidence
-        // for it, so it carries the adapter identity into placement credit.
         let (declared_lora, cache_salt) = typed_req.cache_identity();
         let cache_read_fallback =
             kv_aware_ops(self.policy_for_model(model_id).as_ref()).and_then(|_| match completion {
@@ -1916,23 +1990,6 @@ impl Router {
         if let Some(reason) = cache_read_fallback {
             RouterMetrics::record_kv_placement_lookup(reason);
         }
-        let lora_name = declared_lora.or_else(|| {
-            let requested = typed_req.get_model()?;
-            let workers = self.worker_registry.get_all();
-            // Without a served name nothing can be classified; keep the
-            // historical behavior instead of guessing.
-            let classified = workers.iter().any(|worker| {
-                worker
-                    .served_base_models()
-                    .iter()
-                    .any(|name| *name != "unknown")
-            });
-            (classified
-                && !workers
-                    .iter()
-                    .any(|worker| worker.serves_base_model(requested)))
-            .then_some(requested)
-        });
         let affinity_key = self
             .kv_aware_session_affinity_ttl_secs
             .filter(|_| kv_aware_ops(self.policy_for_model(model_id).as_ref()).is_some())
@@ -1980,6 +2037,12 @@ impl Router {
                 let policy = self.policy_for_model(model_id);
                 let kv_ops = kv_aware_ops(policy.as_ref());
                 let workers = self.available_workers(model_id);
+                let lora_name = declared_lora.or_else(|| {
+                    if pool == Some(crate::backend::WorkerPoolKind::Grpc) {
+                        return None;
+                    }
+                    Self::inferred_lora_name(&workers, typed_req.get_model()?)
+                });
                 let excluded_workers = failed_workers.lock().clone();
                 // Router-rendered token IDs are an exact-token fact, not a
                 // replacement for the Engine's own KV-aware input. On an HTTP
@@ -2050,7 +2113,6 @@ impl Router {
                         .map(KvRequestTokens::PerWorker)
                         .unwrap_or(KvRequestTokens::Shared(None))
                 };
-                let eligibility = cache_read_fallback.map(|_| vec![false; workers.len()]);
                 let selected_worker = if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
@@ -2064,8 +2126,13 @@ impl Router {
                     }) {
                         return Self::program_target_unavailable_response(route);
                     }
-                    let eligibility = cache_read_fallback.map(|_| vec![false]);
                     let kv_receipt = kv_aware_ops(policy.as_ref()).and_then(|kv_aware| {
+                        let eligibility = self.kv_placement_eligibility(
+                            std::slice::from_ref(&worker),
+                            typed_req.get_model(),
+                            lora_name,
+                            cache_read_fallback.is_some(),
+                        );
                         kv_aware.select_worker_with_qualified_inputs(
                             std::slice::from_ref(&worker),
                             request_tokens,
@@ -2078,6 +2145,12 @@ impl Router {
                     });
                     Some(SelectedWorker { worker, kv_receipt })
                 } else {
+                    let eligibility = kv_ops.and_then(|_| self.kv_placement_eligibility(
+                        &workers,
+                        typed_req.get_model(),
+                        lora_name,
+                        cache_read_fallback.is_some(),
+                    ));
                     self.select_worker_for_model(
                         model_id,
                         &workers,
@@ -2924,85 +2997,41 @@ impl Router {
     }
 
     pub fn remove_worker(&self, worker_url: &str) {
-        if self.intra_node_data_parallel_size > 1 {
-            // remove dp-aware workers in a prefix-matching fashion
-            // without contacting the remote worker
-            let mut removed_workers: Vec<String> = Vec::new();
-            let worker_url_prefix = format!("{}@", worker_url);
-
-            // Find and remove all workers with matching prefix
-            let all_workers = self.worker_registry.get_all();
-            for w in all_workers.iter() {
-                if w.url().starts_with(&worker_url_prefix) {
-                    let removed_url = w.url().to_string();
-                    // Get model_id before removing
-                    let model_id = w.model_id().to_string();
-
-                    if self.worker_registry.remove_by_url(&removed_url).is_some() {
-                        self.frontend.remove_worker(&removed_url);
-                        info!("Removed worker: {}", removed_url);
-                        removed_workers.push(removed_url);
-
-                        // Notify PolicyRegistry about the removed worker
-                        self.policy_registry.on_worker_removed(&model_id);
-                    } else {
-                        warn!("Worker {} not found, skipping removal", w.url());
-                    }
-                }
-            }
-
-            RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
-            if !removed_workers.is_empty() {
-                self.remove_kv_worker(worker_url, &removed_workers);
-            }
-
-            // If any models are using cache aware policy, remove the workers from the tree
-            // Check each removed worker's model and get its policy
-            for dp_url in removed_workers.iter() {
-                if let Some(worker) = self.worker_registry.get_by_url(dp_url) {
-                    let model_id = worker.model_id();
-                    if let Some(policy) = self.policy_registry.get_policy(model_id) {
-                        if let Some(cache_aware) = policy
-                            .as_any()
-                            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                        {
-                            cache_aware.remove_worker_by_url(dp_url);
-                            info!("Removed worker from cache-aware tree: {}", dp_url);
-                        }
-                    }
-                }
-            }
+        let removed: Vec<_> = if self.intra_node_data_parallel_size > 1 {
+            let rank_prefix = format!("{worker_url}@");
+            self.worker_registry
+                .get_all()
+                .iter()
+                .filter(|worker| worker.url().starts_with(&rank_prefix))
+                .filter_map(|worker| self.worker_registry.remove_by_url(worker.url()))
+                .collect()
         } else {
-            // Get the worker first to extract model_id
-            let model_id = if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                worker.model_id().to_string()
-            } else {
-                warn!("Worker {} not found, skipping removal", worker_url);
-                return;
-            };
-
-            if self.worker_registry.remove_by_url(worker_url).is_some() {
-                self.frontend.remove_worker(worker_url);
-                info!("Removed worker: {}", worker_url);
-
-                // Notify PolicyRegistry about the removed worker
-                self.policy_registry.on_worker_removed(&model_id);
-
-                RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
-                self.remove_kv_worker(worker_url, &[worker_url.to_string()]);
-            }
-
-            // If the model is using cache aware policy, remove the worker from the tree
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
+            self.worker_registry
+                .remove_by_url(worker_url)
+                .into_iter()
+                .collect()
+        };
+        if removed.is_empty() {
+            warn!("Worker {} not found, skipping removal", worker_url);
+            return;
+        }
+        self.remove_kv_workers(&removed);
+        for worker in &removed {
+            let url = worker.url();
+            let model = worker.model_id();
+            self.frontend.remove_worker(url);
+            if let Some(policy) = self.policy_registry.get_policy(model) {
                 if let Some(cache_aware) = policy
                     .as_any()
                     .downcast_ref::<crate::policies::CacheAwarePolicy>()
                 {
-                    cache_aware.remove_worker_by_url(worker_url);
-                    info!("Removed worker from cache-aware tree: {}", worker_url);
+                    cache_aware.remove_worker_by_url(url);
                 }
             }
+            self.policy_registry.on_worker_removed(model);
+            info!("Removed worker: {}", url);
         }
+        RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
     }
 
     async fn get_worker_load(&self, worker_url: &str) -> Option<isize> {
@@ -3579,7 +3608,11 @@ impl RouterTrait for Router {
         let lora_name = body
             .get("lora_name")
             .and_then(serde_json::Value::as_str)
-            .filter(|name| !name.is_empty());
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                kv_ops?;
+                Self::inferred_lora_name(&workers, model_id?)
+            });
         let cache_salt = body
             .get("cache_salt")
             .and_then(serde_json::Value::as_str)
@@ -3649,6 +3682,12 @@ impl RouterTrait for Router {
                 .filter(|worker| worker.is_available())
                 .map(|worker| {
                     let kv_receipt = kv_ops.and_then(|ops| {
+                        let eligibility = self.kv_placement_eligibility(
+                            std::slice::from_ref(&worker),
+                            model_id,
+                            lora_name,
+                            cache_read_fallback.is_some(),
+                        );
                         ops.select_worker_with_qualified_inputs(
                             std::slice::from_ref(&worker),
                             request_tokens,
@@ -3656,13 +3695,18 @@ impl RouterTrait for Router {
                             cache_salt,
                             affinity_key.as_ref(),
                             &[],
-                            cache_read_fallback.map(|_| &[false][..]),
+                            eligibility.as_deref(),
                         )
                     });
                     SelectedWorker { worker, kv_receipt }
                 })
         } else if let Some(ops) = kv_ops {
-            let eligibility = cache_read_fallback.map(|_| vec![false; workers.len()]);
+            let eligibility = self.kv_placement_eligibility(
+                &workers,
+                model_id,
+                lora_name,
+                cache_read_fallback.is_some(),
+            );
             ops.select_worker_with_qualified_inputs(
                 &workers,
                 request_tokens,
@@ -4336,6 +4380,7 @@ mod tests {
             crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
         );
         let router = Arc::new(Router::new(vec![], &ctx).await.unwrap());
+        let reconcile = router.kv_reconcile_handle.as_ref().unwrap().abort_handle();
         let manager = managed.then(|| {
             let manager = RouterManager::new(
                 ctx.router_config.clone(),
@@ -4415,6 +4460,97 @@ mod tests {
         }
         supervisor.shutdown();
         task.abort();
+        drop(manager);
+        drop(router);
+        wait_for_kv(|| reconcile.is_finished()).await;
+    }
+
+    #[test]
+    fn regular_worker_removal_clears_both_policy_bindings() {
+        use crate::kv_index::source::test_support::full_binding;
+        use crate::kv_index::{CacheKey, RoutableTarget};
+
+        let router = create_test_kv_router();
+        let workers: [Arc<dyn Worker>; 2] = ["http://one", "http://two"].map(|url| {
+            Arc::new(
+                BasicWorker::new(url.into(), WorkerType::Regular)
+                    .with_labels(HashMap::from([("model_id".into(), "m".into())])),
+            ) as Arc<dyn Worker>
+        });
+        for worker in &workers {
+            router.worker_registry.register(worker.clone());
+            router
+                .policy_registry
+                .on_worker_added("m", Some("kv_aware"));
+        }
+        let model = router.policy_registry.get_policy("m").unwrap();
+        let default = router.policy_registry.get_default_policy();
+        assert!(!Arc::ptr_eq(&default, &model));
+        let worker = workers[0].as_ref();
+        let target = RoutableTarget {
+            instance_id: "cached-source".into(),
+            dp_rank: 0,
+        };
+        let policies = [
+            kv_aware_policy(default.as_ref()).unwrap(),
+            kv_aware_policy(model.as_ref()).unwrap(),
+        ];
+        for policy in policies {
+            policy.register_target_with_cache_identity(
+                worker.url(),
+                target.clone(),
+                CacheKey {
+                    model: "m".into(),
+                    block_size: 4,
+                },
+                Arc::new(full_binding(target.clone(), 4)),
+            );
+            assert_eq!(policy.target_for_worker(worker), target);
+        }
+        router.remove_worker(worker.url());
+        assert_eq!(router.worker_registry.get_by_model_fast("m").len(), 1);
+        for policy in policies {
+            assert_eq!(
+                policy.target_for_worker(worker).instance_id.as_ref(),
+                worker.url()
+            );
+        }
+    }
+
+    #[test]
+    fn inferred_adapter_requires_a_complete_pool_of_base_model_names() {
+        let worker = |url: &str, model: &str, aliases: &str| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorker::new(url.into(), WorkerType::Regular).with_labels(HashMap::from([
+                    ("model_id".into(), model.into()),
+                    ("served_model_aliases".into(), aliases.into()),
+                ])),
+            )
+        };
+        let base = worker("http://known", "base", "alias");
+        let unknown = worker("http://unknown", "unknown", "");
+        let workers = [base.clone(), unknown];
+        assert_eq!(Router::inferred_lora_name(&workers, "other"), None);
+        assert_eq!(
+            Router::inferred_lora_name(std::slice::from_ref(&base), "alias"),
+            None
+        );
+        assert_eq!(
+            Router::inferred_lora_name(&[base], "adapter"),
+            Some("adapter")
+        );
+        let mut router = create_test_kv_router();
+        let (supervisor, _) =
+            crate::kv_index::KvIndexSupervisor::new_http_full_attention(Client::new());
+        router.kv_index_supervisor = Some(Arc::new(supervisor));
+        assert_eq!(
+            router.kv_placement_eligibility(&workers, Some("alias"), None, false),
+            Some(vec![true, false])
+        );
+        assert_eq!(
+            router.kv_placement_eligibility(&workers, Some("other"), None, false),
+            Some(vec![false, false])
+        );
     }
 
     #[tokio::test]
@@ -4910,11 +5046,18 @@ mod tests {
     async fn completion_registered_source_credits_prepared_alias_and_preserves_raw() {
         use crate::kv_index::source::test_support::{event_payload, full_store};
         use crate::kv_index::KVEvent;
+        const SERVED_ALIAS: &str = "other-alias";
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            format!("http://{}", listener.local_addr().unwrap()),
-            WorkerType::Regular,
-        ));
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorker::new(
+                format!("http://{}", listener.local_addr().unwrap()),
+                WorkerType::Regular,
+            )
+            .with_labels(HashMap::from([(
+                "served_model_aliases".into(),
+                SERVED_ALIAS.into(),
+            )])),
+        );
         let mut router = create_test_kv_router();
         router.worker_registry.register(worker.clone());
         let policy = router.policy_registry.get_default_policy();
@@ -4945,6 +5088,9 @@ mod tests {
                 let source_url = source_url.clone();
                 async move { Json(serde_json::json!({"model_id":"qwen3","instance_id":source_url,"kv_block_size":4})) }
             }))
+            .route("/v1/models", axum::routing::get(|| async {
+                Json(serde_json::json!({"data":[{"id":SERVED_ALIAS,"parent":null}]}))
+            }))
             .route("/kv_event_sources", axum::routing::get(move || {
                 let sources = sources.clone();
                 async move { Json(sources) }
@@ -4962,6 +5108,13 @@ mod tests {
                 }
             }));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let labels =
+            crate::routers::served_model_labels(&Client::new(), worker.url(), None, None, true)
+                .await;
+        assert_eq!(
+            labels.get("served_model_aliases"),
+            worker.metadata().labels.get("served_model_aliases")
+        );
         let (supervisor, _signals) =
             crate::kv_index::KvIndexSupervisor::new_http_full_attention(Client::new());
         let supervisor = Arc::new(supervisor);
@@ -6108,6 +6261,7 @@ mod tests {
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             kv_index_supervisor: None,
+            kv_reconcile_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
             program_scheduler: None,
             _program_observation_handle: None,
@@ -6142,6 +6296,7 @@ mod tests {
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             kv_index_supervisor: None,
+            kv_reconcile_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
             program_scheduler: None,
             _program_observation_handle: None,
@@ -7748,6 +7903,7 @@ mod tests {
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             kv_index_supervisor: None,
+            kv_reconcile_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
             program_scheduler: None,
             _program_observation_handle: None,

@@ -302,22 +302,6 @@ impl KvIndexSupervisor {
             self.retire_worker(previous);
         }
         let indexer = self.acquire_identity(&key);
-        // Endpoints the subscribers are about to attach to, so the freshness
-        // task can notice a publisher that moves while keeping its identity.
-        let bound_sources: Arc<BoundSources> = Arc::new(
-            event_sources
-                .iter()
-                .map(|ev| {
-                    (
-                        ev.dp_rank,
-                        BoundSource {
-                            endpoint: ev.pub_endpoint.clone(),
-                            replay_endpoint: ev.replay_endpoint.clone(),
-                        },
-                    )
-                })
-                .collect(),
-        );
         let mut ranks = Vec::with_capacity(event_sources.len());
         let mut handles = Vec::with_capacity(event_sources.len());
         let mut targets = Vec::new();
@@ -354,6 +338,20 @@ impl KvIndexSupervisor {
             ranks.push(rank);
         }
 
+        // Revalidate only publishers with an installed subscriber.
+        let bound_sources: BoundSources = targets
+            .iter()
+            .map(|(source, _)| {
+                (
+                    source.dp_rank,
+                    BoundSource {
+                        endpoint: source.pub_endpoint.clone(),
+                        replay_endpoint: source.replay_endpoint.clone(),
+                        topic: source.topic.clone(),
+                    },
+                )
+            })
+            .collect();
         let provider = Arc::new(LayoutWorkerProvider {
             indexes,
             lifecycle: lifecycle.clone(),
@@ -363,7 +361,7 @@ impl KvIndexSupervisor {
             worker_url,
             handles.clone(),
             targets,
-            bound_sources,
+            Arc::new(bound_sources),
             capability,
         );
 

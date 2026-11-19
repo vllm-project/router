@@ -10,7 +10,7 @@ use super::probe::{
     fetch_native_full_sources, grpc_kv_event_source_entries, query_pd_kv_event_sources,
 };
 use super::{
-    dp_rank_suffix, events_enabled, layout_topic_mismatch, resolve_endpoint,
+    events_enabled, layout_topic_mismatch, resolve_endpoint, split_worker_rank,
     static_worker_discovery, worker_host, KvEventSourceEntry, KvIndexSupervisor, SourcesProbe,
 };
 use crate::config::StaticKvEventSources;
@@ -227,7 +227,7 @@ impl KvIndexSupervisor {
                     self.retire_observed_worker(&base, &lifecycle);
                     changed.insert(base);
                 }
-                SourceAction::Expire | SourceAction::Recover => {
+                SourceAction::Recover => {
                     unreachable!("descriptor probe does not recover replay")
                 }
             }
@@ -269,6 +269,7 @@ pub(super) enum StaticHybridMatch {
 pub(super) struct BoundSource {
     pub(super) endpoint: String,
     pub(super) replay_endpoint: Option<String>,
+    pub(super) topic: String,
 }
 
 /// The publisher endpoints a worker's hybrid subscribers are attached to, by
@@ -296,22 +297,7 @@ pub(super) async fn native_full_sources_match(
     let Some(host) = worker_host(worker) else {
         return StaticHybridMatch::Differs;
     };
-    if layout.as_ref() == Some(expected)
-        && sources
-            .values()
-            .filter(|source| events_enabled(source))
-            .count()
-            == bound.len()
-        && bound.iter().all(|(rank, installed)| {
-            sources.get(&rank.to_string()).is_some_and(|actual| {
-                expected
-                    .rank_capability(*rank)
-                    .and_then(|rank| rank.publisher_topic.as_deref())
-                    == Some(actual.topic.as_str())
-                    && !bound_source_moved(&host, installed, actual)
-            })
-        })
-    {
+    if layout.as_ref() == Some(expected) && bound_sources_match(&host, bound, &sources) {
         StaticHybridMatch::Matches
     } else {
         StaticHybridMatch::Differs
@@ -348,9 +334,7 @@ pub(super) async fn static_hybrid_sources_match(
 ) -> StaticHybridMatch {
     // A rank-pinned worker URL (`base@1`) still queries the engine's HTTP
     // control plane on the base URL.
-    let http_url = dp_rank_suffix(worker_url)
-        .and_then(|_| worker_url.rsplit_once('@').map(|(base, _)| base))
-        .unwrap_or(worker_url);
+    let (http_url, _) = split_worker_rank(worker_url);
     // Revalidate with the same probe (gRPC or HTTP) discovery used.
     let observed = if crate::backend::is_grpc_url(worker_url) {
         match tokio::time::timeout(
@@ -382,10 +366,17 @@ pub(super) async fn static_hybrid_sources_match(
             Err(_) => return StaticHybridMatch::Unavailable(SourcesProbe::Failed),
         }
     };
-    let Ok(expected) = static_worker_discovery(worker_url, config).sources else {
+    let Some(host) = worker_host(http_url) else {
         return StaticHybridMatch::Differs;
     };
-    let Some(host) = worker_host(http_url) else {
+    if let Some(bound) = bound {
+        return if bound_sources_match(&host, bound, &observed) {
+            StaticHybridMatch::Matches
+        } else {
+            StaticHybridMatch::Differs
+        };
+    }
+    let Ok(expected) = static_worker_discovery(worker_url, config).sources else {
         return StaticHybridMatch::Differs;
     };
     // A layout-only binding declares no endpoints, so check the answer
@@ -397,19 +388,6 @@ pub(super) async fn static_hybrid_sources_match(
         }
         if layout_topic_mismatch(config, &observed).is_some() {
             return StaticHybridMatch::Differs;
-        }
-        // The subscribers stay attached to the endpoints captured when the
-        // layout was installed, so a publisher that moved or disabled events
-        // while keeping its rank and topic has to retire the provider.
-        if let Some(bound) = bound {
-            let moved = bound.iter().any(|(rank, installed)| {
-                observed
-                    .get(&rank.to_string())
-                    .is_none_or(|actual| bound_source_moved(&host, installed, actual))
-            });
-            if moved {
-                return StaticHybridMatch::Differs;
-            }
         }
         let missing_rank = config.hybrid.as_ref().is_some_and(|layout| {
             layout.ranks.iter().any(|rank| {
@@ -452,9 +430,20 @@ pub(super) async fn static_hybrid_sources_match(
         StaticHybridMatch::Differs
     }
 }
-// The full-attention HTTP adapter reads the optional control-metadata contract,
-// then falls back to the engine config endpoint and the always-on metrics scrape,
-// so a stock vLLM worker needs no static configuration.
+
+fn bound_sources_match(
+    host: &str,
+    bound: &BoundSources,
+    sources: &super::KvEventSourcesResponse,
+) -> bool {
+    !bound.is_empty()
+        && bound.iter().all(|(rank, installed)| {
+            sources
+                .get(&rank.to_string())
+                .is_some_and(|actual| !bound_source_moved(host, installed, actual))
+        })
+}
+
 /// Whether the engine's current answer for one rank no longer matches the
 /// endpoints its subscribers are attached to. The engine reports the addresses
 /// it bound (`tcp://*:port`) while the installed source holds the resolved
@@ -476,6 +465,7 @@ pub(super) fn bound_source_moved(
         _ => false,
     };
     !events_enabled(actual)
+        || actual.topic != installed.topic
         || !same_endpoint(&actual.endpoint, &installed.endpoint)
         || !same_optional_endpoint(
             actual.replay_endpoint.as_deref(),

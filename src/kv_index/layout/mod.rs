@@ -1,6 +1,5 @@
 //! Cache layouts, restore rules and declared model capabilities.
 
-use crate::kv_index::types::TierMatch;
 mod capabilities;
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 pub(crate) use capabilities::valid_groups;
@@ -11,7 +10,8 @@ mod restore;
 
 pub(super) use evidence::full_attention_matches;
 pub(super) use evidence::{credit_from_pages, TailDrop};
-pub use restore::common_reusable_tokens;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+use restore::common_reusable_tokens;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheGroup {
@@ -32,23 +32,19 @@ pub enum GroupRule {
     CompressedFullAttention { tokens_per_state: u32 },
     /// Only a checkpoint block ending at the boundary is needed.
     Checkpoint,
-    /// All blocks intersecting the preceding `window_tokens` are needed.
+    /// The preceding `window_tokens - 1` tokens must be covered by a
+    /// contiguous run of cached blocks, or the run must reach the prompt start.
     SlidingWindow { window_tokens: u64 },
 }
 
-/// One required group's placement in a single trusted snapshot.
+/// Restore coverage of one group in the source snapshot.
 ///
-/// Segment boundaries in `matches` are in this group's blocks, not tokens.
-pub struct GroupView<'a> {
-    pub group_idx: u32,
-    pub block_size: u32,
-    pub kind: GroupRule,
-    pub matches: &'a [TierMatch],
-    /// Whether this group has published addressable page evidence.
-    /// A missing group cannot inherit evidence from another group.
-    pub page_evidence: bool,
+/// Segment boundaries use group blocks. Tier costs come from the original pages.
+struct GroupEvidence {
+    group: CacheGroup,
+    segments: Vec<(u32, u32)>,
     /// Hash-aligned partial page boundaries present in this group.
-    pub partial_ends: &'a [u64],
+    partial_ends: Vec<u64>,
 }
 
 /// Full attention restores from the root, never across a missing page. This
@@ -63,6 +59,7 @@ pub(crate) fn full_attention_prefix(ranges: impl IntoIterator<Item = (u32, u32)>
 }
 
 pub(super) fn window_blocks(window_tokens: u64, block_size: u64) -> u64 {
+    // vLLM counts at least one matching block before accepting a window hit.
     window_tokens.saturating_sub(1).div_ceil(block_size).max(1)
 }
 

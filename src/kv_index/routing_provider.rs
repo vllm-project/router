@@ -100,6 +100,7 @@ pub(crate) struct PromptKey<'a>(pub(crate) &'a [u32]);
 
 impl PartialEq for PromptKey<'_> {
     fn eq(&self, other: &Self) -> bool {
+        // Slice pointers compare both their address and length.
         std::ptr::eq(self.0, other.0)
     }
 }
@@ -199,6 +200,7 @@ mod tests {
     #[test]
     fn request_chains_share_only_identical_tokens_and_contracts() {
         let tokens: Vec<_> = (0..65).collect();
+        assert!(PromptKey(&tokens[..64]) != PromptKey(&tokens));
         let copy = tokens.clone();
         let full_domain = Arc::new(KvBlockIndexer::new());
         let hybrid_domain = Arc::new(KvBlockIndexer::new());

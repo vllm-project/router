@@ -55,7 +55,7 @@ pub(crate) async fn served_model_labels(
     }
     if let Ok(Ok(info)) = tokio::time::timeout(
         timeout,
-        crate::kv_index::discovery::query_pd_server_info(client, worker_url, api_key),
+        crate::kv_index::discovery::query_worker_metadata(client, worker_url, api_key),
     )
     .await
     {

@@ -7,9 +7,11 @@ Clients send OpenAI HTTP requests to the Router with either HTTP or gRPC workers
 | Deployment | Layout JSON to pass to the Router |
 | --- | --- |
 | [Full attention on standard vLLM](#colocated-prefill-and-decode), HTTP or gRPC | Pass the [one-group layout](#full-attention-layout) with `--kv-hybrid-layout`. |
-| Colocated HTTP worker that exposes `/kv_routing_capabilities` for one full-attention group | Omit the layout when [the worker meets the discovery requirements](#full-attention-layout). |
+| [Colocated full attention with capability discovery](#full-attention-layout), HTTP or gRPC | Omit the layout when the worker reports the full-attention layout and hash settings. |
 | [Hybrid attention](#hybrid-attention-models), HTTP or gRPC | Pass the checkpoint's group layout with `--kv-hybrid-layout`. |
 | [P/D disaggregation](#pd-routing), HTTP or gRPC | Pass [`pd-layout.json`](#pd-layout) with `--pd-hybrid-config` for this guide's `sha256_cbor` Prefill setup. |
+
+To upgrade an existing deployment, check that your workers use `sha256_cbor`, publish 32-byte hashes, and expose a replay endpoint. Update the [worker settings](#1-prepare-the-worker-settings) and restart affected workers if any of these settings change. Use the table above to choose the Router layout option. The Router rebuilds its in-memory index from replay and live events, so there is no index file to migrate.
 
 ## Colocated prefill and decode
 
@@ -28,7 +30,7 @@ EVENTS='{"enable_kv_cache_events":true,"endpoint":"tcp://*:5557","replay_endpoin
 
 #### Full-attention layout
 
-For one full-attention group without speculative decoding, LoRA or a KV connector, a colocated HTTP worker with `/kv_routing_capabilities` supplies the layout automatically. Skip this file and omit `--kv-hybrid-layout` from the Router command in that case.
+For one full-attention group without speculative decoding, LoRA or a KV connector, a capable colocated worker can report its layout and hash settings. For HTTP, look for `/kv_routing_capabilities`. For gRPC, the worker must include the capability data in `GetKvEventSources`. In either case, omit `--kv-hybrid-layout` from the Router command. Standard vLLM releases in the [version table](#versions) still require the file below.
 
 For standard vLLM, save this one-group example as `layout.json`. Copy `group_idx: 0` as shown for a 16-token block size. Set the model name and topic to match the worker. Use `http://127.0.0.1:8000` as the top-level key for HTTP or keep the `grpc://` key for gRPC.
 
@@ -126,7 +128,9 @@ request && sleep 1 && before=$(hits) && request && after=$(hits) &&
   printf 'Router KV-aware hits: %s → %s\n' "$before" "$after"
 ```
 
-An increase such as `0 → 1` confirms that KV-aware routing found a cached prefix. If the counts are equal, retry the final request after the Router has received the cache events. Use an idle pool for the check so the counter reflects your requests. To confirm vLLM reuse as well, compare this worker counter before and after the repeat. For P/D, check the Prefill worker.
+An increase such as `0 → 1` confirms a hit in the Router's index. Use an idle pool for the check, and retry the last request if events are still arriving. The Router uses its current event view to estimate reuse. If it cannot verify a compatible source or request identity, traffic still routes by load with zero cache credit.
+
+Compare the worker counter below before and after the repeat to measure actual reuse. For P/D, check the Prefill worker.
 
 ```bash
 curl -fsS http://127.0.0.1:8000/metrics | grep '^vllm:prefix_cache_hits_total'
@@ -219,22 +223,11 @@ Use the V4 Flash 0731 checkpoint with `--max-model-len 4096` and the engine-sele
 
 ### DeepSeek V4 Pro
 
-Use `--max-model-len 4096` and the engine-selected cache block sizes. The reference V4 Pro checkpoint used `--tensor-parallel-size 4`.
+Use `--max-model-len 4096` and the engine-selected cache block sizes. The reference V4 Pro checkpoint used `--tensor-parallel-size 4`. Copy the [V4 Flash rank fields](#deepseek-v4-flash) and update three groups.
 
-```json
-{
-  "hash_block_size": 4,
-  "partial_hash_hits": false,
-  "declared_groups": 5,
-  "groups": [
-    {"group_idx": 0, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 64, "prefix_cacheable": true, "prefix_replay_tokens": 0, "sliding_window": 128},
-    {"group_idx": 1, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 64, "prefix_cacheable": true, "prefix_replay_tokens": 0, "sliding_window": 128},
-    {"group_idx": 2, "kind": "mla_attention", "spec_type": "MLAAttentionSpec", "block_size": 256, "prefix_cacheable": true, "prefix_replay_tokens": 0, "tokens_per_state": "128", "cache_role": "sparse"},
-    {"group_idx": 3, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 8, "prefix_cacheable": true, "prefix_replay_tokens": 0, "sliding_window": 128},
-    {"group_idx": 4, "kind": "sliding_window_mla", "spec_type": "SlidingWindowMLASpec", "block_size": 4, "prefix_cacheable": true, "prefix_replay_tokens": 0, "sliding_window": 8}
-  ]
-}
-```
+- Group 2 uses `"tokens_per_state": "128"`.
+- Group 3 uses `"block_size": 8` and `"sliding_window": 128`.
+- Group 4 uses `"block_size": 4` and `"sliding_window": 8`.
 
 ### DeepSeek V4.1 Flash
 
@@ -300,7 +293,7 @@ Save this as `pd-layout.json`. Replace the empty `hybrid` object with the comple
 
 ## Versions
 
-Use the same vLLM release for the engine and its gRPC frontend. The table tells you how to supply the live and replay addresses in **colocated** deployments. Replay recovers missed events from the worker's recent history.
+Use the same vLLM release for the engine and its gRPC frontend. In colocated deployments, supply event addresses as shown below.
 
 | vLLM release | Colocated HTTP | Colocated gRPC | Hybrid or speculative decoding |
 | --- | --- | --- | --- |
@@ -308,7 +301,7 @@ Use the same vLLM release for the engine and its gRPC frontend. The table tells 
 | [0.31.0](https://github.com/vllm-project/vllm/tree/v0.31.0) | `/kv_event_sources` supplies both addresses. | Same as 0.30.0. | Adds V4.1 bounded replay. Use layouts with zero hash lookahead. |
 | [0.32.0](https://github.com/vllm-project/vllm/tree/v0.32.0) | Same as 0.31.0. | Same as 0.30.0. | Same KV event and layout options as 0.31.0. |
 | [0.33.0](https://github.com/vllm-project/vllm/tree/v0.33.0) | Same as 0.31.0. | Same as 0.30.0. | Adds events for nonzero hash lookahead. Use this release for the model recipes above. |
-| [0.34.0](https://github.com/vllm-project/vllm/tree/v0.34.0) | Same as 0.31.0. | Same as 0.30.0. | Same Router setup as 0.33.0. Check the layout against your running model. |
+| [0.34.0](https://github.com/vllm-project/vllm/tree/v0.34.0) | Same as 0.31.0. | Same as 0.30.0. | Uses 64-token blocks by default when the backend has no preferred size. Match the layout to the worker's resolved block size. |
 
 Standard workers on all five versions need layout JSON for the `sha256_cbor` setup in this guide. Address discovery covers the event connection. The JSON supplies the hash root and cache groups. In P/D disaggregation, include the Prefill addresses in [`pd-layout.json`](#pd-layout). Hash lookahead only matters if the worker uses future tokens when hashing cached blocks, such as the [Qwen3.8 MTP example](#qwen38-27b).
 

@@ -100,7 +100,7 @@ impl TcpReplay {
             hwm: Some(64),
         };
         let stream = Arc::new(EventStream::new(index));
-        let lease = stream.begin_replay();
+        let lease = stream.begin_replay().unwrap();
         spawn(source, stream, lease, self.ctx.clone(), signals)
     }
 
@@ -380,10 +380,40 @@ async fn tcp_recovery(monitor_failure: bool) {
 }
 
 #[tokio::test]
-async fn first_live_batch_can_overlap_startup_replay() {
+async fn first_live_batch_overlaps_only_the_same_replayed_payload() {
+    let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
+    let empty = batch_payload(&[]);
+    for matches_replay in [true, false] {
+        let tcp = TcpReplay::new();
+        let index = Arc::new(full_binding(target("zero-overlap"), BLOCK_SIZE));
+        let (tx, mut signals) = mpsc::channel(16);
+        let _handle = tcp.start(index.clone(), Some(tx));
+        tcp.subscribed().await;
+        tcp.history(&tcp.request(0).await, &[(0, &store)]);
+        wait_until(|| credit(&index) == 4).await;
+
+        if matches_replay {
+            tcp.live(0, &store);
+            tcp.live(1, &empty);
+            wait_until(|| next_seq(&index) == Some(2)).await;
+            assert_eq!(credit(&index), 4);
+            assert!(signals.try_recv().is_err());
+        } else {
+            tcp.live(0, &empty);
+            assert!(matches!(
+                signal(&mut signals).await,
+                IngestionSignal::IncarnationReset { .. }
+            ));
+            assert_eq!(credit(&index), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn live_sequence_without_room_for_a_successor_fences_cache() {
     let tcp = TcpReplay::new();
-    let index = Arc::new(full_binding(target("zero-overlap"), BLOCK_SIZE));
-    let (tx, mut signals) = mpsc::channel(16);
+    let index = Arc::new(full_binding(target("overflow"), BLOCK_SIZE));
+    let (tx, mut signals) = mpsc::channel(8);
     let _handle = tcp.start(index.clone(), Some(tx));
     let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
     let empty = batch_payload(&[]);
@@ -391,11 +421,17 @@ async fn first_live_batch_can_overlap_startup_replay() {
     tcp.history(&tcp.request(0).await, &[(0, &store)]);
     wait_until(|| credit(&index) == 4).await;
 
-    tcp.live(0, &store);
-    tcp.live(1, &empty);
-    wait_until(|| next_seq(&index) == Some(2)).await;
-    assert_eq!(credit(&index), 4);
-    assert!(signals.try_recv().is_err());
+    tcp.live(i64::MAX, &empty);
+    assert!(matches!(
+        signal(&mut signals).await,
+        IngestionSignal::Invalidated {
+            reason: "invalid live sequence",
+            ..
+        }
+    ));
+    assert_eq!(credit(&index), 0);
+    tcp.history(&tcp.request(0).await, &[(0, &store)]);
+    wait_until(|| credit(&index) == 4).await;
 }
 
 #[tokio::test]
@@ -457,11 +493,11 @@ fn monitor_failure_fences_only_active_source_and_respects_stale_lease() {
     let peer = Arc::new(full_binding(target("peer"), BLOCK_SIZE).with_shared_index(shared));
     let active_stream = Arc::new(EventStream::new(active.clone()));
     let peer_stream = EventStream::new(peer.clone());
-    let stale = active_stream.begin_replay();
-    let active_lease = active_stream.begin_replay();
+    let stale = active_stream.begin_replay().unwrap();
+    let active_lease = active_stream.begin_replay().unwrap();
 
     let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
-    let peer_lease = peer_stream.begin_replay();
+    let peer_lease = peer_stream.begin_replay().unwrap();
     for (stream, lease) in [
         (active_stream.as_ref(), active_lease),
         (&peer_stream, peer_lease),

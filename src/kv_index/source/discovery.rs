@@ -31,10 +31,10 @@ use lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
 use observer::WorkerObservation;
 use reconcile::{static_hybrid_sources_match, StaticHybridMatch};
 
+pub(crate) use probe::query_worker_metadata;
 use probe::{
     fetch_kv_event_sources, fetch_native_full_sources, grpc_model_id, layout_model, server_model_id,
 };
-pub(crate) use probe::{query_pd_server_info, query_worker_metadata};
 
 /// The worker-stable core of a cache identity. One indexer per key.
 ///
@@ -369,31 +369,10 @@ impl KvIndexSupervisor {
             return match self.static_pd_sources.get(worker_url) {
                 Some(config) => {
                     let source = pd_static_source(worker_url, config);
-                    if source.hybrid.is_none() {
-                        static_pd_discovery(worker_url, config)
-                    } else {
-                        match static_hybrid_sources_match(
-                            &self.client,
-                            worker_url,
-                            self.api_key.as_deref(),
-                            &source,
-                            None,
-                        )
-                        .await
-                        {
-                            StaticHybridMatch::Differs => failed_hybrid_discovery(
-                                "configured hybrid event sources do not match worker".into(),
-                            ),
-                            StaticHybridMatch::Unavailable(SourcesProbe::Failed) => failed_hybrid_discovery(
-                                "cannot confirm configured hybrid event sources while the control probe is failing".into(),
-                            ),
-                            StaticHybridMatch::Unavailable(SourcesProbe::Unsupported) => {
-                                log_static_layout_trusted(worker_url, SourcesProbe::Unsupported);
-                                static_pd_discovery(worker_url, config)
-                            }
-                            StaticHybridMatch::Matches => static_pd_discovery(worker_url, config),
-                        }
+                    if let Err(reason) = self.verify_static_source(worker_url, &source).await {
+                        return failed_hybrid_discovery(reason.into());
                     }
+                    static_pd_discovery(worker_url, config)
                 }
                 None => {
                     discover_worker(&self.client, worker_url, true, self.api_key.as_deref()).await
@@ -440,31 +419,8 @@ impl KvIndexSupervisor {
                     ranks = config.endpoints.len(),
                     "using configured static KV event sources"
                 );
-                if config.hybrid.is_some() {
-                    match static_hybrid_sources_match(
-                        &self.client,
-                        worker_url,
-                        self.api_key.as_deref(),
-                        config,
-                        None,
-                    )
-                    .await
-                    {
-                        StaticHybridMatch::Differs => {
-                            return failed_hybrid_discovery(
-                                "configured hybrid event sources do not match worker".into(),
-                            );
-                        }
-                        StaticHybridMatch::Unavailable(SourcesProbe::Failed) => {
-                            return failed_hybrid_discovery(
-                                "cannot confirm configured hybrid event sources while the control probe is failing".into(),
-                            );
-                        }
-                        StaticHybridMatch::Unavailable(SourcesProbe::Unsupported) => {
-                            log_static_layout_trusted(worker_url, SourcesProbe::Unsupported)
-                        }
-                        StaticHybridMatch::Matches => {}
-                    }
+                if let Err(reason) = self.verify_static_source(worker_url, config).await {
+                    return failed_hybrid_discovery(reason.into());
                 }
                 static_worker_discovery(worker_url, config)
             }
@@ -477,6 +433,37 @@ impl KvIndexSupervisor {
                 .await
             }
             None => discover_worker(&self.client, worker_url, false, self.api_key.as_deref()).await,
+        }
+    }
+
+    async fn verify_static_source(
+        &self,
+        worker_url: &str,
+        config: &StaticKvEventSources,
+    ) -> Result<(), &'static str> {
+        if config.hybrid.is_none() {
+            return Ok(());
+        }
+        match static_hybrid_sources_match(
+            &self.client,
+            worker_url,
+            self.api_key.as_deref(),
+            config,
+            None,
+        )
+        .await
+        {
+            StaticHybridMatch::Differs => {
+                Err("configured hybrid event sources do not match worker")
+            }
+            StaticHybridMatch::Unavailable(SourcesProbe::Failed) => Err(
+                "cannot confirm configured hybrid event sources while the control probe is failing",
+            ),
+            StaticHybridMatch::Unavailable(SourcesProbe::Unsupported) => {
+                log_static_layout_trusted(worker_url, SourcesProbe::Unsupported);
+                Ok(())
+            }
+            StaticHybridMatch::Matches => Ok(()),
         }
     }
 
@@ -611,18 +598,20 @@ async fn discover_worker(
     discover_full_attention_http_worker(client, worker_url, api_key).await
 }
 
-/// The data-parallel rank a worker URL pins, as in `http://host:8000@3`.
-fn dp_rank_suffix(worker_url: &str) -> Option<u32> {
-    let (base, rank) = worker_url.rsplit_once('@')?;
-    if base.is_empty() {
-        return None;
+/// Split a pinned data-parallel rank, as in `http://host:8000@3`.
+fn split_worker_rank(worker_url: &str) -> (&str, Option<u32>) {
+    let Some((base, rank)) = worker_url.rsplit_once('@') else {
+        return (worker_url, None);
+    };
+    match rank.parse() {
+        Ok(rank) if !base.is_empty() => (base, Some(rank)),
+        _ => (worker_url, None),
     }
-    rank.parse().ok()
 }
 
 fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> WorkerDiscovery {
     let model = config.model.trim().to_owned();
-    let rank_suffix = dp_rank_suffix(worker_url);
+    let (_, rank_suffix) = split_worker_rank(worker_url);
     let server_info = ServerInfo {
         // Model/block size are declarations; the registry URL is not a boot ID.
         model_id: Some(model.clone()),
@@ -881,6 +870,7 @@ fn resolve_endpoint(endpoint: &str, worker_host: &str) -> Result<String, String>
 
 /// Extract the host from a worker URL (`http://10.0.0.5:8000` → `10.0.0.5`).
 fn worker_host(worker_url: &str) -> Option<String> {
+    let (worker_url, _) = split_worker_rank(worker_url);
     let with_scheme = if worker_url.contains("://") {
         worker_url.to_string()
     } else {

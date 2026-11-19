@@ -113,6 +113,10 @@ mod tests {
     fn session_and_report_mode_preserve_cache_credit_only_for_known_values() {
         for (extension, expected) in [
             (json!({"echo": true, "logprobs": 0}), false),
+            (
+                json!({"echo": true, "logprobs": 0, "return_token_ids": true}),
+                false,
+            ),
             (json!({"echo": false, "logprobs": 0}), true),
             (json!({"session_id": "shared"}), true),
             (json!({"session_id": null}), true),

@@ -342,8 +342,9 @@ fn observe(
         }
     } else {
         let mut residency = Residency::default();
-        let accepted = residency.observe(tier, incremental);
-        debug_assert!(accepted);
+        if !residency.observe(tier, incremental) {
+            return Err(PageWriteError::Capacity);
+        }
         if tier != StorageTier::Device {
             *non_device_tiers += 1;
         }
@@ -408,7 +409,7 @@ impl PageTable {
                             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
                                 id.checked_add(1)
                             })
-                            .expect("KV page owner IDs exhausted"),
+                            .map_err(|_| PageWriteError::Capacity)?,
                         owner: owner.clone(),
                     }),
                     base: Pages::default(),

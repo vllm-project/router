@@ -173,32 +173,20 @@ fn worker_auth_uses_only_the_configured_key() {
 }
 
 #[test]
-fn resolve_endpoint_rewrites_bind_star() {
-    assert_eq!(
-        resolve_endpoint("tcp://*:5557", "10.0.0.5").unwrap(),
-        "tcp://10.0.0.5:5557"
-    );
-    assert_eq!(
-        resolve_endpoint("tcp://0.0.0.0:5558", "10.0.0.5").unwrap(),
-        "tcp://10.0.0.5:5558"
-    );
-}
-
-#[test]
-fn resolve_endpoint_keeps_resolved_host() {
-    assert_eq!(
-        resolve_endpoint("tcp://10.0.0.5:5557", "ignored").unwrap(),
-        "tcp://10.0.0.5:5557"
-    );
-}
-
-#[test]
-fn resolve_endpoint_passthrough_non_tcp() {
-    assert_eq!(
-        resolve_endpoint("ipc:///tmp/x", "h").unwrap(),
-        "ipc:///tmp/x"
-    );
-    assert_eq!(resolve_endpoint("inproc://x", "h").unwrap(), "inproc://x");
+fn resolves_bind_endpoints_and_preserves_explicit_addresses() {
+    let ipv6 = worker_host("grpc://[::1]:50051@3").unwrap();
+    for (endpoint, host, expected) in [
+        ("tcp://*:5557", "10.0.0.5", "tcp://10.0.0.5:5557"),
+        ("tcp://0.0.0.0:5558", "10.0.0.5", "tcp://10.0.0.5:5558"),
+        ("tcp://10.0.0.5:5557", "ignored", "tcp://10.0.0.5:5557"),
+        ("tcp://[::]:5557", ipv6.as_str(), "tcp://[::1]:5557"),
+        ("tcp://[::ffff:127.0.0.1]:5557", "", "tcp://127.0.0.1:5557"),
+        ("ipc:///tmp/x", "", "ipc:///tmp/x"),
+        ("inproc://x", "", "inproc://x"),
+    ] {
+        assert_eq!(resolve_endpoint(endpoint, host).unwrap(), expected);
+    }
+    assert!(resolve_endpoint("tcp://*:0", &ipv6).is_err());
 }
 
 #[test]
@@ -208,11 +196,13 @@ fn bound_source_accepts_the_engines_bind_endpoints() {
     let installed = BoundSource {
         endpoint: "tcp://127.0.0.1:26258".to_string(),
         replay_endpoint: Some("tcp://127.0.0.1:27258".to_string()),
+        topic: "boot-1".to_string(),
     };
     let actual = KvEventSourceEntry {
         publisher: Some("zmq".to_string()),
         endpoint: "tcp://*:26258".to_string(),
         replay_endpoint: Some("tcp://*:27258".to_string()),
+        topic: installed.topic.clone(),
         ..KvEventSourceEntry::default()
     };
     assert!(!bound_source_moved("127.0.0.1", &installed, &actual));
@@ -241,26 +231,13 @@ fn bound_source_accepts_the_engines_bind_endpoints() {
 }
 
 #[test]
-fn resolved_tcp_sources_reuse_connect_validation_without_http_worker_admission() {
-    let host = worker_host("grpc://[::1]:50051").unwrap();
-    assert_eq!(
-        resolve_endpoint("tcp://[::]:5557", &host).unwrap(),
-        "tcp://[::1]:5557"
-    );
-    assert_eq!(
-        resolve_endpoint("tcp://[::ffff:127.0.0.1]:5557", &host).unwrap(),
-        "tcp://127.0.0.1:5557"
-    );
-    assert!(resolve_endpoint("tcp://*:0", &host).is_err());
-}
-
-#[test]
 fn worker_host_extracts_from_url() {
     assert_eq!(
         worker_host("http://10.0.0.5:8000").as_deref(),
         Some("10.0.0.5")
     );
     assert_eq!(worker_host("10.0.0.5:8000").as_deref(), Some("10.0.0.5"));
+    assert_eq!(worker_host("10.0.0.5:8000@3").as_deref(), Some("10.0.0.5"));
     assert_eq!(
         worker_host("http://host.example:80").as_deref(),
         Some("host.example")
@@ -521,11 +498,12 @@ async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
     use serde_json::json;
 
     let topic = "kv/full-boot-1";
-    for (algorithm, declared_groups, native) in [
-        (None, None, false),
-        (Some("sha256"), Some(1), false),
-        (Some("sha256_cbor"), None, false),
-        (Some("sha256_cbor"), Some(1), true),
+    for (algorithm, declared_groups, declare_adapters, native) in [
+        (None, None, false, false),
+        (Some("sha256"), Some(1), true, false),
+        (Some("sha256_cbor"), None, true, false),
+        (Some("sha256_cbor"), Some(1), false, false),
+        (Some("sha256_cbor"), Some(1), true, true),
     ] {
         let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
         let sources = Arc::new(Mutex::new(json!({"0": {
@@ -541,7 +519,11 @@ async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
             let mut layout = plain_full_layout("full-model", topic, 8);
             layout.ranks[0].hash_algorithm = algorithm.to_owned();
             layout.ranks[0].declared_groups = declared_groups;
-            automatic_layout(layout)
+            let mut layout = automatic_layout(layout);
+            if !declare_adapters {
+                layout.as_object_mut().unwrap().remove("adapters");
+            }
+            layout
         });
         let capability_response = Arc::new(Mutex::new(layout));
         let app = Router::new().route(
@@ -594,6 +576,8 @@ async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
             })
             .await
             .expect("monitor did not revoke the changed hash contract");
+            assert!(!supervisor.workers_have_cache_bindings([(worker.as_str(), 0)].into_iter()));
+            assert!(supervisor.worker_registrations()[&worker].info.is_none());
             let refreshed = supervisor.refresh_discovered_workers().await;
             assert!(refreshed[&worker]
                 .provider
@@ -732,6 +716,23 @@ async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
     sources.write().await["1"]["topic"] = serde_json::json!("boot-2-rank-1");
     assert_eq!(
         static_hybrid_sources_match(&client, &worker, None, &config, None).await,
+        StaticHybridMatch::Differs
+    );
+    let installed = HashMap::from([(
+        0,
+        BoundSource {
+            endpoint: config.endpoints[0].clone(),
+            replay_endpoint: Some(config.replay_endpoints.as_ref().unwrap()[0].clone()),
+            topic: "boot-1-rank-0".to_owned(),
+        },
+    )]);
+    assert_eq!(
+        static_hybrid_sources_match(&client, &worker, None, &config, Some(&installed)).await,
+        StaticHybridMatch::Matches
+    );
+    sources.write().await["0"]["topic"] = serde_json::json!("boot-2-rank-0");
+    assert_eq!(
+        static_hybrid_sources_match(&client, &worker, None, &config, Some(&installed)).await,
         StaticHybridMatch::Differs
     );
     task.abort();
@@ -1558,8 +1559,10 @@ async fn rank_pinned_static_source_binds_its_own_rank() {
     let hybrid = discovery.hybrid.expect("layout is attached");
     assert_eq!(hybrid.ranks.len(), 1);
     assert_eq!(hybrid.ranks[0].rank, 1);
-    assert!(dp_rank_suffix("http://127.0.0.1:8000@1").is_some());
-    assert!(dp_rank_suffix("http://127.0.0.1:8000").is_none());
+    assert_eq!(
+        split_worker_rank("http://127.0.0.1:8000@1"),
+        ("http://127.0.0.1:8000", Some(1)),
+    );
 }
 
 /// A layout without declared endpoints is legal on engines that report
@@ -1676,16 +1679,15 @@ const METRICS_ONLY: &str = "\
 vllm:cache_config_info{block_size=\"16\",effective_attention_block_size=\"16\",enable_prefix_caching=\"True\",prefix_caching_hash_algo=\"sha256_cbor\",hash_block_size=\"None\",kv_cache_layout=\"None\",engine=\"0\"} 1.0
 ";
 
-fn metrics_and_models_router() -> axum::Router {
+fn metrics_and_models_router(metrics: &'static str) -> axum::Router {
     use axum::{routing::get, Router};
 
-    async fn metrics() -> &'static str {
-        METRICS_ONLY
-    }
-    Router::new().route("/metrics", get(metrics)).route(
-        "/v1/models",
-        get(|| async { axum::Json(serde_json::json!({"data": [{"id": "mock-model"}]})) }),
-    )
+    Router::new()
+        .route("/metrics", get(move || async move { metrics }))
+        .route(
+            "/v1/models",
+            get(|| async { axum::Json(serde_json::json!({"data": [{"id": "mock-model"}]})) }),
+        )
 }
 
 /// Spawn a worker that serves only what a plain `vllm serve` exposes.
@@ -1698,7 +1700,9 @@ async fn spawn_metrics_only_worker(router: axum::Router) -> (String, tokio::task
 
 #[tokio::test]
 async fn metrics_only_worker_supplies_cache_metadata() {
-    let (worker, server) = spawn_metrics_only_worker(metrics_and_models_router()).await;
+    let metrics = "vllm:cache_config_info{engine=\"0\"} 1.0\n\
+        vllm:cache_config_info{block_size=\"16\",effective_attention_block_size=\"16\",engine=\"1\"} 1.0\n";
+    let (worker, server) = spawn_metrics_only_worker(metrics_and_models_router(metrics)).await;
 
     let info = query_worker_metadata(&reqwest::Client::new(), &worker, None)
         .await
@@ -1725,7 +1729,7 @@ async fn cache_metrics_and_event_addresses_do_not_prove_a_hash_contract() {
         "schema_version": 1,
         "enable_kv_cache_events": true
     }});
-    let router = metrics_and_models_router().route(
+    let router = metrics_and_models_router(METRICS_ONLY).route(
         "/kv_event_sources",
         get(move || {
             let sources = sources.clone();

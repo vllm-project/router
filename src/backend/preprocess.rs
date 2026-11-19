@@ -130,6 +130,8 @@ pub(crate) fn completion_cache_read_fallback(request: &CompletionRequest) -> Opt
                 "add_special_tokens" => value.is_boolean(),
                 "priority" => value.is_i64() || value.is_u64(),
                 "truncate_prompt_tokens" => true,
+                // vLLM uses this flag for response IDs and echo detokenization.
+                // Its cache-read gate depends on prompt logprobs and explicit skips.
                 "return_token_ids" => value.is_boolean() || value.is_null(),
                 "session_id" => value.is_string() || value.is_null(),
                 "vllm_xargs" => {

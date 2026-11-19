@@ -6,7 +6,7 @@ use super::*;
 use crate::kv_index::source::test_support::{event_batch, full_store, gpu_remove};
 use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::types::TierBits;
-use crate::kv_index::{KVEvent, Locality, RoutableTarget, SourceBinding, StorageTier, TierMatch};
+use crate::kv_index::{KVEvent, RoutableTarget, SourceBinding, StorageTier};
 
 fn target(name: &str, rank: u32) -> RoutableTarget {
     RoutableTarget {
@@ -20,7 +20,6 @@ fn target(name: &str, rank: u32) -> RoutableTarget {
 fn restore_coverage_unites_local_tiers_and_excludes_external_pages() {
     use StorageTier::{Device, Disk, External, HostPinned};
 
-    let worker = target("w", 0);
     let full = CacheGroup {
         group_idx: 0,
         block_size: 16,
@@ -33,7 +32,7 @@ fn restore_coverage_unites_local_tiers_and_excludes_external_pages() {
         Some(External),
     ]];
     assert_eq!(
-        credit_from_groups(&worker, &[full], &claims, 16, 64, 0),
+        credit_from_groups(&[full], &claims, 16, 64, 0),
         (48, Some(Disk))
     );
     for mask in 0..16 {
@@ -42,7 +41,6 @@ fn restore_coverage_unites_local_tiers_and_excludes_external_pages() {
             .find(|tier| mask & TierBits::bit(*tier) != 0);
         assert_eq!(
             credit_from_pages(
-                &worker,
                 &[full],
                 &[vec![TierBits(mask)]],
                 16,
@@ -66,14 +64,13 @@ fn restore_coverage_unites_local_tiers_and_excludes_external_pages() {
         (vec![None, None, Some(HostPinned)], (0, None)),
     ] {
         assert_eq!(
-            credit_from_groups(&worker, &[partial], &[pages], 16, 48, 0),
+            credit_from_groups(&[partial], &[pages], 16, 48, 0),
             expected
         );
     }
 }
 
 fn credit_from_groups(
-    target: &RoutableTarget,
     groups: &[CacheGroup],
     claims: &[Vec<Option<StorageTier>>],
     hash_unit: usize,
@@ -89,22 +86,13 @@ fn credit_from_groups(
                 .collect::<Vec<_>>()
         })
         .collect();
-    credit_from_pages(
-        target,
-        groups,
-        &pages,
-        hash_unit,
-        cap,
-        replay,
-        TailDrop::default(),
-    )
+    credit_from_pages(groups, &pages, hash_unit, cap, replay, TailDrop::default())
 }
 
 #[test]
 fn group_evidence_combines_partial_checkpoint_and_tier() {
     use StorageTier::{Device, HostPinned};
 
-    let worker = target("w", 0);
     let groups = [
         CacheGroup {
             group_idx: 0,
@@ -122,20 +110,20 @@ fn group_evidence_combines_partial_checkpoint_and_tier() {
         vec![None, Some(Device), Some(HostPinned), None],
     ];
     assert_eq!(
-        credit_from_groups(&worker, &groups[..1], &claims[..1], 8, 32, 0),
+        credit_from_groups(&groups[..1], &claims[..1], 8, 32, 0),
         (32, Some(Device))
     );
     assert_eq!(
-        credit_from_groups(&worker, &groups, &claims, 8, 32, 0),
+        credit_from_groups(&groups, &claims, 8, 32, 0),
         (24, Some(HostPinned))
     );
     assert_eq!(
-        credit_from_groups(&worker, &groups, &claims, 8, 23, 0),
+        credit_from_groups(&groups, &claims, 8, 23, 0),
         (16, Some(Device))
     );
     claims[1][2] = None;
     assert_eq!(
-        credit_from_groups(&worker, &groups, &claims, 8, 32, 0),
+        credit_from_groups(&groups, &claims, 8, 32, 0),
         (16, Some(Device))
     );
 }
@@ -144,7 +132,6 @@ fn group_evidence_combines_partial_checkpoint_and_tier() {
 fn replay_prices_groups_at_the_restore_boundary() {
     use StorageTier::{Device, HostPinned};
 
-    let worker = target("w", 0);
     let groups = [
         CacheGroup {
             group_idx: 0,
@@ -168,24 +155,20 @@ fn replay_prices_groups_at_the_restore_boundary() {
         vec![None, None, Some(Device), Some(HostPinned)],
     ];
     assert_eq!(
-        credit_from_groups(&worker, &groups, &claims, 16, 64, 16),
+        credit_from_groups(&groups, &claims, 16, 64, 16),
         (48, Some(HostPinned))
     );
     assert_eq!(
-        credit_from_groups(&worker, &groups, &claims, 16, 64, 0),
+        credit_from_groups(&groups, &claims, 16, 64, 0),
         (64, Some(HostPinned))
     );
-    assert_eq!(
-        credit_from_groups(&worker, &groups, &claims, 16, 64, 64),
-        (0, None)
-    );
+    assert_eq!(credit_from_groups(&groups, &claims, 16, 64, 64), (0, None));
 }
 
 #[test]
 fn mtp_tail_proof_restores_the_mamba_checkpoint_and_prices_the_dense_page() {
     use StorageTier::{Device, HostPinned};
 
-    let worker = target("w", 0);
     let groups = [
         CacheGroup {
             group_idx: 0,
@@ -213,7 +196,6 @@ fn mtp_tail_proof_restores_the_mamba_checkpoint_and_prices_the_dense_page() {
     }
     let credit = |claims: &[Vec<TierBits>], cap| {
         credit_from_pages(
-            &worker,
             &groups,
             claims,
             16,
@@ -228,34 +210,28 @@ fn mtp_tail_proof_restores_the_mamba_checkpoint_and_prices_the_dense_page() {
     assert_eq!(credit(&claims, 1792), (1776, Some(HostPinned)));
     assert_eq!(credit(&claims, 1776), (1776, Some(HostPinned)));
     assert_eq!(credit(&claims, 1775), (832, Some(Device)));
+    claims[0][1792 / 16 - 1] = TierBits(TierBits::bit(Device));
+    // Both groups reach 1792, below the cap, so the dense proof still loses one unit.
+    assert_eq!(credit(&claims, 1808), (1776, Some(HostPinned)));
     claims[1][1792 / 16 - 1] = TierBits::default();
     assert_eq!(credit(&claims, 1792), (832, Some(Device)));
 }
 
-fn hit(target: &RoutableTarget, segments: &[(u32, u32)]) -> TierMatch {
-    TierMatch {
-        target: target.clone(),
-        tier: StorageTier::Device,
+fn group(id: u32, block_size: u32, kind: GroupRule, segments: &[(u32, u32)]) -> GroupEvidence {
+    GroupEvidence {
+        group: CacheGroup {
+            group_idx: id,
+            block_size,
+            kind,
+        },
         segments: segments.to_vec(),
-        locality: Locality::Local,
-    }
-}
-
-fn group<'a>(id: u32, block_size: u32, kind: GroupRule, matches: &'a [TierMatch]) -> GroupView<'a> {
-    GroupView {
-        group_idx: id,
-        block_size,
-        kind,
-        matches,
-        page_evidence: true,
-        partial_ends: &[],
+        partial_ends: Vec::new(),
     }
 }
 
 #[test]
 fn restore_rules_respect_the_cap_and_page_gaps() {
-    let worker = target("w", 0);
-    let dense = [hit(&worker, &[(0, 4)])];
+    let dense = [(0, 4)];
     let cases = [
         (GroupRule::FullAttention, vec![(0, 2)], 8, 4),
         (GroupRule::FullAttention, vec![(1, 4)], 8, 0),
@@ -301,13 +277,12 @@ fn restore_rules_respect_the_cap_and_page_gaps() {
         ),
     ];
     for (kind, segments, cap, expected) in cases {
-        let pages = [hit(&worker, &segments)];
         let groups = [
             group(0, 2, GroupRule::FullAttention, &dense),
-            group(1, 2, kind, &pages),
+            group(1, 2, kind, &segments),
         ];
         assert_eq!(
-            common_reusable_tokens(&worker, &groups, cap),
+            common_reusable_tokens(&groups, cap),
             expected,
             "kind={kind:?} segments={segments:?} cap={cap}"
         );
@@ -316,117 +291,109 @@ fn restore_rules_respect_the_cap_and_page_gaps() {
 
 #[test]
 fn missing_sliding_pages_never_inherit_dense_group_credit() {
-    let worker = target("w", 0);
-    let dense = [hit(&worker, &[(0, 4)])];
-    let mut sliding = group(1, 16, GroupRule::SlidingWindow { window_tokens: 32 }, &[]);
-    sliding.page_evidence = false;
+    let dense = [(0, 4)];
+    let sliding = group(1, 16, GroupRule::SlidingWindow { window_tokens: 32 }, &[]);
     let groups = [group(0, 16, GroupRule::FullAttention, &dense), sliding];
-    assert_eq!(common_reusable_tokens(&worker, &groups, 64), 0);
+    assert_eq!(common_reusable_tokens(&groups, 64), 0);
 }
 
 #[test]
 fn interleaved_checkpoints_descend_to_zero() {
-    let worker = target("w", 0);
     let odd: Vec<_> = (0..64).step_by(2).map(|i| (i, i + 1)).collect();
     let even: Vec<_> = (1..64).step_by(2).map(|i| (i, i + 1)).collect();
-    let a = [hit(&worker, &odd)];
-    let b = [hit(&worker, &even)];
     let groups = [
-        group(0, 1, GroupRule::Checkpoint, &a),
-        group(1, 1, GroupRule::Checkpoint, &b),
+        group(0, 1, GroupRule::Checkpoint, &odd),
+        group(1, 1, GroupRule::Checkpoint, &even),
     ];
-    assert_eq!(common_reusable_tokens(&worker, &groups, 64), 0);
+    assert_eq!(common_reusable_tokens(&groups, 64), 0);
 }
 
 #[test]
 fn sliding_window_is_rechecked_after_checkpoint_rewinds() {
-    let worker = target("w", 0);
-    let checkpoints = [hit(&worker, &[(3, 4)])];
-    let tail = [hit(&worker, &[(4, 6)])];
+    let checkpoints = [(3, 4)];
+    let tail = [(4, 6)];
     let groups = [
         group(0, 16, GroupRule::Checkpoint, &checkpoints),
         group(1, 16, GroupRule::SlidingWindow { window_tokens: 32 }, &tail),
     ];
-    assert_eq!(common_reusable_tokens(&worker, &groups, 96), 0);
+    assert_eq!(common_reusable_tokens(&groups, 96), 0);
 }
 
 /// vLLM also caches a prefix ending inside a page (`cache_partial_block`).
 /// The boundary is the partial token end, not the page end.
 #[test]
 fn a_partial_page_boundary_is_restorable() {
-    let worker = target("w", 0);
     // Page 576, a partial entry at 560: no page-level hash exists yet.
     let mut full_group = group(0, 576, GroupRule::FullAttention, &[]);
-    full_group.partial_ends = &[560];
-    assert_eq!(common_reusable_tokens(&worker, &[full_group], 1024), 560);
+    full_group.partial_ends = vec![560];
+    assert_eq!(common_reusable_tokens(&[full_group], 1024), 560);
 }
 
 /// A checkpoint needs only itself, so its partial entry alone is enough.
 #[test]
 fn a_partial_checkpoint_is_restorable_on_its_own() {
-    let worker = target("w", 0);
     let mut checkpoint = group(0, 576, GroupRule::Checkpoint, &[]);
-    checkpoint.partial_ends = &[560];
-    assert_eq!(common_reusable_tokens(&worker, &[checkpoint], 1024), 560);
+    checkpoint.partial_ends = vec![560];
+    assert_eq!(common_reusable_tokens(&[checkpoint], 1024), 560);
 }
 
 #[test]
 fn partial_checkpoint_respects_cap_and_does_not_need_earlier_pages() {
-    let worker = target("w", 0);
     let mut checkpoint = group(0, 576, GroupRule::Checkpoint, &[]);
-    checkpoint.partial_ends = &[560, 1136];
-    assert_eq!(common_reusable_tokens(&worker, &[checkpoint], 544), 0);
-    let mut checkpoint = group(0, 576, GroupRule::Checkpoint, &[]);
-    checkpoint.partial_ends = &[560, 1136];
-    assert_eq!(common_reusable_tokens(&worker, &[checkpoint], 1100), 560);
-    let mut checkpoint = group(0, 576, GroupRule::Checkpoint, &[]);
-    checkpoint.partial_ends = &[560, 1136];
-    assert_eq!(common_reusable_tokens(&worker, &[checkpoint], 1152), 1136);
+    checkpoint.partial_ends = vec![560, 1136];
+    assert_eq!(
+        common_reusable_tokens(std::slice::from_ref(&checkpoint), 544),
+        0
+    );
+    assert_eq!(
+        common_reusable_tokens(std::slice::from_ref(&checkpoint), 1100),
+        560
+    );
+    assert_eq!(
+        common_reusable_tokens(std::slice::from_ref(&checkpoint), 1152),
+        1136
+    );
 }
 
 #[test]
 fn dense_partial_requires_earlier_full_pages() {
-    let worker = target("w", 0);
     let mut full = group(0, 576, GroupRule::FullAttention, &[]);
-    full.partial_ends = &[1136];
-    assert_eq!(common_reusable_tokens(&worker, &[full], 1152), 0);
-    let hits = [hit(&worker, &[(0, 1)])];
+    full.partial_ends = vec![1136];
+    assert_eq!(common_reusable_tokens(&[full], 1152), 0);
+    let hits = [(0, 1)];
     let mut full = group(0, 576, GroupRule::FullAttention, &hits);
-    full.partial_ends = &[1136];
-    assert_eq!(common_reusable_tokens(&worker, &[full], 1152), 1136);
+    full.partial_ends = vec![1136];
+    assert_eq!(common_reusable_tokens(&[full], 1152), 1136);
 }
 
 #[test]
 fn sparse_checkpoints_and_different_block_sizes_use_the_same_boundary() {
-    let worker = target("w", 0);
-    let full = [hit(&worker, &[(0, 6)])]; // 0..96, blocks of 16
-    let state = [hit(&worker, &[(0, 2)])]; // checkpoints at 32 and 64
+    let full = [(0, 6)]; // 0..96, blocks of 16
+    let state = [(0, 2)]; // checkpoints at 32 and 64
     let groups = [
         group(0, 16, GroupRule::FullAttention, &full),
         group(1, 32, GroupRule::Checkpoint, &state),
     ];
-    assert_eq!(common_reusable_tokens(&worker, &groups, 127), 64);
-    assert_eq!(common_reusable_tokens(&worker, &groups, 63), 32);
-    assert_eq!(common_reusable_tokens(&worker, &groups, 31), 0);
+    assert_eq!(common_reusable_tokens(&groups, 127), 64);
+    assert_eq!(common_reusable_tokens(&groups, 63), 32);
+    assert_eq!(common_reusable_tokens(&groups, 31), 0);
 }
 
 #[test]
 fn missing_full_blocks_or_checkpoint_falls_back_to_an_earlier_boundary() {
-    let worker = target("w", 0);
-    let full = [hit(&worker, &[(0, 3), (4, 6)])]; // gap at 48..64
-    let state = [hit(&worker, &[(0, 1), (2, 3)])];
+    let full = [(0, 3), (4, 6)]; // gap at 48..64
+    let state = [(0, 1), (2, 3)];
     let groups = [
         group(0, 16, GroupRule::FullAttention, &full),
         group(1, 32, GroupRule::Checkpoint, &state),
     ];
-    assert_eq!(common_reusable_tokens(&worker, &groups, 128), 32);
+    assert_eq!(common_reusable_tokens(&groups, 128), 32);
 }
 
 #[test]
 fn sliding_window_needs_only_the_required_local_interval() {
-    let worker = target("w", 0);
-    let full = [hit(&worker, &[(0, 8)])];
-    let window = [hit(&worker, &[(5, 8)])];
+    let full = [(0, 8)];
+    let window = [(5, 8)];
     let groups = [
         group(0, 16, GroupRule::FullAttention, &full),
         group(
@@ -436,11 +403,11 @@ fn sliding_window_needs_only_the_required_local_interval() {
             &window,
         ),
     ];
-    assert_eq!(common_reusable_tokens(&worker, &groups, 128), 128);
+    assert_eq!(common_reusable_tokens(&groups, 128), 128);
     // The last token cannot be reused, so both groups report 7 blocks. The
     // sliding group still holds two contiguous blocks below that boundary,
     // which is what its window needs, so the reduced boundary stands.
-    assert_eq!(common_reusable_tokens(&worker, &groups, 127), 112);
+    assert_eq!(common_reusable_tokens(&groups, 127), 112);
 }
 
 /// The sliding group's retained tail can sit entirely above a boundary
@@ -448,9 +415,8 @@ fn sliding_window_needs_only_the_required_local_interval() {
 /// absent, so there is no shared restore point and no credit.
 #[test]
 fn a_reduced_boundary_that_loses_the_sliding_window_credits_nothing() {
-    let worker = target("w", 0);
-    let full = [hit(&worker, &[(0, 4)])]; // 0..64
-    let window = [hit(&worker, &[(6, 8)])]; // 96..128, a 32-token window
+    let full = [(0, 4)]; // 0..64
+    let window = [(6, 8)]; // 96..128, a 32-token window
     let groups = [
         group(0, 16, GroupRule::FullAttention, &full),
         group(
@@ -460,7 +426,7 @@ fn a_reduced_boundary_that_loses_the_sliding_window_credits_nothing() {
             &window,
         ),
     ];
-    assert_eq!(common_reusable_tokens(&worker, &groups, 143), 0);
+    assert_eq!(common_reusable_tokens(&groups, 143), 0);
 }
 
 /// A sliding group whose resident run starts at the root has no earlier
@@ -468,9 +434,8 @@ fn a_reduced_boundary_that_loses_the_sliding_window_credits_nothing() {
 /// still reusable: the engine restores the whole run.
 #[test]
 fn a_root_anchored_prefix_shorter_than_the_window_is_reusable() {
-    let worker = target("w", 0);
-    let full = [hit(&worker, &[(0, 1)])];
-    let window = [hit(&worker, &[(0, 1)])];
+    let full = [(0, 1)];
+    let window = [(0, 1)];
     let groups = [
         group(0, 64, GroupRule::FullAttention, &full),
         group(
@@ -481,8 +446,8 @@ fn a_root_anchored_prefix_shorter_than_the_window_is_reusable() {
         ),
     ];
     // A 65-token request keeps one 64-token block, well inside the window.
-    assert_eq!(common_reusable_tokens(&worker, &groups, 64), 64);
-    assert_eq!(common_reusable_tokens(&worker, &groups, 128), 64);
+    assert_eq!(common_reusable_tokens(&groups, 64), 64);
+    assert_eq!(common_reusable_tokens(&groups, 128), 64);
 }
 
 /// A sliding group whose run sits below the boundary still supports it,
@@ -490,9 +455,8 @@ fn a_root_anchored_prefix_shorter_than_the_window_is_reusable() {
 /// the candidate length.
 #[test]
 fn a_sliding_run_below_the_boundary_keeps_the_credit() {
-    let worker = target("w", 0);
-    let full = [hit(&worker, &[(0, 6)])]; // 0..96
-    let window = [hit(&worker, &[(4, 8)])]; // 64..128, a 32-token window
+    let full = [(0, 6)]; // 0..96
+    let window = [(4, 8)]; // 64..128, a 32-token window
     let groups = [
         group(0, 16, GroupRule::FullAttention, &full),
         group(
@@ -502,43 +466,12 @@ fn a_sliding_run_below_the_boundary_keeps_the_credit() {
             &window,
         ),
     ];
-    assert_eq!(common_reusable_tokens(&worker, &groups, 143), 96);
-}
-
-#[test]
-fn state_on_another_rank_or_remote_locality_cannot_complete_a_hit() {
-    let worker = target("w", 0);
-    let full = [hit(&worker, &[(0, 4)])];
-    let mut remote = hit(&worker, &[(0, 4)]);
-    remote.locality = Locality::Remote;
-    let state = [hit(&target("w", 1), &[(0, 4)]), remote];
-    let groups = [
-        group(0, 16, GroupRule::FullAttention, &full),
-        group(1, 16, GroupRule::Checkpoint, &state),
-    ];
-    assert_eq!(common_reusable_tokens(&worker, &groups, 64), 0);
-}
-
-/// A host or storage copy of a checkpoint still completes the hit: the page
-/// is restorable, only its transfer cost differs.
-#[test]
-fn a_host_resident_checkpoint_completes_the_hit() {
-    let worker = target("w", 0);
-    let full = [hit(&worker, &[(0, 4)])];
-    let mut host = hit(&worker, &[(0, 4)]);
-    host.tier = StorageTier::HostPinned;
-    let state = [host];
-    let groups = [
-        group(0, 16, GroupRule::FullAttention, &full),
-        group(1, 16, GroupRule::Checkpoint, &state),
-    ];
-    assert_eq!(common_reusable_tokens(&worker, &groups, 64), 64);
+    assert_eq!(common_reusable_tokens(&groups, 143), 96);
 }
 
 #[test]
 fn incomplete_or_invalid_layout_never_grants_credit() {
-    let worker = target("w", 0);
-    let hits = [hit(&worker, &[(0, 4)])];
+    let hits = [(0, 4)];
     let invalid = [group(0, 0, GroupRule::FullAttention, &hits)];
     let duplicate = [
         group(0, 16, GroupRule::FullAttention, &hits),
@@ -558,11 +491,11 @@ fn incomplete_or_invalid_layout_never_grants_credit() {
         },
         &hits,
     )];
-    assert_eq!(common_reusable_tokens(&worker, &[], 64), 0);
-    assert_eq!(common_reusable_tokens(&worker, &invalid, 64), 0);
-    assert_eq!(common_reusable_tokens(&worker, &duplicate, 64), 0);
-    assert_eq!(common_reusable_tokens(&worker, &empty_window, 64), 0);
-    assert_eq!(common_reusable_tokens(&worker, &invalid_compression, 64), 0);
+    assert_eq!(common_reusable_tokens(&[], 64), 0);
+    assert_eq!(common_reusable_tokens(&invalid, 64), 0);
+    assert_eq!(common_reusable_tokens(&duplicate, 64), 0);
+    assert_eq!(common_reusable_tokens(&empty_window, 64), 0);
+    assert_eq!(common_reusable_tokens(&invalid_compression, 64), 0);
 }
 
 #[test]

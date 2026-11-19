@@ -37,7 +37,7 @@ pub(super) struct PdKvState {
     registry: Option<Arc<WorkerRegistry>>,
     prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
     decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
-    // Serializes membership snapshots and their projection into both policies.
+    // Serializes updates to the target bindings in both policies.
     targets: Mutex<HashMap<String, TargetRegistration>>,
     hybrid_pairs: Option<HashMap<String, HashSet<String>>>,
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -166,7 +166,6 @@ impl PdKvState {
     }
 
     async fn bind_refresh(&self) {
-        let mut targets = self.targets.lock().await;
         let Some(registry) = &self.registry else {
             return;
         };
@@ -174,29 +173,21 @@ impl PdKvState {
         let decode_policy = self.decode_policy.as_deref().and_then(kv_aware_ops);
         let prefill = registry.get_prefill_workers();
         let decode = registry.get_decode_workers();
-        self.bind_pools(
-            &mut targets,
-            [
-                (prefill.as_slice(), prefill_policy),
-                (decode.as_slice(), decode_policy),
-            ],
-        )
+        self.bind_pools([
+            (prefill.as_slice(), prefill_policy),
+            (decode.as_slice(), decode_policy),
+        ])
         .await;
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     async fn bind(&self, workers: &[Arc<dyn Worker>], policy: &dyn KvAwareOps) {
-        let mut targets = self.targets.lock().await;
-        self.bind_pools(&mut targets, [(workers, Some(policy)), (&[], None)])
+        self.bind_pools([(workers, Some(policy)), (&[], None)])
             .await;
     }
 
-    async fn bind_pools(
-        &self,
-        targets: &mut HashMap<String, TargetRegistration>,
-        pools: [StagePool<'_>; 2],
-    ) {
+    async fn bind_pools(&self, pools: [StagePool<'_>; 2]) {
         let bases = pools
             .iter()
             .filter(|(_, policy)| policy.is_some())
@@ -204,10 +195,32 @@ impl PdKvState {
             .collect();
         let registrations = self.supervisor.refresh_workers(&bases).await;
 
+        let mut targets = self.targets.lock().await;
+        // A source probe may outlive the worker it started for.
+        let is_current = |worker: &Arc<dyn Worker>| {
+            self.registry.as_ref().is_none_or(|registry| {
+                registry
+                    .get_by_url(worker.url())
+                    .is_some_and(|current| Arc::ptr_eq(worker, &current))
+            })
+        };
         targets.retain(|url, target| {
             let (workers, policy) = pools[usize::from(target.decode)];
             if let Some(policy) = policy {
-                if workers.iter().any(|worker| worker.url() == url) {
+                let still_registered = match &self.registry {
+                    Some(registry) => registry.get_by_url(url).is_some_and(|worker| {
+                        if target.decode {
+                            worker.worker_type() == crate::core::WorkerType::Decode
+                        } else {
+                            matches!(
+                                worker.worker_type(),
+                                crate::core::WorkerType::Prefill { .. }
+                            )
+                        }
+                    }),
+                    None => workers.iter().any(|worker| worker.url() == url),
+                };
+                if still_registered {
                     return true;
                 }
                 policy.unregister_worker(url);
@@ -216,7 +229,7 @@ impl PdKvState {
         });
         for (stage, (workers, policy)) in pools.into_iter().enumerate() {
             let Some(policy) = policy else { continue };
-            for worker in workers {
+            for worker in workers.iter().filter(|worker| is_current(worker)) {
                 let registration = registrations.get(worker.base_url());
                 let target = TargetRegistration {
                     revision: registration.map_or(0, |registration| registration.revision),
@@ -1058,6 +1071,84 @@ mod kv_input_tests {
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (base, task)
     }
+
+    #[tokio::test]
+    async fn worker_removal_does_not_wait_for_source_discovery() {
+        for replace in [false, true] {
+            check_worker_removal_during_probe(replace).await;
+        }
+    }
+
+    async fn check_worker_removal_during_probe(replace: bool) {
+        use axum::{routing::get, Json, Router};
+        use tokio::sync::Notify;
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let app = Router::new().route(
+            "/get_server_info",
+            get({
+                let (entered, release) = (entered.clone(), release.clone());
+                move || {
+                    let (entered, release) = (entered.clone(), release.clone());
+                    async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        Json(json!({"model_id": "m", "kv_block_size": 16}))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(Arc::new(BasicWorker::new(url.clone(), WorkerType::Decode)));
+        let policy = Arc::new(KvAwarePolicy::default());
+        let mut state = PdKvState::new(Client::new());
+        state.registry = Some(registry.clone());
+        state.decode_policy = Some(policy.clone());
+        let state = Arc::new(state);
+        let refresh = {
+            let state = state.clone();
+            tokio::spawn(async move { state.bind_refresh().await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("source probe did not start");
+        registry.remove_by_url(&url).unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            state.unregister_worker(&url, policy.as_ref()),
+        )
+        .await
+        .expect("worker removal must finish while the source probe is blocked");
+        if replace {
+            let worker = Arc::new(BasicWorker::new(url.clone(), WorkerType::Decode));
+            registry.register(worker.clone());
+            policy.register_worker(worker.as_ref(), None, None);
+            state.targets.lock().await.insert(
+                url.clone(),
+                TargetRegistration {
+                    revision: 1,
+                    decode: true,
+                },
+            );
+        }
+        release.notify_one();
+        refresh.await.unwrap();
+        assert_eq!(
+            state
+                .targets
+                .lock()
+                .await
+                .get(&url)
+                .map(|binding| binding.revision),
+            replace.then_some(1),
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn start_registers_and_prices_both_pools_before_any_request() {
         // Lazy request-path binding would leave a burst unpriced for one tick.

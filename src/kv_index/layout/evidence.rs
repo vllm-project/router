@@ -1,6 +1,6 @@
 //! Interpret one source snapshot using the cache groups' restore rules.
 
-use super::{align_down, restore::restore_boundary, CacheGroup, GroupRule, GroupView};
+use super::{align_down, restore::restore_boundary, CacheGroup, GroupEvidence, GroupRule};
 use crate::kv_index::storage::PageTiers;
 use crate::kv_index::types::{push_block_segment, TierMatch};
 use crate::kv_index::{Locality, RoutableTarget, StorageTier};
@@ -85,19 +85,8 @@ pub(in crate::kv_index) fn full_attention_matches(
         .collect()
 }
 
-/// Restore coverage for one source. Tier costs are read from the original pages.
-struct GroupEvidence {
-    coverage: Option<TierMatch>,
-    partial_ends: Vec<u64>,
-}
-
 impl GroupEvidence {
-    fn from_pages(
-        target: &RoutableTarget,
-        group: &CacheGroup,
-        pages: &[TierBits],
-        hash_unit: usize,
-    ) -> Self {
+    fn from_pages(group: CacheGroup, pages: &[TierBits], hash_unit: usize) -> Self {
         debug_assert!(
             hash_unit > 0
                 && group.block_size as usize >= hash_unit
@@ -132,25 +121,9 @@ impl GroupEvidence {
             }
         }
         Self {
-            coverage: (!segments.is_empty()).then(|| TierMatch {
-                target: target.clone(),
-                // Union coverage proves restoration, never GPU residency.
-                tier: StorageTier::Device,
-                locality: Locality::Local,
-                segments,
-            }),
+            group,
+            segments,
             partial_ends,
-        }
-    }
-
-    fn view<'a>(&'a self, group: &CacheGroup) -> GroupView<'a> {
-        GroupView {
-            group_idx: group.group_idx,
-            block_size: group.block_size,
-            kind: group.kind,
-            page_evidence: self.coverage.is_some() || !self.partial_ends.is_empty(),
-            matches: self.coverage.as_slice(),
-            partial_ends: &self.partial_ends,
         }
     }
 }
@@ -164,7 +137,6 @@ pub(in crate::kv_index) struct TailDrop {
 
 /// Return the credited tokens and slowest required tier for a source snapshot.
 pub(in crate::kv_index) fn credit_from_pages(
-    target: &RoutableTarget,
     groups: &[CacheGroup],
     claims: &[impl AsRef<[TierBits]>],
     hash_block_size: usize,
@@ -175,27 +147,15 @@ pub(in crate::kv_index) fn credit_from_pages(
     let evidence: Vec<_> = groups
         .iter()
         .zip(claims)
-        .map(|(group, claims)| {
-            GroupEvidence::from_pages(target, group, claims.as_ref(), hash_block_size)
-        })
-        .collect();
-    let views: Vec<_> = groups
-        .iter()
-        .zip(&evidence)
-        .map(|(group, evidence)| evidence.view(group))
+        .map(|(&group, claims)| GroupEvidence::from_pages(group, claims.as_ref(), hash_block_size))
         .collect();
     let fine_unit = if tail_drop.fine_grained {
         hash_block_size as u64
     } else {
         0
     };
-    let (boundary, tail_proof) = restore_boundary(
-        target,
-        &views,
-        max_reusable_tokens,
-        tail_drop.group,
-        fine_unit,
-    );
+    let (boundary, tail_proof) =
+        restore_boundary(&evidence, max_reusable_tokens, tail_drop.group, fine_unit);
     let credited = boundary.saturating_sub(u64::from(replay_tokens));
     let credited = align_down(credited, hash_block_size as u32);
     if credited == 0 {

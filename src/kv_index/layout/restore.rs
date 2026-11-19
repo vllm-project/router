@@ -2,27 +2,18 @@
 
 use std::collections::HashSet;
 
-use super::{GroupRule, GroupView};
-use crate::kv_index::types::TierMatch;
-use crate::kv_index::{Locality, RoutableTarget, StorageTier};
+use super::{GroupEvidence, GroupRule};
 
-/// Return the latest jointly restorable boundary, or zero when none is proven.
-/// `max_reusable_tokens` is the engine's upper bound; only local, addressable
-/// device, host, or disk claims on `target` count. Compressed groups must have
-/// a nonzero state size that divides their block size.
-pub fn common_reusable_tokens(
-    target: &RoutableTarget,
-    groups: &[GroupView<'_>],
-    max_reusable_tokens: u64,
-) -> u64 {
-    restore_boundary(target, groups, max_reusable_tokens, None, 0).0
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub(super) fn common_reusable_tokens(groups: &[GroupEvidence], max_reusable_tokens: u64) -> u64 {
+    restore_boundary(groups, max_reusable_tokens, None, 0).0
 }
 
 /// Find the common boundary and the raw dense hit for a verified tail-drop group.
 /// `fine_unit` is zero for block-aligned lookup.
 pub(super) fn restore_boundary(
-    target: &RoutableTarget,
-    groups: &[GroupView<'_>],
+    groups: &[GroupEvidence],
     max_reusable_tokens: u64,
     tail_drop_group: Option<u32>,
     fine_unit: u64,
@@ -31,7 +22,7 @@ pub(super) fn restore_boundary(
         return (0, None);
     }
     let mut group_ids = HashSet::with_capacity(groups.len());
-    if groups.iter().any(|group| {
+    if groups.iter().map(|evidence| evidence.group).any(|group| {
         group.block_size == 0
             || !group_ids.insert(group.group_idx)
             || matches!(group.kind, GroupRule::SlidingWindow { window_tokens: 0 })
@@ -41,7 +32,10 @@ pub(super) fn restore_boundary(
 
     // Every cacheable group must supply its own pages. An empty sliding
     // store can mean masked or null pages; it does not make the group optional.
-    if groups.iter().any(|group| !group.page_evidence) {
+    if groups
+        .iter()
+        .any(|group| group.segments.is_empty() && group.partial_ends.is_empty())
+    {
         return (0, None);
     }
 
@@ -51,7 +45,7 @@ pub(super) fn restore_boundary(
     // group's window.
     let Some(mut cursors) = groups
         .iter()
-        .map(|group| BoundaryCursor::new(group, target))
+        .map(BoundaryCursor::new)
         .collect::<Option<Vec<_>>>()
     else {
         return (0, None);
@@ -59,8 +53,9 @@ pub(super) fn restore_boundary(
     let tail = match tail_drop_group {
         None => None,
         Some(group_idx) => {
-            let Some(index) = groups.iter().position(|group| {
-                group.group_idx == group_idx && group.kind == GroupRule::FullAttention
+            let Some(index) = groups.iter().position(|evidence| {
+                evidence.group.group_idx == group_idx
+                    && evidence.group.kind == GroupRule::FullAttention
             }) else {
                 return (0, None);
             };
@@ -81,6 +76,7 @@ pub(super) fn restore_boundary(
                 max_reusable_tokens.saturating_add(drop_unit)
             };
             let proof = cursors[index].predecessor(lookup_cap);
+            // vLLM drops the last unit even when the dense hit ends below the cap.
             Some((index, proof, proof.saturating_sub(drop_unit)))
         }
     };
@@ -117,18 +113,15 @@ struct BoundaryCursor {
 }
 
 impl BoundaryCursor {
-    fn new(group: &GroupView<'_>, target: &RoutableTarget) -> Option<Self> {
+    fn new(evidence: &GroupEvidence) -> Option<Self> {
+        let group = evidence.group;
         let size = u64::from(group.block_size);
         if let GroupRule::CompressedFullAttention { tokens_per_state } = group.kind {
             if tokens_per_state == 0 || !group.block_size.is_multiple_of(tokens_per_state) {
                 return None;
             }
         }
-        let segments = group
-            .matches
-            .iter()
-            .filter(|hit| eligible(hit, target))
-            .flat_map(|hit| hit.segments.iter().copied());
+        let segments = evidence.segments.iter().copied();
         let mut ranges = Vec::new();
         match group.kind {
             GroupRule::FullAttention | GroupRule::CompressedFullAttention { .. } => {
@@ -171,7 +164,7 @@ impl BoundaryCursor {
             .first()
             .filter(|(start, _)| *start == 1)
             .map_or(0, |(_, end)| end * size);
-        let mut partials: Vec<u64> = group
+        let mut partials: Vec<u64> = evidence
             .partial_ends
             .iter()
             .copied()
@@ -220,15 +213,4 @@ impl BoundaryCursor {
             self.partials[self.partial_end - 1]
         })
     }
-}
-
-fn eligible(hit: &TierMatch, target: &RoutableTarget) -> bool {
-    // A page held in host memory or on storage is still restorable; the policy
-    // weighs it by the transfer credit of its tier. External residencies belong
-    // to another owner and are never claimed by this index.
-    matches!(
-        hit.tier,
-        StorageTier::Device | StorageTier::HostPinned | StorageTier::Disk
-    ) && hit.locality == Locality::Local
-        && hit.target == *target
 }

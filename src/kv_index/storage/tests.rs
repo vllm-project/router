@@ -1,3 +1,5 @@
+#![cfg(all(test, feature = "cpu", feature = "ready"))]
+
 use super::*;
 
 impl KvBlockIndexer {

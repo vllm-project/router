@@ -323,21 +323,12 @@ impl RouterManager {
                         .downcast_ref::<crate::routers::router::Router>()
                 });
                 if let Some(router) = regular {
-                    router.remove_kv_worker(worker.base_url(), &[url.to_owned()]);
-                }
-                let policy = self
-                    .policy_registry
-                    .get_policy_or_default(worker.model_id());
-                let default = self.policy_registry.get_default_policy();
-                if regular.is_none() || !Arc::ptr_eq(&policy, &default) {
-                    if let Some(kv) = kv_aware_ops(policy.as_ref()) {
-                        kv.unregister_worker(url);
-                    }
-                }
-                if regular.is_none() && !Arc::ptr_eq(&policy, &default) {
-                    if let Some(kv) = kv_aware_ops(default.as_ref()) {
-                        kv.unregister_worker(url);
-                    }
+                    router.remove_kv_workers(std::slice::from_ref(&worker));
+                } else {
+                    crate::routers::router::Router::unregister_kv_target(
+                        &self.policy_registry,
+                        worker.as_ref(),
+                    );
                 }
             }
             self.policy_registry.on_worker_removed(worker.model_id());
