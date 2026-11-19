@@ -201,7 +201,11 @@ from the request log. Two useful analyses:
   prefix stability, placement, and backend cache pressure, then use the C/C0
   control in section 8 to test retention. A flat bucket profile alone does not
   identify where the hits came from or rule out a TTL effect.
-- in-flight ratio: `requests * mean_latency / wall_time` divided by concurrency.
+- active-request fraction: estimate `r = requests * mean_latency / (wall_time * CC)`
+  over the same baseline observation window, with latency and wall time in the
+  same units. Then estimate KV pressure as `rho = r * working-set ratio`
+  using section 2. Apply the 0.4–0.8 target band to `rho`, not `r`: for example,
+  `r = 0.60` and a working-set ratio of `1.5` give `rho = 0.90`, above the band.
 
 ### 3.3 Concurrency and task count
 
