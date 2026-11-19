@@ -760,7 +760,7 @@ impl PdRouterBase {
         let admitted = if defer {
             self.pd_load.admit_deferred(select)
         } else {
-            self.pd_load.admit_probe(select, reserve_decode)
+            self.pd_load.admit_with(select, reserve_decode)
         };
         if let Some((selection, attempt)) = &admitted {
             let deferred = attempt.decode_pending_commit();

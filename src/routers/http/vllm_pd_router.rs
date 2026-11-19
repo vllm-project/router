@@ -5967,6 +5967,157 @@ mod tests {
             "Decode pricing must not fan out backend renders on HTTP pools"
         );
     }
+
+    /// A Decode candidate removed while commit-time pricing waits on the bindings
+    /// lock must not be committed: the re-read after `prepare_decode_context`
+    /// drops it. The prefill gate lands the removal after admission but before
+    /// the commit's re-read, which is the window that re-read protects.
+    #[tokio::test]
+    async fn removed_decode_during_commit_pricing_is_not_committed() {
+        use crate::config::{KvConnector, PolicyConfig, RouterConfig, RoutingMode};
+        use axum::{
+            extract::State,
+            http::{Method, StatusCode},
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::time::Duration;
+        use tokio::sync::{mpsc, Semaphore};
+
+        type PrefillGate = (mpsc::UnboundedSender<&'static str>, Arc<Semaphore>);
+        async fn prefill(State((entered, gate)): State<PrefillGate>) -> Json<Value> {
+            entered.send("P").unwrap();
+            gate.acquire().await.unwrap().forget();
+            Json(json!({"kv_transfer_params": {
+                "transfer_id": "t",
+                "remote_engine_id": "P",
+                "remote_bootstrap_addr": "127.0.0.1:1234",
+            }}))
+        }
+        async fn generate() -> Json<Value> {
+            Json(json!({"choices": [{"text": "decoded"}]}))
+        }
+
+        let gate = Arc::new(Semaphore::new(0));
+        let (entered, mut events) = mpsc::unbounded_channel();
+        let prefill_app = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/query",
+                get(|| async { Json(json!({"0": {"engine_id": "P"}})) }),
+            )
+            .route(
+                "/v1/completions/render",
+                post(|| async { Json(json!({"token_ids": [1, 2, 3]})) }),
+            )
+            .route("/v1/completions", post(prefill))
+            .with_state((entered, gate.clone()));
+        let p = spawn_test_server(prefill_app).await;
+        let bootstrap_port = p.rsplit(':').next().unwrap().parse().unwrap();
+
+        let decode_app = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route("/v1/completions", post(generate));
+        let d = spawn_test_server(decode_app).await;
+
+        let publisher_context = zmq::Context::new();
+        let publisher = publisher_context.socket(zmq::PUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let config = RouterConfig {
+            kv_connector: KvConnector::Mooncake,
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(p.clone(), Some(bootstrap_port))],
+                decode_urls: vec![d.clone()],
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: Some(PolicyConfig::KvAware {
+                    router_temperature: 0.0,
+                    kv_penalty_host: 0.8,
+                    kv_penalty_external: 0.6,
+                    kv_penalty_disk: 0.3,
+                    static_kv_event_sources: Default::default(),
+                }),
+                discovery_address: None,
+            },
+            policy: PolicyConfig::RoundRobin,
+            pd_kv_event_sources: HashMap::from([(
+                d.clone(),
+                crate::config::types::PdKvEventSources {
+                    endpoints: vec![endpoint],
+                    replay_endpoints: None,
+                    block_size: 16,
+                    model: Some("m".to_owned()),
+                },
+            )]),
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+        let ctx = Arc::new(
+            crate::server::AppContext::new(config, reqwest::Client::new(), 64, None, vec![])
+                .unwrap(),
+        );
+        ctx.policy_registry
+            .set_prefill_policy(Arc::new(crate::policies::RoundRobinPolicy::new()));
+        ctx.policy_registry
+            .set_decode_policy(Arc::new(crate::policies::KvAwarePolicy::default()));
+        let router = Arc::new(
+            VllmPDRouter::new(
+                vec![(p.clone(), Some(bootstrap_port))],
+                vec![d.clone()],
+                None,
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let runner = router.clone();
+        let request = tokio::spawn(async move {
+            runner
+                .route_transparent(
+                    None,
+                    "/v1/completions",
+                    &Method::POST,
+                    json!({"model": "m", "prompt": [1, 2, 3], "stream": false, "max_tokens": 2}),
+                )
+                .await
+        });
+
+        // Admission is done once Prefill runs. Hold the bindings lock before the
+        // commit prices so its `credit_by_base` blocks on it.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap(),
+            Some("P")
+        );
+        let state = router.pd_router.kv_state.as_ref().unwrap();
+        let guard = state.lock_bindings_for_test().await;
+
+        // Let the commit reach the pricing await, then remove the Decode worker.
+        gate.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let to_remove: Vec<String> = ctx
+            .worker_registry
+            .get_decode_workers()
+            .iter()
+            .map(|worker| worker.url().to_owned())
+            .collect();
+        for url in to_remove {
+            ctx.worker_registry.remove_by_url(&url);
+        }
+        drop(guard);
+
+        let response = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a Decode worker removed during pricing must not be committed"
+        );
+    }
     /// A push-addressed Prefill sent its KV to the provisional Decode: the
     /// commitment must stay there even when live load prefers another worker.
     #[test]

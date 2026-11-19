@@ -27,7 +27,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const REFRESH_TICK: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
-struct Binding {
+pub(super) struct Binding {
     signature: String,
     checked: Instant,
     info: Option<WorkerKvInfo>,
@@ -155,6 +155,16 @@ impl PdKvState {
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn new(client: reqwest::Client) -> Self {
         Self::new_with_statics(client, HashMap::new())
+    }
+
+    /// Test hook: hold the bindings lock so a commit's pricing awaits block, the
+    /// same window a removed Decode candidate is caught by the re-read.
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(super) async fn lock_bindings_for_test(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<String, Binding>> {
+        self.bindings.lock().await
     }
 
     fn new_with_statics(

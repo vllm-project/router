@@ -2047,6 +2047,14 @@ impl KvAwareOps for KvAwarePolicy {
         if workers.is_empty() {
             return None;
         }
+        // A partial table would compare candidates in different units: a missing
+        // entry read as zero makes the recovered worker look free. Enforce the
+        // documented contract here instead of trusting every caller to filter.
+        let new_context = new_context.filter(|context| {
+            workers
+                .iter()
+                .all(|worker| context.contains_key(worker.url()))
+        });
         // Occupancy is the caller's sample; the marginal context is ours. A
         // candidate that reuses its prefix adds only the remainder, so the two
         // are added in tokens rather than compared as separate rankings.
@@ -4344,6 +4352,22 @@ mod tests {
             .select_decode(&workers, None, None, None, None)
             .unwrap();
         assert_ne!(first.index, second.index);
+    }
+
+    #[test]
+    fn decode_partial_context_table_falls_back_to_occupancy() {
+        // A table that omits a candidate would read that absence as zero, making
+        // the unlisted worker look free. The policy must drop the whole table.
+        let policy = KvAwarePolicy::default();
+        let workers = decode_pool(&["http://d0", "http://d1"]);
+        let partial: HashMap<String, u64> = HashMap::from([("http://d0".to_owned(), 100)]);
+        let pick = policy
+            .select_decode(&workers, None, None, None, Some(&partial))
+            .unwrap();
+        assert_eq!(
+            pick.index, 0,
+            "d1's missing entry is not a zero price, so idle d0 wins"
+        );
     }
 
     #[test]

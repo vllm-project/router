@@ -256,19 +256,19 @@ impl PdLoadManager {
         &self,
         select: impl FnOnce(&Loads) -> Option<PdSelection>,
     ) -> Option<(PdSelection, PdAttempt)> {
-        self.admit_inner(select, false)
+        self.admit_inner(select, true)
     }
 
-    /// Same admission, used when a probe takes a pair. `reserve_decode` is false for a
-    /// probe: it takes a pair but
-    /// starts no sequence, so booking Decode occupancy for it would flip the
+    /// Admission with Decode occupancy charged now or left to the deferred
+    /// commit. A probe reserves nothing (`reserve_decode = false`): it takes a
+    /// pair but starts no sequence, so booking Decode for it would flip the
     /// whole pool to request counts for the length of every probe.
-    pub(super) fn admit_probe(
+    pub(super) fn admit_with(
         &self,
         select: impl FnOnce(&Loads) -> Option<PdSelection>,
         reserve_decode: bool,
     ) -> Option<(PdSelection, PdAttempt)> {
-        self.admit_inner(select, !reserve_decode)
+        self.admit_inner(select, reserve_decode)
     }
 
     /// Admit the Prefill stage only and leave the Decode commitment open.
@@ -281,13 +281,13 @@ impl PdLoadManager {
         &self,
         select: impl FnOnce(&Loads) -> Option<PdSelection>,
     ) -> Option<(PdSelection, PdAttempt)> {
-        self.admit_inner(select, true)
+        self.admit_inner(select, false)
     }
 
     fn admit_inner(
         &self,
         select: impl FnOnce(&Loads) -> Option<PdSelection>,
-        defer_decode: bool,
+        charge_decode: bool,
     ) -> Option<(PdSelection, PdAttempt)> {
         let mut loads = self.loads.lock();
         let selection = select(&loads)?;
@@ -306,9 +306,7 @@ impl PdLoadManager {
         }
         p.publish(Stage::Prefill, &prefill.endpoint);
         let now = std::time::Instant::now();
-        let (decode_endpoint, affinity, decode_state, pending_since) = if defer_decode {
-            (None, None, DecodeState::Unbound, None)
-        } else {
+        let (decode_endpoint, affinity, decode_state, pending_since) = if charge_decode {
             let d = loads
                 .entry((Stage::Decode, decode.endpoint.clone()))
                 .or_default();
@@ -324,6 +322,8 @@ impl PdLoadManager {
                 DecodeState::Pending,
                 Some(now),
             )
+        } else {
+            (None, None, DecodeState::Unbound, None)
         };
         let attempt = PdAttempt(Arc::new(AttemptInner {
             admitted_at: now,
@@ -332,7 +332,7 @@ impl PdLoadManager {
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_tokens: selection.prefill.new_prefill_tokens,
-            decode_context: prompt,
+            decode_prompt_tokens: prompt,
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: decode_state,
@@ -370,7 +370,7 @@ impl PdLoadManager {
         // The request's logical context is the prompt it carries: shared prefix blocks are
         // counted once per request, never once per block and never once per sequence -
         // sequences share that copy, which is what makes this a physical KV approximation.
-        match inner.decode_context {
+        match inner.decode_prompt_tokens {
             Some(tokens) => d.pending_decode_tokens += tokens,
             None => d.unknown_decode_requests += 1,
         }
@@ -418,7 +418,7 @@ impl PdLoadManager {
             // The prompt length is unknown here, so the Decode charge is
             // unknown too and the pool stays on request counts for this
             // attempt.
-            decode_context: None,
+            decode_prompt_tokens: None,
 
             state: Mutex::new(AttemptState {
                 prefill: true,
@@ -464,7 +464,7 @@ struct AttemptInner {
     /// Prompt length this attempt will hold on a Decode engine, counted once per request:
     /// the request's sequences share one copy of those blocks. `None` when the prompt was
     /// never measured.
-    decode_context: Option<u64>,
+    decode_prompt_tokens: Option<u64>,
 
     /// Guards every stage transition and the decode fields below, so a commit
     /// and a release cannot interleave halfway through.
@@ -476,13 +476,13 @@ impl AttemptInner {
     /// recorded at admission. Deriving instead of mirroring removes two fields that had to
     /// stay in step with an immutable one.
     fn decode_charge(&self) -> u64 {
-        self.decode_context.unwrap_or(0)
+        self.decode_prompt_tokens.unwrap_or(0)
     }
 
     /// Whether this attempt charged as an unknown-length Decode request, which the release
     /// must undo exactly once.
     fn decode_unknown(&self) -> bool {
-        self.decode_context.is_none()
+        self.decode_prompt_tokens.is_none()
     }
 }
 
