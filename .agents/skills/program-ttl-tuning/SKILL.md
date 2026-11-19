@@ -210,11 +210,17 @@ from the request log. Two useful analyses:
 ### 3.3 Concurrency and task count
 
 Choose concurrency so both axes hold. Task count must be at least concurrency;
-add tasks rather than over-subscribing a smaller set. If the working-set ratio
-stays below 1.0 while the in-flight ratio is already near its ceiling, do not
-add concurrency: shrink the pool with the engine's own knob (vLLM:
-`--num-gpu-blocks-override`) so the working set exceeds capacity at the current
-concurrency.
+add tasks rather than over-subscribing a smaller set. Before increasing
+concurrency or reducing the KV pool (vLLM: `--num-gpu-blocks-override`), project
+both the working-set ratio and `rho = r * working-set ratio`. At fixed
+concurrency, reducing capacity raises both projected ratios for unchanged
+`r` and mean context. Consider a smaller pool only if the projected operating
+point stays within both target bands, then remeasure `r`, mean context, and
+per-Rank pressure in the baseline. For example, if `r = 0.90`, moving the
+working-set ratio from `0.88` to `1.0` raises projected `rho` from `0.792` to
+`0.90`. At a measured `r > 0.80`, the two bands cannot overlap at that
+operating point: try a different baseline concurrency and remeasure, or
+record the workload as outside the target bands rather than forcing eviction.
 
 ### 3.4 Cost coefficients
 
