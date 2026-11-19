@@ -246,7 +246,7 @@ If several candidate workers have the same lowest load, the policy picks one of 
 
 ## KV Aware
 
-See the [KV-aware deployment guide](http_completion_kv.md) for worker requirements, routing modes and model recipes.
+See the [KV-aware deployment guide](kv_aware.md) for worker requirements, routing modes and model recipes.
 
 ### P/D decode load
 

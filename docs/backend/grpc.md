@@ -275,7 +275,7 @@ cache reset. `power_of_two` uses the router's own in-flight counts, since
 `grpc://` workers serve no HTTP `/get_load`.
 
 `--prefill-policy kv_aware` and `cache_aware` use the token IDs sent to prefill.
-For KV event and hybrid layout setup, see [KV-aware P/D routing](../load_balancing/http_completion_kv.md#pd-routing).
+For KV event and hybrid layout setup, see [KV-aware P/D routing](../load_balancing/kv_aware.md#pd-routing).
 
 ## Backend Modules
 

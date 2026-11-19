@@ -15,7 +15,7 @@ Use addresses the Router can reach. Give every worker distinct ports and every p
 
 ## Colocated layout
 
-Save as `layout.json` and pass `--kv-hybrid-layout layout.json` to the [colocated Router](http_completion_kv.md#colocated-prefill-and-decode).
+Save as `layout.json` and pass `--kv-hybrid-layout layout.json` to the [colocated Router](kv_aware.md#colocated-prefill-and-decode).
 
 ```json
 {
@@ -67,7 +67,7 @@ For LoRA, add `"adapters": [{"name": "my-adapter", "path": "/models/my-adapter"}
 
 Add `--prefix-caching-hash-algo sha256_cbor` and set `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` on each worker publishing KV events. Keep prefix caching, incremental events, and replay enabled.
 
-Save this example as `layout.json` for the [Qwen3 walkthrough](http_completion_kv.md#colocated-prefill-and-decode). For HTTP, change the worker key to `http://127.0.0.1:8000`.
+Save this example as `layout.json` for the [Qwen3 walkthrough](kv_aware.md#colocated-prefill-and-decode). For HTTP, change the worker key to `http://127.0.0.1:8000`.
 
 ```json
 {
@@ -101,7 +101,7 @@ Use the seed example with the verified vLLM default and `PYTHONHASHSEED` unset. 
 
 ## P/D layout
 
-Start matching prefill and decode engines with the roles and connector in the [P/D guide](http_completion_kv.md#pd-routing). Set `VLLM_SSM_CONV_STATE_LAYOUT=DS` on both Qwen3.5 engines when using NIXL. Put the worker layout object containing `schema_version` and `ranks` under `hybrid` in the prefill entry.
+Start matching prefill and decode engines with the roles and connector in the [P/D guide](kv_aware.md#pd-routing). Set `VLLM_SSM_CONV_STATE_LAYOUT=DS` on both Qwen3.5 engines when using NIXL. Put the worker layout object containing `schema_version` and `ranks` under `hybrid` in the prefill entry.
 
 ```json
 {
