@@ -4,12 +4,19 @@ Choose [HTTP](#http-workers) or [gRPC](#grpc-workers) for the worker pool. For b
 
 ## Versions
 
-| Component | Version and pairing |
-| --- | --- |
-| Router | Build the Rust `vllm-router` binary from this PR. |
-| HTTP worker | vLLM 0.33.0 for the commands below. vLLM 0.30.0 requires static event endpoints. |
-| gRPC worker | vLLM 0.33.0 and `vllm-rs` from the same tag, with the Rust Inference service. |
-| P/D workers | Use the same vLLM version, model checkpoint, connector and worker transport on both sides. |
+Use the Rust `vllm-router` binary. For a gRPC worker, build `vllm-rs` from the same vLLM tag as its Python engine. Keep the vLLM version, model checkpoint, connector and worker transport consistent across both sides of a P/D pair.
+
+| vLLM release | HTTP event discovery | gRPC event discovery | Events with nonzero hash lookahead | Verification |
+| --- | --- | --- | --- | --- |
+| [0.30.0](https://github.com/vllm-project/vllm/tree/v0.30.0) | Supply both endpoints | Discovered | Unavailable | Source inspected |
+| [0.31.0](https://github.com/vllm-project/vllm/tree/v0.31.0) | Discovered | Discovered | Unavailable | Source inspected |
+| [0.32.0](https://github.com/vllm-project/vllm/tree/v0.32.0) | Discovered | Discovered | Unavailable | Source inspected |
+| [0.33.0](https://github.com/vllm-project/vllm/tree/v0.33.0) | Discovered | Discovered | Available | B300 reference version |
+| [0.34.0](https://github.com/vllm-project/vllm/tree/v0.34.0) | Discovered | Discovered | Available | Source inspected |
+
+For `sha256_cbor` on a standard worker, supply the cache layout JSON for every version above. Event discovery provides live and replay addresses, topics and ranks. The layout provides the hash root and cache groups. The [colocated HTTP exception](#http-workers) applies to worker builds that expose both. For P/D, include the prefill endpoints in [`pd-layout.json`](hybrid_kv_recipes.md#pd-layout).
+
+The commands below use vLLM 0.33.0. See the [model recipes](hybrid_kv_recipes.md#layout-examples-by-checkpoint) for checkpoint-specific settings.
 
 ## 1. Configure vLLM
 
@@ -19,7 +26,7 @@ These single-GPU examples use Qwen3-4B-Instruct-2507. Set the variables in each 
 MODEL=/models/Qwen3-4B-Instruct-2507
 export VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0
 unset PYTHONHASHSEED
-EVENTS='{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://127.0.0.1:5557","replay_endpoint":"tcp://127.0.0.1:5558","topic":"qwen3-start01","buffer_steps":30000}'
+EVENTS='{"enable_kv_cache_events":true,"endpoint":"tcp://127.0.0.1:5557","replay_endpoint":"tcp://127.0.0.1:5558","topic":"qwen3-start01"}'
 ```
 
 Use incremental event reporting, the default. Replay lets the Router catch up on recent events after a disconnect. Use a fresh topic on every worker launch and update the layout JSON to match. For multiple workers, use distinct ports and one transport per pool. Across hosts, use addresses reachable from the Router.
@@ -47,7 +54,7 @@ vllm-router --host 127.0.0.1 --port 19000 --policy kv_aware \
   --worker-urls http://127.0.0.1:8000 --kv-hybrid-layout layout.json
 ```
 
-For a single full-attention group without LoRA or a KV connector, omit `--kv-hybrid-layout` if the worker build exposes its resolved contract at `/kv_routing_capabilities`. Standard vLLM 0.33 deployments can use the JSON example.
+For a single full-attention group without speculative decoding, LoRA or a KV connector, omit `--kv-hybrid-layout` if the worker build exposes its resolved contract at `/kv_routing_capabilities`.
 
 #### gRPC workers
 
