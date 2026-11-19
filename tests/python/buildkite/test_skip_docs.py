@@ -20,6 +20,40 @@ def test_ci_and_test_changes_are_not_docs(path):
     assert not skip_docs.is_doc(path)
 
 
+@pytest.mark.parametrize(
+    "paths,expected",
+    [
+        (b"\ndocs/code.py\0", False),
+        (b"\r\ndocs/code.py\0", False),
+        (b"src/code.py\r\nREADME.md\0", True),
+        (b"README.md\r\0", False),
+        (b"docs/\xff.png\0", True),
+    ],
+)
+def test_raw_diff_paths_preserved(paths, expected, monkeypatch):
+    original_check_output = subprocess.check_output
+
+    def git_output(command, **kwargs):
+        output = paths if command[1] == "diff" else b"a" * 40 + b"\n"
+        # Use a real subprocess pipe so text-mode newline conversion is tested
+        # even on Windows, where these filenames cannot be created on disk.
+        return original_check_output(
+            [sys.executable, "-c", f"import os; os.write(1, {output!r})"], **kwargs
+        )
+
+    monkeypatch.setattr(skip_docs.subprocess, "check_output", git_output)
+    assert skip_docs.git_raw("diff") == paths
+    assert (
+        skip_docs.docs_only_change(
+            {
+                "BUILDKITE_PULL_REQUEST": "12",
+                "BUILDKITE_PULL_REQUEST_BASE_BRANCH": "main",
+            }
+        )
+        is expected
+    )
+
+
 class TestBootstrapRouting:
     def test_all_labels_use_docs_detection(self):
         root = Path(__file__).resolve().parents[3]

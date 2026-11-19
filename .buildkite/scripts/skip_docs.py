@@ -18,10 +18,14 @@ from typing import Mapping
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def git_raw(*args: str) -> bytes:
+    """Preserve path bytes, including CR/LF and non-UTF-8 filenames."""
+    return subprocess.check_output(["git", *args], cwd=ROOT)
+
+
 def git(*args: str) -> str:
-    return subprocess.check_output(
-        ["git", *args], cwd=ROOT, text=True, encoding="utf-8"
-    ).strip("\n")
+    """Read scalar git results, such as commit SHAs."""
+    return git_raw(*args).decode("utf-8").rstrip("\n")
 
 
 def is_doc(path: str) -> bool:
@@ -51,8 +55,12 @@ def docs_only_change(env: Mapping[str, str]) -> bool:
             # HEAD^1 only covers the last commit, not necessarily the full push.
             # Without a verified webhook `before` SHA, do not skip branch CI.
             return False
-        changed = git("diff", "--name-only", "--no-renames", "-z", ancestor, "HEAD")
-        files = [path for path in changed.split("\0") if path]
+        changed = git_raw("diff", "--name-only", "--no-renames", "-z", ancestor, "HEAD")
+        files = [
+            path.decode("utf-8", errors="surrogateescape")
+            for path in changed.split(b"\0")
+            if path
+        ]
         return bool(files) and all(is_doc(path) for path in files)
     except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
         print(f"Cannot resolve change diff; running full CI: {exc}", flush=True)
