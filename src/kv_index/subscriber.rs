@@ -2327,12 +2327,32 @@ mod tests {
             local_hashes: crate::kv_index::local_block_hash_strings(tokens, block_size, None),
             tiers_of_interest: vec![StorageTier::Device],
         };
-        for (expected, actual) in [(16, 8), (8, 16)] {
+        let cases = [(16, 8), (8, 16)].map(|(expected, actual)| {
+            let tokens: [Vec<u32>; 4] = [
+                (0..expected).collect(),
+                (100..100 + expected).collect(),
+                (200..200 + actual).collect(),
+                (300..300 + expected).collect(),
+            ];
+            let [_, partial, bad, fresh] = &tokens;
+            let live = [event(400, fresh, expected)];
+            let replies = [
+                (
+                    1,
+                    b"kv".as_slice(),
+                    batch_payload(&[event(200, partial, expected)], 0),
+                ),
+                (
+                    2,
+                    b"kv".as_slice(),
+                    batch_payload(&[event(300, bad, actual)], 0),
+                ),
+                (3, b"kv".as_slice(), batch_payload(&live, 0)),
+            ];
+            (expected, tokens, live, replies)
+        });
+        for (expected, [old, partial, bad, fresh], live, replies) in cases {
             let mut f = fixture_with_block_size(true, Some(expected));
-            let old: Vec<u32> = (0..expected).collect();
-            let partial: Vec<u32> = (100..100 + expected).collect();
-            let bad: Vec<u32> = (200..200 + actual).collect();
-            let fresh: Vec<u32> = (300..300 + expected).collect();
             publish_until_advanced(
                 &f.publisher,
                 &mut f.signals,
@@ -2347,20 +2367,6 @@ mod tests {
             assert_eq!(old_hits.len(), 1);
             assert_eq!(old_hits[0].target.instance_id.as_ref(), "w0");
             assert_eq!(old_hits[0].target.dp_rank, 0);
-            let live = [event(400, &fresh, expected)];
-            let replies = [
-                (
-                    1,
-                    b"kv".as_slice(),
-                    batch_payload(&[event(200, &partial, expected)], 0),
-                ),
-                (
-                    2,
-                    b"kv".as_slice(),
-                    batch_payload(&[event(300, &bad, actual)], 0),
-                ),
-                (3, b"kv".as_slice(), batch_payload(&live, 0)),
-            ];
             let suspended_queries = [query(&old, expected)];
             let (advances, ()) = tokio::join!(
                 publish_until_advanced(&f.publisher, &mut f.signals, b"kv", 3, 3.0, &live, Some(0)),
@@ -2456,8 +2462,7 @@ mod tests {
         }
     }
 
-    // Keep separate test entry points for isolated ZMQ fixtures and named failures.
-    // A loop would still need one fixture per case while hiding later failures.
+    // Each case owns its ZMQ fixture so failed recovery cannot contaminate the next case.
     async fn check_replay_case(case: &str) {
         let mut f = fixture_with_block_size(true, (case == "complete").then_some(4));
         let old = [1, 2, 3, 4];
@@ -3312,33 +3317,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_missing_start_clears_history() {
-        check_replay_case("missing_start").await;
-    }
-
-    #[tokio::test]
-    async fn replay_middle_gap_clears_partial_stores() {
-        check_replay_case("middle_gap").await;
-    }
-
-    #[tokio::test]
-    async fn replay_corrupt_payload_clears_partial_stores() {
-        check_replay_case("corrupt").await;
-    }
-
-    #[tokio::test]
-    async fn replay_early_eof_clears_partial_stores() {
-        check_replay_case("early_eof").await;
-    }
-
-    #[tokio::test]
-    async fn replay_wrong_rank_clears_partial_stores() {
-        check_replay_case("wrong_rank").await;
-    }
-
-    #[tokio::test]
-    async fn replay_wrong_topic_clears_partial_stores() {
-        check_replay_case("wrong_topic").await;
+    async fn replay_rejections_clear_history_and_partial_stores() {
+        for case in [
+            "missing_start",
+            "middle_gap",
+            "corrupt",
+            "early_eof",
+            "wrong_rank",
+            "wrong_topic",
+        ] {
+            check_replay_case(case).await;
+        }
     }
 
     #[tokio::test]

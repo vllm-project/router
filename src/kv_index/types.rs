@@ -154,6 +154,7 @@ impl SourceRecoveryState {
 }
 
 /// Stable, bounded reasons for source recovery state transitions.
+/// Each variant is a metric label; add a reason only when a distinct alert needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SourceRecoveryReason {
     Registered,

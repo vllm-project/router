@@ -510,7 +510,7 @@ pub struct KvBlockIndexer {
 struct SourceRecoveryRecord {
     status: SourceRecoveryStatus,
     attempt: u64,
-    replay_state: SourceRecoveryState,
+    replay_state: Option<SourceRecoveryState>,
 }
 
 impl KvBlockIndexer {
@@ -556,7 +556,7 @@ impl KvBlockIndexer {
                 entry.insert(SourceRecoveryRecord {
                     status,
                     attempt: self.recovery_attempt.fetch_add(1, Ordering::Relaxed),
-                    replay_state: SourceRecoveryState::Observed,
+                    replay_state: None,
                 });
                 Some(previous)
             }
@@ -564,7 +564,7 @@ impl KvBlockIndexer {
                 entry.insert(SourceRecoveryRecord {
                     status,
                     attempt: self.recovery_attempt.fetch_add(1, Ordering::Relaxed),
-                    replay_state: SourceRecoveryState::Observed,
+                    replay_state: None,
                 });
                 None
             }
@@ -657,7 +657,7 @@ impl KvBlockIndexer {
             .get_mut(&(source.clone(), dp_rank))
             .unwrap();
         record.attempt = attempt;
-        record.replay_state = replay_state;
+        record.replay_state = Some(replay_state);
         attempt
     }
 
@@ -737,6 +737,7 @@ impl KvBlockIndexer {
             if record.attempt != attempt
                 || record.status.state != SourceRecoveryState::Degraded
                 || record.status.reason != SourceRecoveryReason::SequenceGap
+                || record.replay_state.is_none()
             {
                 return None;
             }
@@ -809,14 +810,17 @@ impl KvBlockIndexer {
                 (Observed, SourceRecoveryReason::FreshObservation)
             }
             RecoveryBoundary::Replay { attempt } => {
-                let Some(record) = record.filter(|record| {
-                    record.attempt == attempt
-                        && record.status.state == SourceRecoveryState::Degraded
-                        && record.status.reason == SourceRecoveryReason::SequenceGap
-                }) else {
+                let Some(replay_state) = record
+                    .filter(|record| {
+                        record.attempt == attempt
+                            && record.status.state == SourceRecoveryState::Degraded
+                            && record.status.reason == SourceRecoveryReason::SequenceGap
+                    })
+                    .and_then(|record| record.replay_state)
+                else {
                     return false;
                 };
-                (record.replay_state, SourceRecoveryReason::ReplayApplied)
+                (replay_state, SourceRecoveryReason::ReplayApplied)
             }
         };
         if previous.is_some_and(|s| !Self::visible_state(s))
