@@ -376,7 +376,7 @@ fn finalize_decode_stream(
     let stream = decode_response.bytes_stream();
     let body =
         if status.is_success() && usage_stream::is_supported_path(path) && is_sse && !is_encoded {
-            let cached = prefill_response_json.and_then(usage_merge::cached_tokens);
+            let cached = prefill_response_json.and_then(usage_merge::prefill_cached_tokens);
             let observer = match (observation, cached) {
                 (Some(attempt), Some(_)) => Some(SseUsageObservation::new(attempt.clone(), status)),
                 (Some(attempt), None) => {
@@ -434,7 +434,7 @@ fn finalize_decode_body(
         }
         return response_with_body(status, &headers, Body::from(original));
     }
-    let cached = prefill_response_json.and_then(usage_merge::cached_tokens);
+    let cached = prefill_response_json.and_then(usage_merge::prefill_cached_tokens);
     let mut json: Value = match serde_json::from_slice(&original) {
         Ok(json) => json,
         Err(error) if reconcile_cache => {
@@ -4023,6 +4023,114 @@ mod tests {
                     assert!(!body.contains("cached_tokens"));
                     assert!(metrics.contains("reason=\"missing_usage\""));
                     assert!(!metrics.contains("vllm_router_kv_actual_cached_tokens_count"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prefill_dual_dialect_uses_its_own_usage_for_json_and_sse() {
+        use crate::kv_observation::test_helpers::{has_outcome, prediction};
+        let decode = json!({"usage": {
+            "prompt_tokens": 64, "prompt_tokens_details": {"cached_tokens": 4},
+            "input_tokens": 64, "input_tokens_details": {"cached_tokens": 8, "future": 7},
+            "output_tokens": 8, "total_tokens": 72, "future": 9
+        }});
+        let event = format!("data: {decode}\n\ndata: [DONE]\n\n");
+        let server = spawn_test_server(axum::Router::new().fallback(move || {
+            let event = event.clone();
+            async move { ([("content-type", "text/event-stream")], event) }
+        }))
+        .await;
+        for nested in [false, true] {
+            for streaming in [false, true] {
+                for (cached, expected) in [
+                    (Some(json!(32)), Some(32_u64)),
+                    (Some(json!(0)), Some(0)),
+                    (None, None),
+                    (Some(Value::Null), None),
+                    (Some(json!("32")), None),
+                    (Some(json!(65)), None),
+                ] {
+                    let mut prefill = json!({"usage": {
+                        "prompt_tokens": 64, "prompt_tokens_details": {"cached_tokens": 16},
+                        "input_tokens": 64, "input_tokens_details": {}
+                    }});
+                    if let Some(cached) = cached {
+                        prefill["usage"]["input_tokens_details"]["cached_tokens"] = cached;
+                    }
+                    if nested {
+                        prefill = json!({"response": prefill});
+                    }
+                    let recorder =
+                        metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+                    let handle = recorder.handle();
+                    let _recorder = metrics::set_default_local_recorder(&recorder);
+                    let attempt = KvRouteAttempt::new(prediction());
+                    let response = if streaming {
+                        finalize_decode_stream(
+                            reqwest::get(&server).await.unwrap(),
+                            Some(&prefill),
+                            "/v1/responses",
+                            Some(&attempt),
+                        )
+                    } else {
+                        finalize_decode_body(
+                            StatusCode::OK,
+                            HeaderMap::new(),
+                            Bytes::from(decode.to_string()),
+                            Some(&prefill),
+                            "/v1/responses",
+                            false,
+                            Some(&attempt),
+                        )
+                    }
+                    .unwrap();
+                    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let value: Value = if streaming {
+                        let text = std::str::from_utf8(&bytes).unwrap();
+                        serde_json::from_str(
+                            text.lines()
+                                .find_map(|line| line.strip_prefix("data: "))
+                                .unwrap(),
+                        )
+                        .unwrap()
+                    } else {
+                        serde_json::from_slice(&bytes).unwrap()
+                    };
+                    let usage = usage_merge::usage_object(&value).unwrap();
+                    assert_eq!(
+                        usage["input_tokens_details"].get("cached_tokens"),
+                        expected.map(Value::from).as_ref()
+                    );
+                    assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 4);
+                    assert_eq!(usage["input_tokens_details"]["future"], 7);
+                    assert_eq!(usage["future"], 9);
+                    drop(attempt);
+                    let metrics = handle.render();
+                    if let Some(expected) = expected {
+                        assert!(has_outcome(&metrics, "observed", "none"), "{metrics}");
+                        assert!(
+                            metrics.lines().any(|line| line
+                                == format!("vllm_router_kv_actual_cached_tokens_sum {expected}")),
+                            "{metrics}"
+                        );
+                        let direction = if expected == 32 {
+                            "exact"
+                        } else {
+                            "overpredicted"
+                        };
+                        assert!(metrics.lines().any(|line| line == format!("vllm_router_kv_cached_token_absolute_error_sum{{direction=\"{direction}\"}} {}", 32 - expected)), "{metrics}");
+                    } else {
+                        assert!(
+                            has_outcome(&metrics, "unavailable", "missing_usage"),
+                            "{metrics}"
+                        );
+                        assert!(!metrics.contains("vllm_router_kv_actual_cached_tokens_count"));
+                        assert!(!metrics.contains("vllm_router_kv_predicted_cached_tokens_count"));
+                    }
                 }
             }
         }

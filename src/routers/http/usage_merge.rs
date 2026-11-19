@@ -91,6 +91,12 @@ pub(super) fn usage_dialect(response: &Value, prefill: Option<&Value>) -> UsageD
         .unwrap_or(UsageDialect::Completions)
 }
 
+/// Read Prefill's selected spelling before snapshotting can remove its wrapper.
+/// A missing or invalid selected count cannot borrow a conflicting alias.
+pub(super) fn prefill_cached_tokens(prefill: &Value) -> Option<u64> {
+    cached_tokens_for_dialect(prefill, usage_dialect(prefill, None))
+}
+
 /// Retain only usage, releasing potentially large KV-transfer metadata before
 /// consuming the Decode stream.
 pub(super) fn usage_snapshot(prefill: &Value) -> Option<Value> {
