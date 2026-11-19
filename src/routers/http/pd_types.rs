@@ -156,6 +156,13 @@ pub struct PdRequestContext<'a> {
     pub lora_name: Option<&'a str>,
     /// Request cache salt scoping the binding digest.
     pub cache_salt: Option<&'a str>,
+    /// Engine capacity and pressure, discovered from the engines' own metrics. `None`
+    /// leaves admission disabled rather than guessing a ceiling.
+    pub capacity: Option<&'a crate::routers::http::pd_capacity::CapacityTable>,
+    /// Tokens this request would add to a Decode engine, when the prompt length is known.
+    pub capacity_add_tokens: Option<u64>,
+    /// Sequences this request runs on the candidate (`n` / `best_of`).
+    pub capacity_add_sequences: u64,
     pub route: &'a str,
 }
 

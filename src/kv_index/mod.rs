@@ -7,6 +7,7 @@ mod decode;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
+pub mod capacity;
 pub mod discovery;
 mod endpoints;
 pub mod indexer;
