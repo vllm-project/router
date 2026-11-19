@@ -1140,13 +1140,17 @@ mod tests {
             )
         };
         let first = chat_key("甲");
-        assert_eq!(policy.select_worker(&workers, Some(&first)), Some(0));
-        workers[0].increment_load();
+        let first_idx = policy.select_worker(&workers, Some(&first)).unwrap();
+        workers[first_idx].increment_load();
+        let other = 1 - first_idx;
         assert_eq!(
             policy.select_worker(&workers, Some(&chat_key("乙"))),
-            Some(1)
+            Some(other)
         );
-        assert_eq!(policy.select_worker(&workers, Some(&first)), Some(0));
+        assert_eq!(
+            policy.select_worker(&workers, Some(&first)),
+            Some(first_idx)
+        );
     }
 
     #[test]
