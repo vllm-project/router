@@ -1252,6 +1252,50 @@ mod responses_endpoint_tests {
     }
 
     #[tokio::test]
+    async fn test_v1_messages_body_level_program_request_is_tracked() {
+        let config = RouterConfig {
+            policy: PolicyConfig::RoundRobin,
+            program_scheduling: Some(ProgramSchedulingConfig::default()),
+            ..Default::default()
+        };
+        let ctx = TestContext::new_with_config(
+            config,
+            vec![MockWorkerConfig {
+                port: 0,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let payload = json!({
+            "model": "mock-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "Hello Messages API"}],
+            "vllm_xargs": {"agentic_context": {
+                "program_id": "messages-program",
+                "task_id": null,
+                "expected_resume": true
+            }}
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let diagnostics = ctx.router.scheduling_diagnostics().unwrap();
+        let programs = diagnostics["ranks"][0]["programs"].as_array().unwrap();
+        assert_eq!(programs.len(), 1, "{diagnostics}");
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn test_v1_responses_streaming() {
         let ctx = TestContext::new(vec![MockWorkerConfig {
             port: 18951,
