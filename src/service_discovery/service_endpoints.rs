@@ -211,6 +211,9 @@ pub fn resolve_endpoints(
                 continue;
             }
         }
+        if slice.endpoints.is_empty() {
+            continue;
+        }
         let ports: Vec<_> = slice
             .ports
             .iter()
@@ -309,6 +312,7 @@ pub fn resolve_endpoints(
             });
         }
     }
+    endpoints.sort_unstable_by_key(|endpoint| endpoint.address);
     EndpointResolution {
         endpoints,
         diagnostics: diagnostics.into_iter().collect(),

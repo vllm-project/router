@@ -205,24 +205,36 @@ mod endpoint_resolution {
         let a = slice(
             "a",
             8000,
-            vec![endpoint("pod-2", "10.0.0.2"), endpoint("pod-1", "10.0.0.1")],
+            vec![endpoint("pod-a", "10.0.0.2"), endpoint("pod-z", "10.0.0.1")],
         );
         let b = slice(
             "b",
             8000,
-            vec![endpoint("pod-3", "10.0.0.3"), endpoint("pod-1", "10.0.0.1")],
+            vec![endpoint("pod-m", "10.0.0.3"), endpoint("pod-z", "10.0.0.1")],
         );
         let result = resolve(&[a.clone(), b.clone()]);
         assert_eq!(
             result.endpoints,
             vec![
-                expected_endpoint("pod-1", "10.0.0.1:8000", "model-a"),
-                expected_endpoint("pod-2", "10.0.0.2:8000", "model-a"),
-                expected_endpoint("pod-3", "10.0.0.3:8000", "model-a"),
+                expected_endpoint("pod-z", "10.0.0.1:8000", "model-a"),
+                expected_endpoint("pod-a", "10.0.0.2:8000", "model-a"),
+                expected_endpoint("pod-m", "10.0.0.3:8000", "model-a"),
             ]
         );
         assert_diagnostics(&result, &[]);
         assert_eq!(result, resolve(&[b, a]));
+    }
+
+    #[test]
+    fn accepts_empty_placeholders_without_ports_and_preserves_other_endpoints() {
+        let valid = slice("valid", 8000, vec![endpoint("pod-1", "10.0.0.1")]);
+        let expected = resolve(std::slice::from_ref(&valid));
+        for ports in [None, Some(vec![])] {
+            let mut empty = slice("empty", 8000, vec![]);
+            empty.ports = ports;
+            assert_eq!(resolve(&[empty.clone()]), EndpointResolution::default());
+            assert_eq!(resolve(&[empty, valid.clone()]), expected);
+        }
     }
 
     #[test]
@@ -329,6 +341,36 @@ mod readiness {
 
 mod ownership_and_pod_identity {
     use super::*;
+
+    #[test]
+    fn empty_slices_still_validate_ownership_controller_and_address_type() {
+        let mut empty = slice("empty", 8000, vec![]);
+        empty.ports = None;
+        let mut stale = empty.clone();
+        stale.metadata.owner_references.as_mut().unwrap()[0].uid = "old-service".into();
+        let mut custom = empty.clone();
+        custom
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(MANAGED_BY_LABEL.into(), "custom-controller".into());
+        let mut fqdn = empty;
+        fqdn.address_type = "FQDN".into();
+
+        for (input, field) in [
+            (stale, "metadata.ownerReferences"),
+            (
+                custom,
+                "metadata.labels[endpointslice.kubernetes.io/managed-by]",
+            ),
+            (fqdn, "addressType"),
+        ] {
+            let result = resolve(&[input]);
+            assert!(result.endpoints.is_empty());
+            assert_diagnostics(&result, &[("EndpointSlice inference/empty", field)]);
+        }
+    }
 
     #[test]
     fn rejects_missing_or_stale_service_owners() {
