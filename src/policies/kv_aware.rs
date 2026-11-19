@@ -43,6 +43,9 @@ pub enum KvRequestTokens<'a> {
 pub(crate) struct QualifiedKvInput<'a> {
     pub(crate) tokens: KvRequestTokens<'a>,
     pub(crate) eligibility: Option<&'a [bool]>,
+    /// `false` keeps worker selection but plans no peer fetch, so the request
+    /// takes no source permit.
+    pub(crate) transfer: bool,
 }
 
 impl QualifiedKvInput<'_> {
@@ -163,6 +166,7 @@ pub trait KvAwareOps: Send + Sync {
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
         eligibility: Option<&[bool]>,
+        _transfer: bool,
     ) -> Option<KvSelectionReceipt> {
         if eligibility.is_some() {
             return None;
@@ -1501,6 +1505,7 @@ impl KvAwarePolicy {
             QualifiedKvInput {
                 tokens: KvRequestTokens::Shared(token_ids),
                 eligibility: None,
+                transfer: true,
             },
             lora_name,
             cache_salt,
@@ -1551,6 +1556,7 @@ impl KvAwarePolicy {
             QualifiedKvInput {
                 tokens,
                 eligibility: None,
+                transfer: true,
             },
             lora_name,
             cache_salt,
@@ -1702,6 +1708,12 @@ impl KvAwarePolicy {
             // source unregisters in between, the grant finds no endpoint and
             // the request goes out unchanged.
             let transfer = self.transfer_planner.as_deref().and_then(|planner| {
+                if !input.transfer {
+                    crate::metrics::RouterMetrics::record_kv_transfer_plan(
+                        TransferSkip::PromptLogprobs.label(),
+                    );
+                    return None;
+                }
                 self.plan_transfer_for_pick(
                     planner,
                     workers,
@@ -2545,6 +2557,7 @@ impl KvAwareOps for KvAwarePolicy {
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
         eligibility: Option<&[bool]>,
+        transfer: bool,
     ) -> Option<KvSelectionReceipt> {
         KvAwarePolicy::select_worker_with_qualified_inputs(
             self,
@@ -2552,6 +2565,7 @@ impl KvAwareOps for KvAwarePolicy {
             QualifiedKvInput {
                 tokens,
                 eligibility,
+                transfer,
             },
             lora_name,
             cache_salt,
@@ -2722,6 +2736,7 @@ mod tests {
                         None,
                         excluded,
                         Some(mask),
+                        true,
                     )
                     .unwrap_or_else(|| panic!("{case}: no worker selected for {mask:?}"))
             };
@@ -2751,6 +2766,7 @@ mod tests {
                             QualifiedKvInput {
                                 tokens: KvRequestTokens::Shared(Some(&ids)),
                                 eligibility: Some(&mask),
+                                transfer: true,
                             },
                             None,
                             None,
@@ -3693,6 +3709,7 @@ mod tests {
                     None,
                     &[],
                     eligibility,
+                    true,
                 )
                 .is_none());
         }
@@ -4899,6 +4916,7 @@ mod tests {
                 QualifiedKvInput {
                     tokens: KvRequestTokens::Shared(Some(&ids)),
                     eligibility: None,
+                    transfer: true,
                 },
                 None,
                 None,
@@ -5059,6 +5077,7 @@ mod tests {
                 QualifiedKvInput {
                     tokens: KvRequestTokens::Shared(Some(&ids)),
                     eligibility: None,
+                    transfer: true,
                 },
                 None,
                 None,
@@ -5085,6 +5104,34 @@ mod tests {
             planned.source.registration.as_ref().expect("planned"),
             &current
         ));
+    }
+
+    #[test]
+    fn a_request_that_skips_transfer_keeps_its_worker_but_takes_no_permit() {
+        let (policy, workers, _) = active_fixture(1);
+        let ids = transfer_ids();
+        let skipped = policy
+            .select_worker_with_qualified_inputs(
+                &workers,
+                QualifiedKvInput {
+                    tokens: KvRequestTokens::Shared(Some(&ids)),
+                    eligibility: None,
+                    transfer: false,
+                },
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        assert!(skipped.peer_fetch.is_none());
+        assert!(policy.last_transfer_plan().is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+
+        // Same worker as a request that may fetch, and the cap is still free.
+        let fetching = select(&policy, &workers);
+        assert_eq!(fetching.worker_index, skipped.worker_index);
+        assert!(fetching.peer_fetch.is_some());
     }
 
     #[test]

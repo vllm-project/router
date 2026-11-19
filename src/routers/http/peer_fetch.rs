@@ -10,6 +10,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::policies::PeerEndpoint;
+use crate::protocols::spec::GrpcRequestRef;
 
 /// What happened when peer fetch params were applied to a body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +51,20 @@ fn peer_fetch_params(source: &PeerEndpoint) -> Value {
         "dcp_size": source.dcp_size,
         "pp_size": source.pp_size,
     })
+}
+
+/// Whether the client set `prompt_logprobs` (an explicit `null` counts as
+/// absent). The engine then computes every prompt token and reads no external
+/// KV, so planning a fetch for the request would only hold a source permit.
+pub(super) fn wants_prompt_logprobs(request: Option<GrpcRequestRef<'_>>) -> bool {
+    let other = match request {
+        Some(GrpcRequestRef::Chat(request)) => &request.other,
+        Some(GrpcRequestRef::Completion(request)) => &request.other,
+        None => return false,
+    };
+    other
+        .get("prompt_logprobs")
+        .is_some_and(|value| !value.is_null())
 }
 
 /// Add `kv_transfer_params` for a fetch from `source` to `body`, unless the
@@ -166,6 +181,45 @@ mod tests {
             apply_peer_fetch(&mut body, &endpoint()),
             PeerFetchApply::Applied
         );
+    }
+
+    #[test]
+    fn prompt_logprobs_is_read_from_both_request_kinds() {
+        use crate::protocols::spec::{ChatCompletionRequest, CompletionRequest};
+
+        let chat = |extra: Value| -> ChatCompletionRequest {
+            let mut body = json!({"model": "m", "messages": []});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(body).unwrap()
+        };
+        let completion = |extra: Value| -> CompletionRequest {
+            let mut body = json!({"model": "m", "prompt": "hi"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(body).unwrap()
+        };
+
+        for (extra, expected) in [
+            (json!({"prompt_logprobs": 1}), true),
+            (json!({"prompt_logprobs": 0}), true),
+            (json!({"prompt_logprobs": null}), false),
+            (json!({}), false),
+        ] {
+            assert_eq!(
+                wants_prompt_logprobs(Some(GrpcRequestRef::Chat(&chat(extra.clone())))),
+                expected,
+                "chat {extra}"
+            );
+            assert_eq!(
+                wants_prompt_logprobs(Some(GrpcRequestRef::Completion(&completion(extra.clone())))),
+                expected,
+                "completion {extra}"
+            );
+        }
+        assert!(!wants_prompt_logprobs(None));
     }
 
     #[test]
