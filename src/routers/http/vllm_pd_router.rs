@@ -403,6 +403,11 @@ impl KvTransferGuard {
         }
     }
 
+    /// Update with committed decode worker if deferred selection changed the target.
+    pub(crate) fn update_decode_worker(&mut self, decode_worker: Arc<dyn Worker>) {
+        self.decode_worker = decode_worker;
+    }
+
     /// Update with final decode kv_transfer_params if transformed during stage preparation.
     pub(crate) fn update_params(&mut self, params: Value) {
         self.kv_transfer_params = Some(params);
@@ -2500,6 +2505,7 @@ impl VllmPDRouter {
                 )
                 .await;
 
+                let mut prefill_status_is_success = false;
                 let result = async {
                     let response =
                         prefill_response.map_err(|error| PDRouterError::NetworkError {
@@ -2509,6 +2515,9 @@ impl VllmPDRouter {
                             ),
                         })?;
                     let status = response.status();
+                    if status.is_success() {
+                        prefill_status_is_success = true;
+                    }
                     let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
                     let bytes = read_prefill_body(response, &prefill_base_for_p_rejection).await?;
                     Ok::<_, PDRouterError>((status, content_type, bytes))
@@ -2519,10 +2528,10 @@ impl VllmPDRouter {
                 attempt_for_p_task.finish_prefill();
 
                 let mut kv_guard = None;
-                if let Ok((status, _, ref bytes)) = result {
-                    if status.is_success() {
+                let params = match result {
+                    Ok((status, _, ref bytes)) if status.is_success() => {
                         let json = serde_json::from_slice::<Value>(bytes).ok();
-                        let params = match json.as_ref() {
+                        match json.as_ref() {
                             Some(j) => extract_remote_kv_params(j).or_else(|| {
                                 if j.get("kv_transfer_params").is_none() {
                                     transfer_id_for_p_rejection.as_ref().map(|tid| {
@@ -2541,34 +2550,47 @@ impl VllmPDRouter {
                                     "transfer_id": tid,
                                 })
                             }),
-                        };
-                        if let Some(params) = params {
-                            if matches!(
-                                cancel_rx.try_recv(),
-                                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
-                            ) {
-                                debug!(
-                                "Downstream disconnected during prefill; sending rejection for {}",
-                                request_id_for_p_rejection
-                            );
-                                send_kv_transfer_rejection(
-                                    &client_for_p_rejection,
-                                    decode_worker_for_p_rejection.as_ref(),
-                                    &request_id_for_p_rejection,
-                                    &params,
-                                )
-                                .await;
-                            } else {
-                                // Client still connected: transfer armed guard in task output
-                                // to bridge cleanup ownership across the profiling gap.
-                                kv_guard = Some(KvTransferGuard::new(
-                                    client_for_p_rejection,
-                                    decode_worker_for_p_rejection,
-                                    request_id_for_p_rejection,
-                                    params,
-                                ));
-                            }
                         }
+                    }
+                    Err(_) if prefill_status_is_success => {
+                        // Prefill returned 2xx headers, but reading the response body failed
+                        // (interrupted, connection reset, or over-limit). Fall back to the
+                        // router-known transfer_id so pinned KV blocks are not stranded.
+                        transfer_id_for_p_rejection.as_ref().map(|tid| {
+                            json!({
+                                "do_remote_prefill": true,
+                                "transfer_id": tid,
+                            })
+                        })
+                    }
+                    _ => None,
+                };
+
+                if let Some(params) = params {
+                    if matches!(
+                        cancel_rx.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                    ) {
+                        debug!(
+                            "Downstream disconnected during prefill; sending rejection for {}",
+                            request_id_for_p_rejection
+                        );
+                        send_kv_transfer_rejection(
+                            &client_for_p_rejection,
+                            decode_worker_for_p_rejection.as_ref(),
+                            &request_id_for_p_rejection,
+                            &params,
+                        )
+                        .await;
+                    } else {
+                        // Client still connected: transfer armed guard in task output
+                        // to bridge cleanup ownership across the profiling gap.
+                        kv_guard = Some(KvTransferGuard::new(
+                            client_for_p_rejection,
+                            decode_worker_for_p_rejection,
+                            request_id_for_p_rejection,
+                            params,
+                        ));
                     }
                 }
 
@@ -2666,7 +2688,12 @@ impl VllmPDRouter {
                 .select_and_commit_decode(&attempt, commit, request, headers, pinned)
                 .await
             {
-                Ok(worker) => decode_worker = worker,
+                Ok(worker) => {
+                    decode_worker = worker;
+                    if let Some(guard) = kv_guard.as_mut() {
+                        guard.update_decode_worker(decode_worker.clone());
+                    }
+                }
                 Err((status, message)) => {
                     RouterMetrics::record_pd_error("server_selection");
                     RouterMetrics::record_pd_request(path);
@@ -2708,6 +2735,7 @@ impl VllmPDRouter {
             .await
         {
             if let Some(guard) = kv_guard.as_mut() {
+                guard.update_decode_worker(decode_worker.clone());
                 guard.update_params(params.clone());
             } else {
                 kv_guard = Some(KvTransferGuard::new(
@@ -2719,6 +2747,9 @@ impl VllmPDRouter {
             }
             decode_request["kv_transfer_params"] = params;
         } else {
+            if let Some(guard) = kv_guard.as_mut() {
+                guard.update_decode_worker(decode_worker.clone());
+            }
             warn!(
                 "No kv_transfer_params for prefill {}, decode will proceed without them",
                 prefill_base_url
@@ -7776,6 +7807,135 @@ mod tests {
             })
         });
         assert_eq!(params, None);
+    }
+
+    #[tokio::test]
+    async fn test_kv_transfer_guard_update_decode_worker_sends_rejection_to_committed_target() {
+        let _serial_guard = REJECTION_TEST_MUTEX.lock().await;
+        let prov_rejections = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let prov_clone = prov_rejections.clone();
+        let committed_rejections = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let committed_clone = committed_rejections.clone();
+
+        async fn reject_handler(
+            axum::extract::State(rejections): axum::extract::State<
+                Arc<tokio::sync::Mutex<Vec<Value>>>,
+            >,
+            axum::Json(body): axum::Json<Value>,
+        ) -> StatusCode {
+            rejections.lock().await.push(body);
+            StatusCode::ACCEPTED
+        }
+
+        let app_prov = axum::Router::new().route(
+            "/v1/kv_transfer/reject",
+            axum::routing::post(reject_handler).with_state(prov_clone),
+        );
+        let listener_prov = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prov_addr = format!("http://{}", listener_prov.local_addr().unwrap());
+        let server_prov = tokio::spawn(async move {
+            axum::serve(listener_prov, app_prov).await.unwrap();
+        });
+
+        let app_committed = axum::Router::new().route(
+            "/v1/kv_transfer/reject",
+            axum::routing::post(reject_handler).with_state(committed_clone),
+        );
+        let listener_committed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let committed_addr = format!("http://{}", listener_committed.local_addr().unwrap());
+        let server_committed = tokio::spawn(async move {
+            axum::serve(listener_committed, app_committed)
+                .await
+                .unwrap();
+        });
+
+        let prov_worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new(prov_addr, WorkerType::Decode));
+        let committed_worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new(committed_addr, WorkerType::Decode));
+
+        let mut guard = KvTransferGuard::new(
+            reqwest::Client::new(),
+            prov_worker,
+            "req-committed-target-rejection".to_string(),
+            json!({
+                "do_remote_prefill": true,
+                "remote_engine_id": "producer-p",
+                "transfer_id": "tx-committed-453"
+            }),
+        );
+
+        // Deferred selection updates the decode target to committed worker
+        guard.update_decode_worker(committed_worker);
+
+        // Dispatch to committed worker returns non-2xx -> guard is dropped armed
+        drop(guard);
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let prov_recorded = prov_rejections.lock().await;
+        let committed_recorded = committed_rejections.lock().await;
+
+        assert_eq!(
+            prov_recorded.len(),
+            0,
+            "Provisional worker must NOT receive rejection after target update"
+        );
+        assert_eq!(
+            committed_recorded.len(),
+            1,
+            "Committed worker MUST receive rejection after target update"
+        );
+        assert_eq!(
+            committed_recorded[0]["request_id"],
+            "req-committed-target-rejection"
+        );
+        assert_eq!(
+            committed_recorded[0]["kv_transfer_params"]["transfer_id"],
+            "tx-committed-453"
+        );
+
+        server_prov.abort();
+        server_committed.abort();
+    }
+
+    #[test]
+    fn test_extract_remote_kv_params_body_read_failure_uses_transfer_id_fallback() {
+        let transfer_id = Some("tx-body-read-err-789".to_string());
+
+        // When prefill returned 2xx headers (prefill_status_is_success = true), but body read failed:
+        let prefill_status_is_success = true;
+        let params_success_header = if prefill_status_is_success {
+            transfer_id.as_ref().map(|tid| {
+                json!({
+                    "do_remote_prefill": true,
+                    "transfer_id": tid,
+                })
+            })
+        } else {
+            None
+        };
+        assert_eq!(
+            params_success_header,
+            Some(json!({
+                "do_remote_prefill": true,
+                "transfer_id": "tx-body-read-err-789",
+            }))
+        );
+
+        // When prefill returned 5xx headers (prefill_status_is_success = false), no rejection:
+        let prefill_status_is_500 = false;
+        let params_fail_header = if prefill_status_is_500 {
+            transfer_id.as_ref().map(|tid| {
+                json!({
+                    "do_remote_prefill": true,
+                    "transfer_id": tid,
+                })
+            })
+        } else {
+            None
+        };
+        assert_eq!(params_fail_header, None);
     }
 
     #[test]
