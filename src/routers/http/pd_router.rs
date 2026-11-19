@@ -8,6 +8,7 @@ use super::pd_types::{
 };
 use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs, HttpTokenInput};
 use crate::core::worker::WorkerMetadata;
+use crate::core::worker::{worker_get, worker_post};
 use crate::core::{
     BasicWorker, CircuitBreaker, CircuitBreakerConfig, ConnectionMode, DPAwareWorker, HealthConfig,
     Worker, WorkerRegistry, WorkerResult, WorkerType,
@@ -847,7 +848,10 @@ impl PdRouterBase {
             // Extract base URL if DP-aware format (e.g., http://127.0.0.1:8081@0 → http://127.0.0.1:8081)
             let (base_url, _) = super::dp_utils::parse_worker_url(&worker_url);
             let url = format!("{}/{}", base_url, endpoint);
-            match self.client.post(&url).send().await {
+            match worker_post(&self.client, &url, self.api_key.as_deref())
+                .send()
+                .await
+            {
                 Ok(res) if res.status().is_success() => {
                     results.push(format!("{} {}: OK", worker_type, worker_url));
                 }
@@ -1331,6 +1335,7 @@ impl PdRouterBase {
                     .collect();
                 let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
                 let monitor_client = ctx.client.clone();
+                let monitor_api_key = ctx.router_config.api_key.clone();
                 let prefill_policy_clone = Arc::clone(&prefill_policy);
                 let decode_policy_clone = Arc::clone(&decode_policy);
 
@@ -1340,6 +1345,7 @@ impl PdRouterBase {
                         tx,
                         monitor_interval,
                         monitor_client,
+                        monitor_api_key,
                         prefill_policy_clone,
                         decode_policy_clone,
                     )
@@ -1398,6 +1404,7 @@ impl PdRouterBase {
         tx: tokio::sync::watch::Sender<HashMap<String, isize>>,
         interval_secs: u64,
         client: Client,
+        api_key: Option<String>,
         prefill_policy: Arc<dyn LoadBalancingPolicy>,
         decode_policy: Arc<dyn LoadBalancingPolicy>,
     ) {
@@ -1408,9 +1415,12 @@ impl PdRouterBase {
                 .iter()
                 .map(|url| {
                     let client = client.clone();
+                    let api_key = api_key.clone();
                     let url = url.clone();
                     async move {
-                        let load = get_worker_load(&client, &url).await.unwrap_or(0);
+                        let load = get_worker_load(&client, &url, api_key.as_deref())
+                            .await
+                            .unwrap_or(0);
                         (url, load)
                     }
                 })
@@ -1441,8 +1451,16 @@ impl PdRouterBase {
 
 // Helper functions
 
-async fn get_worker_load(client: &Client, worker_url: &str) -> Option<isize> {
-    match client.get(format!("{}/get_load", worker_url)).send().await {
+async fn get_worker_load(
+    client: &Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Option<isize> {
+    let (base_url, _) = super::dp_utils::parse_worker_url(worker_url);
+    match worker_get(client, &format!("{}/get_load", base_url), api_key)
+        .send()
+        .await
+    {
         Ok(res) if res.status().is_success() => match res.bytes().await {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(data) => data
@@ -1811,7 +1829,7 @@ impl PdRouterBase {
         // Process prefill workers
         let prefill_urls = self.get_prefill_worker_urls();
         for worker_url in prefill_urls {
-            match get_worker_load(&self.client, &worker_url).await {
+            match get_worker_load(&self.client, &worker_url, self.api_key.as_deref()).await {
                 Some(load) => {
                     loads.insert(format!("prefill_{}", worker_url), load);
                 }
@@ -1824,7 +1842,7 @@ impl PdRouterBase {
         // Process decode workers
         let decode_urls = self.get_decode_worker_urls();
         for worker_url in decode_urls {
-            match get_worker_load(&self.client, &worker_url).await {
+            match get_worker_load(&self.client, &worker_url, self.api_key.as_deref()).await {
                 Some(load) => {
                     loads.insert(format!("decode_{}", worker_url), load);
                 }
@@ -1948,6 +1966,175 @@ mod tests {
         let worker = BasicWorker::new(url, worker_type);
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    async fn start_admin_auth_mock_server(
+        api_key: Option<&str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{
+            http::header::AUTHORIZATION,
+            routing::{get, post},
+            Json, Router as AxumRouter,
+        };
+        use tokio::net::TcpListener;
+
+        let expected = api_key.map(|key| format!("Bearer {key}"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected = std::sync::Arc::new(expected);
+        let authorize = {
+            let expected = expected.clone();
+            move |headers: HeaderMap| {
+                let sent = headers.get(AUTHORIZATION).map(|value| value.as_bytes());
+                sent == expected.as_deref().map(str::as_bytes)
+            }
+        };
+        let health_ok = authorize.clone();
+        let flush_ok = authorize.clone();
+        let load_ok = authorize;
+        let app = AxumRouter::new()
+            .route(
+                "/health",
+                get(move |headers: HeaderMap| async move {
+                    if health_ok(headers) {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    }
+                }),
+            )
+            .route(
+                "/flush_cache",
+                post(move |headers: HeaderMap| async move {
+                    if flush_ok(headers) {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    }
+                }),
+            )
+            .route(
+                "/get_load",
+                get(move |headers: HeaderMap| async move {
+                    if load_ok(headers) {
+                        (StatusCode::OK, Json(serde_json::json!({"load": 7}))).into_response()
+                    } else {
+                        StatusCode::UNAUTHORIZED.into_response()
+                    }
+                }),
+            );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    fn pd_router_with_api_key(api_key: Option<&str>) -> PdRouterBase {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
+        PdRouterBase {
+            kv_state: None,
+            pd_load: Arc::new(PdLoadManager::default()),
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
+            load_monitor_handle: None,
+            client: Client::new(),
+            api_key: api_key.map(str::to_owned),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            dp_size: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pd_flush_cache_and_get_load_send_api_key() {
+        let (prefill_url, prefill_server) = start_admin_auth_mock_server(Some("worker-key")).await;
+        let (decode_url, decode_server) = start_admin_auth_mock_server(Some("worker-key")).await;
+        let router = pd_router_with_api_key(Some("worker-key"));
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                prefill_url.clone(),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                true,
+            )));
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                decode_url.clone(),
+                WorkerType::Decode,
+                true,
+            )));
+
+        let flush = router.flush_cache().await;
+        assert_eq!(flush.status(), StatusCode::OK, "flush_cache");
+        let loads = router.get_worker_loads().await;
+        assert_eq!(loads.status(), StatusCode::OK, "get_loads");
+        let body = axum::body::to_bytes(loads.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["loads"][format!("prefill_{prefill_url}")],
+            7,
+            "{payload}"
+        );
+        assert_eq!(
+            payload["loads"][format!("decode_{decode_url}")],
+            7,
+            "{payload}"
+        );
+        assert!(
+            payload["errors"].as_array().unwrap().is_empty(),
+            "{payload}"
+        );
+
+        prefill_server.abort();
+        decode_server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_pd_flush_cache_and_get_load_fail_without_matching_api_key() {
+        let (prefill_url, prefill_server) = start_admin_auth_mock_server(Some("worker-key")).await;
+        let (decode_url, decode_server) = start_admin_auth_mock_server(Some("worker-key")).await;
+        let router = pd_router_with_api_key(Some("other-key"));
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                prefill_url.clone(),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                true,
+            )));
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                decode_url.clone(),
+                WorkerType::Decode,
+                true,
+            )));
+
+        let flush = router.flush_cache().await;
+        assert_eq!(flush.status(), StatusCode::PARTIAL_CONTENT, "flush_cache");
+        let loads = router.get_worker_loads().await;
+        let body = axum::body::to_bytes(loads.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            payload["loads"].as_object().unwrap().is_empty(),
+            "{payload}"
+        );
+        assert_eq!(payload["errors"].as_array().unwrap().len(), 2, "{payload}");
+
+        prefill_server.abort();
+        decode_server.abort();
     }
 
     // ============= Worker Management Tests =============
