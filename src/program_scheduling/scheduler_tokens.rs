@@ -141,12 +141,10 @@ impl ProgramScheduler {
             let placement = state.runtime.placement(&program).map(str::to_string);
             if let Some(decision) = state.decisions.get_mut(&program) {
                 let before = decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
-                // Preserve larger historical/in-flight demand, as on arrival.
-                if context.tokens() >= decision.context_tokens {
-                    decision.context_tokens = context.tokens();
-                    decision.context_token_source = context.source();
-                    decision.context_token_fingerprint = context.fingerprint();
-                    decision.shadow_context_facts = context.shadow_facts();
+                // Preserve larger historical/in-flight demand. On a tie the
+                // fallback must replace the old provenance after revocation.
+                if context.tokens() >= decision.context.tokens() {
+                    decision.context = context;
                     decision.context_shrink_observations = 0;
                 }
                 let after = decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);

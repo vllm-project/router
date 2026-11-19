@@ -29,7 +29,7 @@ use super::openai::{
     completion_final_response, final_response, finish_reason_name, now_secs, sse_chunk,
     sse_usage_chunk, SSE_DONE,
 };
-use super::outcome::EngineOutcomeObserver;
+use super::outcome::{EngineOutcomeObserver, EngineUsage};
 use super::pb::control_client::ControlClient;
 use super::pb::finish_info::FinishReason;
 use super::pb::inference_client::InferenceClient;
@@ -689,10 +689,11 @@ async fn stream_openai(
                         }
                         if finish.is_some() {
                             if let Some(observer) = &observer {
-                                observer.record_usage(
-                                    engine_prompt_tokens.map(|tokens| tokens as usize),
-                                    completion_tokens as usize,
-                                );
+                                observer.record_usage(EngineUsage {
+                                    prompt_tokens: engine_prompt_tokens
+                                        .map(|tokens| tokens as usize),
+                                    completion_tokens: completion_tokens as usize,
+                                });
                             }
                             if include_usage {
                                 let usage = Usage {
@@ -882,10 +883,10 @@ async fn collect_openai(
             .into_response();
     }
     if let Some(observer) = &observer {
-        observer.record_usage(
-            engine_prompt_tokens.map(|tokens| tokens as usize),
-            completion_tokens as usize,
-        );
+        observer.record_usage(EngineUsage {
+            prompt_tokens: engine_prompt_tokens.map(|tokens| tokens as usize),
+            completion_tokens: completion_tokens as usize,
+        });
     }
     abort.disarm();
     // Program settlement must see aborts even when this adapter preserves the

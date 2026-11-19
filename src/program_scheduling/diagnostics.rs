@@ -306,21 +306,21 @@ impl ProgramScheduler {
                     home_target: decision.home_target.clone(),
                     last_target: decision.last_target.clone(),
                     placement: runtime.placement.map(str::to_string),
-                    context_tokens: decision.context_tokens,
-                    legacy_estimated_context_tokens: decision.context_tokens,
-                    context_token_source: decision.context_token_source.as_str(),
-                    shadow_context_tokens: decision
-                        .shadow_context_facts
-                        .map(|facts| facts.tokens()),
+                    context_tokens: decision.context.tokens(),
+                    legacy_estimated_context_tokens: decision.context.tokens(),
+                    context_token_source: decision.context.source().as_str(),
+                    shadow_context_tokens: decision.context.shadow_tokens(),
                     context_token_fingerprint: decision
-                        .context_token_fingerprint
+                        .context
+                        .fingerprint()
                         .map(|fingerprint| fingerprint.as_hex()),
                     shared_prefix_tokens: decision.shared_prefix_tokens,
                     shared_prefix_freshness_remaining_seconds: decision
                         .shared_prefix_fresh_until
                         .map(|deadline| deadline.saturating_duration_since(now).as_secs_f64()),
                     logical_tokens: decision
-                        .context_tokens
+                        .context
+                        .tokens()
                         .saturating_add(self.config.progress_ttl.decode_buffer_tokens),
                     private_tokens: decision
                         .private_tokens(self.config.progress_ttl.decode_buffer_tokens)

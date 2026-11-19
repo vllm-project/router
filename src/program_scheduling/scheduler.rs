@@ -652,28 +652,11 @@ impl ProgramScheduler {
                 if self.config.pd_mode {
                     // A new PD front turn uses its own context even when it is
                     // smaller than the previous turn.
-                    decision.context_tokens = context.tokens();
-                    decision.context_token_source = context.source();
-                    decision.context_token_fingerprint = context.fingerprint();
-                    decision.shadow_context_facts = context.shadow_facts();
+                    decision.context = context;
                     decision.context_shrink_observations = 0;
                 } else {
-                    let current_tokens = decision.context_tokens;
-                    let merged = ContextTokens {
-                        tokens: decision.context_tokens,
-                        estimated_tokens: decision.context_tokens,
-                        source: decision.context_token_source,
-                        fingerprint: decision.context_token_fingerprint,
-                        shadow: decision.shadow_context_facts,
-                        fallback: None,
-                    }
-                    .max_with(context);
-                    decision.context_tokens = merged.tokens();
-                    decision.context_token_source = merged.source();
-                    // Assign unconditionally: an estimate that wins must not
-                    // keep the fingerprint of an older prepared count.
-                    decision.context_token_fingerprint = merged.fingerprint();
-                    decision.shadow_context_facts = merged.shadow_facts();
+                    let current_tokens = decision.context.tokens();
+                    decision.context = decision.context.max_with(context);
                     // A shrink confirmation must survive arrivals that demand
                     // *less* context: only growth (or an equal arrival) proves
                     // the Program is still at the larger size.
@@ -1066,7 +1049,7 @@ mod tests {
             .unwrap();
         let state = scheduler.state.lock();
         let decision = state.decisions.get(first.program()).expect("decision");
-        assert_eq!(decision.context_tokens, 100_000);
+        assert_eq!(decision.context.tokens(), 100_000);
         assert_eq!(decision.context_shrink_observations, 2);
     }
 

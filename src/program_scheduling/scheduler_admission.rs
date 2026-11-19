@@ -443,9 +443,8 @@ impl ProgramScheduler {
         // now the Program's active turn, and later admission must account for
         // its real prompt rather than the previous front's smaller one.
         if let Some(decision) = state.decisions.get_mut(dispatch.program()) {
-            if dispatch.context_tokens() > decision.context_tokens {
-                decision.context_tokens = dispatch.context_tokens();
-                decision.context_shrink_observations = 0;
+            if dispatch.context_tokens() > decision.context.tokens() {
+                decision.set_context_tokens(dispatch.context_tokens());
             }
         }
         RouterMetrics::record_agent_aware_queue_wait(
@@ -501,9 +500,8 @@ impl ProgramScheduler {
             if let Some(decision) = state.decisions.get_mut(handle.program()) {
                 decision.output_token_reservation = next_output;
                 if let Some(context_tokens) = next_context {
-                    if context_tokens != decision.context_tokens {
-                        decision.context_tokens = context_tokens;
-                        decision.context_shrink_observations = 0;
+                    if context_tokens != decision.context.tokens() {
+                        decision.set_context_tokens(context_tokens);
                     }
                 }
             }
@@ -801,7 +799,7 @@ impl ProgramScheduler {
             state
                 .runtime
                 .front_request_context(program)
-                .unwrap_or(decision.context_tokens)
+                .unwrap_or(decision.context.tokens())
         });
         let required_tokens = decision.private_tokens_from_context(
             context_tokens,
@@ -887,7 +885,7 @@ impl ProgramScheduler {
                     state
                         .decisions
                         .get(active.reference)
-                        .map(|decision| decision.context_tokens)
+                        .map(|decision| decision.context.tokens())
                 })
                 .sum(),
             candidate_context_tokens: context_tokens,
@@ -946,9 +944,8 @@ impl ProgramScheduler {
         // its observed shrink policy.
         if let Some(context_tokens) = state.runtime.front_request_context(program) {
             if let Some(decision) = state.decisions.get_mut(program) {
-                if self.config.pd_mode || context_tokens > decision.context_tokens {
-                    decision.context_tokens = context_tokens;
-                    decision.context_shrink_observations = 0;
+                if self.config.pd_mode || context_tokens > decision.context.tokens() {
+                    decision.set_context_tokens(context_tokens);
                 }
             }
         }
@@ -1725,7 +1722,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            state.decisions[first_handle.program()].context_tokens,
+            state.decisions[first_handle.program()].context.tokens(),
             100,
             "the queued tail must not overwrite the front turn's context scope"
         );
@@ -1738,7 +1735,10 @@ mod tests {
         // Cancelling the tail keeps the front's request-scoped charge.
         scheduler.cancel_retained_request(&second_handle);
         let state = scheduler.state.lock();
-        assert_eq!(state.decisions[first_handle.program()].context_tokens, 100);
+        assert_eq!(
+            state.decisions[first_handle.program()].context.tokens(),
+            100
+        );
         let plan = scheduler
             .rank_admission_plan(&state, first_handle.program(), "rank-0", now)
             .expect("front turn still fits after the tail is cancelled");
@@ -1815,7 +1815,9 @@ mod tests {
             .claim_dispatch(&second_handle)
             .expect("successor dispatches");
         assert_eq!(
-            scheduler.state.lock().decisions[second_handle.program()].context_tokens,
+            scheduler.state.lock().decisions[second_handle.program()]
+                .context
+                .tokens(),
             1_000,
             "dispatch promotes the admitted turn's context scope"
         );
@@ -1920,13 +1922,13 @@ mod tests {
                 .decisions
                 .get_mut(handle.program())
                 .unwrap()
-                .context_tokens = 800;
+                .set_context_tokens(800);
             let plan = scheduler
                 .rank_admission_plan(&state, handle.program(), "rank-0", now)
                 .expect("compacted turn fits the 900-token low watermark");
             assert_eq!(plan.required_tokens, 300.0);
             assert!(scheduler.commit_admission(&mut state, handle.program(), "rank-0", plan, now));
-            assert_eq!(state.decisions[handle.program()].context_tokens, 100);
+            assert_eq!(state.decisions[handle.program()].context.tokens(), 100);
             assert_eq!(state.decisions[handle.program()].private_tokens(10), 300.0);
             handle
         };
@@ -1981,7 +1983,9 @@ mod tests {
         scheduler.complete(&first_dispatch, true, false, None, None);
         pd_observe(&scheduler, 0.0);
         assert_eq!(
-            scheduler.state.lock().decisions[second_handle.program()].context_tokens,
+            scheduler.state.lock().decisions[second_handle.program()]
+                .context
+                .tokens(),
             100
         );
         assert!(
@@ -2071,7 +2075,9 @@ mod tests {
 
         scheduler.cancel_retained_request(&first_handle);
         assert_eq!(
-            scheduler.state.lock().decisions[second_handle.program()].context_tokens,
+            scheduler.state.lock().decisions[second_handle.program()]
+                .context
+                .tokens(),
             1_000,
             "cancellation must promote the retained front turn's context"
         );

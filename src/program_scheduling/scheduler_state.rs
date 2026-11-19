@@ -10,7 +10,7 @@ use super::return_time::PendingReturnPrediction;
 use super::{
     ContextTokens, ProgramBindingStrategy, ProgramBindings, ProgramRef, ProgramRuntime,
     ProgramSchedulingEnableKey, ProgramTarget, ProgressTtlConfig, ProgressTtlFactors,
-    TokenCountMode, TokenFactSource, TokenizerFingerprint,
+    TokenCountMode, TokenizerFingerprint,
 };
 use crate::config::types::PredictionProfileConfig;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -253,14 +253,8 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) step_id: u64,
     pub(crate) home_target: Option<String>,
     pub(crate) last_target: Option<String>,
-    /// Input-token demand currently reserved in the rank ledger.
-    pub(crate) context_tokens: usize,
-    /// Provenance of `context_tokens`.
-    pub(crate) context_token_source: TokenFactSource,
-    /// Pending prepared fact: shadow counterfactual or probation witness.
-    pub(crate) shadow_context_facts: Option<crate::program_scheduling::TokenFacts>,
-    /// Fingerprint of the prepared count that established `context_tokens`.
-    pub(crate) context_token_fingerprint: Option<TokenizerFingerprint>,
+    /// Input-token demand currently reserved in the rank ledger and its provenance.
+    pub(crate) context: ContextTokens,
     pub(crate) output_token_reservation: Option<usize>,
     pub(crate) context_shrink_observations: u8,
     pub(crate) completed_requests: usize,
@@ -320,10 +314,7 @@ impl ProgramDecisionState {
             step_id: 0,
             last_target: home_target.clone(),
             home_target,
-            context_tokens: context.tokens(),
-            context_token_source: context.source(),
-            shadow_context_facts: context.shadow_facts(),
-            context_token_fingerprint: context.fingerprint(),
+            context,
             output_token_reservation: None,
             context_shrink_observations: 0,
             completed_requests: 0,
@@ -369,7 +360,8 @@ impl ProgramDecisionState {
         decode_buffer_tokens: usize,
         expected_output_tokens: Option<usize>,
     ) -> f64 {
-        self.context_tokens
+        self.context
+            .tokens()
             .saturating_sub(self.shared_prefix_tokens)
             .saturating_add(
                 expected_output_tokens
@@ -397,6 +389,12 @@ impl ProgramDecisionState {
             ) as f64
     }
 
+    /// Update the ledger size while retaining the arrival's token provenance.
+    pub(crate) fn set_context_tokens(&mut self, tokens: usize) {
+        self.context.tokens = tokens;
+        self.context_shrink_observations = 0;
+    }
+
     /// Reconcile an Engine-observed context with the current ledger demand.
     ///
     /// Trusted prepared counts may replace an older estimate immediately when
@@ -410,20 +408,15 @@ impl ProgramDecisionState {
         context_is_quiescent: bool,
     ) {
         const SHRINK_CONFIRMATIONS: u8 = 2;
-        if observed_context_tokens >= self.context_tokens {
-            self.context_tokens = observed_context_tokens;
-            self.context_shrink_observations = 0;
-            return;
-        }
-        if trusted_prepared && context_is_quiescent {
-            self.context_tokens = observed_context_tokens;
-            self.context_shrink_observations = 0;
+        if observed_context_tokens >= self.context.tokens()
+            || (trusted_prepared && context_is_quiescent)
+        {
+            self.set_context_tokens(observed_context_tokens);
             return;
         }
         self.context_shrink_observations = self.context_shrink_observations.saturating_add(1);
         if self.context_shrink_observations >= SHRINK_CONFIRMATIONS {
-            self.context_tokens = observed_context_tokens;
-            self.context_shrink_observations = 0;
+            self.set_context_tokens(observed_context_tokens);
         }
     }
 }
@@ -625,11 +618,11 @@ mod tests {
             now,
         );
         state.observe_completed_context(80, false, true);
-        assert_eq!(state.context_tokens, 100);
+        assert_eq!(state.context.tokens(), 100);
         state.observe_completed_context(80, false, true);
-        assert_eq!(state.context_tokens, 80);
+        assert_eq!(state.context.tokens(), 80);
         state.observe_completed_context(120, false, true);
-        assert_eq!(state.context_tokens, 120);
+        assert_eq!(state.context.tokens(), 120);
     }
 
     #[test]
@@ -643,7 +636,7 @@ mod tests {
             now,
         );
         state.observe_completed_context(80_000, true, true);
-        assert_eq!(state.context_tokens, 80_000);
+        assert_eq!(state.context.tokens(), 80_000);
     }
 
     #[test]
@@ -657,8 +650,8 @@ mod tests {
             now,
         );
         state.observe_completed_context(80_000, true, false);
-        assert_eq!(state.context_tokens, 100_000);
+        assert_eq!(state.context.tokens(), 100_000);
         state.observe_completed_context(80_000, true, false);
-        assert_eq!(state.context_tokens, 80_000);
+        assert_eq!(state.context.tokens(), 80_000);
     }
 }

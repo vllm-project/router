@@ -273,9 +273,8 @@ impl ProgramScheduler {
                     trusted_prepared,
                     context_is_quiescent,
                 );
-            } else if observed_prompt_tokens >= decision.context_tokens {
-                decision.context_tokens = observed_prompt_tokens;
-                decision.context_shrink_observations = 0;
+            } else if observed_prompt_tokens >= decision.context.tokens() {
+                decision.set_context_tokens(observed_prompt_tokens);
             }
             if success {
                 RouterMetrics::record_agent_aware_cache_miss_impact(
@@ -423,9 +422,8 @@ impl ProgramScheduler {
         // update it before reconciling the active reservation below.
         if let Some(context_tokens) = state.runtime.front_request_context(dispatch.program()) {
             if let Some(decision) = state.decisions.get_mut(dispatch.program()) {
-                if self.config.pd_mode || context_tokens > decision.context_tokens {
-                    decision.context_tokens = context_tokens;
-                    decision.context_shrink_observations = 0;
+                if self.config.pd_mode || context_tokens > decision.context.tokens() {
+                    decision.set_context_tokens(context_tokens);
                 }
             }
         }
@@ -783,9 +781,9 @@ impl ProgramScheduler {
                         let input = if program.status == ProgramStatus::Acting {
                             decision
                                 .last_context_tokens
-                                .unwrap_or(decision.context_tokens)
+                                .unwrap_or(decision.context.tokens())
                         } else {
-                            decision.context_tokens
+                            decision.context.tokens()
                         };
                         let score = elapsed
                             * (1.0 / (input as f64 / average_prompt).max(1e-6).sqrt()).max(0.5);
@@ -1200,12 +1198,12 @@ mod tests {
                 .decisions
                 .get_mut(first.program())
                 .unwrap()
-                .context_tokens = 140;
+                .set_context_tokens(140);
             state
                 .decisions
                 .get_mut(second.program())
                 .unwrap()
-                .context_tokens = 140;
+                .set_context_tokens(140);
             assert!(!scheduler.repair_capacity(&mut state, now));
             assert!(state.decisions[first.program()].pause_when_idle);
             assert!(!state.decisions[second.program()].pause_when_idle);
