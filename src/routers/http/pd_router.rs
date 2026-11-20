@@ -1359,6 +1359,7 @@ impl PdRouterBase {
             Some(
                 PdKvState::start(
                     ctx.client.clone(),
+                    ctx.router_config.enable_igw,
                     ctx.router_config.api_key.clone(),
                     ctx.router_config.pd_kv_event_sources.clone(),
                     Arc::clone(&ctx.worker_registry),
@@ -1667,8 +1668,12 @@ impl PdRouterBase {
 
     pub async fn get_server_info(&self, _req: Request<Body>) -> Response {
         if let Some(worker_url) = self.first_grpc_prefill_url() {
-            return match crate::backend::get_grpc_server_info(&worker_url, Duration::from_secs(2))
-                .await
+            return match crate::backend::get_grpc_server_info(
+                &worker_url,
+                self.api_key.as_deref(),
+                Duration::from_secs(2),
+            )
+            .await
             {
                 Ok(info) => (
                     StatusCode::OK,
@@ -1691,7 +1696,13 @@ impl PdRouterBase {
     ) -> Option<Response> {
         let worker_url = self.first_grpc_prefill_url()?;
         Some(
-            match crate::backend::get_grpc_model_info(&worker_url, Duration::from_secs(2)).await {
+            match crate::backend::get_grpc_model_info(
+                &worker_url,
+                self.api_key.as_deref(),
+                Duration::from_secs(2),
+            )
+            .await
+            {
                 Ok(info) => (StatusCode::OK, Json(render(&info))).into_response(),
                 Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
             },

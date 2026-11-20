@@ -261,7 +261,7 @@ has tracing support.
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key for the router's own requests to workers over HTTP and gRPC, including health checks. |
+| `--api-key` | `string` | `unset` | `string` | `unset` | Bearer token for the router's own HTTP and gRPC worker requests, including health checks and gRPC model, server and KV event source discovery for configured workers. |
 | `--api-key-validation-urls` | `string [0..] (repeatable)` | `[]` | — | — | Validation URLs; an empty list falls back to comma-separated `API_KEY_VALIDATION_URLS` from the environment or `.env`. |
 
 The key is the bearer token the router sends on its own requests to workers

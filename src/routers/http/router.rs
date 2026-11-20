@@ -3125,6 +3125,7 @@ impl RouterTrait for Router {
             Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
                 return match crate::backend::get_grpc_server_info(
                     &worker_url,
+                    self.api_key.as_deref(),
                     Duration::from_secs(2),
                 )
                 .await
@@ -3148,6 +3149,7 @@ impl RouterTrait for Router {
             Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
                 return match crate::backend::get_grpc_model_info(
                     &worker_url,
+                    self.api_key.as_deref(),
                     Duration::from_secs(2),
                 )
                 .await
@@ -3171,6 +3173,7 @@ impl RouterTrait for Router {
             Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
                 return match crate::backend::get_grpc_model_info(
                     &worker_url,
+                    self.api_key.as_deref(),
                     Duration::from_secs(2),
                 )
                 .await

@@ -62,14 +62,14 @@ pub enum AuthorizationCheck {
 
 impl AuthorizationCheck {
     fn verify<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        let value = request
-            .metadata()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok());
+        let value = request.metadata().get("authorization");
         let ok = match self {
             Self::Any => true,
             Self::Absent => value.is_none(),
-            Self::Bearer(key) => value == Some(format!("Bearer {key}").as_str()),
+            Self::Bearer(key) => {
+                value.and_then(|value| value.to_str().ok())
+                    == Some(format!("Bearer {key}").as_str())
+            }
         };
         ok.then_some(())
             .ok_or_else(|| Status::unauthenticated("missing or wrong authorization metadata"))
@@ -101,9 +101,11 @@ pub struct MockVllmRs {
     pub aborts: Arc<Mutex<Vec<String>>>,
     /// After `hold_after` recorded requests, wait until [`HoldGate::release`].
     pub hold: Option<HoldGate>,
-    /// Credential gate applied to Generate/GenerateStream and Control.Abort.
+    /// Credential gate applied to Inference and Control RPCs.
     /// Default accepts everything.
     pub authorization: AuthorizationCheck,
+    /// Discovery RPC name and whether its metadata matched the credential gate.
+    pub(crate) control_calls: Arc<Mutex<Vec<(&'static str, bool)>>>,
     /// Credential gate applied to `grpc.health.v1`. Kept separate from
     /// [`Self::authorization`] because the P/D startup wait does not send
     /// the API key yet (issue #578), while inference on both legs does.
@@ -171,6 +173,7 @@ impl Default for MockVllmRs {
             aborts: Arc::new(Mutex::new(Vec::new())),
             hold: None,
             authorization: AuthorizationCheck::default(),
+            control_calls: Default::default(),
             health_authorization: AuthorizationCheck::default(),
         }
     }
@@ -212,6 +215,22 @@ pub struct MockVllmRsServer {
 }
 
 impl MockVllmRsServer {
+    pub fn assert_control_authorization(&self, expected: &[&str]) {
+        let calls = self.state.control_calls.lock().unwrap();
+        for (method, authorized) in calls.iter() {
+            assert!(
+                authorized,
+                "{method} received unexpected authorization metadata"
+            );
+        }
+        for method in expected {
+            assert!(
+                calls.iter().any(|(name, _)| name == method),
+                "{method} was never called"
+            );
+        }
+    }
+
     pub async fn spawn() -> Self {
         Self::spawn_with_state(MockVllmRs::default()).await
     }
@@ -432,10 +451,20 @@ impl Inference for MockVllmRs {
     }
 }
 
+impl MockVllmRs {
+    fn verify_control<T>(&self, method: &'static str, request: &Request<T>) -> Result<(), Status> {
+        let result = self.authorization.verify(request);
+        self.control_calls
+            .lock()
+            .unwrap()
+            .push((method, result.is_ok()));
+        result
+    }
+}
+
 macro_rules! mock_control {
     ($($method:ident($request:ident) -> $response:ident;)*) => {
-        /// Records `Abort` and serves model and server info; every other
-        /// Control RPC is unimplemented.
+        /// Records `Abort` and serves the worker discovery RPCs.
         #[tonic::async_trait]
         impl Control for MockVllmRs {
             async fn abort(
@@ -452,8 +481,9 @@ macro_rules! mock_control {
 
             async fn get_model_info(
                 &self,
-                _request: Request<pb::GetModelInfoRequest>,
+                request: Request<pb::GetModelInfoRequest>,
             ) -> Result<Response<pb::ModelInfo>, Status> {
+                self.verify_control("GetModelInfo", &request)?;
                 Ok(Response::new(pb::ModelInfo {
                     model_id: "mock-model".into(),
                     supports_token_ids_input: true,
@@ -463,12 +493,21 @@ macro_rules! mock_control {
 
             async fn get_server_info(
                 &self,
-                _request: Request<pb::GetServerInfoRequest>,
+                request: Request<pb::GetServerInfoRequest>,
             ) -> Result<Response<pb::ServerInfo>, Status> {
+                self.verify_control("GetServerInfo", &request)?;
                 Ok(Response::new(pb::ServerInfo {
                     engine_version: "mock".into(),
                     ..Default::default()
                 }))
+            }
+
+            async fn get_kv_event_sources(
+                &self,
+                request: Request<pb::GetKvEventSourcesRequest>,
+            ) -> Result<Response<pb::GetKvEventSourcesResponse>, Status> {
+                self.verify_control("GetKvEventSources", &request)?;
+                Ok(Response::new(pb::GetKvEventSourcesResponse::default()))
             }
 
             $(
@@ -487,7 +526,6 @@ mock_control! {
     load_lora(LoadLoraRequest) -> LoadLoraResponse;
     unload_lora(UnloadLoraRequest) -> UnloadLoraResponse;
     list_loras(ListLorasRequest) -> ListLorasResponse;
-    get_kv_event_sources(GetKvEventSourcesRequest) -> GetKvEventSourcesResponse;
     pause_generation(PauseGenerationRequest) -> PauseGenerationResponse;
     resume_generation(ResumeGenerationRequest) -> ResumeGenerationResponse;
     is_paused(IsPausedRequest) -> IsPausedResponse;

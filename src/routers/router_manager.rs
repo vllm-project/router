@@ -335,7 +335,9 @@ impl RouterManager {
     /// Query model identity through OpenAI `/v1/models` or the gRPC control API.
     async fn query_model_id(&self, url: &str) -> Result<String, String> {
         if crate::backend::is_grpc_url(url) {
-            let info = crate::backend::get_grpc_model_info(url, Duration::from_secs(10)).await?;
+            // IGW registration accepts caller-supplied URLs. Keep the shared worker key private.
+            let info =
+                crate::backend::get_grpc_model_info(url, None, Duration::from_secs(10)).await?;
             let model_id = if info.served_model_name.is_empty() {
                 info.model_id
             } else {

@@ -94,6 +94,7 @@ fn probe_outcome(existing: Option<&Binding>, signature: Option<&str>) -> ProbeOu
 
 pub(super) struct PdKvState {
     client: reqwest::Client,
+    enable_igw: bool,
     api_key: Option<String>,
     supervisor: KvIndexSupervisor,
     registry: Option<Arc<crate::core::WorkerRegistry>>,
@@ -122,6 +123,7 @@ impl PdKvState {
     /// entry point as refresh so the two cannot diverge.
     pub(super) async fn start(
         client: reqwest::Client,
+        enable_igw: bool,
         api_key: Option<String>,
         sources: HashMap<String, crate::config::types::PdKvEventSources>,
         registry: Arc<crate::core::WorkerRegistry>,
@@ -129,8 +131,8 @@ impl PdKvState {
         decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
+        state.enable_igw = enable_igw;
         state.api_key = api_key;
-        state.supervisor.set_api_key(state.api_key.clone());
         state.registry = Some(registry);
         state.prefill_policy = prefill_policy;
         state.decode_policy = decode_policy;
@@ -176,6 +178,7 @@ impl PdKvState {
         Self {
             client,
             supervisor,
+            enable_igw: false,
             api_key: None,
             registry: None,
             prefill_policy: None,
@@ -459,7 +462,13 @@ impl PdKvState {
     /// Statically configured workers skip the control-plane queries and
     /// derive the signature from their configuration.
     async fn probe_base(&self, base: &str) -> Result<Discovery, String> {
-        let worker = self.supervisor.discover(base).await;
+        let grpc = crate::backend::is_grpc_url(base);
+        // IGW's registry can add arbitrary gRPC endpoints between refreshes.
+        let api_key = self
+            .api_key
+            .as_deref()
+            .filter(|_| !(grpc && self.enable_igw));
+        let worker = self.supervisor.discover(base, api_key).await;
         let info = worker.server_info.as_ref().map_err(Clone::clone)?;
         let sources = worker.sources.as_ref().map_err(Clone::clone)?;
         let mut sources: Vec<_> = sources.iter().collect();
@@ -467,14 +476,15 @@ impl PdKvState {
         let signature = format!("{info:?}:{sources:?}");
         // gRPC workers serve no HTTP /v1/models; Control.GetModelInfo names
         // the served model, including for statically configured sources.
-        if crate::backend::is_grpc_url(base) {
-            let base_models = crate::backend::control::get_grpc_model_info(base, CONTROL_TIMEOUT)
-                .await
-                .ok()
-                .map(|info| info.model_id)
-                .filter(|model| !model.trim().is_empty())
-                .into_iter()
-                .collect();
+        if grpc {
+            let base_models =
+                crate::backend::control::get_grpc_model_info(base, api_key, CONTROL_TIMEOUT)
+                    .await
+                    .ok()
+                    .map(|info| info.model_id)
+                    .filter(|model| !model.trim().is_empty())
+                    .into_iter()
+                    .collect();
             return Ok(Discovery {
                 signature,
                 base_models,
@@ -484,7 +494,7 @@ impl PdKvState {
         let models_request = worker_get(
             &self.client,
             &format!("{}/v1/models", base.trim_end_matches('/')),
-            self.api_key.as_deref(),
+            api_key,
         );
         let models = match models_request.send().await {
             Ok(response) if response.status().is_success() => response.json::<Value>().await.ok(),
@@ -1184,7 +1194,6 @@ mod kv_input_tests {
             };
             let mut state = PdKvState::new_with_statics(reqwest::Client::new(), sources);
             state.api_key = Some("pd-test-key".to_owned());
-            state.supervisor.set_api_key(state.api_key.clone());
             let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
             let ops = kv_aware_ops(policy.as_ref()).unwrap();
             let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
@@ -1342,6 +1351,7 @@ mod kv_input_tests {
         }
         let state = PdKvState::start(
             reqwest::Client::new(),
+            false,
             None,
             HashMap::from([
                 (p_base.clone(), sources(5557)),

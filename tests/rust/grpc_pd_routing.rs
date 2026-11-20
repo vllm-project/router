@@ -1190,9 +1190,24 @@ async fn grpc_pd_aborted_decode_stream_records_decode_error() {
 
 #[tokio::test]
 async fn grpc_pd_info_endpoints_use_grpc_control() {
-    let prefill = MockVllmRsServer::spawn().await;
-    let decode = MockVllmRsServer::spawn().await;
-    let router = pd_router(&prefill, &decode).await;
+    let worker = || MockVllmRs {
+        authorization: AuthorizationCheck::Bearer("worker-secret".into()),
+        ..MockVllmRs::default()
+    };
+    let prefill = MockVllmRsServer::spawn_with_state(worker()).await;
+    let decode = MockVllmRsServer::spawn_with_state(worker()).await;
+    let router = pd_router_with_kv_sources(
+        &[&prefill],
+        &decode,
+        1,
+        serde_json::from_value(json!({"type": "kv_aware"})).unwrap(),
+        HashMap::new(),
+        Some("worker-secret".into()),
+    )
+    .await;
+    prefill.assert_control_authorization(&["GetModelInfo", "GetServerInfo", "GetKvEventSources"]);
+    // The decode worker only receives the startup engine-version probe.
+    decode.assert_control_authorization(&["GetServerInfo"]);
     let get = |uri: &str| {
         axum::http::Request::builder()
             .uri(uri)

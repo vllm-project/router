@@ -50,12 +50,12 @@ pub(crate) const AUTHORIZATION_METADATA: &str = "authorization";
 /// is skipped with a warning.
 pub(crate) fn set_bearer_auth<T>(request: &mut tonic::Request<T>, api_key: Option<&str>) {
     if let Some(key) = api_key {
-        match format!("Bearer {key}").parse() {
-            Ok(value) => {
+        match format!("Bearer {key}").parse::<tonic::metadata::AsciiMetadataValue>() {
+            Ok(mut value) if key.is_ascii() => {
+                value.set_sensitive(true);
                 request.metadata_mut().insert(AUTHORIZATION_METADATA, value);
             }
-            Err(error) => tracing::warn!(
-                error = %error,
+            _ => tracing::warn!(
                 "worker api key is not valid gRPC metadata; sending no authorization"
             ),
         }
@@ -84,6 +84,29 @@ pub use preprocess::TokenizerCache;
 
 /// Prost/Tonic bindings for vLLM Inference + Control (`vllm-proto` on crates.io).
 pub use vllm_proto as pb;
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_bearer_metadata_is_sensitive_and_skips_invalid_keys() {
+        let mut request = tonic::Request::new(());
+        set_bearer_auth(&mut request, Some("test-key"));
+        assert!(request
+            .metadata()
+            .get(AUTHORIZATION_METADATA)
+            .unwrap()
+            .is_sensitive());
+
+        for key in ["invalid\nkey", "non-ascii-ü"] {
+            let mut request = tonic::Request::new(());
+            set_bearer_auth(&mut request, Some(key));
+            assert!(!request.metadata().contains_key(AUTHORIZATION_METADATA));
+        }
+    }
+}
 
 // Shared by gRPC emission and HTTP response consumption.
 pub(crate) mod stream_output {

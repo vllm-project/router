@@ -549,11 +549,21 @@ async fn power_of_two_prefers_the_less_loaded_worker() {
     );
 }
 
-/// The router answers `--api-key` on every gRPC exchange: the startup wait
-/// and `/health` probe grpc.health.v1 with the key, and Generate carries it
-/// as `authorization` metadata (issue #587).
+async fn assert_control_requests(router: &Router, server: &MockVllmRsServer) {
+    // KV discovery tolerates failed RPCs, so check what the worker saw at startup.
+    server.assert_control_authorization(&["GetModelInfo", "GetServerInfo", "GetKvEventSources"]);
+    let get = || axum::http::Request::new(axum::body::Body::empty());
+    for (path, response) in [
+        ("/get_model_info", router.get_model_info(get()).await),
+        ("/get_server_info", router.get_server_info(get()).await),
+        ("/v1/models", router.get_models(get()).await),
+    ] {
+        assert_eq!(response.status(), axum::http::StatusCode::OK, "{path}");
+    }
+}
+
 #[tokio::test]
-async fn api_key_reaches_grpc_health_checks_and_generate() {
+async fn api_key_reaches_grpc_health_control_and_generate() {
     let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
         authorization: AuthorizationCheck::Bearer("worker-secret".to_string()),
         health_authorization: AuthorizationCheck::Bearer("worker-secret".to_string()),
@@ -561,11 +571,12 @@ async fn api_key_reaches_grpc_health_checks_and_generate() {
     })
     .await;
     let urls = vec![server.grpc_url.clone()];
-    let mut cfg = config(urls.clone(), PolicyConfig::RoundRobin);
+    let mut cfg = config(urls.clone(), kv_aware());
     cfg.api_key = Some("worker-secret".to_string());
     let router = Router::new(urls, &create_test_context(cfg))
         .await
         .expect("the startup grpc health check must pass with the api key");
+    assert_control_requests(&router, &server).await;
     router.pin_test_token_ids(vec![1]);
 
     let response = router.send_health_check(&server.grpc_url).await;
@@ -599,12 +610,10 @@ async fn without_api_key_no_authorization_metadata_is_sent() {
     })
     .await;
     let urls = vec![server.grpc_url.clone()];
-    let router = Router::new(
-        urls.clone(),
-        &create_test_context(config(urls, PolicyConfig::RoundRobin)),
-    )
-    .await
-    .expect("grpc health must pass without credentials");
+    let router = Router::new(urls.clone(), &create_test_context(config(urls, kv_aware())))
+        .await
+        .expect("grpc health must pass without credentials");
+    assert_control_requests(&router, &server).await;
     router.pin_test_token_ids(vec![1]);
 
     complete(
@@ -619,6 +628,42 @@ async fn without_api_key_no_authorization_metadata_is_sent() {
         captured[0].authorization, None,
         "no authorization metadata may be invented without --api-key"
     );
+}
+
+#[tokio::test]
+async fn igw_grpc_registration_and_kv_discovery_omit_the_shared_api_key() {
+    use vllm_router_rs::routers::{
+        http::vllm_pd_router::VllmPDRouter, router_manager::RouterManager,
+    };
+
+    let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        authorization: AuthorizationCheck::Absent,
+        ..MockVllmRs::default()
+    })
+    .await;
+    let mut cfg = config(vec![], kv_aware());
+    cfg.enable_igw = true;
+    cfg.api_key = Some("worker-secret".into());
+    let ctx = create_test_context(cfg);
+    let manager = RouterManager::new(
+        ctx.router_config.clone(),
+        ctx.client.clone(),
+        ctx.worker_registry.clone(),
+        ctx.policy_registry.clone(),
+    );
+    let registration =
+        serde_json::from_value(json!({"url": server.grpc_url, "worker_type": "prefill"})).unwrap();
+    let worker = manager
+        .add_worker(registration)
+        .await
+        .unwrap()
+        .worker
+        .unwrap();
+    assert_eq!(worker.model_id, "mock-model");
+
+    // P/D refresh reads the same registry as IGW registration.
+    let _router = VllmPDRouter::new(vec![], vec![], None, &ctx).await.unwrap();
+    server.assert_control_authorization(&["GetModelInfo", "GetServerInfo", "GetKvEventSources"]);
 }
 
 /// A wrong key surfaces as a failed startup wait, as on the HTTP path.

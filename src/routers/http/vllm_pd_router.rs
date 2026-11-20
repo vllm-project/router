@@ -3268,8 +3268,11 @@ impl VllmPDRouter {
             }
 
             if !grpc_workers.is_empty() {
-                crate::backend::warn_old_grpc_pd_workers(grpc_workers.iter().map(String::as_str))
-                    .await;
+                crate::backend::warn_old_grpc_pd_workers(
+                    grpc_workers.iter().map(String::as_str),
+                    ctx.router_config.api_key.as_deref(),
+                )
+                .await;
             }
 
             Ok(Self {
