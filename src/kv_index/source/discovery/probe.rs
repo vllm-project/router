@@ -15,7 +15,6 @@ use crate::protocols::worker_spec::ServerInfo;
 
 pub(super) struct RegistrationProbe {
     pub(super) descriptor: WorkerDescriptor,
-    pub(super) base_models: HashSet<String>,
     pub(super) worker: WorkerDiscovery,
 }
 
@@ -72,20 +71,16 @@ impl KvIndexSupervisor {
             worker.hybrid = None;
         }
         let descriptor = worker_descriptor(&worker)?;
-        let base_models = if let Some(models) = worker.base_models.take() {
-            models
-        } else {
-            query_model_list(&self.client, base, self.api_key.as_deref())
-                .await
-                .as_ref()
-                .map(base_model_names)
-                .unwrap_or_default()
-        };
-        Ok(RegistrationProbe {
-            descriptor,
-            base_models,
-            worker,
-        })
+        if worker.base_models.is_none() {
+            worker.base_models = Some(
+                query_model_list(&self.client, base, self.api_key.as_deref())
+                    .await
+                    .as_ref()
+                    .map(base_model_names)
+                    .unwrap_or_default(),
+            );
+        }
+        Ok(RegistrationProbe { descriptor, worker })
     }
 }
 

@@ -223,12 +223,14 @@ impl KvIndexSupervisor {
             match action {
                 SourceAction::Keep => {
                     if let Some(probe) = probe {
-                        lifecycle.state.lock().base_models = probe.base_models;
+                        lifecycle.state.lock().base_models =
+                            probe.worker.base_models.unwrap_or_default();
                     }
                 }
                 SourceAction::Rebuild => {
                     let probe = probe.expect("rebuilding requires a descriptor");
-                    lifecycle.state.lock().base_models = probe.base_models.clone();
+                    lifecycle.state.lock().base_models =
+                        probe.worker.base_models.clone().unwrap_or_default();
                     // Both owner and control-record identities are compared under
                     // the publication lock; an old probe cannot resurrect a source.
                     let installation = self.install_observed_worker(
@@ -236,7 +238,6 @@ impl KvIndexSupervisor {
                         probe.worker,
                         owner,
                         Some(lifecycle.clone()),
-                        probe.base_models,
                     );
                     if !installation.is_ok_and(|info| info.cache_key.is_some()) {
                         self.installed.retire_if_current(&base, &lifecycle);

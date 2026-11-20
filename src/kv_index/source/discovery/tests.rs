@@ -247,9 +247,15 @@ fn bound_source_accepts_the_engines_bind_endpoints() {
 fn events_enabled_gates_on_publisher_and_endpoint() {
     let mut e = KvEventSourceEntry::default();
     assert!(!events_enabled(&e)); // empty endpoint
-    e.endpoint = "tcp://*:5557".into();
-    e.publisher = Some("zmq".into());
-    // vLLM 0.33 omits the optional wire metadata; "zmq" alone is enough.
+                                  // vLLM 0.33 omits the optional wire metadata; "zmq" alone is enough.
+    let mut ranks: KvEventSourcesResponse = serde_json::from_value(serde_json::json!({
+        "0": {"endpoint": "tcp://*:5557", "publisher": "zmq", "hwm": 100000},
+        "1": {"endpoint": "tcp://*:5559", "publisher": "zmq", "replay_endpoint": null}
+    }))
+    .unwrap();
+    assert!(ranks["1"].replay_endpoint.is_none());
+    e = ranks.remove("0").unwrap();
+    assert_eq!(e.hwm, Some(100_000));
     assert!(events_enabled(&e));
     e.encoding = Some("msgpack".into());
     assert!(events_enabled(&e));
@@ -286,20 +292,6 @@ fn zero_block_size_is_treated_as_missing() {
         };
         assert_eq!(discovered_block_size(&server_info), expected);
     }
-}
-
-#[test]
-fn kv_event_sources_decodes_rank_map() {
-    let body = r#"{
-            "0": {"endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","topic":"","hwm":100000,"publisher":"zmq","encoding":"msgpack","schema_version":1,"enable_kv_cache_events":true},
-            "1": {"endpoint":"tcp://*:5559","replay_endpoint":null,"topic":"","publisher":"zmq","encoding":"msgpack","schema_version":1}
-        }"#;
-    let m: KvEventSourcesResponse = serde_json::from_str(body).unwrap();
-    assert_eq!(m.len(), 2);
-    assert_eq!(m["0"].hwm, Some(100_000));
-    assert_eq!(m["0"].encoding.as_deref(), Some("msgpack"));
-    assert_eq!(m["0"].schema_version, Some(1));
-    assert!(m["1"].replay_endpoint.is_none());
 }
 
 #[test]
@@ -1745,7 +1737,11 @@ fn metrics_and_models_router(metrics: &'static str) -> axum::Router {
         .route("/metrics", get(move || async move { metrics }))
         .route(
             "/v1/models",
-            get(|| async { axum::Json(serde_json::json!({"data": [{"id": "mock-model"}]})) }),
+            get(|| async {
+                axum::Json(
+                    serde_json::json!({"data": [{"id": "mock-model"}, {"id": "mock-alias"}]}),
+                )
+            }),
         )
 }
 
@@ -1769,42 +1765,56 @@ async fn metrics_only_worker_supplies_cache_metadata() {
     assert_eq!(info.kv_block_size, Some(16));
     assert_eq!(discovered_block_size(&info), Some(16));
     assert_eq!(info.model_id.as_deref(), Some("mock-model"));
-    assert_eq!(models.unwrap(), HashSet::from(["mock-model".to_owned()]));
+    assert_eq!(
+        models.unwrap(),
+        HashSet::from(["mock-model".to_owned(), "mock-alias".to_owned()])
+    );
     server.abort();
 }
 
 #[tokio::test]
-async fn cache_metrics_without_a_replay_source_do_not_bind_default_layout() {
+async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
     use axum::routing::get;
 
     let context = zmq::Context::new();
     let publisher = context.socket(zmq::XPUB).unwrap();
     publisher.bind("tcp://127.0.0.1:*").unwrap();
     let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-    let sources = serde_json::json!({"0": {
-        "endpoint": endpoint,
-        "topic": "kv/metrics-only",
-        "publisher": "zmq",
-        "encoding": "msgpack",
-        "schema_version": 1,
-        "enable_kv_cache_events": true
-    }});
-    let router = metrics_and_models_router(METRICS_ONLY).route(
-        "/kv_event_sources",
-        get(move || {
-            let sources = sources.clone();
-            async move { axum::Json(sources) }
-        }),
-    );
-    let (worker, server) = spawn_metrics_only_worker(router).await;
-
-    let (supervisor, _signals) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-    let info = supervisor.on_worker_added(&worker).await.unwrap();
-    assert_eq!(info.block_size, Some(16));
-    assert!(info.cache_key.is_none());
-    assert!(supervisor.match_provider_for_worker(&worker).is_none());
-    supervisor.shutdown();
-    server.abort();
+    let replay = context.socket(zmq::ROUTER).unwrap();
+    replay.bind("tcp://127.0.0.1:*").unwrap();
+    let replay_endpoint = replay.get_last_endpoint().unwrap().unwrap();
+    for with_replay in [false, true] {
+        let sources = serde_json::json!({"0": {
+            "endpoint": endpoint,
+            "replay_endpoint": with_replay.then_some(&replay_endpoint),
+            "topic": "kv/metrics-only",
+            "publisher": "zmq"
+        }});
+        let router = metrics_and_models_router(METRICS_ONLY).route(
+            "/kv_event_sources",
+            get(move || {
+                let sources = sources.clone();
+                async move { axum::Json(sources) }
+            }),
+        );
+        let (worker, server) = spawn_metrics_only_worker(router).await;
+        let (supervisor, _signals) =
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
+        let info = supervisor.on_worker_added(&worker).await.unwrap();
+        assert_eq!(info.block_size, Some(16));
+        assert_eq!(info.cache_key.is_some(), with_replay);
+        assert_eq!(
+            supervisor.match_provider_for_worker(&worker).is_some(),
+            with_replay
+        );
+        assert_eq!(
+            supervisor.worker_model_eligibility(std::slice::from_ref(&worker), Some("mock-alias"))
+                [&worker],
+            with_replay
+        );
+        supervisor.shutdown();
+        server.abort();
+    }
 }
 
 #[tokio::test]

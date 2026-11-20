@@ -31,7 +31,7 @@ impl KvIndexSupervisor {
             .lock()
             .get(worker_url)
             .map(|worker| worker.active.clone());
-        self.install_observed_worker(worker_url, discovery, observed, None, HashSet::new())
+        self.install_observed_worker(worker_url, discovery, observed, None)
     }
 
     pub(super) fn install_observed_worker(
@@ -40,7 +40,6 @@ impl KvIndexSupervisor {
         discovery: WorkerDiscovery,
         observed: Option<Arc<AtomicBool>>,
         expected_lifecycle: Option<Arc<WorkerLifecycle>>,
-        base_models: HashSet<String>,
     ) -> Result<WorkerKvInfo, String> {
         let descriptor = worker_descriptor(&discovery).ok();
         let assumed_plain_full = discovery.assumed_plain_full;
@@ -353,7 +352,7 @@ impl KvIndexSupervisor {
         {
             let mut state = lifecycle.state.lock();
             state.info = (!info.ranks.is_empty()).then(|| info.clone());
-            state.base_models = base_models;
+            state.base_models = discovery.base_models.unwrap_or_default();
         }
         self.lifecycles
             .lock()

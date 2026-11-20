@@ -402,13 +402,7 @@ impl KvIndexSupervisor {
             (owner, lifecycle)
         };
         let discovery = self.discover(worker_url).await;
-        self.install_observed_worker(
-            worker_url,
-            discovery,
-            observed,
-            Some(lifecycle),
-            HashSet::new(),
-        )
+        self.install_observed_worker(worker_url, discovery, observed, Some(lifecycle))
     }
 
     /// Prepare metadata once; P/D refresh fingerprints and installs this same snapshot.
@@ -1253,6 +1247,16 @@ mod rank_merge_tests {
             .unwrap()
             .sources
             .is_err());
+        assert!(supervisor
+            .resolved_static_source(base)
+            .unwrap()
+            .sources
+            .is_err());
+        supervisor
+            .static_sources
+            .get_mut(&pinned)
+            .unwrap()
+            .replay_endpoints = Some(vec!["tcp://rank3:5558".into()]);
 
         let declaration = supervisor.static_sources.get_mut(base).unwrap();
         declaration.endpoints.push("tcp://rank1:5557".into());
