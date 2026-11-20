@@ -115,6 +115,18 @@ fn default_intra_node_data_parallel_size() -> usize {
     1
 }
 
+fn default_dp_capacity_quantum() -> usize {
+    512
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeSolverStrategy {
+    #[default]
+    Dp,
+    Greedy,
+}
+
 /// Router-level Program scheduling configuration.
 ///
 /// This is intentionally separate from request-level `PolicyConfig`. The
@@ -143,6 +155,15 @@ pub struct ProgramSchedulingConfig {
     pub hash_virtual_nodes: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_capacity_per_dp_rank: Option<usize>,
+    /// Read live backend block headroom instead of a configured token ceiling.
+    #[serde(default)]
+    pub dynamic_token_capacity: bool,
+    #[serde(default = "default_dp_capacity_quantum")]
+    pub dp_capacity_quantum: usize,
+    #[serde(default)]
+    pub dp_state_budget: Option<usize>,
+    #[serde(default)]
+    pub resume_solver_strategy: ResumeSolverStrategy,
     #[serde(default = "default_program_max_active_programs_per_target")]
     pub max_active_programs_per_target: usize,
     #[serde(default = "default_program_metrics_interval_seconds")]
@@ -272,6 +293,10 @@ impl Default for ProgramSchedulingConfig {
             binding_strategy: ProgramBindingStrategy::default(),
             hash_virtual_nodes: default_program_hash_virtual_nodes(),
             token_capacity_per_dp_rank: None,
+            dynamic_token_capacity: false,
+            dp_capacity_quantum: 512,
+            dp_state_budget: None,
+            resume_solver_strategy: ResumeSolverStrategy::Dp,
             max_active_programs_per_target: default_program_max_active_programs_per_target(),
             metrics_interval_seconds: default_program_metrics_interval_seconds(),
             admission_waiting_request_threshold:
@@ -319,6 +344,14 @@ struct ProgramSchedulingConfigInput {
     hash_virtual_nodes: u32,
     #[serde(default, alias = "token_capacity_per_target")]
     token_capacity_per_dp_rank: Option<usize>,
+    #[serde(default)]
+    dynamic_token_capacity: bool,
+    #[serde(default = "default_dp_capacity_quantum")]
+    dp_capacity_quantum: usize,
+    #[serde(default)]
+    dp_state_budget: Option<usize>,
+    #[serde(default)]
+    resume_solver_strategy: ResumeSolverStrategy,
     #[serde(default = "default_program_max_active_programs_per_target")]
     max_active_programs_per_target: usize,
     #[serde(default = "default_program_metrics_interval_seconds")]
@@ -443,6 +476,10 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             binding_strategy: input.binding_strategy,
             hash_virtual_nodes: input.hash_virtual_nodes,
             token_capacity_per_dp_rank: input.token_capacity_per_dp_rank,
+            dynamic_token_capacity: input.dynamic_token_capacity,
+            dp_capacity_quantum: input.dp_capacity_quantum,
+            dp_state_budget: input.dp_state_budget,
+            resume_solver_strategy: input.resume_solver_strategy,
             max_active_programs_per_target: input.max_active_programs_per_target,
             metrics_interval_seconds: input.metrics_interval_seconds,
             admission_waiting_request_threshold: input.admission_waiting_request_threshold,

@@ -60,6 +60,11 @@ pub trait ProgramBindingPolicy: Send + Sync + Debug {
     fn commit_placement(&self, _model_pool: &str, _text: &str, _target_id: &str) {}
 
     fn remove_target(&self, _model_pool: &str, _target_id: &str) {}
+
+    /// Read the existing affinity tree without committing a placement.
+    fn prefix_match_rate(&self, _model_pool: &str, _text: &str, _target_id: &str) -> f64 {
+        0.0
+    }
 }
 
 /// Stable Program binding table plus one selected initial-binding policy.
@@ -73,6 +78,10 @@ pub struct ProgramBindings {
 }
 
 impl ProgramBindings {
+    pub(crate) fn prefix_match_rate(&self, model_pool: &str, text: &str, target_id: &str) -> f64 {
+        self.policy.prefix_match_rate(model_pool, text, target_id)
+    }
+
     /// Construct a binding table using one of the behavior-compatible policies.
     pub fn new(strategy: ProgramBindingStrategy, hash_virtual_nodes: u32) -> Self {
         let policy: Box<dyn ProgramBindingPolicy> = match strategy {
@@ -346,12 +355,49 @@ impl ProgramBindingPolicy for CacheAwareBinding {
     fn remove_target(&self, model_pool: &str, target_id: &str) {
         self.affinity.remove_placement_target(model_pool, target_id);
     }
+
+    fn prefix_match_rate(&self, model_pool: &str, text: &str, target_id: &str) -> f64 {
+        self.affinity.prefix_match_rate(model_pool, text, target_id)
+    }
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn prefix_queries_reuse_the_committed_tree_without_mutating_it() {
+        let bindings = ProgramBindings::new(ProgramBindingStrategy::CacheAware, 160);
+        let program = ProgramRef::new("model".into(), "program".into(), 0);
+        assert_eq!(
+            bindings.prefix_match_rate("model", "你好abc", "rank-0"),
+            0.0
+        );
+        bindings.commit_placement(&program, "你好", "rank-0");
+        assert_eq!(
+            bindings.prefix_match_rate("model", "你好abc", "rank-0"),
+            0.4
+        );
+        assert_eq!(
+            bindings.prefix_match_rate("model", "你好abc", "rank-0"),
+            0.4
+        );
+        assert_eq!(
+            bindings.prefix_match_rate("model", "你好abc", "rank-1"),
+            0.0
+        );
+        assert_eq!(
+            bindings.prefix_match_rate("other-model", "你好abc", "rank-0"),
+            0.0
+        );
+        assert_eq!(bindings.prefix_match_rate("model", "", "rank-0"), 0.0);
+        bindings.remove_affinity_target("model", "rank-0");
+        assert_eq!(
+            bindings.prefix_match_rate("model", "你好abc", "rank-0"),
+            0.0
+        );
+    }
 
     fn identity(program_id: &str) -> ProgramIdentity {
         ProgramIdentity::from_request(

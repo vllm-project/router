@@ -127,6 +127,20 @@ impl RequestPool {
         Some(was_front)
     }
 
+    pub(crate) fn front_context_tokens(&self, program: &ProgramRef) -> Option<usize> {
+        Some(
+            self.requests
+                .get(program)?
+                .front()?
+                .estimated_context_tokens,
+        )
+    }
+
+    /// Routing text belongs to the current front request, including after cancel.
+    pub(crate) fn front_routing_text(&self, program: &ProgramRef) -> Option<&str> {
+        self.requests.get(program)?.front()?.routing_text.as_deref()
+    }
+
     /// Wake the front retained request for one Program generation.
     pub(crate) fn notify_front(&self, program: &ProgramRef) {
         if let Some(request) = self.requests.get(program).and_then(VecDeque::front) {

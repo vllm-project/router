@@ -1,5 +1,5 @@
 use super::*;
-use crate::program_scheduling::ProgramBindingStrategy;
+use crate::program_scheduling::{ProgramBindingStrategy, ProgramResumeOrder};
 
 /// Configuration validator
 pub struct ConfigValidator;
@@ -45,11 +45,41 @@ impl ConfigValidator {
     }
 
     fn validate_program_scheduling(config: &ProgramSchedulingConfig) -> ConfigResult<()> {
+        if matches!(
+            config.resume_order,
+            ProgramResumeOrder::Dp | ProgramResumeOrder::DpAdmission
+        ) && (config.binding_strategy != ProgramBindingStrategy::CacheAware
+            || (config.token_capacity_per_dp_rank.is_none() && !config.dynamic_token_capacity))
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason:
+                    "dp/dp_admission requires cache_aware binding and static or dynamic token capacity"
+                        .to_string(),
+            });
+        }
+        if config.resume_order == ProgramResumeOrder::DpAdmission && config.binding_only {
+            return Err(ConfigError::ValidationFailed {
+                reason: "dp_admission cannot be combined with binding_only".to_string(),
+            });
+        }
         if config.binding_strategy == ProgramBindingStrategy::ReasoningTokenBalance
             && config.token_capacity_per_dp_rank.is_none()
+            && !config.dynamic_token_capacity
         {
             return Err(ConfigError::ValidationFailed {
                 reason: "reasoning_token_balance requires token_capacity_per_dp_rank".to_string(),
+            });
+        }
+        if config.dp_capacity_quantum == 0 || config.dp_state_budget == Some(0) {
+            return Err(ConfigError::ValidationFailed {
+                reason: "dp_capacity_quantum and explicit dp_state_budget must be positive".into(),
+            });
+        }
+        if config.dynamic_token_capacity
+            && (config.token_capacity_per_dp_rank.is_some() || config.binding_only)
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "dynamic_token_capacity cannot be combined with a static capacity or binding_only".into(),
             });
         }
         let positive_finite = [
@@ -808,6 +838,100 @@ impl ConfigValidator {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn solver_configuration_defaults_and_validation() {
+        let mut cfg: ProgramSchedulingConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.dp_capacity_quantum, 512);
+        assert_eq!(cfg.dp_state_budget, None);
+        assert_eq!(
+            cfg.resume_solver_strategy,
+            crate::config::ResumeSolverStrategy::Dp
+        );
+        cfg.dp_capacity_quantum = 0;
+        assert!(ConfigValidator::validate_program_scheduling(&cfg).is_err());
+        cfg.dp_capacity_quantum = 512;
+        cfg.dp_state_budget = Some(0);
+        assert!(ConfigValidator::validate_program_scheduling(&cfg).is_err());
+        cfg.dp_state_budget = Some(1);
+        assert!(ConfigValidator::validate_program_scheduling(&cfg).is_ok());
+        let decoded: ProgramSchedulingConfig = serde_json::from_str(
+            r#"{"dp_capacity_quantum":512,"dp_state_budget":42,"resume_solver_strategy":"greedy"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.resume_solver_strategy,
+            crate::config::ResumeSolverStrategy::Greedy
+        );
+        assert_eq!(decoded.dp_state_budget, Some(42));
+        assert_eq!(
+            serde_json::from_value::<ProgramSchedulingConfig>(
+                serde_json::to_value(&decoded).unwrap()
+            )
+            .unwrap(),
+            decoded
+        );
+        assert!(serde_json::from_str::<ProgramSchedulingConfig>(
+            r#"{"resume_solver_strategy":"typo"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn direct_dp_admission_is_a_separate_validated_configuration() {
+        let mut config: ProgramSchedulingConfig = serde_json::from_str(
+            r#"{"resume_order":"dp_admission","binding_strategy":"cache_aware","token_capacity_per_dp_rank":1200}"#,
+        ).unwrap();
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["resume_order"],
+            "dp_admission"
+        );
+        config.binding_only = true;
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+        config.binding_only = false;
+        config.token_capacity_per_dp_rank = None;
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+        config.token_capacity_per_dp_rank = Some(1200);
+        config.binding_strategy = ProgramBindingStrategy::ConsistentHash;
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+    }
+
+    #[test]
+    fn dynamic_capacity_replaces_static_requirement_but_not_binding_constraints() {
+        for order in ["dp", "dp_admission"] {
+            let mut config: ProgramSchedulingConfig = serde_json::from_value(serde_json::json!({
+                "resume_order": order,
+                "binding_strategy": "cache_aware", "dynamic_token_capacity": true
+            }))
+            .unwrap();
+            assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
+            assert!(
+                serde_json::to_value(&config).unwrap()["dynamic_token_capacity"]
+                    .as_bool()
+                    .unwrap()
+            );
+            config.token_capacity_per_dp_rank = Some(1000);
+            assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+            config.token_capacity_per_dp_rank = None;
+            config.binding_strategy = ProgramBindingStrategy::ConsistentHash;
+            assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn dp_resume_requires_native_cache_tree_and_token_capacity() {
+        let mut config: ProgramSchedulingConfig = serde_json::from_str(
+            r#"{"resume_order":"dp","binding_strategy":"cache_aware","token_capacity_per_dp_rank":1200}"#,
+        ).unwrap();
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
+        assert_eq!(serde_json::to_value(&config).unwrap()["resume_order"], "dp");
+        config.token_capacity_per_dp_rank = None;
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+        config.token_capacity_per_dp_rank = Some(1200);
+        config.binding_strategy = ProgramBindingStrategy::ConsistentHash;
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+    }
 
     #[test]
     fn test_validate_program_scheduling_boundaries() {

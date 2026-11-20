@@ -4,6 +4,7 @@
 //! request routing, worker selection, or request forwarding.
 
 mod binding;
+mod capacity;
 mod contracts;
 mod diagnostics;
 mod domain;
@@ -13,13 +14,17 @@ mod lineage;
 mod observations;
 mod policy;
 mod request_pool;
+mod resume_dp;
 mod runtime;
 mod scheduler;
 mod scheduler_admission;
+mod scheduler_dp;
+mod scheduler_dp_admission;
 mod scheduler_fairness;
 mod scheduler_global;
 mod scheduler_lifecycle;
 mod scheduler_state;
+mod tree_dp_admission;
 
 pub use binding::{
     ProgramBindingCandidate, ProgramBindingPolicy, ProgramBindingStrategy, ProgramBindings,

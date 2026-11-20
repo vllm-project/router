@@ -89,10 +89,11 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 | `program_scheduling_enable_key` | `vllm_xargs.agentic_context` | Selects which identity inputs opt a request into Program scheduling. The default accepts only canonical `vllm_xargs.agentic_context`; `auto` additionally accepts the documented `agent_hint` and framework Header schemas. |
 | `binding_only` | `false` | Preserves Program identity and initial Program-to-Rank binding but bypasses RequestPool admission, Progress-TTL pause, and resume scheduling. This isolates the effect of Program affinity. |
 | `global_queue` | `false` | When `false`, a paused Program can resume only on its bound Rank. When `true`, resume first tries the previous Rank and may then select another Rank that passes the cross-Rank capacity gates. |
-| `resume_order` | `mru` | Orders ordinary Rank-local resume candidates within the same force-resume, request-priority, and segment-yield tier. Supported values are `mru` and `fcfs`; cross-Rank resume is always FCFS. |
+| `resume_order` | `mru` | `mru` and `fcfs` retain native ordering; `dp` selects a subset subject to native admission; `dp_admission` lets DP decide admission directly. Both DP modes require `cache_aware` binding plus either explicit token capacity or `dynamic_token_capacity: true`. See the DP sections below. |
 | `cross_rank_headroom_ratio` | `1.2` | Controls cross-Rank migration conservatism. A destination must have at least the source Rank's free capacity plus this multiple of the Program's complete estimated context. It has no effect when `global_queue` is `false`. |
 | `binding_strategy` | `consistent_hash` | Selects the initial home Rank for each new Program generation. Supported values are `consistent_hash`, `program_round_robin`, `least_program_count`, `reasoning_token_balance`, and `cache_aware`; it does not replace admission or resume decisions. |
 | `hash_virtual_nodes` | `160` | Sets the number of virtual nodes used by `consistent_hash` initial binding. It has no effect on the other binding strategies. |
+| `dynamic_token_capacity` | `false` | Opt into live per-rank engine block-headroom estimates. Omit static token capacity; missing or stale metrics defer new admissions. See Dynamic backend capacity below. |
 | `token_capacity_per_dp_rank` | `null` | Supplies the logical KV-token capacity of each concrete DP Rank. A value enables token-based admission, growth reserve, capacity repair, and cross-Rank headroom checks; `null` falls back to the Program-count guard. `reasoning_token_balance` requires this value. The deprecated input alias `token_capacity_per_target` is accepted but is never emitted when the configuration is serialized. |
 | `max_active_programs_per_target` | `64` | Limits active Programs on one Rank as a coarse concurrency guard. It is the primary capacity guard when token capacity is absent and remains a count guard when token capacity is configured; forced resume may override it. |
 | `metrics_interval_seconds` | `1.0` | Sets the backend metrics polling and periodic scheduling interval. It also defines observation freshness and the minimum residence used by parts of cross-Rank resume. |
@@ -157,6 +158,122 @@ The canonical contract is `vllm_xargs.agentic_context`. Identity semantics match
 For `agent_hint`, `session_id` becomes both Program ID and session ID, `task_id` remains absent, and `blocks_parent` defaults to true. A blocking hint requires `parent_session_id`. Explicit `expected_resume` always overrides the blocking-subagent default.
 
 ## Resume ordering and capacity
+
+### Direct DP admission (aggregated HTTP only)
+
+Merge this into the existing Program scheduling configuration, retaining its
+configured `token_capacity_per_dp_rank`:
+
+```json
+{"binding_strategy": "cache_aware", "resume_order": "dp_admission"}
+```
+
+This is a separate mode; `resume_order: "dp"` below is unchanged.
+
+- **Candidates:** all live paused Programs with waiting requests. Native
+  growth-reserve, batch-gain, low-watermark and backend-waiting-count tests do
+  not filter candidates or veto DP's selected set.
+- **Budget:** configured token capacity minus existing active occupancy, and
+  the remaining Program-count slots. Costs use the same private-token ledger
+  as committed admissions, including its existing immediate output allowance;
+  no new reserve or shared-prefix estimator is added.
+- **Decision:** within each force/priority/yield tier, DP maximizes the sum of
+  `(estimated_cached_tokens, context_tokens)` using the existing prefix tree.
+  It selects an admission set under the joint token/count constraints, then
+  commits that set under the scheduler lock without a second native admission
+  pass. Non-selected requests stay queued. When the entire set fits, admitting
+  all candidates is already optimal and no DP frontier is constructed.
+- **Placement:** retain existing cache-aware bindings in both local and global
+  queue configurations. This mode does not introduce cross-rank placement
+  optimization. Active requests, pause/TTL and capacity repair are unchanged.
+- **Deadlines:** overdue force-resume deadlines raise priority, but never permit
+  overselling. Oversized requests continue waiting until capacity/placement
+  changes or the existing queue timeout expires.
+- **Solver limit:** `dp_state_budget` is unlimited by default. If an explicit
+  budget is exhausted, recompute from the full candidate set using BFD on raw
+  costs and emit `resume_solver_fallback`. Ordinary decisions emit
+  `dp_admission_decision` at DEBUG level.
+
+For example, with 1,200 tokens free and costs of 900, 600 and 600, the DP can
+admit the two smaller requests when their combined cache value is higher.
+It can do so even if native future-growth reserve would reject all three.
+`binding_only: true` is incompatible with this mode.
+
+### Dynamic tree-DP admission
+
+This path replaces the fixed-binding direct-DP budget described above
+when `dynamic_token_capacity=true`, `binding_strategy="cache_aware"`,
+and `resume_order="dp_admission"`.
+
+The backend's cache configuration still supplies total reference capacity C.
+The existing metrics converter supplies sampled free reference tokens F, with
+the null-block correction. The router additionally retains each admitted but
+unfinished request's frozen tree cost R (input tokens minus predicted prefix
+hits). The budget is `max(0, F - sum(R))`, equivalently
+`max(0, C - ((C - F) + sum(R)))`. Backend waiters keep their reservation across
+scrapes; completion/cancellation releases the reservation, not observed occupancy.
+Missing/invalid/stale required metrics block new admissions. Unexpired returning
+placements use the same budget and keep their placement when the next turn fits.
+
+This deliberately double-counts some KV already reflected in F. It is a
+conservative experiment, not an exact per-request block allocator or an OOM
+guarantee. Tree prediction errors and unreserved decode growth remain. A valid
+zero-free sample still permits a zero-estimated-cost full prefix hit, as before;
+unknown capacity does not. No arbitrary safety factor is introduced.
+
+For this path, `/scheduling/diagnostics` reports:
+
+- `token_capacity_source`: `vllm_usage_plus_reservations_tree_dp`.
+- `effective_token_capacity`: total backend reference capacity C (unchanged).
+- `backend_available_tokens_at_observation`: F.
+- `router_reasoning_reserved_tokens`: sum(R), router reservations only.
+- `router_estimated_used_tokens`: C - F + sum(R), conservative combined charge.
+- `dynamic_admission_headroom_tokens`: max(0, F - sum(R)).
+
+The `tree_dp_admission` INFO event also records backend unavailable tokens,
+aggregate router reservations and the remaining budget after selection.
+TTL settings, shared-prefix observation updates, tree values/costs, quantum,
+solver/BFD and the MRU path are unchanged. Existing launch arguments work.
+
+### DP selection with native admission (aggregated HTTP only)
+
+Set `binding_strategy: "cache_aware"`, `resume_order: "dp"`, and the existing
+`token_capacity_per_dp_rank` to enable DP selection. For example, merge these
+fields into the deployment's existing Program scheduling JSON, keeping its
+measured capacity and other settings:
+
+```json
+{"binding_strategy": "cache_aware", "resume_order": "dp"}
+```
+
+DP queries the **same prefix tree** used for cache-aware binding. Its estimated
+cached-token value is the target's matched-character fraction times the
+Program's estimated context tokens, rounded down. This is a text-affinity
+estimate, not a physical KV-block inventory; querying it does not update the tree.
+
+For ordinary waiters within each native priority/yield tier, DP maximizes the sum of
+`(estimated_cached_tokens, context_tokens)` lexicographically under native
+immediate token and Program-count budgets. A Program is assigned at most once.
+The existing local-before-cross-rank order and cross-rank eligibility gates
+remain in force. The native admission check still owns growth reserve,
+batch-gain behavior. Forced resumes retain native ordered admission, including
+its existing capacity bypass. Each selected admission is rechecked before
+commit against current capacity and request state.
+Thus DP optimizes the snapshot's additive selection problem, not the nonlinear
+batch-gain model or a joint local/cross-rank placement problem.
+
+No new reserve, shared-prefix, decay, pause or capacity policy is introduced.
+Equal-value choices use native FCFS/program-ID order. Each sparse frontier is
+bounded to 16,384 states; exhaustion emits
+`dp_resume_fallback` and uses native ordered admission for that decision.
+Omitting `resume_order: "dp"` preserves the default MRU behavior. PD
+disaggregation remains outside this feature.
+
+For an algorithm comparison, use the same aggregated backends, capacity,
+cache-aware binding, workload and concurrency, changing only `resume_order`
+between the native baseline and `dp`.
+
+### Native ordering
 
 Resume first selects expired force-resume deadlines, then larger request priorities. Within each equal force/priority cohort, a Program paused because it reached `max_segment_rounds` ranks behind other candidates. Rank-local ordering defaults to MRU and can be changed to FCFS, while cross-Rank candidates always use FCFS. Successful resume clears the one-shot yield marker. Priority and yield ordering only change selection order and never grant a new capacity bypass; established force-resume admission behavior remains unchanged.
 
@@ -239,3 +356,108 @@ Report absolute and relative results for job completion time, request throughput
 ## Engine KV-control boundary
 
 Progress-TTL currently protects KV indirectly by controlling request admission. Physical eviction, offload, and prefetch are not executed by this feature. A future Router-to-engine KV hint must receive explicit `accepted`, `rejected`, or `unsupported` feedback and an eventual `applied`, `failed`, or `expired` result. Router residency accounting must not change until the engine reports `applied`.
+
+## Dynamic backend capacity (opt-in, aggregated HTTP)
+
+Set `dynamic_token_capacity: true` and **omit** `token_capacity_per_dp_rank`.
+No Python launcher, fixed H200 budget, or new backend metric is required.
+The Rust metrics provider reads each worker's `/metrics` every
+`metrics_interval_seconds` (default 1 second). It selects the matching
+`engine` label for each internal DP rank; it does not multiply by TP size or
+sum ranks. Multiple models/duplicate series for the same rank are rejected as
+ambiguous. An unlabelled metric is rank 0 only, never broadcast across DP ranks.
+
+The mode examples are `examples/configs/program_dynamic_dp.json` and
+`program_dynamic_dp_admission.json`.
+
+### What is measured, and what is estimated
+
+The required standard vLLM metrics are:
+
+- `vllm:kv_cache_usage_perc{engine="..."}`: actual used fraction of the engine's
+  shared block pool, not CUDA allocated-memory utilization.
+- `vllm:cache_config_info{engine="...",kv_cache_size_tokens="...",num_gpu_blocks="..."} 1`:
+  group-aware reference token capacity and physical pool size.
+
+vLLM's `KVCacheManager.usage` calls `BlockPool.get_usage()`. For the inspected
+engine this is `1 - free_blocks / (num_gpu_blocks - 1)`, with one null block
+reserved. The Rust conversion is:
+
+```
+reference_free_tokens = floor((1 - usage) * reference_token_capacity
+                              * (num_gpu_blocks - 1) / num_gpu_blocks)
+remaining_budget = max(0, reference_free_tokens - positive_charges_since_scrape)
+effective_capacity = max(0, floor(current_router_active_private_tokens
+                                  + reference_free_tokens - positive_charges_since_scrape))
+```
+
+DP therefore gets a changing per-rank budget, rather than a user-supplied total.
+An overdraw remains visible as capacity pressure to the existing pause policy.
+The original admission watermarks/reserves still apply to DP-filter; direct DP
+continues to use the full available budget without those native
+admission filters. Each successful positive occupancy adjustment immediately
+consumes the sampled budget. Logical pause/finish does **not** replenish that
+budget until a new backend scrape. A scrape begun before an admission preserves
+its intervening charge, using the existing observation-epoch fence.
+
+This is a **reference-token headroom estimate**, not an exact hybrid-KV token
+capacity or an OOM-prevention guarantee. The block pool responds to compression,
+SWA block release, and linear-attention state allocation. However,
+`kv_cache_size_tokens` is an equivalent capacity computed for the backend's
+reference/max-length request layout, not a universal bytes-per-token constant.
+Two sets of requests with the same total logical tokens can require different
+numbers of blocks. Prefix hits, block rounding, in-flight decode and stats
+publication latency also matter. The unchanged DP private-token cost model does
+not become a candidate-specific block allocator merely by changing its budget.
+An exact admission oracle would require querying engine allocation costs for
+specific candidate requests (or using block-cost DP); that is outside this
+capacity-only change. No new metric or backend patch is fabricated.
+
+### Failure behavior and diagnostics
+
+Before the first valid sample, or if required metrics are missing/invalid,
+new Program admissions wait. Samples older than the existing freshness rule
+(`3 * metrics_interval_seconds`) also block new admissions. Already active
+inference is not cancelled. Missing data does not trigger a zero-capacity
+mass pause, and there is no silent static-capacity or Program-count fallback.
+A force-resume deadline cannot bypass unknown or exhausted dynamic headroom.
+Existing queue timeout behavior remains in effect. Poll freshness measures
+HTTP observation time, not engine-side stats production time; a responding
+API that republishes stale engine stats cannot be detected by these metrics.
+
+Inspect `/scheduling/diagnostics` per rank:
+
+- `token_capacity_source`: `vllm_block_headroom_estimate` or `backend_unavailable`.
+- `backend_reference_token_capacity`: the backend's reference conversion scale.
+- `backend_available_tokens_at_observation`: uncharged sampled equivalent headroom.
+- `dynamic_admission_headroom_tokens`: remaining headroom after local charges.
+- `effective_token_capacity`: current logical occupancy plus remaining headroom.
+- `observation_age_seconds` and `observation_fresh`: scrape freshness.
+
+Zero headroom is valid; absent headroom is unknown. Both stop positive-cost
+admission. The default remains the previous static/count-only path. Supplying
+both dynamic mode and static token capacity is a configuration error, as is
+combining dynamic mode with `binding_only`.
+
+Engine references:
+- https://docs.vllm.ai/en/v0.32.0/api/vllm/v1/core/block_pool/
+- https://docs.vllm.ai/en/v0.32.0/api/vllm/v1/core/kv_cache_utils/
+- https://docs.vllm.ai/en/v0.32.0/api/vllm/v1/core/kv_cache_manager/
+
+
+## Solver configuration
+
+`dp_capacity_quantum` defaults to 512: ceil option token costs and floor per-target
+capacities. Values remain unscaled. Full-set raw all-fit paths remain valid.
+`dp_state_budget` is null/unlimited by default, or a positive frontier state cap.
+Exhaustion recomputes from the full candidate set with best-fit decreasing on raw
+token costs, respecting allowed target options and slots; it no longer defers
+solely for state budget. The cap applies to each solver invocation.
+`resume_solver_strategy` is `dp` (default) or objective-ranked `greedy`. Use with
+`resume_order=dp`/`dp_admission`. `greedy` is a solver
+choice, not a replacement for the lifecycle scheduling policy.
+Diagnostics expose all three fields.
+`program_resume` supplements `program_admit` for activations with a recorded
+pause reason, with `pause_elapsed_seconds`; first admission is not a resume.
+
+Correction (2026-11-08): resume_solver_strategy=greedy now selects feasible session/backend pairs by the complete caller-supplied lexicographic objective, not BFD. BFD is reserved for bounded-DP state-budget exhaustion.

@@ -132,6 +132,7 @@ impl ProgramScheduler {
             );
             let current_tokens = state.decisions[&reference]
                 .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+            self.recheck_idle_execution_capacity(&mut state, &reference, arrived_at);
             if let Some(placement) = state
                 .runtime
                 .view(&reference)
@@ -193,7 +194,14 @@ impl ProgramScheduler {
                     .get(guard.handle().program())
                     .and_then(|decision| decision.force_resume_deadline)
             };
-            let wake_at = force_deadline.map_or(deadline, |force| force.min(deadline));
+            let wake_at = force_deadline
+                .filter(|force| {
+                    // Direct DP never forces an over-capacity admission. Once
+                    // the priority deadline expires, wait for a notification or
+                    // the queue deadline rather than spinning on a past timer.
+                    self.config.resume_order != ProgramResumeOrder::DpAdmission || *force > now
+                })
+                .map_or(deadline, |force| force.min(deadline));
             if tokio::time::timeout(wake_at.saturating_duration_since(now), notified)
                 .await
                 .is_err()
@@ -238,6 +246,9 @@ impl ProgramScheduler {
 
     fn claim_dispatch(&self, handle: &ProgramRequestHandle) -> Option<ProgramDispatch> {
         let mut state = self.state.lock();
+        if self.tree_dp_mode() && state.runtime.view(handle.program())?.in_flight_requests > 0 {
+            return None;
+        }
         let target = state.runtime.placement(handle.program())?.to_string();
         let dispatch = state.runtime.admit_front(handle, target, Instant::now())?;
         RouterMetrics::record_agent_aware_queue_wait(
@@ -278,6 +289,11 @@ impl ProgramScheduler {
             return;
         }
         let after = state.runtime.view(handle.program());
+        if self.tree_dp_mode() && after.as_ref().is_some_and(|v| v.in_flight_requests == 0) {
+            if let Some(d) = state.decisions.get_mut(handle.program()) {
+                d.tree_dp_reserved_tokens = None;
+            }
+        }
         if let (Some(before), Some(after), Some(tokens), Some(target_id)) = (
             before,
             after,
@@ -350,13 +366,22 @@ impl ProgramScheduler {
                     .cloned()
                     .collect::<Vec<_>>();
                 self.order_resume_candidates(state, &mut queued, now);
-                let Some((candidate, plan)) = queued.into_iter().find_map(|candidate| {
+                let admissible = queued.into_iter().filter_map(|candidate| {
                     self.rank_admission_plan(state, &candidate, &target_id, now)
-                        .map(|plan| (candidate, plan))
-                }) else {
+                        .map(|plan| (candidate, target_id.clone(), plan))
+                });
+                let selected = self.select_resume_admissions(state, admissible, now);
+                let mut committed = false;
+                for (candidate, _, _) in selected {
+                    if let Some(plan) = self.rank_admission_plan(state, &candidate, &target_id, now)
+                    {
+                        committed |=
+                            self.commit_admission(state, &candidate, &target_id, plan, now);
+                    }
+                }
+                if !committed {
                     break;
-                };
-                self.commit_admission(state, &candidate, &target_id, plan, now);
+                }
                 changed = true;
             }
         }
@@ -364,6 +389,12 @@ impl ProgramScheduler {
     }
 
     pub(crate) fn schedule_waiting(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {
+        if self.tree_dp_mode() {
+            return self.schedule_tree_dp(state, now);
+        }
+        if self.config.resume_order == ProgramResumeOrder::DpAdmission {
+            return self.schedule_dp_admission(state, now);
+        }
         if self.config.global_queue {
             self.schedule_global_waiting(state, now)
         } else {
@@ -415,7 +446,7 @@ impl ProgramScheduler {
         });
     }
 
-    fn resume_tier_cmp(
+    pub(crate) fn resume_tier_cmp(
         &self,
         state: &ProgramSchedulerState,
         left: &ProgramRef,
@@ -443,7 +474,7 @@ impl ProgramScheduler {
             .then_with(|| right_priority.cmp(&left_priority))
     }
 
-    fn segment_yield_cmp(
+    pub(crate) fn segment_yield_cmp(
         &self,
         state: &ProgramSchedulerState,
         left: &ProgramRef,
@@ -464,7 +495,9 @@ impl ProgramScheduler {
         let left_state = &state.decisions[left];
         let right_state = &state.decisions[right];
         match self.config.resume_order {
-            ProgramResumeOrder::Fcfs => self.fcfs_resume_cmp(state, left, right),
+            ProgramResumeOrder::Fcfs | ProgramResumeOrder::Dp | ProgramResumeOrder::DpAdmission => {
+                self.fcfs_resume_cmp(state, left, right)
+            }
             ProgramResumeOrder::Mru => right_state
                 .last_request_finished_at
                 .cmp(&left_state.last_request_finished_at)
@@ -533,7 +566,15 @@ impl ProgramScheduler {
             self.config.progress_ttl.decode_buffer_tokens,
             expected_output_tokens,
         );
-        let capacity = self.config.progress_ttl.token_capacity;
+        if !self.capacity_ready(state, target_id, now) {
+            return None;
+        }
+        if self.config.dynamic_token_capacity
+            && required_tokens > self.dynamic_headroom(state, target_id, now)?
+        {
+            return None;
+        }
+        let capacity = self.target_capacity(state, target_id, now);
         let count_fits =
             |count: usize| count.saturating_add(1) <= self.config.max_active_programs_per_target;
         let Some(capacity_tokens) = capacity else {
@@ -647,6 +688,10 @@ impl ProgramScheduler {
         else {
             return false;
         };
+        let resume_info = state
+            .decisions
+            .get(program)
+            .and_then(|d| d.last_pause_reason.map(|reason| (reason, d.paused_at)));
         if !state.runtime.activate(program, target_id.to_string()) {
             return false;
         }
@@ -686,6 +731,11 @@ impl ProgramScheduler {
             capacity_tokens = ?plan.capacity_tokens,
             "Program scheduling decision"
         );
+        if let Some((reason, paused_at)) = resume_info {
+            info!(event="program_resume", program=%program.redacted_id(), target=target_id,
+                reason=reason.as_str(), pause_elapsed_seconds=?paused_at.map(|t| now.saturating_duration_since(t).as_secs_f64()),
+                "Program resumed");
+        }
         if !self.config.binding_only {
             let observation = state.observations.get(target_id);
             RouterMetrics::record_agent_aware_admission(

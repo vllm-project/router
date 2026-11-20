@@ -20,6 +20,10 @@ pub struct BackendObservation {
     pub dp_rank: Option<usize>,
     /// Fraction of the local KV cache currently used by native vLLM.
     pub kv_cache_usage: Option<f64>,
+    /// Group-aware reference capacity exported by vLLM cache_config_info.
+    pub token_capacity: Option<usize>,
+    /// Physical pool size, including vLLM's reserved null block.
+    pub num_gpu_blocks: Option<usize>,
     /// Native requests currently executing on the engine.
     pub running_requests: Option<usize>,
     /// Native requests waiting inside the engine.
@@ -124,6 +128,8 @@ impl BackendObservationProvider for VllmMetricsObservationProvider {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct VllmEngineMetrics {
+    token_capacity: Option<usize>,
+    num_gpu_blocks: Option<usize>,
     kv_cache_usage: Option<f64>,
     running_requests: Option<usize>,
     waiting_requests: Option<usize>,
@@ -142,6 +148,8 @@ fn observations_from_metrics(targets: &[ProgramTarget], text: &str) -> Vec<Backe
                 base_url: target.base_url.clone(),
                 dp_rank: target.dp_rank,
                 kv_cache_usage: metrics.kv_cache_usage,
+                token_capacity: metrics.token_capacity,
+                num_gpu_blocks: metrics.num_gpu_blocks,
                 running_requests: metrics.running_requests,
                 waiting_requests: metrics.waiting_requests,
                 observed_at,
@@ -153,6 +161,8 @@ fn observations_from_metrics(targets: &[ProgramTarget], text: &str) -> Vec<Backe
 /// Parse only the stable vLLM metric families consumed by Program scheduling.
 fn parse_vllm_metrics(text: &str) -> HashMap<usize, VllmEngineMetrics> {
     let mut engines: HashMap<usize, VllmEngineMetrics> = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut ambiguous = std::collections::HashSet::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -162,28 +172,83 @@ fn parse_vllm_metrics(text: &str) -> HashMap<usize, VllmEngineMetrics> {
             continue;
         };
         let (name, labels) = parse_series(series);
-        let engine = labels
-            .get("engine")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
+        if !matches!(
+            name,
+            "vllm:kv_cache_usage_perc"
+                | "vllm:num_requests_running"
+                | "vllm:num_requests_waiting"
+                | "vllm:cache_config_info"
+        ) {
+            continue;
+        }
+        let engine = match labels.get("engine") {
+            Some(raw) => match raw.parse::<usize>() {
+                Ok(rank) => rank,
+                Err(_) => continue,
+            },
+            None => 0,
+        };
+        if !seen.insert((engine, name.to_string())) {
+            ambiguous.insert(engine);
+        }
         let entry = engines.entry(engine).or_default();
         match name {
-            "vllm:kv_cache_usage_perc" => entry.kv_cache_usage = value.parse().ok(),
-            "vllm:num_requests_running" => {
-                entry.running_requests = value.parse::<f64>().ok().map(|value| value as usize)
+            "vllm:kv_cache_usage_perc" => {
+                entry.kv_cache_usage = value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
             }
-            "vllm:num_requests_waiting" => {
-                entry.waiting_requests = value.parse::<f64>().ok().map(|value| value as usize)
+            "vllm:num_requests_running" => entry.running_requests = parse_count(value),
+            "vllm:num_requests_waiting" => entry.waiting_requests = parse_count(value),
+            "vllm:cache_config_info" if value.parse::<f64>().ok() == Some(1.0) => {
+                entry.token_capacity = labels
+                    .get("kv_cache_size_tokens")
+                    .and_then(|v| parse_count(v))
+                    .filter(|v| *v > 0);
+                entry.num_gpu_blocks = labels
+                    .get("num_gpu_blocks")
+                    .and_then(|v| parse_count(v))
+                    .filter(|v| *v > 1);
             }
             _ => {}
+        }
+    }
+    // Multiple models/replicas cannot be silently combined into one rank budget.
+    for engine in ambiguous {
+        if let Some(entry) = engines.get_mut(&engine) {
+            entry.token_capacity = None;
+            entry.num_gpu_blocks = None;
         }
     }
     engines
 }
 
+fn parse_count(value: &str) -> Option<usize> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0 && v.fract() == 0.0 && *v < usize::MAX as f64)
+        .map(|v| v as usize)
+}
+
 fn split_series_value(line: &str) -> Option<(&str, &str)> {
-    let split = line.rfind(char::is_whitespace)?;
-    Some((line[..split].trim(), line[split..].trim()))
+    let mut quoted = false;
+    let mut escaped = false;
+    for (i, c) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' && quoted {
+            escaped = true;
+        } else if c == '"' {
+            quoted = !quoted;
+        } else if c.is_whitespace() && !quoted {
+            return Some((&line[..i], line[i..].split_whitespace().next()?));
+        }
+    }
+    None
 }
 
 fn parse_series(series: &str) -> (&str, HashMap<String, String>) {
@@ -289,5 +354,39 @@ unrelated_metric{engine="1",label="escaped\"comma,value"} 99
             dp_rank: Some(2),
         }];
         assert!(observations_from_metrics(&targets, METRICS).is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod capacity_tests {
+    use super::*;
+    #[test]
+    fn capacity_is_parsed_per_engine_with_timestamps_and_label_spaces() {
+        let metrics = parse_vllm_metrics(
+            r#"
+vllm:cache_config_info{engine="0",model_name="a b",kv_cache_size_tokens="1000",num_gpu_blocks="100"} 1 123
+vllm:cache_config_info{engine="1",kv_cache_size_tokens="2000",num_gpu_blocks="200"} 1
+vllm:kv_cache_usage_perc{engine="0"} 0.25 123
+vllm:kv_cache_usage_perc{engine="1"} 0.5
+"#,
+        );
+        assert_eq!(metrics[&0].token_capacity, Some(1000));
+        assert_eq!(metrics[&1].token_capacity, Some(2000));
+        assert_eq!(metrics[&0].kv_cache_usage, Some(0.25));
+        assert_eq!(metrics[&1].num_gpu_blocks, Some(200));
+    }
+    #[test]
+    fn malformed_or_ambiguous_capacity_never_invents_a_budget() {
+        for value in ["NaN", "inf", "-1", "1.5", "None"] {
+            let parsed = parse_vllm_metrics(&format!("vllm:cache_config_info{{kv_cache_size_tokens=\"{value}\",num_gpu_blocks=\"100\"}} 1"));
+            assert_eq!(parsed[&0].token_capacity, None);
+        }
+        for value in ["NaN", "inf", "-0.1", "1.1"] {
+            let parsed = parse_vllm_metrics(&format!("vllm:kv_cache_usage_perc {value}"));
+            assert_eq!(parsed[&0].kv_cache_usage, None);
+        }
+        let parsed = parse_vllm_metrics("vllm:cache_config_info{engine=\"0\",model_name=\"a\",kv_cache_size_tokens=\"1000\",num_gpu_blocks=\"100\"} 1\nvllm:cache_config_info{engine=\"0\",model_name=\"b\",kv_cache_size_tokens=\"2000\",num_gpu_blocks=\"100\"} 1");
+        assert_eq!(parsed[&0].token_capacity, None);
+        assert!(parse_vllm_metrics("vllm:kv_cache_usage_perc{engine=\"bad\"} 0.2").is_empty());
     }
 }

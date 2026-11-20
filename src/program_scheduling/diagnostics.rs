@@ -13,6 +13,7 @@ use std::time::Instant;
 /// One live Program generation and the facts used by scheduling decisions.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProgramDiagnostic {
+    pub tree_dp_reserved_tokens: Option<usize>,
     pub program: String,
     pub generation: u64,
     pub state: &'static str,
@@ -85,6 +86,13 @@ pub struct RankDiagnostic {
     pub base_url: String,
     pub dp_rank: Option<usize>,
     pub configured_token_capacity: Option<usize>,
+    pub effective_token_capacity: Option<usize>,
+    pub token_capacity_source: &'static str,
+    pub backend_reference_token_capacity: Option<usize>,
+    pub backend_usable_token_capacity: Option<usize>,
+    pub backend_available_tokens_at_observation: Option<f64>,
+    pub dynamic_admission_headroom_tokens: Option<f64>,
+    pub router_reasoning_reserved_tokens: f64,
     pub router_estimated_used_tokens: usize,
     pub router_estimated_headroom_tokens: Option<usize>,
     pub vllm_usage_scaled_tokens: Option<usize>,
@@ -122,6 +130,9 @@ pub struct ProgramSchedulerDiagnostic {
     pub binding_only: bool,
     pub global_queue: bool,
     pub resume_order: super::ProgramResumeOrder,
+    pub resume_solver_strategy: crate::config::types::ResumeSolverStrategy,
+    pub dp_capacity_quantum: usize,
+    pub dp_state_budget: Option<usize>,
     pub cross_rank_headroom_ratio: f64,
     pub retained_requests: usize,
     pub ranks: Vec<RankDiagnostic>,
@@ -208,6 +219,7 @@ impl ProgramScheduler {
                 .entry(target_id)
                 .or_default()
                 .push(ProgramDiagnostic {
+                    tree_dp_reserved_tokens: decision.tree_dp_reserved_tokens,
                     program: runtime.reference.redacted_id(),
                     generation: runtime.reference.generation(),
                     state: match runtime.state {
@@ -375,8 +387,37 @@ impl ProgramScheduler {
                 base_url: target.base_url.clone(),
                 dp_rank: target.dp_rank,
                 configured_token_capacity: capacity,
+                effective_token_capacity: self.target_capacity(&state, target_id, now),
+                token_capacity_source: if self.tree_dp_mode()
+                    && self.capacity_ready(&state, target_id, now)
+                {
+                    "vllm_usage_plus_reservations_tree_dp"
+                } else if !self.config.dynamic_token_capacity {
+                    "configured"
+                } else if self.capacity_ready(&state, target_id, now) {
+                    "vllm_block_headroom_estimate"
+                } else {
+                    "backend_unavailable"
+                },
+                backend_usable_token_capacity: observation
+                    .and_then(|o| o.backend_usable_token_capacity),
+                backend_reference_token_capacity: observation
+                    .and_then(|o| o.backend_token_capacity),
+                backend_available_tokens_at_observation: observation
+                    .and_then(|o| o.backend_available_tokens),
+                dynamic_admission_headroom_tokens: self
+                    .config
+                    .dynamic_token_capacity
+                    .then(|| self.dynamic_headroom(&state, target_id, now))
+                    .flatten(),
+                router_reasoning_reserved_tokens: if self.tree_dp_mode() {
+                    self.tree_dp_used(&state, target_id) as f64
+                } else {
+                    self.reasoning_reservations(&state, target_id)
+                },
                 router_estimated_used_tokens: used,
-                router_estimated_headroom_tokens: capacity
+                router_estimated_headroom_tokens: self
+                    .target_capacity(&state, target_id, now)
                     .map(|capacity| capacity.saturating_sub(used)),
                 vllm_usage_scaled_tokens,
                 observed_active_reasoning_tokens,
@@ -436,6 +477,9 @@ impl ProgramScheduler {
             binding_only: self.config.binding_only,
             global_queue: self.config.global_queue,
             resume_order: self.config.resume_order,
+            resume_solver_strategy: self.config.resume_solver_strategy,
+            dp_capacity_quantum: self.config.dp_capacity_quantum,
+            dp_state_budget: self.config.dp_state_budget,
             cross_rank_headroom_ratio: self.config.cross_rank_headroom_ratio,
             retained_requests: state.runtime.retained_request_count(),
             ranks,
@@ -501,6 +545,8 @@ mod tests {
         scheduler.apply_observations(
             epoch,
             [super::super::BackendObservation {
+                token_capacity: None,
+                num_gpu_blocks: None,
                 target_id: target.id.clone(),
                 base_url: target.base_url.clone(),
                 dp_rank: target.dp_rank,

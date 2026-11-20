@@ -275,6 +275,10 @@ impl ProgramScheduler {
                     target.id.clone(),
                     ObservationCheckpoint {
                         ledger_checkpoint,
+                        debit_checkpoint: state
+                            .observations
+                            .get(&target.id)
+                            .map_or(0.0, |o| o.admitted_token_debits),
                         ..ObservationCheckpoint::default()
                     },
                 )
@@ -338,6 +342,26 @@ impl ProgramScheduler {
             if !state.targets.contains_key(&target_id) {
                 continue;
             }
+            if state
+                .observations
+                .get(&target_id)
+                .and_then(|o| o.observed_at)
+                .is_some_and(|previous| raw.observed_at <= previous)
+            {
+                continue;
+            }
+            let backend_available_tokens = raw
+                .token_capacity
+                .zip(raw.num_gpu_blocks)
+                .zip(raw.kv_cache_usage)
+                .filter(|((capacity, blocks), usage)| {
+                    *capacity > 0 && *blocks > 1 && usage.is_finite() && (0.0..=1.0).contains(usage)
+                })
+                .map(|((capacity, blocks), usage)| {
+                    // vLLM's usage denominator excludes the reserved null block,
+                    // whereas its reference token capacity uses the full pool.
+                    ((1.0 - usage) * capacity as f64 * (blocks - 1) as f64 / blocks as f64).floor()
+                });
             let native_used_tokens = raw
                 .kv_cache_usage
                 .zip(self.config.progress_ttl.token_capacity)
@@ -357,6 +381,17 @@ impl ProgramScheduler {
                 .map(|reasoning| reasoning + checkpoint.active_acting_private_tokens);
             let observation = state.observations.entry(target_id.clone()).or_default();
             observation.active_program_token_delta -= checkpoint.ledger_checkpoint;
+            observation.admitted_token_debits =
+                (observation.admitted_token_debits - checkpoint.debit_checkpoint).max(0.0);
+            observation.backend_token_capacity = raw.token_capacity;
+            observation.backend_usable_token_capacity = raw
+                .token_capacity
+                .zip(raw.num_gpu_blocks)
+                .filter(|(capacity, blocks)| *capacity > 0 && *blocks > 1)
+                .map(|(capacity, blocks)| {
+                    ((capacity as u128 * (blocks - 1) as u128) / blocks as u128) as usize
+                });
+            observation.backend_available_tokens = backend_available_tokens;
             observation.kv_cache_usage = raw.kv_cache_usage;
             observation.running_requests = raw.running_requests;
             observation.waiting_requests = raw.waiting_requests;
@@ -381,7 +416,8 @@ impl ProgramScheduler {
                 observed_active_program_tokens = ?estimated_active_program_tokens,
                 active_program_token_delta,
                 estimated_total_tokens,
-                capacity_tokens = ?self.config.progress_ttl.token_capacity,
+                capacity_tokens = ?self.target_capacity(&state, &target_id, raw.observed_at),
+                backend_available_tokens = ?backend_available_tokens,
                 "Program scheduling diagnostic"
             );
         }
@@ -446,19 +482,20 @@ impl ProgramScheduler {
         let required_tokens = estimated_context_tokens
             .saturating_add(self.config.progress_ttl.decode_buffer_tokens)
             as f64;
-        let capacity = self.config.progress_ttl.token_capacity;
         state
             .model_targets
             .get(identity.model_pool())
             .into_iter()
             .flatten()
             .map(|target_id| {
+                let capacity = self.target_capacity(state, target_id, now);
                 let summary = &summaries[target_id.as_str()];
                 let target_usage = self
                     .observed_target_usage(state, target_id, now)
                     .unwrap_or(summary.router_usage);
-                let immediately_admissible = summary.active_programs.saturating_add(1)
-                    <= self.config.max_active_programs_per_target
+                let immediately_admissible = self.capacity_ready(state, target_id, now)
+                    && summary.active_programs.saturating_add(1)
+                        <= self.config.max_active_programs_per_target
                     && capacity.is_none_or(|capacity| {
                         target_usage + required_tokens
                             <= capacity as f64 * self.config.progress_ttl.low_watermark_ratio
@@ -467,7 +504,7 @@ impl ProgramScheduler {
                     target_id: target_id.clone(),
                     accounted_programs: summary.accounted_programs,
                     accounted_tokens: summary.accounted_tokens,
-                    capacity_tokens: self.config.progress_ttl.token_capacity,
+                    capacity_tokens: capacity,
                     kv_pressure: capacity.map_or(0.0, |capacity| {
                         if capacity == 0 {
                             1.0
@@ -552,6 +589,29 @@ impl ProgramScheduler {
         observation: Option<&RankObservationState>,
         now: Instant,
     ) -> CapacityAccountingSource {
+        if self.config.dynamic_token_capacity {
+            return if observation.is_some_and(|o| {
+                self.observation_is_fresh(o, now)
+                    && if self.tree_dp_mode() {
+                        o.backend_token_capacity.is_some_and(|c| c > 0)
+                            && o.backend_available_tokens.is_some_and(|free| {
+                                free.is_finite()
+                                    && free >= 0.0
+                                    && free <= o.backend_token_capacity.unwrap() as f64
+                            })
+                    } else {
+                        o.backend_available_tokens.is_some()
+                    }
+            }) {
+                if self.tree_dp_mode() {
+                    CapacityAccountingSource::BackendCacheConfigTreeDp
+                } else {
+                    CapacityAccountingSource::BackendHeadroomEstimate
+                }
+            } else {
+                CapacityAccountingSource::BackendHeadroomUnavailable
+            };
+        }
         let Some(observation) = observation else {
             return CapacityAccountingSource::RouterLedgerMissingObservation;
         };
@@ -585,7 +645,12 @@ impl ProgramScheduler {
             let observation_age_seconds = observation
                 .observed_at
                 .map(|observed_at| now.saturating_duration_since(observed_at).as_secs_f64());
-            if source == CapacityAccountingSource::BackendObservation {
+            if matches!(
+                source,
+                CapacityAccountingSource::BackendObservation
+                    | CapacityAccountingSource::BackendCacheConfigTreeDp
+                    | CapacityAccountingSource::BackendHeadroomEstimate
+            ) {
                 if let Some(previous) = previous {
                     info!(
                         event = "capacity_observation_recovered",
@@ -604,7 +669,7 @@ impl ProgramScheduler {
                     capacity_accounting_source = source.as_str(),
                     observation_age_seconds = ?observation_age_seconds,
                     freshness_threshold_seconds = self.config.metrics_interval.saturating_mul(3).as_secs_f64(),
-                    "Program scheduling is using Router-ledger capacity accounting"
+                    "Program scheduling capacity source changed; dynamic unavailable blocks new admissions"
                 );
             }
         }
@@ -616,6 +681,12 @@ impl ProgramScheduler {
         target_id: &str,
         now: Instant,
     ) -> f64 {
+        if self.tree_dp_mode() {
+            return self.tree_dp_accounted_used(state, target_id) as f64;
+        }
+        if self.config.dynamic_token_capacity {
+            return self.ledger_usage(state, target_id);
+        }
         if let Some(tokens) = self.observed_target_usage(state, target_id, now) {
             return tokens;
         }
@@ -636,6 +707,9 @@ impl ProgramScheduler {
         target_id: &str,
         now: Instant,
     ) -> Option<f64> {
+        if self.config.dynamic_token_capacity {
+            return Some(self.ledger_usage(state, target_id));
+        }
         state
             .observations
             .get(target_id)
@@ -652,11 +726,9 @@ impl ProgramScheduler {
         target_id: &str,
         delta_tokens: f64,
     ) {
-        state
-            .observations
-            .entry(target_id.to_string())
-            .or_default()
-            .active_program_token_delta += delta_tokens;
+        let observation = state.observations.entry(target_id.to_string()).or_default();
+        observation.active_program_token_delta += delta_tokens;
+        observation.admitted_token_debits += delta_tokens.max(0.0);
     }
 }
 
@@ -679,6 +751,7 @@ pub struct BackendObservationEpoch {
 #[derive(Debug, Clone, Default)]
 struct ObservationCheckpoint {
     ledger_checkpoint: f64,
+    debit_checkpoint: f64,
     active_reasoning_programs: usize,
     active_reasoning_requests: usize,
     active_reasoning_private_tokens: f64,
@@ -711,6 +784,8 @@ mod tests {
         scheduler.apply_observations(
             epoch,
             [BackendObservation {
+                token_capacity: None,
+                num_gpu_blocks: None,
                 target_id: "rank-0".into(),
                 base_url: "http://worker".into(),
                 dp_rank: Some(0),
@@ -741,6 +816,8 @@ mod tests {
         scheduler.apply_observations(
             epoch,
             [BackendObservation {
+                token_capacity: None,
+                num_gpu_blocks: None,
                 target_id: target.id.clone(),
                 base_url: target.base_url.clone(),
                 dp_rank: target.dp_rank,
@@ -770,6 +847,8 @@ mod tests {
         scheduler.apply_observations(
             epoch,
             [BackendObservation {
+                token_capacity: None,
+                num_gpu_blocks: None,
                 target_id: target.id.clone(),
                 base_url: target.base_url.clone(),
                 dp_rank: target.dp_rank,

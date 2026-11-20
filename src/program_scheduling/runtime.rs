@@ -310,6 +310,15 @@ impl ProgramRuntime {
         self.request_pool.is_empty()
     }
 
+    /// Text retained with the exact front request, not the last completed step.
+    pub(crate) fn front_context_tokens(&self, program: &ProgramRef) -> Option<usize> {
+        self.request_pool.front_context_tokens(program)
+    }
+
+    pub(crate) fn front_routing_text(&self, program_ref: &ProgramRef) -> Option<&str> {
+        self.request_pool.front_routing_text(program_ref)
+    }
+
     /// Request-scoped hints associated with the Program's front waiter.
     pub(crate) fn front_request_hints(
         &self,

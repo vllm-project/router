@@ -115,6 +115,15 @@ impl ProgramScheduler {
             return;
         }
         let runtime_after = state.runtime.view(dispatch.program());
+        if self.tree_dp_mode()
+            && runtime_after
+                .as_ref()
+                .is_some_and(|v| v.in_flight_requests == 0)
+        {
+            if let Some(d) = state.decisions.get_mut(dispatch.program()) {
+                d.tree_dp_reserved_tokens = None;
+            }
+        }
 
         // A retained successor continues the same reasoning placement. Match
         // the historical Router behavior by cancelling a deferred capacity
@@ -488,7 +497,7 @@ impl ProgramScheduler {
         if !factors.request_window_complete(self.config.progress_ttl.stats_window_size) {
             return self.config.shared_prefix_freshness_warmup;
         }
-        let Some(capacity) = self.config.progress_ttl.token_capacity else {
+        let Some(capacity) = self.target_capacity(state, target_id, Instant::now()) else {
             return self.config.shared_prefix_freshness_warmup;
         };
         let active_reasoning = state
@@ -517,12 +526,15 @@ impl ProgramScheduler {
     }
 
     fn repair_capacity(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {
-        let Some(capacity) = self.config.progress_ttl.token_capacity else {
+        if self.tree_dp_mode() {
             return false;
-        };
+        }
         let target_ids = state.targets.keys().cloned().collect::<Vec<_>>();
         let mut changed = false;
         for target_id in target_ids {
+            let Some(capacity) = self.target_capacity(state, &target_id, now) else {
+                continue;
+            };
             let high = capacity as f64 * self.config.progress_ttl.high_watermark_ratio;
             let low = capacity as f64 * self.config.progress_ttl.low_watermark_ratio;
             let average_completion = state
