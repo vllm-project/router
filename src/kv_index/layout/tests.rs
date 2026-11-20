@@ -655,17 +655,22 @@ mod declarations {
         }
         let mut spec = value.clone();
         spec["ranks"][0]["speculative_tokens"] = serde_json::json!(3);
-        for (lookahead, tail_groups, accepted) in [
-            (0, serde_json::json!(null), false),
-            (0, serde_json::json!([]), true),
-            (0, serde_json::json!([3]), true),
-            (0, serde_json::json!([0]), false),
-            (1, serde_json::json!(null), true),
-            (1, serde_json::json!([3]), false),
+        let unsupported_speculation = Some("unsupported speculative cache contract");
+        for (lookahead, tail_groups, expected_error) in [
+            (0, serde_json::json!(null), unsupported_speculation),
+            (0, serde_json::json!([]), None),
+            (0, serde_json::json!([3]), None),
+            (
+                0,
+                serde_json::json!([0]),
+                Some("unsupported tail-drop layout. Set tail_drop_groups to the effective groups and use [] when the worker skips the drop"),
+            ),
+            (1, serde_json::json!(null), None),
+            (1, serde_json::json!([3]), unsupported_speculation),
         ] {
             spec["ranks"][0]["hash_lookahead_tokens"] = serde_json::json!(lookahead);
             spec["ranks"][0]["tail_drop_groups"] = tail_groups;
-            assert_eq!(bind_layout(&spec, "epoch-1").is_ok(), accepted, "{spec}");
+            assert_eq!(bind_layout(&spec, "epoch-1").err(), expected_error, "{spec}");
         }
         let mut seeded = value.clone();
         seeded["ranks"][0]["hash_seed"] = serde_json::json!("0");

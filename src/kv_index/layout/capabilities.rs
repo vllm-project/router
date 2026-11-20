@@ -50,9 +50,10 @@ pub struct RankCapability {
     pub partial_hash_hits: bool,
     pub hash_lookahead_tokens: u32,
     pub speculative_tokens: u32,
-    /// Cache groups whose engine lookup drops a trailing proof unit. When
-    /// speculation uses legacy hashes, the engine must report this list, even
-    /// when it is empty. The speculative token count alone cannot identify it.
+    /// Groups whose cache lookup actually drops a trailing proof unit for this
+    /// worker role. With speculation and zero hash lookahead, report an empty
+    /// list if the engine skips the drop. EAGLE group IDs describe model
+    /// membership and may differ from this list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail_drop_groups: Option<Vec<u32>>,
     pub prefix_caching: bool,
@@ -355,10 +356,11 @@ impl CacheCapabilities {
         let tail_drop_group = if tail_drop_groups.is_empty() {
             None
         } else {
+            let unsupported = "unsupported tail-drop layout. Set tail_drop_groups to the effective groups and use [] when the worker skips the drop";
             let mut dense = groups
                 .iter()
                 .filter(|group| group.kind == GroupRule::FullAttention);
-            let group = dense.next().ok_or("unsupported tail-drop layout")?;
+            let group = dense.next().ok_or(unsupported)?;
             if dense.next().is_some()
                 || tail_drop_groups != [group.group_idx]
                 || groups.len() != rank.groups.len()
@@ -372,7 +374,7 @@ impl CacheCapabilities {
                         || (!rank.partial_hash_hits && other.block_size != group.block_size)
                 })
             {
-                return Err("unsupported tail-drop layout");
+                return Err(unsupported);
             }
             Some(group.group_idx)
         };

@@ -175,7 +175,7 @@ Use `--max-model-len 4096 --prefix-match-unit 16`. Copy the Qwen3.5 rank fields 
 
 For the base checkpoint, use the [Qwen3.6 settings](#qwen36-27b) with the Qwen3.8 weights and served model name. Update the rank when enabling speculation.
 
-Enable MTP or DSpark on the worker with `--speculative-config`. In Router's layout, `speculative_tokens` is the configured draft length and `hash_lookahead_tokens` is the number of tokens after each block that enter its hash. For lookahead 1 and a 16-token block, token 17 is part of the hash of tokens 1–16. For lookahead 0, set `tail_drop_groups` to the groups for which the engine rolls back the last matched unit. DSpark uses `[]` in the examples below. Use the values in effect on Prefill for P/D disaggregation.
+Enable MTP or DSpark on the worker with `--speculative-config`. In Router's layout, `speculative_tokens` is the configured draft length and `hash_lookahead_tokens` is the number of tokens after each block that enter its hash. For lookahead 1 and a 16-token block, token 17 is part of the hash of tokens 1–16. For lookahead 0, list the groups where the worker actually drops a trailing unit during cache lookup in `tail_drop_groups`. Use `[]` when the worker skips the drop. For P/D disaggregation, declare the rules in effect on Prefill.
 
 | vLLM configuration | Rank settings |
 | --- | --- |
@@ -184,6 +184,17 @@ Enable MTP or DSpark on the worker with `--speculative-config`. In Router's layo
 | `--speculative-config '{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.8-27B-speculator.dspark"}'` | Set `speculative_tokens: 8`, `hash_lookahead_tokens: 0`, `tail_drop_groups: []` and `partial_hash_hits: false`. Keep `hash_block_size: 16`. |
 
 With the [Qwen3.8 DSpark draft](https://huggingface.co/RedHatAI/Qwen3.8-27B-speculator.dspark), set `declared_groups: 15`. Groups 0–9 use the 832-token Mamba settings above, and groups 10–13 use the 832-token full-attention settings. Group 14 uses `kind: "sliding_window"`, `spec_type: "SlidingWindowSpec"`, `block_size: 832`, `sliding_window: 2048`, `prefix_cacheable: true` and `prefix_replay_tokens: 0`.
+
+### Ascend with vLLM 0.32
+
+On vllm-ascend builds with the [Ascend tail-drop rule](https://github.com/vllm-project/vllm-ascend/blob/450e556980df9f1b09392b77952d552d75e4cba2/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py#L42-L61), colocated workers and pure Prefill producers skip the tail drop. Keep the block sizes and group IDs reported by each worker. Use the following rank fields for MTP or DSpark workers that publish zero-lookahead hashes. For P/D disaggregation, put the Prefill layout in the [`hybrid` field](#pd-layout).
+
+| Worker configuration | `speculative_tokens` | `hash_lookahead_tokens` | `tail_drop_groups` |
+| --- | ---: | ---: | --- |
+| Qwen3.5 or Qwen3.8 MTP with three draft tokens | `3` | `0` | `[]` |
+| Qwen3.8 DSpark with eight draft tokens | `8` | `0` | `[]` |
+
+Use a bind address such as `tcp://*:5557` for the worker's live publisher. Use a reachable worker address when configuring a static Router subscriber. Decode workers that perform a tail drop require their own layout. Use load-based Decode routing for tail-drop rules outside the supported layout.
 
 ### Qwen4Exp FP8 QSA
 
@@ -253,7 +264,7 @@ Use `--max-model-len 4096`, keep `--swa-bounded-replay` enabled, and let vLLM ch
 }
 ```
 
-To [check reuse](#3-check-cache-reuse) for a hybrid model, use its served name and a repeated prompt long enough to span its cache pages. The configurations describe the tested CUDA layouts, including the declared speculative modes. Check connector compatibility when deploying a model in P/D.
+To [check reuse](#3-check-cache-reuse) for a hybrid model, use its served name and a repeated prompt long enough to span its cache pages. Check connector compatibility when deploying a model in P/D.
 
 ## P/D routing
 
@@ -302,7 +313,7 @@ Use the same vLLM release for the engine and its gRPC frontend. In all versions 
 | --- | --- | --- |
 | [0.30.0](https://github.com/vllm-project/vllm/tree/v0.30.0) | Pass a layout and [static addresses](#static-event-endpoints). | Zero hash lookahead. |
 | [0.31.0](https://github.com/vllm-project/vllm/tree/v0.31.0) | `/kv_event_sources` | Zero hash lookahead and V4.1 bounded replay. |
-| [0.32.0](https://github.com/vllm-project/vllm/tree/v0.32.0) | `/kv_event_sources` | Zero hash lookahead and V4.1 bounded replay. |
+| [0.32.0](https://github.com/vllm-project/vllm/tree/v0.32.0) | `/kv_event_sources` | Zero hash lookahead and V4.1 bounded replay. See [Ascend layouts](#ascend-with-vllm-032) for MTP and DSpark. |
 | [0.33.0](https://github.com/vllm-project/vllm/tree/v0.33.0) | `/kv_event_sources` | Adds nonzero hash lookahead. Model recipes use this release. |
 | [0.34.0](https://github.com/vllm-project/vllm/tree/v0.34.0) | `/kv_event_sources` | Nonzero hash lookahead. The default block size is 64 tokens if the backend has no preferred size. |
 
@@ -328,5 +339,6 @@ For session affinity, send the same `x-session-id` or `session_params.session_id
 ## Troubleshooting
 
 - If the engine reports hits and the Router does not, check the layout's model and topic, the hash flags, and whether both event ports are reachable from the Router.
+- For `unsupported tail-drop layout`, check the effective lookup rule on the worker. Use `tail_drop_groups: []` if it skips the drop. An EAGLE group ID alone indicates model membership.
 - If vLLM reports `Address already in use`, check the live and replay port ranges before starting it again. Inspect the actual event addresses in `/kv_event_sources` for HTTP or `Control.GetKvEventSources` for gRPC.
 - When a worker restarts, rerun the worker settings for a fresh topic. If you use a layout file, regenerate it with the new topic and restart the Router to load it. On a Router-only restart, replay recovers the events still in the worker's history.
