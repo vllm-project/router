@@ -5,7 +5,10 @@ use std::hash::{BuildHasher, Hash};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use super::{output_length::PendingOutputPrediction, ContextTokens, ProgramRequestHints};
+use super::{
+    output_length::PendingOutputPrediction, prediction_profile::ReturnTimeKey, ContextTokens,
+    ProgramRequestHints,
+};
 
 /// Whether a Program currently owns logical admission capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +99,7 @@ pub struct ProgramDispatch {
     request_hints: ProgramRequestHints,
     expected_resume: bool,
     pending_output_prediction: Option<PendingOutputPrediction>,
+    return_time_keys: Vec<ReturnTimeKey>,
 }
 
 impl ProgramDispatch {
@@ -126,6 +130,7 @@ impl ProgramDispatch {
             request_hints,
             expected_resume: true,
             pending_output_prediction: None,
+            return_time_keys: Vec::new(),
         }
     }
 
@@ -133,9 +138,11 @@ impl ProgramDispatch {
         &mut self,
         expected_resume: bool,
         pending_output_prediction: Option<PendingOutputPrediction>,
+        return_time_keys: Vec<ReturnTimeKey>,
     ) {
         self.expected_resume = expected_resume;
         self.pending_output_prediction = pending_output_prediction;
+        self.return_time_keys = return_time_keys;
     }
 
     /// Unique Router-owned attempt, fencing duplicate completion within a placement.
@@ -215,6 +222,11 @@ impl ProgramDispatch {
 
     pub(crate) fn pending_output_prediction(&self) -> Option<&PendingOutputPrediction> {
         self.pending_output_prediction.as_ref()
+    }
+
+    /// Arrival-time workflow keys, independent of later Program mutations.
+    pub(crate) fn return_time_keys(&self) -> &[ReturnTimeKey] {
+        &self.return_time_keys
     }
 
     /// Stable privacy-preserving Program identifier for logs and metrics.
