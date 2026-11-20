@@ -651,7 +651,7 @@ mod declarations {
         let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
         assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 528);
         assert_eq!(index.reusable_tokens(&prompt[..529], usize::MAX), 528);
-        let prefill = index.with_mooncake_prefill(true);
+        let prefill = index.with_mooncake_prefill(true, false);
         assert_eq!(prefill.reusable_tokens(&prompt[..529], usize::MAX), 0);
         assert_eq!(prefill.reusable_tokens(&prompt[..530], usize::MAX), 528);
     }
@@ -751,6 +751,18 @@ mod declarations {
             ]
         }]});
         bind_layout(&value, "ds4").expect("deepseek v4 layout must bind");
+        value["ranks"][0]["groups"][2]["tokens_per_state"] = "4".into();
+        value["ranks"][0]["groups"][2]["cache_role"] = "sparse".into();
+        for (prefill, truncates_compressed, expected) in [
+            (true, true, 16383),
+            (true, false, 16384),
+            (false, true, 16384),
+        ] {
+            let binding = bind_layout(&value, "ds4")
+                .unwrap()
+                .with_mooncake_prefill(prefill, truncates_compressed);
+            assert_eq!(binding.reusable_prompt_cap(16385), expected);
+        }
         value["ranks"][0]["groups"][0]["sliding_window"] = 0.into();
         assert!(bind_layout(&value, "ds4").is_err());
         value["ranks"][0]["groups"] = serde_json::json!([]);

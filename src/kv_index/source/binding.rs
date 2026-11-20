@@ -198,19 +198,24 @@ impl SourceBinding {
         self
     }
 
-    pub(in crate::kv_index) fn with_mooncake_prefill(mut self, enabled: bool) -> Self {
+    pub(in crate::kv_index) fn with_mooncake_prefill(
+        mut self,
+        enabled: bool,
+        truncates_compressed: bool,
+    ) -> Self {
         self.mooncake_truncates_prompt = enabled
             && (self.replay_tokens != 0
-                || self
-                    .groups
-                    .iter()
-                    .any(|group| group.kind == GroupRule::Checkpoint));
+                || self.groups.iter().any(|group| {
+                    group.kind == GroupRule::Checkpoint
+                        || (truncates_compressed
+                            && matches!(group.kind, GroupRule::CompressedFullAttention { .. }))
+                }));
         self
     }
 
     pub(in crate::kv_index) fn reusable_prompt_cap(&self, len: usize) -> usize {
-        // Mooncake prefills through N-1 for Mamba or bounded replay. The engine
-        // hashes the original request before truncating, so cap only the lookup.
+        // A Mooncake connector can remove the last prompt token before cache
+        // lookup. Keep the full hash chain and lower only the lookup limit.
         len.saturating_sub(1 + usize::from(self.mooncake_truncates_prompt))
     }
 

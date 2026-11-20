@@ -428,7 +428,7 @@ fn validate_worker_metadata(
 }
 
 /// Engine configuration exposed by `vllm serve` behind `VLLM_SERVER_DEV_MODE=1`.
-async fn query_server_info_json(
+pub(super) async fn query_server_info_json(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
@@ -458,11 +458,20 @@ async fn query_server_info_json(
         .and_then(serde_json::Value::as_u64)
         .and_then(|size| u32::try_from(size).ok())
         .filter(|size| *size > 0);
+    let mooncake_truncates_compressed = match config
+        .pointer("/kv_transfer_config/kv_connector")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("MooncakeHybridConnector" | "MooncakeConnectorV1") => Some(true),
+        Some("MooncakeConnector") => Some(false),
+        _ => None,
+    };
     Ok(ServerInfo {
         model_id: model.clone(),
         model_path: model,
         kv_block_size: block_size,
         effective_attention_block_size,
+        mooncake_truncates_compressed,
         ..Default::default()
     })
 }

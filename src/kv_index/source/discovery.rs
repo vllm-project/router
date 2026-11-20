@@ -299,6 +299,14 @@ impl KvIndexSupervisor {
         self.mooncake_prefill = enabled;
     }
 
+    fn uses_mooncake_prefill(&self, worker_url: &str) -> bool {
+        self.mooncake_prefill
+            && self
+                .static_pd_sources
+                .get(worker_url)
+                .is_some_and(|source| !source.compatible_decode_urls.is_empty())
+    }
+
     pub(crate) fn set_strict_recovery(&mut self, enabled: bool) {
         self.strict_recovery = enabled;
     }
@@ -415,7 +423,7 @@ impl KvIndexSupervisor {
         } else {
             self.resolved_static_source(worker_url)
         };
-        match static_source {
+        let mut discovery = match static_source {
             Some(discovery) if layout_only(&discovery) => {
                 self.discover_declared_layout(worker_url, discovery).await
             }
@@ -462,7 +470,39 @@ impl KvIndexSupervisor {
                 }
                 discovery
             }
+        };
+        if !self.uses_mooncake_prefill(worker_url)
+            || !discovery.hybrid.as_ref().is_some_and(|layout| {
+                layout.ranks.iter().any(|rank| {
+                    rank.groups.iter().any(|group| {
+                        group.kind == "mla_attention" && group.tokens_per_state.is_some()
+                    })
+                })
+            })
+        {
+            return discovery;
         }
+        if let Some(info) = discovery
+            .server_info
+            .as_mut()
+            .ok()
+            .filter(|info| info.mooncake_truncates_compressed.is_none())
+        {
+            // This optional metadata lookup must leave time to install the source.
+            if let Ok(Ok(runtime)) = tokio::time::timeout(
+                CONTROL_TIMEOUT / 4,
+                probe::query_server_info_json(
+                    &self.client,
+                    split_worker_rank(worker_url).0,
+                    self.api_key.as_deref(),
+                ),
+            )
+            .await
+            {
+                info.mooncake_truncates_compressed = runtime.mooncake_truncates_compressed;
+            }
+        }
+        discovery
     }
 
     async fn discover_declared_layout(

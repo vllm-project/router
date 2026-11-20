@@ -162,6 +162,9 @@ pub struct ServerInfo {
     pub kv_block_size: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_attention_block_size: Option<u32>,
+    /// Whether the worker's Mooncake connector trims compressed-model Prefill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mooncake_truncates_compressed: Option<bool>,
     /// `--served-model-name` aliases, so the router can tell a base-model alias
     /// from a LoRA adapter selected through the request's `model`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
