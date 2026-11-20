@@ -196,6 +196,8 @@ On vllm-ascend builds with the [Ascend tail-drop rule](https://github.com/vllm-p
 
 Use a bind address such as `tcp://*:5557` for the worker's live publisher. Use a reachable worker address when configuring a static Router subscriber. Decode workers that perform a tail drop require their own layout. Use load-based Decode routing for tail-drop rules outside the supported layout.
 
+For HTTP P/D, set `kv_connector: "MooncakeConnectorV1"` in the Ascend workers' KV transfer config and use `--kv-connector mooncake` on Router. Use the [P/D layout](#pd-layout) and omit the optional bootstrap port when Prefill returns the transfer parameters. Router uses the Prefill lookup boundary for Mamba and bounded-replay layouts.
+
 ### Qwen4Exp FP8 QSA
 
 Use the FP8 QSA checkpoint with architecture `Qwen4ExpForConditionalGeneration`. The reference checkpoint has the name `Qwen3.8-Flash-Next-FP8`. Use `--max-model-len 4096` and let the engine choose cache block sizes. Use a prompt longer than 1,600 tokens to check reuse.
@@ -309,13 +311,13 @@ Save this as `pd-layout.json`. Replace the empty `hybrid` object with the value 
 
 Use the same vLLM release for the engine and its gRPC frontend. In all versions below, gRPC discovers live and replay addresses through `GetKvEventSources`.
 
-| vLLM release | HTTP event discovery | Layout support |
-| --- | --- | --- |
-| [0.30.0](https://github.com/vllm-project/vllm/tree/v0.30.0) | Pass a layout and [static addresses](#static-event-endpoints). | Zero hash lookahead. |
-| [0.31.0](https://github.com/vllm-project/vllm/tree/v0.31.0) | `/kv_event_sources` | Zero hash lookahead and V4.1 bounded replay. |
-| [0.32.0](https://github.com/vllm-project/vllm/tree/v0.32.0) | `/kv_event_sources` | Zero hash lookahead and V4.1 bounded replay. See [Ascend layouts](#ascend-with-vllm-032) for MTP and DSpark. |
-| [0.33.0](https://github.com/vllm-project/vllm/tree/v0.33.0) | `/kv_event_sources` | Adds nonzero hash lookahead. Model recipes use this release. |
-| [0.34.0](https://github.com/vllm-project/vllm/tree/v0.34.0) | `/kv_event_sources` | Nonzero hash lookahead. The default block size is 64 tokens if the backend has no preferred size. |
+| vLLM release | HTTP event discovery | Layout support | vLLM Ascend pairing |
+| --- | --- | --- | --- |
+| [0.30.0](https://github.com/vllm-project/vllm/tree/v0.30.0) | Pass a layout and [static addresses](#static-event-endpoints). | Zero hash lookahead. | [0.30.0 stable](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.30.0). |
+| [0.31.0](https://github.com/vllm-project/vllm/tree/v0.31.0) | `/kv_event_sources` | Zero hash lookahead and V4.1 bounded replay. | [Release candidate branch](https://github.com/vllm-project/vllm-ascend/tree/releases/v0.31.0rc). |
+| [0.32.0](https://github.com/vllm-project/vllm/tree/v0.32.0) | `/kv_event_sources` | Zero hash lookahead and V4.1 bounded replay. | [0.32.0rc1](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.32.0rc1). See [Ascend layouts](#ascend-with-vllm-032) for MTP and DSpark. |
+| [0.33.0](https://github.com/vllm-project/vllm/tree/v0.33.0) | `/kv_event_sources` | Adds nonzero hash lookahead. Model recipes use this release. | Select an Ascend build that explicitly declares vLLM 0.33 compatibility. |
+| [0.34.0](https://github.com/vllm-project/vllm/tree/v0.34.0) | `/kv_event_sources` | Nonzero hash lookahead. The default block size is 64 tokens if the backend has no preferred size. | Select an Ascend build that explicitly declares vLLM 0.34 compatibility. |
 
 ## CLI options
 
