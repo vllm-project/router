@@ -193,6 +193,22 @@ Comprehensive test suite:
 - Rust integration tests
 - Python tests with coverage
 
+### ROCm KV-aware e2e
+
+`rocm-kv-aware-e2e` in `test-nightly.yml` reuses the L4 functional test on
+two MI300X GPUs on one host. It runs whenever L3 is uploaded, including
+`ROCM_ONLY=1` builds, and does not require the NVIDIA image build.
+The pinned ROCm image supplies `vllm-rs`; the router binary comes from this
+build. See the [test configuration](../tests/python/e2e/function/kv_aware/config.py)
+for the prefix-reuse scenario and worker settings; this is not a P/D test.
+
+Router installation and Python dependency installation each have a ten-minute
+bound; pytest has a separate 30-minute bound. On forced termination, container
+teardown remains the final cleanup boundary for workers. JUnit and worker logs
+are collected under `target/ci-logs/kv-aware-rocm`; pytest output is in the
+Buildkite console. See [shared host leases](#shared-host-leases-and-timeouts)
+for the overall job timeout.
+
 ### Benchmarks
 Not part of the pipeline. Run them locally with `scripts/run_benchmarks.py`
 (criterion) or the router overhead harness; see
@@ -201,31 +217,6 @@ Not part of the pipeline. Run them locally with `scripts/run_benchmarks.py`
 ### Docker Build
 Builds Docker image for the router.
 
-## ROCm KV-aware coverage
-
-`rocm-kv-aware-e2e` in `test-nightly.yml` reuses the L4 KV-aware functional
-test on two MI300X GPUs on one host. It runs when L3 is uploaded: default
-branch with `NIGHTLY=1`, or a non-default branch labeled `nightly-test`,
-including `ROCM_ONLY=1` builds. No NVIDIA image build is required.
-The 450-minute job timeout covers 360 minutes of host lease acquisition plus
-90 minutes of setup/execution headroom. The host `pre-command` hook invokes
-`vllm-router-rocm-hold-cluster-lease` after the agent accepts the job; this is
-inside Buildkite's step timer, not a wait before dispatch. Existing lanes have
-timed out in the hook before the test command started. #508 aligns those lanes
-with the same lease budget. A manual retry starts a fresh, independently
-bounded attempt rather than continuing the previous attempt's budget.
-Artifact installation and Python dependency installation each have a ten-minute
-bound; pytest has a separate 30-minute bound. On forced termination, container
-teardown remains the final cleanup boundary for workers.
-
-The pinned ROCm image supplies `vllm-rs`; the router binary comes from this
-build. Two full Qwen3-0.6B workers publish KV events with replay enabled.
-The test primes a distinct prefix on each worker, checks streaming and
-non-streaming reuse routing, then checks concurrent completion. It does not
-validate P/D transfers or server-side resource reclamation. Worker logs and
-JUnit results are collected under `target/ci-logs/kv-aware-rocm`; pytest output
-is available in the Buildkite console.
-
 ## Agent Queues
 
 - `medium_cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
@@ -233,6 +224,18 @@ is available in the Buildkite console.
 - `mithril-h100-pool`: NVIDIA H100 SXM tests (2-GPU gRPC prefix-KV perf)
 - `router_rocm_mi300_2`: MI300X MoRI tests and the single-host, two-GPU KV-aware functional lane (`spawn=1`)
 - `default`: General purpose queue
+
+### Shared host leases and timeouts
+
+The `router_rocm_mi300_2` hosts are shared. Their `pre-command` hook invokes
+`vllm-router-rocm-hold-cluster-lease` after the agent accepts the job, so lease
+acquisition counts toward Buildkite's step timeout. The hook can wait up to
+360 minutes; jobs have previously timed out here before their test command ran.
+
+The KV-aware lane allows 450 minutes: 360 for the lease plus 90 for setup and
+execution. #508 aligns the MoRI lanes with this budget. A manual retry starts
+a fresh, independently bounded attempt rather than continuing the previous
+attempt's budget. Lane-specific command timeouts still bound actual test work.
 
 ## Adding New Tests
 
