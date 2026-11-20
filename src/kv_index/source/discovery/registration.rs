@@ -158,10 +158,9 @@ impl KvIndexSupervisor {
 
         // Admit each rank on its own verified contract.
         let engine_model = layout_model(&server_info, &model_id, &capability);
-        // Only Prefill declares compatible Decode targets. Decode looks up its
-        // own request without Mooncake's Prefill truncation.
-        let mooncake_prefill = self.uses_mooncake_prefill(worker_url);
-        // When metadata is unavailable, bound compressed credit by the shorter lookup.
+        // Only Prefill declares compatible Decode targets.
+        let connector = self.prefill_connector(worker_url);
+        // Without Mooncake metadata, bound compressed credit by the shorter lookup.
         let truncates_compressed = server_info.mooncake_truncates_compressed.unwrap_or(true);
         let mut bindings = HashMap::new();
         event_sources.retain(|source| {
@@ -174,7 +173,7 @@ impl KvIndexSupervisor {
                     };
                     bindings.insert(
                         source.dp_rank,
-                        binding.with_mooncake_prefill(mooncake_prefill, truncates_compressed),
+                        binding.with_pd_prefill(connector, truncates_compressed),
                     );
                     true
                 }

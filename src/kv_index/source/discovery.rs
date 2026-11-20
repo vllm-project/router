@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::config::StaticKvEventSources;
+use crate::config::{KvConnector, StaticKvEventSources};
 use crate::kv_index::storage::KvBlockIndexer;
 use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::EventSubscriberHandle;
@@ -189,7 +189,7 @@ pub struct KvIndexSupervisor {
     api_key: Option<String>,
     full_attention_http: bool,
     http_pd: bool,
-    mooncake_prefill: bool,
+    pd_connector: Option<KvConnector>,
     strict_recovery: bool,
     /// Explicit event sources override discovery for configured regular workers.
     static_sources: HashMap<String, StaticKvEventSources>,
@@ -232,7 +232,7 @@ impl KvIndexSupervisor {
             api_key: None,
             full_attention_http: false,
             http_pd: false,
-            mooncake_prefill: false,
+            pd_connector: None,
             strict_recovery: false,
             static_sources: HashMap::new(),
             static_pd_sources: HashMap::new(),
@@ -295,16 +295,16 @@ impl KvIndexSupervisor {
         self.api_key = api_key;
     }
 
-    pub(crate) fn set_mooncake_prefill(&mut self, enabled: bool) {
-        self.mooncake_prefill = enabled;
+    pub(crate) fn set_pd_connector(&mut self, connector: KvConnector) {
+        self.pd_connector = Some(connector);
     }
 
-    fn uses_mooncake_prefill(&self, worker_url: &str) -> bool {
-        self.mooncake_prefill
-            && self
-                .static_pd_sources
+    fn prefill_connector(&self, worker_url: &str) -> Option<KvConnector> {
+        self.pd_connector.filter(|_| {
+            self.static_pd_sources
                 .get(worker_url)
                 .is_some_and(|source| !source.compatible_decode_urls.is_empty())
+        })
     }
 
     pub(crate) fn set_strict_recovery(&mut self, enabled: bool) {
@@ -471,7 +471,7 @@ impl KvIndexSupervisor {
                 discovery
             }
         };
-        if !self.uses_mooncake_prefill(worker_url)
+        if self.prefill_connector(worker_url) != Some(KvConnector::Mooncake)
             || !discovery.hybrid.as_ref().is_some_and(|layout| {
                 layout.ranks.iter().any(|rank| {
                     rank.groups.iter().any(|group| {

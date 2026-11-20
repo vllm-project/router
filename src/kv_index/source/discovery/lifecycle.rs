@@ -245,6 +245,12 @@ impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
         true
     }
 
+    fn nixl_decode_credit(&self, rank: u32, prompt_len: usize, reused: u64) -> u64 {
+        self.indexes
+            .get(&rank)
+            .map_or(reused, |index| index.nixl_decode_credit(prompt_len, reused))
+    }
+
     fn matches(
         &self,
         tokens: &[u32],

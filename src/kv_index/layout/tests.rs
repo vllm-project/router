@@ -638,22 +638,46 @@ mod declarations {
     }
 
     #[test]
-    fn qwen_layout_restores_prefix_and_respects_mooncake_boundary() {
+    fn qwen_layout_restores_prefix_and_respects_pd_prefill_boundary() {
+        use crate::config::KvConnector;
+
         let value = qwen_layout();
-        let index = bind_layout(&value, "epoch-1").unwrap();
-        index.begin_empty(0);
-        index
-            .apply_payload(
-                0,
-                &crate::kv_index::source::binding::tests::qwen35_payload(),
-            )
-            .unwrap();
         let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
-        assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 528);
-        assert_eq!(index.reusable_tokens(&prompt[..529], usize::MAX), 528);
-        let prefill = index.with_mooncake_prefill(true, false);
-        assert_eq!(prefill.reusable_tokens(&prompt[..529], usize::MAX), 0);
-        assert_eq!(prefill.reusable_tokens(&prompt[..530], usize::MAX), 528);
+        let payload = crate::kv_index::source::binding::tests::qwen35_payload();
+        for (connector, at_boundary) in [
+            (None, 528),
+            (Some(KvConnector::Nixl), 0),
+            (Some(KvConnector::Mooncake), 0),
+        ] {
+            let binding = bind_layout(&value, "epoch-1")
+                .unwrap()
+                .with_pd_prefill(connector, false);
+            binding.begin_empty(0);
+            binding.apply_payload(0, &payload).unwrap();
+            assert_eq!(
+                binding.reusable_tokens(&prompt[..529], usize::MAX),
+                at_boundary
+            );
+            assert_eq!(binding.reusable_tokens(&prompt[..530], usize::MAX), 528);
+        }
+    }
+
+    #[test]
+    fn nixl_decode_replaces_a_partial_checkpoint_only_for_a_longer_pull() {
+        let mut value = qwen_layout();
+        let rank = &mut value["ranks"][0];
+        rank["hash_block_size"] = 16.into();
+        rank["partial_hash_hits"] = true.into();
+        for group in rank["groups"].as_array_mut().unwrap() {
+            group["block_size"] = 576.into();
+            if group["kind"] == "mamba" {
+                group["prefill_checkpoint_alignment"] = 64.into();
+            }
+        }
+        let index = bind_layout(&value, "epoch-1").unwrap();
+        assert_eq!(index.nixl_decode_credit(1801, 1792), 1728);
+        assert_eq!(index.nixl_decode_credit(1793, 1792), 1792);
+        assert_eq!(index.nixl_decode_credit(1801, 1728), 1728);
     }
 
     #[test]
@@ -753,14 +777,16 @@ mod declarations {
         bind_layout(&value, "ds4").expect("deepseek v4 layout must bind");
         value["ranks"][0]["groups"][2]["tokens_per_state"] = "4".into();
         value["ranks"][0]["groups"][2]["cache_role"] = "sparse".into();
-        for (prefill, truncates_compressed, expected) in [
-            (true, true, 16383),
-            (true, false, 16384),
-            (false, true, 16384),
+        use crate::config::KvConnector;
+        for (connector, truncates_compressed, expected) in [
+            (Some(KvConnector::Mooncake), true, 16383),
+            (Some(KvConnector::Mooncake), false, 16384),
+            (Some(KvConnector::Nixl), true, 16384),
+            (None, true, 16384),
         ] {
             let binding = bind_layout(&value, "ds4")
                 .unwrap()
-                .with_mooncake_prefill(prefill, truncates_compressed);
+                .with_pd_prefill(connector, truncates_compressed);
             assert_eq!(binding.reusable_prompt_cap(16385), expected);
         }
         value["ranks"][0]["groups"][0]["sliding_window"] = 0.into();

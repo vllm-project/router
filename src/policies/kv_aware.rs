@@ -52,6 +52,10 @@ pub trait TieredMatchProvider: Send + Sync {
     fn target_scoped(&self) -> bool {
         false
     }
+
+    fn nixl_decode_credit(&self, _rank: u32, _prompt_len: usize, reused: u64) -> u64 {
+        reused
+    }
 }
 
 /// Exact prompt sequences rendered by each HTTP backend. DP ranks share their
@@ -161,6 +165,15 @@ pub trait KvAwareOps: Send + Sync {
         inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
         hashes: &mut PromptHashes<'tokens>,
     ) -> Vec<DecodeWorkEstimate>;
+    #[doc(hidden)]
+    fn estimate_decode_work_with_transfer<'tokens>(
+        &self,
+        inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
+        hashes: &mut PromptHashes<'tokens>,
+        _nixl_pull: bool,
+    ) -> Vec<DecodeWorkEstimate> {
+        self.estimate_decode_work(inputs, hashes)
+    }
     fn pick_prefill(&self, costs: &[f64], occupancy: &[usize]) -> Option<usize>;
     /// Decode-side occupancy picker for P/D: deterministic argmin over the
     /// projected stage occupancies, rotating across equal-load targets so
@@ -2019,19 +2032,20 @@ impl KvAwareOps for KvAwarePolicy {
 
     /// Marginal Decode context: the prompt, once per request (sequences share one copy of
     /// its blocks), less
-    /// the device blocks this candidate already holds.
-    ///
-    /// The engine's `get_num_new_matched_tokens` subtracts its own block-aligned
-    /// local prefix hit from what it pulls, so a cached prefix costs a Decode
-    /// worker neither a transfer nor new blocks. Charging it full price would
-    /// make a warm decoder look as loaded as a cold one and push continuations
-    /// off the engine that can resume them. Both the last-token rule and the
-    /// block alignment come from [`credited_tokens`], so the Router and the
-    /// engine agree on what counts as reused.
+    /// the device blocks the scheduler can retain on this candidate.
     fn estimate_decode_work<'tokens>(
         &self,
         inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
         hashes: &mut PromptHashes<'tokens>,
+    ) -> Vec<DecodeWorkEstimate> {
+        self.estimate_decode_work_with_transfer(inputs, hashes, false)
+    }
+
+    fn estimate_decode_work_with_transfer<'tokens>(
+        &self,
+        inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
+        hashes: &mut PromptHashes<'tokens>,
+        nixl_pull: bool,
     ) -> Vec<DecodeWorkEstimate> {
         hashes.set_stage_targets(inputs);
         let mut lookups = crate::metrics::PlacementLookups::default();
@@ -2084,14 +2098,23 @@ impl KvAwareOps for KvAwarePolicy {
                             prefill_tokens: None,
                         },
                         &params,
-                    );
+                    ) as u64;
+                    let reused = if nixl_pull {
+                        binding.matches.nixl_decode_credit(
+                            binding.target.dp_rank,
+                            tokens.len(),
+                            reused,
+                        )
+                    } else {
+                        reused
+                    };
                     // The engine shares one copy of the prompt's blocks across the
                     // request's sequences, so the marginal cost is the prompt's
                     // un-cached remainder once - the same amount the ledger charges when
                     // this request becomes an existing one. Multiplying by `n` here made
                     // a request cost more before admission than after, so the two sides of
                     // the comparison disagreed.
-                    additional = additional.saturating_add(context.saturating_sub(reused as u64));
+                    additional = additional.saturating_add(context.saturating_sub(reused));
                 }
                 DecodeWorkEstimate {
                     additional_tokens: Some(additional),

@@ -41,6 +41,7 @@ pub(super) struct PdKvState {
     targets: Mutex<HashMap<String, TargetRegistration>>,
     hybrid_pairs: Option<HashMap<String, HashSet<String>>>,
     allow_hybrid_layouts: bool,
+    nixl_pull: bool,
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
     credit_gate: Mutex<()>,
 }
@@ -69,11 +70,10 @@ impl PdKvState {
         let mut state = Self::new_with_statics(client, sources);
         state.api_key = api_key;
         state.allow_hybrid_layouts = allow_hybrid_layouts;
+        state.nixl_pull = connector == KvConnector::Nixl;
         state.supervisor.set_api_key(state.api_key.clone());
         state.supervisor.set_strict_recovery(strict_recovery);
-        state
-            .supervisor
-            .set_mooncake_prefill(connector == KvConnector::Mooncake);
+        state.supervisor.set_pd_connector(connector);
         state.registry = Some(registry);
         state.prefill_policy = prefill_policy;
         state.decode_policy = decode_policy;
@@ -129,6 +129,7 @@ impl PdKvState {
             targets: Mutex::new(HashMap::new()),
             hybrid_pairs: (!pairs.is_empty()).then_some(pairs),
             allow_hybrid_layouts: true,
+            nixl_pull: false,
             #[cfg(all(test, feature = "cpu", feature = "ready"))]
             credit_gate: Mutex::new(()),
         }
@@ -393,7 +394,7 @@ impl PdKvState {
             .map(|kv| Self::prefill_work(kv, prefill_workers, &prepared, &mut hashes));
         let decode_context = if decode_priced_here {
             let kv = kv_aware_ops(decode_policy.as_ref()).expect("priced decode policy");
-            Self::decode_context_from_results(
+            self.decode_context_from_results(
                 kv,
                 decode_workers,
                 &allow_credit,
@@ -512,6 +513,7 @@ impl PdKvState {
     /// figure beside a full-price one would compare different units across the
     /// pool.
     fn decode_context_from_results<'tokens>(
+        &self,
         kv: &dyn KvAwareOps,
         workers: &[Arc<dyn Worker>],
         allow_credit: &HashMap<String, bool>,
@@ -545,7 +547,7 @@ impl PdKvState {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unpriced");
             return None;
         }
-        let work = kv.estimate_decode_work(&inputs, hashes);
+        let work = kv.estimate_decode_work_with_transfer(&inputs, hashes, self.nixl_pull);
         let mut context = HashMap::with_capacity(work.len());
         for ((worker, _, _), estimate) in inputs.iter().zip(work) {
             context.insert(worker.url().to_owned(), estimate.additional_tokens?);
@@ -588,7 +590,7 @@ impl PdKvState {
         let results = self
             .tokenize(bases, request, route, headers, router_prompts)
             .await;
-        Self::decode_context_from_results(
+        self.decode_context_from_results(
             kv,
             workers,
             &allow_credit,

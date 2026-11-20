@@ -30,10 +30,11 @@ impl SourceLease {
     }
 }
 
+use crate::config::KvConnector;
 use crate::kv_hash::BlockKeyGenerator;
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 use crate::kv_index::layout::valid_groups;
-use crate::kv_index::layout::{CacheGroup, GroupRule, TailDrop};
+use crate::kv_index::layout::{align_down, CacheGroup, GroupRule, TailDrop};
 use crate::kv_index::storage::source_transaction::{StreamControl, StreamPhase, StreamState};
 use crate::kv_index::storage::{
     IndexBatch, PageEvidence, PageMatch, PageQuery, PageTiers, SourceVersion,
@@ -54,7 +55,8 @@ pub struct SourceBinding {
     /// publishes no events can still make this window mandatory.
     pub(in crate::kv_index) replay_tokens: u32,
     pub(in crate::kv_index) tail_drop_group: Option<u32>,
-    mooncake_truncates_prompt: bool,
+    prefill_truncates_prompt: bool,
+    nixl_decode_alignment: Option<u32>,
     /// LoRA adapters this worker serves, as `(name, path)`. The engine seeds an
     /// adapter's chain with both, so a layout that does not declare an adapter
     /// cannot credit it, and one that declares the wrong path credits nothing.
@@ -113,7 +115,8 @@ impl SourceBinding {
             keys,
             replay_tokens: 0,
             tail_drop_group: None,
-            mooncake_truncates_prompt: false,
+            prefill_truncates_prompt: false,
+            nixl_decode_alignment: None,
             adapters: Vec::new(),
             max_entries,
             partial_hash_hits: false,
@@ -198,25 +201,41 @@ impl SourceBinding {
         self
     }
 
-    pub(in crate::kv_index) fn with_mooncake_prefill(
+    pub(in crate::kv_index) fn with_pd_prefill(
         mut self,
-        enabled: bool,
+        connector: Option<KvConnector>,
         truncates_compressed: bool,
     ) -> Self {
-        self.mooncake_truncates_prompt = enabled
-            && (self.replay_tokens != 0
-                || self.groups.iter().any(|group| {
-                    group.kind == GroupRule::Checkpoint
-                        || (truncates_compressed
-                            && matches!(group.kind, GroupRule::CompressedFullAttention { .. }))
-                }));
+        let has_checkpoint = self
+            .groups
+            .iter()
+            .any(|group| group.kind == GroupRule::Checkpoint);
+        self.prefill_truncates_prompt = match connector {
+            Some(KvConnector::Nixl) => has_checkpoint,
+            Some(KvConnector::Mooncake) => {
+                has_checkpoint
+                    || self.replay_tokens != 0
+                    || truncates_compressed
+                        && self.groups.iter().any(|group| {
+                            matches!(group.kind, GroupRule::CompressedFullAttention { .. })
+                        })
+            }
+            _ => false,
+        };
         self
     }
 
     pub(in crate::kv_index) fn reusable_prompt_cap(&self, len: usize) -> usize {
-        // A Mooncake connector can remove the last prompt token before cache
-        // lookup. Keep the full hash chain and lower only the lookup limit.
-        len.saturating_sub(1 + usize::from(self.mooncake_truncates_prompt))
+        // Prefill can remove the last token before looking up the prefix.
+        len.saturating_sub(1 + usize::from(self.prefill_truncates_prompt))
+    }
+
+    pub(in crate::kv_index) fn nixl_decode_credit(&self, prompt_len: usize, reused: u64) -> u64 {
+        // vLLM keeps the partial checkpoint page unless the remote prefill
+        // extends beyond it. Mamba transfers through the penultimate token.
+        self.nixl_decode_alignment
+            .filter(|_| prompt_len.saturating_sub(1) as u64 > reused)
+            .map_or(reused, |alignment| align_down(reused, alignment))
     }
 
     /// Enable only when the source contract identifies hash-sized stores as
@@ -386,9 +405,27 @@ impl CacheCapabilities {
             .with_tail_drop_group(layout.tail_drop_group)
             .with_adapters(layout.adapters)
             .with_partial_hash_hits(layout.partial_hash_hits);
-        binding.strict_event_block_size = self
-            .rank_capability(source.dp_rank)
-            .is_some_and(|rank| rank.has_plain_full_attention_shape());
+        if let Some(rank) = self.rank_capability(source.dp_rank) {
+            binding.strict_event_block_size = rank.has_plain_full_attention_shape();
+            if layout.partial_hash_hits
+                && layout.replay_tokens == 0
+                && binding
+                    .groups
+                    .iter()
+                    .any(|group| group.kind == GroupRule::Checkpoint)
+            {
+                // The vLLM scheduler aligns across all groups, including groups
+                // that do not publish prefix residency.
+                binding.nixl_decode_alignment = rank.groups.iter().try_fold(1u32, |lcm, group| {
+                    let mut a = lcm;
+                    let mut b = group.block_size;
+                    while b != 0 {
+                        (a, b) = (b, a % b);
+                    }
+                    (lcm / a).checked_mul(group.block_size)
+                });
+            }
+        }
         Ok(binding)
     }
 
