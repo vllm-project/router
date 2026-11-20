@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
@@ -124,12 +126,13 @@ struct CliArgs {
     policy: String,
 
     /// Enable Program-level scheduling independently of the request-level
-    /// load-balancing policy.
+    /// load-balancing policy. Defaults to verified exact counts with estimation fallback.
     #[arg(long, default_value_t = false)]
     enable_program_scheduling: bool,
 
     /// Optional JSON object overriding Program-level scheduling defaults.
-    /// Requires --enable-program-scheduling.
+    /// Requires --enable-program-scheduling. Use {"token_count_mode":"estimated"}
+    /// for compatible byte-estimated counts; HTTP text tokenization is opt-in.
     #[arg(long)]
     program_scheduling_config_json: Option<String>,
 
@@ -854,6 +857,7 @@ Provide --worker-urls or PD flags as usual.",
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

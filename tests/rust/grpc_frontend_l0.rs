@@ -243,6 +243,7 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
 
     http_ignores_l0_config(&request).await;
     grpc_kv_routing_keeps_unavailable_control_a_legal_fallback(&worker, &request).await;
+    grpc_abort_does_not_count_as_a_successful_program_round(&worker, &request).await;
 
     // Oversized inputs must preserve cached entries.
     let small = EngineFrontend::with_tokenizer_cache(
@@ -292,6 +293,59 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
         worker.captured().last().unwrap().token_ids,
         expected.tokenized.token_ids.as_ref()
     );
+}
+
+async fn grpc_abort_does_not_count_as_a_successful_program_round(
+    worker: &MockVllmRsServer,
+    request: &vllm_router_rs::protocols::spec::ChatCompletionRequest,
+) {
+    use vllm_router_rs::routers::RouterTrait;
+    let config = RouterConfig {
+        policy: PolicyConfig::RoundRobin,
+        program_scheduling: Some(serde_json::from_value(json!({})).unwrap()),
+        ..Default::default()
+    };
+    let context = common::create_test_context(config);
+    let router = Router::new(vec![worker.grpc_url.clone()], &context)
+        .await
+        .unwrap();
+    for stream in [false, true] {
+        let mut request = request.clone();
+        request.stream = stream;
+        request.other.insert(
+            "vllm_xargs".into(),
+            json!({"agentic_context":{
+                "program_id":format!("abort-{stream}"), "expected_resume":true
+            }}),
+        );
+        worker
+            .state
+            .aborted_finishes_remaining
+            .store(1, Ordering::Relaxed);
+        let response = router.route_chat(None, &request, None).await;
+        // The regular adapter preserves its existing wire contract.
+        assert_eq!(response.status(), 200);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("\"finish_reason\":\"abort\""));
+        let snapshot = router.scheduling_diagnostics().unwrap();
+        let programs: Vec<_> = snapshot["ranks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|rank| rank["programs"].as_array().unwrap())
+            .collect();
+        assert!(
+            !programs.is_empty(),
+            "the request must enter Program scheduling"
+        );
+        for program in programs {
+            assert_eq!(program["in_flight_requests"], 0);
+            assert_eq!(
+                program["segment_served_rounds"], 0,
+                "an Engine abort must not count as a successful Program round: {program}"
+            );
+        }
+    }
 }
 
 async fn grpc_kv_routing_keeps_unavailable_control_a_legal_fallback(
