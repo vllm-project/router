@@ -15,6 +15,7 @@ use sha2::{Digest as _, Sha256};
 use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::kv_index::{CacheKey, MatchQuery, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo};
+use crate::kv_observation::KvRoutePrediction;
 use crate::request_identity::StableIdentity;
 
 /// Read-only placement port owned by its policy consumer.
@@ -60,8 +61,11 @@ impl<'a> KvRequestTokens<'a> {
 }
 
 /// Immutable P work estimate from one placement snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The prediction owns its target's Arc, so this is intentionally Clone rather
+/// than Copy: it remains bound to that snapshot after admission changes pools.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefillWorkEstimate {
+    pub prediction: Option<KvRoutePrediction>,
     pub new_prefill_tokens: u64,
     pub placement_verified: bool,
 }
@@ -549,6 +553,7 @@ pub struct CostDecision {
 pub struct KvSelectionReceipt {
     pub worker_index: usize,
     pub new_prefill_tokens: u64,
+    pub prediction: Option<KvRoutePrediction>,
     pub decision: CostDecision,
     pub slot: Option<KvRequestSlot>,
 }
@@ -791,11 +796,8 @@ pub trait Picker: Send + Sync + std::fmt::Debug {
     fn pick(&self, costs: &[f64]) -> Option<usize>;
 }
 
-/// Device prefix plus one external continuation, matching vLLM's two-segment
-/// reuse rule. The return value is in tokens and can be fractional because a
-/// transfer penalty is a credit ratio.
-fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
-    let device_blocks = candidate
+fn device_prefix_blocks(candidate: &CandidateView<'_>, params: &CostParams) -> u32 {
+    candidate
         .matches
         .iter()
         .filter(|hit| hit.tier == StorageTier::Device)
@@ -814,8 +816,16 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
                 .checked_div(params.block_size as usize)
                 .unwrap_or(0)
                 .min(u32::MAX as usize) as u32,
-        );
+        )
+}
 
+struct PrefixEstimate {
+    predicted_cached_tokens: u64,
+    credited_tokens: f64,
+}
+
+fn prefix_estimate(candidate: &CandidateView<'_>, params: &CostParams) -> PrefixEstimate {
+    let device_blocks = device_prefix_blocks(candidate, params);
     let mut best_continuation = (0_u32, 0.0_f64);
     for hit in candidate
         .matches
@@ -837,10 +847,20 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
 
     let credited_blocks =
         f64::from(device_blocks) + f64::from(best_continuation.0) * best_continuation.1;
-    // External reuse may have a different alignment, but it cannot eliminate
-    // the last-token logits work either.
-    (credited_blocks * f64::from(params.block_size))
-        .min(candidate.input_tokens.saturating_sub(1) as f64)
+    let block_size = u64::from(params.block_size);
+    let raw_blocks = u64::from(device_blocks) + u64::from(best_continuation.0);
+    PrefixEstimate {
+        // Engine usage counts local and external hits before applying transfer costs.
+        predicted_cached_tokens: (raw_blocks * block_size).min(candidate.input_tokens as u64),
+        credited_tokens: (credited_blocks * f64::from(params.block_size))
+            .min(candidate.input_tokens.saturating_sub(1) as f64),
+    }
+}
+
+impl PrefixEstimate {
+    fn remaining_work(&self, input_tokens: usize) -> u64 {
+        ((input_tokens as f64 - self.credited_tokens).max(0.0)).ceil() as u64
+    }
 }
 
 fn request_prefill_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> u64 {
@@ -849,7 +869,7 @@ fn request_prefill_tokens(candidate: &CandidateView<'_>, params: &CostParams) ->
     }
     // Round remaining work up: a fractional transfer credit never erases a
     // whole token of compute that was not fully credited.
-    ((candidate.input_tokens as f64 - credited_tokens(candidate, params)).max(0.0)).ceil() as u64
+    prefix_estimate(candidate, params).remaining_work(candidate.input_tokens)
 }
 
 pub fn cost_components(candidate: &CandidateView<'_>, params: &CostParams) -> CostComponents {
@@ -984,6 +1004,7 @@ struct SelectionPlan {
     grouped: Vec<Vec<TierMatch>>,
     input_tokens: Vec<usize>,
     prefill_tokens: Vec<Option<u64>>,
+    predictions: Vec<Option<KvRoutePrediction>>,
     has_tokens: bool,
 }
 
@@ -1325,6 +1346,7 @@ impl KvAwarePolicy {
                         .map(|tokens| tokens.unwrap_or(max_known_input))
                         .collect(),
                     prefill_tokens: vec![None; count],
+                    predictions: vec![None; count],
                     has_tokens: max_known_input > 0,
                 }
             } else {
@@ -1440,6 +1462,7 @@ impl KvAwarePolicy {
             return Some(KvSelectionReceipt {
                 worker_index,
                 new_prefill_tokens,
+                prediction: plan.predictions[position].clone(),
                 decision,
                 slot,
             });
@@ -1531,10 +1554,17 @@ impl KvAwarePolicy {
         let mut grouped = Vec::with_capacity(bindings.len());
         let mut input_tokens = Vec::with_capacity(bindings.len());
         let mut prefill_tokens = Vec::with_capacity(bindings.len());
+        let mut predicted_by_candidate = Vec::with_capacity(bindings.len());
         for ((binding, prompts), &worker_index) in bindings.iter().zip(prompts).zip(&healthy) {
             let mut total_input = 0usize;
             let mut total_prefill = 0u64;
+            let mut total_predicted = 0u64;
             let mut single_matches = Vec::new();
+            let prediction_verified = has_tokens
+                && prompts.len() == 1
+                && input.allows_credit(worker_index, workers.len())
+                && credit_fallback.is_none()
+                && binding.cache_key.is_some();
             if has_tokens {
                 for ids in &prompts {
                     if !input.allows_credit(worker_index, workers.len()) {
@@ -1583,16 +1613,20 @@ impl KvAwarePolicy {
                         block_size: binding.block_size,
                         ..self.params
                     };
-                    total_prefill = total_prefill.saturating_add(request_prefill_tokens(
-                        &CandidateView {
-                            target: &binding.target,
-                            matches: &matches,
-                            load: LoadSample::default(),
-                            input_tokens: ids.len(),
-                            prefill_tokens: None,
-                        },
-                        &params,
-                    ));
+                    let candidate = CandidateView {
+                        target: &binding.target,
+                        matches: &matches,
+                        load: LoadSample::default(),
+                        input_tokens: ids.len(),
+                        prefill_tokens: None,
+                    };
+                    let prefix = prefix_estimate(&candidate, &params);
+                    total_prefill =
+                        total_prefill.saturating_add(prefix.remaining_work(candidate.input_tokens));
+                    if prediction_verified {
+                        total_predicted =
+                            total_predicted.saturating_add(prefix.predicted_cached_tokens);
+                    }
                     total_input = total_input.saturating_add(ids.len());
                     if prompts.len() == 1 {
                         single_matches = matches;
@@ -1605,6 +1639,16 @@ impl KvAwarePolicy {
             grouped.push(single_matches);
             input_tokens.push(total_input);
             prefill_tokens.push((has_tokens && prompts.len() > 1).then_some(total_prefill));
+            predicted_by_candidate.push(if prompts.len() > 1 {
+                Some(KvRoutePrediction::MultiPrompt {
+                    target: binding.target.clone(),
+                })
+            } else {
+                prediction_verified.then(|| KvRoutePrediction::Single {
+                    target: binding.target.clone(),
+                    cached_tokens: total_predicted,
+                })
+            });
         }
         Some(SelectionPlan {
             healthy,
@@ -1612,6 +1656,7 @@ impl KvAwarePolicy {
             grouped,
             input_tokens,
             prefill_tokens,
+            predictions: predicted_by_candidate,
             has_tokens,
         })
     }
@@ -1878,6 +1923,7 @@ impl KvAwareOps for KvAwarePolicy {
                     ..self.params
                 };
                 let mut new_prefill_tokens = 0u64;
+                let mut prediction = None;
                 for tokens in prompts {
                     let hits = if verified {
                         let key = (
@@ -1906,19 +1952,26 @@ impl KvAwareOps for KvAwarePolicy {
                         .filter(|hit| hit.target == binding.target)
                         .cloned()
                         .collect();
-                    new_prefill_tokens = new_prefill_tokens.saturating_add(request_prefill_tokens(
-                        &CandidateView {
-                            target: &binding.target,
-                            matches: &matches,
-                            load: LoadSample::default(),
-                            input_tokens: tokens.len(),
-                            prefill_tokens: None,
-                        },
-                        &params,
-                    ));
+                    let candidate = CandidateView {
+                        target: &binding.target,
+                        matches: &matches,
+                        load: LoadSample::default(),
+                        input_tokens: tokens.len(),
+                        prefill_tokens: None,
+                    };
+                    let prefix = prefix_estimate(&candidate, &params);
+                    new_prefill_tokens = new_prefill_tokens
+                        .saturating_add(prefix.remaining_work(candidate.input_tokens));
+                    if verified && prompts.len() == 1 {
+                        prediction = Some(KvRoutePrediction::Single {
+                            target: binding.target.clone(),
+                            cached_tokens: prefix.predicted_cached_tokens,
+                        });
+                    }
                 }
                 PrefillWorkEstimate {
                     new_prefill_tokens,
+                    prediction,
                     placement_verified: verified,
                 }
             })
@@ -1934,7 +1987,7 @@ impl KvAwareOps for KvAwarePolicy {
     /// worker neither a transfer nor new blocks. Charging it full price would
     /// make a warm decoder look as loaded as a cold one and push continuations
     /// off the engine that can resume them. Both the last-token rule and the
-    /// block alignment come from [`credited_tokens`], so the Router and the
+    /// block alignment come from [`prefix_estimate`], so the Router and the
     /// engine agree on what counts as reused.
     fn estimate_decode_work(
         &self,
@@ -1988,7 +2041,7 @@ impl KvAwareOps for KvAwarePolicy {
                         .cloned()
                         .collect();
                     let context = u64::try_from(tokens.len()).unwrap_or(u64::MAX);
-                    let reused = credited_tokens(
+                    let reused = prefix_estimate(
                         &CandidateView {
                             target: &binding.target,
                             matches: &matches,
@@ -1997,7 +2050,8 @@ impl KvAwareOps for KvAwarePolicy {
                             prefill_tokens: None,
                         },
                         &params,
-                    );
+                    )
+                    .credited_tokens;
                     // The engine shares one copy of the prompt's blocks across the
                     // request's sequences, so the marginal cost is the prompt's
                     // un-cached remainder once - the same amount the ledger charges when
@@ -2359,6 +2413,14 @@ mod tests {
             let receipt = select(&mask, &[]);
             assert!(mask[receipt.worker_index], "{case}: ineligible worker");
             assert_eq!(receipt.new_prefill_tokens, 1, "{case}");
+            assert_eq!(
+                receipt
+                    .prediction
+                    .as_ref()
+                    .and_then(KvRoutePrediction::cached_tokens),
+                Some(u64::from(2 * block_size)),
+                "{case}"
+            );
             assert_eq!(provider.queries.load(Ordering::Relaxed), 1, "{case}");
             assert_eq!(provider.blocks.load(Ordering::Relaxed), 3, "{case}");
             release_receipt(&workers, &receipt);
@@ -2562,6 +2624,10 @@ mod tests {
                 batchsize: 3
             }
         );
+        assert_eq!(
+            prefix_estimate(&candidate, &params).predicted_cached_tokens,
+            144
+        );
     }
 
     #[test]
@@ -2578,6 +2644,10 @@ mod tests {
             prefill_tokens: None,
             input_tokens: 160,
         };
+        assert_eq!(
+            prefix_estimate(&candidate, &CostParams::default()).predicted_cached_tokens,
+            48
+        );
         assert_eq!(
             cost_components(&candidate, &CostParams::default()).ptoken,
             112
@@ -2624,7 +2694,7 @@ mod tests {
                 input_tokens: tokens,
             };
             assert_eq!(
-                credited_tokens(&candidate, &params),
+                prefix_estimate(&candidate, &params).credited_tokens,
                 cached as f64,
                 "tokens={tokens}"
             );
@@ -2976,6 +3046,13 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.worker_index, 0);
         assert_eq!(receipt.new_prefill_tokens, 4);
+        assert_eq!(
+            receipt
+                .prediction
+                .as_ref()
+                .and_then(KvRoutePrediction::cached_tokens),
+            None
+        );
         release_receipt(&workers, &receipt);
         let receipt = policy
             .select_worker_with_inputs(
@@ -2988,6 +3065,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(receipt.new_prefill_tokens, 12);
+        assert_eq!(
+            receipt
+                .prediction
+                .as_ref()
+                .and_then(KvRoutePrediction::cached_tokens),
+            None
+        );
         release_receipt(&workers, &receipt);
     }
 
@@ -3887,6 +3971,28 @@ mod tests {
             );
             assert_eq!(receipt.worker_index, 1);
             assert!(prefill.iter().all(|estimate| estimate.placement_verified));
+            let expected_cached = if shared { 0 } else { 2 };
+            assert_eq!(
+                receipt
+                    .prediction
+                    .as_ref()
+                    .and_then(KvRoutePrediction::cached_tokens),
+                Some(expected_cached),
+                "shared={shared}: route prediction must use the selected provider"
+            );
+            assert_eq!(
+                prefill
+                    .iter()
+                    .map(|estimate| {
+                        estimate
+                            .prediction
+                            .as_ref()
+                            .and_then(KvRoutePrediction::cached_tokens)
+                    })
+                    .collect::<Vec<_>>(),
+                [Some(0), Some(expected_cached)],
+                "shared={shared}: Prefill predictions must not leak across providers"
+            );
             assert_eq!(
                 [
                     first.calls.load(Ordering::Relaxed) - calls_before[0],
@@ -4088,6 +4194,12 @@ mod tests {
             );
             assert_eq!(receipt.decision.components.ptoken, expected, "{case}");
             assert_eq!(receipt.decision.cost, expected as f64, "{case}");
+            if queries > 0 {
+                assert!(
+                    receipt.prediction.is_none(),
+                    "{case}: churn fallback must charge input without claiming a KV prediction"
+                );
+            }
             assert_eq!(
                 reserved,
                 LoadSample {
@@ -4635,6 +4747,57 @@ mod tests {
             .select_decode(&workers, None, None, None, None)
             .unwrap();
         assert_ne!(first.index, second.index);
+    }
+
+    #[test]
+    fn decode_credit_stays_device_only_while_prefill_prediction_counts_external_hits() {
+        struct Matches(Vec<TierMatch>);
+        impl TieredMatchProvider for Matches {
+            fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
+                self.0.clone()
+            }
+        }
+        for (device_blocks, expected_new, expected_decode) in [(4, 8, 16), (8, 2, 4)] {
+            let policy = KvAwarePolicy::new(CostParams {
+                block_size: 4,
+                transfer_credits: TransferCredits {
+                    host_pinned: 0.5,
+                    ..TransferCredits::default()
+                },
+                ..CostParams::default()
+            });
+            let worker = BasicWorker::new("http://shared".to_owned(), WorkerType::Regular);
+            let target = target(worker.url(), 0);
+            policy.register_target_with_cache_identity(
+                worker.url(),
+                target.clone(),
+                CacheKey {
+                    model: Arc::from("shared"),
+                    hash_mode: crate::kv_index::HashMode::Sha256,
+                    block_size: 4,
+                },
+                Arc::new(Matches(vec![
+                    tier_match(&target, StorageTier::Device, &[(0, device_blocks)]),
+                    tier_match(&target, StorageTier::HostPinned, &[(4, 8)]),
+                ])),
+            );
+            let prompts = vec![(0..32).collect()];
+            let inputs = [(&worker as &dyn Worker, prompts.as_slice(), true)];
+            let mut hashes = PromptHashes::new();
+            let prefill = policy.estimate_prefill_work(&inputs, &mut hashes);
+            assert_eq!(prefill[0].new_prefill_tokens, expected_new);
+            assert_eq!(
+                prefill[0]
+                    .prediction
+                    .as_ref()
+                    .and_then(KvRoutePrediction::cached_tokens),
+                Some(32)
+            );
+            assert_eq!(
+                policy.estimate_decode_work(&inputs, &mut hashes)[0].additional_tokens,
+                Some(expected_decode)
+            );
+        }
     }
 
     #[test]

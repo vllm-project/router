@@ -1,4 +1,5 @@
 use crate::core::Worker;
+use crate::kv_observation::{KvRouteAttempt, KvRoutePrediction};
 use crate::policies::{AffinityKey, AffinityRecord, RequestHeaders};
 use axum::body::Body;
 use futures_util::StreamExt;
@@ -210,6 +211,7 @@ fn prompt_tokens(prefill: &StageDecision) -> Option<u64> {
 
 #[derive(Debug, Clone)]
 pub struct StageDecision {
+    pub prediction: Option<KvRoutePrediction>,
     pub fallback_reason: Option<&'static str>,
     pub credited_prefix_tokens: Option<u64>,
     pub worker_index: usize,
@@ -329,6 +331,10 @@ impl PdLoadManager {
             prefill: selection.prefill.endpoint.clone(),
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
+            observation: KvRouteAttempt::for_http(
+                prefill.prediction.clone(),
+                &prefill.endpoint.http_url,
+            ),
             prefill_tokens: selection.prefill.new_prefill_tokens,
             decode_prompt_tokens: prompt,
             state: Mutex::new(AttemptState {
@@ -413,11 +419,11 @@ impl PdLoadManager {
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_tokens: None,
+            observation: None,
             // The prompt length is unknown here, so the Decode charge is
             // unknown too and the pool stays on request counts for this
             // attempt.
             decode_prompt_tokens: None,
-
             state: Mutex::new(AttemptState {
                 prefill: true,
                 decode: DecodeState::Pending,
@@ -453,6 +459,7 @@ struct AttemptState {
 }
 
 struct AttemptInner {
+    observation: Option<Arc<KvRouteAttempt>>,
     admitted_at: std::time::Instant,
     loads: Arc<Mutex<Loads>>,
     prefill: PdEndpoint,
@@ -626,6 +633,9 @@ impl Drop for DecodeBodyGuard {
 }
 
 impl PdAttempt {
+    pub(super) fn kv_observation(&self) -> Option<&Arc<KvRouteAttempt>> {
+        self.0.observation.as_ref()
+    }
     pub(super) fn attach_workers(
         &self,
         prefill_worker: Arc<dyn Worker>,

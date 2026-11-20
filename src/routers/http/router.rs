@@ -2,6 +2,7 @@ use super::completion_route::{placement_eligibility, prepare_completion_route, C
 use super::program_adapter::{
     prepare_stream_usage_body, settle_grpc_response, ProgramCompletion, SseUsageStripper, StreamEnd,
 };
+use super::response_usage::{observe_json_response, observe_json_stream, observe_unavailable};
 use crate::backend::health::check_grpc_health_within;
 use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
 use crate::backend::token_count::{
@@ -17,6 +18,7 @@ use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
     RetryExecutor, Worker, WorkerRegistry, WorkerType,
 };
+use crate::kv_observation::{KvRouteAttempt, UnavailableReason};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -116,6 +118,7 @@ struct LoadTrackedBody {
 struct RequestLoadState {
     worker: Option<Arc<dyn Worker>>,
     kv_slot: Option<KvRequestSlot>,
+    kv_attempt: Option<Arc<KvRouteAttempt>>,
     released: AtomicBool,
 }
 
@@ -132,6 +135,7 @@ impl RequestLoadGuard {
             state: Arc::new(RequestLoadState {
                 worker,
                 kv_slot,
+                kv_attempt: None,
                 released: AtomicBool::new(false),
             }),
         }
@@ -149,14 +153,50 @@ impl RequestLoadGuard {
             }
             RouterMetrics::set_running_requests(worker.url(), worker.load());
         }
-        Self::new(
-            tracked.then_some(worker),
-            receipt.and_then(|receipt| receipt.slot),
-        )
+        let (kv_slot, kv_attempt) = match receipt {
+            Some(receipt) => {
+                let attempt = KvRouteAttempt::for_http(receipt.prediction, worker.url());
+                (receipt.slot, attempt)
+            }
+            None => (None, None),
+        };
+        Self {
+            state: Arc::new(RequestLoadState {
+                worker: tracked.then_some(worker),
+                kv_slot,
+                kv_attempt,
+                released: AtomicBool::new(false),
+            }),
+        }
     }
 
     fn tracks_worker(&self) -> bool {
         self.state.worker.is_some()
+    }
+
+    fn kv_attempt(&self) -> Option<Arc<KvRouteAttempt>> {
+        self.state.kv_attempt.clone()
+    }
+
+    fn response_observation(
+        &self,
+        status: StatusCode,
+        sent_to: &str,
+        program_target: Option<&str>,
+    ) -> Option<Arc<KvRouteAttempt>> {
+        let attempt = self.kv_attempt()?;
+        let unattributed = program_target.is_some_and(|bound| {
+            bound != sent_to
+                || !self.state.worker.as_ref().is_some_and(|worker| {
+                    worker.url() == sent_to && worker.worker_type() == WorkerType::Regular
+                })
+        });
+        if unattributed {
+            observe_unavailable(&attempt, status, UnavailableReason::PdUsageNotComparable);
+            None
+        } else {
+            Some(attempt)
+        }
     }
 
     fn begin_decode(&self) {
@@ -2268,6 +2308,7 @@ impl Router {
             return response;
         }
 
+        let kv_attempt = load.kv_attempt();
         let strip_usage = request_body.is_some();
         let stream_end = StreamEnd::for_http_route(route);
         let (mut request_builder, extracted_dp_rank, request_url) =
@@ -2371,6 +2412,13 @@ impl Router {
         {
             Ok(res) => res,
             Err(e) => {
+                if let Some(attempt) = &kv_attempt {
+                    observe_unavailable(
+                        attempt,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        UnavailableReason::RequestError,
+                    );
+                }
                 error!(
                     "Failed to send typed request worker_url={} route={} error={}",
                     worker_url, route, e
@@ -2386,6 +2434,13 @@ impl Router {
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let kv_attempt = load.response_observation(
+            status,
+            worker_url,
+            program_completion
+                .as_ref()
+                .map(|c| c.dispatch().target_id.as_str()),
+        );
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
         if strip_usage
@@ -2396,6 +2451,9 @@ impl Router {
                 .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
         {
             RouterMetrics::record_agent_aware_usage_filter_error();
+            if let Some(attempt) = &kv_attempt {
+                observe_unavailable(attempt, status, UnavailableReason::ResponseError);
+            }
             if let Some(completion) = &program_completion {
                 completion.finish(false);
             }
@@ -2418,6 +2476,9 @@ impl Router {
 
             let response = match res.bytes().await {
                 Ok(body) => {
+                    if let Some(attempt) = &kv_attempt {
+                        observe_json_response(attempt, status, &body);
+                    }
                     if let Some(completion) = &program_completion {
                         completion.observe_json(&body);
                     }
@@ -2427,6 +2488,9 @@ impl Router {
                     response
                 }
                 Err(e) => {
+                    if let Some(attempt) = &kv_attempt {
+                        observe_unavailable(attempt, status, UnavailableReason::ResponseError);
+                    }
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
@@ -2461,7 +2525,8 @@ impl Router {
                 insert_router_stages(&mut response_headers, &header_stages);
             }
 
-            let stream = res.bytes_stream();
+            let stream =
+                super::usage_stream::observe_sse_stream(res.bytes_stream(), kv_attempt, status);
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let (mut producer_output_frame, output_frame) = if completion_echo.is_some() {
                 let (producer, consumer) = output_frame_tracking();
@@ -3583,9 +3648,11 @@ impl RouterTrait for Router {
         };
         let url = worker.endpoint_url(path);
 
-        let load_tracked = policy.tracks_request_load() || program_completion.is_some();
+        let load_tracked =
+            policy.tracks_request_load() || program_completion.is_some() || kv_receipt.is_some();
         let load = load_tracked
             .then(|| RequestLoadGuard::from_selection(worker.clone(), kv_receipt, true));
+        let kv_attempt = load.as_ref().and_then(RequestLoadGuard::kv_attempt);
 
         let (body, mut transfers) = if let Some(epd) = &self.epd {
             if *method == Method::POST && path == "/v1/chat/completions" {
@@ -3685,6 +3752,15 @@ impl RouterTrait for Router {
         {
             Ok(response) => {
                 let status = response.status();
+                let kv_attempt = load.as_ref().and_then(|guard| {
+                    guard.response_observation(
+                        status,
+                        worker.url(),
+                        program_completion
+                            .as_ref()
+                            .map(|c| c.dispatch().target_id.as_str()),
+                    )
+                });
                 // Keep the circuit breaker informed, as the typed path does:
                 // 2xx/4xx count as success, 5xx as worker failure.
                 let was_available = worker.is_available();
@@ -3712,9 +3788,25 @@ impl RouterTrait for Router {
                     }
                 }
 
+                // Only Program completion needs a full JSON buffer. Ordinary KV
+                // observation stays on the forwarding stream with a bounded copy.
                 if Self::should_proxy_transparent_directly(program_completion.is_some()) {
+                    let stream: Pin<
+                        Box<
+                            dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>
+                                + Send,
+                        >,
+                    > = if is_stream {
+                        super::usage_stream::observe_sse_stream(
+                            response.bytes_stream(),
+                            kv_attempt.clone(),
+                            status,
+                        )
+                    } else {
+                        observe_json_stream(response.bytes_stream(), kv_attempt.clone(), status)
+                    };
                     response_builder
-                        .body(Body::from_stream(response.bytes_stream()))
+                        .body(Body::from_stream(stream))
                         .unwrap_or_else(|error| {
                             (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3728,6 +3820,9 @@ impl RouterTrait for Router {
                 ) {
                     match response.bytes().await {
                         Ok(bytes) => {
+                            if let Some(attempt) = &kv_attempt {
+                                observe_json_response(attempt, status, &bytes);
+                            }
                             if status.is_success() {
                                 if let Some(completion) = &program_completion {
                                     completion.observe_json(&bytes);
@@ -3745,6 +3840,13 @@ impl RouterTrait for Router {
                                 })
                         }
                         Err(error) => {
+                            if let Some(attempt) = &kv_attempt {
+                                observe_unavailable(
+                                    attempt,
+                                    status,
+                                    UnavailableReason::ResponseError,
+                                );
+                            }
                             if status.is_success() {
                                 if let Some(completion) = &program_completion {
                                     completion.finish(false);
@@ -3758,7 +3860,20 @@ impl RouterTrait for Router {
                         }
                     }
                 } else {
-                    let stream = response.bytes_stream();
+                    let stream: Pin<
+                        Box<
+                            dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>
+                                + Send,
+                        >,
+                    > = if is_stream {
+                        super::usage_stream::observe_sse_stream(
+                            response.bytes_stream(),
+                            kv_attempt.clone(),
+                            status,
+                        )
+                    } else {
+                        observe_json_stream(response.bytes_stream(), kv_attempt.clone(), status)
+                    };
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let completion = status.is_success().then_some(program_completion).flatten();
                     let stream_end = StreamEnd::for_http_route(path);
@@ -3800,6 +3915,13 @@ impl RouterTrait for Router {
             }
             Err(error) => {
                 // The 502 response below still flows through
+                if let Some(attempt) = &kv_attempt {
+                    observe_unavailable(
+                        attempt,
+                        StatusCode::BAD_GATEWAY,
+                        UnavailableReason::RequestError,
+                    );
+                }
                 // hold_load_until_body_done, which releases the load once
                 // its body finishes or is dropped — do not decrement here.
                 if let Some(completion) = &program_completion {
@@ -3840,6 +3962,7 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use crate::backend::outcome::EngineUsage;
+    use crate::kv_observation::KvRoutePrediction;
     use crate::routers::http::program_adapter::MAX_SSE_LINE_BYTES;
     use std::collections::HashMap;
 
@@ -3854,6 +3977,81 @@ mod tests {
     impl Drop for CompletionResponseFixture {
         fn drop(&mut self) {
             self.server.abort();
+        }
+    }
+
+    #[test]
+    fn grpc_selection_tracks_load_without_creating_a_kv_observation() {
+        let url = "grpc://worker:8000";
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url.into(), WorkerType::Regular));
+        worker.increment_load();
+        let receipt = KvSelectionReceipt {
+            worker_index: 0,
+            new_prefill_tokens: 4,
+            prediction: Some(KvRoutePrediction::Single {
+                target: crate::kv_index::RoutableTarget {
+                    instance_id: url.into(),
+                    dp_rank: 0,
+                },
+                cached_tokens: 16,
+            }),
+            decision: crate::policies::CostDecision {
+                target: crate::kv_index::RoutableTarget {
+                    instance_id: url.into(),
+                    dp_rank: 0,
+                },
+                cost: 4.0,
+                components: Default::default(),
+            },
+            slot: None,
+        };
+        let guard = RequestLoadGuard::from_selection(worker.clone(), Some(receipt), false);
+        assert!(guard.kv_attempt().is_none());
+        assert_eq!(worker.load(), 1);
+        drop(guard);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[test]
+    fn program_observation_requires_the_bound_regular_worker() {
+        let url = "http://worker-a:8000";
+        for (kind, bound, comparable) in [
+            (WorkerType::Regular, url, true),
+            (WorkerType::Regular, "http://worker-b:8000", false),
+            (WorkerType::Decode, url, false),
+        ] {
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url.into(), kind));
+            worker.increment_load();
+            let guard = RequestLoadGuard::from_selection(
+                worker,
+                Some(KvSelectionReceipt {
+                    worker_index: 0,
+                    new_prefill_tokens: 4,
+                    prediction: Some(KvRoutePrediction::Single {
+                        target: crate::kv_index::RoutableTarget {
+                            instance_id: url.into(),
+                            dp_rank: 0,
+                        },
+                        cached_tokens: 16,
+                    }),
+                    slot: None,
+                    decision: crate::policies::CostDecision {
+                        target: crate::kv_index::RoutableTarget {
+                            instance_id: url.into(),
+                            dp_rank: 0,
+                        },
+                        cost: 4.0,
+                        components: Default::default(),
+                    },
+                }),
+                true,
+            );
+            assert_eq!(
+                guard
+                    .response_observation(StatusCode::OK, url, Some(bound))
+                    .is_some(),
+                comparable
+            );
         }
     }
 
@@ -5111,6 +5309,7 @@ mod tests {
         calls: Arc<Mutex<Vec<(usize, String, serde_json::Value)>>>,
         loads: Arc<Mutex<Vec<(usize, crate::policies::LoadSample)>>>,
         fail_first: Arc<AtomicBool>,
+        hold_json_open: Arc<AtomicBool>,
     }
 
     impl Drop for HttpKvFixture {
@@ -5136,19 +5335,24 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let loads = Arc::new(Mutex::new(Vec::new()));
         let fail_first = Arc::new(AtomicBool::new(false));
+        let hold_json_open = Arc::new(AtomicBool::new(false));
         let mut servers = Vec::new();
         let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
         for (worker_index, prompts) in inputs.iter().cloned().enumerate() {
             let captured = calls.clone();
             let dispatch_loads = loads.clone();
             let fail_first = fail_first.clone();
+            let hold_json_open = hold_json_open.clone();
             let policy = router.policy_registry.get_default_policy();
             let app = axum::Router::new().fallback(post(move |OriginalUri(uri): OriginalUri, Json(body): Json<serde_json::Value>| {
                 let prompts = prompts.clone(); let captured = captured.clone();
                 let (dispatch_loads, policy) = (dispatch_loads.clone(), policy.clone());
                 let fail_first = fail_first.clone();
+                let hold_json_open = hold_json_open.clone();
                 async move {
                     let path = uri.path().to_string();
+                    let streaming = body.get("stream").and_then(serde_json::Value::as_bool).unwrap_or(false)
+                        && body.get("model").and_then(serde_json::Value::as_str) == Some("kv-observation-test");
                     captured.lock().push((worker_index, path.clone(), body));
                     if path.ends_with("/render") {
                         if prompts.is_empty() {
@@ -5167,7 +5371,16 @@ mod tests {
                     if worker_index == 0 && fail_first.swap(false, Ordering::SeqCst) {
                         return StatusCode::SERVICE_UNAVAILABLE.into_response();
                     }
-                    Json(serde_json::json!({"worker": worker_index, "choices": []})).into_response()
+                    let response = serde_json::json!({"worker": worker_index, "choices": [], "usage": {"prompt_tokens_details": {"cached_tokens": 4}}});
+                    if streaming {
+                        return ([("content-type", "text/event-stream")], format!("data: {response}\n\ndata: [DONE]\n\n")).into_response();
+                    }
+                    if hold_json_open.load(Ordering::SeqCst) {
+                        let source = futures_util::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from(serde_json::to_vec(&response).unwrap()))])
+                            .chain(futures_util::stream::pending());
+                        return ([("content-type", "application/json")], Body::from_stream(source)).into_response();
+                    }
+                    Json(response).into_response()
                 }
             }));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5223,6 +5436,7 @@ mod tests {
             calls,
             loads,
             fail_first,
+            hold_json_open,
         }
     }
 
@@ -5617,6 +5831,107 @@ mod tests {
             1
         );
         assert_eq!(fixture.workers[1].load(), 1);
+    }
+
+    #[tokio::test]
+    async fn multi_prompt_json_and_sse_do_not_report_prediction_error() {
+        use crate::kv_observation::test_helpers::has_outcome;
+        for transparent in [false, true] {
+            for streaming in [false, true] {
+                let recorder =
+                    metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+                let handle = recorder.handle();
+                let _recorder = metrics::set_default_local_recorder(&recorder);
+                let ids = vec![1, 2, 3, 4, 5, 6];
+                let fixture = http_kv_fixture(
+                    [vec![ids.clone(), ids.clone()], vec![ids.clone(), ids]],
+                    0,
+                    true,
+                )
+                .await;
+                let value = serde_json::json!({
+                    "model": "kv-observation-test", "prompt": ["one", "two"], "stream": streaming
+                });
+                let response = if transparent {
+                    fixture
+                        .router
+                        .route_transparent(None, "/v1/completions", &Method::POST, value)
+                        .await
+                } else {
+                    let request: CompletionRequest = serde_json::from_value(value).unwrap();
+                    fixture
+                        .router
+                        .route_typed_request(None, &request, "/v1/completions", None)
+                        .await
+                };
+                assert!(response.status().is_success());
+                if streaming {
+                    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+                }
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                if streaming {
+                    assert!(std::str::from_utf8(&body).unwrap().contains("data: [DONE]"));
+                } else {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["usage"]
+                            ["prompt_tokens_details"]["cached_tokens"],
+                        4
+                    );
+                }
+                let metrics = handle.render();
+                assert!(
+                    has_outcome(&metrics, "unavailable", "multi_prompt_usage_not_aggregate"),
+                    "transparent={transparent}, streaming={streaming}: {metrics}"
+                );
+                assert!(!metrics.contains("vllm_router_kv_cached_token_absolute_error"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transparent_kv_json_forwards_without_waiting_for_backend_eof() {
+        use crate::kv_observation::test_helpers::has_outcome;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let ids = vec![1, 2, 3, 4, 5, 6];
+        let fixture = http_kv_fixture([vec![ids.clone()], vec![ids.clone()]], 0, true).await;
+        fixture.hold_json_open.store(true, Ordering::SeqCst);
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            fixture.router.route_transparent(
+                None,
+                "/v1/completions",
+                &Method::POST,
+                serde_json::json!({"prompt": ids}),
+            ),
+        )
+        .await
+        .expect("response headers must not wait for the complete backend body");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let bytes = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .expect("forward the first JSON chunk before backend EOF")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["usage"]
+                ["prompt_tokens_details"]["cached_tokens"],
+            4
+        );
+        assert!(!handle
+            .render()
+            .contains("vllm_router_kv_actual_cached_tokens_count"));
+        drop(body);
+        let metrics = handle.render();
+        assert!(
+            has_outcome(&metrics, "unavailable", "attempt_cancelled"),
+            "{metrics}"
+        );
+        assert!(!metrics.contains("vllm_router_kv_actual_cached_tokens_count"));
     }
 
     #[tokio::test]
@@ -7267,14 +7582,17 @@ mod tests {
         ));
         let mode = Arc::new(Mutex::new((StatusCode::OK, false)));
         let handler_mode = mode.clone();
+        let fail_stream = Arc::new(tokio::sync::Notify::new());
+        let handler_signal = fail_stream.clone();
         let app = axum::Router::new().route(
             "/v1/chat/completions",
             post(move || {
                 let (status, fail_body) = *handler_mode.lock();
+                let signal = handler_signal.clone();
                 async move {
                     let body = if fail_body {
-                        Body::from_stream(futures_util::stream::once(async {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        Body::from_stream(futures_util::stream::once(async move {
+                            signal.notified().await;
                             Err::<bytes::Bytes, _>(std::io::Error::other("broken backend body"))
                         }))
                     } else {
@@ -7299,10 +7617,6 @@ mod tests {
                 static_kv_event_sources: Default::default(),
             }));
         router.retry_config.max_retries = 0;
-        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "messages": [{"role": "user", "content": "hello"}],
-        }))
-        .unwrap();
         worker.increment_load(); // An unrelated request must remain counted.
         for (status, fail_body) in [
             (StatusCode::OK, false),
@@ -7311,21 +7625,64 @@ mod tests {
             (StatusCode::OK, true),
         ] {
             *mode.lock() = (status, fail_body);
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": fail_body
+            }))
+            .unwrap();
             let response = router
                 .route_typed_request(None, &request, "/v1/chat/completions", None)
                 .await;
-            let expected_status = if fail_body {
-                StatusCode::INTERNAL_SERVER_ERROR
+            assert_eq!(response.status(), status);
+            if fail_body {
+                assert_eq!(worker.load(), 2);
+                fail_stream.notify_one();
+                assert!(to_bytes(response.into_body(), usize::MAX).await.is_err());
             } else {
-                status
-            };
-            assert_eq!(response.status(), expected_status);
-            assert_eq!(worker.load(), 1, "status={status}, fail_body={fail_body}");
-            to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            }
             assert_eq!(worker.load(), 1);
         }
         worker.decrement_load();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn truncated_nonstreaming_body_releases_the_selected_worker() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            WorkerType::Regular,
+        ));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            assert!(socket.read(&mut buf).await.unwrap() > 0);
+            // EOF after valid HTTP headers but before the advertised body length.
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{")
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+            while socket.read(&mut buf).await.unwrap_or(0) != 0 {}
+        });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(worker.clone());
+        router.retry_config.max_retries = 0;
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let response = router
+            .route_typed_request(None, &request, "/v1/chat/completions", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Failed to get response body"));
+        assert_eq!(worker.load(), 0);
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -8500,6 +8857,145 @@ mod tests {
                 wire.get("max_tokens"),
                 Some(&serde_json::Value::Null),
                 "exact={exact}: explicit null must survive forwarding"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_program_usage_is_observed_before_client_filtering() {
+        use crate::kv_index::{
+            CacheKey, HashMode, KvBlockIndexer, ResidencyOwner, RoutableTarget, StorageTier,
+        };
+        use crate::kv_observation::test_helpers::has_outcome;
+        use crate::policies::KvAwarePolicy;
+        use crate::program_scheduling::TokenCountMode;
+
+        for encoded in [false, true] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _recorder = metrics::set_default_local_recorder(&recorder);
+            let mut fixture = completion_response_fixture().await;
+            let scheduler = Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                token_count_mode: TokenCountMode::Exact,
+                token_count_verification_settlements: 1,
+                enable_key: crate::program_scheduling::ProgramSchedulingEnableKey::Auto,
+                ..Default::default()
+            }));
+            Arc::get_mut(&mut fixture.router).unwrap().program_scheduler = Some(scheduler.clone());
+            let policy = fixture.router.policy_registry.get_default_policy();
+            let kv = kv_aware_policy(policy.as_ref()).unwrap();
+            let target = RoutableTarget {
+                instance_id: Arc::from(fixture.worker.url()),
+                dp_rank: 0,
+            };
+            let index = Arc::new(KvBlockIndexer::new());
+            kv.register_target_with_cache_identity(
+                fixture.worker.url(),
+                target.clone(),
+                CacheKey {
+                    model: Arc::from("m"),
+                    hash_mode: HashMode::Sha256,
+                    block_size: 1,
+                },
+                index.clone(),
+            );
+            let blocks: Vec<_> = KvAwarePolicy::local_hashes(&[1, 2], 1)
+                .into_iter()
+                .enumerate()
+                .map(|(block, hash)| (Arc::from(format!("block-{block}")), hash))
+                .collect();
+            index.store(
+                0,
+                ResidencyOwner::Worker {
+                    source: target.instance_id.clone(),
+                    dp_rank: 0,
+                    incarnation: 0,
+                },
+                StorageTier::Device,
+                None,
+                &blocks,
+            );
+            let raw = bytes::Bytes::from_static(
+                br#"{"model":"m","prompt":[1,2,3],"add_special_tokens":false,"stream":true,
+                    "stream_options":{"include_usage":false}}"#,
+            );
+            // Header identity preserves the qualified Completion cache contract.
+            let mut headers = HeaderMap::new();
+            headers.insert("x-session-id", HeaderValue::from_static("p"));
+            let request = Arc::new(serde_json::from_slice::<CompletionRequest>(&raw).unwrap());
+            let mut upstream = Response::builder();
+            if encoded {
+                upstream = upstream.header(http::header::CONTENT_ENCODING, "gzip");
+            }
+            fixture
+                .responses
+                .send(upstream.body(Body::from(concat!(
+                    "data: {\"choices\":[{\"text\":\"hello\",\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":2}}}\n\n",
+                    "data: [DONE]\n\n"
+                ))).unwrap())
+                .unwrap();
+            let response = fixture
+                .router
+                .route_completion_raw(Some(&headers), request, raw, None)
+                .await;
+            assert_eq!(
+                response.status(),
+                if encoded {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    StatusCode::OK
+                }
+            );
+            let bytes = to_bytes(response.into_body(), 10_000).await.unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            if !encoded {
+                assert!(text.contains("hello"));
+                assert!(text.ends_with("data: [DONE]\n\n"));
+                assert!(!text.contains("\"usage\""));
+            }
+            let received = fixture.requests.recv().await.unwrap();
+            let wire: serde_json::Value = serde_json::from_slice(&received).unwrap();
+            assert_eq!(
+                wire.pointer("/stream_options/include_usage"),
+                Some(&serde_json::json!(true))
+            );
+
+            let metrics = handle.render();
+            let diagnostics = scheduler.diagnostics();
+            if encoded {
+                assert!(
+                    has_outcome(&metrics, "unavailable", "response_error"),
+                    "{metrics}"
+                );
+                assert!(
+                    !metrics.contains("vllm_router_kv_predicted_cached_tokens_count"),
+                    "{metrics}"
+                );
+                assert!(
+                    !metrics.contains("vllm_router_kv_actual_cached_tokens_count"),
+                    "{metrics}"
+                );
+                assert_eq!(diagnostics.verified_token_fingerprints, 0);
+                for program in diagnostics.ranks.iter().flat_map(|rank| &rank.programs) {
+                    assert_eq!(program.in_flight_requests, 0);
+                    assert_eq!(program.segment_served_rounds, 0);
+                }
+            } else {
+                // Both observers consume the original usage before the client filter.
+                assert!(has_outcome(&metrics, "observed", "none"), "{metrics}");
+                for kind in ["predicted", "actual"] {
+                    let expected = format!("vllm_router_kv_{kind}_cached_tokens_sum 2");
+                    assert!(metrics.lines().any(|line| line == expected), "{metrics}");
+                }
+                assert_eq!(diagnostics.verified_token_fingerprints, 1);
+                assert_eq!(diagnostics.revoked_token_fingerprints, 0);
+                assert_eq!(diagnostics.ranks[0].programs[0].context_tokens, 3);
+            }
+            assert_eq!(fixture.worker.load(), 0);
+            assert_eq!(
+                kv.slot_manager().unwrap().sample(&target),
+                crate::policies::LoadSample::default()
             );
         }
     }
