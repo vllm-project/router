@@ -47,10 +47,14 @@ pub struct EventSource {
 
 /// A handle to a running subscriber task; drop it (or call `shutdown`) to stop.
 pub struct SubscriberHandle {
-    shutdown_tx: broadcast::Sender<()>,
+    pub(super) shutdown_tx: broadcast::Sender<()>,
 }
 
 impl SubscriberHandle {
+    pub(super) fn is_finished(&self) -> bool {
+        self.shutdown_tx.receiver_count() == 0
+    }
+
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
     }
@@ -782,7 +786,7 @@ fn report_full_attention_rejection(
     }
 }
 
-fn apply_batch(
+pub(super) fn apply_batch(
     indexer: &KvBlockIndexer,
     source_id: &SourceId,
     dp_rank: u32,

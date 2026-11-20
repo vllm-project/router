@@ -5,8 +5,26 @@ use crate::program_scheduling::ProgramBindingStrategy;
 pub struct ConfigValidator;
 
 impl ConfigValidator {
+    pub(crate) fn validate_snapshot_scope(config: &RouterConfig) -> ConfigResult<()> {
+        if !config.kv_snapshot_sources.is_empty()
+            && (!config.kv_event_strict_recovery
+                || config.enable_igw
+                || config.connection_mode != ConnectionMode::Http
+                || config.intra_node_data_parallel_size != 1
+                || config.program_scheduling.is_some()
+                || !matches!(config.mode, RoutingMode::Regular { .. })
+                || !matches!(config.policy, PolicyConfig::KvAware { .. }))
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "publisher snapshot enrollment requires strict kv_aware non-IGW HTTP Regular routing with independently addressable DP1 workers".into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Validate a complete router configuration
     pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        Self::validate_snapshot_scope(config)?;
         if let Some(ttl_secs) = config.kv_aware_session_affinity_ttl_secs {
             if !(1..=31_536_000).contains(&ttl_secs) {
                 return Err(ConfigError::InvalidValue {

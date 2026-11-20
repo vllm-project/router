@@ -87,6 +87,30 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | `--kv-event-block-size` | `u32` | `16` | `integer` | `16` | KV cache block size in tokens for workers registered through `--kv-event-source`. |
 | `--kv-event-model` | `string` | `unset` | `string` | `unset` | Model id advertised to static KV-event sources; `unset` keeps the served model id. |
 | `--kv-event-strict-recovery` | `flag` | `false` | `flag` | `false` | Opt in to authoritative KV history recovery. External pool tiers stay uncredited until an independent pool baseline exists. Requests stay routable in fallback; after retry exhaustion, an operator-initiated worker KV clear restores worker-local credit. Without strict mode, fresh observations can restore credit after history loss. |
+| `--kv-snapshot-sources-file` | `string` | `unset` | — | — | Bounded JSON enrollment for experimental loopback publisher snapshots; requires strict kv_aware non-IGW HTTP Regular DP1 routing. |
+
+The snapshot file maps each trusted worker HTTP origin to its publisher client
+configuration, for example:
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "namespace": "engine-a",
+    "rank": 0,
+    "block_size": 16,
+    "publisher_snapshot": {
+      "endpoint": "tcp://127.0.0.1:5557",
+      "snapshot_endpoint": "tcp://127.0.0.1:5558",
+      "topic": ""
+    }
+  }
+}
+```
+
+Enroll only independently addressable workers running one plain full-attention
+engine with complete snapshot support. The router restores worker-local KV
+credit only after verifying the snapshot and live sequence. Missing or
+unusable evidence leaves that worker routable at full prefill cost.
 
 The Rust CLI requires worker URLs in regular mode unless service discovery is
 enabled. The Python launcher permits an empty worker list without service
