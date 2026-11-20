@@ -117,6 +117,7 @@ impl ProgramScheduler {
                 arrived_at,
             );
             let reference = handle.program().clone();
+            self.next_turn_arrived(&mut state, &reference, arrived_at);
             let continuity = state
                 .runtime
                 .view(&reference)
@@ -484,6 +485,7 @@ impl ProgramScheduler {
         if !state.runtime.cancel_request(handle) {
             return;
         }
+        self.next_turn_cancelled(&mut state, handle);
         let after = state.runtime.view(handle.program());
         if self.config.pd_mode
             && after
@@ -2248,6 +2250,7 @@ mod tests {
                     kv_cache_usage: Some(usage),
                     running_requests: Some(0),
                     waiting_requests: Some(0),
+                    external_kv_prompt_tokens_total: None,
                     observed_at: Instant::now(),
                 }),
         );
