@@ -429,6 +429,7 @@ impl Router {
                     crate::kv_index::HashMode::Sha256,
                 );
             supervisor.set_api_key(ctx.router_config.api_key.clone());
+            supervisor.set_strict_recovery(ctx.router_config.kv_event_strict_recovery);
             let static_sources = match &ctx.router_config.policy {
                 crate::config::PolicyConfig::KvAware {
                     static_kv_event_sources,
@@ -4186,15 +4187,6 @@ mod tests {
         publisher.bind("tcp://127.0.0.1:*").unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let worker = format!("http://{}", listener.local_addr().unwrap());
-        // Discovery endpoints deliberately do not exist: the saved mapping must
-        // supply the source for this later, independently addressed worker.
-        let app = axum::Router::new()
-            .route("/health", get(|| async { "ok" }))
-            .route(
-                "/v1/completions",
-                axum::routing::post(|| async { Json(json!({"choices": []})) }),
-            );
-        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let config = RouterConfig {
             policy: PolicyConfig::KvAware {
                 router_temperature: 0.0,
@@ -4209,6 +4201,7 @@ mod tests {
                     .unwrap(),
                 ),
             },
+            kv_event_strict_recovery: true,
             kv_aware_completion_history: true,
             worker_startup_timeout_secs: 5,
             ..Default::default()
@@ -4216,6 +4209,36 @@ mod tests {
         let ctx = Arc::new(
             crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
         );
+        let policy = ctx.policy_registry.get_default_policy();
+        let manager = kv_aware_policy(policy.as_ref())
+            .unwrap()
+            .slot_manager()
+            .unwrap();
+        let target = crate::kv_index::RoutableTarget {
+            instance_id: worker.clone().into(),
+            dp_rank: 0,
+        };
+        // The saved mapping supplies discovery; both cold and history-warmed
+        // requests must reserve their full input through the actual HTTP caller.
+        let app = axum::Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/v1/completions",
+                axum::routing::post({
+                    let (manager, target) = (manager.clone(), target.clone());
+                    move || {
+                        assert_eq!(
+                            manager.sample(&target),
+                            crate::policies::LoadSample {
+                                active_prefill_tokens: 8,
+                                active_requests: 1,
+                            }
+                        );
+                        async { Json(json!({"choices": []})) }
+                    }
+                }),
+            );
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let router = Router::new(vec![], &ctx).await.unwrap();
         router.add_worker(&worker).await.unwrap();
         let req: CompletionRequest =
@@ -4258,11 +4281,18 @@ mod tests {
         .unwrap();
         let payload = rmp_serde::to_vec(&(
             1.0,
-            [json!({
-                "type": "BlockStored", "block_hashes": [1], "parent_block_hash": null,
-                "token_ids": vec![1; 8], "block_size": 8, "medium": "GPU",
-                "lora_id": null, "lora_name": null
-            })],
+            [
+                json!({
+                    "type": "BlockStored", "block_hashes": [1], "parent_block_hash": null,
+                    "token_ids": vec![1; 8], "block_size": 8, "medium": "GPU",
+                    "lora_id": null, "lora_name": null
+                }),
+                json!({
+                    "type": "BlockStored", "block_hashes": [2], "parent_block_hash": null,
+                    "token_ids": vec![77; 8], "block_size": 8, "medium": "GPU",
+                    "lora_id": null, "lora_name": null, "ownership": "pool"
+                }),
+            ],
             0u32,
         ))
         .unwrap();
@@ -4288,6 +4318,26 @@ mod tests {
         })
         .await
         .unwrap();
+        // The worker hit above proves this same batch was consumed. Strict
+        // startup must not publish its pool-owned prefix as external credit.
+        assert!(provider
+            .find_tiered_matches(&MatchQuery {
+                group_idx: 0,
+                local_hashes: crate::kv_index::local_block_hash_strings(&[77; 8], 8, None),
+                tiers_of_interest: vec![StorageTier::External],
+            })
+            .is_empty());
+        assert_eq!(
+            router
+                .route_typed_request(None, &req, "/v1/completions", None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            manager.sample(&target),
+            crate::policies::LoadSample::default()
+        );
         // Reuse the valid source to isolate the private registration caller's
         // transport gate. This is not a gRPC inference/health backend test.
         let info = supervisor.on_worker_added(&worker).await.unwrap();
@@ -4505,6 +4555,27 @@ mod tests {
                         )
                         .unwrap();
                 }
+                let recovered = rmp_serde::to_vec(&(
+                    1.0,
+                    [
+                        json!({"type": "AllBlocksCleared"}),
+                        json!({
+                            "type": "BlockStored", "block_hashes": [4],
+                            "parent_block_hash": null,
+                            "token_ids": vec![4; expected as usize],
+                            "block_size": expected, "medium": "CPU",
+                            "lora_id": null, "lora_name": null
+                        }),
+                    ],
+                    3u32,
+                ))
+                .unwrap();
+                publisher
+                    .send_multipart(
+                        [b"kv/router".as_slice(), &3i64.to_be_bytes(), &recovered],
+                        0,
+                    )
+                    .unwrap();
             } else {
                 publisher
                     .send_multipart(
@@ -4520,18 +4591,19 @@ mod tests {
             let result = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     if replayed {
-                        let fresh = provider.find_tiered_matches(&query(3));
-                        if fresh.is_empty() {
+                        let recovered = provider.find_tiered_matches(&query(4));
+                        if recovered.is_empty() {
                             tokio::task::yield_now().await;
                             continue;
                         }
-                        assert_eq!(fresh.len(), 1);
-                        assert_eq!(fresh[0].target.instance_id.as_ref(), "router-source");
-                        assert_eq!(fresh[0].target.dp_rank, 3);
-                        assert_eq!(fresh[0].tier, StorageTier::HostPinned);
-                        assert_eq!(fresh[0].segments, [(0, 1)]);
+                        assert_eq!(recovered.len(), 1);
+                        assert_eq!(recovered[0].target.instance_id.as_ref(), "router-source");
+                        assert_eq!(recovered[0].target.dp_rank, 3);
+                        assert_eq!(recovered[0].tier, StorageTier::HostPinned);
+                        assert_eq!(recovered[0].segments, [(0, 1)]);
                         assert!(provider.find_tiered_matches(&query(1)).is_empty());
                         assert!(provider.find_tiered_matches(&query(2)).is_empty());
+                        assert!(provider.find_tiered_matches(&query(3)).is_empty());
                         break true;
                     }
                     let old = provider.find_tiered_matches(&query(1));
@@ -7888,6 +7960,7 @@ mod tests {
                 async move {
                     let body = if fail_body {
                         Body::from_stream(futures_util::stream::once(async {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                             Err::<bytes::Bytes, _>(std::io::Error::other("broken backend body"))
                         }))
                     } else {

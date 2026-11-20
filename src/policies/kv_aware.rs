@@ -5133,6 +5133,191 @@ mod tests {
     }
 
     #[test]
+    fn churn_fallback_preserves_each_workers_known_input() {
+        #[derive(Default)]
+        struct Churn {
+            replace: Mutex<Option<Box<dyn Fn() + Send>>>,
+            queries: AtomicUsize,
+        }
+        impl TieredMatchProvider for Churn {
+            fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
+                self.queries.fetch_add(1, Ordering::Relaxed);
+                self.replace.lock().as_ref().unwrap()();
+                Vec::new()
+            }
+        }
+        let both_known: [Option<&[usize]>; 2] = [Some(&[33]), Some(&[17])];
+        let missing_second = [both_known[0], None];
+        let cases = [
+            ("known and missing", missing_second, None, None, 33, 3),
+            ("both known", both_known, None, Some(1), 17, 6),
+            ("forced longer", both_known, Some(1), Some(0), 33, 6),
+            ("forced shorter", both_known, Some(0), Some(1), 17, 6),
+            ("forced missing", missing_second, Some(0), Some(1), 33, 3),
+            (
+                "empty prompt",
+                [Some(&[33]), Some(&[0])],
+                None,
+                Some(1),
+                0,
+                3,
+            ),
+            ("all unknown", [None, None], None, None, 0, 0),
+            ("two prompts", [Some(&[17, 16]); 2], None, None, 33, 6),
+        ];
+        for history_enabled in [false, true] {
+            let policy = Arc::new(KvAwarePolicy::new(CostParams {
+                router_temperature: 0.0,
+                ..CostParams::default()
+            }));
+            let workers = registered_worker_pair(&policy);
+            let matches = Arc::new(Churn::default());
+            let info = WorkerKvInfo {
+                ranks: vec![0],
+                cache_key: Some(CacheKey {
+                    model: Arc::from("model"),
+                    hash_mode: crate::kv_index::HashMode::Sha256,
+                    block_size: 16,
+                }),
+                ..WorkerKvInfo::default()
+            };
+            let register =
+                move |policy: &KvAwarePolicy, worker: &Arc<dyn Worker>, matches: Arc<Churn>| {
+                    if history_enabled {
+                        policy.register_history_worker(worker, Some(&info), Some(matches));
+                    } else {
+                        policy.register_worker(worker.as_ref(), Some(&info), Some(matches));
+                    }
+                };
+            for worker in &workers {
+                register(&policy, worker, matches.clone());
+            }
+            let weak_policy = Arc::downgrade(&policy);
+            let weak_matches = Arc::downgrade(&matches);
+            let registered = workers.clone();
+            // Every query replaces both registrations, forcing selection to reach
+            // the final, query-free attempt rather than reserve a stale snapshot.
+            *matches.replace.lock() = Some(Box::new(move || {
+                let policy = weak_policy.upgrade().unwrap();
+                let matches = weak_matches.upgrade().unwrap();
+                for worker in &registered {
+                    register(&policy, worker, matches.clone());
+                }
+            }));
+            for (case, lengths, excluded, chosen, expected, queries) in cases {
+                let case = format!("{case} (history={history_enabled})");
+                let inputs: WorkerTokenInputs = workers
+                    .iter()
+                    .zip(lengths)
+                    .filter_map(|(worker, lengths)| {
+                        lengths.map(|lengths| {
+                            (
+                                worker.base_url().to_owned(),
+                                Arc::from(
+                                    lengths
+                                        .iter()
+                                        .map(|&length| vec![7; length])
+                                        .collect::<Vec<_>>(),
+                                ),
+                            )
+                        })
+                    })
+                    .collect();
+                let excluded: Vec<_> = excluded
+                    .map(|index: usize| workers[index].url().to_owned())
+                    .into_iter()
+                    .collect();
+                let recorder =
+                    metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+                let queries_before = matches.queries.load(Ordering::Relaxed);
+                let receipt = metrics::with_local_recorder(&recorder, || {
+                    let tokens = KvRequestTokens::PerWorker(&inputs);
+                    if history_enabled {
+                        let request = policy
+                            .capture_completion_history(&workers, "model")
+                            .unwrap();
+                        assert_eq!(request.registrations.len(), workers.len(), "{case}");
+                        let (receipt, observation) = policy
+                            .select_with_history(
+                                &workers,
+                                tokens,
+                                None,
+                                Some(&request),
+                                SelectionIdentity::default(),
+                                &excluded,
+                            )
+                            .unwrap();
+                        assert!(observation.is_none(), "{case}");
+                        receipt
+                    } else {
+                        policy
+                            .select_worker_with_inputs(
+                                &workers, tokens, None, None, None, &excluded,
+                            )
+                            .unwrap()
+                    }
+                });
+                assert_eq!(
+                    matches.queries.load(Ordering::Relaxed) - queries_before,
+                    queries,
+                    "{case}",
+                );
+                if let Some(chosen) = chosen {
+                    assert_eq!(receipt.worker_index, chosen, "{case}");
+                }
+                let worker = &workers[receipt.worker_index];
+                let target = &receipt.decision.target;
+                let reserved = policy.load.sample(target);
+                assert_eq!(
+                    receipt.new_prefill_tokens,
+                    expected,
+                    "{case}: {} (cost {}, reserved {reserved:?})",
+                    worker.url(),
+                    receipt.decision.cost,
+                );
+                assert_eq!(receipt.decision.components.ptoken, expected, "{case}");
+                assert_eq!(receipt.decision.cost, expected as f64, "{case}");
+                assert_eq!(
+                    reserved,
+                    LoadSample {
+                        active_prefill_tokens: expected,
+                        active_requests: 1,
+                    },
+                    "{case}",
+                );
+                assert_eq!(worker.load(), 1, "{case}");
+                release_receipt(&workers, &receipt);
+                assert_eq!(policy.load.sample(target), LoadSample::default(), "{case}");
+                assert_eq!(worker.load(), 0, "{case}");
+
+                let rendered = recorder.handle().render();
+                let mut outcomes = rendered
+                    .lines()
+                    .filter(|line| line.starts_with("vllm_router_prefix_routing_decisions_total{"));
+                let reason = if queries == 0 {
+                    "missing_tokens"
+                } else {
+                    "registration_churn"
+                };
+                assert!(
+                    outcomes.next().is_some_and(|line| {
+                        line.contains(&format!("outcome=\"{reason}\"")) && line.ends_with(" 1")
+                    }) && outcomes.next().is_none(),
+                    "{case}: {rendered}",
+                );
+                if history_enabled && queries != 0 {
+                    assert!(
+                        !rendered
+                            .lines()
+                            .any(|line| line.starts_with("vllm_router_history_decisions_total{")),
+                        "{case}: churn fallback recorded a history decision: {rendered}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn registration_uses_the_discovered_cache_block_size_and_provider() {
         #[derive(Default)]
         struct QueryBlocks(
@@ -5200,7 +5385,7 @@ mod tests {
             workers[0].set_healthy(true);
         }
         // Every placement query changes the target generation. Selection must
-        // terminate with a current full-input reservation and no KV credit.
+        // terminate after three queries with full-input work and no KV credit.
         let weak_policy = Arc::downgrade(&policy);
         let weak_matches = Arc::downgrade(&matches);
         let churn_worker = workers[0].clone();
@@ -5218,171 +5403,6 @@ mod tests {
         assert_eq!(matches.2.load(Ordering::Relaxed) - queries_before, 3);
         assert_eq!(receipt.new_prefill_tokens, 5);
         release_receipt(&workers, &receipt);
-    }
-
-    #[test]
-    fn churn_fallback_preserves_each_workers_known_input() {
-        #[derive(Default)]
-        struct Churn {
-            replace: Mutex<Option<Box<dyn Fn() + Send>>>,
-            queries: AtomicUsize,
-        }
-        impl TieredMatchProvider for Churn {
-            fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
-                self.queries.fetch_add(1, Ordering::Relaxed);
-                self.replace.lock().as_ref().unwrap()();
-                Vec::new()
-            }
-        }
-        let policy = Arc::new(KvAwarePolicy::new(CostParams {
-            router_temperature: 0.0,
-            ..CostParams::default()
-        }));
-        let workers = registered_worker_pair(&policy);
-        let matches = Arc::new(Churn::default());
-        let info = WorkerKvInfo {
-            ranks: vec![0],
-            cache_key: Some(CacheKey {
-                model: Arc::from("model"),
-                hash_mode: crate::kv_index::HashMode::Sha256,
-                block_size: 16,
-            }),
-            ..WorkerKvInfo::default()
-        };
-        for worker in &workers {
-            policy.register_history_worker(worker, Some(&info), Some(matches.clone()));
-        }
-        let weak_policy = Arc::downgrade(&policy);
-        let weak_matches = Arc::downgrade(&matches);
-        let registered = workers.clone();
-        // Every query replaces both registrations, forcing selection to reach
-        // the final, query-free attempt rather than reserve a stale snapshot.
-        *matches.replace.lock() = Some(Box::new(move || {
-            for worker in &registered {
-                weak_policy.upgrade().unwrap().register_history_worker(
-                    worker,
-                    Some(&info),
-                    Some(weak_matches.upgrade().unwrap()),
-                );
-            }
-        }));
-        let both_known: [Option<&[usize]>; 2] = [Some(&[33]), Some(&[17])];
-        let missing_second = [both_known[0], None];
-        for (case, lengths, excluded, chosen, expected, queries) in [
-            ("known and missing", missing_second, None, None, 33, 3),
-            ("both known", both_known, None, Some(1), 17, 6),
-            ("forced longer", both_known, Some(1), Some(0), 33, 6),
-            ("forced shorter", both_known, Some(0), Some(1), 17, 6),
-            ("forced missing", missing_second, Some(0), Some(1), 33, 3),
-            (
-                "empty prompt",
-                [Some(&[33]), Some(&[0])],
-                None,
-                Some(1),
-                0,
-                3,
-            ),
-            ("all unknown", [None, None], None, None, 0, 0),
-            ("two prompts", [Some(&[17, 16]); 2], None, None, 33, 6),
-        ] {
-            let inputs: WorkerTokenInputs = workers
-                .iter()
-                .zip(lengths)
-                .filter_map(|(worker, lengths)| {
-                    lengths.map(|lengths| {
-                        (
-                            worker.base_url().to_owned(),
-                            Arc::from(
-                                lengths
-                                    .iter()
-                                    .map(|&length| vec![7; length])
-                                    .collect::<Vec<_>>(),
-                            ),
-                        )
-                    })
-                })
-                .collect();
-            let excluded: Vec<_> = excluded
-                .map(|index: usize| workers[index].url().to_owned())
-                .into_iter()
-                .collect();
-            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-            let queries_before = matches.queries.load(Ordering::Relaxed);
-            let request = policy
-                .capture_completion_history(&workers, "model")
-                .unwrap();
-            assert_eq!(request.registrations.len(), workers.len(), "{case}");
-            let (receipt, observation) = metrics::with_local_recorder(&recorder, || {
-                policy.select_with_context(
-                    &workers,
-                    QualifiedKvInput {
-                        tokens: KvRequestTokens::PerWorker(&inputs),
-                        eligibility: None,
-                    },
-                    SelectionIdentity::default(),
-                    &excluded,
-                    Some(&request),
-                )
-            })
-            .unwrap();
-            assert_eq!(
-                matches.queries.load(Ordering::Relaxed) - queries_before,
-                queries,
-                "{case}",
-            );
-            if let Some(chosen) = chosen {
-                assert_eq!(receipt.worker_index, chosen, "{case}");
-            }
-            let worker = &workers[receipt.worker_index];
-            let target = &receipt.decision.target;
-            let reserved = policy.load.sample(target);
-            assert_eq!(
-                receipt.new_prefill_tokens,
-                expected,
-                "{case}: {} (cost {}, reserved {reserved:?})",
-                worker.url(),
-                receipt.decision.cost,
-            );
-            assert_eq!(receipt.decision.components.ptoken, expected, "{case}");
-            assert_eq!(receipt.decision.cost, expected as f64, "{case}");
-            assert_eq!(
-                reserved,
-                LoadSample {
-                    active_prefill_tokens: expected,
-                    active_requests: 1,
-                },
-                "{case}",
-            );
-            assert_eq!(worker.load(), 1, "{case}");
-            release_receipt(&workers, &receipt);
-            assert_eq!(policy.load.sample(target), LoadSample::default(), "{case}");
-            assert_eq!(worker.load(), 0, "{case}");
-
-            let rendered = recorder.handle().render();
-            let mut outcomes = rendered
-                .lines()
-                .filter(|line| line.starts_with("vllm_router_prefix_routing_decisions_total{"));
-            let reason = if queries == 0 {
-                "missing_tokens"
-            } else {
-                "registration_churn"
-            };
-            assert!(
-                outcomes.next().is_some_and(|line| {
-                    line.contains(&format!("outcome=\"{reason}\"")) && line.ends_with(" 1")
-                }) && outcomes.next().is_none(),
-                "{case}: {rendered}",
-            );
-            assert!(observation.is_none(), "{case}");
-            if queries != 0 {
-                assert!(
-                    !rendered
-                        .lines()
-                        .any(|line| line.starts_with("vllm_router_history_decisions_total{")),
-                    "{case}: churn fallback recorded a history decision: {rendered}",
-                );
-            }
-        }
     }
 
     #[test]

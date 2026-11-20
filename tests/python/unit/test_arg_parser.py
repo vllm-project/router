@@ -17,6 +17,22 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
 class TestKvLauncherArgs:
+    @pytest.mark.parametrize(
+        "strict,history", [(False, False), (True, False), (False, True), (True, True)]
+    )
+    def test_strict_and_history_construct_native_router(self, strict, history):
+        from vllm_router_rs import Router as NativeRouter
+
+        flags = ["--policy", "kv_aware"]
+        if strict:
+            flags.append("--kv-event-strict-recovery")
+        if history:
+            flags.append("--kv-aware-completion-history")
+        args = parse_router_args(flags)
+        assert args.kv_event_strict_recovery is strict
+        assert args.kv_aware_completion_history is history
+        assert isinstance(Router.from_args(args)._router, NativeRouter)
+
     def test_defaults(self):
         args = parse_router_args([])
         assert args.kv_aware_session_affinity_ttl_secs is None
