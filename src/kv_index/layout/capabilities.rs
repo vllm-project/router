@@ -1,5 +1,5 @@
 //! Verified engine declarations, independent of worker discovery and storage.
-use super::{CacheGroup, GroupRule};
+use super::{common_block_alignment, AlignedTailDrop, CacheGroup, GroupRule};
 use crate::kv_index::request_hash::{BlockKeyGenerator, SequenceHash};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -141,6 +141,7 @@ pub(crate) struct VerifiedLayout {
     pub(crate) hash_block_size: u32,
     pub(crate) hash_lookahead_tokens: u32,
     pub(crate) tail_drop_group: Option<u32>,
+    pub(in crate::kv_index) aligned_tail_drop: Option<AlignedTailDrop>,
     pub(crate) root: SequenceHash,
     pub(crate) replay_tokens: u32,
     pub(crate) adapters: Vec<(String, String)>,
@@ -366,39 +367,68 @@ impl CacheCapabilities {
         }
         // Circular buffers are excluded from vLLM's cache lookup even when
         // the coordinator lists them as draft groups.
-        let mut tail_groups = tail_drop_groups.iter().copied().filter(|id| {
-            !rank.groups.iter().any(|group| {
-                group.group_idx == *id
-                    && !group.prefix_cacheable
-                    && group.spec_type == "CircularBufferSpec"
-            })
-        });
-        let tail_drop_group = if let Some(group_idx) = tail_groups.next() {
-            let unsupported = "unsupported tail-drop layout. Set tail_drop_groups to the effective groups and use [] when the worker skips the drop";
-            let mut dense = groups
-                .iter()
-                .filter(|group| group.kind.is_dense_attention());
-            let group = dense.next().ok_or(unsupported)?;
-            if dense.next().is_some()
-                || group_idx != group.group_idx
-                || tail_groups.next().is_some()
-                || replay_tokens != 0
-                || groups.iter().any(|other| {
-                    (!other.kind.is_dense_attention() && other.kind != GroupRule::Checkpoint)
-                        || (!rank.partial_hash_hits && other.block_size != group.block_size)
+        let tail_groups: Vec<_> = tail_drop_groups
+            .iter()
+            .copied()
+            .filter(|id| {
+                !rank.groups.iter().any(|group| {
+                    group.group_idx == *id
+                        && !group.prefix_cacheable
+                        && group.spec_type == "CircularBufferSpec"
                 })
-            {
+            })
+            .collect();
+        let (tail_drop_group, aligned_tail_drop) = if tail_groups.is_empty() {
+            (None, None)
+        } else {
+            let unsupported = "unsupported tail-drop layout. Set tail_drop_groups to the effective groups and use [] when the worker skips the drop";
+            if replay_tokens != 0 {
                 return Err(unsupported);
             }
-            Some(group_idx)
-        } else {
-            None
+            let single_dense = tail_groups.as_slice().first().and_then(|id| {
+                let group = groups.iter().find(|group| group.group_idx == *id)?;
+                (tail_groups.len() == 1
+                    && group.kind.is_dense_attention()
+                    && groups.iter().all(|other| {
+                        (other.group_idx == *id || other.kind == GroupRule::Checkpoint)
+                            && (rank.partial_hash_hits || other.block_size == group.block_size)
+                    }))
+                .then_some(*id)
+            });
+            if single_dense.is_some() {
+                (single_dense, None)
+            } else {
+                let mut distinct = HashSet::new();
+                // These layouts use whole scheduler units. Every group in the
+                // alignment must also participate in the reported cache contract.
+                if rank.partial_hash_hits
+                    || groups.len() != rank.groups.len()
+                    || !tail_groups.iter().all(|id| {
+                        distinct.insert(*id)
+                            && groups.iter().any(|group| {
+                                group.group_idx == *id && group.kind != GroupRule::Checkpoint
+                            })
+                    })
+                {
+                    return Err(unsupported);
+                }
+                let alignment = common_block_alignment(groups.iter().map(|group| group.block_size))
+                    .ok_or(unsupported)?;
+                (
+                    None,
+                    Some(AlignedTailDrop {
+                        groups: tail_groups,
+                        alignment,
+                    }),
+                )
+            }
         };
         Ok(VerifiedLayout {
             groups,
             hash_block_size,
             hash_lookahead_tokens: rank.hash_lookahead_tokens,
             tail_drop_group,
+            aligned_tail_drop,
             root,
             replay_tokens,
             adapters: validate_adapters(&self.adapters)?,

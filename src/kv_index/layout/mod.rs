@@ -12,6 +12,7 @@ pub(super) use evidence::full_attention_matches;
 pub(super) use evidence::{credit_from_pages, TailDrop};
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 use restore::common_reusable_tokens;
+pub(super) use restore::AlignedTailDrop;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheGroup {
@@ -81,6 +82,19 @@ pub(crate) fn align_down(tokens: u64, block_size: u32) -> u64 {
         return 0;
     }
     tokens - tokens % u64::from(block_size)
+}
+
+pub(super) fn common_block_alignment(sizes: impl IntoIterator<Item = u32>) -> Option<u32> {
+    sizes.into_iter().try_fold(1u32, |alignment, size| {
+        if size == 0 {
+            return None;
+        }
+        let (mut a, mut b) = (alignment, size);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        (alignment / a).checked_mul(size)
+    })
 }
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(all(test, feature = "cpu", feature = "ready"))]

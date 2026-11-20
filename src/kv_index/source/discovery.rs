@@ -475,27 +475,35 @@ impl KvIndexSupervisor {
             return discovery;
         };
         let connector = self.prefill_connector(worker_url);
-        if connector == Some(KvConnector::Nixl)
+        let bounded_nixl = connector == Some(KvConnector::Nixl)
             && layout.ranks.iter().any(|rank| {
                 rank.groups
                     .iter()
                     .any(|group| group.prefix_replay_tokens > 0)
-            })
-        {
-            if let Ok(info) = &mut discovery.server_info {
-                info.nixl_truncates_bounded_replay = tokio::time::timeout(
+            });
+        let aligned_tails = layout.ranks.iter().any(|rank| {
+            !rank.partial_hash_hits
+                && rank
+                    .tail_drop_groups
+                    .as_ref()
+                    .is_some_and(|groups| !groups.is_empty())
+        });
+        let (base, _) = split_worker_rank(worker_url);
+        if bounded_nixl || aligned_tails {
+            if let Some(info) = discovery
+                .server_info
+                .as_mut()
+                .ok()
+                .filter(|info| info.vllm_version.is_none())
+            {
+                info.vllm_version = tokio::time::timeout(
                     CONTROL_TIMEOUT / 4,
-                    probe::query_nixl_bounded_replay(
-                        &self.client,
-                        split_worker_rank(worker_url).0,
-                        self.api_key.as_deref(),
-                    ),
+                    probe::query_vllm_version(&self.client, base, self.api_key.as_deref()),
                 )
                 .await
                 .ok()
                 .flatten();
             }
-            return discovery;
         }
         if connector != Some(KvConnector::Mooncake)
             || !layout.ranks.iter().any(|rank| {
@@ -749,6 +757,7 @@ async fn discover_worker(
             effective_attention_block_size: server
                 .effective_attention_block_size
                 .and_then(|size| u32::try_from(size).ok()),
+            vllm_version: probe::parse_vllm_version(&server.engine_version),
             ..Default::default()
         });
         let base_models = model_id

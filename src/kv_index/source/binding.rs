@@ -34,7 +34,9 @@ use crate::config::KvConnector;
 use crate::kv_hash::BlockKeyGenerator;
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 use crate::kv_index::layout::valid_groups;
-use crate::kv_index::layout::{align_down, CacheGroup, GroupRule, TailDrop};
+use crate::kv_index::layout::{
+    align_down, common_block_alignment, AlignedTailDrop, CacheGroup, GroupRule, TailDrop,
+};
 use crate::kv_index::storage::source_transaction::{StreamControl, StreamPhase, StreamState};
 use crate::kv_index::storage::{
     IndexBatch, PageEvidence, PageMatch, PageQuery, PageTiers, SourceVersion,
@@ -55,6 +57,8 @@ pub struct SourceBinding {
     /// publishes no events can still make this window mandatory.
     pub(in crate::kv_index) replay_tokens: u32,
     pub(in crate::kv_index) tail_drop_group: Option<u32>,
+    aligned_tail_drop: Option<AlignedTailDrop>,
+    tail_proof_within_cap: bool,
     prefill_truncates_prompt: bool,
     nixl_decode_alignment: Option<u32>,
     /// LoRA adapters this worker serves, as `(name, path)`. The engine seeds an
@@ -115,6 +119,8 @@ impl SourceBinding {
             keys,
             replay_tokens: 0,
             tail_drop_group: None,
+            aligned_tail_drop: None,
+            tail_proof_within_cap: true,
             prefill_truncates_prompt: false,
             nixl_decode_alignment: None,
             adapters: Vec::new(),
@@ -228,6 +234,19 @@ impl SourceBinding {
     pub(in crate::kv_index) fn reusable_prompt_cap(&self, len: usize) -> usize {
         // Prefill can remove the last token before looking up the prefix.
         len.saturating_sub(1 + usize::from(self.prefill_truncates_prompt))
+    }
+
+    pub(in crate::kv_index::source) fn with_tail_proof_limit(
+        mut self,
+        version: Option<(u32, u32)>,
+    ) -> Result<Self, &'static str> {
+        if self.aligned_tail_drop.is_some() {
+            let version = version
+                .filter(|&version| version >= (0, 30))
+                .ok_or("block-aligned tail proofs require a known vLLM version of 0.30 or later")?;
+            self.tail_proof_within_cap = version < (0, 32);
+        }
+        Ok(self)
     }
 
     pub(in crate::kv_index) fn nixl_decode_credit(&self, prompt_len: usize, reused: u64) -> u64 {
@@ -405,6 +424,7 @@ impl CacheCapabilities {
             .with_tail_drop_group(layout.tail_drop_group)
             .with_adapters(layout.adapters)
             .with_partial_hash_hits(layout.partial_hash_hits);
+        binding.aligned_tail_drop = layout.aligned_tail_drop;
         if let Some(rank) = self.rank_capability(source.dp_rank) {
             binding.strict_event_block_size = rank.has_plain_full_attention_shape();
             if layout.partial_hash_hits
@@ -416,14 +436,8 @@ impl CacheCapabilities {
             {
                 // The vLLM scheduler aligns across all groups, including groups
                 // that do not publish prefix residency.
-                binding.nixl_decode_alignment = rank.groups.iter().try_fold(1u32, |lcm, group| {
-                    let mut a = lcm;
-                    let mut b = group.block_size;
-                    while b != 0 {
-                        (a, b) = (b, a % b);
-                    }
-                    (lcm / a).checked_mul(group.block_size)
-                });
+                binding.nixl_decode_alignment =
+                    common_block_alignment(rank.groups.iter().map(|group| group.block_size));
             }
         }
         Ok(binding)
@@ -560,6 +574,10 @@ impl SourceBinding {
             TailDrop {
                 group: self.tail_drop_group,
                 fine_grained: self.partial_hash_hits,
+                aligned: self
+                    .aligned_tail_drop
+                    .as_ref()
+                    .map(|tail| (tail, self.tail_proof_within_cap)),
             },
         );
         if tier.is_none() || u32::try_from(credited / self.keys.block_size() as u64).is_err() {

@@ -1,6 +1,10 @@
 //! Interpret one source snapshot using the cache groups' restore rules.
 
-use super::{align_down, restore::restore_boundary, CacheGroup, GroupEvidence, GroupRule};
+use super::{
+    align_down,
+    restore::{aligned_tail_boundary, restore_boundary},
+    AlignedTailDrop, CacheGroup, GroupEvidence, GroupRule,
+};
 use crate::kv_index::{
     storage::PageTiers,
     types::{TierBits, TierMatch},
@@ -157,11 +161,12 @@ impl GroupEvidence {
     }
 }
 
-/// The verified layout's dense group that must drop one proof unit.
+/// The verified layout's groups that must drop a proof unit.
 #[derive(Default)]
-pub(in crate::kv_index) struct TailDrop {
+pub(in crate::kv_index) struct TailDrop<'a> {
     pub group: Option<u32>,
     pub fine_grained: bool,
+    pub aligned: Option<(&'a AlignedTailDrop, bool)>,
 }
 
 /// Return the credited tokens and slowest required tier for a source snapshot.
@@ -171,7 +176,7 @@ pub(in crate::kv_index) fn credit_from_pages(
     hash_block_size: usize,
     max_reusable_tokens: u64,
     replay_tokens: u32,
-    tail_drop: TailDrop,
+    tail_drop: TailDrop<'_>,
 ) -> (u64, Option<StorageTier>) {
     let evidence: Vec<_> = groups
         .iter()
@@ -183,8 +188,14 @@ pub(in crate::kv_index) fn credit_from_pages(
     } else {
         0
     };
-    let (boundary, tail_proof) =
-        restore_boundary(&evidence, max_reusable_tokens, tail_drop.group, fine_unit);
+    let (boundary, tail_proof) = if let Some((tail, proof_within_cap)) = tail_drop.aligned {
+        (
+            aligned_tail_boundary(&evidence, max_reusable_tokens, tail, proof_within_cap),
+            None,
+        )
+    } else {
+        restore_boundary(&evidence, max_reusable_tokens, tail_drop.group, fine_unit)
+    };
     let credited = boundary.saturating_sub(u64::from(replay_tokens));
     let credited = align_down(credited, hash_block_size as u32);
     if credited == 0 {

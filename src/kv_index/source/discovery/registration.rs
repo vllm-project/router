@@ -162,14 +162,18 @@ impl KvIndexSupervisor {
         let connector = self.prefill_connector(worker_url);
         // With unknown connector metadata, price the shorter Prefill lookup.
         let truncates = match connector {
-            Some(KvConnector::Nixl) => server_info.nixl_truncates_bounded_replay,
+            // NIXL started trimming bounded-replay layouts in vLLM 0.32.
+            Some(KvConnector::Nixl) => server_info.vllm_version.map(|version| version >= (0, 32)),
             Some(KvConnector::Mooncake) => server_info.mooncake_truncates_compressed,
             _ => None,
         }
         .unwrap_or(true);
         let mut bindings = HashMap::new();
         event_sources.retain(|source| {
-            match capability.bind_worker_source(source, engine_model, 1_000_000) {
+            match capability
+                .bind_worker_source(source, engine_model, 1_000_000)
+                .and_then(|binding| binding.with_tail_proof_limit(server_info.vllm_version))
+            {
                 Ok(binding) => {
                     let binding = if assumed_plain_full {
                         binding.require_root_proof()

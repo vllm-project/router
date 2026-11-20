@@ -350,21 +350,26 @@ async fn query_worker_json<T: serde::de::DeserializeOwned>(
     serde_json::from_str(&body).map_err(|e| format!("{path} parse: {e}"))
 }
 
-pub(super) async fn query_nixl_bounded_replay(
+pub(super) async fn query_vllm_version(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-) -> Option<bool> {
+) -> Option<(u32, u32)> {
+    if crate::backend::is_grpc_url(worker_url) {
+        let info = crate::backend::control::get_grpc_server_info(worker_url, CONTROL_TIMEOUT)
+            .await
+            .ok()?;
+        return parse_vllm_version(&info.engine_version);
+    }
     let info: serde_json::Value = query_worker_json(client, worker_url, "version", true, api_key)
         .await
         .ok()?;
-    let version = info.get("version")?.as_str()?.trim_start_matches('v');
-    let mut parts = version.split('.');
-    let major = parts.next()?.parse::<u32>().ok()?;
-    let minor = parts.next()?.parse::<u32>().ok()?;
-    // vLLM 0.31 introduced bounded replay, then 0.32 extended the NIXL
-    // Prefill backoff to that layout.
-    Some((major, minor) >= (0, 32))
+    parse_vllm_version(info.get("version")?.as_str()?)
+}
+
+pub(super) fn parse_vllm_version(version: &str) -> Option<(u32, u32)> {
+    let mut parts = version.trim_start_matches('v').split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
 /// Worker cache metadata, tried in the order a deployment is likely to answer it:

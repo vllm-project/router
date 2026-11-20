@@ -1,6 +1,11 @@
 //! Compute the common restore boundary from cache-group evidence.
 
-use super::{GroupEvidence, GroupRule};
+use super::{align_down, GroupEvidence, GroupRule};
+
+pub(in crate::kv_index) struct AlignedTailDrop {
+    pub groups: Vec<u32>,
+    pub alignment: u32,
+}
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -32,7 +37,10 @@ pub(super) fn restore_boundary(
     // boundary it can restore under the current cap, the smallest one wins, and
     // the loop repeats because that smaller cap can invalidate a sliding
     // group's window.
-    let mut cursors: Vec<_> = groups.iter().map(BoundaryCursor::new).collect();
+    let mut cursors: Vec<_> = groups
+        .iter()
+        .map(|group| BoundaryCursor::new(group, false))
+        .collect();
     let tail = match tail_drop_group {
         None => None,
         Some(group_idx) => {
@@ -85,6 +93,45 @@ pub(super) fn restore_boundary(
     }
 }
 
+/// A dropped page proves that the preceding aligned boundary is reusable.
+/// Sliding groups need both their retained window and the extra trailing page.
+pub(super) fn aligned_tail_boundary(
+    groups: &[GroupEvidence],
+    cap: u64,
+    tail: &AlignedTailDrop,
+    proof_within_cap: bool,
+) -> u64 {
+    let mut boundary = cap;
+    let mut cursors: Vec<_> = groups
+        .iter()
+        .map(|evidence| {
+            let drop = tail.groups.contains(&evidence.group.group_idx);
+            if drop && proof_within_cap {
+                boundary = boundary.min(cap.saturating_sub(u64::from(evidence.group.block_size)));
+            }
+            let mut cursor = BoundaryCursor::new(evidence, drop);
+            cursor.partial_end = 0;
+            cursor
+        })
+        .collect();
+    boundary = align_down(boundary, tail.alignment);
+    while boundary != 0 {
+        let next = align_down(
+            cursors
+                .iter_mut()
+                .map(|cursor| cursor.predecessor(boundary))
+                .min()
+                .unwrap_or(0),
+            tail.alignment,
+        );
+        if next == boundary {
+            return boundary;
+        }
+        boundary = next;
+    }
+    0
+}
+
 /// Temporary, query-local predecessor cursor. Block ranges are inclusive;
 /// partial boundaries are exact token offsets and are never interpolated.
 struct BoundaryCursor {
@@ -96,16 +143,18 @@ struct BoundaryCursor {
 }
 
 impl BoundaryCursor {
-    fn new(evidence: &GroupEvidence) -> Self {
+    fn new(evidence: &GroupEvidence, drop_last: bool) -> Self {
         let group = evidence.group;
         let size = u64::from(group.block_size);
         let segments = evidence.segments.iter().copied();
+        let tail_pages = u64::from(drop_last);
         let mut ranges = Vec::new();
         match group.kind {
             GroupRule::FullAttention | GroupRule::CompressedFullAttention { .. } => {
-                let end = super::full_attention_prefix(segments);
+                let end =
+                    u64::from(super::full_attention_prefix(segments)).saturating_sub(tail_pages);
                 if end != 0 {
-                    ranges.push((1, u64::from(end)));
+                    ranges.push((1, end));
                 }
             }
             GroupRule::Checkpoint | GroupRule::SlidingWindow { .. } => {
@@ -121,7 +170,7 @@ impl BoundaryCursor {
                     } else {
                         u64::from(start).saturating_add(needed)
                     };
-                    let end = u64::from(end);
+                    let end = u64::from(end).saturating_sub(tail_pages);
                     if first <= end {
                         ranges.push((first, end));
                     }

@@ -15,6 +15,51 @@ fn target(name: &str, rank: u32) -> RoutableTarget {
     }
 }
 
+#[test]
+fn aligned_tail_requires_dense_and_window_guard_pages() {
+    let evidence = |group_idx, block_size, kind, segments| GroupEvidence {
+        group: CacheGroup {
+            group_idx,
+            block_size,
+            kind,
+        },
+        segments,
+        partial_ends: Vec::new(),
+    };
+    let mut groups = [
+        evidence(0, 560, GroupRule::Checkpoint, vec![(3, 4), (7, 8)]),
+        evidence(5, 560, GroupRule::FullAttention, vec![(0, 10)]),
+        evidence(6, 560, GroupRule::FullAttention, vec![(0, 10)]),
+        evidence(
+            7,
+            64,
+            GroupRule::SlidingWindow {
+                window_tokens: 2048,
+            },
+            vec![(3, 80)],
+        ),
+    ];
+    let tail = AlignedTailDrop {
+        groups: vec![5, 6, 7],
+        alignment: 2240,
+    };
+    let hit = |groups: &[GroupEvidence], cap, legacy| {
+        super::restore::aligned_tail_boundary(groups, cap, &tail, legacy)
+    };
+    assert_eq!(hit(&groups, 2799, true), 0);
+    assert_eq!(hit(&groups, 2800, true), 2240);
+    assert_eq!(hit(&groups, 4480, true), 2240);
+    assert_eq!(hit(&groups, 4480, false), 4480);
+
+    groups[2].segments = vec![(0, 4)];
+    assert_eq!(hit(&groups, 2800, true), 0);
+    groups[2].segments = vec![(0, 10)];
+    groups[3].segments = vec![(3, 35)];
+    assert_eq!(hit(&groups, 2800, true), 0);
+    groups[3].segments = vec![(3, 36)];
+    assert_eq!(hit(&groups, 2800, true), 2240);
+}
+
 fn page_view(group: &[TierBits]) -> crate::kv_index::storage::PageTiers<'_> {
     let prefix = group.first().copied().unwrap_or_default();
     let prefix_len = group.iter().take_while(|&&bits| bits == prefix).count();
@@ -262,6 +307,7 @@ fn mtp_tail_proof_restores_the_mamba_checkpoint_and_prices_the_dense_page() {
             TailDrop {
                 group: Some(3),
                 fine_grained: true,
+                ..Default::default()
             },
         )
     };
