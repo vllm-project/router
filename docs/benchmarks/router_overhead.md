@@ -60,8 +60,9 @@ size constant within each cell. Reports distinguish `text<bytes>` from
 | `policy/{cache_aware,rendezvous_hash}` | Select among four healthy workers using a warmed hot set |
 | `cache_aware_key_format` | Insert and prefix-match raw text, one character per token, or tagged decimal IDs at 128–8192 tokens; tree operations only |
 | `edge/cache_aware` | Select from long keys, threshold cases, imbalanced loads and UTF-8 keys |
-| `edge/long_input` | Parse through `axum::Json`, extract routing text and serialize completion/chat bodies; also parse equal-sized CJK inputs |
+| `edge/long_input` | Parse and serialize completion and chat bodies, extract routing text, read the sticky session ID from typed chat requests, and parse equal-sized CJK inputs |
 | `edge/rendezvous` | Select using long prompts, session headers or JSON-like fields in prompt text |
+| `edge/sticky_least_loaded_stateless` | Select from a serialized completion body without a session ID, across 4, 16 and 64 workers |
 | `edge/token_ids` | Parse and extract routing text from ID prompts |
 | `edge/workers` | Select among 1, 4, 16 and 64 workers |
 
@@ -140,6 +141,7 @@ in flight per task.
 | `direct_chat` | Direct to mock worker | `/v1/chat/completions` |
 | `completions_off` | `cache_aware` | `/v1/completions` |
 | `completions_rendezvous` | `rendezvous_hash` | `/v1/completions` |
+| `completions_sticky_least_loaded` | `sticky_least_loaded` with no session ID in the request | `/v1/completions` |
 | `chat_off` | `cache_aware` | `/v1/chat/completions` |
 
 ### Configuration
@@ -148,7 +150,7 @@ All variables below have the prefix `VLLM_ROUTER_BENCH_`.
 
 | Suffix | Default | Meaning |
 |---|---|---|
-| `SCENARIOS` | All five above | Comma-separated scenario names |
+| `SCENARIOS` | All six above | Comma-separated scenario names |
 | `SIZES` | `200,2048,16384` | Text prompt bytes |
 | `CORPORA` | `hot64,cold` | Comma-separated corpus names |
 | `PROMPT_IDS` | None | ID counts; completions only, separate from text size/corpus combinations |
