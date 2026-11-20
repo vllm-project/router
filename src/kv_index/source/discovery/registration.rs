@@ -14,6 +14,7 @@ use super::{
     CacheKey, KvIndexSupervisor, LiveSource, SourcesProbe, WorkerDiscovery, WorkerKvInfo,
     WorkerSubs,
 };
+use crate::config::KvConnector;
 use crate::kv_index::{EventStream, SourceId};
 use crate::protocols::worker_spec::ServerInfo;
 
@@ -159,8 +160,13 @@ impl KvIndexSupervisor {
         let engine_model = layout_model(&server_info, &model_id, &capability);
         // Only Prefill declares compatible Decode targets.
         let connector = self.prefill_connector(worker_url);
-        // Without Mooncake metadata, bound compressed credit by the shorter lookup.
-        let truncates_compressed = server_info.mooncake_truncates_compressed.unwrap_or(true);
+        // With unknown connector metadata, price the shorter Prefill lookup.
+        let truncates = match connector {
+            Some(KvConnector::Nixl) => server_info.nixl_truncates_bounded_replay,
+            Some(KvConnector::Mooncake) => server_info.mooncake_truncates_compressed,
+            _ => None,
+        }
+        .unwrap_or(true);
         let mut bindings = HashMap::new();
         event_sources.retain(|source| {
             match capability.bind_worker_source(source, engine_model, 1_000_000) {
@@ -172,7 +178,7 @@ impl KvIndexSupervisor {
                     };
                     bindings.insert(
                         source.dp_rank,
-                        binding.with_pd_prefill(connector, truncates_compressed),
+                        binding.with_pd_prefill(connector, truncates),
                     );
                     true
                 }

@@ -350,6 +350,23 @@ async fn query_worker_json<T: serde::de::DeserializeOwned>(
     serde_json::from_str(&body).map_err(|e| format!("{path} parse: {e}"))
 }
 
+pub(super) async fn query_nixl_bounded_replay(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Option<bool> {
+    let info: serde_json::Value = query_worker_json(client, worker_url, "version", true, api_key)
+        .await
+        .ok()?;
+    let version = info.get("version")?.as_str()?.trim_start_matches('v');
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    // vLLM 0.31 introduced bounded replay, then 0.32 extended the NIXL
+    // Prefill backoff to that layout.
+    Some((major, minor) >= (0, 32))
+}
+
 /// Worker cache metadata, tried in the order a deployment is likely to answer it:
 /// the multi-backend control contract, the engine config endpoint, then the
 /// always-on `/metrics` scrape.

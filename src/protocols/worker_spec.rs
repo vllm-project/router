@@ -165,6 +165,9 @@ pub struct ServerInfo {
     /// Whether the worker's Mooncake connector trims compressed-model Prefill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mooncake_truncates_compressed: Option<bool>,
+    /// Whether NIXL trims Prefill for bounded sliding-window replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nixl_truncates_bounded_replay: Option<bool>,
     /// `--served-model-name` aliases, so the router can tell a base-model alias
     /// from a LoRA adapter selected through the request's `model`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

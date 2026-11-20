@@ -1838,6 +1838,12 @@ fn bounded_replay_credits_one_window_below_the_engine() {
         index.begin_empty(0);
         assert_eq!(index.apply_batch(0, &batch), Ok(()));
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), credit);
+        let mut cache = crate::kv_index::RequestHashCache::for_single_target();
+        cache.count_replay_pages = true;
+        assert_eq!(
+            index.credit_parts(None, &tokens, usize::MAX, &mut cache),
+            (896, Some(crate::kv_index::StorageTier::Device))
+        );
     }
 }
 

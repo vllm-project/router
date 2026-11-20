@@ -471,13 +471,37 @@ impl KvIndexSupervisor {
                 discovery
             }
         };
-        if self.prefill_connector(worker_url) != Some(KvConnector::Mooncake)
-            || !discovery.hybrid.as_ref().is_some_and(|layout| {
-                layout.ranks.iter().any(|rank| {
-                    rank.groups.iter().any(|group| {
-                        group.kind == "mla_attention" && group.tokens_per_state.is_some()
-                    })
-                })
+        let Some(layout) = discovery.hybrid.as_ref() else {
+            return discovery;
+        };
+        let connector = self.prefill_connector(worker_url);
+        if connector == Some(KvConnector::Nixl)
+            && layout.ranks.iter().any(|rank| {
+                rank.groups
+                    .iter()
+                    .any(|group| group.prefix_replay_tokens > 0)
+            })
+        {
+            if let Ok(info) = &mut discovery.server_info {
+                info.nixl_truncates_bounded_replay = tokio::time::timeout(
+                    CONTROL_TIMEOUT / 4,
+                    probe::query_nixl_bounded_replay(
+                        &self.client,
+                        split_worker_rank(worker_url).0,
+                        self.api_key.as_deref(),
+                    ),
+                )
+                .await
+                .ok()
+                .flatten();
+            }
+            return discovery;
+        }
+        if connector != Some(KvConnector::Mooncake)
+            || !layout.ranks.iter().any(|rank| {
+                rank.groups
+                    .iter()
+                    .any(|group| group.kind == "mla_attention" && group.tokens_per_state.is_some())
             })
         {
             return discovery;

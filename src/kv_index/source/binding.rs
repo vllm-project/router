@@ -204,18 +204,18 @@ impl SourceBinding {
     pub(in crate::kv_index) fn with_pd_prefill(
         mut self,
         connector: Option<KvConnector>,
-        truncates_compressed: bool,
+        truncates: bool,
     ) -> Self {
         let has_checkpoint = self
             .groups
             .iter()
             .any(|group| group.kind == GroupRule::Checkpoint);
         self.prefill_truncates_prompt = match connector {
-            Some(KvConnector::Nixl) => has_checkpoint,
+            Some(KvConnector::Nixl) => has_checkpoint || (truncates && self.replay_tokens != 0),
             Some(KvConnector::Mooncake) => {
                 has_checkpoint
                     || self.replay_tokens != 0
-                    || truncates_compressed
+                    || truncates
                         && self.groups.iter().any(|group| {
                             matches!(group.kind, GroupRule::CompressedFullAttention { .. })
                         })
@@ -535,6 +535,11 @@ impl SourceBinding {
         max_reusable_tokens: usize,
         cache: &mut RequestHashCache<'a>,
     ) -> (u64, Option<StorageTier>) {
+        let replay_tokens = if cache.count_replay_pages {
+            0
+        } else {
+            self.replay_tokens
+        };
         let snapshot = self.page_snapshot(namespace, tokens, true, cache);
         let Some((claims, version, reset_generation)) = snapshot else {
             return (0, None);
@@ -551,7 +556,7 @@ impl SourceBinding {
             self.keys.block_size(),
             self.reusable_prompt_cap(tokens.len())
                 .min(max_reusable_tokens) as u64,
-            self.replay_tokens,
+            replay_tokens,
             TailDrop {
                 group: self.tail_drop_group,
                 fine_grained: self.partial_hash_hits,

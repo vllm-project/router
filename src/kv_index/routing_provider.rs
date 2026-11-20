@@ -127,6 +127,8 @@ pub struct RequestHashCache<'a> {
     pub(crate) single_target: bool,
     /// Built-in scoring only consumes a device prefix and its tier continuation.
     pub(crate) stop_at_gap: bool,
+    /// NIXL Decode counts resident pages even when rebuilding the sliding window.
+    pub(crate) count_replay_pages: bool,
     seen: HashMap<PromptKey<'a>, usize, RandomState>,
     prompts: HashMap<&'a [u32], usize, RandomState>,
     prepared: Vec<(&'a [u32], Vec<PreparedChain>)>,

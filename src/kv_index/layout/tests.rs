@@ -789,6 +789,19 @@ mod declarations {
                 .with_pd_prefill(connector, truncates_compressed);
             assert_eq!(binding.reusable_prompt_cap(16385), expected);
         }
+        let window = &mut value["ranks"][0]["groups"][0];
+        window["prefix_cacheable"] = false.into();
+        window["prefix_replay_tokens"] = 128.into();
+        for (connector, truncates, expected) in [
+            (Some(KvConnector::Nixl), true, 1023),
+            (Some(KvConnector::Nixl), false, 1024),
+            (None, true, 1024),
+        ] {
+            let binding = bind_layout(&value, "ds4")
+                .unwrap()
+                .with_pd_prefill(connector, truncates);
+            assert_eq!(binding.reusable_prompt_cap(1025), expected);
+        }
         value["ranks"][0]["groups"][0]["sliding_window"] = 0.into();
         assert!(bind_layout(&value, "ds4").is_err());
         value["ranks"][0]["groups"] = serde_json::json!([]);

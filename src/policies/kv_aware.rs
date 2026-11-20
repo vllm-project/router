@@ -1047,11 +1047,16 @@ impl PromptHashes<'_> {
         Self::default()
     }
 
-    fn set_stage_targets(&mut self, inputs: &[(&dyn Worker, &[Vec<u32>], bool)]) {
+    fn set_stage_targets(
+        &mut self,
+        inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
+        count_replay_pages: bool,
+    ) {
         // Events and target registrations can change between prefill and decode.
         self.matches.clear();
         self.hashes.first_trust_check = None;
         self.hashes.stop_at_gap = true;
+        self.hashes.count_replay_pages = count_replay_pages;
         self.hashes.single_target = inputs
             .iter()
             .filter(|(_, prompts, credit)| *credit && !prompts.is_empty())
@@ -1975,7 +1980,7 @@ impl KvAwareOps for KvAwarePolicy {
         inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
         hashes: &mut PromptHashes<'tokens>,
     ) -> Vec<PrefillWorkEstimate> {
-        hashes.set_stage_targets(inputs);
+        hashes.set_stage_targets(inputs, false);
         let mut lookups = crate::metrics::PlacementLookups::default();
         let mut unique = hashes.hashes.single_target.then_some(true);
         inputs
@@ -2047,7 +2052,7 @@ impl KvAwareOps for KvAwarePolicy {
         hashes: &mut PromptHashes<'tokens>,
         nixl_pull: bool,
     ) -> Vec<DecodeWorkEstimate> {
-        hashes.set_stage_targets(inputs);
+        hashes.set_stage_targets(inputs, nixl_pull);
         let mut lookups = crate::metrics::PlacementLookups::default();
         let mut unique = hashes.hashes.single_target.then_some(true);
         inputs
