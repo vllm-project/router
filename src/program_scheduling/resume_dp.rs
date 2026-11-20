@@ -265,14 +265,14 @@ mod tests {
             };
             let selected = solve(&programs, &caps, &cfg);
             assert!(!selected.is_empty());
-            for target in 0..2 {
+            for (target, capacity) in caps.iter().enumerate() {
                 let tokens: usize = programs
                     .iter()
                     .flatten()
                     .filter(|o| o.target == target && selected.contains(&o.index))
                     .map(|o| o.tokens)
                     .sum();
-                assert!(tokens <= caps[target].0);
+                assert!(tokens <= capacity.0);
             }
         }
     }
