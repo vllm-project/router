@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use rand::Rng;
 use sha2::{Digest as _, Sha256};
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
+use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::kv_index::{CacheKey, MatchQuery, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo};
 use crate::request_identity::StableIdentity;
@@ -938,19 +938,6 @@ impl Picker for TemperaturePicker {
     }
 }
 
-/// Picks uniformly among tied candidates.
-///
-/// Equal scores carry no ranking evidence. Keeping the first candidate would
-/// encode slice order as a preference: with an idle pool every cold request of
-/// the same length has one cost, and all of them would land on the same worker.
-fn pick_tied(candidates: &[usize]) -> Option<usize> {
-    match candidates {
-        [] => None,
-        [only] => Some(*only),
-        _ => Some(candidates[rand::rng().random_range(0..candidates.len())]),
-    }
-}
-
 /// Picks uniformly among the candidates that share the lowest cost.
 ///
 /// The ranking still decides which candidates are eligible; chance only
@@ -973,6 +960,10 @@ impl TieredMatchProvider for EmptyMatchProvider {
     fn find_tiered_matches(&self, _query: &MatchQuery) -> Vec<TierMatch> {
         Vec::new()
     }
+}
+
+fn provider_id(provider: &Arc<dyn TieredMatchProvider>) -> usize {
+    Arc::as_ptr(provider) as *const () as usize
 }
 
 #[derive(Clone)]
@@ -1302,20 +1293,39 @@ impl KvAwarePolicy {
         excluded_workers: &[String],
     ) -> Option<KvSelectionReceipt> {
         let digest = affinity_key.map(|key| key.scoped_digest(lora_name, cache_salt));
-        // Re-query at most three times under registration churn. The final
-        // attempt snapshots current targets and reserves using live load only.
+        // Run up to three rounds of placement queries under registration churn.
+        // The final attempt scores live load and full input work without querying
+        // placement or granting KV credit.
         for attempt in 0..=3 {
             let fallback_guard = (attempt == 3).then(|| self.selection_lock.lock());
             let plan = if fallback_guard.is_some() {
                 let (healthy, bindings) = self.selection_targets(workers)?;
                 let count = healthy.len();
+                let input_tokens: Vec<Option<usize>> = healthy
+                    .iter()
+                    .map(|&index| {
+                        let prompts = input.tokens.prompts_for(workers[index].as_ref());
+                        (!prompts.is_empty()).then(|| {
+                            prompts
+                                .iter()
+                                .map(|ids| ids.len())
+                                .fold(0, usize::saturating_add)
+                        })
+                    })
+                    .collect();
+                // As in normal preparation, bound missing input using current
+                // healthy peers. A supplied empty prompt is known zero.
+                let max_known_input = input_tokens.iter().flatten().copied().max().unwrap_or(0);
                 SelectionPlan {
                     healthy,
                     bindings,
                     grouped: vec![Vec::new(); count],
-                    input_tokens: vec![0; count],
+                    input_tokens: input_tokens
+                        .into_iter()
+                        .map(|tokens| tokens.unwrap_or(max_known_input))
+                        .collect(),
                     prefill_tokens: vec![None; count],
-                    has_tokens: false,
+                    has_tokens: max_known_input > 0,
                 }
             } else {
                 self.prepare_selection(workers, input, lora_name, cache_salt)?
@@ -1389,6 +1399,8 @@ impl KvAwarePolicy {
                 self.decision_for_position(&plan, &candidates, &costs, &components, position);
             let outcome = if used_binding {
                 "sticky_hit"
+            } else if attempt == 3 {
+                "registration_churn"
             } else if !plan.has_tokens {
                 "missing_tokens"
             } else if let Some(reason) = Self::credit_fallback(cache_salt, true) {
@@ -1514,7 +1526,8 @@ impl KvAwarePolicy {
         if !has_tokens {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("missing_tokens");
         }
-        let mut query_cache: HashMap<(Option<CacheKey>, &[u32]), Vec<TierMatch>> = HashMap::new();
+        // The binding snapshot owns these provider Arcs for the memo lifetime.
+        let mut query_cache = HashMap::new();
         let mut grouped = Vec::with_capacity(bindings.len());
         let mut input_tokens = Vec::with_capacity(bindings.len());
         let mut prefill_tokens = Vec::with_capacity(bindings.len());
@@ -1530,7 +1543,11 @@ impl KvAwarePolicy {
                         continue;
                     }
                     let hits = query_cache
-                        .entry((binding.cache_key.clone(), ids))
+                        .entry((
+                            provider_id(&binding.matches),
+                            binding.cache_key.clone(),
+                            *ids,
+                        ))
                         .or_insert_with(|| {
                             if let Some(reason) = credit_fallback {
                                 crate::metrics::RouterMetrics::record_kv_placement_lookup(reason);
@@ -1863,13 +1880,23 @@ impl KvAwareOps for KvAwarePolicy {
                 let mut new_prefill_tokens = 0u64;
                 for tokens in prompts {
                     let hits = if verified {
-                        let key = (binding.cache_key.clone(), prompt_fingerprint(tokens));
+                        let key = (
+                            provider_id(&binding.matches),
+                            binding.cache_key.clone(),
+                            prompt_fingerprint(tokens),
+                        );
                         query_cache
                             .entry(key)
                             .or_insert_with(|| {
                                 let local = hashes.hashes_for(binding.block_size, tokens);
-                                Self::placement_matches_with(&binding, local)
+                                // Keep the allocation alive even if a later
+                                // input observes a replaced registration.
+                                (
+                                    binding.matches.clone(),
+                                    Self::placement_matches_with(&binding, local),
+                                )
                             })
+                            .1
                             .as_slice()
                     } else {
                         &[]
@@ -1939,13 +1966,21 @@ impl KvAwareOps for KvAwarePolicy {
                 };
                 let mut additional = 0u64;
                 for tokens in prompts {
-                    let key = (binding.cache_key.clone(), prompt_fingerprint(tokens));
+                    let key = (
+                        provider_id(&binding.matches),
+                        binding.cache_key.clone(),
+                        prompt_fingerprint(tokens),
+                    );
                     let hits = query_cache
                         .entry(key)
                         .or_insert_with(|| {
                             let local = hashes.hashes_for(binding.block_size, tokens);
-                            Self::placement_matches_with(&binding, local)
+                            (
+                                binding.matches.clone(),
+                                Self::placement_matches_with(&binding, local),
+                            )
                         })
+                        .1
                         .as_slice();
                     let matches: Vec<_> = hits
                         .iter()
@@ -3766,6 +3801,109 @@ mod tests {
     }
 
     #[test]
+    fn placement_memos_keep_distinct_providers_and_reuse_shared_arcs() {
+        struct Matches {
+            calls: AtomicUsize,
+            hits: Vec<TierMatch>,
+        }
+        impl TieredMatchProvider for Matches {
+            fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.hits.clone()
+            }
+        }
+        let policy = KvAwarePolicy::default();
+        let workers = registered_worker_pair(&policy);
+        let first = Arc::new(Matches {
+            calls: AtomicUsize::new(0),
+            hits: Vec::new(),
+        });
+        let second = Arc::new(Matches {
+            calls: AtomicUsize::new(0),
+            hits: vec![tier_match(
+                &target(workers[1].url(), 0),
+                StorageTier::Device,
+                &[(0, 1)],
+            )],
+        });
+        let info = WorkerKvInfo {
+            cache_key: Some(CacheKey {
+                model: Arc::from("shared"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size: 2,
+            }),
+            ..Default::default()
+        };
+        for (worker, provider) in workers.iter().zip([
+            first.clone() as Arc<dyn TieredMatchProvider>,
+            second.clone(),
+        ]) {
+            policy.register_worker(worker.as_ref(), Some(&info), Some(provider));
+        }
+        let prompts = [vec![1, 2, 3, 4]];
+        for shared in [false, true] {
+            if shared {
+                policy.register_worker(workers[1].as_ref(), Some(&info), Some(first.clone()));
+            }
+            let calls_before = [
+                first.calls.load(Ordering::Relaxed),
+                second.calls.load(Ordering::Relaxed),
+            ];
+            // An exclusion fixes the selected target, not its placement credit.
+            let receipt = policy
+                .select_worker_with_receipt(
+                    &workers,
+                    Some(&prompts[0]),
+                    None,
+                    None,
+                    None,
+                    &[workers[0].url().to_owned()],
+                )
+                .unwrap();
+            let inputs = [
+                (workers[0].as_ref(), prompts.as_slice(), true),
+                (workers[1].as_ref(), prompts.as_slice(), true),
+            ];
+            let mut hashes = PromptHashes::new();
+            let prefill = policy.estimate_prefill_work(&inputs, &mut hashes);
+            let decode = policy.estimate_decode_work(&inputs, &mut hashes);
+            let expected = if shared { 4 } else { 2 };
+            let actual = (
+                receipt.new_prefill_tokens,
+                prefill
+                    .iter()
+                    .map(|estimate| estimate.new_prefill_tokens)
+                    .collect::<Vec<_>>(),
+                decode
+                    .iter()
+                    .map(|estimate| estimate.additional_tokens)
+                    .collect::<Vec<_>>(),
+            );
+            release_receipt(&workers, &receipt);
+            assert_eq!(
+                actual,
+                (expected, vec![4, expected], vec![Some(4), Some(expected)]),
+                "shared={shared}"
+            );
+            assert_eq!(receipt.worker_index, 1);
+            assert!(prefill.iter().all(|estimate| estimate.placement_verified));
+            assert_eq!(
+                [
+                    first.calls.load(Ordering::Relaxed) - calls_before[0],
+                    second.calls.load(Ordering::Relaxed) - calls_before[1],
+                ],
+                [3, if shared { 0 } else { 3 }],
+                "each request-local memo reuses only the same provider Arc"
+            );
+            assert_eq!(
+                policy.load.sample(&receipt.decision.target),
+                LoadSample::default()
+            );
+            assert_eq!(workers[1].load(), 0);
+        }
+    }
+
+    #[test]
     fn pd_prefill_queries_once_per_cache_identity_and_prompt() {
         struct Matches {
             calls: AtomicUsize,
@@ -3830,6 +3968,155 @@ mod tests {
                 .collect::<Vec<_>>(),
             [false, true, true, true, true]
         );
+    }
+
+    #[test]
+    fn churn_fallback_preserves_each_workers_known_input() {
+        #[derive(Default)]
+        struct Churn {
+            replace: Mutex<Option<Box<dyn Fn() + Send>>>,
+            queries: AtomicUsize,
+        }
+        impl TieredMatchProvider for Churn {
+            fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
+                self.queries.fetch_add(1, Ordering::Relaxed);
+                self.replace.lock().as_ref().unwrap()();
+                Vec::new()
+            }
+        }
+        let policy = Arc::new(KvAwarePolicy::new(CostParams {
+            router_temperature: 0.0,
+            ..CostParams::default()
+        }));
+        let workers = registered_worker_pair(&policy);
+        let matches = Arc::new(Churn::default());
+        let info = WorkerKvInfo {
+            cache_key: Some(CacheKey {
+                model: Arc::from("model"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size: 16,
+            }),
+            ..WorkerKvInfo::default()
+        };
+        for worker in &workers {
+            policy.register_worker(worker.as_ref(), Some(&info), Some(matches.clone()));
+        }
+        let weak_policy = Arc::downgrade(&policy);
+        let weak_matches = Arc::downgrade(&matches);
+        let registered = workers.clone();
+        // Every query replaces both registrations, forcing selection to reach
+        // the final, query-free attempt rather than reserve a stale snapshot.
+        *matches.replace.lock() = Some(Box::new(move || {
+            for worker in &registered {
+                weak_policy.upgrade().unwrap().register_worker(
+                    worker.as_ref(),
+                    Some(&info),
+                    Some(weak_matches.upgrade().unwrap()),
+                );
+            }
+        }));
+        let both_known: [Option<&[usize]>; 2] = [Some(&[33]), Some(&[17])];
+        let missing_second = [both_known[0], None];
+        for (case, lengths, excluded, chosen, expected, queries) in [
+            ("known and missing", missing_second, None, None, 33, 3),
+            ("both known", both_known, None, Some(1), 17, 6),
+            ("forced longer", both_known, Some(1), Some(0), 33, 6),
+            ("forced shorter", both_known, Some(0), Some(1), 17, 6),
+            ("forced missing", missing_second, Some(0), Some(1), 33, 3),
+            (
+                "empty prompt",
+                [Some(&[33]), Some(&[0])],
+                None,
+                Some(1),
+                0,
+                3,
+            ),
+            ("all unknown", [None, None], None, None, 0, 0),
+            ("two prompts", [Some(&[17, 16]); 2], None, None, 33, 6),
+        ] {
+            let inputs: WorkerTokenInputs = workers
+                .iter()
+                .zip(lengths)
+                .filter_map(|(worker, lengths)| {
+                    lengths.map(|lengths| {
+                        (
+                            worker.base_url().to_owned(),
+                            Arc::from(
+                                lengths
+                                    .iter()
+                                    .map(|&length| vec![7; length])
+                                    .collect::<Vec<_>>(),
+                            ),
+                        )
+                    })
+                })
+                .collect();
+            let excluded: Vec<_> = excluded
+                .map(|index: usize| workers[index].url().to_owned())
+                .into_iter()
+                .collect();
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let queries_before = matches.queries.load(Ordering::Relaxed);
+            let receipt = metrics::with_local_recorder(&recorder, || {
+                policy.select_worker_with_inputs(
+                    &workers,
+                    KvRequestTokens::PerWorker(&inputs),
+                    None,
+                    None,
+                    None,
+                    &excluded,
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                matches.queries.load(Ordering::Relaxed) - queries_before,
+                queries,
+                "{case}",
+            );
+            if let Some(chosen) = chosen {
+                assert_eq!(receipt.worker_index, chosen, "{case}");
+            }
+            let worker = &workers[receipt.worker_index];
+            let target = &receipt.decision.target;
+            let reserved = policy.load.sample(target);
+            assert_eq!(
+                receipt.new_prefill_tokens,
+                expected,
+                "{case}: {} (cost {}, reserved {reserved:?})",
+                worker.url(),
+                receipt.decision.cost,
+            );
+            assert_eq!(receipt.decision.components.ptoken, expected, "{case}");
+            assert_eq!(receipt.decision.cost, expected as f64, "{case}");
+            assert_eq!(
+                reserved,
+                LoadSample {
+                    active_prefill_tokens: expected,
+                    active_requests: 1,
+                },
+                "{case}",
+            );
+            assert_eq!(worker.load(), 1, "{case}");
+            release_receipt(&workers, &receipt);
+            assert_eq!(policy.load.sample(target), LoadSample::default(), "{case}");
+            assert_eq!(worker.load(), 0, "{case}");
+
+            let rendered = recorder.handle().render();
+            let mut outcomes = rendered
+                .lines()
+                .filter(|line| line.starts_with("vllm_router_prefix_routing_decisions_total{"));
+            let reason = if queries == 0 {
+                "missing_tokens"
+            } else {
+                "registration_churn"
+            };
+            assert!(
+                outcomes.next().is_some_and(|line| {
+                    line.contains(&format!("outcome=\"{reason}\"")) && line.ends_with(" 1")
+                }) && outcomes.next().is_none(),
+                "{case}: {rendered}",
+            );
+        }
     }
 
     #[test]
@@ -3900,7 +4187,7 @@ mod tests {
             workers[0].set_healthy(true);
         }
         // Every placement query changes the target generation. Selection must
-        // terminate with a current load-only reservation after three queries.
+        // terminate with a current full-input reservation after three queries.
         let weak_policy = Arc::downgrade(&policy);
         let weak_matches = Arc::downgrade(&matches);
         let churn_worker = workers[0].clone();
@@ -3916,7 +4203,7 @@ mod tests {
         let queries_before = matches.2.load(Ordering::Relaxed);
         let receipt = select().unwrap();
         assert_eq!(matches.2.load(Ordering::Relaxed) - queries_before, 3);
-        assert_eq!(receipt.new_prefill_tokens, 0);
+        assert_eq!(receipt.new_prefill_tokens, 5);
         release_receipt(&workers, &receipt);
     }
 
