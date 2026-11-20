@@ -173,6 +173,14 @@ switch to `active`. In `active` mode, a mature workflow prediction replaces the
 rank-level fitted TTL. Insufficient support falls back to the fitted TTL, and a
 request-scoped TTL remains authoritative.
 
+Return-time keys are captured for each request at arrival, including its assigned
+step, and retained through admission and retries. Overlapping requests completing
+out of order therefore use their own workflow keys for TTL selection and feedback.
+
+Shadow scheduling decisions remain unchanged. Predicted TTL suggestions in logs
+and metrics use the shortest utility-maximizing candidate and the cache-miss-cost
+cap, so these observational values may differ from earlier versions.
+
 An offline profile is optional. If `profile_path` is configured,
 `workflow_profile_id` and `profile_version` select compatible seeded entries;
 the bounded online overlay continues learning from current traffic.
@@ -194,6 +202,10 @@ Before enabling `active`, verify all of the following:
    appears for eligible completions.
 6. Backend `cached_prompt_tokens` confirms that retained Programs actually
    preserve reusable KV.
+
+The diagnostics endpoint exposes predicted TTL, support, backoff level, and
+prediction source. Baseline and applied TTLs are structured log fields; they
+are not additional fields on the diagnostics endpoint.
 
 Useful aggregate metrics include
 `vllm_router_workflow_return_prediction_total`,

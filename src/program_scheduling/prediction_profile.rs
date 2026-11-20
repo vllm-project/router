@@ -993,4 +993,12 @@ mod tests {
         store.observe_output(&[second], 20);
         assert_eq!(store.output_key_count(), 1);
     }
+    #[test]
+    fn best_ttl_alone_enforces_both_configured_and_recompute_cost_caps() {
+        let counts = [20.0, 0.0, 0.0];
+        let bounds = [0.5, 1.0, 2.0];
+        assert_eq!(best_ttl(&counts, 0.0, &bounds, 0.4, 10.0, 0.5), 0.0);
+        assert_eq!(best_ttl(&counts, 0.0, &bounds, 0.8, 10.0, 0.5), 0.5);
+        assert_eq!(best_ttl(&counts, 0.0, &bounds, 8.0, 0.25, 0.5), 0.0);
+    }
 }

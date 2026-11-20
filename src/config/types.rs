@@ -144,6 +144,13 @@ pub enum PredictionMode {
     Active,
 }
 
+impl PredictionMode {
+    /// Only Active predictions may alter acting TTLs, and only outside PD mode.
+    pub(crate) fn applies_acting_ttl(self, pd_mode: bool) -> bool {
+        self == Self::Active && !pd_mode
+    }
+}
+
 /// Shared configuration for workflow-profile predictors.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PredictionProfileConfig {

@@ -30,7 +30,7 @@ struct CapacityVictim {
     status: ProgramStatus,
     score: f64,
     sort_private_tokens: f64,
-    retention_value: f64,
+    retention_value: Option<f64>,
     retention_ttl_seconds: f64,
     cache_miss_impact_seconds: f64,
 }
@@ -57,7 +57,12 @@ impl CapacityVictim {
             CapacityRepairPolicy::Legacy => Self::legacy_cmp(left, right),
             CapacityRepairPolicy::RetentionValue => left
                 .retention_value
-                .total_cmp(&right.retention_value)
+                .is_none()
+                .cmp(&right.retention_value.is_none())
+                .then_with(|| match (left.retention_value, right.retention_value) {
+                    (Some(left), Some(right)) => left.total_cmp(&right),
+                    _ => Ordering::Equal,
+                })
                 .then_with(|| Self::legacy_cmp(left, right)),
         }
     }
@@ -273,33 +278,26 @@ impl ProgramScheduler {
                 Some(CompletionAction::StartActingTtl)
                     | Some(CompletionAction::Pause(ProgramPauseReason::CapacityRepair))
             ) {
-            state.decisions.get(dispatch.program()).map(|decision| {
-                let keys = return_time::keys_for_decision(
-                    decision,
-                    dispatch.program().model_pool(),
-                    &self.config.prediction_profile,
-                );
-                let prediction = state.prediction_profiles.predict_return(
-                    &keys,
-                    0.0,
-                    self.config.prediction_profile.return_time_horizon_seconds,
-                    self.config.prediction_profile.return_time_min_support,
-                    self.config.prediction_profile.prior_weight,
-                    cache_miss_impact_seconds,
-                    self.config
-                        .progress_ttl
-                        .max_acting_ttl
-                        .as_secs_f64()
-                        .min(cache_miss_impact_seconds),
-                );
-                return_time::PendingReturnPrediction { keys, prediction }
-            })
+            let keys = dispatch.return_time_keys().to_vec();
+            let prediction = state.prediction_profiles.predict_return(
+                &keys,
+                0.0,
+                self.config.prediction_profile.return_time_horizon_seconds,
+                self.config.prediction_profile.return_time_min_support,
+                self.config.prediction_profile.prior_weight,
+                cache_miss_impact_seconds,
+                self.config.progress_ttl.max_acting_ttl.as_secs_f64(),
+            );
+            Some(return_time::PendingReturnPrediction { keys, prediction })
         } else {
             None
         };
         let mut prediction_ttl_applied = false;
-        if self.config.prediction_profile.mode == PredictionMode::Active
-            && !self.config.pd_mode
+        if self
+            .config
+            .prediction_profile
+            .mode
+            .applies_acting_ttl(self.config.pd_mode)
             && completion_action == Some(CompletionAction::StartActingTtl)
             && dispatch.request_hints().kv_retention_ttl.is_none()
         {
@@ -307,15 +305,7 @@ impl ProgramScheduler {
                 .as_ref()
                 .and_then(|pending| pending.prediction.as_ref())
             {
-                acting_ttl = std::time::Duration::from_secs_f64(
-                    prediction.suggested_ttl_seconds.min(
-                        self.config
-                            .progress_ttl
-                            .max_acting_ttl
-                            .as_secs_f64()
-                            .min(cache_miss_impact_seconds),
-                    ),
-                );
+                acting_ttl = std::time::Duration::from_secs_f64(prediction.suggested_ttl_seconds);
                 prediction_ttl_applied = true;
             }
         }
@@ -548,16 +538,9 @@ impl ProgramScheduler {
             }
 
             if completion_action == Some(CompletionAction::Terminate) {
-                let keys = state.decisions.get(dispatch.program()).map(|decision| {
-                    return_time::keys_for_decision(
-                        decision,
-                        dispatch.program().model_pool(),
-                        &self.config.prediction_profile,
-                    )
-                });
-                if let Some(keys) = keys {
-                    state.prediction_profiles.observe_no_return(&keys);
-                }
+                state
+                    .prediction_profiles
+                    .observe_no_return(dispatch.return_time_keys());
             } else if let Some(pending) = pending_return_prediction {
                 let prediction = pending.prediction.as_ref();
                 debug!(
@@ -859,23 +842,24 @@ impl ProgramScheduler {
                         };
                         let score = elapsed
                             * (1.0 / (input as f64 / average_prompt).max(1e-6).sqrt()).max(0.5);
-                        let retention_ttl_seconds = if program.status == ProgramStatus::Acting {
-                            decision.ttl_deadline.map_or(0.0, |deadline| {
-                                deadline.saturating_duration_since(now).as_secs_f64()
-                            })
-                        } else {
-                            decision.last_applied_acting_ttl.as_secs_f64()
-                        };
-                        let cache_miss_impact_seconds =
-                            decision.last_cache_miss_impact_seconds.max(0.0);
+                        let retention = CapacityRepairPolicy::victim_value(
+                            program.status,
+                            decision.completed_requests,
+                            decision
+                                .ttl_deadline
+                                .map(|deadline| deadline.saturating_duration_since(now))
+                                .unwrap_or_default(),
+                            decision.last_applied_acting_ttl,
+                            decision.last_cache_miss_impact_seconds,
+                        );
                         victims.push(CapacityVictim {
                             reference: program.reference.clone(),
                             status: program.status,
                             score,
                             sort_private_tokens: private_tokens,
-                            retention_value: retention_ttl_seconds * cache_miss_impact_seconds,
-                            retention_ttl_seconds,
-                            cache_miss_impact_seconds,
+                            retention_value: retention.value,
+                            retention_ttl_seconds: retention.ttl_seconds,
+                            cache_miss_impact_seconds: retention.cache_miss_impact_seconds,
                         });
                     }
                 }
@@ -923,7 +907,8 @@ impl ProgramScheduler {
                     target = %target_id,
                     policy = repair_policy.as_str(),
                     status = ?victim.status,
-                    retention_value = victim.retention_value,
+                    retention_value = victim.retention_value.unwrap_or_default(),
+                    retention_value_observed = victim.retention_value.is_some(),
                     retention_ttl_seconds = victim.retention_ttl_seconds,
                     cache_miss_impact_seconds = victim.cache_miss_impact_seconds,
                     legacy_score = victim.score,
@@ -1466,7 +1451,7 @@ mod tests {
                     status: ProgramStatus::Acting,
                     score: 10.0,
                     sort_private_tokens: 100.0,
-                    retention_value: 5.0,
+                    retention_value: Some(5.0),
                     retention_ttl_seconds: 5.0,
                     cache_miss_impact_seconds: 1.0,
                 },
@@ -1475,7 +1460,7 @@ mod tests {
                     status: ProgramStatus::Acting,
                     score: 1.0,
                     sort_private_tokens: 100.0,
-                    retention_value: 0.0,
+                    retention_value: Some(0.0),
                     retention_ttl_seconds: 0.0,
                     cache_miss_impact_seconds: 1.0,
                 },
@@ -1493,6 +1478,16 @@ mod tests {
             CapacityVictim::cmp_for_policy(left, right, CapacityRepairPolicy::RetentionValue)
         });
         assert_eq!(retention_value[0].reference, *low_retention_value.program());
+        for value in [Some(0.0), None] {
+            let mut tied = make_victims();
+            for victim in &mut tied {
+                victim.retention_value = value;
+            }
+            tied.sort_by(|left, right| {
+                CapacityVictim::cmp_for_policy(left, right, CapacityRepairPolicy::RetentionValue)
+            });
+            assert_eq!(tied[0].reference, *high_legacy_score.program());
+        }
     }
 
     #[tokio::test]
@@ -1679,5 +1674,294 @@ mod tests {
         let state = scheduler.state.lock();
         assert_eq!(state.observations["rank-0"].active_program_token_delta, 0.0);
         assert!(!state.decisions.contains_key(dispatch.program()));
+    }
+    #[tokio::test]
+    async fn out_of_order_completion_keeps_request_keys_for_ttl_and_training() {
+        for mode in [PredictionMode::Shadow, PredictionMode::Active] {
+            for terminal in [false, true] {
+                for explicit_steps in [false, true] {
+                    let mut config = ProgramSchedulerConfig::default();
+                    config.prediction_profile.mode = mode;
+                    config.prediction_profile.step_bucket_size = 1;
+                    config.prediction_profile.return_time_min_support = 1;
+                    let scheduler = ProgramScheduler::new(config);
+                    let target = ProgramTarget {
+                        id: "rank-0".into(),
+                        base_url: "http://rank-0".into(),
+                        dp_rank: Some(0),
+                    };
+                    let request = |step: u64, reason: &str| {
+                        let mut context = json!({"program_id":"overlap", "expected_resume":true,
+                            "workflow_profile_id":"test", "profile_version":"v1", "spawn_reason":reason});
+                        if explicit_steps {
+                            context["step_id"] = json!(step);
+                        }
+                        ProgramIdentity::from_request(
+                            None,
+                            Some(&json!({"vllm_xargs":{"agentic_context":context}})),
+                            Some("model"),
+                        )
+                        .unwrap()
+                        .unwrap()
+                    };
+                    let first = scheduler
+                        .acquire(
+                            request(0, "first"),
+                            50_000,
+                            std::slice::from_ref(&target),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    let second = scheduler
+                        .acquire(
+                            request(1, "second"),
+                            50_000,
+                            std::slice::from_ref(&target),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    let first_key = first.return_time_keys()[0].clone();
+                    let second_key = second.return_time_keys()[0].clone();
+                    assert_eq!(first_key.step_bucket, Some(0));
+                    assert_eq!(second_key.step_bucket, Some(1));
+                    assert_eq!(first_key.spawn_reason.as_deref(), Some("first"));
+                    assert_eq!(second_key.spawn_reason.as_deref(), Some("second"));
+                    {
+                        let mut state = scheduler.state.lock();
+                        state
+                            .prediction_profiles
+                            .observe_return(std::slice::from_ref(&first_key), 1.0);
+                        state
+                            .prediction_profiles
+                            .observe_return(std::slice::from_ref(&second_key), 5.0);
+                    }
+                    scheduler.complete(&second, true, false, Some(50_000), Some(0.1));
+                    scheduler.complete(&first, true, terminal, Some(50_000), Some(0.1));
+                    if !terminal {
+                        {
+                            let state = scheduler.state.lock();
+                            let decision = &state.decisions[first.program()];
+                            let pending = decision.pending_return_prediction.as_ref().unwrap();
+                            assert_eq!(pending.keys[0], first_key);
+                            assert_eq!(
+                                pending.prediction.as_ref().unwrap().suggested_ttl_seconds,
+                                1.0
+                            );
+                            assert_eq!(
+                                decision.last_applied_acting_ttl,
+                                if mode == PredictionMode::Active {
+                                    Duration::from_secs(1)
+                                } else {
+                                    Duration::ZERO
+                                }
+                            );
+                        }
+                        let next = scheduler
+                            .acquire(request(2, "next"), 50_000, &[target], None)
+                            .await
+                            .unwrap();
+                        scheduler.complete(&next, true, true, Some(50_000), Some(0.1));
+                    }
+                    let state = scheduler.state.lock();
+                    let predict = |key| {
+                        state
+                            .prediction_profiles
+                            .predict_return(&[key], 0.0, 10.0, 1, 1.0, 8.0, 10.0)
+                            .unwrap()
+                    };
+                    assert_eq!(predict(first_key).support, 2);
+                    assert_eq!(predict(second_key).support, 1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_arrivals_snapshot_keys_before_later_identity_updates() {
+        use std::sync::Arc;
+        let config = ProgramSchedulerConfig {
+            max_active_programs_per_target: 1,
+            prediction_profile: crate::config::types::PredictionProfileConfig {
+                step_bucket_size: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let scheduler = Arc::new(ProgramScheduler::new(config));
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let blocker = scheduler
+            .acquire(
+                identity("blocker"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        let spawn = |step, reason| {
+            let scheduler = Arc::clone(&scheduler);
+            let target = target.clone();
+            let identity = ProgramIdentity::from_request(None,Some(&json!({"vllm_xargs":{"agentic_context":{
+                "program_id":"queued", "step_id":step,"spawn_reason":reason,"expected_resume":true
+            }}})),Some("model")).unwrap().unwrap();
+            tokio::spawn(async move {
+                scheduler
+                    .acquire(identity, 100, &[target], None)
+                    .await
+                    .unwrap()
+            })
+        };
+        let first = spawn(0, "first");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while scheduler
+                .state
+                .lock()
+                .runtime
+                .iter_views()
+                .map(|p| p.waiting_requests)
+                .sum::<usize>()
+                != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let second = spawn(1, "second");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while scheduler
+                .state
+                .lock()
+                .runtime
+                .iter_views()
+                .map(|p| p.waiting_requests)
+                .sum::<usize>()
+                != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        scheduler.complete(&blocker, true, true, Some(100), Some(0.1));
+        let first = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.return_time_keys()[0].step_bucket, Some(0));
+        assert_eq!(
+            first.return_time_keys()[0].spawn_reason.as_deref(),
+            Some("first")
+        );
+        assert_eq!(second.return_time_keys()[0].step_bucket, Some(1));
+        assert_eq!(
+            second.return_time_keys()[0].spawn_reason.as_deref(),
+            Some("second")
+        );
+        scheduler.complete(&first, true, false, Some(100), Some(0.1));
+        scheduler.complete(&second, true, true, Some(100), Some(0.1));
+    }
+
+    #[tokio::test]
+    async fn repair_preserves_unobserved_first_turn_until_observed_victims_are_released() {
+        for policy in [
+            CapacityRepairPolicy::Legacy,
+            CapacityRepairPolicy::RetentionValue,
+        ] {
+            let mut config = ProgramSchedulerConfig::default();
+            config.progress_ttl.token_capacity = Some(500);
+            config.progress_ttl.capacity_repair_policy = policy;
+            let scheduler = ProgramScheduler::new(config);
+            let target = ProgramTarget {
+                id: "rank-0".into(),
+                base_url: "http://rank-0".into(),
+                dp_rank: Some(0),
+            };
+            let old = scheduler
+                .acquire(
+                    ProgramIdentity::from_request(None,Some(&json!({"vllm_xargs":{"agentic_context":{ "program_id":"observed","expected_resume":true,"kv_retention_ttl_seconds":10.0 }}})),Some("model")).unwrap().unwrap(),
+                    100,
+                    std::slice::from_ref(&target),
+                    None,
+                )
+                .await
+                .unwrap();
+            scheduler.complete(&old, true, false, Some(100), Some(0.1));
+            let fresh = scheduler
+                .acquire(identity("unobserved"), 100, &[target], None)
+                .await
+                .unwrap();
+            let now = Instant::now();
+            let mut state = scheduler.state.lock();
+            // The old reservation is valuable but observed; zero on a fresh
+            // in-flight request must not mean a measured zero-value prefix.
+            let decision = state.decisions.get_mut(old.program()).unwrap();
+            decision.ttl_deadline = Some(now + Duration::from_secs(10));
+            decision.last_cache_miss_impact_seconds = 2.0;
+            decision.segment_started_at = Some(now - Duration::from_secs(20));
+            state
+                .decisions
+                .get_mut(fresh.program())
+                .unwrap()
+                .set_context_tokens(300);
+            assert_eq!(state.decisions[fresh.program()].completed_requests, 0);
+            assert!(scheduler.repair_capacity(&mut state, now));
+            assert!(!state.decisions[fresh.program()].pause_when_idle);
+            assert_eq!(
+                state.runtime.view(old.program()).unwrap().state,
+                ProgramState::Paused
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_can_still_release_unobserved_candidates_to_reach_capacity() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(500);
+        config.progress_ttl.capacity_repair_policy = CapacityRepairPolicy::RetentionValue;
+        let scheduler = ProgramScheduler::new(config);
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let first = scheduler
+            .acquire(identity("first"), 100, std::slice::from_ref(&target), None)
+            .await
+            .unwrap();
+        let second = scheduler
+            .acquire(identity("second"), 100, &[target], None)
+            .await
+            .unwrap();
+        let now = Instant::now();
+        let mut state = scheduler.state.lock();
+        state
+            .decisions
+            .get_mut(first.program())
+            .unwrap()
+            .set_context_tokens(300);
+        state
+            .decisions
+            .get_mut(first.program())
+            .unwrap()
+            .segment_started_at = Some(now - Duration::from_secs(10));
+        state
+            .decisions
+            .get_mut(second.program())
+            .unwrap()
+            .set_context_tokens(300);
+        assert!(scheduler.repair_capacity(&mut state, now));
+        assert!(state.decisions[first.program()].pause_when_idle);
+        assert!(!state.decisions[second.program()].pause_when_idle);
     }
 }
