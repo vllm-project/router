@@ -206,8 +206,14 @@ impl RouterManager {
             || labels.get("policy").is_some_and(|hint| hint == "kv_aware");
         if uses_kv && !labels.contains_key("served_model_aliases") {
             labels.extend(
-                crate::routers::served_model_labels(&self.client, &config.url, None, None, false)
-                    .await,
+                crate::routers::served_model_labels(
+                    &self.client,
+                    &config.url,
+                    None,
+                    None,
+                    Some(Default::default()),
+                )
+                .await,
             );
         }
 

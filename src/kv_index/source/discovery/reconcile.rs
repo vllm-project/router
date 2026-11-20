@@ -14,6 +14,16 @@ use super::{
 use crate::kv_index::CacheCapabilities;
 
 impl KvIndexSupervisor {
+    pub(crate) fn discovered_base_models(&self, worker_url: &str) -> Option<HashSet<String>> {
+        let lifecycles = self.lifecycles.lock();
+        let lifecycle = lifecycles.get(worker_url)?;
+        let state = lifecycle.state.lock();
+        (lifecycle.active.load(Ordering::Acquire)
+            && state.info.is_some()
+            && !state.base_models.is_empty())
+        .then(|| state.base_models.clone())
+    }
+
     /// Request preparation needs only model eligibility, not cloned registrations.
     pub(crate) fn worker_model_eligibility(
         &self,

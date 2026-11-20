@@ -24,20 +24,22 @@ pub use factory::RouterFactory;
 pub use http::{openai_router, pd_router, pd_types, router};
 
 /// Base-model names used to distinguish served aliases from LoRA names.
+/// Probe `/v1/models` only when no model-list snapshot was supplied.
 pub(crate) async fn served_model_labels(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
     dp_rank: Option<usize>,
-    probe_model: bool,
+    base_models: Option<std::collections::HashSet<String>>,
 ) -> std::collections::HashMap<String, String> {
     let mut labels = std::collections::HashMap::new();
     if crate::backend::is_grpc_url(worker_url) {
         return labels;
     }
     let timeout = std::time::Duration::from_secs(2);
-    let mut aliases = Vec::new();
-    if probe_model {
+    let mut aliases: Vec<String> = if let Some(models) = base_models {
+        models.into_iter().collect()
+    } else {
         let url = format!("{}/v1/models", worker_url.trim_end_matches('/'));
         let mut probe = crate::core::worker::worker_get(client, &url, api_key).timeout(timeout);
         if let Some(rank) = dp_rank {
@@ -49,10 +51,13 @@ pub(crate) async fn served_model_labels(
             }
             _ => None,
         };
-        if let Some(served) = served {
-            aliases.extend(crate::core::worker::served_base_model_ids(&served).map(str::to_owned));
-        }
-    }
+        served
+            .as_ref()
+            .into_iter()
+            .flat_map(crate::core::worker::served_base_model_ids)
+            .map(str::to_owned)
+            .collect()
+    };
     if let Ok(Ok(info)) = tokio::time::timeout(
         timeout,
         crate::kv_index::discovery::query_worker_control_metadata(client, worker_url, api_key),
@@ -62,6 +67,8 @@ pub(crate) async fn served_model_labels(
         aliases.extend(info.served_model_aliases);
     }
     if !aliases.is_empty() {
+        aliases.sort_unstable();
+        aliases.dedup();
         labels.insert("served_model_aliases".to_string(), aliases.join(","));
     }
     labels

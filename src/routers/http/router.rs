@@ -515,12 +515,16 @@ impl Router {
             // KV-aware placement distinguishes base aliases from adapter names.
             // Other policies retain the original unlabeled worker behavior.
             let labels = if kv_aware_ops(default_policy.as_ref()).is_some() {
+                let base_models = kv_index_supervisor
+                    .as_ref()
+                    .filter(|_| dp_rank.is_none())
+                    .and_then(|supervisor| supervisor.discovered_base_models(&base_url));
                 crate::routers::served_model_labels(
                     &ctx.client,
                     &base_url,
                     ctx.router_config.api_key.as_deref(),
                     dp_rank,
-                    true,
+                    base_models,
                 )
                 .await
             } else {
@@ -2881,7 +2885,7 @@ impl Router {
                                     &base_url,
                                     self.api_key.as_deref(),
                                     dp_rank,
-                                    true,
+                                    None,
                                 )
                                 .await
                             } else {
@@ -2935,12 +2939,20 @@ impl Router {
                         // from a base-model alias.
                         let policy = self.policy_registry.get_default_policy();
                         let labels = if kv_aware_ops(policy.as_ref()).is_some() {
+                            let (base_url, dp_rank) = dp_utils::parse_worker_url(worker_url);
+                            let base_models = self
+                                .kv_index_supervisor
+                                .as_ref()
+                                .filter(|_| dp_rank.is_none())
+                                .and_then(|supervisor| {
+                                    supervisor.discovered_base_models(&base_url)
+                                });
                             crate::routers::served_model_labels(
                                 &self.client,
                                 worker_url,
                                 self.api_key.as_deref(),
-                                dp_utils::parse_worker_url(worker_url).1,
-                                true,
+                                dp_rank,
+                                base_models,
                             )
                             .await
                         } else {
@@ -5110,7 +5122,7 @@ mod tests {
             }));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let labels =
-            crate::routers::served_model_labels(&Client::new(), worker.url(), None, None, true)
+            crate::routers::served_model_labels(&Client::new(), worker.url(), None, None, None)
                 .await;
         assert_eq!(
             labels.get("served_model_aliases"),
@@ -6353,7 +6365,7 @@ mod tests {
             &url,
             Some("secret"),
             Some(1),
-            true,
+            None,
         )
         .await;
         let worker = BasicWorker::new(url.clone(), WorkerType::Regular).with_labels(labels);
@@ -6376,7 +6388,7 @@ mod tests {
             &url,
             Some("secret"),
             Some(1),
-            true,
+            None,
         )
         .await;
         let worker = BasicWorker::new(url, WorkerType::Regular).with_labels(labels);
@@ -6408,7 +6420,7 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let labels =
-            crate::routers::served_model_labels(&Client::new(), &url, None, None, true).await;
+            crate::routers::served_model_labels(&Client::new(), &url, None, None, None).await;
         assert_eq!(labels["served_model_aliases"], "model");
         assert_eq!(requests.load(Ordering::Relaxed), 1);
         server.abort();

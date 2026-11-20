@@ -342,6 +342,12 @@ impl KvIndexSupervisor {
             }
         }
         per_rank.sort_by_key(|(rank, _, _)| *rank);
+        if let Some(duplicate) = per_rank.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+            return Some(failed_hybrid_discovery(format!(
+                "duplicate static KV event sources for DP rank {} of {worker_url}",
+                duplicate[0].0
+            )));
+        }
         let mut per_rank = per_rank.into_iter();
         let mut merged = if let Some(source) = exact {
             static_worker_discovery(worker_url, source)
@@ -1237,6 +1243,17 @@ mod rank_merge_tests {
         );
 
         let pinned = format!("{base}@3");
+        let duplicate = format!("{base}@03");
+        let config = supervisor.static_sources[&pinned].clone();
+        supervisor.static_sources.insert(duplicate.clone(), config);
+        let error = supervisor
+            .resolved_static_source(base)
+            .unwrap()
+            .sources
+            .unwrap_err();
+        assert!(error.detail.contains("duplicate static KV event sources"));
+        supervisor.static_sources.remove(&duplicate);
+
         supervisor
             .static_sources
             .get_mut(&pinned)

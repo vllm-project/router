@@ -1775,6 +1775,7 @@ async fn metrics_only_worker_supplies_cache_metadata() {
 #[tokio::test]
 async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
     use axum::routing::get;
+    use std::sync::atomic::AtomicUsize;
 
     let context = zmq::Context::new();
     let publisher = context.socket(zmq::XPUB).unwrap();
@@ -1784,19 +1785,30 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
     replay.bind("tcp://127.0.0.1:*").unwrap();
     let replay_endpoint = replay.get_last_endpoint().unwrap().unwrap();
     for with_replay in [false, true] {
+        let model_requests = Arc::new(AtomicUsize::new(0));
         let sources = serde_json::json!({"0": {
             "endpoint": endpoint,
             "replay_endpoint": with_replay.then_some(&replay_endpoint),
             "topic": "kv/metrics-only",
             "publisher": "zmq"
         }});
-        let router = metrics_and_models_router(METRICS_ONLY).route(
-            "/kv_event_sources",
-            get(move || {
-                let sources = sources.clone();
-                async move { axum::Json(sources) }
-            }),
-        );
+        let router = metrics_and_models_router(METRICS_ONLY)
+            .route(
+                "/kv_event_sources",
+                get(move || {
+                    let sources = sources.clone();
+                    async move { axum::Json(sources) }
+                }),
+            )
+            .layer(axum::middleware::from_fn({
+                let model_requests = model_requests.clone();
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    if request.uri().path() == "/v1/models" {
+                        model_requests.fetch_add(1, Ordering::Relaxed);
+                    }
+                    next.run(request)
+                }
+            }));
         let (worker, server) = spawn_metrics_only_worker(router).await;
         let (supervisor, _signals) =
             KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
@@ -1811,6 +1823,19 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
             supervisor.worker_model_eligibility(std::slice::from_ref(&worker), Some("mock-alias"))
                 [&worker],
             with_replay
+        );
+        let labels = crate::routers::served_model_labels(
+            &reqwest::Client::new(),
+            &worker,
+            None,
+            None,
+            supervisor.discovered_base_models(&worker),
+        )
+        .await;
+        assert_eq!(labels["served_model_aliases"], "mock-alias,mock-model");
+        assert_eq!(
+            model_requests.load(Ordering::Relaxed),
+            if with_replay { 1 } else { 2 }
         );
         supervisor.shutdown();
         server.abort();
