@@ -129,10 +129,12 @@ impl PdKvState {
         registry: Arc<crate::core::WorkerRegistry>,
         prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
         decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
+        strict_recovery: bool,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
         state.enable_igw = enable_igw;
         state.api_key = api_key;
+        state.supervisor.set_strict_recovery(strict_recovery);
         state.registry = Some(registry);
         state.prefill_policy = prefill_policy;
         state.decode_policy = decode_policy;
@@ -1321,6 +1323,107 @@ mod kv_input_tests {
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (base, task)
     }
+
+    #[tokio::test]
+    async fn startup_applies_strict_recovery_to_both_stage_subscribers() {
+        use crate::kv_index::{MatchQuery, StorageTier};
+
+        for strict in [false, true] {
+            let (base, server) = models_server().await;
+            let context = zmq::Context::new();
+            let registry = Arc::new(crate::core::WorkerRegistry::new());
+            let mut publishers = Vec::new();
+            let mut sources = HashMap::new();
+            let bases = [format!("{base}/p"), format!("{base}/d")];
+            for (worker_base, worker_type) in bases.iter().zip([
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                WorkerType::Decode,
+            ]) {
+                let publisher = context.socket(zmq::PUB).unwrap();
+                publisher.bind("tcp://127.0.0.1:*").unwrap();
+                sources.insert(
+                    worker_base.clone(),
+                    crate::config::types::PdKvEventSources {
+                        endpoints: vec![publisher.get_last_endpoint().unwrap().unwrap()],
+                        replay_endpoints: None,
+                        block_size: 16,
+                        model: Some("m".to_owned()),
+                    },
+                );
+                registry.register(Arc::new(BasicWorker::new(worker_base.clone(), worker_type)));
+                publishers.push(publisher);
+            }
+            let state = PdKvState::start(
+                reqwest::Client::new(),
+                false,
+                None,
+                sources,
+                registry,
+                Some(Arc::new(KvAwarePolicy::default())),
+                Some(Arc::new(KvAwarePolicy::default())),
+                strict,
+            )
+            .await;
+
+            for (stage, (worker_base, publisher)) in bases.iter().zip(&publishers).enumerate() {
+                let offset = (stage * 64) as u32;
+                let worker_tokens: Vec<u32> = (offset..offset + 16).collect();
+                let pool_tokens: Vec<u32> = (offset + 16..offset + 32).collect();
+                let store = |hash, tokens: &[u32], ownership| {
+                    json!({"type":"BlockStored", "block_hashes":[hash], "parent_block_hash":null,
+                        "token_ids":tokens, "block_size":16, "lora_id":null,
+                        "lora_name":null, "medium":"GPU", "ownership":ownership})
+                };
+                let payload = rmp_serde::to_vec(&(
+                    1.0,
+                    vec![
+                        store(1, &worker_tokens, None),
+                        store(2, &pool_tokens, Some("pool")),
+                    ],
+                    0_u32,
+                ))
+                .unwrap();
+                let provider = state
+                    .supervisor
+                    .match_provider_for_worker(worker_base)
+                    .unwrap();
+                let query = |tokens: &[u32], tier| MatchQuery {
+                    group_idx: 0,
+                    local_hashes: crate::kv_index::local_block_hash_strings(tokens, 16, None),
+                    tiers_of_interest: vec![tier],
+                };
+                let seq = 0_u64.to_be_bytes();
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        publisher
+                            .send_multipart([b"".as_slice(), seq.as_slice(), payload.as_slice()], 0)
+                            .unwrap();
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        if !provider
+                            .find_tiered_matches(&query(&worker_tokens, StorageTier::Device))
+                            .is_empty()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .expect("each stage must ingest its initial worker-owned prefix");
+                assert_eq!(
+                    provider
+                        .find_tiered_matches(&query(&pool_tokens, StorageTier::External))
+                        .is_empty(),
+                    strict,
+                    "strict recovery must not grant external-pool credit through either stage"
+                );
+            }
+            drop(state);
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn start_registers_and_prices_both_pools_before_any_request() {
         // Lazy request-path binding would leave a burst unpriced for one tick.
@@ -1360,6 +1463,7 @@ mod kv_input_tests {
             registry.clone(),
             Some(prefill_policy.clone()),
             Some(decode_policy.clone()),
+            false,
         )
         .await;
         let credit = state.credit_by_base(&json!({"model":"m"})).await;

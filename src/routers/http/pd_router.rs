@@ -1369,6 +1369,7 @@ impl PdRouterBase {
                     kv_aware_ops(decode_policy.as_ref())
                         .is_some()
                         .then(|| decode_policy.clone()),
+                    ctx.router_config.kv_event_strict_recovery,
                 )
                 .await,
             )
