@@ -277,10 +277,11 @@ async fn cache_aware_prefix_overrides_load() {
     let before = hits(&servers);
     let holder = {
         let router = Arc::clone(&router);
-        let body = prompt(
-            &[100, 101, 102, 103, 104, 105, 106, 107, 108, 109],
-            json!({}),
-        );
+        // Sharing the cached prefix pins the holder to the cached worker.
+        // An unrelated prompt would tie on load and could land on either one.
+        let mut holder_prompt = cached_prompt.clone();
+        holder_prompt.extend(100..110);
+        let body = prompt(&holder_prompt, json!({}));
         tokio::spawn(async move {
             let request: CompletionRequest = serde_json::from_value(body).unwrap();
             let response = router.route_completion(None, &request, None).await;

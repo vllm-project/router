@@ -84,7 +84,7 @@ checks exact character counts and selection after a fixture reset.
 | Match threshold | 45% misses, 55% hits; exactly 50% and one character below miss, one above hits |
 | Load thresholds | Imbalanced only when both `max - min > abs` and `max > min × rel`; test equality and each condition alone |
 | UTF-8 boundaries | Count characters when byte and character ratios disagree, including a fork inside a multibyte character |
-| Unhealthy tenant | Fall back to the first healthy worker, remove the stale tenant, and miss after it recovers |
+| Unhealthy tenant | Fall back to the least-loaded healthy worker, remove the stale tenant, and miss after it recovers |
 | Session header | Override two long prompts that otherwise select different workers; ignore an empty header |
 | Worker count | Every hot prompt hits its assigned tenant at 1, 4, 16 and 64 workers |
 | HTTP body limit | Route a body of exactly 1 MiB; reject one byte more with 413 |
@@ -102,8 +102,8 @@ The fixture configuration differs from library and CLI defaults:
 | CLI / overhead harness | 0.3 | 64 | 1.5 | 120 s / 3600 s |
 
 Branch cases warm W1 and normally use loads `[1, 1, 1, 0]`: W1 identifies
-a cache hit, W3 a low-match or imbalanced selection, and W0 the fallback
-when W1 is unhealthy. Small load thresholds make boundary cases easy to set up.
+a cache hit, and W3 a low-match, imbalanced or stale-tenant selection.
+Small load thresholds make boundary cases easy to set up.
 
 Routing inserts the probe into the tree. Before each timed call, the
 benchmark clears and re-warms the fixture outside the timer. Long inputs

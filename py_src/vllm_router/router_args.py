@@ -35,6 +35,7 @@ class RouterArgs:
     kv_event_replay_source: List[str] = dataclasses.field(default_factory=list)
     kv_event_block_size: int = 16
     kv_event_model: Optional[str] = None
+    kv_event_strict_recovery: bool = False
     worker_startup_timeout_secs: int = 600
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
@@ -149,14 +150,17 @@ class RouterArgs:
             f"--{prefix}enable-program-scheduling",
             action="store_true",
             default=False,
-            help="Enable Program-level scheduling",
+            help="Enable Program-level scheduling (defaults to verified exact counts with estimation fallback)",
         )
 
         parser.add_argument(
             f"--{prefix}program-scheduling-config-json",
             type=str,
             default=None,
-            help="JSON object overriding Program-level scheduling defaults (requires the enable flag)",
+            help=(
+                "JSON object overriding Program-level scheduling defaults (requires the enable flag). "
+                'For compatible byte-estimated counts, use {"token_count_mode":"estimated"}; HTTP text tokenization is opt-in'
+            ),
         )
 
         # Routing policy configuration
@@ -267,13 +271,19 @@ class RouterArgs:
         )
         # PD-specific arguments
         parser.add_argument(
+            f"--{prefix}kv-event-strict-recovery",
+            action="store_true",
+            help="Require authoritative full KV event recovery before restoring credit",
+        )
+        parser.add_argument(
             f"--{prefix}pd-kv-events",
             action="append",
             default=[],
             metavar="URL=ENDPOINT[,ENDPOINT...]",
-            help="Static KV event sources for a prefill worker in PD mode "
-            "(requires a kv_aware prefill policy). Repeat for multiple workers; "
-            "comma-separated endpoints are ordered by DP rank. Block size is 16.",
+            help="Static KV event sources for a prefill or decode worker in PD "
+            "mode; a source belongs to a stage whose policy is kv_aware. "
+            "Repeat for multiple workers; comma-separated endpoints are "
+            "ordered by DP rank. Block size is 16.",
         )
         parser.add_argument(
             f"--{prefix}mini-lb",
