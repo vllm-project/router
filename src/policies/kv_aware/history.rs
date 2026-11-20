@@ -1,5 +1,6 @@
 //! Bounded advisory prefixes, independent of request and backend protocols.
 //! A registration ID scopes exact token identity; it is not a Worker UUID.
+//! This completion-routing token-prefix history is unrelated to Responses `HistoryBackend` storage.
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};

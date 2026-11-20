@@ -35,8 +35,8 @@ pub use kv_aware::{
     HistoryObservation, InMemorySlotManager, KvAffinityTable, KvAwareOps, KvAwarePolicy,
     KvRequestSlot, KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample,
     MultiplicativeScorer, Picker, PrefillWorkEstimate, PromptHashes, Scorer, SelectionError,
-    SlotManager, StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits,
-    WorkerTokenInputs,
+    SelectionIdentity, SlotManager, StagePick, TemperaturePicker, TieredMatchProvider,
+    TransferCredits, WorkerTokenInputs,
 };
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;

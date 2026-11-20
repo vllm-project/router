@@ -60,11 +60,12 @@ pub(crate) struct QualifiedKvInput<'a> {
     pub eligibility: Option<&'a [bool]>,
 }
 
+/// Cache and affinity scope of the actual request being selected.
 #[derive(Default)]
-struct SelectionIdentity<'a> {
-    lora_name: Option<&'a str>,
-    cache_salt: Option<&'a str>,
-    affinity_key: Option<&'a AffinityKey>,
+pub struct SelectionIdentity<'a> {
+    pub lora_name: Option<&'a str>,
+    pub cache_salt: Option<&'a str>,
+    pub affinity_key: Option<&'a AffinityKey>,
 }
 
 impl QualifiedKvInput<'_> {
@@ -223,9 +224,10 @@ pub trait KvAwareOps: Send + Sync {
         None
     }
 
-    /// Commit the adapter's successful observation, without owning load.
+    /// Commit the adapter's observation at its milestone, without owning load.
     /// HTTP headers and a valid gRPC generation message are distinct milestones.
-    fn observe_completion_headers(&self, _worker: &dyn Worker, _observation: HistoryObservation) {}
+    fn observe_completion_milestone(&self, _worker: &dyn Worker, _observation: HistoryObservation) {
+    }
 
     /// Ordinary and history-assisted requests share selection and reservation.
     /// History applies only to requests without a LoRA or cache-salt identity.
@@ -236,15 +238,15 @@ pub trait KvAwareOps: Send + Sync {
         tokens: KvRequestTokens<'_>,
         eligibility: Option<&[bool]>,
         _history: Option<&CompletionHistoryRequest>,
-        affinity_key: Option<&AffinityKey>,
+        identity: SelectionIdentity<'_>,
         excluded_workers: &[String],
     ) -> Option<(KvSelectionReceipt, Option<HistoryObservation>)> {
         self.select_worker_with_qualified_inputs(
             workers,
             tokens,
-            None,
-            None,
-            affinity_key,
+            identity.lora_name,
+            identity.cache_salt,
+            identity.affinity_key,
             excluded_workers,
             eligibility,
         )
@@ -1083,6 +1085,8 @@ struct SelectionPlan {
     has_tokens: bool,
 }
 
+type HistoryCandidate<'a> = (u64, &'a [u32], Option<history::HistoryHit>);
+
 /// Registered `kv_aware` policy. Discovery binds each worker target to the
 /// placement provider for its cache identity.
 pub struct KvAwarePolicy {
@@ -1521,11 +1525,15 @@ impl KvAwarePolicy {
             cache_salt,
             affinity_key,
         } = identity;
-        let history = history.filter(|_| self.params.router_temperature == 0.0);
+        let history = history.filter(|_| {
+            self.params.router_temperature == 0.0 && lora_name.is_none() && cache_salt.is_none()
+        });
         let digest = affinity_key.map(|key| key.scoped_digest(lora_name, cache_salt));
-        // Try up to three placement snapshots under registration churn.
-        // The final attempt scores live load and full input work without KV credit.
+        // Run up to three rounds of placement queries under registration churn.
+        // The final attempt scores live load and full input work without querying
+        // placement or granting KV credit.
         for attempt in 0..=3 {
+            let history = history.filter(|_| attempt != 3);
             let fallback_guard = (attempt == 3).then(|| self.selection_lock.lock());
             let plan = if fallback_guard.is_some() {
                 let (healthy, bindings) = self.selection_targets(workers)?;
@@ -1534,7 +1542,12 @@ impl KvAwarePolicy {
                     .iter()
                     .map(|&index| {
                         let prompts = input.tokens.prompts_for(workers[index].as_ref());
-                        (!prompts.is_empty()).then(|| prompts.iter().map(|ids| ids.len()).sum())
+                        (!prompts.is_empty()).then(|| {
+                            prompts
+                                .iter()
+                                .map(|ids| ids.len())
+                                .fold(0, usize::saturating_add)
+                        })
                     })
                     .collect();
                 // As in normal preparation, bound missing input using current
@@ -1555,37 +1568,9 @@ impl KvAwarePolicy {
             } else {
                 self.prepare_selection(workers, input, lora_name, cache_salt, history.is_some())?
             };
-            // Token comparisons happen outside the reservation lock. Only a
-            // single qualified, backend-rendered prompt can establish history.
-            let history_inputs: Vec<_> = history
-                .filter(|_| attempt != 3)
-                .map(|request| {
-                    plan.healthy
-                        .iter()
-                        .zip(&plan.bindings)
-                        .map(|(&index, binding)| {
-                            if !input.allows_credit(index, workers.len()) {
-                                return None;
-                            }
-                            let prompts = input.tokens.prompts_for(workers[index].as_ref());
-                            if prompts.len() != 1 || prompts[0].is_empty() {
-                                return None;
-                            }
-                            let registration_id =
-                                request.registration_id(workers[index].as_ref(), binding)?;
-                            let ids = prompts[0];
-                            let hit = self.completion_history.get().and_then(|store| {
-                                store.match_prefix(
-                                    registration_id,
-                                    ids,
-                                    binding.block_size,
-                                    Instant::now(),
-                                )
-                            });
-                            Some((registration_id, ids, hit))
-                        })
-                        .collect()
-                })
+            // Token comparisons happen outside the reservation lock.
+            let history_inputs = history
+                .map(|request| self.history_candidates(workers, input, &plan, request))
                 .unwrap_or_default();
             let excluded = |position: usize| {
                 excluded_workers
@@ -1658,11 +1643,14 @@ impl KvAwarePolicy {
                                 .iter()
                                 .copied()
                                 .filter(|&index| {
-                                    costs[base] == minimum
-                                        && costs[index] == costs[base]
-                                        && components[index] == components[base]
-                                        && candidates[index].load.active_prefill_tokens
-                                            <= candidates[base].load.active_prefill_tokens
+                                    Self::history_tied(
+                                        base,
+                                        index,
+                                        minimum,
+                                        &costs,
+                                        &components,
+                                        &candidates,
+                                    )
                                 })
                                 .map(|index| {
                                     let length = history_inputs[index]
@@ -1762,6 +1750,54 @@ impl KvAwarePolicy {
         None
     }
 
+    fn history_candidates<'a>(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        input: QualifiedKvInput<'a>,
+        plan: &SelectionPlan,
+        request: &CompletionHistoryRequest,
+    ) -> Vec<Option<HistoryCandidate<'a>>> {
+        // Keep positions aligned with the plan. Only a single qualified,
+        // backend-rendered prompt can establish history.
+        plan.healthy
+            .iter()
+            .zip(&plan.bindings)
+            .map(|(&index, binding)| {
+                if !input.allows_credit(index, workers.len()) {
+                    return None;
+                }
+                let worker = workers[index].as_ref();
+                let prompts = input.tokens.prompts_for(worker);
+                let [ids] = prompts.as_slice() else {
+                    return None;
+                };
+                if ids.is_empty() {
+                    return None;
+                }
+                let registration_id = request.registration_id(worker, binding)?;
+                let hit = self.completion_history.get().and_then(|store| {
+                    store.match_prefix(registration_id, ids, binding.block_size, Instant::now())
+                });
+                Some((registration_id, *ids, hit))
+            })
+            .collect()
+    }
+
+    fn history_tied(
+        base: usize,
+        index: usize,
+        minimum: f64,
+        costs: &[f64],
+        components: &[CostComponents],
+        candidates: &[CandidateView<'_>],
+    ) -> bool {
+        costs[base] == minimum
+            && costs[index] == costs[base]
+            && components[index] == components[base]
+            && candidates[index].load.active_prefill_tokens
+                <= candidates[base].load.active_prefill_tokens
+    }
+
     /// Position of a record's target among the plan's healthy bindings while
     /// its registration generation is still current.
     fn affinity_position(&self, plan: &SelectionPlan, record: &AffinityRecord) -> Option<usize> {
@@ -1849,13 +1885,21 @@ impl KvAwarePolicy {
         let mut prefill_tokens = Vec::with_capacity(bindings.len());
         let mut history_credit = Vec::new();
         for ((binding, prompts), &worker_index) in bindings.iter().zip(prompts).zip(&healthy) {
+            let allows_credit = input.allows_credit(worker_index, workers.len());
+            let mut evidence_known = collect_history_credit
+                && has_tokens
+                && binding.cache_key.is_some()
+                && !prompts.is_empty()
+                && allows_credit
+                && credit_fallback.is_none();
             let mut total_input = 0usize;
             let mut total_prefill = 0u64;
             let mut credited = false;
             let mut single_matches = Vec::new();
             if has_tokens {
                 for ids in &prompts {
-                    if !input.allows_credit(worker_index, workers.len()) {
+                    evidence_known &= !ids.is_empty();
+                    if !allows_credit {
                         total_input = total_input.saturating_add(ids.len());
                         total_prefill = total_prefill.saturating_add(ids.len() as u64);
                         continue;
@@ -1922,11 +1966,6 @@ impl KvAwarePolicy {
             }
             grouped.push(single_matches);
             if collect_history_credit {
-                let evidence_known = binding.cache_key.is_some()
-                    && !prompts.is_empty()
-                    && prompts.iter().all(|ids| !ids.is_empty())
-                    && input.allows_credit(worker_index, workers.len())
-                    && credit_fallback.is_none();
                 history_credit.push(evidence_known.then_some(credited));
             }
             input_tokens.push(total_input);
@@ -2171,7 +2210,7 @@ impl KvAwareOps for KvAwarePolicy {
         Some(self.capture_history_registrations(workers, requested_model))
     }
 
-    fn observe_completion_headers(&self, worker: &dyn Worker, observation: HistoryObservation) {
+    fn observe_completion_milestone(&self, worker: &dyn Worker, observation: HistoryObservation) {
         self.commit_history_observation(worker, observation);
     }
 
@@ -2181,7 +2220,7 @@ impl KvAwareOps for KvAwarePolicy {
         tokens: KvRequestTokens<'_>,
         eligibility: Option<&[bool]>,
         history: Option<&CompletionHistoryRequest>,
-        affinity_key: Option<&AffinityKey>,
+        identity: SelectionIdentity<'_>,
         excluded_workers: &[String],
     ) -> Option<(KvSelectionReceipt, Option<HistoryObservation>)> {
         self.select_with_context(
@@ -2190,11 +2229,7 @@ impl KvAwareOps for KvAwarePolicy {
                 tokens,
                 eligibility,
             },
-            SelectionIdentity {
-                lora_name: None,
-                cache_salt: None,
-                affinity_key,
-            },
+            identity,
             excluded_workers,
             history,
         )
@@ -3667,11 +3702,14 @@ mod tests {
                 &self,
                 _workers: &[Arc<dyn Worker>],
                 _tokens: KvRequestTokens<'_>,
-                _lora_name: Option<&str>,
-                _cache_salt: Option<&str>,
-                _affinity_key: Option<&AffinityKey>,
+                lora_name: Option<&str>,
+                cache_salt: Option<&str>,
+                key: Option<&AffinityKey>,
                 _excluded_workers: &[String],
             ) -> Option<KvSelectionReceipt> {
+                assert_eq!(lora_name, Some("adapter"));
+                assert_eq!(cache_salt, Some("tenant-salt"));
+                assert_eq!(key, Some(&affinity_key("ordinary")));
                 self.selections.fetch_add(1, Ordering::Relaxed);
                 None
             }
@@ -3686,6 +3724,7 @@ mod tests {
             WorkerType::Regular,
         ))];
         let denied = [false];
+        let key = affinity_key("ordinary");
         for eligibility in [None, Some(denied.as_slice())] {
             assert!(ops
                 .select_with_history(
@@ -3693,7 +3732,11 @@ mod tests {
                     KvRequestTokens::Shared(Some(&[1, 2])),
                     eligibility,
                     None,
-                    None,
+                    SelectionIdentity {
+                        lora_name: Some("adapter"),
+                        cache_salt: Some("tenant-salt"),
+                        affinity_key: Some(&key),
+                    },
                     &[],
                 )
                 .is_none());
@@ -3770,32 +3813,33 @@ mod tests {
     #[test]
     fn completion_history_is_advisory_with_worker_specific_inputs() {
         let (policy, workers, inputs) = completion_history_fixture();
+        let ops: &dyn KvAwareOps = &policy;
         let request = policy
             .capture_completion_history(&workers, "model")
             .unwrap();
-        let input = QualifiedKvInput {
-            tokens: KvRequestTokens::PerWorker(&inputs),
-            eligibility: None,
-        };
-        let (seed, observation) = policy
-            .select_with_context(
+        let tokens = KvRequestTokens::PerWorker(&inputs);
+        let exclude_first = [workers[0].url().to_owned()];
+        let (seed, observation) = ops
+            .select_with_history(
                 &workers,
-                input,
-                SelectionIdentity::default(),
-                &[workers[0].url().to_owned()],
+                tokens,
+                None,
                 Some(&request),
+                SelectionIdentity::default(),
+                &exclude_first,
             )
             .unwrap();
         assert_eq!(seed.worker_index, 1);
-        policy.observe_completion_headers(workers[1].as_ref(), observation.unwrap());
+        ops.observe_completion_milestone(workers[1].as_ref(), observation.unwrap());
         release_receipt(&workers, &seed);
-        let (receipt, observation) = policy
-            .select_with_context(
+        let (receipt, observation) = ops
+            .select_with_history(
                 &workers,
-                input,
+                tokens,
+                None,
+                Some(&request),
                 SelectionIdentity::default(),
                 &[],
-                Some(&request),
             )
             .unwrap();
         assert_eq!(receipt.worker_index, 1);
@@ -3806,6 +3850,66 @@ mod tests {
             policy.observed_completion_prefix(workers[1].as_ref(), &[9, 8, 7, 6]),
             0
         );
+
+        let key = affinity_key("scoped-history");
+        for (case, lora_name, cache_salt) in [
+            ("LoRA", Some("adapter"), None),
+            ("salt", None, Some("tenant-salt")),
+        ] {
+            // Ordinary selection establishes a scoped binding to the peer
+            // that the unbound FirstPicker would not choose on its own.
+            let ordinary = ops
+                .select_worker_with_qualified_inputs(
+                    &workers,
+                    tokens,
+                    lora_name,
+                    cache_salt,
+                    Some(&key),
+                    &exclude_first,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(ordinary.worker_index, 1, "{case}");
+            release_receipt(&workers, &ordinary);
+            let binding = policy
+                .affinity
+                .get(&key.scoped_digest(lora_name, cache_salt))
+                .unwrap();
+
+            let (receipt, observation) = ops
+                .select_with_history(
+                    &workers,
+                    tokens,
+                    None,
+                    Some(&request),
+                    SelectionIdentity {
+                        lora_name,
+                        cache_salt,
+                        affinity_key: Some(&key),
+                    },
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(receipt.worker_index, ordinary.worker_index, "{case}");
+            assert_eq!(receipt.decision, ordinary.decision, "{case}");
+            assert_eq!(receipt.new_prefill_tokens, 4, "{case}");
+            assert!(observation.is_none(), "{case}");
+            let target = &receipt.decision.target;
+            assert_eq!(
+                policy.load.sample(target),
+                LoadSample {
+                    active_prefill_tokens: 4,
+                    active_requests: 1,
+                },
+                "{case}",
+            );
+            assert_eq!(workers[1].load(), 2, "{case}");
+            assert_eq!(binding.in_flight(), 1, "{case}");
+            release_receipt(&workers, &receipt);
+            assert_eq!(policy.load.sample(target), LoadSample::default(), "{case}");
+            assert_eq!(workers[1].load(), 1, "{case}");
+            assert_eq!(binding.in_flight(), 0, "{case}");
+        }
     }
 
     #[test]
@@ -3864,7 +3968,7 @@ mod tests {
                 &policy.binding_for_worker(workers[0].as_ref())
             )
             .is_none());
-        other.observe_completion_headers(workers[1].as_ref(), observation.unwrap());
+        other.observe_completion_milestone(workers[1].as_ref(), observation.unwrap());
         assert_eq!(
             other.observed_completion_prefix(workers[1].as_ref(), &[1, 2, 3, 4]),
             0
@@ -3890,7 +3994,7 @@ mod tests {
                 Some(&request),
             )
             .unwrap();
-        policy.observe_completion_headers(workers[1].as_ref(), observation.unwrap());
+        policy.observe_completion_milestone(workers[1].as_ref(), observation.unwrap());
         release_receipt(&workers, &seed);
         // Missing qualification, batch inputs, and wrong request model cannot
         // produce observations, even if their generation has stored history.
@@ -3933,26 +4037,49 @@ mod tests {
             assert!(observation.is_none(), "{name}");
             release_receipt(&workers, &receipt);
         }
-        // A failed preparation on another feasible peer is unknown, not a
-        // measured zero that would permit overriding the ordinary choice.
-        let mut missing_peer = inputs.clone();
-        missing_peer.remove(workers[0].base_url());
-        let (receipt, observation) = policy
-            .select_with_context(
-                &workers,
-                QualifiedKvInput {
-                    tokens: KvRequestTokens::PerWorker(&missing_peer),
-                    eligibility: None,
-                },
-                SelectionIdentity::default(),
-                &[],
-                Some(&request),
-            )
+        // A missing or empty prompt is unknown. A nonempty prompt shorter
+        // than a block has known zero credit, but still cannot override cost.
+        for (case, ids, charge, observed, reason) in [
+            ("missing", None, 4, false, "missing_evidence"),
+            ("empty", Some(vec![]), 0, false, "missing_evidence"),
+            ("short", Some(vec![9]), 1, true, "no_tie"),
+        ] {
+            let mut per_worker = inputs.clone();
+            let peer = workers[0].base_url();
+            if let Some(ids) = ids {
+                per_worker.insert(peer.to_owned(), Arc::from(vec![ids]));
+            } else {
+                per_worker.remove(peer);
+            }
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let (receipt, observation) = metrics::with_local_recorder(&recorder, || {
+                policy.select_with_context(
+                    &workers,
+                    QualifiedKvInput {
+                        tokens: KvRequestTokens::PerWorker(&per_worker),
+                        eligibility: None,
+                    },
+                    SelectionIdentity::default(),
+                    &[],
+                    Some(&request),
+                )
+            })
             .unwrap();
-        assert_eq!(receipt.worker_index, 0);
-        assert_eq!(receipt.new_prefill_tokens, 4);
-        assert!(observation.is_none());
-        release_receipt(&workers, &receipt);
+            assert_eq!(receipt.worker_index, 0, "{case}");
+            assert_eq!(receipt.new_prefill_tokens, charge, "{case}");
+            assert_eq!(observation.is_some(), observed, "{case}");
+            release_receipt(&workers, &receipt);
+            let rendered = recorder.handle().render();
+            let mut decisions = rendered
+                .lines()
+                .filter(|line| line.starts_with("vllm_router_history_decisions_total{"));
+            assert!(
+                decisions.next().is_some_and(|line| {
+                    line.contains(&format!("reason=\"{reason}\"")) && line.ends_with(" 1")
+                }) && decisions.next().is_none(),
+                "{case}: {rendered}",
+            );
+        }
     }
 
     #[test]
@@ -3968,6 +4095,7 @@ mod tests {
                 )) as Arc<dyn Worker>
             })
             .collect();
+        let matches = Arc::new(EmptyMatchProvider);
         for worker in &workers {
             worker.increment_load();
             policy.register_history_worker(
@@ -3982,7 +4110,7 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
-                Some(Arc::new(EmptyMatchProvider)),
+                Some(matches.clone()),
             );
         }
         let request = policy
@@ -4007,25 +4135,40 @@ mod tests {
             policy.observed_completion_prefix(workers[1].as_ref(), &ids),
             0
         );
-        policy.observe_completion_headers(workers[1].as_ref(), observation.unwrap());
+        policy.observe_completion_milestone(workers[1].as_ref(), observation.unwrap());
         release_receipt(&workers, &seed);
         assert_eq!(
             policy.observed_completion_prefix(workers[1].as_ref(), &ids),
             32
         );
-        let (next, observation) = policy
-            .select_with_context(
+        // The second candidate reuses the first one's placement lookup.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let (next, observation) = metrics::with_local_recorder(&recorder, || {
+            policy.select_with_context(
                 &workers,
                 input,
                 SelectionIdentity::default(),
                 &[],
                 Some(&request),
             )
-            .unwrap();
+        })
+        .unwrap();
         assert_eq!(next.worker_index, 1);
         assert_eq!(next.new_prefill_tokens, 33);
         assert!(observation.is_some());
         release_receipt(&workers, &next);
+        let rendered = recorder.handle().render();
+        let mut decisions = rendered
+            .lines()
+            .filter(|line| line.starts_with("vllm_router_history_decisions_total{"));
+        assert!(
+            decisions.next().is_some_and(|line| {
+                (line.contains("reason=\"override\"")
+                    || line.contains("reason=\"eligible_ordinary\""))
+                    && line.ends_with(" 1")
+            }) && decisions.next().is_none(),
+            "{rendered}",
+        );
         for worker in &workers {
             assert_eq!(worker.load(), 1, "background load remains");
             worker.decrement_load();
@@ -4051,7 +4194,7 @@ mod tests {
                 Some(&request),
             )
             .unwrap();
-        policy.observe_completion_headers(workers[1].as_ref(), observation.unwrap());
+        policy.observe_completion_milestone(workers[1].as_ref(), observation.unwrap());
         release_receipt(&workers, &seed);
         let key = affinity_key("history-cannot-rebind");
         let bound = policy
@@ -4175,7 +4318,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(receipt.worker_index, target);
-            policy.observe_completion_headers(workers[target].as_ref(), observation.unwrap());
+            policy.observe_completion_milestone(workers[target].as_ref(), observation.unwrap());
             release_receipt(&workers, &receipt);
         }
         for excluded in [None, Some(0), Some(1)] {
@@ -4216,7 +4359,7 @@ mod tests {
                 Some(&captured),
             )
             .unwrap();
-        policy.observe_completion_headers(workers[1].as_ref(), observation.unwrap());
+        policy.observe_completion_milestone(workers[1].as_ref(), observation.unwrap());
         release_receipt(&workers, &receipt);
         for (ids, expected) in [
             (vec![1], 0),
@@ -4258,7 +4401,7 @@ mod tests {
                 .registration_id(workers[index].as_ref(), &binding)
                 .unwrap();
             // One old successful observation plus one still in flight.
-            policy.observe_completion_headers(
+            policy.observe_completion_milestone(
                 workers[index].as_ref(),
                 HistoryObservation::new(registration_id, &[1, 2, 3, 4]),
             );
@@ -4277,7 +4420,7 @@ mod tests {
             }),
             Some(Arc::new(EmptyMatchProvider)),
         );
-        policy.observe_completion_headers(workers[0].as_ref(), old_observation);
+        policy.observe_completion_milestone(workers[0].as_ref(), old_observation);
         let new_binding = policy.targets.get(workers[0].url()).unwrap().clone();
         assert!(captured
             .registration_id(workers[0].as_ref(), &new_binding)
@@ -4353,7 +4496,7 @@ mod tests {
         assert_eq!(receipt.new_prefill_tokens, 4);
         assert!(observation.is_none());
         release_receipt(&replaced_workers, &receipt);
-        policy.observe_completion_headers(
+        policy.observe_completion_milestone(
             replacement.as_ref(),
             HistoryObservation::new(peer_registration_id, &[77, 88]),
         );
@@ -5098,6 +5241,7 @@ mod tests {
         let workers = registered_worker_pair(&policy);
         let matches = Arc::new(Churn::default());
         let info = WorkerKvInfo {
+            ranks: vec![0],
             cache_key: Some(CacheKey {
                 model: Arc::from("model"),
                 hash_mode: crate::kv_index::HashMode::Sha256,
@@ -5106,7 +5250,7 @@ mod tests {
             ..WorkerKvInfo::default()
         };
         for worker in &workers {
-            policy.register_worker(worker.as_ref(), Some(&info), Some(matches.clone()));
+            policy.register_history_worker(worker, Some(&info), Some(matches.clone()));
         }
         let weak_policy = Arc::downgrade(&policy);
         let weak_matches = Arc::downgrade(&matches);
@@ -5115,32 +5259,45 @@ mod tests {
         // the final, query-free attempt rather than reserve a stale snapshot.
         *matches.replace.lock() = Some(Box::new(move || {
             for worker in &registered {
-                weak_policy.upgrade().unwrap().register_worker(
-                    worker.as_ref(),
+                weak_policy.upgrade().unwrap().register_history_worker(
+                    worker,
                     Some(&info),
                     Some(weak_matches.upgrade().unwrap()),
                 );
             }
         }));
-        let both_known = [Some(33), Some(17)];
-        let missing_second = [Some(33), None];
+        let both_known: [Option<&[usize]>; 2] = [Some(&[33]), Some(&[17])];
+        let missing_second = [both_known[0], None];
         for (case, lengths, excluded, chosen, expected, queries) in [
             ("known and missing", missing_second, None, None, 33, 3),
             ("both known", both_known, None, Some(1), 17, 6),
             ("forced longer", both_known, Some(1), Some(0), 33, 6),
             ("forced shorter", both_known, Some(0), Some(1), 17, 6),
             ("forced missing", missing_second, Some(0), Some(1), 33, 3),
-            ("empty prompt", [Some(33), Some(0)], None, Some(1), 0, 3),
+            (
+                "empty prompt",
+                [Some(&[33]), Some(&[0])],
+                None,
+                Some(1),
+                0,
+                3,
+            ),
             ("all unknown", [None, None], None, None, 0, 0),
+            ("two prompts", [Some(&[17, 16]); 2], None, None, 33, 6),
         ] {
             let inputs: WorkerTokenInputs = workers
                 .iter()
                 .zip(lengths)
-                .filter_map(|(worker, length)| {
-                    length.map(|length| {
+                .filter_map(|(worker, lengths)| {
+                    lengths.map(|lengths| {
                         (
                             worker.base_url().to_owned(),
-                            Arc::from(vec![vec![7; length]]),
+                            Arc::from(
+                                lengths
+                                    .iter()
+                                    .map(|&length| vec![7; length])
+                                    .collect::<Vec<_>>(),
+                            ),
                         )
                     })
                 })
@@ -5151,14 +5308,20 @@ mod tests {
                 .collect();
             let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
             let queries_before = matches.queries.load(Ordering::Relaxed);
-            let receipt = metrics::with_local_recorder(&recorder, || {
-                policy.select_worker_with_inputs(
+            let request = policy
+                .capture_completion_history(&workers, "model")
+                .unwrap();
+            assert_eq!(request.registrations.len(), workers.len(), "{case}");
+            let (receipt, observation) = metrics::with_local_recorder(&recorder, || {
+                policy.select_with_context(
                     &workers,
-                    KvRequestTokens::PerWorker(&inputs),
-                    None,
-                    None,
-                    None,
+                    QualifiedKvInput {
+                        tokens: KvRequestTokens::PerWorker(&inputs),
+                        eligibility: None,
+                    },
+                    SelectionIdentity::default(),
                     &excluded,
+                    Some(&request),
                 )
             })
             .unwrap();
@@ -5210,6 +5373,15 @@ mod tests {
                 }) && outcomes.next().is_none(),
                 "{case}: {rendered}",
             );
+            assert!(observation.is_none(), "{case}");
+            if queries != 0 {
+                assert!(
+                    !rendered
+                        .lines()
+                        .any(|line| line.starts_with("vllm_router_history_decisions_total{")),
+                    "{case}: churn fallback recorded a history decision: {rendered}",
+                );
+            }
         }
     }
 

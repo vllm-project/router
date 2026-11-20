@@ -24,7 +24,9 @@ use crate::policies::{
     kv_aware_ops, AffinityKey, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy,
     PolicyRegistry,
 };
-use crate::policies::{CompletionHistoryRequest, HistoryObservation, QualifiedKvInput};
+use crate::policies::{
+    CompletionHistoryRequest, HistoryObservation, QualifiedKvInput, SelectionIdentity,
+};
 use crate::program_scheduling::{
     ArrivalTokenFacts, BackendObservationProvider, ProgramIdentity, ProgramScheduler,
     ProgramSchedulerConfig, ProgramTarget, ScheduleError, TokenFacts,
@@ -66,6 +68,25 @@ pub(super) fn prepare_error_status(error: &PrepareError) -> StatusCode {
     match error {
         PrepareError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         PrepareError::Invalid(_) => StatusCode::BAD_REQUEST,
+    }
+}
+
+fn register_kv_target_for_policy(
+    policy: &dyn LoadBalancingPolicy,
+    supervisor: Option<&crate::kv_index::KvIndexSupervisor>,
+    worker: &Arc<dyn Worker>,
+    info: Option<&crate::kv_index::WorkerKvInfo>,
+    history_enabled: bool,
+) {
+    let Some(kv_aware) = kv_aware_ops(policy) else {
+        return;
+    };
+    let provider =
+        supervisor.and_then(|supervisor| supervisor.match_provider_for_worker(worker.base_url()));
+    if history_enabled {
+        kv_aware.register_history_worker(worker, info, provider);
+    } else {
+        kv_aware.register_worker(worker.as_ref(), info, provider);
     }
 }
 
@@ -540,24 +561,13 @@ impl Router {
             };
             ctx.worker_registry.register(worker_arc.clone());
 
-            if let Some(kv_aware) = kv_aware_ops(default_policy.as_ref()) {
-                let provider = kv_index_supervisor.as_ref().and_then(|supervisor| {
-                    supervisor.match_provider_for_worker(worker_arc.base_url())
-                });
-                if kv_aware_completion_history {
-                    kv_aware.register_history_worker(
-                        &worker_arc,
-                        kv_worker_info.get(worker_arc.base_url()),
-                        provider,
-                    );
-                } else {
-                    kv_aware.register_worker(
-                        worker_arc.as_ref(),
-                        kv_worker_info.get(worker_arc.base_url()),
-                        provider,
-                    );
-                }
-            }
+            register_kv_target_for_policy(
+                default_policy.as_ref(),
+                kv_index_supervisor.as_deref(),
+                &worker_arc,
+                kv_worker_info.get(worker_arc.base_url()),
+                kv_aware_completion_history,
+            );
 
             // Notify PolicyRegistry about the new worker
             let model_id = worker_arc.model_id();
@@ -802,18 +812,13 @@ impl Router {
         info: Option<&crate::kv_index::WorkerKvInfo>,
     ) {
         let policy = self.policy_registry.get_default_policy();
-        let Some(kv_aware) = kv_aware_ops(policy.as_ref()) else {
-            return;
-        };
-        let provider = self
-            .kv_index_supervisor
-            .as_ref()
-            .and_then(|supervisor| supervisor.match_provider_for_worker(worker.base_url()));
-        if self.kv_aware_completion_history {
-            kv_aware.register_history_worker(worker, info, provider);
-        } else {
-            kv_aware.register_worker(worker.as_ref(), info, provider);
-        }
+        register_kv_target_for_policy(
+            policy.as_ref(),
+            self.kv_index_supervisor.as_deref(),
+            worker,
+            info,
+            self.kv_aware_completion_history,
+        );
     }
 
     fn remove_kv_worker(&self, worker_url: &str, target_urls: &[String]) {
@@ -1615,7 +1620,11 @@ impl Router {
                         input.tokens,
                         input.eligibility,
                         history,
-                        affinity_key,
+                        SelectionIdentity {
+                            lora_name,
+                            cache_salt,
+                            affinity_key,
+                        },
                         excluded_workers,
                     )
                 } else {
@@ -2337,7 +2346,7 @@ impl Router {
                     if let Some((policy, worker, observation)) = &history {
                         if let Some(observation) = observation.lock().take() {
                             if let Some(kv) = kv_aware_ops(policy.as_ref()) {
-                                kv.observe_completion_headers(worker.as_ref(), observation);
+                                kv.observe_completion_milestone(worker.as_ref(), observation);
                             }
                         }
                     }
@@ -2485,7 +2494,7 @@ impl Router {
                     kv_aware_ops(policy.as_ref()),
                     self.worker_registry.get_by_url(worker_url),
                 ) {
-                    kv.observe_completion_headers(current.as_ref(), observation);
+                    kv.observe_completion_milestone(current.as_ref(), observation);
                 }
             }
         }
@@ -5454,12 +5463,28 @@ mod tests {
 
     async fn selected_http_worker(response: Response) -> usize {
         assert_eq!(response.status(), StatusCode::OK);
+        let streaming = response.headers()[CONTENT_TYPE] == "text/event-stream";
         let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
-        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["worker"]
-            .as_u64()
-            .unwrap() as usize
+        let payload = if streaming {
+            let body = std::str::from_utf8(&bytes).unwrap();
+            let body = if body.starts_with(": router-stages ") {
+                body.split_once("\n\n")
+                    .expect("router-stages comment must be a complete SSE frame")
+                    .1
+            } else {
+                body
+            };
+            let frame = body
+                .strip_prefix("data: ")
+                .and_then(|frame| frame.strip_suffix("\n\ndata: [DONE]\n\n"))
+                .expect("fixture SSE must contain a JSON data frame followed by [DONE]");
+            serde_json::from_str::<serde_json::Value>(frame).unwrap()
+        } else {
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        payload["worker"].as_u64().unwrap() as usize
     }
 
     fn register_history_target(
@@ -6168,16 +6193,14 @@ mod tests {
         for body in requests {
             let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
             let forwarded = serde_json::to_value(&request).unwrap();
-            assert_eq!(
-                selected_http_worker(
-                    fixture
-                        .router
-                        .route_typed_request(None, &request, "/v1/chat/completions", None)
-                        .await
-                )
-                .await,
-                0
-            );
+            let response = fixture
+                .router
+                .route_typed_request(None, &request, "/v1/chat/completions", None)
+                .await;
+            if request.stream {
+                assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+            }
+            assert_eq!(selected_http_worker(response).await, 0);
             let calls = fixture.calls.lock();
             for (_, _, payload) in calls.iter().rev().take(3) {
                 assert_eq!(*payload, forwarded);
