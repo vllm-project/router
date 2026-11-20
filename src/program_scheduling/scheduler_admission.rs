@@ -246,6 +246,13 @@ impl ProgramScheduler {
 
     fn claim_dispatch(&self, handle: &ProgramRequestHandle) -> Option<ProgramDispatch> {
         let mut state = self.state.lock();
+        if state
+            .decisions
+            .get(handle.program())
+            .is_some_and(|decision| decision.terminate_when_idle)
+        {
+            return None;
+        }
         if self.tree_dp_mode() && state.runtime.view(handle.program())?.in_flight_requests > 0 {
             return None;
         }
@@ -915,6 +922,25 @@ mod tests {
             base_url: "http://rank-0".into(),
             dp_rank: Some(0),
         }
+    }
+
+    #[tokio::test]
+    async fn terminating_completion_does_not_dispatch_a_retained_successor() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let first = scheduler
+            .acquire(identity("p"), 100, &[target()], None)
+            .await
+            .unwrap();
+        let successor = scheduler.state.lock().runtime.retain_request(
+            &identity("p"),
+            120,
+            None,
+            Instant::now(),
+        );
+        assert_eq!(successor.program(), first.program());
+        scheduler.complete(&first, true, true, None, None);
+        assert!(scheduler.claim_dispatch(&successor).is_none());
+        scheduler.cancel_retained_request(&successor);
     }
 
     #[tokio::test]

@@ -2,6 +2,5 @@
   "binding_strategy": "cache_aware",
   "global_queue": false,
   "dynamic_token_capacity": true,
-  "scheduling_policy": "progress_ttl",
   "resume_order": "dp_admission"
 }

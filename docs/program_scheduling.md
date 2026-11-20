@@ -221,6 +221,11 @@ guarantee. Tree prediction errors and unreserved decode growth remain. A valid
 zero-free sample still permits a zero-estimated-cost full prefix hit, as before;
 unknown capacity does not. No arbitrary safety factor is introduced.
 
+Unlike fixed-binding direct DP, this path considers every eligible backend
+in the model pool even with `global_queue=false`. It uses token budgets and
+candidate-count slots, not the configured per-target active-Program count guard.
+These are the historical tree-admission semantics.
+
 For this path, `/scheduling/diagnostics` reports:
 
 - `token_capacity_source`: `vllm_usage_plus_reservations_tree_dp`.
@@ -263,9 +268,9 @@ Thus DP optimizes the snapshot's additive selection problem, not the nonlinear
 batch-gain model or a joint local/cross-rank placement problem.
 
 No new reserve, shared-prefix, decay, pause or capacity policy is introduced.
-Equal-value choices use native FCFS/program-ID order. Each sparse frontier is
-bounded to 16,384 states; exhaustion emits
-`dp_resume_fallback` and uses native ordered admission for that decision.
+Equal-value choices use native FCFS/program-ID order. The shared solver uses
+`dp_capacity_quantum`, optional `dp_state_budget`, and BFD on budget exhaustion;
+see [solver configuration](#solver-configuration).
 Omitting `resume_order: "dp"` preserves the default MRU behavior. PD
 disaggregation remains outside this feature.
 
