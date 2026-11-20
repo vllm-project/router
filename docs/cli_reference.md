@@ -86,6 +86,7 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | `--kv-event-replay-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Replay endpoint(s) for a static KV-event source, same `WORKER_URL=ENDPOINT[,ENDPOINT...]` form. |
 | `--kv-event-block-size` | `u32` | `16` | `integer` | `16` | KV cache block size in tokens for workers registered through `--kv-event-source`. |
 | `--kv-event-model` | `string` | `unset` | `string` | `unset` | Model id advertised to static KV-event sources; `unset` keeps the served model id. |
+| `--kv-event-strict-recovery` | `flag` | `false` | `flag` | `false` | Opt in to authoritative KV history recovery. External pool tiers stay uncredited until an independent pool baseline exists. Requests stay routable in fallback; after retry exhaustion, an operator-initiated worker KV clear restores worker-local credit. Without strict mode, fresh observations can restore credit after history loss. |
 
 The Rust CLI requires worker URLs in regular mode unless service discovery is
 enabled. The Python launcher permits an empty worker list without service
@@ -159,12 +160,26 @@ in clap's option list in `--help`.
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--enable-program-scheduling` | `flag` | `false` | `flag` | `false` | Enable Program-level scheduling independently of the request-level routing policy. |
+| `--enable-program-scheduling` | `flag` | `false` | `flag` | `false` | Enable Program-level scheduling independently of the request-level routing policy, defaulting to verified exact input-token counts with estimation fallback. |
 | `--program-scheduling-config-json` | `string` | `unset` | `string` | `unset` | JSON object overriding Program scheduling defaults; requires `--enable-program-scheduling`. |
 
 For JSON fields, defaults and request opt-in behavior, see
 [Program scheduling](program_scheduling/program-scheduling.md). The JSON option configures the
 feature; it does not enable it on its own.
+
+No JSON override is needed for the `exact` default. To select the
+supported `estimated` compatibility mode, both CLIs accept the same override:
+
+```bash
+--enable-program-scheduling \
+--program-scheduling-config-json '{"token_count_mode":"estimated"}'
+```
+
+The default verifies available prepared counts automatically and falls back to
+estimation. `estimated` remains supported and is not deprecated. HTTP chat
+tokenization remains a separate explicit opt-in. See
+[input-token configuration](program_scheduling/program-scheduling.md#input-token-facts)
+for that opt-in and the advanced `shadow` diagnostic option.
 
 ## Kubernetes service discovery
 
