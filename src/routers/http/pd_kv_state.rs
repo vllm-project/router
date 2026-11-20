@@ -53,6 +53,7 @@ impl std::fmt::Debug for PdKvState {
 }
 
 impl PdKvState {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn start(
         client: reqwest::Client,
         api_key: Option<String>,
@@ -61,10 +62,12 @@ impl PdKvState {
         registry: Arc<WorkerRegistry>,
         prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
         decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
+        strict_recovery: bool,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
         state.api_key = api_key;
         state.supervisor.set_api_key(state.api_key.clone());
+        state.supervisor.set_strict_recovery(strict_recovery);
         state
             .supervisor
             .set_mooncake_prefill(connector == KvConnector::Mooncake);
@@ -1184,6 +1187,7 @@ mod kv_input_tests {
             registry.clone(),
             Some(prefill_policy.clone()),
             Some(decode_policy.clone()),
+            false,
         )
         .await;
         tokio::join!(

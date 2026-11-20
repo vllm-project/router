@@ -418,10 +418,7 @@ impl SourceBinding {
         }
         let adapter = match namespace {
             None => None,
-            Some(name) => match self.adapter_path(name) {
-                Some(path) => Some((name, path)),
-                None => return None,
-            },
+            Some(name) => Some((name, self.adapter_path(name)?)),
         };
         let queries = self.groups.iter().map(|group| PageQuery {
             group: group.group_idx,

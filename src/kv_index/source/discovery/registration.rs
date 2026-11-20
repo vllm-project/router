@@ -321,7 +321,9 @@ impl KvIndexSupervisor {
                     .with_shared_index(indexer.clone())
                     .with_source_binding(live.lease.clone()),
             );
-            let stream = Arc::new(EventStream::new(index.clone()));
+            let stream = Arc::new(
+                EventStream::new(index.clone()).with_strict_recovery(self.strict_recovery),
+            );
             let handle = match super::super::events::event_stream::spawn_zmq_with_signals(
                 ev.clone(),
                 stream,

@@ -64,6 +64,7 @@ struct TcpReplay {
     replay: zmq::Socket,
     publisher: Option<zmq::Socket>,
     endpoint: String,
+    hwm: i32,
 }
 
 impl TcpReplay {
@@ -83,6 +84,7 @@ impl TcpReplay {
             replay,
             publisher: Some(publisher),
             endpoint,
+            hwm: 64,
         }
     }
 
@@ -91,15 +93,24 @@ impl TcpReplay {
         index: Arc<SourceBinding>,
         signals: Option<mpsc::Sender<IngestionSignal>>,
     ) -> SubscriberHandle {
+        self.start_with_recovery(index, signals, false)
+    }
+
+    fn start_with_recovery(
+        &self,
+        index: Arc<SourceBinding>,
+        signals: Option<mpsc::Sender<IngestionSignal>>,
+        strict: bool,
+    ) -> SubscriberHandle {
         let source = EventSource {
             source: index.target.instance_id.clone(),
             dp_rank: index.target.dp_rank,
             pub_endpoint: self.endpoint.clone(),
             replay_endpoint: Some("inproc://tcp-recovery-replay".into()),
             topic: "kv".into(),
-            hwm: Some(64),
+            hwm: Some(self.hwm),
         };
-        let stream = Arc::new(EventStream::new(index));
+        let stream = Arc::new(EventStream::new(index).with_strict_recovery(strict));
         let lease = stream.begin_replay().unwrap();
         spawn(source, stream, lease, self.ctx.clone(), signals)
     }
@@ -263,6 +274,79 @@ async fn full_attention_live_store_remove_and_clear_update_credit() {
 }
 
 #[tokio::test]
+async fn exhausted_replay_recovers_on_the_configured_live_boundary() {
+    for strict in [false, true] {
+        let tcp = TcpReplay::new();
+        let index = Arc::new(full_binding(target("recovery-mode"), BLOCK_SIZE));
+        let _handle = tcp.start_with_recovery(index.clone(), None, strict);
+        let store = store_prompt();
+        let live_store = batch_payload(&[KVEvent::BlockStored(store.clone())]);
+        tcp.subscribed().await;
+        for _ in 0..MAX_REPLAY_FAILURES {
+            let request = tcp.request(0).await;
+            tcp.history(&request, &[(10, &live_store)]);
+        }
+        tcp.subscribed().await;
+        assert_eq!(credit(&index), 0);
+        tcp.live(11, &live_store);
+
+        if strict {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert_eq!(
+                credit(&index),
+                0,
+                "a store alone cannot restore strict credit"
+            );
+            let clear = batch_payload(&[
+                KVEvent::AllBlocksCleared(Default::default()),
+                KVEvent::BlockStored(store.clone()),
+            ]);
+            tcp.live(12, &clear);
+            wait_until(|| next_seq(&index) == Some(13)).await;
+            assert_eq!(credit(&index), 4);
+        } else {
+            wait_until(|| next_seq(&index) == Some(12)).await;
+            assert_eq!(credit(&index), 4);
+        }
+        let seq = if strict { 13 } else { 12 };
+        tcp.live(
+            seq,
+            &batch_payload(&[gpu_remove(Some(0), store.block_hashes)]),
+        );
+        wait_until(|| next_seq(&index) == Some(seq as u64 + 1)).await;
+        assert_eq!(credit(&index), 0);
+    }
+}
+
+#[tokio::test]
+async fn delayed_replay_keeps_live_removal_with_a_small_receive_queue() {
+    let mut tcp = TcpReplay::new();
+    tcp.hwm = 2;
+    let index = Arc::new(full_binding(target("buffered-recovery"), BLOCK_SIZE));
+    let _handle = tcp.start(index.clone(), None);
+    let store = store_prompt();
+    let remove = batch_payload(&[gpu_remove(Some(0), store.block_hashes.clone())]);
+    let warm = batch_payload(&[KVEvent::BlockStored(store)]);
+    let empty = batch_payload(&[]);
+
+    tcp.subscribed().await;
+    tcp.history(&tcp.request(0).await, &[]);
+    tcp.live(0, &warm);
+    wait_until(|| credit(&index) == 4).await;
+    tcp.live(2, &empty);
+    let request = tcp.request(1).await;
+    for seq in 3..24 {
+        tcp.live(seq, &empty);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tcp.live(24, &remove);
+    assert_eq!(credit(&index), 0);
+    tcp.history(&request, &[(1, &empty), (2, &empty)]);
+    wait_until(|| next_seq(&index) == Some(25)).await;
+    assert_eq!(credit(&index), 0);
+}
+
+#[tokio::test]
 async fn replay_requires_continuous_history_and_valid_topic_rank_and_payload() {
     let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
     let empty = batch_payload(&[]);
@@ -294,14 +378,14 @@ async fn replay_requires_continuous_history_and_valid_topic_rank_and_payload() {
             }
         ));
 
-        let request = tcp.request(0).await;
+        let request = tcp.request(1).await;
         assert_eq!(credit(&index), 0);
-        if failure != "missing_start" {
-            tcp.reply(&request, 0, &store);
-        }
         match failure {
-            "missing_start" => tcp.reply(&request, 1, &empty),
-            "middle_gap" => tcp.reply(&request, 2, &empty),
+            "missing_start" => tcp.reply(&request, 2, &empty),
+            "middle_gap" => {
+                tcp.reply(&request, 1, &empty);
+                tcp.reply(&request, 3, &empty);
+            }
             "corrupt" => tcp.reply(&request, 1, &[0xc1]),
             "early_eof" => {}
             "wrong_rank" => tcp.reply(&request, 1, &bad_rank),
@@ -515,14 +599,14 @@ async fn tcp_disconnect_during_gap_replay_never_republishes_old_source() {
         signal(&mut signals).await,
         IngestionSignal::Gap { .. }
     ));
-    let in_flight = tcp.request(0).await;
-    tcp.reply(&in_flight, 0, &store);
-    wait_until(|| next_seq(&index) == Some(1)).await;
+    let in_flight = tcp.request(1).await;
+    tcp.reply(&in_flight, 1, &empty);
+    wait_until(|| next_seq(&index) == Some(2)).await;
 
     tcp.disconnect();
     // Let ZMQ report the TCP disconnect while this replay is still open.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    tcp.history(&in_flight, &[(1, &empty), (2, &empty)]);
+    tcp.history(&in_flight, &[(2, &empty)]);
     assert!(matches!(
         signal(&mut signals).await,
         IngestionSignal::Invalidated {

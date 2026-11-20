@@ -1,6 +1,6 @@
 //! Shared event transport, frame parsing and connection readiness.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::Duration;
 
@@ -370,21 +370,78 @@ impl ConnectionMonitor {
     }
 }
 
-/// Cancel a replay if its live subscription disconnects before completion.
-pub(super) async fn while_connected<F: std::future::Future>(
+#[derive(Default)]
+pub(super) struct PendingLive {
+    frames: VecDeque<Vec<Vec<u8>>>,
+    bytes: usize,
+}
+
+impl PendingLive {
+    pub(super) fn pop(&mut self) -> Option<Vec<Vec<u8>>> {
+        let frames = self.frames.pop_front()?;
+        self.bytes -= frames.iter().map(Vec::len).sum::<usize>();
+        Some(frames)
+    }
+
+    pub(super) fn discard(&mut self, topic: &[u8]) -> Option<i64> {
+        let through = self
+            .frames
+            .drain(..)
+            .filter_map(|frames| {
+                live_sequence(&frames, topic)
+                    .ok()
+                    .flatten()
+                    .filter(|seq| (0..i64::MAX).contains(seq))
+            })
+            .max();
+        self.bytes = 0;
+        through
+    }
+}
+
+pub(super) enum ReplayPoll {
+    Finished(Option<i64>),
+    Disconnected,
+    BufferFull,
+}
+
+/// Watch the connection and drain the live socket while replay is in progress.
+pub(super) async fn while_connected(
     connection: &mut ConnectionMonitor,
-    replay: F,
+    replay: impl std::future::Future<Output = Option<i64>>,
     watch: bool,
-) -> io::Result<Option<F::Output>> {
+    sub: &mut ReadableSocket,
+    pending: &mut PendingLive,
+    topic: &[u8],
+) -> io::Result<ReplayPoll> {
+    const MAX_FRAMES: usize = 1024;
+    const MAX_BYTES: usize = 64 * 1024 * 1024;
     tokio::pin!(replay);
     loop {
         tokio::select! {
-            result = &mut replay => return Ok(Some(result)),
+            result = &mut replay => return Ok(ReplayPoll::Finished(result)),
             result = connection.wait(), if watch => {
                 result?;
                 let (lost, _) = connection.drain().map_err(io::Error::other)?;
                 if lost {
-                    return Ok(None);
+                    return Ok(ReplayPoll::Disconnected);
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                for _ in 0..64 {
+                    let frames = match sub.socket().recv_multipart(zmq::DONTWAIT) {
+                        Ok(frames) => frames,
+                        Err(zmq::Error::EAGAIN) => break,
+                        Err(error) => return Err(io::Error::other(error)),
+                    };
+                    if frames.first().is_some_and(|frame| frame.as_slice() != topic) {
+                        continue;
+                    }
+                    pending.bytes += frames.iter().map(Vec::len).sum::<usize>();
+                    pending.frames.push_back(frames);
+                    if pending.frames.len() >= MAX_FRAMES || pending.bytes >= MAX_BYTES {
+                        return Ok(ReplayPoll::BufferFull);
+                    }
                 }
             }
         }

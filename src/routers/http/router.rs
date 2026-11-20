@@ -406,6 +406,7 @@ impl Router {
             let (mut supervisor, signals) =
                 crate::kv_index::KvIndexSupervisor::new_http_full_attention(ctx.client.clone());
             supervisor.set_api_key(ctx.router_config.api_key.clone());
+            supervisor.set_strict_recovery(ctx.router_config.kv_event_strict_recovery);
             let static_sources = match &ctx.router_config.policy {
                 crate::config::PolicyConfig::KvAware {
                     static_kv_event_sources,
@@ -4674,9 +4675,9 @@ mod tests {
                 new.medium = Some("CPU".into());
                 let fresh = event_payload(3.0, &[KVEvent::BlockStored(new)], Some(3));
                 publisher.send(topic, 2, &fresh);
-                let request = publisher.replay_request(0).await;
+                let request = publisher.replay_request(1).await;
                 assert!(lookup(1).is_empty(), "gap must hide the source");
-                publisher.reply(&request, topic, &[(0, &warm), (1, &remove), (2, &fresh)]);
+                publisher.reply(&request, topic, &[(1, &remove), (2, &fresh)]);
                 wait_for_kv(|| !lookup(3).is_empty()).await;
                 check_hit(3);
                 assert!(lookup(1).is_empty());
@@ -7713,6 +7714,7 @@ mod tests {
                 async move {
                     let body = if fail_body {
                         Body::from_stream(futures_util::stream::once(async {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                             Err::<bytes::Bytes, _>(std::io::Error::other("broken backend body"))
                         }))
                     } else {

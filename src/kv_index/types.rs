@@ -200,7 +200,6 @@ pub(crate) enum SourceRecoveryReason {
     RetryExhausted,
     ReplayFailed,
     IncarnationReset,
-    RankScopeChanged,
     ValidationFailed,
     ClearBarrier,
     FreshObservation,
@@ -216,21 +215,11 @@ impl SourceRecoveryReason {
             Self::RetryExhausted => "retry_exhausted",
             Self::ReplayFailed => "replay_failed",
             Self::IncarnationReset => "incarnation_reset",
-            Self::RankScopeChanged => "rank_scope_changed",
             Self::ValidationFailed => "validation_failed",
             Self::ClearBarrier => "clear_barrier",
             Self::FreshObservation => "fresh_observation",
         }
     }
-}
-
-/// Evidence boundary that can restore placement credit for one source/rank.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RecoveryBoundary {
-    Initial,
-    Clear,
-    Observed,
-    Replay { attempt: u64 },
 }
 
 /// Current externally observable recovery status for one source/rank.

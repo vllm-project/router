@@ -8,12 +8,16 @@ use tracing::{debug, info, warn};
 
 use super::event_stream::{EventStream, StreamLease};
 use super::transport::{
-    live_sequence, retry_backoff, ConnectionMonitor, ReplayOverlap, IDLE_REPLAY_INTERVAL,
+    live_sequence, retry_backoff, ConnectionMonitor, PendingLive, ReplayOverlap, ReplayPoll,
+    IDLE_REPLAY_INTERVAL,
 };
+use crate::kv_index::types::SourceRecoveryReason as Reason;
 use crate::kv_index::IngestionSignal;
+use crate::metrics::RouterMetrics;
 
 /// The signed sentinel ending a replay stream: `seq = -1`.
 const END_SEQ: i64 = -1;
+const MAX_REPLAY_FAILURES: u32 = 3;
 
 pub use crate::kv_index::source::endpoints::EventSource;
 
@@ -75,9 +79,9 @@ impl Subscriber {
         }
     }
 
-    fn invalidate(&self, loss: bool) -> Result<(), ()> {
+    fn invalidate(&self, loss: bool, reason: Reason) -> Result<(), ()> {
         if let Some((stream, lease)) = &self.binding {
-            return stream.restart_replay(*lease, loss).map_err(|_| ());
+            return stream.restart_replay(*lease, loss, reason).map_err(|_| ());
         }
         if loss {
             crate::kv_index::record_signal_loss();
@@ -85,24 +89,27 @@ impl Subscriber {
         Ok(())
     }
 
-    fn suspend(&self, loss: bool) -> Result<(), ()> {
+    fn suspend(&self) -> Result<(), ()> {
         self.binding.as_ref().map_or(Ok(()), |(stream, lease)| {
-            stream.suspend_for_replay(*lease, loss).map_err(|_| ())
+            stream.suspend_for_replay(*lease).map_err(|_| ())
         })
     }
 
-    fn resume(&self, last: i64) -> Result<(), ()> {
+    fn resume(&self, last: i64, reason: Reason) -> Result<(), ()> {
         self.binding.as_ref().map_or(Ok(()), |(stream, lease)| {
             let next = last.checked_add(1).ok_or(())?;
-            stream.finish_replay(*lease, next as u64).map_err(|_| ())
+            stream.resume(*lease, next as u64, reason).map_err(|_| ())
         })
     }
 
-    fn apply(&self, seq: u64, payload: &[u8]) -> Result<(), ()> {
+    fn apply(&self, seq: u64, payload: &[u8], fresh: bool) -> Result<(), ()> {
         let cleared = if let Some((stream, lease)) = &self.binding {
-            stream
-                .apply_publisher_payload(*lease, seq, payload)
-                .map_err(|_| ())?
+            if fresh {
+                stream.observe_live(*lease, seq, payload)
+            } else {
+                stream.apply_publisher_payload(*lease, seq, payload)
+            }
+            .map_err(|_| ())?
         } else {
             let batch = crate::kv_index::decode_batch(payload).map_err(|_| ())?;
             batch
@@ -132,7 +139,7 @@ impl Subscriber {
 
     fn monitor_failed(&self, error: impl std::fmt::Display) {
         warn!(%error, source = %self.source.source, "KV event connection monitor failed");
-        if self.invalidate(true).is_ok() {
+        if self.invalidate(true, Reason::ValidationFailed).is_ok() {
             self.invalidated("KV event connection monitor failed");
         }
     }
@@ -196,10 +203,10 @@ impl Subscriber {
                         return None;
                     }
                     if reconcile && seq == start {
-                        self.suspend(false).ok()?;
+                        self.suspend().ok()?;
                         self.invalidated("idle replay found unapplied events");
                     }
-                    self.apply(seq, payload).ok()?;
+                    self.apply(seq, payload, false).ok()?;
                     super::transport::remember_replay(replayed, seq, payload);
                     last = wire_seq;
                     next = seq + 1;
@@ -263,7 +270,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
             );
 
             let mut last_seq: i64 = -1;
-            if subscriber.invalidate(false).is_err() {
+            if subscriber.invalidate(false, Reason::Registered).is_err() {
                 return;
             }
             let mut suspended = false;
@@ -273,12 +280,14 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
             let mut allow_overlap = bootstrap;
             let mut replayed = ReplayOverlap::new();
             let mut replay_socket = None;
+            let mut pending_live = PendingLive::default();
             let mut next_catchup = tokio::time::Instant::now();
             let mut next_idle_replay = tokio::time::Instant::now() + IDLE_REPLAY_INTERVAL;
             let mut idle_reconcile = false;
             let mut disconnected = false;
             let mut reconnect = false;
             let mut recovery_through = None;
+            let mut replay_failures = 0;
             let mut monitor_error = None;
 
             'live: loop {
@@ -295,7 +304,10 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                 };
                 let lost = std::mem::take(&mut reconnect) || lost;
                 if lost {
-                    if subscriber.invalidate(true).is_err() {
+                    if subscriber
+                        .invalidate(true, Reason::IncarnationReset)
+                        .is_err()
+                    {
                         break;
                     }
                     subscriber.invalidated("KV event publisher disconnected");
@@ -312,12 +324,14 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     }
                     disconnected = true;
                     recovery_through = None;
+                    replay_failures = 0;
                     last_seq = -1;
                     bootstrap = false;
                     idle_reconcile = false;
                     allow_overlap = false;
                     replayed.clear();
                     replay_socket = None;
+                    pending_live = PendingLive::default();
                 }
                 if !lost && disconnected && latest == Some(true) {
                     disconnected = false;
@@ -352,7 +366,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                 }
                 if bootstrap && tokio::time::Instant::now() >= next_catchup {
                     if last_seq == -1 && !suspended {
-                        if subscriber.suspend(false).is_err() {
+                        if subscriber.suspend().is_err() {
                             break;
                         }
                         suspended = true;
@@ -367,13 +381,26 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             idle_reconcile,
                             &shutdown_rx,
                         );
-                        match super::transport::while_connected(&mut connection, replay, !suspended)
-                            .await
+                        match super::transport::while_connected(
+                            &mut connection,
+                            replay,
+                            !suspended,
+                            &mut sub,
+                            &mut pending_live,
+                            topic.as_bytes(),
+                        )
+                        .await
                         {
-                            Ok(Some(result)) => result,
-                            Ok(None) => {
+                            Ok(ReplayPoll::Finished(result)) => result,
+                            Ok(ReplayPoll::Disconnected) => {
                                 reconnect = true;
                                 continue;
+                            }
+                            Ok(ReplayPoll::BufferFull) => {
+                                // The replay must cover any discarded live data.
+                                recovery_through =
+                                    recovery_through.max(pending_live.discard(topic.as_bytes()));
+                                None
                             }
                             Err(error) => {
                                 monitor_error = Some(error.to_string());
@@ -393,11 +420,13 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         continue;
                     }
                     if let Some(high) = result {
+                        RouterMetrics::record_kv_replay_outcome("applied");
+                        replay_failures = 0;
                         let advanced = high != last_seq;
                         last_seq = high;
                         recovery_through = None;
                         if suspended || (idle_reconcile && advanced) {
-                            if subscriber.resume(last_seq).is_err() {
+                            if subscriber.resume(last_seq, Reason::ReplayApplied).is_err() {
                                 break;
                             }
                             suspended = false;
@@ -415,7 +444,15 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     } else {
                         let had_credit = !suspended || idle_reconcile;
                         idle_reconcile = false;
-                        if subscriber.invalidate(had_credit).is_err() {
+                        replay_failures += 1;
+                        let exhausted = replay_failures == MAX_REPLAY_FAILURES;
+                        let (reason, outcome) = if exhausted {
+                            (Reason::RetryExhausted, "retry_exhausted")
+                        } else {
+                            (Reason::ReplayFailed, "failed")
+                        };
+                        RouterMetrics::record_kv_replay_outcome(outcome);
+                        if subscriber.invalidate(had_credit, reason).is_err() {
                             break;
                         }
                         last_seq = -1;
@@ -423,6 +460,26 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         replayed.clear();
                         if had_credit {
                             subscriber.invalidated("replay lost continuity");
+                        }
+                        if exhausted {
+                            // Discard frames queued during the failed replay. In
+                            // compatibility mode only fresh observations can
+                            // start a new view. Strict mode waits for a clear.
+                            match ConnectionMonitor::fresh_sub(&ctx, &pub_endpoint, &topic, hwm) {
+                                Ok((new_sub, new_monitor)) => {
+                                    sub = new_sub;
+                                    connection = new_monitor;
+                                }
+                                Err(error) => {
+                                    monitor_error = Some(error.to_string());
+                                    break;
+                                }
+                            }
+                            bootstrap = false;
+                            allow_overlap = false;
+                            recovery_through = None;
+                            pending_live = PendingLive::default();
+                            continue;
                         }
                         next_catchup = tokio::time::Instant::now() + Duration::from_millis(500);
                     }
@@ -435,8 +492,11 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     }
                     continue;
                 }
-                let (through, overlap) = 'live_batch: {
-                    match sub.socket().recv_multipart(zmq::DONTWAIT) {
+                let (through, overlap, restart_from) = 'live_batch: {
+                    let received = pending_live
+                        .pop()
+                        .map_or_else(|| sub.socket().recv_multipart(zmq::DONTWAIT), Ok);
+                    match received {
                         Ok(frames) => {
                             let seq = match live_sequence(&frames, topic.as_bytes()) {
                                 Ok(Some(seq)) if (0..i64::MAX).contains(&seq) => seq,
@@ -445,16 +505,32 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                     continue 'live;
                                 }
                                 Ok(Some(_)) | Err(()) => {
-                                    if subscriber.invalidate(true).is_err() {
+                                    if replay_failures == MAX_REPLAY_FAILURES {
+                                        tokio::task::yield_now().await;
+                                        continue 'live;
+                                    }
+                                    if subscriber
+                                        .invalidate(true, Reason::ValidationFailed)
+                                        .is_err()
+                                    {
                                         break 'live;
                                     }
                                     subscriber.invalidated("invalid live sequence");
                                     suspended = true;
                                     tokio::task::yield_now().await;
-                                    break 'live_batch (None, true);
+                                    break 'live_batch (None, true, -1);
                                 }
                             };
                             next_idle_replay = tokio::time::Instant::now() + IDLE_REPLAY_INTERVAL;
+                            if replay_failures == MAX_REPLAY_FAILURES {
+                                if subscriber.apply(seq as u64, &frames[2], true).is_ok() {
+                                    last_seq = seq;
+                                    suspended = false;
+                                    replay_failures = 0;
+                                }
+                                tokio::task::yield_now().await;
+                                continue 'live;
+                            }
                             if allow_overlap
                                 && seq <= last_seq
                                 && super::transport::replay_overlap(
@@ -473,7 +549,10 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                     "kv_index {}: restart seq {} after {} → incarnation {}",
                                     source_id, seq, last_seq, incarnation
                                 );
-                                if subscriber.invalidate(true).is_err() {
+                                if subscriber
+                                    .invalidate(true, Reason::IncarnationReset)
+                                    .is_err()
+                                {
                                     break 'live;
                                 }
                                 emit(
@@ -484,19 +563,28 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                     },
                                 );
                                 suspended = true;
-                                break 'live_batch (Some(seq), true);
+                                break 'live_batch (Some(seq), true, -1);
                             }
                             if seq <= last_seq {
-                                if subscriber.invalidate(true).is_err() {
+                                if subscriber
+                                    .invalidate(true, Reason::ValidationFailed)
+                                    .is_err()
+                                {
                                     break 'live;
                                 }
                                 subscriber.invalidated("duplicate live sequence");
                                 suspended = true;
-                                break 'live_batch (Some(seq), allow_overlap);
+                                break 'live_batch (Some(seq), allow_overlap, -1);
                             }
                             let expected = last_seq + 1; // Every accepted sequence leaves room.
                             if (can_replay || last_seq >= 0) && seq > expected {
-                                if subscriber.invalidate(true).is_err() {
+                                if can_replay && last_seq >= 0 {
+                                    if subscriber.suspend().is_err() {
+                                        break 'live;
+                                    }
+                                    crate::kv_index::record_signal_loss();
+                                } else if subscriber.invalidate(true, Reason::SequenceGap).is_err()
+                                {
                                     break 'live;
                                 }
                                 emit(
@@ -508,19 +596,22 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                     },
                                 );
                                 suspended = true;
-                                break 'live_batch (Some(seq), true);
+                                break 'live_batch (Some(seq), true, last_seq);
                             }
-                            if subscriber.apply(seq as u64, &frames[2]).is_err() {
-                                if subscriber.invalidate(true).is_err() {
+                            if subscriber.apply(seq as u64, &frames[2], false).is_err() {
+                                if subscriber
+                                    .invalidate(true, Reason::ValidationFailed)
+                                    .is_err()
+                                {
                                     break 'live;
                                 }
                                 subscriber.invalidated("invalid live KV event batch");
                                 suspended = true;
                                 tokio::task::yield_now().await;
-                                break 'live_batch (Some(seq), true);
+                                break 'live_batch (Some(seq), true, -1);
                             }
                             if suspended {
-                                if subscriber.resume(seq).is_err() {
+                                if subscriber.resume(seq, Reason::InitialSequence).is_err() {
                                     break 'live;
                                 }
                                 suspended = false;
@@ -568,9 +659,10 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     suspended = false;
                     continue;
                 }
-                last_seq = -1;
+                last_seq = restart_from;
                 recovery_through = through;
                 bootstrap = true;
+                next_catchup = tokio::time::Instant::now();
                 allow_overlap = overlap;
                 replayed.clear();
                 replay_socket = None;

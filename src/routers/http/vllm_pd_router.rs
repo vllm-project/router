@@ -3966,6 +3966,7 @@ mod tests {
                 router.pd_router.worker_registry.clone(),
                 Some(Arc::new(crate::policies::KvAwarePolicy::default())),
                 None,
+                false,
             )
             .await,
         );

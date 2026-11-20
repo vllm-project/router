@@ -330,6 +330,7 @@ Use the same vLLM release for the engine and its gRPC frontend. In all versions 
 | `--kv-event-replay-source` | `WORKER_URL=ENDPOINT[,ENDPOINT...]` | string, repeatable | `[]` | Supplies replay addresses for a matching static live source. |
 | `--kv-event-block-size` | `16` | `u32` | `16` | Sets the block size in tokens for static colocated sources. |
 | `--kv-event-model` | `qwen3` | string | unset | Sets the served model name when using static colocated sources. |
+| `--kv-event-strict-recovery` | Set the flag | flag | off | Requires complete event history or a worker KV clear before restoring cache credit. Requests continue routing by load during recovery. |
 | `--pd-hybrid-config` | `pd-layout.json` | path | unset | Supplies Prefill sources, their layouts and compatible Decode URLs. |
 | `--pd-kv-events` | `WORKER_URL=ENDPOINT[,ENDPOINT...]` | string, repeatable | `[]` | Supplies live publishers for 16-token P/D sources without a declared layout. |
 | `--router-temperature` | finite value ≥ `0` | `f64` | `0.0` | Samples more broadly with higher values in colocated routing and P/D Prefill. Zero selects the lowest-cost worker. |

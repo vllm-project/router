@@ -717,7 +717,7 @@ impl PageTable {
         };
         let mut run = self
             .read_row(&PageKey::new(group, first), |row| {
-                row.holders(namespace).map(&claims)
+                row.holders(namespace).map(claims)
             })
             .flatten()
             .unwrap_or_default();

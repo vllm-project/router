@@ -149,6 +149,7 @@ pub struct KvIndexSupervisor {
     full_attention_http: bool,
     http_pd: bool,
     mooncake_prefill: bool,
+    strict_recovery: bool,
     /// Explicit event sources override discovery for configured regular workers.
     static_sources: HashMap<String, StaticKvEventSources>,
     /// Static KV event sources per prefill URL; these workers skip HTTP
@@ -191,6 +192,7 @@ impl KvIndexSupervisor {
             full_attention_http: false,
             http_pd: false,
             mooncake_prefill: false,
+            strict_recovery: false,
             static_sources: HashMap::new(),
             static_pd_sources: HashMap::new(),
             ctx: Arc::new(zmq::Context::new()),
@@ -254,6 +256,10 @@ impl KvIndexSupervisor {
 
     pub(crate) fn set_mooncake_prefill(&mut self, enabled: bool) {
         self.mooncake_prefill = enabled;
+    }
+
+    pub(crate) fn set_strict_recovery(&mut self, enabled: bool) {
+        self.strict_recovery = enabled;
     }
 
     pub fn with_static_sources(

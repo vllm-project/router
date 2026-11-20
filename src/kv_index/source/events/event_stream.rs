@@ -14,6 +14,7 @@ use crate::kv_index::source::endpoints::EventSource;
 use crate::kv_index::source::events::transport::retry_backoff;
 use crate::kv_index::storage::source_transaction::{StreamPhase as Phase, StreamState};
 use crate::kv_index::storage::IndexBatch;
+use crate::kv_index::types::{SourceRecoveryReason as Reason, SourceRecoveryState as Recovery};
 use crate::kv_index::{IngestionSignal, KVEvent, SourceBinding, SourceError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,13 +30,30 @@ pub enum StreamError {
 /// Lease changes and cache mutations use the index's single source transaction.
 pub struct EventStream {
     index: Arc<SourceBinding>,
+    strict_recovery: bool,
 }
 
 impl EventStream {
     /// Fence any previous subscriber and hide its cache before starting a new replay.
     pub fn new(index: Arc<SourceBinding>) -> Self {
         index.invalidate();
-        Self { index }
+        Self {
+            index,
+            strict_recovery: false,
+        }
+    }
+
+    pub(in crate::kv_index::source) fn with_strict_recovery(mut self, enabled: bool) -> Self {
+        self.strict_recovery = enabled;
+        self
+    }
+
+    fn exact_state(&self) -> Recovery {
+        if self.strict_recovery {
+            Recovery::WorkerExact
+        } else {
+            Recovery::Exact
+        }
     }
 
     /// The caller must first establish that sequence zero represents an empty
@@ -46,31 +64,36 @@ impl EventStream {
                 self.index.with_stream_batch(|state, tx| {
                     let lease = StreamLease(state.begin_lease());
                     self.index.reset_stream(state, tx, Some(0), false);
+                    state.recovery_transition(Recovery::Degraded, Reason::Registered);
                     lease
                 })
             })
             .ok_or(StreamError::Index(SourceError::Untrusted))
     }
 
-    pub(super) fn restart_replay(&self, lease: StreamLease, loss: bool) -> Result<(), StreamError> {
-        self.with_state(lease, |state, tx| {
-            if loss {
-                crate::kv_index::record_signal_loss();
-            }
-            self.index.reset_stream(state, tx, Some(0), false);
-            Ok(())
-        })
-    }
-
-    pub(super) fn suspend_for_replay(
+    pub(super) fn restart_replay(
         &self,
         lease: StreamLease,
         loss: bool,
+        reason: Reason,
     ) -> Result<(), StreamError> {
         self.with_state(lease, |state, tx| {
             if loss {
                 crate::kv_index::record_signal_loss();
             }
+            self.index.reset_stream(state, tx, Some(0), false);
+            let recovery = if reason == Reason::RetryExhausted {
+                Recovery::Fallback
+            } else {
+                Recovery::Degraded
+            };
+            state.recovery_transition(recovery, reason);
+            Ok(())
+        })
+    }
+
+    pub(super) fn suspend_for_replay(&self, lease: StreamLease) -> Result<(), StreamError> {
+        self.with_state(lease, |state, tx| {
             if state.phase == Phase::Replaying {
                 return Ok(());
             }
@@ -80,6 +103,7 @@ impl EventStream {
             tx.suspend_source(&self.index.target.instance_id, self.index.target.dp_rank);
             state.hide();
             state.phase = Phase::Replaying;
+            state.recovery_transition(Recovery::Degraded, Reason::SequenceGap);
             Ok(())
         })
     }
@@ -102,6 +126,27 @@ impl EventStream {
         seq: u64,
         payload: &[u8],
     ) -> Result<bool, StreamError> {
+        self.apply_payload_at(lease, seq, payload, false)
+    }
+
+    /// Start from a fresh SUB connection after the replay budget is exhausted.
+    /// Strict recovery can resume only after a worker-local clear.
+    pub(super) fn observe_live(
+        &self,
+        lease: StreamLease,
+        seq: u64,
+        payload: &[u8],
+    ) -> Result<bool, StreamError> {
+        self.apply_payload_at(lease, seq, payload, true)
+    }
+
+    fn apply_payload_at(
+        &self,
+        lease: StreamLease,
+        seq: u64,
+        payload: &[u8],
+        fresh: bool,
+    ) -> Result<bool, StreamError> {
         let batch = crate::kv_index::decode_batch(payload);
         let prepared = batch
             .as_ref()
@@ -114,6 +159,21 @@ impl EventStream {
                 super::apply::PreparedEvent::page_changes(events, self.index.max_entries)
             });
         self.with_state_for_pages(lease, planned, |state, tx| {
+            let cleared = batch.as_ref().is_ok_and(|batch| {
+                batch
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, KVEvent::AllBlocksCleared(_)))
+            });
+            if fresh {
+                if batch.is_err() {
+                    return Err(StreamError::Index(SourceError::InvalidBatch));
+                }
+                if self.strict_recovery && !cleared {
+                    return Err(StreamError::InvalidState);
+                }
+                self.index.reset_stream(state, tx, Some(seq), false);
+            }
             let result = match (&batch, prepared) {
                 (Ok(batch), Some(prepared)) => {
                     self.index.apply_prepared(state, tx, seq, batch, prepared)
@@ -157,18 +217,37 @@ impl EventStream {
                 state.phase = Phase::Replaying;
                 return Err(StreamError::Index(error));
             }
-            Ok(batch.as_ref().is_ok_and(|batch| {
-                batch
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, KVEvent::AllBlocksCleared(_)))
-            }))
+            state.history_complete |= cleared || (!fresh && seq == 0);
+            if fresh {
+                self.index
+                    .publish_stream(state, tx, seq + 1)
+                    .map_err(StreamError::Index)?;
+            }
+            if state.phase == Phase::Live {
+                if cleared {
+                    state.recovery_transition(self.exact_state(), Reason::ClearBarrier);
+                } else if fresh {
+                    state.recovery_transition(Recovery::Observed, Reason::FreshObservation);
+                } else if seq == 0 {
+                    state.recovery_transition(self.exact_state(), Reason::InitialSequence);
+                }
+            }
+            Ok(cleared)
         })
     }
 
     /// Publish a continuous replay; its caller must keep the cursor caught up
     /// until the live subscription has been confirmed.
     pub fn finish_replay(&self, lease: StreamLease, next_seq: u64) -> Result<(), StreamError> {
+        self.resume(lease, next_seq, Reason::ReplayApplied)
+    }
+
+    pub(super) fn resume(
+        &self,
+        lease: StreamLease,
+        next_seq: u64,
+        reason: Reason,
+    ) -> Result<(), StreamError> {
         self.with_state(lease, |state, tx| {
             if state.phase != Phase::Replaying {
                 return Err(StreamError::InvalidState);
@@ -178,7 +257,16 @@ impl EventStream {
                 .map_err(|error| {
                     state.phase = Phase::Replaying;
                     StreamError::Index(error)
-                })
+                })?;
+            if next_seq != 0 {
+                let recovery = if state.history_complete {
+                    self.exact_state()
+                } else {
+                    Recovery::Observed
+                };
+                state.recovery_transition(recovery, reason);
+            }
+            Ok(())
         })
     }
 
@@ -193,6 +281,7 @@ impl EventStream {
                     Self::check(state, lease)?;
                     self.index.reset_stream(state, tx, None, false);
                     state.lease_id = 0;
+                    state.forget_recovery();
                     Ok(())
                 },
             )
@@ -495,14 +584,14 @@ mod tests {
             "a rejected batch must remain recoverable"
         );
         let loss_epoch = crate::kv_index::signal_loss_epoch();
-        stream.restart_replay(current, true).unwrap();
+        stream
+            .restart_replay(current, true, Reason::ValidationFailed)
+            .unwrap();
         assert!(crate::kv_index::signal_loss_epoch() > loss_epoch);
         stream.apply_payload(current, 0, payload).unwrap();
         stream.finish_replay(current, 1).unwrap();
         assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 528);
-        let loss_epoch = crate::kv_index::signal_loss_epoch();
-        stream.suspend_for_replay(current, true).unwrap();
-        assert!(crate::kv_index::signal_loss_epoch() > loss_epoch);
+        stream.suspend_for_replay(current).unwrap();
         assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 0);
         stream.finish_replay(current, 1).unwrap();
         stream.retire(current).unwrap();

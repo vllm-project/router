@@ -235,6 +235,9 @@ struct CliArgs {
     /// Shared model identity for workers using static event publishers.
     #[arg(long)]
     kv_event_model: Option<String>,
+    /// Require complete KV event recovery or a worker KV clear to restore placement credit.
+    #[arg(long, default_value_t = false)]
+    kv_event_strict_recovery: bool,
     /// Cache layout JSON for hybrid attention models, keyed by worker URL.
     #[arg(long)]
     kv_hybrid_layout: Option<std::path::PathBuf>,
@@ -690,6 +693,7 @@ impl CliArgs {
                 })?,
             mode,
             pd_kv_event_sources,
+            kv_event_strict_recovery: self.kv_event_strict_recovery,
             policy,
             connection_mode,
             host: self.host.clone(),

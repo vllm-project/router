@@ -308,6 +308,7 @@ impl KvIndexSupervisor {
         let api_key = self.api_key.clone();
         let static_config = self.resolved_static_source(worker_url);
         let installed = Arc::downgrade(&self.installed);
+        let strict_recovery = self.strict_recovery;
         tokio::spawn(async move {
             let invalidate = |handles: &[Arc<EventSubscriberHandle>]| {
                 for handle in handles {
@@ -376,7 +377,10 @@ impl KvIndexSupervisor {
                         handles.clear();
                         let mut recovered = true;
                         for (ev, index) in &targets {
-                            let stream = Arc::new(EventStream::new(index.clone()));
+                            let stream = Arc::new(
+                                EventStream::new(index.clone())
+                                    .with_strict_recovery(strict_recovery),
+                            );
                             match super::super::events::event_stream::spawn_zmq_with_signals(
                                 ev.clone(),
                                 stream,
