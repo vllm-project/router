@@ -12,7 +12,7 @@ use crate::backend::{
     PrepareError,
 };
 use crate::config::types::RetryConfig;
-use crate::core::worker::{worker_get, worker_post};
+use crate::core::worker::{fetch_worker_load, worker_get, worker_post};
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
     RetryExecutor, Worker, WorkerRegistry, WorkerType,
@@ -2943,39 +2943,7 @@ impl Router {
             worker_url
         };
 
-        match worker_get(client, &format!("{}/get_load", worker_url), api_key)
-            .send()
-            .await
-        {
-            Ok(res) if res.status().is_success() => match res.bytes().await {
-                Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    Ok(data) => data
-                        .get("load")
-                        .and_then(|v| v.as_i64())
-                        .map(|v| v as isize),
-                    Err(e) => {
-                        debug!("Failed to parse load response from {}: {}", worker_url, e);
-                        None
-                    }
-                },
-                Err(e) => {
-                    debug!("Failed to read load response from {}: {}", worker_url, e);
-                    None
-                }
-            },
-            Ok(res) => {
-                debug!(
-                    "Worker {} returned non-success status: {}",
-                    worker_url,
-                    res.status()
-                );
-                None
-            }
-            Err(e) => {
-                debug!("Failed to get load from {}: {}", worker_url, e);
-                None
-            }
-        }
+        fetch_worker_load(client, worker_url, api_key).await
     }
 
     async fn build_rerank_response(
