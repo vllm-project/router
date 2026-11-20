@@ -41,9 +41,11 @@ Choose one transport. Run the worker and Router in separate terminals. For an [e
 
 #### HTTP workers
 
+`--enable-scale-out` exposes the worker's rendering endpoints for text and chat requests. Requests that already contain token IDs can use KV-aware routing without this flag.
+
 ```bash
 vllm serve "$MODEL" --host 127.0.0.1 --port 8000 --served-model-name qwen3 \
-  --enable-prefix-caching --prefix-caching-hash-algo sha256_cbor --block-size 16 \
+  --enable-scale-out --enable-prefix-caching --prefix-caching-hash-algo sha256_cbor --block-size 16 \
   --kv-events-config "$EVENTS"
 ```
 
@@ -278,7 +280,7 @@ P/D disaggregation puts prompt processing on Prefill workers and token generatio
 3. Add `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'` to Prefill and the same option with `"kv_role":"kv_consumer"` to Decode. Enable events and replay on Prefill. Omit `--kv-events-config` on Decode for this setup. For gRPC, pass these engine options after `--`.
 4. Create [`pd-layout.json`](#pd-layout) with the Prefill layout, its live and replay addresses, and the compatible Decode URL. Leave Program scheduling disabled for declared P/D layouts.
 
-For gRPC, export `VLLM_ROUTER_TOKENIZER` with the model directory in the Router terminal.
+For text or chat over HTTP, add `--enable-scale-out` to each worker scored by `kv_aware`. For gRPC, export `VLLM_ROUTER_TOKENIZER` with the model directory in the Router terminal.
 
 ```bash
 PREFILL=http://127.0.0.1:8000
