@@ -127,6 +127,83 @@ pub enum ClearScope {
     All,
 }
 
+/// Trust state for one independently addressed KV event source.
+///
+/// `Observed` is compatibility-mode credit for fresh observations, not a claim
+/// that the publisher's complete history has been reconstructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SourceRecoveryState {
+    /// Worker history is complete; the external pool has no proven baseline.
+    WorkerExact,
+    Exact,
+    Observed,
+    Degraded,
+    Fallback,
+}
+
+impl SourceRecoveryState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkerExact => "worker_exact",
+            Self::Exact => "exact",
+            Self::Observed => "observed",
+            Self::Degraded => "degraded",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+/// Stable, bounded reasons for source recovery state transitions.
+/// Each variant is a metric label; add a reason only when a distinct alert needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SourceRecoveryReason {
+    Registered,
+    InitialSequence,
+    SequenceGap,
+    ReplayApplied,
+    RetryExhausted,
+    ReplayFailed,
+    IncarnationReset,
+    RankScopeChanged,
+    ValidationFailed,
+    ClearBarrier,
+    FreshObservation,
+}
+
+impl SourceRecoveryReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Registered => "registered",
+            Self::InitialSequence => "initial_sequence",
+            Self::SequenceGap => "sequence_gap",
+            Self::ReplayApplied => "replay_applied",
+            Self::RetryExhausted => "retry_exhausted",
+            Self::ReplayFailed => "replay_failed",
+            Self::IncarnationReset => "incarnation_reset",
+            Self::RankScopeChanged => "rank_scope_changed",
+            Self::ValidationFailed => "validation_failed",
+            Self::ClearBarrier => "clear_barrier",
+            Self::FreshObservation => "fresh_observation",
+        }
+    }
+}
+
+/// Evidence boundary that can restore placement credit for one source/rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecoveryBoundary {
+    Initial,
+    Clear,
+    Observed,
+    Replay { attempt: u64 },
+}
+
+/// Current externally observable recovery status for one source/rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SourceRecoveryStatus {
+    pub(crate) state: SourceRecoveryState,
+    pub(crate) reason: SourceRecoveryReason,
+}
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
