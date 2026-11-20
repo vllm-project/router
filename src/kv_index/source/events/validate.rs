@@ -1,7 +1,6 @@
 //! Event-shape admission, separate from structural decoding and transport.
 use crate::kv_hash::SequenceHash;
 use crate::kv_index::layout::{CacheGroup, GroupRule};
-use crate::kv_index::wire::extra_keys_match;
 use crate::kv_index::wire::{BlockStored, ExternalBlockHash, KVEvent};
 
 pub(super) fn sequence_hash(hash: &ExternalBlockHash) -> Option<SequenceHash> {
@@ -57,8 +56,6 @@ pub(super) fn validate_store(
                     || ahead.iter().any(|tokens| tokens.len() != lookahead_tokens)
             }
         }
-        || (store.lora_name.is_none()
-            && !extra_keys_match(store.extra_keys.as_ref(), store.block_hashes.len(), None))
         || store
             .parent_block_hash
             .as_ref()
@@ -66,6 +63,32 @@ pub(super) fn validate_store(
         || !event_kind_matches(group.kind, store)
     {
         return Err(());
+    }
+    if let Some(keys) = store
+        .extra_keys
+        .as_ref()
+        .filter(|_| store.lora_name.is_none())
+    {
+        if keys.len() != store.block_hashes.len() {
+            return Err(());
+        }
+        if let Some((first, rest)) = keys.split_first() {
+            if !rest.iter().all(rmpv::Value::is_nil) {
+                return Err(());
+            }
+            if !first.is_nil() {
+                // vLLM folds cache_salt into the first block's native hash.
+                // Leave salted requests on load-based routing without invalidating
+                // unrelated chains or the publisher's replay.
+                return if first.as_array().is_some_and(|parts| {
+                    matches!(parts.as_slice(), [salt] if salt.as_str().is_some_and(|s| !s.is_empty()))
+                }) {
+                    Ok(false)
+                } else {
+                    Err(())
+                };
+            }
+        }
     }
     let partial = partial_hash_hits
         && matches!(group.kind, GroupRule::FullAttention | GroupRule::Checkpoint)

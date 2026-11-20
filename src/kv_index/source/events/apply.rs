@@ -124,14 +124,11 @@ impl SourceBinding {
         let mut prepared = Vec::with_capacity(batch.events.len());
         for event in &batch.events {
             match event {
-                KVEvent::BlockStored(store) => match self.prepare_store(store) {
-                    Ok(Some(event)) => prepared.push(event),
-                    Ok(None) => {}
-                    // An unsupported adapter cannot revoke base-model facts.
-                    Err(SourceError::InvalidBatch)
-                        if !self.requires_root_proof && store.lora_name.is_some() => {}
-                    Err(error) => return Err(error),
-                },
+                KVEvent::BlockStored(store) => {
+                    if let Some(event) = self.prepare_store(store)? {
+                        prepared.push(event);
+                    }
+                }
                 KVEvent::BlockRemoved(remove) => {
                     if self.requires_root_proof && remove.group_idx != Some(0) {
                         return Err(SourceError::InvalidBatch);
@@ -185,10 +182,7 @@ impl SourceBinding {
             return Self::fail(state, tx, &self.owner, SourceError::Sequence);
         }
         // The vLLM publisher stamps every batch with its configured DP rank.
-        if batch.data_parallel_rank != Some(self.target.dp_rank)
-            || !batch.ts.is_finite()
-            || batch.ts < 0.0
-        {
+        if batch.data_parallel_rank != Some(self.target.dp_rank) {
             return Self::fail(state, tx, &self.owner, SourceError::InvalidBatch);
         }
         let prepared = match prepared {

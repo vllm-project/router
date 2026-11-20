@@ -20,17 +20,18 @@ Omitting the layout declares ordinary single-group full attention. With a standa
 
 ### 1. Prepare the worker settings
 
-Run this before each worker start. vLLM uses the default live port `5557` and allocates a replay port. The command generates a fresh publisher topic. Keep the default incremental reporting.
+Run this before each worker start. Set the live port and let vLLM allocate a replay port. The command generates a fresh publisher topic. Keep the default incremental reporting.
 
 ```bash
 MODEL=/models/Qwen3-4B-Instruct-2507
 export VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0
 unset PYTHONHASHSEED
 KV_TOPIC=$(python3 -c 'from uuid import uuid4; print(uuid4().hex)')
-EVENTS=$(printf '{"enable_kv_cache_events":true,"replay_endpoint":"tcp://*:0","topic":"%s"}' "$KV_TOPIC")
+KV_LIVE_PORT=5557
+EVENTS=$(printf '{"enable_kv_cache_events":true,"endpoint":"tcp://*:%s","replay_endpoint":"tcp://*:0","topic":"%s"}' "$KV_LIVE_PORT" "$KV_TOPIC")
 ```
 
-For multiple worker processes on the same host, set a distinct live `endpoint` in `EVENTS` for each process, such as `tcp://*:5657`. Set a fixed `replay_endpoint` if the network requires a reserved port. vLLM adds the DP rank to each fixed event port, so reserve non-overlapping ranges for live and replay. These ports are separate from the HTTP and gRPC ports.
+For multiple worker processes on one host, set a distinct `KV_LIVE_PORT` per process. Set a fixed `replay_endpoint` if the network requires a reserved port. vLLM adds the DP rank to each fixed event port, so reserve non-overlapping ranges for live and replay. These ports are separate from HTTP and gRPC.
 
 On vLLM 0.30.0, use a fixed replay endpoint such as `tcp://*:5558` for one rank.
 
@@ -53,7 +54,7 @@ vllm-router --host 127.0.0.1 --port 19000 --policy kv_aware \
 
 #### gRPC workers
 
-Use [`vllm-rs` from the same vLLM version](../backend/grpc.md#starting-vllm-029). Activate that vLLM Python environment before starting the worker.
+Use [`vllm-rs` from the same vLLM version](../backend/grpc.md#starting-a-vllm-grpc-worker). Activate that vLLM Python environment before starting the worker.
 
 ```bash
 "${VLLM_RS:-vllm-rs}" serve "$MODEL" --host 127.0.0.1 --port 8000 --grpc-port 50051 --served-model-name qwen3 -- \
@@ -314,10 +315,9 @@ Use the same vLLM release for the engine and its gRPC frontend. In all versions 
 | vLLM release | HTTP event discovery | Layout support | vLLM Ascend pairing |
 | --- | --- | --- | --- |
 | [0.30.0](https://github.com/vllm-project/vllm/tree/v0.30.0) | Pass a layout and [static addresses](#static-event-endpoints). | Zero hash lookahead. | [0.30.0 stable](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.30.0). |
-| [0.31.0](https://github.com/vllm-project/vllm/tree/v0.31.0) | `/kv_event_sources` | Zero hash lookahead and V4.1 bounded replay. | [Release candidate branch](https://github.com/vllm-project/vllm-ascend/tree/releases/v0.31.0rc). |
-| [0.32.0](https://github.com/vllm-project/vllm/tree/v0.32.0) | `/kv_event_sources` | Zero hash lookahead and V4.1 bounded replay. | [0.32.0rc1](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.32.0rc1). See [Ascend layouts](#ascend-with-vllm-032) for MTP and DSpark. |
-| [0.33.0](https://github.com/vllm-project/vllm/tree/v0.33.0) | `/kv_event_sources` | Adds nonzero hash lookahead. Model recipes use this release. | Select an Ascend build that explicitly declares vLLM 0.33 compatibility. |
-| [0.34.0](https://github.com/vllm-project/vllm/tree/v0.34.0) | `/kv_event_sources` | Nonzero hash lookahead. The default block size is 64 tokens if the backend has no preferred size. | Select an Ascend build that explicitly declares vLLM 0.34 compatibility. |
+| [0.31.0](https://github.com/vllm-project/vllm/tree/v0.31.0)–[0.32.0](https://github.com/vllm-project/vllm/tree/v0.32.0) | `/kv_event_sources` | Zero hash lookahead and V4.1 bounded replay. | [0.31 release candidate](https://github.com/vllm-project/vllm-ascend/tree/releases/v0.31.0rc) or [0.32.0rc1](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.32.0rc1). See [0.32 Ascend layouts](#ascend-with-vllm-032) for MTP and DSpark. |
+| [0.33.0](https://github.com/vllm-project/vllm/tree/v0.33.0) | `/kv_event_sources` | Adds nonzero hash lookahead via `BlockStored.lookahead_token_ids`. Model recipes use this release. | Use an Ascend build compatible with vLLM 0.33. |
+| [0.34.0](https://github.com/vllm-project/vllm/tree/v0.34.0) | `/kv_event_sources` | Defaults to 64-token blocks when the backend has no preferred size. Use the actual block size in an explicit layout. | Use an Ascend build compatible with vLLM 0.34. |
 
 ## CLI options
 

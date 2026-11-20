@@ -105,7 +105,6 @@ pub(super) fn grpc_kv_event_source_entries(
                         .then_some(source.replay_endpoint),
                     topic: source.topic,
                     hwm: i32::try_from(source.hwm).ok(),
-                    buffer_steps: Some(u64::from(source.buffer_steps)),
                     publisher: Some(source.transport),
                     encoding: Some(source.encoding),
                     schema_version: Some(source.schema_version),
@@ -278,7 +277,7 @@ fn parse_native_full_layout(body: serde_json::Value) -> Result<CacheCapabilities
     if capability
         .ranks
         .iter()
-        .any(|rank| rank.declared_groups != Some(1) || !rank.is_plain_full_attention())
+        .any(|rank| rank.declared_groups != Some(1) || !rank.has_plain_full_attention_shape())
     {
         return Err("worker does not declare a single full-attention group".into());
     }
@@ -481,23 +480,4 @@ async fn query_served_model(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
     Some((id.to_owned(), path))
-}
-
-pub(crate) async fn query_pd_kv_event_sources(
-    client: &reqwest::Client,
-    worker_url: &str,
-    api_key: Option<&str>,
-) -> Result<KvEventSourcesResponse, SourcesUnavailable> {
-    let mut sources = fetch_kv_event_sources(client, worker_url, api_key).await?;
-    // Native Python KVEventsConfig omits these fixed ZMQ wire declarations.
-    for source in sources.values_mut() {
-        if source.publisher.as_deref() == Some("zmq")
-            && source.encoding.is_none()
-            && source.schema_version.is_none()
-        {
-            source.encoding = Some("msgpack".into());
-            source.schema_version = Some(1);
-        }
-    }
-    Ok(sources)
 }

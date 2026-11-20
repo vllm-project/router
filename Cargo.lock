@@ -7353,7 +7353,6 @@ dependencies = [
  "metrics-exporter-prometheus",
  "mime",
  "minijinja",
- "once_cell",
  "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-otlp",

@@ -27,13 +27,13 @@ pub struct AdapterCapability {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RankCapability {
     pub rank: u32,
-    /// Total cache groups the engine declares, including groups that never
-    /// publish block events (V4.1 keeps its sparse state in such backends).
-    /// `None` means the listed groups are the whole layout.
+    /// Number of group declarations in this layout, including listed groups
+    /// that do not publish cache events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_groups: Option<u32>,
     pub model: String,
     pub weight_version: String,
+    /// Compared as part of the worker descriptor when refreshing the binding.
     pub weight_identity: Option<String>,
     pub publisher_topic: Option<String>,
     pub instance_topic: bool,
@@ -76,11 +76,12 @@ pub struct GroupCapability {
 }
 
 impl RankCapability {
-    pub(crate) fn is_plain_full_attention(&self) -> bool {
+    pub(crate) fn has_plain_full_attention_shape(&self) -> bool {
         self.declared_groups.is_none_or(|count| count == 1)
             && self.hash_lookahead_tokens == 0
             && self.speculative_tokens == 0
             && !self.partial_hash_hits
+            && self.tail_drop_groups.as_ref().is_none_or(Vec::is_empty)
             && matches!(
                 self.groups.as_slice(),
                 [group] if self.hash_block_size == Some(group.block_size)
@@ -172,6 +173,12 @@ impl CacheCapabilities {
         let rank = self
             .rank_capability(dp_rank)
             .ok_or("missing rank capability")?;
+        if rank
+            .declared_groups
+            .is_some_and(|count| count as usize != rank.groups.len())
+        {
+            return Err("declared group count does not match layout");
+        }
         if model.is_some_and(|model| rank.model != model) {
             return Err("model does not match source model");
         }

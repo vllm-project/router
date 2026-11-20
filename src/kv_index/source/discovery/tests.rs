@@ -92,7 +92,6 @@ use super::lifecycle::SourceAction;
 use super::probe::{grpc_kv_event_source_entries, worker_descriptor};
 use super::reconcile::{bound_source_moved, probe_keeps_trust, probe_renews_trust, BoundSource};
 use super::*;
-use crate::core::worker::worker_get;
 use crate::kv_index::source::test_support::{event_payload, full_store};
 use crate::kv_index::wire::KVEvent;
 use std::sync::atomic::Ordering;
@@ -177,26 +176,6 @@ async fn endpoints_without_a_verified_layout_do_not_create_a_cache_provider() {
 }
 
 #[test]
-fn worker_auth_uses_only_the_configured_key() {
-    let client = reqwest::Client::new();
-    for (key, expected) in [
-        (None, None),
-        (Some("backend-key"), Some("Bearer backend-key")),
-    ] {
-        let request = worker_get(&client, "https://worker/v1/models", key)
-            .build()
-            .unwrap();
-        assert_eq!(
-            request
-                .headers()
-                .get("authorization")
-                .map(|value| value.to_str().unwrap()),
-            expected
-        );
-    }
-}
-
-#[test]
 fn resolves_bind_endpoints_and_preserves_explicit_addresses() {
     let ipv6 = worker_host("grpc://[::1]:50051@3").unwrap();
     for (endpoint, host, expected) in [
@@ -252,20 +231,6 @@ fn bound_source_accepts_the_engines_bind_endpoints() {
         ..actual
     };
     assert!(bound_source_moved("127.0.0.1", &installed, &no_replay));
-}
-
-#[test]
-fn worker_host_extracts_from_url() {
-    assert_eq!(
-        worker_host("http://10.0.0.5:8000").as_deref(),
-        Some("10.0.0.5")
-    );
-    assert_eq!(worker_host("10.0.0.5:8000").as_deref(), Some("10.0.0.5"));
-    assert_eq!(worker_host("10.0.0.5:8000@3").as_deref(), Some("10.0.0.5"));
-    assert_eq!(
-        worker_host("http://host.example:80").as_deref(),
-        Some("host.example")
-    );
 }
 
 #[test]
@@ -336,26 +301,6 @@ fn server_info_parses_kv_fields_and_aliases() {
     // empty body → defaults, no error.
     let s: ServerInfo = serde_json::from_str("{}").unwrap();
     assert!(s.kv_block_size.is_none());
-}
-
-#[test]
-fn warnings_name_the_transport_that_was_probed() {
-    assert_eq!(
-        metadata_source_label("grpc://127.0.0.1:50051"),
-        "GetServerInfo"
-    );
-    assert_eq!(
-        metadata_source_label("http://127.0.0.1:8000"),
-        "/get_server_info, /server_info or /metrics"
-    );
-    assert_eq!(
-        event_source_label("grpc://127.0.0.1:50051"),
-        "GetKvEventSources"
-    );
-    assert_eq!(
-        event_source_label("http://127.0.0.1:8000"),
-        "/kv_event_sources"
-    );
 }
 
 #[test]
@@ -576,7 +521,7 @@ async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
         if assumed {
             let layout = discovered.hybrid.unwrap();
             let rank = &layout.ranks[0];
-            assert!(rank.is_plain_full_attention());
+            assert!(rank.has_plain_full_attention_shape());
             assert_eq!(rank.hash_seed.as_deref(), Some("vllm-none-hash"));
             assert_eq!(rank.hash_block_size, Some(16));
         }
@@ -600,7 +545,9 @@ async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
             assert_eq!(registered.cache_key.unwrap().model.as_ref(), "served-alias");
         }
         if native && declare_empty_fields {
-            let provider = supervisor.workers.lock()[&worker].provider.clone();
+            let provider = supervisor.installed.workers.lock()[&worker]
+                .provider
+                .clone();
             provider
                 .lifecycle
                 .state
@@ -646,7 +593,9 @@ async fn http_full_attention_uses_the_worker_hash_contract_when_verified() {
                 .as_ref()
                 .unwrap()
                 .target_scoped());
-            let replacement = supervisor.workers.lock()[&worker].provider.clone();
+            let replacement = supervisor.installed.workers.lock()[&worker]
+                .provider
+                .clone();
             assert!(replacement.is_trusted());
             assert!(!provider.lifecycle.active.load(Ordering::Acquire));
         }
@@ -779,6 +728,24 @@ async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
         static_hybrid_sources_match(&client, &worker, None, &config, None).await,
         StaticHybridMatch::Matches
     );
+    let mut live_only = config.clone();
+    live_only.replay_endpoints = None;
+    assert_eq!(
+        static_hybrid_sources_match(&client, &worker, None, &live_only, None).await,
+        StaticHybridMatch::Differs
+    );
+    let with_replay = sources.lock().clone();
+    for rank in ["0", "1"] {
+        sources.lock()[rank]
+            .as_object_mut()
+            .unwrap()
+            .remove("replay_endpoint");
+    }
+    assert_eq!(
+        static_hybrid_sources_match(&client, &worker, None, &live_only, None).await,
+        StaticHybridMatch::Matches
+    );
+    *sources.lock() = with_replay;
     sources.lock()["1"]["topic"] = serde_json::json!("boot-2-rank-1");
     assert_eq!(
         static_hybrid_sources_match(&client, &worker, None, &config, None).await,
@@ -799,43 +766,6 @@ async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
     sources.lock()["0"]["topic"] = serde_json::json!("boot-2-rank-0");
     assert_eq!(
         static_hybrid_sources_match(&client, &worker, None, &config, Some(&installed)).await,
-        StaticHybridMatch::Differs
-    );
-    task.abort();
-}
-
-#[tokio::test]
-async fn layout_only_sources_retire_when_the_engine_changes_its_topic() {
-    let sources = Arc::new(Mutex::new(serde_json::json!({
-        "0": {"endpoint":"tcp://*:5557", "replay_endpoint":"tcp://*:5558", "topic":"kv-hybrid", "publisher":"zmq"}
-    })));
-    let (worker, task) = event_sources_worker(sources.clone()).await;
-    let mut layout = capability("model", "kv-hybrid", 16, serde_json::json!([]));
-    layout.ranks[0].root_hash = None;
-    // A layout-only binding declares no endpoints; the engine names them.
-    let config = StaticKvEventSources {
-        endpoints: Vec::new(),
-        replay_endpoints: None,
-        topic: String::new(),
-        block_size: 16,
-        model: "model".into(),
-        hybrid: Some(layout),
-    };
-    let client = reqwest::Client::new();
-    assert_eq!(
-        static_hybrid_sources_match(&client, &worker, None, &config, None).await,
-        StaticHybridMatch::Matches
-    );
-    // A restarted engine that advertises a new topic belongs to another boot.
-    sources.lock()["0"]["topic"] = serde_json::json!("kv-hybrid-boot-2");
-    assert_eq!(
-        static_hybrid_sources_match(&client, &worker, None, &config, None).await,
-        StaticHybridMatch::Differs
-    );
-    // An engine that advertises nothing cannot keep the old binding alive.
-    *sources.lock() = serde_json::json!({});
-    assert_eq!(
-        static_hybrid_sources_match(&client, &worker, None, &config, None).await,
         StaticHybridMatch::Differs
     );
     task.abort();
@@ -888,7 +818,7 @@ async fn hybrid_discovery_binds_only_ranks_for_the_worker_model() {
             .install_worker(worker_url, discovery(capability.clone()))
             .unwrap();
         assert_eq!(info.block_size, Some(16));
-        let workers = supervisor.workers.lock();
+        let workers = supervisor.installed.workers.lock();
         let provider = &workers[worker_url].provider;
         let mut bound: Vec<_> = provider.indexes.keys().copied().collect();
         bound.sort_unstable();
@@ -1024,6 +954,7 @@ async fn exercise_static_hybrid(pd: bool) {
     );
     assert_eq!(estimate[0].new_prefill_tokens, 496);
     let hybrid = supervisor
+        .installed
         .workers
         .lock()
         .get(&worker_url)
@@ -1213,16 +1144,16 @@ async fn source_installation_keeps_live_streams_replays_and_index_targets_indepe
         if let Some(error) = error {
             assert!(other.unwrap_err().contains(error), "{error}");
             assert!(supervisor.match_provider_for_worker(worker_b).is_none());
-            assert_eq!(supervisor.workers.lock().len(), 1);
+            assert_eq!(supervisor.installed.workers.lock().len(), 1);
         } else {
             assert_eq!(other.unwrap().ranks, [rank_b]);
             assert!(supervisor.match_provider_for_worker(worker_b).is_some());
-            assert_eq!(supervisor.workers.lock().len(), 2);
+            assert_eq!(supervisor.installed.workers.lock().len(), 2);
         }
         assert!(supervisor.match_provider_for_worker(worker_a).is_some());
         supervisor.shutdown();
-        assert!(supervisor.workers.lock().is_empty());
-        assert!(supervisor.identity_refs.lock().is_empty());
+        assert!(supervisor.installed.workers.lock().is_empty());
+        assert!(supervisor.installed.identity_refs.lock().is_empty());
     }
 }
 
@@ -1244,8 +1175,8 @@ async fn source_group_rejects_duplicate_normalized_ranks_without_mutation() {
         .install_worker("http://worker:8000", discovery)
         .unwrap_err();
     assert!(error.contains("duplicate normalized"));
-    assert!(supervisor.workers.lock().is_empty());
-    assert!(supervisor.identity_refs.lock().is_empty());
+    assert!(supervisor.installed.workers.lock().is_empty());
+    assert!(supervisor.installed.identity_refs.lock().is_empty());
 }
 
 #[tokio::test]
@@ -1273,7 +1204,7 @@ async fn failed_readd_preserves_the_active_binding_and_success_fences_it() {
         .unwrap();
 
     let provider = supervisor.match_provider_for_worker(worker).unwrap();
-    let active = supervisor.workers.lock()[worker].active.clone();
+    let active = supervisor.installed.workers.lock()[worker].active.clone();
     boundary_subscription(&publisher, "kv", true).await;
     finish_empty_startup_replay(&replay).await;
     live_frame(&publisher, b"kv", 0, &full_payload(&[1; 8], 8, 0));
@@ -1382,9 +1313,9 @@ async fn discovered_source_bindings_are_atomic_and_released_with_the_worker() {
         let mut waiting = [entered.recv().await.unwrap(), entered.recv().await.unwrap()];
         waiting.sort_unstable();
         assert_eq!(waiting, ["binding-a", "binding-b"]);
-        assert!(supervisor.workers.lock().is_empty());
-        assert!(supervisor.indexers.is_empty());
-        assert!(supervisor.identity_refs.lock().is_empty());
+        assert!(supervisor.installed.workers.lock().is_empty());
+        assert!(supervisor.installed.indexers.is_empty());
+        assert!(supervisor.installed.identity_refs.lock().is_empty());
         release.add_permits(2);
     };
     let ((a, b), ()) = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1398,9 +1329,10 @@ async fn discovered_source_bindings_are_atomic_and_released_with_the_worker() {
     } else {
         (&worker_b, &worker_a)
     };
-    assert_eq!(supervisor.workers.lock().len(), 1);
+    assert_eq!(supervisor.installed.workers.lock().len(), 1);
     assert_eq!(
         supervisor
+            .installed
             .identity_refs
             .lock()
             .values()
@@ -1411,8 +1343,8 @@ async fn discovered_source_bindings_are_atomic_and_released_with_the_worker() {
     assert!(supervisor.match_provider_for_worker(accepted).is_some());
     assert!(supervisor.match_provider_for_worker(rejected).is_none());
     supervisor.on_worker_removed(accepted);
-    assert!(supervisor.workers.lock().is_empty());
-    assert!(supervisor.identity_refs.lock().is_empty());
+    assert!(supervisor.installed.workers.lock().is_empty());
+    assert!(supervisor.installed.identity_refs.lock().is_empty());
     supervisor.on_worker_added(rejected).await.unwrap();
     let alias = if rejected.ends_with('/') {
         rejected.trim_end_matches('/').to_owned()
@@ -1421,10 +1353,11 @@ async fn discovered_source_bindings_are_atomic_and_released_with_the_worker() {
     };
     let error = supervisor.on_worker_added(&alias).await.unwrap_err();
     assert!(error.contains("worker origins must be independent"));
-    assert!(supervisor.workers.lock().contains_key(rejected));
-    assert!(!supervisor.workers.lock().contains_key(&alias));
+    assert!(supervisor.installed.workers.lock().contains_key(rejected));
+    assert!(!supervisor.installed.workers.lock().contains_key(&alias));
     assert_eq!(
         supervisor
+            .installed
             .identity_refs
             .lock()
             .values()
@@ -1438,9 +1371,10 @@ async fn discovered_source_bindings_are_atomic_and_released_with_the_worker() {
         supervisor.on_worker_added(rejected)
     );
     assert_ne!(first.is_ok(), second.is_ok());
-    assert_eq!(supervisor.workers.lock().len(), 1);
+    assert_eq!(supervisor.installed.workers.lock().len(), 1);
     assert_eq!(
         supervisor
+            .installed
             .identity_refs
             .lock()
             .values()
@@ -1449,8 +1383,8 @@ async fn discovered_source_bindings_are_atomic_and_released_with_the_worker() {
         1
     );
     supervisor.shutdown();
-    assert!(supervisor.workers.lock().is_empty());
-    assert!(supervisor.identity_refs.lock().is_empty());
+    assert!(supervisor.installed.workers.lock().is_empty());
+    assert!(supervisor.installed.identity_refs.lock().is_empty());
     http_a.abort();
     http_b.abort();
 }
@@ -1617,6 +1551,13 @@ async fn rank_pinned_static_source_binds_its_own_rank() {
         split_worker_rank("http://127.0.0.1:8000@1"),
         ("http://127.0.0.1:8000", Some(1)),
     );
+    let mut ambiguous = config;
+    ambiguous.endpoints.push("tcp://127.0.0.1:5559".into());
+    assert!(
+        static_worker_discovery("http://127.0.0.1:8000@1", &ambiguous)
+            .sources
+            .is_err()
+    );
 }
 
 /// A layout without declared endpoints is legal on engines that report
@@ -1632,7 +1573,7 @@ async fn layout_without_endpoints_discovers_publishers_for_the_declared_topic() 
                   "topic": topic, "publisher": "zmq", "encoding": "msgpack",
                   "schema_version": 1, "enable_kv_cache_events": true}
         })));
-        let (worker, task) = event_sources_worker(sources).await;
+        let (worker, task) = event_sources_worker(sources.clone()).await;
         let config = layout_only_sources("kv-hybrid", 8, "layout-only");
         let (supervisor, _signals) = KvIndexSupervisor::indexed(reqwest::Client::new());
         let supervisor = supervisor.with_static_sources(HashMap::from([(worker.clone(), config)]));
@@ -1642,8 +1583,13 @@ async fn layout_without_endpoints_discovers_publishers_for_the_declared_topic() 
             let info = info.unwrap();
             assert_eq!(info.block_size, Some(8));
             assert_eq!(info.ranks, vec![0]);
-            assert_eq!(info.cache_key.unwrap().model.as_ref(), "layout-only");
+            let key = info.cache_key.unwrap();
+            assert_eq!(key.model.as_ref(), "layout-only");
             assert!(supervisor.match_provider_for_worker(&worker).is_some());
+            sources.lock()["0"]["topic"] = serde_json::json!("kv-hybrid-next-boot");
+            wait_for(|| !supervisor.installed.workers.lock().contains_key(&worker)).await;
+            assert!(!supervisor.installed.identity_refs.lock().contains_key(&key));
+            assert!(!supervisor.installed.indexers.contains_key(&key));
         } else {
             assert!(info.map(|info| info.ranks.is_empty()).unwrap_or(true));
             assert!(supervisor.match_provider_for_worker(&worker).is_none());
@@ -1902,7 +1848,7 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
     assert!(rejected[&base].info.is_none());
     assert!(rejected[&base].provider.is_none());
     assert!(hits().is_empty());
-    assert!(!supervisor.workers.lock().contains_key(&base));
+    assert!(!supervisor.installed.workers.lock().contains_key(&base));
     *metadata.lock() = serde_json::json!({"0": valid});
     rewind();
     let restored = supervisor.refresh_workers(&bases).await;

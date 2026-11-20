@@ -1,9 +1,11 @@
 //! Interpret one source snapshot using the cache groups' restore rules.
 
 use super::{align_down, restore::restore_boundary, CacheGroup, GroupEvidence, GroupRule};
-use crate::kv_index::storage::PageTiers;
-use crate::kv_index::types::{TierBits, TierMatch};
-use crate::kv_index::{Locality, RoutableTarget, StorageTier};
+use crate::kv_index::{
+    storage::PageTiers,
+    types::{TierBits, TierMatch},
+    Locality, RoutableTarget, StorageTier,
+};
 
 /// Preserve the full-attention policy's per-tier segments, including gaps and
 /// a transfer continuation. Only published entries within the request cap count.

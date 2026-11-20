@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256};
 
 /// Full 32-byte, engine-compatible `sha256_cbor` sequence digest.
 ///
-/// The decoder preserves the opaque wire sequence. This module computes only
-/// verified, narrow `sha256_cbor` request sequences; M2's local hash is different.
+/// The decoder preserves the publisher's bytes. This module generates the
+/// corresponding request chain for the supported `sha256_cbor` contracts.
 pub type SequenceHash = [u8; 32];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,8 +32,8 @@ impl BlockKeyGenerator {
         Self::from_seed(block_size, &seed)
     }
 
-    /// Reproduce vLLM's resolved seed, including `vllm-none-hash` when its
-    /// verified cryptographic-hash contract uses the v0.33 default.
+    /// Derive the root from vLLM's resolved seed string, including the fixed
+    /// `vllm-none-hash` seed when the worker uses it.
     pub fn from_seed(block_size: usize, seed: &str) -> Self {
         assert!(block_size > 0 && !seed.is_empty(), "invalid hash contract");
         let mut encoded = Vec::with_capacity(seed.len() + 9);

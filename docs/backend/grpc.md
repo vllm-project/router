@@ -295,10 +295,10 @@ For KV event and hybrid layout setup, see [KV-aware P/D routing](../load_balanci
 telemetry. Compare it only when the first-output boundary is equivalent across
 paths.
 
-## Starting vLLM 0.29
+## Starting a vLLM gRPC worker
 
-In vLLM 0.29, `vllm-rs` is a binary inside the Python wheel next to the
-package. This router does not vendor or Cargo-depend on that binary.
+The `vllm-rs` binary is distributed alongside the Python package in wheels
+that include the Rust frontend. Use the same release for both.
 
 Two entrypoints are easy to mix up:
 

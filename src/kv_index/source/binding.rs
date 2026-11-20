@@ -328,7 +328,9 @@ use crate::kv_index::CacheCapabilities;
 impl CacheCapabilities {
     /// Construct an index for one rank and its event source. Unknown layouts
     /// get no credit.
-    pub fn index_for_source(
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(crate) fn index_for_source(
         &self,
         source: &EventSource,
         target: RoutableTarget,
@@ -376,9 +378,10 @@ impl CacheCapabilities {
             .with_tail_drop_group(layout.tail_drop_group)
             .with_adapters(layout.adapters)
             .with_partial_hash_hits(layout.partial_hash_hits);
-        binding.strict_event_block_size = self
-            .rank_capability(source.dp_rank)
-            .is_some_and(|rank| rank.declared_groups == Some(1) && rank.is_plain_full_attention());
+        binding.strict_event_block_size =
+            self.rank_capability(source.dp_rank).is_some_and(|rank| {
+                rank.declared_groups == Some(1) && rank.has_plain_full_attention_shape()
+            });
         Ok(binding)
     }
 

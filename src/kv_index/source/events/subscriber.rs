@@ -279,6 +279,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
             let mut disconnected = false;
             let mut reconnect = false;
             let mut recovery_through = None;
+            let mut monitor_error = None;
 
             'live: loop {
                 if is_shutdown(&mut shutdown_rx) || !subscriber.active() {
@@ -288,7 +289,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                 let (lost, latest) = match connection.drain() {
                     Ok(events) => events,
                     Err(error) => {
-                        subscriber.monitor_failed(error);
+                        monitor_error = Some(error.to_string());
                         break;
                     }
                 };
@@ -304,7 +305,10 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             sub = new_sub;
                             connection = new_monitor;
                         }
-                        Err(_) => break,
+                        Err(error) => {
+                            monitor_error = Some(error.to_string());
+                            break;
+                        }
                     }
                     disconnected = true;
                     recovery_through = None;
@@ -325,7 +329,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     tokio::select! {
                         result = connection.wait() => {
                             if let Err(error) = result {
-                                subscriber.monitor_failed(error);
+                                monitor_error = Some(error.to_string());
                                 break;
                             }
                         },
@@ -372,16 +376,15 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                 continue;
                             }
                             Err(error) => {
-                                subscriber.monitor_failed(error);
-                                reconnect = true;
-                                continue;
+                                monitor_error = Some(error.to_string());
+                                break;
                             }
                         }
                     };
                     let (lost_during_replay, _) = match connection.drain() {
                         Ok(events) => events,
                         Err(error) => {
-                            subscriber.monitor_failed(error);
+                            monitor_error = Some(error.to_string());
                             break;
                         }
                     };
@@ -536,7 +539,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             tokio::select! {
                                 result = connection.wait() => {
                                     if let Err(error) = result {
-                                        subscriber.monitor_failed(error);
+                                        monitor_error = Some(error.to_string());
                                         break 'live;
                                     }
                                 },
@@ -575,7 +578,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
             if is_shutdown(&mut shutdown_rx) || !subscriber.active() {
                 return;
             }
-            subscriber.monitor_failed("subscriber stopped");
+            subscriber.monitor_failed(monitor_error.as_deref().unwrap_or("subscriber stopped"));
             if started.elapsed() >= Duration::from_secs(5) {
                 failures = 0;
             }

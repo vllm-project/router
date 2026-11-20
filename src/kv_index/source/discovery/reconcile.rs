@@ -6,9 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::lifecycle::{SourceAction, WorkerLifecycle, WorkerRegistration, CONTROL_TIMEOUT};
-use super::probe::{
-    fetch_native_full_sources, grpc_kv_event_source_entries, query_pd_kv_event_sources,
-};
+use super::probe::{fetch_native_full_sources, grpc_kv_event_source_entries};
 use super::{
     events_enabled, layout_topic_mismatch, resolve_endpoint, split_worker_rank,
     static_worker_discovery, worker_host, KvEventSourceEntry, KvIndexSupervisor, SourcesProbe,
@@ -78,7 +76,7 @@ impl KvIndexSupervisor {
 
     /// Clone policy inputs without exposing or duplicating the source state machine.
     pub(crate) fn worker_registrations(&self) -> HashMap<String, WorkerRegistration> {
-        let workers = self.workers.lock();
+        let workers = self.installed.workers.lock();
         self.lifecycles
             .lock()
             .iter()
@@ -121,7 +119,7 @@ impl KvIndexSupervisor {
             self.on_worker_removed(&base);
         }
         let refresh: Vec<_> = {
-            let workers = self.workers.lock();
+            let workers = self.installed.workers.lock();
             bases
                 .iter()
                 .filter_map(|base| {
@@ -146,7 +144,7 @@ impl KvIndexSupervisor {
     pub(crate) async fn refresh_discovered_workers(&self) -> HashMap<String, WorkerRegistration> {
         let _refresh = self.refresh_lock.lock().await;
         let refresh = {
-            let workers = self.workers.lock();
+            let workers = self.installed.workers.lock();
             self.lifecycles
                 .lock()
                 .iter()
@@ -219,12 +217,12 @@ impl KvIndexSupervisor {
                         probe.base_models,
                     );
                     if !installation.is_ok_and(|info| info.cache_key.is_some()) {
-                        self.retire_observed_worker(&base, &lifecycle);
+                        self.installed.retire_if_current(&base, &lifecycle);
                     }
                     changed.insert(base);
                 }
                 SourceAction::Stop => {
-                    self.retire_observed_worker(&base, &lifecycle);
+                    self.installed.retire_if_current(&base, &lifecycle);
                     changed.insert(base);
                 }
                 SourceAction::Recover => {
@@ -233,23 +231,6 @@ impl KvIndexSupervisor {
             }
         }
         changed
-    }
-
-    fn retire_observed_worker(&self, base: &str, lifecycle: &Arc<WorkerLifecycle>) {
-        let mut workers = self.workers.lock();
-        if self
-            .lifecycles
-            .lock()
-            .get(base)
-            .is_some_and(|current| Arc::ptr_eq(current, lifecycle))
-            && workers
-                .get(base)
-                .is_some_and(|worker| Arc::ptr_eq(&worker.active, &lifecycle.active))
-        {
-            if let Some(worker) = workers.remove(base) {
-                self.retire_worker(worker);
-            }
-        }
     }
 }
 
@@ -353,7 +334,7 @@ pub(super) async fn static_hybrid_sources_match(
     } else {
         match tokio::time::timeout(
             Duration::from_secs(2),
-            query_pd_kv_event_sources(client, http_url, api_key),
+            super::probe::fetch_kv_event_sources(client, http_url, api_key),
         )
         .await
         {
@@ -419,11 +400,14 @@ pub(super) async fn static_hybrid_sources_match(
         events_enabled(actual)
             && actual.topic == expected.topic
             && endpoints_match(&actual.endpoint, &expected.endpoint)
-            && actual
-                .replay_endpoint
-                .as_deref()
-                .zip(expected.replay_endpoint.as_deref())
-                .is_some_and(|(actual, expected)| endpoints_match(actual, expected))
+            && match (
+                actual.replay_endpoint.as_deref(),
+                expected.replay_endpoint.as_deref(),
+            ) {
+                (None, None) => true,
+                (Some(actual), Some(expected)) => endpoints_match(actual, expected),
+                _ => false,
+            }
     });
     if matches {
         StaticHybridMatch::Matches

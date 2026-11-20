@@ -1213,6 +1213,39 @@ fn unmodeled_cache_identity_and_group_metadata_are_rejected() {
 }
 
 #[test]
+fn salted_events_leave_replay_open_for_the_unsalted_chain() {
+    let index = fresh_index(16);
+    let original = qwen_batch();
+    let mut salted = original.clone();
+    for event in &mut salted.events {
+        let KVEvent::BlockStored(store) = event else {
+            panic!("expected store");
+        };
+        let mut extra_keys = vec![rmpv::Value::Nil; store.block_hashes.len()];
+        extra_keys[0] = rmpv::Value::Array(vec![rmpv::Value::from("private-request")]);
+        store.extra_keys = Some(extra_keys);
+    }
+    assert_eq!(index.apply_batch(0, &salted), Ok(()));
+    assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
+    assert_eq!(index.apply_batch(1, &original), Ok(()));
+    assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+}
+
+#[test]
+fn malformed_event_for_declared_adapter_revokes_the_source() {
+    let index = fresh_index(16).with_adapters(vec![("lora1".into(), "/adapters/lora1".into())]);
+    index.apply_batch(0, &qwen_batch()).unwrap();
+    assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+    let mut batch = adapter_batch("lora1", "/adapters/lora1");
+    let KVEvent::BlockStored(store) = &mut batch.events[0] else {
+        panic!("expected store");
+    };
+    store.group_idx = Some(u32::MAX);
+    assert_eq!(index.apply_batch(1, &batch), Err(SourceError::InvalidBatch));
+    assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
+}
+
+#[test]
 fn capacity_failure_invalidates_all_groups_and_requires_a_new_barrier() {
     let index = fresh_index(3);
     let batch = qwen_batch();

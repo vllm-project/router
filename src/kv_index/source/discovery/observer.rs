@@ -152,7 +152,7 @@ mod tests {
         let info = supervisor.on_worker_added(&worker_url).await.unwrap();
         assert_eq!(info.ranks, vec![0]);
         assert!(info.cache_key.is_some());
-        assert!(supervisor.indexers.is_empty());
+        assert!(supervisor.installed.indexers.is_empty());
         assert!(supervisor.match_provider_for_worker(&worker_url).is_none());
 
         let subscribed = tokio::time::timeout(Duration::from_secs(4), async {

@@ -27,6 +27,7 @@ impl KvIndexSupervisor {
         discovery: WorkerDiscovery,
     ) -> Result<WorkerKvInfo, String> {
         let observed = self
+            .installed
             .workers
             .lock()
             .get(worker_url)
@@ -232,7 +233,7 @@ impl KvIndexSupervisor {
         };
         // Admission and publication share the existing source-owner lock. Two
         // concurrent discoveries must not both accept an ambiguous binding.
-        let mut workers = self.workers.lock();
+        let mut workers = self.installed.workers.lock();
         let unchanged = match (observed.as_ref(), workers.get(worker_url)) {
             (Some(observed), Some(current)) => Arc::ptr_eq(observed, &current.active),
             (None, None) => true,
@@ -304,9 +305,9 @@ impl KvIndexSupervisor {
             })
             .collect();
         if let Some(previous) = workers.remove(worker_url) {
-            self.retire_worker(previous);
+            self.installed.retire_worker(previous);
         }
-        let indexer = self.acquire_identity(&key);
+        let indexer = self.installed.acquire_identity(&key);
         let mut ranks = Vec::with_capacity(event_sources.len());
         let mut handles = Vec::with_capacity(event_sources.len());
         let mut targets = Vec::new();

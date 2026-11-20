@@ -162,6 +162,17 @@ impl StaticKvEventSources {
                 ),
             });
         }
+        if crate::kv_index::source::discovery::split_worker_rank(worker)
+            .1
+            .is_some()
+            && self.endpoints.len() > 1
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: format!(
+                    "rank-pinned KV source '{worker}' can have only one publisher and one replay endpoint"
+                ),
+            });
+        }
         for endpoint in self
             .endpoints
             .iter()
@@ -278,6 +289,7 @@ mod static_kv_event_source_tests {
         for worker in ["grpc://worker:50051", "http://worker:8000/engine"] {
             source.validate(worker).unwrap();
         }
+        assert!(source.validate("http://worker:8000@1").is_err());
     }
 
     /// A layout without declared endpoints is legal: the declaration still

@@ -84,7 +84,9 @@ impl EventStream {
         })
     }
 
-    pub fn apply_payload(
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(crate) fn apply_payload(
         &self,
         lease: StreamLease,
         seq: u64,
@@ -150,6 +152,8 @@ impl EventStream {
                     }
                     _ => tracing::warn!(seq, error = ?error, "KV event batch rejected"),
                 }
+                // The cache is cleared, but the active lease must still be
+                // able to call restart_replay on this source.
                 state.phase = Phase::Replaying;
                 return Err(StreamError::Index(error));
             }

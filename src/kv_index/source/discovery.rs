@@ -1,6 +1,5 @@
 //! Worker discovery: query /get_server_info and the optional KV event source
-//! control route, spawn one subscriber per (worker, rank). One indexer per
-//! cache-identity core.
+//! control route, then spawn one subscriber per (worker, rank).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
@@ -57,8 +56,6 @@ pub struct KvEventSourceEntry {
     pub topic: String,
     #[serde(default)]
     pub hwm: Option<i32>,
-    #[serde(default)]
-    pub buffer_steps: Option<u64>,
     #[serde(default)]
     pub publisher: Option<String>, // "zmq" | "null"
     #[serde(default)]
@@ -138,9 +135,14 @@ struct LiveSource {
     lease: crate::kv_index::source::binding::SourceLease,
 }
 
-/// Orchestrates discovery + subscriber lifecycle for the router's workers.
-/// One indexer per `CacheKey`, shared by every `(worker, rank)` of that
-/// identity.
+#[derive(Default)]
+struct InstalledWorkers {
+    indexers: DashMap<CacheKey, Arc<KvBlockIndexer>>,
+    identity_refs: Mutex<HashMap<CacheKey, usize>>,
+    workers: Mutex<HashMap<String, WorkerSubs>>,
+}
+
+/// Discovers workers and keeps one shared index per cache identity.
 pub struct KvIndexSupervisor {
     client: reqwest::Client,
     api_key: Option<String>,
@@ -154,14 +156,9 @@ pub struct KvIndexSupervisor {
     static_pd_sources: HashMap<String, crate::config::types::PdKvEventSources>,
     /// Shared across every subscriber — one I/O thread pool, not one per task.
     ctx: Arc<zmq::Context>,
-    /// One indexer per cache-identity core.
-    indexers: DashMap<CacheKey, Arc<KvBlockIndexer>>,
-    /// Live-worker ref-count per identity; drop the indexer on last departure.
-    identity_refs: Mutex<HashMap<CacheKey, usize>>,
+    installed: Arc<InstalledWorkers>,
     signal_tx: mpsc::Sender<IngestionSignal>,
     observers: Option<Mutex<HashMap<String, WorkerObservation>>>,
-    /// Per-worker subscriber state.
-    workers: Mutex<HashMap<String, WorkerSubs>>,
     lifecycles: Mutex<HashMap<String, Arc<WorkerLifecycle>>>,
     refresh_lock: tokio::sync::Mutex<()>,
     /// First-seen block_size, for cross-worker mismatch warning.
@@ -172,8 +169,8 @@ impl std::fmt::Debug for KvIndexSupervisor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("KvIndexSupervisor")
-            .field("indexers", &self.indexers.len())
-            .field("workers", &self.workers.lock().len())
+            .field("indexers", &self.installed.indexers.len())
+            .field("workers", &self.installed.workers.lock().len())
             .finish()
     }
 }
@@ -197,11 +194,9 @@ impl KvIndexSupervisor {
             static_sources: HashMap::new(),
             static_pd_sources: HashMap::new(),
             ctx: Arc::new(zmq::Context::new()),
-            indexers: DashMap::new(),
-            identity_refs: Mutex::new(HashMap::new()),
+            installed: Arc::new(InstalledWorkers::default()),
             signal_tx,
             observers: None,
-            workers: Mutex::new(HashMap::new()),
             lifecycles: Mutex::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
             first_block_size: Mutex::new(None),
@@ -244,7 +239,8 @@ impl KvIndexSupervisor {
                 .map(|(url, _)| url.clone())
                 .collect();
         }
-        self.workers
+        self.installed
+            .workers
             .lock()
             .iter()
             .filter(|(_, w)| &w.source_id == source)
@@ -344,7 +340,7 @@ impl KvIndexSupervisor {
         // Discovery awaits without the owner lock. A failed/stale re-add must
         // leave the prior registration and its observed placement intact.
         let (observed, lifecycle) = {
-            let workers = self.workers.lock();
+            let workers = self.installed.workers.lock();
             let owner = workers.get(worker_url).map(|worker| worker.active.clone());
             let lifecycle = self.lifecycle_for_worker(worker_url);
             (owner, lifecycle)
@@ -468,7 +464,8 @@ impl KvIndexSupervisor {
         &self,
         worker_url: &str,
     ) -> Option<Arc<dyn crate::policies::TieredMatchProvider>> {
-        self.workers
+        self.installed
+            .workers
             .lock()
             .get(worker_url)
             .map(|worker| worker.provider.clone() as Arc<dyn crate::policies::TieredMatchProvider>)
@@ -597,7 +594,7 @@ async fn discover_worker(
 }
 
 /// Split a pinned data-parallel rank, as in `http://host:8000@3`.
-fn split_worker_rank(worker_url: &str) -> (&str, Option<u32>) {
+pub(crate) fn split_worker_rank(worker_url: &str) -> (&str, Option<u32>) {
     let Some((base, rank)) = worker_url.rsplit_once('@') else {
         return (worker_url, None);
     };
@@ -617,6 +614,24 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         kv_block_size: Some(config.block_size),
         ..Default::default()
     };
+    if rank_suffix.is_some()
+        && (config.endpoints.len() > 1
+            || config
+                .replay_endpoints
+                .as_ref()
+                .is_some_and(|endpoints| endpoints.len() > 1))
+    {
+        return WorkerDiscovery {
+            server_info: Ok(server_info),
+            sources: Err(SourcesUnavailable {
+                probe: SourcesProbe::Failed,
+                detail: format!("rank-pinned KV source '{worker_url}' can have only one publisher and one replay endpoint"),
+            }),
+            model_id: Ok(Some(model)),
+            hybrid: config.hybrid.clone(),
+            assumed_plain_full: false,
+        };
+    }
     let sources = config
         .endpoints
         .iter()
@@ -625,11 +640,6 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
             // With a rank-pinned URL the operator declares exactly that rank's
             // publisher, so the single configured endpoint belongs to it.
             let rank = rank_suffix.unwrap_or(index as u32);
-            let endpoint = if rank_suffix.is_some() {
-                config.endpoints.first().unwrap_or(endpoint)
-            } else {
-                endpoint
-            };
             (
                 rank.to_string(),
                 KvEventSourceEntry {
@@ -637,13 +647,7 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
                     replay_endpoint: config
                         .replay_endpoints
                         .as_ref()
-                        .and_then(|replay| {
-                            if rank_suffix.is_some() {
-                                replay.first()
-                            } else {
-                                replay.get(index)
-                            }
-                        })
+                        .and_then(|replay| replay.get(index))
                         .cloned(),
                     topic: config
                         .hybrid
@@ -657,7 +661,6 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
                     encoding: Some("msgpack".to_owned()),
                     schema_version: Some(1),
                     enable_kv_cache_events: Some(true),
-                    ..Default::default()
                 },
             )
         })

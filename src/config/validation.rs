@@ -831,9 +831,7 @@ impl ConfigValidator {
             }
         }
 
-        // Check if service discovery is enabled for worker count validation.
-        // This covers both K8s service discovery (config.discovery) and vLLM ZMQ
-        // service discovery (VllmPrefillDecode { discovery_address: Some(_) }).
+        // Check whether vLLM supplies the P/D worker list dynamically.
         let has_vllm_discovery = matches!(
             &config.mode,
             RoutingMode::VllmPrefillDecode {
@@ -841,6 +839,7 @@ impl ConfigValidator {
                 ..
             }
         );
+        // Either K8s or vLLM discovery can supply the worker list.
         let has_service_discovery =
             config.discovery.as_ref().is_some_and(|d| d.enabled) || has_vllm_discovery;
 
@@ -987,11 +986,10 @@ impl ConfigValidator {
                         let invalid = |reason: &str| ConfigError::IncompatibleConfig {
                             reason: format!("PD cache layout for '{url}': {reason}"),
                         };
-                        let paired_layout = !layout
-                            .ranks
-                            .iter()
-                            .all(crate::kv_index::RankCapability::is_plain_full_attention)
-                            || !sources.compatible_decode_urls.is_empty();
+                        let paired_layout =
+                            !layout.ranks.iter().all(
+                                crate::kv_index::RankCapability::has_plain_full_attention_shape,
+                            ) || !sources.compatible_decode_urls.is_empty();
                         if paired_layout && !prefill_kv {
                             return Err(invalid("requires a KV-aware prefill worker"));
                         }

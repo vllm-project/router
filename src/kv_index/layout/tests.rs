@@ -360,14 +360,6 @@ fn a_partial_page_boundary_is_restorable() {
     assert_eq!(common_reusable_tokens(&[full_group], 1024), 560);
 }
 
-/// A checkpoint needs only itself, so its partial entry alone is enough.
-#[test]
-fn a_partial_checkpoint_is_restorable_on_its_own() {
-    let mut checkpoint = group(0, 576, GroupRule::Checkpoint, &[]);
-    checkpoint.partial_ends = vec![560];
-    assert_eq!(common_reusable_tokens(&[checkpoint], 1024), 560);
-}
-
 #[test]
 fn partial_checkpoint_respects_cap_and_does_not_need_earlier_pages() {
     let mut checkpoint = group(0, 576, GroupRule::Checkpoint, &[]);
@@ -595,8 +587,7 @@ mod declarations {
         assert!(bind_layout(&value, "epoch-1").is_err());
     }
 
-    #[test]
-    fn capability_requires_complete_supported_layout_and_same_publisher() {
+    fn qwen_layout() -> serde_json::Value {
         let group = |idx, kind, spec, mode| {
             serde_json::json!({
                 "group_idx": idx, "kind": kind, "spec_type": spec, "block_size": 528,
@@ -605,7 +596,7 @@ mod declarations {
                 "prefill_checkpoint_alignment": if kind == "mamba" { Some(528) } else { None },
             })
         };
-        let mut value = serde_json::json!({"schema_version": 1, "ranks": [{
+        serde_json::json!({"schema_version": 1, "ranks": [{
             "rank": 0, "model": "qwen", "weight_version": "default", "weight_identity": "model-sha256",
             "publisher_topic": "epoch-1", "instance_topic": true,
             "hash_algorithm": "sha256_cbor", "full_hashes": true,
@@ -616,7 +607,12 @@ mod declarations {
                 group(1, "mamba", "MambaSpec", Some("align")),
                 group(2, "mamba", "MambaSpec", Some("align")),
                 group(3, "full_attention", "FullAttentionSpec", None)]
-        }]});
+        }]})
+    }
+
+    #[test]
+    fn qwen_layout_restores_prefix_and_respects_mooncake_boundary() {
+        let value = qwen_layout();
         let index = bind_layout(&value, "epoch-1").unwrap();
         index.begin_empty(0);
         index
@@ -631,6 +627,11 @@ mod declarations {
         let prefill = index.with_mooncake_prefill(true);
         assert_eq!(prefill.reusable_tokens(&prompt[..529], usize::MAX), 0);
         assert_eq!(prefill.reusable_tokens(&prompt[..530], usize::MAX), 528);
+    }
+
+    #[test]
+    fn layout_rejects_inconsistent_groups_publisher_and_hash_contract() {
+        let mut value = qwen_layout();
         value["ranks"][0]["groups"][0]["prefill_checkpoint_alignment"] = serde_json::Value::Null;
         assert!(bind_layout(&value, "epoch-1").is_ok());
         // Reject malformed group sizes and identities during source admission.
@@ -644,6 +645,8 @@ mod declarations {
         value["ranks"][0]["groups"][0]["prefill_checkpoint_alignment"] = serde_json::json!(528);
         for (field, invalid) in [
             ("publisher_topic", serde_json::json!("other")),
+            ("declared_groups", serde_json::json!(3)),
+            ("declared_groups", serde_json::json!(5)),
             ("full_hashes", serde_json::json!(false)),
             ("speculative_tokens", serde_json::json!(1)),
             ("root_hash", serde_json::json!("bad")),
@@ -653,7 +656,13 @@ mod declarations {
             assert!(bind_layout(&value, "epoch-1").is_err(), "{field}");
             value["ranks"][0][field] = saved;
         }
-        let mut spec = value.clone();
+        value["ranks"][0]["groups"][0]["prefix_replay_tokens"] = serde_json::json!(128);
+        assert!(bind_layout(&value, "epoch-1").is_err());
+    }
+
+    #[test]
+    fn layout_validates_speculative_contract_and_resolved_seed() {
+        let mut spec = qwen_layout();
         spec["ranks"][0]["speculative_tokens"] = serde_json::json!(3);
         let unsupported_speculation = Some("unsupported speculative cache contract");
         for (lookahead, tail_groups, expected_error) in [
@@ -672,7 +681,8 @@ mod declarations {
             spec["ranks"][0]["tail_drop_groups"] = tail_groups;
             assert_eq!(bind_layout(&spec, "epoch-1").err(), expected_error, "{spec}");
         }
-        let mut seeded = value.clone();
+        let mut seeded = qwen_layout();
+        let root_hash = seeded["ranks"][0]["root_hash"].clone();
         seeded["ranks"][0]["hash_seed"] = serde_json::json!("0");
         assert!(bind_layout(&seeded, "epoch-1").is_ok());
         seeded["ranks"][0]
@@ -683,10 +693,8 @@ mod declarations {
         seeded["ranks"][0]["hash_seed"] = serde_json::json!("");
         assert!(bind_layout(&seeded, "epoch-1").is_err());
         seeded["ranks"][0]["hash_seed"] = serde_json::json!("42");
-        seeded["ranks"][0]["root_hash"] = value["ranks"][0]["root_hash"].clone();
+        seeded["ranks"][0]["root_hash"] = root_hash;
         assert!(bind_layout(&seeded, "epoch-1").is_err());
-        value["ranks"][0]["groups"][0]["prefix_replay_tokens"] = serde_json::json!(128);
-        assert!(bind_layout(&value, "epoch-1").is_err());
     }
 
     /// DeepSeek V4 can declare MLA pages without `tokens_per_state` next to

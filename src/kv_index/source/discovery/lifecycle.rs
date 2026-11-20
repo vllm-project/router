@@ -13,7 +13,7 @@ use super::reconcile::{
     native_full_sources_match, probe_keeps_trust, probe_renews_trust, static_hybrid_sources_match,
     BoundSource, BoundSources, StaticHybridMatch,
 };
-use super::{CacheKey, KvIndexSupervisor, WorkerKvInfo, WorkerSubs};
+use super::{CacheKey, InstalledWorkers, KvIndexSupervisor, WorkerKvInfo, WorkerSubs};
 use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::{
     CacheCapabilities, EventStream, EventSubscriberHandle, IngestionSignal, KvBlockIndexer,
@@ -307,6 +307,7 @@ impl KvIndexSupervisor {
         let worker = worker_url.to_owned();
         let api_key = self.api_key.clone();
         let static_config = self.resolved_static_source(worker_url);
+        let installed = Arc::downgrade(&self.installed);
         tokio::spawn(async move {
             let invalidate = |handles: &[Arc<EventSubscriberHandle>]| {
                 for handle in handles {
@@ -366,6 +367,9 @@ impl KvIndexSupervisor {
                 match provider.lifecycle.observe_layout(&outcome) {
                     SourceAction::Stop => {
                         invalidate(&handles);
+                        if let Some(installed) = installed.upgrade() {
+                            installed.retire_if_current(&worker, &provider.lifecycle);
+                        }
                         break;
                     }
                     SourceAction::Recover => {
@@ -414,11 +418,41 @@ impl KvIndexSupervisor {
             observers.lock().remove(worker_url);
             return;
         }
-        let mut workers = self.workers.lock();
+        let mut workers = self.installed.workers.lock();
         self.lifecycles.lock().remove(worker_url);
         if let Some(subs) = workers.remove(worker_url) {
-            self.retire_worker(subs);
+            self.installed.retire_worker(subs);
             info!("kv_index {}: removed subscribers", worker_url);
+        }
+    }
+
+    /// Shut down every subscriber and drop all indexers.
+    pub fn shutdown(&self) {
+        if let Some(observers) = &self.observers {
+            observers.lock().clear();
+            return;
+        }
+        let mut workers = self.installed.workers.lock();
+        for (_url, subs) in workers.drain() {
+            self.installed.retire_worker(subs);
+        }
+        self.lifecycles.lock().clear();
+        drop(workers);
+        info!("kv_index supervisor shut down");
+    }
+}
+
+impl InstalledWorkers {
+    pub(super) fn retire_if_current(&self, worker_url: &str, lifecycle: &Arc<WorkerLifecycle>) {
+        let mut workers = self.workers.lock();
+        if workers
+            .get(worker_url)
+            .is_none_or(|worker| !Arc::ptr_eq(&worker.provider.lifecycle, lifecycle))
+        {
+            return;
+        }
+        if let Some(subs) = workers.remove(worker_url) {
+            self.retire_worker(subs);
         }
     }
 
@@ -434,21 +468,6 @@ impl KvIndexSupervisor {
         self.release_identity(&subs.key);
     }
 
-    /// Shut down every subscriber and drop all indexers.
-    pub fn shutdown(&self) {
-        if let Some(observers) = &self.observers {
-            observers.lock().clear();
-            return;
-        }
-        let mut workers = self.workers.lock();
-        for (_url, subs) in workers.drain() {
-            self.retire_worker(subs);
-        }
-        self.lifecycles.lock().clear();
-        drop(workers);
-        info!("kv_index supervisor shut down");
-    }
-
     /// Ref-count an identity; on first acquisition create its indexer.
     pub(super) fn acquire_identity(&self, key: &CacheKey) -> Arc<KvBlockIndexer> {
         let mut refs = self.identity_refs.lock();
@@ -458,7 +477,6 @@ impl KvIndexSupervisor {
                 .insert(key.clone(), Arc::new(KvBlockIndexer::new()));
         }
         *count += 1;
-        drop(refs);
         self.indexers.get(key).expect("just inserted").clone()
     }
 
@@ -469,11 +487,8 @@ impl KvIndexSupervisor {
             *c = c.saturating_sub(1);
             if *c == 0 {
                 refs.remove(key);
-                drop(refs);
                 self.indexers.remove(key);
-                return;
             }
         }
-        drop(refs);
     }
 }
