@@ -2,6 +2,7 @@
 use crate::kv_hash::SequenceHash;
 use crate::kv_index::layout::{CacheGroup, GroupRule};
 use crate::kv_index::wire::{BlockStored, ExternalBlockHash, KVEvent};
+use crate::kv_index::SourceError;
 
 pub(super) fn sequence_hash(hash: &ExternalBlockHash) -> Option<SequenceHash> {
     match hash {
@@ -39,12 +40,6 @@ fn complete_blocks(store: &BlockStored) -> bool {
         == Some(store.token_ids.len())
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum StoreValidationError {
-    Contract,
-    Packing,
-}
-
 /// Return false for a secondary page size that proves no prefix evidence.
 pub(super) fn validate_store(
     group: &CacheGroup,
@@ -52,7 +47,7 @@ pub(super) fn validate_store(
     hash_block_size: usize,
     lookahead_tokens: usize,
     partial_hash_hits: bool,
-) -> Result<bool, StoreValidationError> {
+) -> Result<bool, SourceError> {
     if store.locality.as_deref().is_some_and(|s| s != "LOCAL")
         || match &store.lookahead_token_ids {
             None => lookahead_tokens != 0 && !store.block_hashes.is_empty(),
@@ -68,7 +63,7 @@ pub(super) fn validate_store(
             .is_some_and(|hash| sequence_hash(hash).is_none())
         || !event_kind_matches(group.kind, store)
     {
-        return Err(StoreValidationError::Contract);
+        return Err(SourceError::InvalidBatch);
     }
     if let Some(keys) = store
         .extra_keys
@@ -76,11 +71,11 @@ pub(super) fn validate_store(
         .filter(|_| store.lora_name.is_none())
     {
         if keys.len() != store.block_hashes.len() {
-            return Err(StoreValidationError::Contract);
+            return Err(SourceError::InvalidBatch);
         }
         if let Some((first, rest)) = keys.split_first() {
             if !rest.iter().all(rmpv::Value::is_nil) {
-                return Err(StoreValidationError::Contract);
+                return Err(SourceError::InvalidBatch);
             }
             if !first.is_nil() {
                 // vLLM folds cache_salt into the first block's native hash.
@@ -91,7 +86,7 @@ pub(super) fn validate_store(
                 }) {
                     Ok(false)
                 } else {
-                    Err(StoreValidationError::Contract)
+                    Err(SourceError::InvalidBatch)
                 };
             }
         }
@@ -103,9 +98,12 @@ pub(super) fn validate_store(
         && store.block_hashes.len() == 1
         && store.token_ids.len() == hash_block_size;
     if store.block_size == 0 {
-        return Err(StoreValidationError::Contract);
+        return Err(SourceError::InvalidBatch);
     }
     if store.block_size != group.block_size && !partial {
+        if store.lora_name.is_some() {
+            return Err(SourceError::InvalidBatch);
+        }
         tracing::debug!(
             group_idx = group.group_idx,
             declared = group.block_size,
@@ -124,7 +122,7 @@ pub(super) fn validate_store(
             _ => complete_blocks(store),
         }
     {
-        return Err(StoreValidationError::Packing);
+        return Err(SourceError::InvalidBatch);
     }
     Ok(true)
 }
@@ -177,18 +175,18 @@ mod tests {
             .push(ExternalBlockHash::Bytes(vec![0; 32]));
         assert_eq!(
             validate_store(&group, &store, 2, 1, true),
-            Err(StoreValidationError::Contract)
+            Err(SourceError::InvalidBatch)
         );
         store.lookahead_token_ids = Some(vec![vec![9, 10]]);
         assert_eq!(
             validate_store(&group, &store, 2, 1, true),
-            Err(StoreValidationError::Contract)
+            Err(SourceError::InvalidBatch)
         );
         store.lookahead_token_ids = Some(vec![vec![9]]);
         assert_eq!(validate_store(&group, &store, 2, 1, true), Ok(true));
         assert_eq!(
             validate_store(&group, &store, 2, 0, true),
-            Err(StoreValidationError::Contract)
+            Err(SourceError::InvalidBatch)
         );
     }
 }

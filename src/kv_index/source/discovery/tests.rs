@@ -1763,12 +1763,13 @@ async fn metrics_only_worker_supplies_cache_metadata() {
         vllm:cache_config_info{block_size=\"8\",effective_attention_block_size=\"16\",engine=\"1\"} 1.0\n";
     let (worker, server) = spawn_metrics_only_worker(metrics_and_models_router(metrics)).await;
 
-    let info = query_worker_metadata(&reqwest::Client::new(), &worker, None)
+    let (info, models) = query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None)
         .await
         .unwrap();
     assert_eq!(info.kv_block_size, Some(16));
     assert_eq!(discovered_block_size(&info), Some(16));
     assert_eq!(info.model_id.as_deref(), Some("mock-model"));
+    assert_eq!(models.unwrap(), HashSet::from(["mock-model".to_owned()]));
     server.abort();
 }
 
@@ -1810,7 +1811,7 @@ async fn cache_metrics_without_a_replay_source_do_not_bind_default_layout() {
 async fn worker_without_metadata_names_every_source() {
     let (worker, server) = spawn_metrics_only_worker(axum::Router::new()).await;
 
-    let error = query_worker_metadata(&reqwest::Client::new(), &worker, None)
+    let error = query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None)
         .await
         .unwrap_err();
     assert!(error.contains("get_server_info"), "{error}");

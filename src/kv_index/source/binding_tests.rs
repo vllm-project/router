@@ -1224,36 +1224,11 @@ fn salted_events_leave_replay_open_for_the_unsalted_chain() {
 }
 
 #[test]
-fn malformed_adapter_store_preserves_base_credit_and_sequence() {
-    let index = fresh_index(16).with_adapters(vec![("lora1".into(), "/adapters/lora1".into())]);
-    index.apply_batch(0, &qwen_batch()).unwrap();
-    assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
-    let mut batch = adapter_batch("lora1", "/adapters/lora1");
-    let KVEvent::BlockStored(store) = &mut batch.events[0] else {
-        panic!("expected store");
-    };
-    store.token_ids.pop();
-    assert_eq!(index.apply_batch(1, &batch), Ok(()));
-    assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
-    assert_eq!(
-        index.reusable_tokens_in(Some("lora1"), &prompt(), usize::MAX),
-        0
-    );
-    assert_eq!(
-        index.apply_batch(2, &adapter_batch("lora1", "/adapters/lora1")),
-        Ok(())
-    );
-    assert_eq!(
-        index.reusable_tokens_in(Some("lora1"), &prompt(), usize::MAX),
-        528
-    );
-}
-
-#[test]
 fn declared_adapter_store_does_not_hide_layout_errors() {
-    for error in ["group", "kind", "locality", "block size"] {
+    for error in ["group", "kind", "locality", "block size", "token packing"] {
         let index = fresh_index(16).with_adapters(vec![("lora1".into(), "/adapters/lora1".into())]);
         index.apply_batch(0, &qwen_batch()).unwrap();
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
         let mut batch = adapter_batch("lora1", "/adapters/lora1");
         let KVEvent::BlockStored(store) = &mut batch.events[0] else {
             panic!("expected store");
@@ -1262,7 +1237,11 @@ fn declared_adapter_store_does_not_hide_layout_errors() {
             "group" => store.group_idx = Some(u32::MAX),
             "kind" => store.kv_cache_spec_kind = Some("sliding_window".into()),
             "locality" => store.locality = Some("REMOTE".into()),
-            _ => store.block_size = 0,
+            "block size" => store.block_size += 1,
+            "token packing" => {
+                store.token_ids.pop();
+            }
+            _ => unreachable!(),
         }
         assert_eq!(
             index.apply_batch(1, &batch),
@@ -1270,6 +1249,17 @@ fn declared_adapter_store_does_not_hide_layout_errors() {
             "{error}"
         );
         assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
+        index.begin_replay(0);
+        index.apply_batch(0, &qwen_batch()).unwrap();
+        index
+            .apply_batch(1, &adapter_batch("lora1", "/adapters/lora1"))
+            .unwrap();
+        index.finish_replay(2).unwrap();
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+        assert_eq!(
+            index.reusable_tokens_in(Some("lora1"), &prompt(), usize::MAX),
+            528
+        );
     }
 }
 

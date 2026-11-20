@@ -362,16 +362,6 @@ async fn query_worker_json<T: serde::de::DeserializeOwned>(
 /// Every source is optional; the error names what each one said, so an operator
 /// can tell a missing endpoint from an endpoint that answered without a block
 /// size.
-pub(super) async fn query_worker_metadata(
-    client: &reqwest::Client,
-    worker_url: &str,
-    api_key: Option<&str>,
-) -> Result<ServerInfo, String> {
-    query_worker_metadata_and_models(client, worker_url, api_key)
-        .await
-        .map(|(info, _)| info)
-}
-
 pub(super) async fn query_worker_metadata_and_models(
     client: &reqwest::Client,
     worker_url: &str,

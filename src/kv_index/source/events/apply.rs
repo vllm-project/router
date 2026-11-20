@@ -8,7 +8,7 @@ use crate::kv_index::{
     KVEvent, KVEventBatch, ResidencyOwner, SourceBinding, SourceError, StorageTier,
 };
 
-use super::validate::{publishes_int_hash, sequence_hash, validate_store, StoreValidationError};
+use super::validate::{publishes_int_hash, sequence_hash, validate_store};
 
 pub(super) enum PreparedEvent<'a> {
     Store {
@@ -259,26 +259,14 @@ impl SourceBinding {
         if self.strict_event_block_size && store.block_size != group.block_size {
             return Err(SourceError::InvalidBatch);
         }
-        match validate_store(
+        if !validate_store(
             group,
             store,
             self.keys.block_size(),
             self.keys.lookahead_tokens(),
             self.partial_hash_hits,
-        ) {
-            Ok(true) => {}
-            Ok(false) => return Ok(None),
-            Err(StoreValidationError::Packing) if namespace.is_some() => {
-                tracing::warn!(
-                    source = %self.target.instance_id,
-                    rank = self.target.dp_rank,
-                    adapter = ?namespace,
-                    group = group.group_idx,
-                    "ignoring malformed token packing in an adapter KV store"
-                );
-                return Ok(None);
-            }
-            Err(_) => return Err(SourceError::InvalidBatch),
+        )? {
+            return Ok(None);
         }
         let hashes = store
             .block_hashes

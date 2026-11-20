@@ -6,8 +6,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use super::{
-    discovered_block_size, event_sources_for_worker, fetch_kv_event_sources, query_worker_metadata,
-    server_instance_id, server_model_id, CacheKey, KvIndexSupervisor, SourcesProbe, WorkerKvInfo,
+    discovered_block_size, event_sources_for_worker, fetch_kv_event_sources,
+    query_worker_metadata_and_models, server_instance_id, server_model_id, CacheKey,
+    KvIndexSupervisor, SourcesProbe, WorkerKvInfo,
 };
 use crate::kv_index::source::events::subscriber::{spawn_observer, SubscriberHandle};
 use crate::kv_index::SourceId;
@@ -26,7 +27,7 @@ impl KvIndexSupervisor {
         let api_key = self.api_key.as_deref();
         let (sources, info) = tokio::join!(
             fetch_kv_event_sources(&self.client, worker_url, api_key),
-            query_worker_metadata(&self.client, worker_url, api_key),
+            query_worker_metadata_and_models(&self.client, worker_url, api_key),
         );
         let sources = match sources {
             Ok(sources) => sources,
@@ -35,29 +36,32 @@ impl KvIndexSupervisor {
             }
             Err(error) => return Err(error.detail),
         };
-        let info = info?;
-        let instance_id = server_instance_id(&info, worker_url);
-        let Some(block_size) = discovered_block_size(&info) else {
-            return Ok(WorkerKvInfo {
-                instance_id,
-                ..Default::default()
-            });
+        let (server_info, _) = info?;
+        let mut info = WorkerKvInfo {
+            instance_id: server_instance_id(&server_info, worker_url),
+            block_size: discovered_block_size(&server_info),
+            ..Default::default()
         };
-        let model = server_model_id(&info).unwrap_or_else(|| worker_url.to_owned());
+        let Some(block_size) = info.block_size else {
+            return Ok(info);
+        };
         let source: SourceId = Arc::from(format!(
-            "{instance_id}#observation-{}",
+            "{}#observation-{}",
+            info.instance_id,
             crate::kv_index::next_owner_incarnation()
         ));
         let mut sources = event_sources_for_worker(worker_url, &source, &sources, false)?;
-        sources.sort_unstable_by_key(|entry| entry.dp_rank);
-        let ranks: Vec<_> = sources.iter().map(|source| source.dp_rank).collect();
-        if ranks.is_empty() {
-            return Ok(WorkerKvInfo {
-                instance_id,
-                block_size: Some(block_size),
-                ..Default::default()
-            });
+        if sources.is_empty() {
+            return Ok(info);
         }
+        sources.sort_unstable_by_key(|entry| entry.dp_rank);
+        info.ranks = sources.iter().map(|source| source.dp_rank).collect();
+        info.cache_key = Some(CacheKey {
+            model: Arc::from(
+                server_model_id(&server_info).unwrap_or_else(|| worker_url.to_owned()),
+            ),
+            block_size,
+        });
         let subscribers = sources
             .into_iter()
             .map(|source| spawn_observer(source, self.ctx.clone(), self.signal_tx.clone()))
@@ -69,15 +73,7 @@ impl KvIndexSupervisor {
                 _subscribers: subscribers,
             },
         );
-        Ok(WorkerKvInfo {
-            instance_id,
-            block_size: Some(block_size),
-            ranks,
-            cache_key: Some(CacheKey {
-                model: Arc::from(model),
-                block_size,
-            }),
-        })
+        Ok(info)
     }
 }
 
