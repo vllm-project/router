@@ -3274,7 +3274,7 @@ impl RouterTrait for Router {
         // Get all worker URLs
         let worker_urls = self.get_worker_urls();
 
-        // Send requests to all workers concurrently without headers
+        // Send the cache flush to all workers concurrently.
         let mut tasks = Vec::new();
         for worker_url in &worker_urls {
             let worker_url = if self.intra_node_data_parallel_size > 1 {

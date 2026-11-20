@@ -7,8 +7,7 @@ use super::pd_types::{
     PdSelection, Stage, StageDecision,
 };
 use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs, HttpTokenInput};
-use crate::core::worker::WorkerMetadata;
-use crate::core::worker::{worker_get, worker_post};
+use crate::core::worker::{worker_get, worker_post, WorkerMetadata};
 use crate::core::{
     BasicWorker, CircuitBreaker, CircuitBreakerConfig, ConnectionMode, DPAwareWorker, HealthConfig,
     Worker, WorkerRegistry, WorkerResult, WorkerType,
@@ -829,25 +828,16 @@ impl PdRouterBase {
         })
     }
 
-    // Generic helper for processing all workers with an endpoint
-    async fn process_workers(
+    async fn flush_worker_caches(
         &self,
-        worker_type_enum: WorkerType,
+        urls: Vec<String>,
         worker_type: &str,
-        endpoint: &str,
     ) -> (Vec<String>, Vec<String>) {
         let mut results = Vec::new();
         let mut errors = Vec::new();
-
-        // Get workers from registry based on type
-        let workers = self.worker_registry.get_by_type(&worker_type_enum);
-        let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
-
-        // Process each worker
         for worker_url in urls {
-            // Extract base URL if DP-aware format (e.g., http://127.0.0.1:8081@0 → http://127.0.0.1:8081)
             let (base_url, _) = super::dp_utils::parse_worker_url(&worker_url);
-            let url = format!("{}/{}", base_url, endpoint);
+            let url = format!("{base_url}/flush_cache");
             match worker_post(&self.client, &url, self.api_key.as_deref())
                 .send()
                 .await
@@ -896,10 +886,7 @@ impl PdRouterBase {
         let (base_url, _) = super::dp_utils::parse_worker_url(worker_url);
 
         let url = format!("{}/start_profile", base_url);
-        match worker_post(&self.client, &url, self.api_key.as_deref())
-            .send()
-            .await
-        {
+        match self.client.post(&url).send().await {
             Ok(res) if res.status().is_success() => {
                 info!("Started profiling on {}", base_url);
             }
@@ -922,10 +909,7 @@ impl PdRouterBase {
         let (base_url, _) = super::dp_utils::parse_worker_url(worker_url);
 
         let url = format!("{}/stop_profile", base_url);
-        match worker_post(&self.client, &url, self.api_key.as_deref())
-            .send()
-            .await
-        {
+        match self.client.post(&url).send().await {
             Ok(res) if res.status().is_success() => {
                 info!("Stopped profiling on {}", base_url);
             }
@@ -1422,12 +1406,10 @@ impl PdRouterBase {
                 .iter()
                 .map(|url| {
                     let client = client.clone();
-                    let api_key = api_key.clone();
+                    let api_key = api_key.as_deref();
                     let url = url.clone();
                     async move {
-                        let load = get_worker_load(&client, &url, api_key.as_deref())
-                            .await
-                            .unwrap_or(0);
+                        let load = get_worker_load(&client, &url, api_key).await.unwrap_or(0);
                         (url, load)
                     }
                 })
@@ -1626,10 +1608,11 @@ impl PdRouterBase {
         let (decode_base_url, _) = super::dp_utils::parse_worker_url(decode.url());
 
         let prefill_url = format!("{}/health_generate", prefill_base_url);
-        let decode_url = format!("{}/health_generate", decode_base_url);
         let (prefill_result, decode_result) = tokio::join!(
-            worker_get(&self.client, &prefill_url, self.api_key.as_deref()).send(),
-            worker_get(&self.client, &decode_url, self.api_key.as_deref()).send()
+            self.client.get(&prefill_url).send(),
+            self.client
+                .get(format!("{}/health_generate", decode_base_url))
+                .send()
         );
 
         // Check results
@@ -1792,16 +1775,10 @@ impl PdRouterBase {
         }
         // Process both prefill and decode workers
         let (prefill_results, prefill_errors) = self
-            .process_workers(
-                WorkerType::Prefill {
-                    bootstrap_port: None,
-                },
-                "Prefill",
-                "flush_cache",
-            )
+            .flush_worker_caches(self.get_prefill_worker_urls(), "Prefill")
             .await;
         let (decode_results, decode_errors) = self
-            .process_workers(WorkerType::Decode, "Decode", "flush_cache")
+            .flush_worker_caches(self.get_decode_worker_urls(), "Decode")
             .await;
 
         // Combine results and errors
@@ -1975,106 +1952,26 @@ mod tests {
         Box::new(worker)
     }
 
-    fn pd_router_with_api_key(api_key: Option<&str>) -> PdRouterBase {
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry =
-            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
+    fn pd_router_with_api_key(api_key: &str) -> PdRouterBase {
         PdRouterBase {
-            kv_state: None,
-            pd_load: Arc::new(PdLoadManager::default()),
-            worker_registry,
-            policy_registry,
-            worker_startup_timeout_secs: 5,
-            worker_startup_check_interval_secs: 1,
-            worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
-            load_monitor_handle: None,
-            client: Client::new(),
-            api_key: api_key.map(str::to_owned),
-            circuit_breaker_config: CircuitBreakerConfig::default(),
-            dp_size: 1,
-        }
-    }
-
-    // Expected worker key, configured router key, and status returned by the worker.
-    const ADMIN_AUTH_CASES: [(Option<&str>, Option<&str>, StatusCode); 3] = [
-        (Some("worker-key"), Some("worker-key"), StatusCode::OK),
-        (Some("worker-key"), None, StatusCode::UNAUTHORIZED),
-        (None, None, StatusCode::OK),
-    ];
-
-    #[tokio::test]
-    async fn test_pd_profiling_worker_auth() {
-        for (expected_key, router_key, status) in ADMIN_AUTH_CASES {
-            let (url, server, requests) = start_admin_auth_mock_server(expected_key).await;
-            let router = pd_router_with_api_key(router_key);
-            router.start_profiling(&url).await;
-            router.stop_profiling(&url).await;
-            assert_eq!(
-                *requests.borrow(),
-                [
-                    ("/start_profile".into(), status),
-                    ("/stop_profile".into(), status)
-                ]
-            );
-            server.abort();
-        }
-    }
-
-    #[tokio::test]
-    async fn test_pd_health_generate_worker_auth() {
-        for (expected_key, router_key, status) in ADMIN_AUTH_CASES {
-            let (prefill_url, prefill_server, prefill_requests) =
-                start_admin_auth_mock_server(expected_key).await;
-            let (decode_url, decode_server, decode_requests) =
-                start_admin_auth_mock_server(expected_key).await;
-            let prefill = create_test_worker(
-                prefill_url.clone(),
-                WorkerType::Prefill {
-                    bootstrap_port: None,
-                },
-                true,
-            );
-            let decode = create_test_worker(decode_url.clone(), WorkerType::Decode, true);
-            let response = pd_router_with_api_key(router_key)
-                .health_generate_for_workers(&[Arc::from(prefill)], &[Arc::from(decode)])
-                .await;
-            let response_status = response.status();
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let body = std::str::from_utf8(&body).unwrap();
-            for requests in [prefill_requests, decode_requests] {
-                assert_eq!(*requests.borrow(), [("/health_generate".into(), status)]);
-            }
-            if status == StatusCode::OK {
-                assert_eq!(response_status, StatusCode::OK);
-                assert_eq!(body, format!("Health generate passed on selected pair: prefill={prefill_url}, decode={decode_url}"));
-            } else {
-                assert_eq!(response_status, StatusCode::SERVICE_UNAVAILABLE);
-                for (role, url) in [("Prefill", prefill_url), ("Decode", decode_url)] {
-                    assert!(
-                        body.contains(&format!("{role} {url} returned status {status}")),
-                        "{body}"
-                    );
-                }
-            }
-            prefill_server.abort();
-            decode_server.abort();
+            api_key: Some(api_key.to_owned()),
+            ..create_test_pd_router()
         }
     }
 
     #[tokio::test]
     async fn test_pd_flush_cache_and_get_load_send_api_key() {
-        let (prefill_url, prefill_server, _) =
+        let (prefill_url, prefill_server, prefill_requests) =
             start_admin_auth_mock_server(Some("worker-key")).await;
-        let (decode_url, decode_server, _) = start_admin_auth_mock_server(Some("worker-key")).await;
-        let router = pd_router_with_api_key(Some("worker-key"));
+        let (decode_url, decode_server, decode_requests) =
+            start_admin_auth_mock_server(Some("worker-key")).await;
+        let router = pd_router_with_api_key("worker-key");
         router
             .worker_registry
             .register(Arc::from(create_test_worker(
                 prefill_url.clone(),
                 WorkerType::Prefill {
-                    bootstrap_port: None,
+                    bootstrap_port: Some(9000),
                 },
                 true,
             )));
@@ -2088,6 +1985,12 @@ mod tests {
 
         let flush = router.flush_cache().await;
         assert_eq!(flush.status(), StatusCode::OK, "flush_cache");
+        for requests in [&prefill_requests, &decode_requests] {
+            assert_eq!(
+                *requests.borrow(),
+                [("/flush_cache".into(), StatusCode::OK)]
+            );
+        }
         let loads = router.get_worker_loads().await;
         assert_eq!(loads.status(), StatusCode::OK, "get_loads");
         let body = axum::body::to_bytes(loads.into_body(), usize::MAX)
@@ -2118,7 +2021,7 @@ mod tests {
         let (prefill_url, prefill_server, _) =
             start_admin_auth_mock_server(Some("worker-key")).await;
         let (decode_url, decode_server, _) = start_admin_auth_mock_server(Some("worker-key")).await;
-        let router = pd_router_with_api_key(Some("other-key"));
+        let router = pd_router_with_api_key("other-key");
         router
             .worker_registry
             .register(Arc::from(create_test_worker(

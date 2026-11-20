@@ -43,9 +43,6 @@ pub(super) async fn start_admin_auth_mock_server(
             "/get_load",
             get(|| async { Json(serde_json::json!({"load": 7})) }),
         )
-        .route("/start_profile", post(ok))
-        .route("/stop_profile", post(ok))
-        .route("/health_generate", get(ok))
         .route_layer(middleware::from_fn(authorize));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
