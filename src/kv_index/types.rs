@@ -13,14 +13,6 @@ pub struct TierMatch {
     pub locality: Locality,
 }
 
-/// Append a block to the last contiguous segment or start a new segment.
-pub(crate) fn push_block_segment(segments: &mut Vec<(u32, u32)>, start: u32, end: u32) {
-    match segments.last_mut() {
-        Some((_, previous_end)) if *previous_end == start => *previous_end = end,
-        _ => segments.push((start, end)),
-    }
-}
-
 /// Where a request goes — one (worker, rank) target.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RoutableTarget {
@@ -53,19 +45,23 @@ pub enum ResidencyOwner {
 }
 
 impl ResidencyOwner {
-    /// The target a hit on this owner routes to.
-    pub fn target(&self) -> RoutableTarget {
-        let (source, dp_rank) = match self {
+    pub(crate) fn target_parts(&self) -> (&SourceId, u32) {
+        match self {
             ResidencyOwner::Worker {
                 source, dp_rank, ..
             }
             | ResidencyOwner::CacheOwner {
                 source, dp_rank, ..
-            } => (source, dp_rank),
-        };
+            } => (source, *dp_rank),
+        }
+    }
+
+    /// The target a hit on this owner routes to.
+    pub fn target(&self) -> RoutableTarget {
+        let (source, dp_rank) = self.target_parts();
         RoutableTarget {
             instance_id: source.clone(),
-            dp_rank: *dp_rank,
+            dp_rank,
         }
     }
 

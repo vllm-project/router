@@ -10,6 +10,7 @@ pub(crate) struct IndexBatch<'a> {
     pub(super) index: &'a KvBlockIndexer,
     pub(super) target: &'a RoutableTarget,
     pub(super) active_pages: &'a mut ActivePages,
+    pub(super) source: &'a SourceLock,
 }
 
 /// A consistent view under one source read lock.
@@ -43,21 +44,36 @@ impl IndexBatch<'_> {
     /// Remove only this precise owner, including its incarnation.
     pub(crate) fn clear_owner_exact(&mut self, owner: &ResidencyOwner) {
         self.check_target(&owner.target());
+        *self.source.planned.write() = None;
         self.index.hash_pages.clear_owner(self.active_pages, owner);
     }
 }
 
 impl IndexSnapshot<'_> {
-    fn check_target(&self, target: &RoutableTarget) {
+    fn check_owner(&self, owner: &ResidencyOwner) {
         assert_eq!(
-            &self.source.target, target,
+            owner.target_parts(),
+            (&self.source.target.instance_id, self.source.target.dp_rank),
             "source snapshot crossed targets"
         );
     }
 
     pub(crate) fn stream(&self, owner: &ResidencyOwner) -> Option<&StreamState> {
-        self.check_target(&owner.target());
+        self.check_owner(owner);
         self.source_data.streams.get(owner)
+    }
+
+    pub(in crate::kv_index) fn contains_any(
+        &self,
+        owner: &ResidencyOwner,
+        group: u32,
+        namespace: Option<&str>,
+        keys: &[SequenceHash],
+    ) -> bool {
+        self.source_data
+            .active_pages
+            .get(owner)
+            .is_some_and(|pages| pages.contains_any(group, namespace, keys))
     }
 
     pub(crate) fn source_version(&self) -> SourceVersion {
@@ -73,20 +89,15 @@ impl IndexSnapshot<'_> {
         owner: &ResidencyOwner,
         namespace: Option<&str>,
         keys: &[SequenceHash],
-        by_group: &'a HashMap<u32, PageEvidence>,
-        groups: impl Iterator<Item = u32> + Clone,
+        by_group: &'a GroupPages,
+        groups: impl Iterator<Item = PageQuery> + Clone,
     ) -> SmallVec<[PageTiers<'a>; 1]> {
-        let target = owner.target();
-        self.check_target(&target);
-        let source = self.source;
-        let revision = source.revision.load(Ordering::Acquire);
-        let stable = revision.is_multiple_of(2)
-            && groups.clone().all(|group| {
-                by_group
-                    .get(&group)
-                    .and_then(|e| e.versions.get(&target))
-                    .is_some_and(|(gate, start)| Arc::ptr_eq(gate, source) && *start == revision)
-            });
+        self.check_owner(owner);
+        let stable = groups.clone().all(|group| {
+            by_group
+                .get(&group)
+                .is_some_and(|e| self.source.committed_at(&e.scan))
+        });
         groups
             .map(|group| {
                 if stable {
@@ -97,7 +108,7 @@ impl IndexSnapshot<'_> {
                         prefix: TierBits::default(),
                         tail: Cow::Owned(self.index.hash_pages.for_owner(
                             self.source_data.active_pages.get(owner),
-                            group,
+                            group.group,
                             namespace,
                             keys,
                         )),
@@ -114,31 +125,46 @@ impl IndexSnapshot<'_> {
         owner: &ResidencyOwner,
         namespace: Option<&str>,
         keys: &[SequenceHash],
-        by_group: &'a HashMap<u32, PageEvidence>,
+        by_group: &'a GroupPages,
         groups: impl Iterator<Item = u32> + Clone,
     ) -> Vec<Cow<'a, [TierBits]>> {
-        self.hash_page_runs(owner, namespace, keys, by_group, groups)
-            .into_iter()
-            .map(PageTiers::expanded)
-            .collect()
+        self.hash_page_runs(
+            owner,
+            namespace,
+            keys,
+            by_group,
+            groups.map(PageQuery::from),
+        )
+        .into_iter()
+        .map(PageTiers::expanded)
+        .collect()
     }
 }
 
 /// Mark the entire source batch, including failures and clears, as one mutation.
-pub(super) struct SourceWrite<'a>(&'a AtomicU64);
+pub(super) struct SourceWrite<'a> {
+    revision: &'a AtomicU64,
+    committed: &'a AtomicU64,
+}
 impl<'a> SourceWrite<'a> {
-    pub(super) fn new(revision: &'a AtomicU64) -> Self {
-        let previous = revision.fetch_add(1, Ordering::AcqRel);
+    pub(super) fn new(revision: &'a AtomicU64, committed: &'a AtomicU64) -> Self {
+        let previous = revision.fetch_or(1, Ordering::AcqRel);
         assert!(
-            previous.is_multiple_of(2) && previous < u64::MAX - 1,
-            "invalid source write version"
+            previous.is_multiple_of(2),
+            "source writes must be serialized"
         );
-        Self(revision)
+        Self {
+            revision,
+            committed,
+        }
     }
 }
 impl Drop for SourceWrite<'_> {
     fn drop(&mut self) {
-        self.0.fetch_add(1, Ordering::Release);
+        // Pages must already be updated when this commit becomes part of a scan's cutoff.
+        let previous = self.committed.fetch_add(2, Ordering::AcqRel);
+        assert!(previous < u64::MAX - 1, "index commit sequence exhausted");
+        self.revision.store(previous + 2, Ordering::Release);
     }
 }
 

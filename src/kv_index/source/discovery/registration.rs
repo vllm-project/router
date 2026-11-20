@@ -310,7 +310,7 @@ impl KvIndexSupervisor {
         let mut ranks = Vec::with_capacity(event_sources.len());
         let mut handles = Vec::with_capacity(event_sources.len());
         let mut targets = Vec::new();
-        let mut indexes = HashMap::new();
+        let mut indexes = HashMap::default();
         for (ev, live) in event_sources.into_iter().zip(&live_sources) {
             let rank = ev.dp_rank;
             let index = Arc::new(

@@ -83,16 +83,53 @@ impl WorkerLifecycle {
         }
     }
 
-    fn trusted(&self, state: &LifecycleState) -> bool {
+    pub(super) fn trusted_at(&self, state: &LifecycleState, now: impl FnOnce() -> Instant) -> bool {
         self.active.load(Ordering::Acquire)
             && state.trusted
-            && (!self.layout || state.verified_at.elapsed() <= LAYOUT_FRESHNESS)
+            && (!self.layout
+                || now().saturating_duration_since(state.verified_at) <= LAYOUT_FRESHNESS)
+    }
+    fn trusted(&self, state: &LifecycleState) -> bool {
+        self.trusted_at(state, Instant::now)
     }
 
-    pub(super) fn is_trusted(&self) -> bool {
-        self.trusted(&self.state.lock())
+    pub(super) fn read_rank<T>(
+        &self,
+        rank: &SourceBinding,
+        mut first_trust_check: Option<Instant>,
+        now: impl Fn() -> Instant,
+        mut query: impl FnMut() -> Vec<T>,
+    ) -> Vec<T> {
+        for _ in 0..2 {
+            let generation = rank.control.generation();
+            let initial = {
+                let state = self.state.lock();
+                if generation == 0
+                    || !self.trusted_at(&state, || first_trust_check.take().unwrap_or_else(&now))
+                {
+                    return Vec::new();
+                }
+                state.verified_at
+            };
+            let hits = query();
+            if hits.is_empty() {
+                return hits;
+            }
+            let state = self.state.lock();
+            let end = now();
+            if !self.trusted_at(&state, || end) {
+                return Vec::new();
+            }
+            // The same source and the original grant must cover the observation.
+            // Renewal alone cannot certify pages observed during an expiry gap.
+            if rank.control.generation() == generation
+                && (!self.layout || end.saturating_duration_since(initial) <= LAYOUT_FRESHNESS)
+            {
+                return hits;
+            }
+        }
+        Vec::new()
     }
-
     pub(super) fn expire_if_needed(&self) -> bool {
         let mut state = self.state.lock();
         self.layout
@@ -185,14 +222,8 @@ impl WorkerLifecycle {
 
 pub(super) struct LayoutWorkerProvider {
     /// Rank lookups share lifecycle evidence but never another rank's pages.
-    pub(super) indexes: HashMap<u32, Arc<SourceBinding>>,
+    pub(super) indexes: HashMap<u32, Arc<SourceBinding>, foldhash::fast::RandomState>,
     pub(super) lifecycle: Arc<WorkerLifecycle>,
-}
-
-impl LayoutWorkerProvider {
-    pub(super) fn is_trusted(&self) -> bool {
-        self.lifecycle.is_trusted()
-    }
 }
 
 impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
@@ -212,7 +243,7 @@ impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
             block_size,
             lora,
             dp_rank,
-            &mut crate::kv_index::RequestHashCache::default(),
+            &mut crate::kv_index::RequestHashCache::for_single_target(),
         )
     }
 
@@ -224,15 +255,15 @@ impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
         dp_rank: u32,
         cache: &mut crate::kv_index::RequestHashCache<'a>,
     ) -> Vec<crate::kv_index::TierMatch> {
-        if !self.is_trusted() {
+        let Some(index) = self.indexes.get(&dp_rank) else {
             return Vec::new();
-        }
-        // An unadmitted rank is a miss for that rank, never a fallback to a
-        // sibling rank's state or to the single-group event reader.
-        let hits = self
-            .indexes
-            .get(&dp_rank)
-            .map(|index| {
+        };
+        let first_trust_check = self
+            .lifecycle
+            .layout
+            .then(|| *cache.first_trust_check.get_or_insert_with(Instant::now));
+        self.lifecycle
+            .read_rank(index, first_trust_check, Instant::now, || {
                 crate::policies::TieredMatchProvider::matches_with_cache(
                     index.as_ref(),
                     tokens,
@@ -242,11 +273,6 @@ impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
                     cache,
                 )
             })
-            .unwrap_or_default();
-        if !self.is_trusted() {
-            return Vec::new();
-        }
-        hits
     }
 }
 

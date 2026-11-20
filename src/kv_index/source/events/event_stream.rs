@@ -105,7 +105,13 @@ impl EventStream {
             .as_ref()
             .ok()
             .map(|batch| self.index.prepare_batch(batch));
-        self.with_state(lease, |state, tx| {
+        let planned = prepared
+            .as_ref()
+            .and_then(|result| result.as_deref().ok())
+            .and_then(|events| {
+                super::apply::PreparedEvent::page_changes(events, self.index.max_entries)
+            });
+        self.with_state_for_pages(lease, planned, |state, tx| {
             let result = match (&batch, prepared) {
                 (Ok(batch), Some(prepared)) => {
                     self.index.apply_prepared(state, tx, seq, batch, prepared)
@@ -202,9 +208,18 @@ impl EventStream {
         lease: StreamLease,
         operation: impl FnOnce(&mut StreamState, &mut IndexBatch<'_>) -> Result<R, StreamError>,
     ) -> Result<R, StreamError> {
+        self.with_state_for_pages(lease, None, operation)
+    }
+
+    fn with_state_for_pages<R>(
+        &self,
+        lease: StreamLease,
+        planned: Option<crate::kv_index::storage::PageChanges>,
+        operation: impl FnOnce(&mut StreamState, &mut IndexBatch<'_>) -> Result<R, StreamError>,
+    ) -> Result<R, StreamError> {
         self.index
             .with_active_binding(|| {
-                self.index.with_stream_batch(|state, tx| {
+                self.index.with_page_mutation_batch(planned, |state, tx| {
                     Self::check(state, lease)?;
                     if state.phase == Phase::Retired {
                         return Err(StreamError::InvalidState);

@@ -3,7 +3,7 @@
 use crate::kv_hash::SequenceHash;
 use crate::kv_index::layout::align_down;
 use crate::kv_index::request_hash::BlockKeyGenerator;
-use crate::kv_index::storage::PageEvidence;
+use crate::kv_index::storage::{GroupPages, PageQuery};
 use crate::kv_index::SourceBinding;
 use crate::kv_index::{KvBlockIndexer, Locality, TierMatch};
 use std::collections::HashMap;
@@ -29,7 +29,7 @@ impl crate::policies::TieredMatchProvider for SourceBinding {
             block_size,
             lora_name,
             dp_rank,
-            &mut RequestHashCache::default(),
+            &mut RequestHashCache::for_single_target(),
         )
     }
 
@@ -43,7 +43,8 @@ impl crate::policies::TieredMatchProvider for SourceBinding {
     ) -> Vec<TierMatch> {
         // Events, ownership and history are bound to one rank. A hit computed
         // from another rank's stream is never evidence for this one.
-        if block_size == 0 || dp_rank != self.target.dp_rank {
+        let prompt_cap = self.reusable_prompt_cap(tokens.len());
+        if block_size == 0 || dp_rank != self.target.dp_rank || prompt_cap < block_size as usize {
             return Vec::new();
         }
         if self.groups.len() == 1
@@ -53,7 +54,7 @@ impl crate::policies::TieredMatchProvider for SourceBinding {
             && self.tail_drop_group.is_none()
         {
             let Some((mut claims, version, generation)) =
-                self.page_snapshot(lora_name, tokens, cache)
+                self.page_snapshot(lora_name, tokens, cache.stop_at_gap, cache)
             else {
                 return Vec::new();
             };
@@ -63,7 +64,7 @@ impl crate::policies::TieredMatchProvider for SourceBinding {
                 claims.pop().expect("one group in the snapshot"),
                 self.keys.block_size(),
                 block_size,
-                self.reusable_prompt_cap(tokens.len()) as u64,
+                prompt_cap as u64,
             );
             if !self.snapshot_is_current(&version, generation) {
                 return Vec::new();
@@ -118,23 +119,59 @@ impl Hash for PromptKey<'_> {
 /// Prepared engine hashes shared across candidates in one routing selection.
 #[derive(Default)]
 pub struct RequestHashCache<'a> {
-    seen: HashMap<PromptKey<'a>, &'a [u32], RandomState>,
-    prompts: HashMap<&'a [u32], &'a [u32], RandomState>,
-    chains: HashMap<PromptKey<'a>, Vec<PreparedChain>, RandomState>,
+    /// Lower bound used only for the initial trust check within this routing stage.
+    pub(crate) first_trust_check: Option<std::time::Instant>,
+    /// A single candidate reads its own source snapshot without collecting other ranks.
+    pub(crate) single_target: bool,
+    /// Built-in scoring only consumes a device prefix and its tier continuation.
+    pub(crate) stop_at_gap: bool,
+    seen: HashMap<PromptKey<'a>, usize, RandomState>,
+    prompts: HashMap<&'a [u32], usize, RandomState>,
+    prepared: Vec<(&'a [u32], Vec<PreparedChain>)>,
 }
 
 struct PreparedChain {
     generator: BlockKeyGenerator,
     adapter: Option<(String, String)>,
     keys: Vec<SequenceHash>,
-    domains: Vec<(Arc<KvBlockIndexer>, HashMap<u32, PageEvidence>)>,
+    domains: Vec<(Arc<KvBlockIndexer>, GroupPages)>,
 }
 
 impl<'a> RequestHashCache<'a> {
+    pub(crate) fn for_single_target() -> Self {
+        Self {
+            single_target: true,
+            ..Self::default()
+        }
+    }
+
+    fn prompt_slot(&mut self, tokens: &'a [u32]) -> usize {
+        let Some(&(first, _)) = self.prepared.first() else {
+            self.prepared.push((tokens, Vec::new()));
+            return 0;
+        };
+        if std::ptr::eq(first, tokens) {
+            return 0;
+        }
+        // Populate the content map only when this request has distinct prompts.
+        *self.seen.entry(PromptKey(tokens)).or_insert_with(|| {
+            if self.prompts.is_empty() {
+                if first == tokens {
+                    return 0;
+                }
+                self.prompts.insert(first, 0);
+            }
+            *self.prompts.entry(tokens).or_insert_with(|| {
+                let slot = self.prepared.len();
+                self.prepared.push((tokens, Vec::new()));
+                slot
+            })
+        })
+    }
+
     pub(crate) fn canonical_prompt(&mut self, tokens: &'a [u32]) -> &'a [u32] {
-        self.seen
-            .entry(PromptKey(tokens))
-            .or_insert_with(|| self.prompts.entry(tokens).or_insert(tokens))
+        let slot = self.prompt_slot(tokens);
+        self.prepared[slot].0
     }
 
     pub(in crate::kv_index) fn pages(
@@ -143,10 +180,10 @@ impl<'a> RequestHashCache<'a> {
         generator: &BlockKeyGenerator,
         adapter: Option<(&str, &str)>,
         domain_index: &Arc<KvBlockIndexer>,
-        groups: impl Iterator<Item = u32>,
-    ) -> (&[SequenceHash], &HashMap<u32, PageEvidence>) {
-        let tokens = self.canonical_prompt(tokens);
-        let chains = self.chains.entry(PromptKey(tokens)).or_default();
+        groups: impl Iterator<Item = impl Into<PageQuery>>,
+    ) -> (&[SequenceHash], &GroupPages) {
+        let slot = self.prompt_slot(tokens);
+        let (tokens, chains) = &mut self.prepared[slot];
         let index = chains.iter().position(|chain| {
             chain.generator == *generator
                 && chain
@@ -174,21 +211,27 @@ impl<'a> RequestHashCache<'a> {
             .iter()
             .position(|(candidate, _)| Arc::ptr_eq(candidate, domain_index));
         let domain = domain.unwrap_or_else(|| {
-            chain.domains.push((domain_index.clone(), HashMap::new()));
+            chain
+                .domains
+                .push((domain_index.clone(), GroupPages::default()));
             chain.domains.len() - 1
         });
         let evidence = &mut chain.domains[domain].1;
-        let missing: Vec<_> = groups
+        let mut missing = groups
+            .map(Into::into)
             .filter(|group| !evidence.contains_key(group))
-            .collect();
-        // A single source has no postings to share with another candidate.
-        // The source snapshot reads all of its groups at one revision.
-        if !missing.is_empty() && domain_index.has_multiple_sources() {
-            evidence.extend(domain_index.collect_hash_groups(
-                missing.into_iter(),
+            .peekable();
+        if missing.peek().is_some() && !self.single_target && domain_index.has_multiple_sources() {
+            let added = domain_index.collect_hash_groups(
+                missing,
                 adapter.map(|(name, _)| name),
                 &chain.keys,
-            ));
+            );
+            if evidence.is_empty() {
+                *evidence = added;
+            } else {
+                evidence.extend(added);
+            }
         }
         (&chain.keys, evidence)
     }
@@ -208,28 +251,58 @@ mod tests {
         let mut cache = RequestHashCache::default();
         let generator = BlockKeyGenerator::new(16, 42);
         let first = cache
-            .pages(&tokens, &generator, None, &full_domain, [0].into_iter())
+            .pages(&tokens, &generator, None, &full_domain, [0u32].into_iter())
             .0
             .as_ptr();
         let second = cache
-            .pages(&copy, &generator, None, &hybrid_domain, [0, 1].into_iter())
+            .pages(
+                &copy,
+                &generator,
+                None,
+                &hybrid_domain,
+                [0u32, 1].into_iter(),
+            )
             .0
             .as_ptr();
         assert_eq!(first, second);
         let other = BlockKeyGenerator::new(16, 43);
-        cache.pages(&tokens, &other, None, &hybrid_domain, [0, 1].into_iter());
-        assert_eq!(cache.chains.values().map(Vec::len).sum::<usize>(), 2);
-        let lookahead = generator.clone().with_lookahead(1);
         assert_ne!(
             cache
-                .pages(&tokens, &lookahead, None, &hybrid_domain, [0].into_iter())
+                .pages(&tokens, &other, None, &hybrid_domain, [0u32, 1].into_iter())
                 .0
                 .as_ptr(),
             first
         );
-        assert_eq!(cache.chains.values().map(Vec::len).sum::<usize>(), 3);
+        let lookahead = generator.clone().with_lookahead(1);
+        assert_ne!(
+            cache
+                .pages(
+                    &tokens,
+                    &lookahead,
+                    None,
+                    &hybrid_domain,
+                    [0u32].into_iter()
+                )
+                .0
+                .as_ptr(),
+            first
+        );
         let mut changed = tokens.clone();
         changed[32] += 1;
+        let changed_copy = changed.clone();
+        assert!(std::ptr::eq(
+            cache.canonical_prompt(&changed),
+            changed.as_slice()
+        ));
+        assert!(std::ptr::eq(
+            cache.canonical_prompt(&changed_copy),
+            changed.as_slice()
+        ));
+        assert!(std::ptr::eq(
+            cache.canonical_prompt(&copy),
+            tokens.as_slice()
+        ));
+        assert_eq!(cache.canonical_prompt(&tokens[..64]).len(), 64);
         let original = generator.generate_block_keys(&tokens);
         let sibling = generator.generate_block_keys(&changed);
         assert_eq!(original[..2], sibling[..2]);

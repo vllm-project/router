@@ -84,7 +84,13 @@ impl BlockKeyGenerator {
             return None;
         }
         let block = token_ids.get(..self.block_size)?;
-        Some(hash_block(&self.none_hash, block, None, &[]))
+        Some(hash_block(
+            &mut Vec::new(),
+            &self.none_hash,
+            block,
+            None,
+            &[],
+        ))
     }
 
     /// The same chain for one LoRA adapter. vLLM hashes each adapter block with
@@ -107,6 +113,7 @@ impl BlockKeyGenerator {
         adapter: Option<(&str, &str)>,
     ) -> Vec<SequenceHash> {
         let mut parent = parent;
+        let mut encoded = Vec::new();
         let hashable_tokens = token_ids.len().saturating_sub(self.lookahead_tokens);
         token_ids[..hashable_tokens]
             .chunks_exact(self.block_size)
@@ -114,7 +121,7 @@ impl BlockKeyGenerator {
             .map(|(index, tokens)| {
                 let end = (index + 1) * self.block_size;
                 let lookahead = &token_ids[end..end + self.lookahead_tokens];
-                parent = hash_block(&parent, tokens, adapter, lookahead);
+                parent = hash_block(&mut encoded, &parent, tokens, adapter, lookahead);
                 parent
             })
             .collect()
@@ -122,41 +129,43 @@ impl BlockKeyGenerator {
 }
 
 fn hash_block(
+    encoded: &mut Vec<u8>,
     parent: &SequenceHash,
     token_ids: &[u32],
     adapter: Option<(&str, &str)>,
     lookahead: &[u32],
 ) -> SequenceHash {
-    let mut encoded = Vec::with_capacity(40 + token_ids.len() * 3);
+    encoded.clear();
+    encoded.reserve(40 + token_ids.len() * 3);
 
     // Canonical CBOR for [parent_hash, token_ids, extra_keys].
-    encode_major(&mut encoded, 4, 3);
-    encode_major(&mut encoded, 2, parent.len() as u64);
+    encode_major(encoded, 4, 3);
+    encode_major(encoded, 2, parent.len() as u64);
     encoded.extend_from_slice(parent);
-    encode_major(&mut encoded, 4, token_ids.len() as u64);
+    encode_major(encoded, 4, token_ids.len() as u64);
     for &token_id in token_ids {
-        encode_major(&mut encoded, 0, u64::from(token_id));
+        encode_major(encoded, 0, u64::from(token_id));
     }
     if !lookahead.is_empty() {
         // vLLM wraps the original extra keys and appends the lookahead IDs.
-        encode_major(&mut encoded, 4, 1 + lookahead.len() as u64);
+        encode_major(encoded, 4, 1 + lookahead.len() as u64);
     }
     match adapter {
         None => encoded.push(0xf6),
         Some((name, path)) => {
             // [["lora", name, path]]: one extra key group, one tagged tuple.
-            encode_major(&mut encoded, 4, 1);
-            encode_major(&mut encoded, 4, 3);
-            encode_text(&mut encoded, "lora");
-            encode_text(&mut encoded, name);
-            encode_text(&mut encoded, path);
+            encode_major(encoded, 4, 1);
+            encode_major(encoded, 4, 3);
+            encode_text(encoded, "lora");
+            encode_text(encoded, name);
+            encode_text(encoded, path);
         }
     }
     for &token_id in lookahead {
-        encode_major(&mut encoded, 0, u64::from(token_id));
+        encode_major(encoded, 0, u64::from(token_id));
     }
 
-    digest(&encoded)
+    digest(encoded)
 }
 
 fn encode_text(output: &mut Vec<u8>, value: &str) {

@@ -129,6 +129,10 @@ fn full_and_checkpoint_layouts_share_hash_pages_but_preserve_tier_scoring() {
     .with_shared_index(shared);
     full.begin_empty(0);
     hybrid.begin_empty(0);
+    let mut initially_empty = crate::kv_index::RequestHashCache::default();
+    assert!(hybrid
+        .matches_with_cache(&tokens, 16, None, 0, &mut initially_empty)
+        .is_empty());
     let gpu = gpu_store(0, "full_attention", 16, &tokens[..32], &hashes[..2]);
     let mut host = gpu_store(0, "full_attention", 16, &tokens[32..64], &hashes[2..]);
     host.medium = Some("CPU".into());
@@ -157,47 +161,83 @@ fn full_and_checkpoint_layouts_share_hash_pages_but_preserve_tier_scoring() {
             ),
         )
         .unwrap();
-    let full_hits = full.matches(&tokens, 16, None, 0);
-    assert_eq!(full_hits.len(), 2);
-    assert!(full_hits
-        .iter()
-        .any(|h| h.tier == StorageTier::Device && h.segments == [(0, 2)]));
-    assert!(full_hits
-        .iter()
-        .any(|h| h.tier == StorageTier::HostPinned && h.segments == [(2, 4)]));
-    let hybrid_hits = hybrid.matches(&tokens, 16, None, 0);
+    for (score_unit, middle, end) in [(16, 2, 4), (32, 1, 2)] {
+        let full_hits = full.matches(&tokens, score_unit, None, 0);
+        assert_eq!(full_hits.len(), 2);
+        assert!(full_hits
+            .iter()
+            .any(|h| h.tier == StorageTier::Device && h.segments == [(0, middle)]));
+        assert!(full_hits
+            .iter()
+            .any(|h| h.tier == StorageTier::HostPinned && h.segments == [(middle, end)]));
+    }
+    assert!(full.matches(&tokens, 64, None, 0).is_empty());
+    let hybrid_hits = hybrid.matches_with_cache(&tokens, 16, None, 0, &mut initially_empty);
     assert_eq!(hybrid_hits.len(), 1);
     assert_eq!(hybrid_hits[0].tier, StorageTier::HostPinned);
     assert_eq!(hybrid_hits[0].segments, [(0, 4)]);
 
+    // P/D stages can share prompt hashes while scoring different numbers of targets.
+    let mut cache = crate::kv_index::RequestHashCache::for_single_target();
+    let one = hybrid.matches_with_cache(&tokens, 16, None, 0, &mut cache);
+    assert_eq!(one[0].tier, StorageTier::HostPinned);
+    assert_eq!(one[0].segments, [(0, 4)]);
+    cache.single_target = false;
     // Keep the request's original shared evidence across a committed deletion.
     // The next lookup must refresh the edited source while preserving the
     // other source's evidence, even when both use the same hash chain.
-    let mut cache = crate::kv_index::RequestHashCache::default();
     assert_eq!(
         full.matches_with_cache(&tokens, 16, None, 0, &mut cache)
             .len(),
         2
     );
-    full.apply_batch(
-        1,
-        &event_batch(
-            1.0,
-            vec![gpu_remove(
-                Some(0),
-                vec![ExternalBlockHash::Bytes(hashes[0].to_vec())],
-            )],
-        ),
-    )
-    .unwrap();
+    let evict_first = event_batch(
+        1.0,
+        vec![gpu_remove(
+            Some(0),
+            vec![ExternalBlockHash::Bytes(hashes[0].to_vec())],
+        )],
+    );
+    full.apply_batch(1, &evict_first).unwrap();
+    cache.single_target = true;
     let hits = full.matches_with_cache(&tokens, 16, None, 0, &mut cache);
     assert!(hits
         .iter()
         .any(|h| h.tier == StorageTier::Device && h.segments == [(1, 2)]));
+    let coarse_hits = full.matches_with_cache(&tokens, 32, None, 0, &mut cache);
+    assert_eq!(coarse_hits.len(), 1);
+    assert_eq!(coarse_hits[0].tier, StorageTier::HostPinned);
+    assert_eq!(coarse_hits[0].segments, [(1, 2)]);
     assert_eq!(
         hybrid.matches_with_cache(&tokens, 16, None, 0, &mut cache)[0].segments,
         [(0, 4)]
     );
+    hybrid.apply_batch(1, &evict_first).unwrap();
+    for single_target in [true, false] {
+        let mut shared = crate::kv_index::RequestHashCache::default();
+        shared.single_target = single_target;
+        assert!(hybrid
+            .matches_with_cache(&tokens, 16, None, 0, &mut shared)
+            .is_empty());
+        let hits = full.matches_with_cache(&tokens, 16, None, 0, &mut shared);
+        assert!(hits
+            .iter()
+            .any(|hit| hit.tier == StorageTier::Device && hit.segments == [(1, 2)]));
+        assert!(hits
+            .iter()
+            .any(|hit| hit.tier == StorageTier::HostPinned && hit.segments == [(2, 4)]));
+    }
+
+    let mut scored = crate::kv_index::RequestHashCache::default();
+    scored.stop_at_gap = true;
+    assert!(full
+        .matches_with_cache(&tokens, 16, None, 0, &mut scored)
+        .is_empty());
+    scored.stop_at_gap = false;
+    assert!(full
+        .matches_with_cache(&tokens, 16, None, 0, &mut scored)
+        .iter()
+        .any(|hit| hit.tier == StorageTier::HostPinned && hit.segments == [(2, 4)]));
     full.begin_replay(0);
     assert!(full
         .matches_with_cache(&tokens, 16, None, 0, &mut cache)
@@ -602,8 +642,9 @@ fn snapshot_calculation_does_not_block_same_source_writes_or_survive_reset() {
         first.apply_batch(0, &qwen_batch()).unwrap();
         let tokens = prompt();
         let mut cache = crate::kv_index::RequestHashCache::default();
-        let (_claims, version, generation) =
-            first.page_snapshot(None, &tokens, &mut cache).unwrap();
+        let (_claims, version, generation) = first
+            .page_snapshot(None, &tokens, false, &mut cache)
+            .unwrap();
         assert!(first.snapshot_is_current(&version, generation));
         let writer = first.clone();
         let (sent, received) = mpsc::channel();
@@ -927,6 +968,76 @@ fn adapter_pages_are_indexed_under_their_own_chain() {
         index.reusable_tokens_in(Some("lora1"), &prompt(), usize::MAX),
         0
     );
+}
+
+#[test]
+fn hybrid_first_page_accepts_either_adapter_hash_endpoint() {
+    use crate::kv_index::StorageTier;
+    use crate::policies::TieredMatchProvider;
+
+    let groups = vec![
+        CacheGroup {
+            group_idx: 0,
+            block_size: 32,
+            kind: GroupRule::FullAttention,
+        },
+        CacheGroup {
+            group_idx: 1,
+            block_size: 32,
+            kind: GroupRule::Checkpoint,
+        },
+    ];
+    let index = SourceBinding::new(target(), groups, 16, 0, 16)
+        .unwrap()
+        .with_partial_hash_hits(true)
+        .with_adapters(vec![("a".into(), "/a".into()), ("b".into(), "/b".into())]);
+    index.begin_empty(0);
+    let tokens: Vec<_> = (0..65).collect();
+    let hashes = BlockKeyGenerator::new(16, 0).generate_block_keys_for_adapter(&tokens, "a", "/a");
+    let stores = |start: usize, end: usize, medium: &str| {
+        [(0, "full_attention"), (1, "mamba")].map(|(group, kind)| {
+            let mut store = gpu_store(
+                group,
+                kind,
+                (end - start) as u32,
+                &tokens[start..end],
+                &hashes[end / 16 - 1..end / 16],
+            );
+            store.lora_name = Some("a".into());
+            store.medium = Some(medium.into());
+            KVEvent::BlockStored(store)
+        })
+    };
+    index
+        .apply_batch(
+            0,
+            &event_batch(
+                1.0,
+                stores(0, 32, "GPU")
+                    .into_iter()
+                    .chain(stores(32, 48, "GPU"))
+                    .collect(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        index.matches(&tokens, 16, Some("a"), 0)[0].segments,
+        [(0, 3)]
+    );
+    for other in [None, Some("b")] {
+        assert!(index.matches(&tokens, 16, other, 0).is_empty());
+    }
+    let evict = gpu_remove(Some(0), vec![ExternalBlockHash::Bytes(hashes[1].to_vec())]);
+    index
+        .apply_batch(1, &event_batch(2.0, vec![evict]))
+        .unwrap();
+    assert!(index.matches(&tokens, 16, Some("a"), 0).is_empty());
+    index
+        .apply_batch(2, &event_batch(3.0, stores(0, 16, "CPU").to_vec()))
+        .unwrap();
+    let hits = index.matches(&tokens, 16, Some("a"), 0);
+    assert_eq!(hits[0].segments, [(0, 1)]);
+    assert_eq!(hits[0].tier, StorageTier::HostPinned);
 }
 
 /// A page for an adapter this layout does not declare is skipped: it can

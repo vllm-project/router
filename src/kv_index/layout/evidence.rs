@@ -2,10 +2,8 @@
 
 use super::{align_down, restore::restore_boundary, CacheGroup, GroupEvidence, GroupRule};
 use crate::kv_index::storage::PageTiers;
-use crate::kv_index::types::{push_block_segment, TierMatch};
+use crate::kv_index::types::{TierBits, TierMatch};
 use crate::kv_index::{Locality, RoutableTarget, StorageTier};
-
-use crate::kv_index::types::TierBits;
 
 /// Preserve the full-attention policy's per-tier segments, including gaps and
 /// a transfer continuation. Only published entries within the request cap count.
@@ -24,24 +22,31 @@ pub(in crate::kv_index) fn full_attention_matches(
     ];
     let aligned = score_unit == group.block_size && hash_unit == score_unit as usize;
     let max_pages = cap / hash_unit as u64;
-    let (prefix_len, prefix, tail) = if aligned {
-        (pages.prefix_len, pages.prefix, pages.tail)
-    } else {
-        (0, TierBits::default(), pages.expanded())
-    };
     let mut segments = [Vec::new(), Vec::new(), Vec::new()];
-    let Ok(prefix_end) = u32::try_from(max_pages.min(prefix_len as u64)) else {
-        return Vec::new();
-    };
-    if prefix_end != 0 {
-        for (tier, hits) in TIERS.into_iter().zip(&mut segments) {
-            if prefix.contains(tier) {
-                hits.push((0, prefix_end));
+    // Join adjacent physical coverage at each tier before rounding to scoring blocks.
+    let mut covered = [(0_u64, 0_u64); 3];
+    let prefix_pages = max_pages.min(pages.prefix_len as u64);
+    if prefix_pages != 0 && pages.prefix.0 != 0 {
+        let prefix_tokens = prefix_pages * hash_unit as u64;
+        let blocks = if aligned {
+            prefix_pages
+        } else {
+            prefix_tokens / u64::from(score_unit)
+        };
+        let Ok(prefix_end) = u32::try_from(blocks) else {
+            return Vec::new();
+        };
+        for ((tier, hits), run) in TIERS.into_iter().zip(&mut segments).zip(&mut covered) {
+            if pages.prefix.contains(tier) {
+                run.1 = prefix_tokens;
+                if prefix_end != 0 {
+                    hits.push((0, prefix_end));
+                }
             }
         }
     }
-    for (position, bits) in tail.iter().enumerate() {
-        let position = (prefix_len + position) as u64;
+    for (position, bits) in pages.tail.iter().enumerate() {
+        let position = (pages.prefix_len + position) as u64;
         if position >= max_pages {
             break;
         }
@@ -53,21 +58,31 @@ pub(in crate::kv_index) fn full_attention_matches(
         } else {
             let end = (position + 1) * hash_unit as u64;
             let start = (end - 1) / u64::from(group.block_size) * u64::from(group.block_size);
-            (
-                start.div_ceil(u64::from(score_unit)),
-                end / u64::from(score_unit),
-            )
+            (start, end)
         };
-        let (Ok(start), Ok(end)) = (u32::try_from(start), u32::try_from(end)) else {
-            return Vec::new();
-        };
-        if start < end {
-            for (tier, hits) in TIERS.into_iter().zip(&mut segments) {
-                if bits.contains(tier) {
-                    match hits.last_mut() {
-                        Some((_, previous_end)) if start <= *previous_end => *previous_end = end,
-                        _ => hits.push((start, end)),
-                    }
+        for ((tier, hits), run) in TIERS.into_iter().zip(&mut segments).zip(&mut covered) {
+            if !bits.contains(tier) {
+                continue;
+            }
+            let (start, end) = if aligned {
+                (start, end)
+            } else {
+                if start > run.1 {
+                    run.0 = start;
+                }
+                run.1 = end;
+                (
+                    run.0.div_ceil(u64::from(score_unit)),
+                    end / u64::from(score_unit),
+                )
+            };
+            let (Ok(start), Ok(end)) = (u32::try_from(start), u32::try_from(end)) else {
+                return Vec::new();
+            };
+            if start < end {
+                match hits.last_mut() {
+                    Some((_, previous_end)) if start <= *previous_end => *previous_end = end,
+                    _ => hits.push((start, end)),
                 }
             }
         }
@@ -86,39 +101,52 @@ pub(in crate::kv_index) fn full_attention_matches(
 }
 
 impl GroupEvidence {
-    fn from_pages(group: CacheGroup, pages: &[TierBits], hash_unit: usize) -> Self {
+    fn from_pages(group: CacheGroup, pages: &PageTiers<'_>, hash_unit: usize) -> Self {
         debug_assert!(
             hash_unit > 0
                 && group.block_size as usize >= hash_unit
                 && (group.block_size as usize).is_multiple_of(hash_unit)
         );
         let stride = group.block_size as usize / hash_unit;
-        let partial_ends = if stride == 1 {
-            Vec::new()
-        } else {
-            pages
-                .iter()
-                .enumerate()
-                .filter_map(|(i, bits)| {
-                    ((i + 1) % stride != 0
-                        && bits
-                            .best()
-                            .is_some_and(|tier| tier != StorageTier::External))
-                    .then_some((i + 1) as u64 * hash_unit as u64)
-                })
-                .collect()
-        };
-        let mut segments = Vec::new();
-        for (i, bits) in pages.iter().skip(stride - 1).step_by(stride).enumerate() {
-            let Ok(end) = u32::try_from(i + 1) else {
-                break;
-            };
-            if bits
-                .best()
+        let local = |bits: TierBits| {
+            bits.best()
                 .is_some_and(|tier| tier != StorageTier::External)
-            {
-                push_block_segment(&mut segments, end - 1, end);
+        };
+        let shared = local(pages.prefix);
+        let mut segments = Vec::new();
+        let prefix_blocks = u32::try_from(pages.prefix_len / stride).unwrap_or(u32::MAX);
+        let mut run_start = (shared && prefix_blocks != 0).then_some(0);
+        let partial_ends =
+            if stride == 1 {
+                Vec::new()
+            } else {
+                (1..=if shared { pages.prefix_len } else { 0 })
+                    .chain(
+                        pages.tail.iter().enumerate().filter_map(|(i, bits)| {
+                            local(*bits).then_some(pages.prefix_len + i + 1)
+                        }),
+                    )
+                    .filter(|end| end % stride != 0)
+                    .map(|end| end as u64 * hash_unit as u64)
+                    .collect()
+            };
+        // The shared run may end inside a physical block. Align the first
+        // tail endpoint to the group's stride in the original hash chain.
+        let offset = stride - 1 - pages.prefix_len % stride;
+        let mut end = prefix_blocks;
+        for &bits in pages.tail.iter().skip(offset).step_by(stride) {
+            if end == u32::MAX {
+                break;
             }
+            if local(bits) {
+                run_start.get_or_insert(end);
+            } else if let Some(start) = run_start.take() {
+                segments.push((start, end));
+            }
+            end += 1;
+        }
+        if let Some(start) = run_start {
+            segments.push((start, end));
         }
         Self {
             group,
@@ -138,7 +166,7 @@ pub(in crate::kv_index) struct TailDrop {
 /// Return the credited tokens and slowest required tier for a source snapshot.
 pub(in crate::kv_index) fn credit_from_pages(
     groups: &[CacheGroup],
-    claims: &[impl AsRef<[TierBits]>],
+    claims: &[PageTiers<'_>],
     hash_block_size: usize,
     max_reusable_tokens: u64,
     replay_tokens: u32,
@@ -147,7 +175,7 @@ pub(in crate::kv_index) fn credit_from_pages(
     let evidence: Vec<_> = groups
         .iter()
         .zip(claims)
-        .map(|(&group, claims)| GroupEvidence::from_pages(group, claims.as_ref(), hash_block_size))
+        .map(|(&group, claims)| GroupEvidence::from_pages(group, claims, hash_block_size))
         .collect();
     let fine_unit = if tail_drop.fine_grained {
         hash_block_size as u64
@@ -198,11 +226,7 @@ pub(in crate::kv_index) fn credit_from_pages(
         };
         if let Some(end) = partial_end {
             let index = (end as usize / hash_block_size).saturating_sub(1);
-            if let Some(tier) = claims[group_pos]
-                .as_ref()
-                .get(index)
-                .and_then(|bits| bits.best())
-            {
+            if let Some(tier) = claims[group_pos].get(index).and_then(|bits| bits.best()) {
                 if tier.rank() > worst.rank() {
                     worst = tier;
                 }
@@ -214,11 +238,8 @@ pub(in crate::kv_index) fn credit_from_pages(
             }
         }
         for position in (floor..blocks.max(1)).rev() {
-            let Some(tier) = claims[group_pos]
-                .as_ref()
-                .get(stride * (position + 1) - 1)
-                .map(|bits| bits.best())
-            else {
+            let index = stride * (position + 1) - 1;
+            let Some(tier) = claims[group_pos].get(index).map(|bits| bits.best()) else {
                 break;
             };
             if let Some(tier) = tier {
@@ -228,6 +249,9 @@ pub(in crate::kv_index) fn credit_from_pages(
                 if matches!(group.kind, GroupRule::Checkpoint) {
                     break;
                 }
+            }
+            if index < claims[group_pos].prefix_len {
+                break;
             }
         }
     }

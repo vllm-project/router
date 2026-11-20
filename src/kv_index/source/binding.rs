@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use smallvec::{smallvec, SmallVec};
+use smallvec::SmallVec;
 
 /// All ranks of a worker share `active`; owners of one canonical publisher and
 /// exact topic share `strict_rank`. Neither identifies a remote engine lifetime.
@@ -35,7 +35,9 @@ use crate::kv_hash::BlockKeyGenerator;
 use crate::kv_index::layout::valid_groups;
 use crate::kv_index::layout::{CacheGroup, GroupRule, TailDrop};
 use crate::kv_index::storage::source_transaction::{StreamControl, StreamPhase, StreamState};
-use crate::kv_index::storage::{IndexBatch, PageTiers, SourceVersion};
+use crate::kv_index::storage::{
+    IndexBatch, PageEvidence, PageMatch, PageQuery, PageTiers, SourceVersion,
+};
 use crate::kv_index::SourceError;
 use crate::kv_index::{
     KvBlockIndexer, RequestHashCache, ResidencyOwner, RoutableTarget, StorageTier,
@@ -168,6 +170,20 @@ impl SourceBinding {
     ) -> R {
         self.index
             .with_stream_batch(&self.target, &self.owner, &self.control, operation)
+    }
+
+    pub(in crate::kv_index) fn with_page_mutation_batch<R>(
+        &self,
+        planned: Option<crate::kv_index::storage::PageChanges>,
+        operation: impl FnOnce(&mut StreamState, &mut IndexBatch<'_>) -> R,
+    ) -> R {
+        self.index.with_page_mutation_batch(
+            &self.target,
+            &self.owner,
+            &self.control,
+            planned,
+            operation,
+        )
     }
 
     /// Declare the layout's restore-time recomputation window
@@ -383,6 +399,7 @@ impl SourceBinding {
         &self,
         namespace: Option<&str>,
         tokens: &'a [u32],
+        stop_at_gap: bool,
         cache: &'b mut RequestHashCache<'a>,
     ) -> Option<PageSnapshot<'b>> {
         if self
@@ -403,22 +420,27 @@ impl SourceBinding {
                 None => return None,
             },
         };
-        let (prepared, evidence) = cache.pages(
-            tokens,
-            &self.keys,
-            adapter,
+        let queries = self.groups.iter().map(|group| PageQuery {
+            group: group.group_idx,
+            // One hash must cover the entire physical page. A smaller hash may
+            // be absent even when a later endpoint proves the same page.
+            stop_at_gap: stop_at_gap
+                && group.kind == GroupRule::FullAttention
+                && group.block_size as usize == self.keys.block_size(),
+        });
+        let (prepared, evidence) =
+            cache.pages(tokens, &self.keys, adapter, &self.index, queries.clone());
+        if let Some(matched) = PageEvidence::unchanged_groups(
             &self.index,
-            self.groups.iter().map(|group| group.group_idx),
-        );
-        if let [group] = self.groups.as_slice() {
-            if let Some((claims, version)) = evidence
-                .get(&group.group_idx)
-                .and_then(|pages| pages.unchanged(&self.target, &self.owner))
-            {
-                // A published generation proves stream visibility. The caller
-                // rechecks it and the source generation before returning hits.
-                return Some((smallvec![claims], version, generation));
-            }
+            &self.target,
+            &self.owner,
+            prepared,
+            queries.clone().map(|query| evidence.get(&query)),
+        ) {
+            return match matched {
+                PageMatch::Miss => None,
+                PageMatch::Hit(claims, version) => Some((claims, version, generation)),
+            };
         }
         // Borrow unchanged evidence. Refresh all required groups together
         // when the source changed since collection.
@@ -428,13 +450,31 @@ impl SourceBinding {
                 if state.next_seq.is_none() || !state.visible() {
                     return None;
                 }
-                let claims = view.hash_page_runs(
-                    &self.owner,
-                    namespace,
-                    prepared,
-                    evidence,
-                    self.groups.iter().map(|g| g.group_idx),
-                );
+                // A hybrid restore needs a reachable endpoint in the first physical
+                // page of every dense group. Later hashes still count for plain full
+                // attention, which reports segments beyond gaps.
+                if self.groups.len() > 1 {
+                    if let Some(dense) = self.groups.iter().find(|group| {
+                        matches!(
+                            group.kind,
+                            GroupRule::FullAttention | GroupRule::CompressedFullAttention { .. }
+                        )
+                    }) {
+                        let width = dense.block_size as usize / self.keys.block_size();
+                        if prepared.len() > width
+                            && !view.contains_any(
+                                &self.owner,
+                                dense.group_idx,
+                                namespace,
+                                &prepared[..width],
+                            )
+                        {
+                            return None;
+                        }
+                    }
+                }
+                let claims =
+                    view.hash_page_runs(&self.owner, namespace, prepared, evidence, queries);
                 Some((claims, view.source_version(), state.reset_generation))
             })
             .flatten()
@@ -451,11 +491,16 @@ impl SourceBinding {
         max_reusable_tokens: usize,
         cache: &mut RequestHashCache<'a>,
     ) -> (u64, Option<StorageTier>) {
-        let snapshot = self.page_snapshot(namespace, tokens, cache);
+        let snapshot = self.page_snapshot(namespace, tokens, true, cache);
         let Some((claims, version, reset_generation)) = snapshot else {
             return (0, None);
         };
-        let claims: Vec<_> = claims.into_iter().map(PageTiers::expanded).collect();
+        if claims
+            .iter()
+            .all(|pages| pages.prefix_len == 0 && pages.tail.is_empty())
+        {
+            return (0, None);
+        }
         let (credited, tier) = crate::kv_index::layout::credit_from_pages(
             &self.groups,
             &claims,
@@ -496,7 +541,7 @@ impl SourceBinding {
             namespace,
             tokens,
             max_reusable_tokens,
-            &mut RequestHashCache::default(),
+            &mut RequestHashCache::for_single_target(),
         )
         .0
     }

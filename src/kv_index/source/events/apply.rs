@@ -2,7 +2,7 @@
 
 use crate::kv_hash::SequenceHash;
 use crate::kv_index::storage::source_transaction::StreamState as State;
-use crate::kv_index::storage::{IndexBatch, PageWriteError};
+use crate::kv_index::storage::{IndexBatch, PageChanges, PageWriteError};
 use crate::kv_index::wire::BlockStored;
 use crate::kv_index::{
     KVEvent, KVEventBatch, ResidencyOwner, SourceBinding, SourceError, StorageTier,
@@ -29,6 +29,16 @@ pub(super) enum PreparedEvent<'a> {
 }
 
 impl PreparedEvent<'_> {
+    pub(super) fn page_changes(events: &[Self], max_entries: usize) -> Option<PageChanges> {
+        PageChanges::from_batches(
+            events.iter().map(|event| match event {
+                Self::Store { hashes, .. } | Self::Remove { hashes, .. } => Some(hashes.as_slice()),
+                Self::Clear => None,
+            }),
+            max_entries,
+        )
+    }
+
     fn apply(
         self,
         tx: &mut IndexBatch<'_>,
@@ -92,8 +102,14 @@ impl SourceBinding {
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn apply_batch(&self, seq: u64, batch: &KVEventBatch) -> Result<(), SourceError> {
         let prepared = self.prepare_batch(batch);
+        let planned = prepared
+            .as_deref()
+            .ok()
+            .and_then(|events| PreparedEvent::page_changes(events, self.max_entries));
         self.with_active_binding(|| {
-            self.with_stream_batch(|state, tx| self.apply_prepared(state, tx, seq, batch, prepared))
+            self.with_page_mutation_batch(planned, |state, tx| {
+                self.apply_prepared(state, tx, seq, batch, prepared)
+            })
         })
         .unwrap_or(Err(SourceError::Untrusted))
     }

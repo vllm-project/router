@@ -15,6 +15,16 @@ fn target(name: &str, rank: u32) -> RoutableTarget {
     }
 }
 
+fn page_view(group: &[TierBits]) -> crate::kv_index::storage::PageTiers<'_> {
+    let prefix = group.first().copied().unwrap_or_default();
+    let prefix_len = group.iter().take_while(|&&bits| bits == prefix).count();
+    crate::kv_index::storage::PageTiers {
+        prefix_len,
+        prefix,
+        tail: (&group[prefix_len..]).into(),
+    }
+}
+
 // The index tests cover path/hash equivalence; restoration only needs page facts.
 #[test]
 fn restore_coverage_unites_local_tiers_and_excludes_external_pages() {
@@ -42,7 +52,7 @@ fn restore_coverage_unites_local_tiers_and_excludes_external_pages() {
         assert_eq!(
             credit_from_pages(
                 &[full],
-                &[vec![TierBits(mask)]],
+                &[page_view(&[TierBits(mask)])],
                 16,
                 16,
                 0,
@@ -68,6 +78,25 @@ fn restore_coverage_unites_local_tiers_and_excludes_external_pages() {
             expected
         );
     }
+    // Both runs end inside a physical block. The partial checkpoint after
+    // the gap determines the restore boundary and tier before replay.
+    let checkpoint = CacheGroup {
+        group_idx: 1,
+        kind: GroupRule::Checkpoint,
+        ..partial
+    };
+    let dense = vec![
+        Some(Device),
+        Some(Device),
+        Some(Device),
+        Some(HostPinned),
+        Some(Device),
+    ];
+    let sparse = vec![None, None, None, Some(HostPinned), Some(HostPinned)];
+    assert_eq!(
+        credit_from_groups(&[partial, checkpoint], &[dense, sparse], 16, 80, 16),
+        (64, Some(HostPinned))
+    );
 }
 
 fn credit_from_groups(
@@ -86,7 +115,8 @@ fn credit_from_groups(
                 .collect::<Vec<_>>()
         })
         .collect();
-    credit_from_pages(groups, &pages, hash_unit, cap, replay, TailDrop::default())
+    let views: Vec<_> = pages.iter().map(|pages| page_view(pages)).collect();
+    credit_from_pages(groups, &views, hash_unit, cap, replay, TailDrop::default())
 }
 
 #[test]
@@ -195,9 +225,10 @@ fn mtp_tail_proof_restores_the_mamba_checkpoint_and_prices_the_dense_page() {
         claims[group][end / 16 - 1] = TierBits(TierBits::bit(tier));
     }
     let credit = |claims: &[Vec<TierBits>], cap| {
+        let views: Vec<_> = claims.iter().map(|pages| page_view(pages)).collect();
         credit_from_pages(
             &groups,
-            claims,
+            &views,
             16,
             cap,
             0,
@@ -470,35 +501,6 @@ fn a_sliding_run_below_the_boundary_keeps_the_credit() {
 }
 
 #[test]
-fn incomplete_or_invalid_layout_never_grants_credit() {
-    let hits = [(0, 4)];
-    let invalid = [group(0, 0, GroupRule::FullAttention, &hits)];
-    let duplicate = [
-        group(0, 16, GroupRule::FullAttention, &hits),
-        group(0, 16, GroupRule::Checkpoint, &hits),
-    ];
-    let empty_window = [group(
-        1,
-        16,
-        GroupRule::SlidingWindow { window_tokens: 0 },
-        &hits,
-    )];
-    let invalid_compression = [group(
-        2,
-        16,
-        GroupRule::CompressedFullAttention {
-            tokens_per_state: 3,
-        },
-        &hits,
-    )];
-    assert_eq!(common_reusable_tokens(&[], 64), 0);
-    assert_eq!(common_reusable_tokens(&invalid, 64), 0);
-    assert_eq!(common_reusable_tokens(&duplicate, 64), 0);
-    assert_eq!(common_reusable_tokens(&empty_window, 64), 0);
-    assert_eq!(common_reusable_tokens(&invalid_compression, 64), 0);
-}
-
-#[test]
 fn group_index_removal_reduces_the_common_restore_point() {
     let tokens: Vec<_> = (0..64).collect();
     let full = full_store(&tokens, 16, None);
@@ -631,6 +633,12 @@ mod declarations {
         assert_eq!(prefill.reusable_tokens(&prompt[..530], usize::MAX), 528);
         value["ranks"][0]["groups"][0]["prefill_checkpoint_alignment"] = serde_json::Value::Null;
         assert!(bind_layout(&value, "epoch-1").is_ok());
+        // Reject malformed group sizes and identities during source admission.
+        for (field, invalid) in [("block_size", 0), ("group_idx", 0)] {
+            let mut invalid_layout = value.clone();
+            invalid_layout["ranks"][0]["groups"][1][field] = serde_json::json!(invalid);
+            assert!(bind_layout(&invalid_layout, "epoch-1").is_err());
+        }
         value["ranks"][0]["groups"][0]["prefill_checkpoint_alignment"] = serde_json::json!(7);
         assert!(bind_layout(&value, "epoch-1").is_err());
         value["ranks"][0]["groups"][0]["prefill_checkpoint_alignment"] = serde_json::json!(528);
@@ -688,7 +696,7 @@ mod declarations {
                 "prefill_checkpoint_alignment": null,
             })
         };
-        let value = serde_json::json!({"schema_version": 1, "ranks": [{
+        let mut value = serde_json::json!({"schema_version": 1, "ranks": [{
             "rank": 0, "model": "deepseek-v4", "weight_version": "default",
             "weight_identity": null, "publisher_topic": "ds4", "instance_topic": true,
             "hash_algorithm": "sha256_cbor", "root_hash":
@@ -704,6 +712,10 @@ mod declarations {
             ]
         }]});
         bind_layout(&value, "ds4").expect("deepseek v4 layout must bind");
+        value["ranks"][0]["groups"][0]["sliding_window"] = 0.into();
+        assert!(bind_layout(&value, "ds4").is_err());
+        value["ranks"][0]["groups"] = serde_json::json!([]);
+        assert!(bind_layout(&value, "ds4").is_err());
     }
 
     #[test]

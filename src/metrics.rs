@@ -615,6 +615,24 @@ pub(crate) struct AgentAwareAdmissionMetrics {
     pub(crate) observation_age: Option<Duration>,
 }
 
+/// Keep each lookup result bound to the current stage's recorder.
+#[derive(Default)]
+pub(crate) struct PlacementLookups {
+    counters: smallvec::SmallVec<[(&'static str, metrics::Counter); 2]>,
+}
+
+impl PlacementLookups {
+    pub(crate) fn record(&mut self, result: &'static str) {
+        if let Some((_, counter)) = self.counters.iter().find(|(label, _)| *label == result) {
+            counter.increment(1);
+        } else {
+            let counter = counter!("vllm_router_kv_placement_lookups_total", "result" => result);
+            counter.increment(1);
+            self.counters.push((result, counter));
+        }
+    }
+}
+
 pub struct RouterMetrics;
 
 pub struct TokenizerMetrics;

@@ -1,19 +1,21 @@
 //! Hash-addressed page facts; reverse memberships live in the source transaction.
 
 use std::borrow::{Borrow, Cow};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use dashmap::DashMap;
 use hashbrown::hash_map::EntryRef;
+use parking_lot::RwLock;
 
-use super::{records::Residency, Fast, PageWriteError, SourceLock, SourceVersion};
+use super::{
+    page_tag, records::Residency, Fast, KvBlockIndexer, PageQuery, PageWriteError, SourceVersion,
+};
 use crate::kv_hash::SequenceHash;
 use crate::kv_index::types::{ResidencyOwner, RoutableTarget, StorageTier, TierBits};
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct PageKey {
     group: u32,
     fingerprint: u32,
@@ -23,7 +25,11 @@ struct PageKey {
 impl PageKey {
     fn new(group: u32, digest: SequenceHash) -> Self {
         static HASHER: LazyLock<Fast> = LazyLock::new(Fast::default);
-        let fingerprint = HASHER.hash_one((group, digest)) as u32;
+        // Hash the fixed-width SHA-256 as two words. Both halves and the group
+        // participate in bucket selection; equality still checks the whole key.
+        let low = u128::from_le_bytes(digest[..16].try_into().unwrap());
+        let high = u128::from_le_bytes(digest[16..].try_into().unwrap());
+        let fingerprint = HASHER.hash_one((low, high, group)) as u32;
         Self {
             group,
             fingerprint,
@@ -39,10 +45,49 @@ impl Hash for PageKey {
         state.write_u32(self.fingerprint);
     }
 }
+#[derive(Clone)]
+struct PageRef(Arc<PageRecord>);
+
+struct PageRecord {
+    key: PageKey,
+    row: RwLock<PageRow>,
+}
+
+impl PageRef {
+    fn new(key: PageKey) -> Self {
+        Self(Arc::new(PageRecord {
+            key,
+            row: RwLock::default(),
+        }))
+    }
+}
+
+impl Borrow<PageKey> for PageRef {
+    fn borrow(&self) -> &PageKey {
+        &self.0.key
+    }
+}
+
+impl PartialEq for PageRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.key == other.0.key
+    }
+}
+
+impl Eq for PageRef {}
+
+impl Hash for PageRef {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.key.hash(state);
+    }
+}
+
 type HolderMap = HashMap<u64, PageHolder, Fast>;
 type Claim = (Arc<PageOwner>, TierBits);
+type PrefixClaims = HashMap<ResidencyOwner, TierBits, Fast>;
 type OwnerClaims = HashMap<ResidencyOwner, Vec<TierBits>, Fast>;
-type Pages = HashSet<Arc<PageKey>, Fast>;
+type OwnerRuns = HashMap<u64, (Arc<PageOwner>, Vec<TierBits>), Fast>;
+type Pages = hashbrown::HashMap<PageRef, (), Fast>;
 
 // A page holds one pointer to a namespace shared across the source's pages.
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -167,6 +212,26 @@ pub(super) struct OwnerPages {
 }
 
 impl OwnerPages {
+    fn pages(&self, namespace: Option<&str>) -> Option<&Pages> {
+        match namespace {
+            Some(name) => self.named.get(name),
+            None => Some(&self.base),
+        }
+    }
+
+    pub(super) fn contains_any(
+        &self,
+        group: u32,
+        namespace: Option<&str>,
+        keys: &[SequenceHash],
+    ) -> bool {
+        self.pages(namespace).is_some_and(|pages| {
+            keys.iter()
+                .rev()
+                .any(|&hash| pages.contains_key(&PageKey::new(group, hash)))
+        })
+    }
+
     pub(super) fn device_only(&self) -> bool {
         self.non_device_tiers == 0
     }
@@ -256,15 +321,15 @@ impl PageRow {
 
 #[derive(Default)]
 pub(super) struct PageTable {
-    rows: DashMap<Arc<PageKey>, PageRow, Fast>,
+    rows: scc::HashIndex<PageRef, (), Fast>,
     next_owner: AtomicU64,
 }
 
-/// An optimistic page scan and the source versions sampled before it started.
+/// An optimistic page scan and the shared commit sequence sampled before it started.
 pub(crate) struct PageEvidence {
-    pub(super) versions: Arc<HashMap<RoutableTarget, (Arc<SourceLock>, u64), Fast>>,
+    pub(super) scan: Arc<super::PageScan>,
     pub(super) prefix_len: usize,
-    pub(super) prefix: HashMap<ResidencyOwner, TierBits, Fast>,
+    pub(super) prefix: PrefixClaims,
     pub(super) holders: OwnerClaims,
 }
 
@@ -274,7 +339,22 @@ pub(crate) struct PageTiers<'a> {
     pub(crate) tail: Cow<'a, [TierBits]>,
 }
 
+pub(crate) enum PageMatch<'a> {
+    Miss,
+    Hit(smallvec::SmallVec<[PageTiers<'a>; 1]>, SourceVersion),
+}
+
 impl<'a> PageTiers<'a> {
+    pub(crate) fn get(&self, index: usize) -> Option<TierBits> {
+        if index < self.prefix_len {
+            Some(self.prefix)
+        } else {
+            self.tail.get(index - self.prefix_len).copied()
+        }
+    }
+
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn expanded(self) -> Cow<'a, [TierBits]> {
         if self.prefix_len == 0 {
             return self.tail;
@@ -287,24 +367,75 @@ impl<'a> PageTiers<'a> {
 }
 
 impl PageEvidence {
-    /// Reuse the scan for a source whose transaction did not change during it.
-    pub(crate) fn unchanged(
+    /// A scan stays coherent through one transaction if it cannot touch a requested page.
+    pub(super) fn validate_source(
         &self,
+        index: &KvBlockIndexer,
+        target: &RoutableTarget,
+        keys: &[SequenceHash],
+    ) -> Option<SourceVersion> {
+        let source = index.existing_source(target)?;
+        let generation = source.generation.load(Ordering::Acquire);
+        let now = source.revision.load(Ordering::Acquire);
+        if now > self.scan.committed || !now.is_multiple_of(2) {
+            let changes = {
+                let published = source.planned.read();
+                let (writing, changes) = published.as_ref()?;
+                let same_batch = if now.is_multiple_of(2) {
+                    now > *writing
+                } else {
+                    now == *writing
+                };
+                // The prior commit must predate the scan. Validate the plan against the
+                // same revision because writers mark the source busy before publishing it.
+                if self.scan.committed < writing - 1
+                    || !same_batch
+                    || source.revision.load(Ordering::Acquire) != now
+                {
+                    return None;
+                }
+                changes.clone()
+            };
+            let tags = self
+                .scan
+                .request_tags
+                .get_or_init(|| keys.iter().map(page_tag).collect());
+            if changes.as_slice().iter().any(|tag| tags.contains(tag)) {
+                return None;
+            }
+        }
+        Some(SourceVersion { source, generation })
+    }
+
+    pub(crate) fn unchanged_groups<'a>(
+        index: &KvBlockIndexer,
         target: &RoutableTarget,
         owner: &ResidencyOwner,
-    ) -> Option<(PageTiers<'_>, SourceVersion)> {
-        let (source, revision) = self.versions.get(target)?;
-        let generation = source.generation.load(Ordering::Acquire);
-        if !revision.is_multiple_of(2) || source.revision.load(Ordering::Acquire) != *revision {
-            return None;
+        keys: &[SequenceHash],
+        mut groups: impl Iterator<Item = Option<&'a Self>>,
+    ) -> Option<PageMatch<'a>> {
+        let first = groups.next()??;
+        let head = first.runs_for_owner(owner);
+        let missing = head.prefix_len == 0 && head.tail.is_empty();
+        // A required group has no pages for this owner. A confirmed domain
+        // scan establishes this for every non-holder without another source lookup.
+        if missing && first.scan.confirms_unchanged(index) {
+            return Some(PageMatch::Miss);
         }
-        Some((
-            self.runs_for_owner(owner),
-            SourceVersion {
-                source: source.clone(),
-                generation,
-            },
-        ))
+        let version = first.validate_source(index, target, keys)?;
+        if missing {
+            return Some(PageMatch::Miss);
+        }
+        let mut runs = smallvec::SmallVec::with_capacity(groups.size_hint().0 + 1);
+        runs.push(head);
+        for group in groups {
+            let group = group?;
+            if !Arc::ptr_eq(&first.scan, &group.scan) {
+                return None;
+            }
+            runs.push(group.runs_for_owner(owner));
+        }
+        Some(PageMatch::Hit(runs, version))
     }
 
     pub(super) fn runs_for_owner(&self, owner: &ResidencyOwner) -> PageTiers<'_> {
@@ -331,8 +462,6 @@ impl PageEvidence {
 fn observe(
     holders: &mut Holders,
     owner: &Arc<PageOwner>,
-    keys: &mut Pages,
-    page: &Arc<PageKey>,
     non_device_tiers: &mut usize,
     tier: StorageTier,
     incremental: bool,
@@ -358,7 +487,6 @@ fn observe(
             owner: owner.clone(),
             residency,
         });
-        keys.insert(page.clone());
     }
     Ok(())
 }
@@ -386,6 +514,20 @@ fn withdraw(
 }
 
 impl PageTable {
+    fn read_row<R>(&self, key: &PageKey, read: impl FnOnce(&PageRow) -> R) -> Option<R> {
+        self.rows
+            .peek_with(key, |page, ()| read(&page.0.row.read()))
+    }
+
+    fn remove_row_if(&self, key: &PageKey, withdraw: impl FnOnce(&mut PageRow) -> bool) {
+        if let Some(entry) = self.rows.get_sync(key) {
+            let empty = withdraw(&mut entry.key().0.row.write());
+            if empty {
+                entry.remove_entry();
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn store(
         &self,
@@ -412,7 +554,7 @@ impl PageTable {
                     owner: Arc::new(PageOwner {
                         id: self
                             .next_owner
-                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
                                 id.checked_add(1)
                             })
                             .map_err(|_| PageWriteError::Capacity)?,
@@ -437,26 +579,38 @@ impl PageTable {
         if hashes.len() > keys.len() {
             keys.reserve(hashes.len().min(max_entries.saturating_sub(keys.len())));
         }
-        for &hash in hashes {
-            let page = PageKey::new(group, hash);
-            if keys.len() >= max_entries && !keys.contains(&page) {
-                return Err(PageWriteError::Capacity);
-            }
-            // The entry path rechecks after a miss racing another source.
-            let mut row = self
-                .rows
-                .get_mut(&page)
-                .unwrap_or_else(|| self.rows.entry(Arc::new(page)).or_default());
-            let (key, row) = row.pair_mut();
+        let mut observe_page = |page: &PageRef| {
+            let mut row = page.0.row.write();
             observe(
                 row.holders_mut(namespace.as_ref()),
                 &pages.owner,
-                keys,
-                key,
                 &mut pages.non_device_tiers,
                 tier,
                 incremental,
-            )?;
+            )
+        };
+        for &hash in hashes {
+            let page = PageKey::new(group, hash);
+            let at_limit = keys.len() >= max_entries;
+            match keys.entry_ref(&page) {
+                EntryRef::Occupied(member) => {
+                    // This source keeps the row attached while its write gate is held.
+                    observe_page(member.key())?;
+                }
+                EntryRef::Vacant(member) => {
+                    if at_limit {
+                        return Err(PageWriteError::Capacity);
+                    }
+                    // Hold the directory entry until both the row and its membership exist.
+                    let entry = self.rows.get_sync(&page).unwrap_or_else(|| {
+                        self.rows
+                            .entry_sync(PageRef::new(page.clone()))
+                            .or_default()
+                    });
+                    observe_page(entry.key())?;
+                    member.insert_with_key(entry.key().clone(), ());
+                }
+            }
         }
         Ok(())
     }
@@ -480,31 +634,31 @@ impl PageTable {
         for &hash in hashes {
             // Remove carries the raw hash but no adapter name. Only namespaces
             // sharing this exact page need to be visited.
-            self.rows
-                .remove_if_mut(&PageKey::new(group, hash), |key, row| {
-                    for scope in row.scopes_mut() {
-                        if !withdraw(
-                            &mut scope.holders,
-                            id,
-                            &mut pages.non_device_tiers,
-                            tier,
-                            incremental,
-                        ) {
-                            continue;
-                        }
-                        if let Some(name) = &scope.namespace {
-                            if let EntryRef::Occupied(mut entry) = pages.named.entry_ref(name) {
-                                entry.get_mut().remove(key);
-                                if entry.get().is_empty() {
-                                    entry.remove();
-                                }
-                            }
-                        } else {
-                            pages.base.remove(key);
-                        }
+            let page = PageKey::new(group, hash);
+            self.remove_row_if(&page, |row| {
+                for scope in row.scopes_mut() {
+                    if !withdraw(
+                        &mut scope.holders,
+                        id,
+                        &mut pages.non_device_tiers,
+                        tier,
+                        incremental,
+                    ) {
+                        continue;
                     }
-                    row.prune()
-                });
+                    if let Some(name) = &scope.namespace {
+                        if let EntryRef::Occupied(mut entry) = pages.named.entry_ref(name) {
+                            entry.get_mut().remove(&page);
+                            if entry.get().is_empty() {
+                                entry.remove();
+                            }
+                        }
+                    } else {
+                        pages.base.remove(&page);
+                    }
+                }
+                row.prune()
+            });
         }
         if pages.base.is_empty() && pages.named.is_empty() {
             active.remove(owner);
@@ -518,57 +672,219 @@ impl PageTable {
         let id = pages.owner.id;
         for page in pages
             .base
-            .into_iter()
-            .chain(pages.named.into_values().flatten())
+            .into_keys()
+            .chain(pages.named.into_values().flat_map(Pages::into_keys))
         {
-            self.rows.remove_if_mut(page.as_ref(), |_, row| {
+            self.remove_row_if(page.borrow(), |row| {
                 for scope in row.scopes_mut() {
                     scope.holders.remove(id);
                 }
                 row.prune()
             });
         }
-        if self.rows.is_empty() {
-            self.rows.shrink_to_fit();
+    }
+
+    fn read_hint<R>(
+        &self,
+        hint: Option<&PageRef>,
+        group: u32,
+        key: SequenceHash,
+        read: impl FnOnce(&PageRow) -> R,
+    ) -> Option<R> {
+        match hint {
+            Some(page) => Some(read(&page.0.row.read())),
+            None => self.read_row(&PageKey::new(group, key), read),
         }
     }
 
-    /// Full-attention callers can emit one interval for the common run.
+    /// Compress the initial shared run and pass the first different row on to the tail.
     pub(super) fn collect_split(
         &self,
-        group: u32,
+        query: PageQuery,
         namespace: Option<&str>,
         keys: &[SequenceHash],
-    ) -> (usize, Vec<(ResidencyOwner, TierBits)>, OwnerClaims) {
-        let (skip, head) = self
-            .shared_prefix(group, namespace, keys)
+        index: &KvBlockIndexer,
+    ) -> (usize, PrefixClaims, OwnerClaims) {
+        let Some((&first, rest)) = keys.split_first() else {
+            return Default::default();
+        };
+        let group = query.group;
+        let claims = |holders: &Holders| -> Vec<Claim> {
+            holders
+                .values()
+                .map(|holder| (holder.owner.clone(), holder.residency.tiers))
+                .collect()
+        };
+        let mut run = self
+            .read_row(&PageKey::new(group, first), |row| {
+                row.holders(namespace).map(&claims)
+            })
+            .flatten()
             .unwrap_or_default();
-        let head = head
+        if rest.is_empty() || (query.stop_at_gap && run.is_empty()) {
+            return (1, Self::prefix_claims(run), OwnerClaims::default());
+        }
+        let mut hints = Vec::new();
+        if let Some((owner, _)) = run.first() {
+            Self::source_hints(index, group, namespace, owner, rest, &mut hints);
+        }
+        run.sort_unstable_by_key(|(owner, _)| owner.id);
+        let compact = run
+            .first()
+            .zip(run.last())
+            .is_some_and(|(first, last)| last.0.id - first.0.id == (run.len() - 1) as u64);
+        if !compact {
+            let first = run
+                .into_iter()
+                .map(|(owner, tier)| (owner.id, (owner, vec![tier])))
+                .collect();
+            let tail = self.collect_claims(query, namespace, rest, &hints, index, first);
+            return (0, PrefixClaims::default(), tail);
+        }
+
+        let first_id = run[0].0.id;
+        let mut first_tail = OwnerRuns::default();
+        for (offset, &key) in rest.iter().enumerate() {
+            let same = self
+                .read_hint(hints.get(offset), group, key, |row| {
+                    let Some(owners) = row.holders(namespace) else {
+                        return false;
+                    };
+                    // Same cardinality plus the exact ID and tier of each holder.
+                    let same = owners.len() == run.len()
+                        && owners.values().all(|holder| {
+                            usize::try_from(holder.owner.id.wrapping_sub(first_id))
+                                .ok()
+                                .and_then(|slot| run.get(slot))
+                                .is_some_and(|(_, tiers)| *tiers == holder.residency.tiers)
+                        });
+                    if !same {
+                        first_tail.extend(owners.values().map(|holder| {
+                            (
+                                holder.owner.id,
+                                (holder.owner.clone(), vec![holder.residency.tiers]),
+                            )
+                        }));
+                    }
+                    same
+                })
+                .unwrap_or(false);
+            if !same {
+                let tail = if query.stop_at_gap && first_tail.is_empty() {
+                    OwnerClaims::default()
+                } else {
+                    self.collect_claims(
+                        query,
+                        namespace,
+                        &rest[offset + 1..],
+                        hints.get(offset + 1..).unwrap_or_default(),
+                        index,
+                        first_tail,
+                    )
+                };
+                return (offset + 1, Self::prefix_claims(run), tail);
+            }
+        }
+        (keys.len(), Self::prefix_claims(run), OwnerClaims::default())
+    }
+
+    fn prefix_claims(claims: Vec<Claim>) -> PrefixClaims {
+        claims
             .into_iter()
             .map(|(owner, tier)| (owner.owner.clone(), tier))
-            .collect();
-        let tail = self.collect_claims(group, namespace, &keys[skip..]);
-        (skip, head, tail)
+            .collect()
+    }
+
+    // The source read gate protects the reverse set while handles are copied.
+    // Each handle's current namespace, holders and tiers are checked after releasing the gate.
+    fn source_hints(
+        index: &KvBlockIndexer,
+        group: u32,
+        namespace: Option<&str>,
+        owner: &PageOwner,
+        keys: &[SequenceHash],
+        hints: &mut Vec<PageRef>,
+    ) {
+        let Some(source) = index.existing_source(&owner.owner.target()) else {
+            return;
+        };
+        let Some(data) = source.access.try_read() else {
+            return;
+        };
+        let Some(pages) = data
+            .active_pages
+            .get(&owner.owner)
+            .and_then(|stored| stored.pages(namespace))
+        else {
+            return;
+        };
+        hints.extend(keys.iter().map_while(|&key| {
+            pages
+                .get_key_value(&PageKey::new(group, key))
+                .map(|(page, ())| page.clone())
+        }));
     }
 
     fn collect_claims(
         &self,
-        group: u32,
+        query: PageQuery,
         namespace: Option<&str>,
         keys: &[SequenceHash],
+        hint: &[PageRef],
+        index: &KvBlockIndexer,
+        mut holders: OwnerRuns,
     ) -> OwnerClaims {
-        let mut holders: HashMap<_, _, Fast> = HashMap::default();
-        for (position, &key) in keys.iter().enumerate() {
-            let Some(row) = self.rows.get(&PageKey::new(group, key)) else {
-                continue;
-            };
-            if let Some(group) = row.holders(namespace) {
-                for holder in group.values() {
-                    let (_, pages) = holders
-                        .entry(holder.owner.id)
-                        .or_insert_with(|| (holder.owner.clone(), Vec::new()));
-                    pages.resize(position, TierBits::default());
-                    pages.push(holder.residency.tiers);
+        // Nested directory reads can share the thread's epoch for this scan.
+        let _guard = scc::Guard::new();
+        let mut record = |position, row: &PageRow, need_hint: bool| {
+            let owners = row.holders(namespace).filter(|owners| !owners.is_empty())?;
+            for holder in owners.values() {
+                let (_, pages) = holders
+                    .entry(holder.owner.id)
+                    .or_insert_with(|| (holder.owner.clone(), Vec::new()));
+                pages.resize(position, TierBits::default());
+                pages.push(holder.residency.tiers);
+            }
+            Some(if need_hint {
+                owners.values().next().map(|holder| holder.owner.clone())
+            } else {
+                None
+            })
+        };
+        let mut position = 0;
+        let mut pending = hint.iter();
+        let mut hints = Vec::new();
+        'tail: while position < keys.len() {
+            let hint = pending.next();
+            let found = self
+                .read_hint(hint, query.group, keys[position], |row| {
+                    record(
+                        position + 1,
+                        row,
+                        hint.is_none() && position + 1 < keys.len(),
+                    )
+                })
+                .flatten();
+            position += 1;
+            if query.stop_at_gap && found.is_none() {
+                break;
+            }
+            if let Some(Some(owner)) = found {
+                Self::source_hints(
+                    index,
+                    query.group,
+                    namespace,
+                    &owner,
+                    &keys[position..],
+                    &mut hints,
+                );
+                for page in hints.drain(..) {
+                    if record(position + 1, &page.0.row.read(), false).is_none()
+                        && query.stop_at_gap
+                    {
+                        break 'tail;
+                    }
+                    position += 1;
                 }
             }
         }
@@ -576,56 +892,6 @@ impl PageTable {
             .into_values()
             .map(|(owner, pages)| (owner.owner.clone(), pages))
             .collect()
-    }
-
-    /// Collapse the initial shared run. Stop at the first different page so
-    /// fragmented prefixes use the ordinary one-pass collection thereafter.
-    fn shared_prefix(
-        &self,
-        group: u32,
-        namespace: Option<&str>,
-        keys: &[SequenceHash],
-    ) -> Option<(usize, Vec<Claim>)> {
-        let (head, tail) = keys.split_first()?;
-        if tail.is_empty() {
-            return None;
-        }
-        let row = self.rows.get(&PageKey::new(group, *head))?;
-        let owners = row.holders(namespace)?;
-        if owners.len() < 2 {
-            return None;
-        }
-        let mut run: Vec<_> = owners
-            .values()
-            .map(|holder| (holder.owner.clone(), holder.residency.tiers))
-            .collect();
-        drop(row);
-        run.sort_unstable_by_key(|(owner, _)| owner.id);
-        let first_id = run.first()?.0.id;
-        if run.last()?.0.id - first_id != (run.len() - 1) as u64 {
-            return None;
-        }
-        // Same cardinality plus an exact ID and tier check for every holder
-        // proves equality. This works across different hash table orders.
-        let len = tail
-            .iter()
-            .take_while(|&&key| {
-                let Some(row) = self.rows.get(&PageKey::new(group, key)) else {
-                    return false;
-                };
-                let Some(owners) = row.holders(namespace) else {
-                    return false;
-                };
-                owners.len() == run.len()
-                    && owners.values().all(|holder| {
-                        usize::try_from(holder.owner.id.wrapping_sub(first_id))
-                            .ok()
-                            .and_then(|slot| run.get(slot))
-                            .is_some_and(|(_, tiers)| *tiers == holder.residency.tiers)
-                    })
-            })
-            .count();
-        (len != 0).then_some((len + 1, run))
     }
 
     pub(super) fn for_owner(
@@ -638,21 +904,16 @@ impl PageTable {
         let Some(active) = active else {
             return Vec::new();
         };
+        let Some(pages) = active.pages(namespace) else {
+            return vec![TierBits::default(); keys.len()];
+        };
         if active.device_only() {
-            // The source read gate covers both this membership set and the
-            // counter. Each member then has exactly the device tier.
-            let pages = match namespace {
-                Some(name) => active.named.get(name),
-                None => Some(&active.base),
-            };
-            let Some(pages) = pages else {
-                return vec![TierBits::default(); keys.len()];
-            };
+            // The source read gate covers both membership and the tier count.
             let device = TierBits(TierBits::bit(StorageTier::Device));
             return keys
                 .iter()
                 .map(|&hash| {
-                    if pages.contains(&PageKey::new(group, hash)) {
+                    if pages.contains_key(&PageKey::new(group, hash)) {
                         device
                     } else {
                         TierBits::default()
@@ -662,10 +923,13 @@ impl PageTable {
         }
         keys.iter()
             .map(|&key| {
-                self.rows
-                    .get(&PageKey::new(group, key))
-                    .and_then(|row| {
-                        row.holders(namespace)?
+                pages
+                    .get_key_value(&PageKey::new(group, key))
+                    .and_then(|(page, ())| {
+                        page.0
+                            .row
+                            .read()
+                            .holders(namespace)?
                             .get(active.owner.id)
                             .map(|holder| holder.residency.tiers)
                     })
@@ -679,6 +943,7 @@ impl PageTable {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use crate::kv_index::storage::GroupPages;
     use crate::kv_index::{CacheGroup, GroupRule, KvBlockIndexer};
 
     fn owner(name: &str) -> ResidencyOwner {
@@ -697,22 +962,126 @@ mod tests {
     }
 
     #[test]
+    fn last_holder_removal_leaves_a_pinned_row_empty_after_another_rank_recreates_it() {
+        let index = KvBlockIndexer::new();
+        let worker = |dp_rank| ResidencyOwner::Worker {
+            source: Arc::from("w"),
+            dp_rank,
+            incarnation: 1,
+        };
+        let old = worker(0);
+        let new = worker(1);
+        let digest = [7; 32];
+        put(&index, &old, 0);
+        let hash = PageKey::new(0, digest);
+        let page = index
+            .hash_pages
+            .rows
+            .peek_with(&hash, |page, ()| page.clone())
+            .unwrap();
+        index.with_source_batch(&old.target(), |tx| {
+            tx.remove_hash_pages(&old, 0, StorageTier::Device, &[digest], true);
+        });
+        put(&index, &new, 0);
+        let owns = |row: &PageRow, owner: &ResidencyOwner| {
+            row.holders(None)
+                .is_some_and(|holders| holders.values().any(|holder| holder.owner.owner == *owner))
+        };
+        let retained = page.0.row.read();
+        assert!(!owns(&retained, &old));
+        assert!(!owns(&retained, &new));
+        assert_eq!(
+            index
+                .hash_pages
+                .read_row(&hash, |row| (owns(row, &old), owns(row, &new))),
+            Some((false, true))
+        );
+    }
+
+    #[test]
     fn page_keys_keep_groups_and_digests_distinct_on_bucket_hash_collision() {
         let key = PageKey::new(0, [7; 32]);
         let fingerprint = key.fingerprint;
         let mut pages = Pages::default();
-        assert!(pages.insert(Arc::new(key)));
-        assert!(pages.insert(Arc::new(PageKey {
-            group: 1,
-            fingerprint,
-            digest: [7; 32],
-        })));
-        assert!(pages.insert(Arc::new(PageKey {
-            group: 0,
-            fingerprint,
-            digest: [8; 32],
-        })));
-        assert!(pages.contains(&PageKey::new(0, [7; 32])));
+        for key in [
+            key,
+            PageKey {
+                group: 1,
+                fingerprint,
+                digest: [7; 32],
+            },
+            PageKey {
+                group: 0,
+                fingerprint,
+                digest: [8; 32],
+            },
+        ] {
+            assert!(pages.insert(PageRef::new(key), ()).is_none());
+        }
+        assert!(pages.contains_key(&PageKey::new(0, [7; 32])));
+    }
+
+    #[test]
+    fn resident_writes_at_quota_preserve_exact_handle_across_other_sources_evictions() {
+        let index = KvBlockIndexer::new();
+        let a = owner("keeper");
+        let b = owner("churn");
+        let ns = Some("adapter");
+        let hash = [19; 32];
+        let extra = [23; 32];
+        index.with_source_batch(&a.target(), |tx| {
+            tx.store_hash_pages(&a, 0, StorageTier::Device, ns, &[hash], true, 1)
+                .unwrap();
+            assert!(matches!(
+                tx.store_hash_pages(&a, 0, StorageTier::Device, ns, &[extra], true, 1),
+                Err(PageWriteError::Capacity)
+            ));
+        });
+        let key = PageKey::new(0, hash);
+        let pinned = index
+            .hash_pages
+            .rows
+            .peek_with(&key, |p, _| p.clone())
+            .unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                barrier.wait();
+                for _ in 0..1000 {
+                    index.with_source_batch(&b.target(), |tx| {
+                        tx.store_hash_pages(&b, 0, StorageTier::Device, ns, &[hash], true, 1)
+                            .unwrap()
+                    });
+                    index.with_source_batch(&b.target(), |tx| tx.clear_owner_exact(&b));
+                }
+            });
+            barrier.wait();
+            for _ in 0..1000 {
+                index.with_source_batch(&a.target(), |tx| {
+                    tx.store_hash_pages(&a, 0, StorageTier::Device, ns, &[hash], true, 1)
+                        .unwrap();
+                    tx.store_hash_pages(&a, 0, StorageTier::HostPinned, ns, &[hash], false, 1)
+                        .unwrap();
+                    tx.remove_hash_pages(&a, 0, StorageTier::Device, &[hash], true);
+                });
+                let g = index.collect_hash_groups(0u32..1, ns, &[hash, extra]);
+                let e = g[&0.into()].for_owner(&a);
+                assert_eq!(e[0].0, 3);
+                assert!(e.get(1).is_none_or(|p| p.0 == 0));
+                assert!(index
+                    .hash_pages
+                    .rows
+                    .peek_with(&key, |p, _| Arc::ptr_eq(&p.0, &pinned.0))
+                    .unwrap());
+                index.with_source_batch(&a.target(), |tx| {
+                    tx.remove_hash_pages(&a, 0, StorageTier::HostPinned, &[hash], false)
+                });
+            }
+        });
+        index.with_source_batch(&a.target(), |tx| {
+            tx.remove_hash_pages(&a, 0, StorageTier::Device, &[hash], true)
+        });
+        assert!(index.hash_pages.rows.is_empty());
     }
 
     #[test]
@@ -734,11 +1103,10 @@ mod tests {
         let holds = |owner: &ResidencyOwner| {
             index
                 .hash_pages
-                .rows
-                .get(&key)
-                .and_then(|row| {
-                    row.holders(None)
-                        .map(|holders| holders.values().any(|holder| holder.owner.owner == *owner))
+                .read_row(&key, |row| {
+                    row.holders(None).is_some_and(|holders| {
+                        holders.values().any(|holder| holder.owner.owner == *owner)
+                    })
                 })
                 .unwrap_or(false)
         };
@@ -790,10 +1158,12 @@ mod tests {
         });
         let has = |owner, namespace| {
             index
-                .hash_pages
-                .collect_split(0, namespace, &[hash])
-                .2
-                .contains_key(owner)
+                .collect_hash_groups(std::iter::once(0u32), namespace, &[hash])
+                .remove(&0.into())
+                .unwrap()
+                .for_owner(owner)
+                .first()
+                .is_some_and(|tiers| tiers.contains(StorageTier::Device))
         };
         assert!(!has(&a, None));
         assert!(has(&a, Some("adapter-a")));
@@ -824,8 +1194,8 @@ mod tests {
         let index = KvBlockIndexer::new();
         let a = owner("a");
         let keys = [[7; 32]];
-        let mut postings = HashMap::new();
-        postings.insert(0, index.collect_hash_pages(0, &keys));
+        let mut postings = GroupPages::default();
+        postings.insert(0.into(), index.collect_hash_pages(0, &keys));
         put(&index, &a, 0);
         let groups = [CacheGroup {
             group_idx: 0,
@@ -844,7 +1214,7 @@ mod tests {
             })
             .unwrap();
         assert!(pages[0][0].contains(StorageTier::Device));
-        postings.insert(0, index.collect_hash_pages(0, &keys));
+        postings.insert(0.into(), index.collect_hash_pages(0, &keys));
         index.with_source_batch(&a.target(), |tx| tx.clear_owner_exact(&a));
         let pages = index
             .with_source_snapshot(&a.target(), |view| {
@@ -865,7 +1235,7 @@ mod tests {
         let index = KvBlockIndexer::new();
         let owner = owner("worker");
         let keys = [[7; 32], [8; 32]];
-        let snapshots = HashMap::new();
+        let snapshots = GroupPages::default();
         let repair = |group, namespace| {
             index
                 .with_source_snapshot(&owner.target(), |view| {
@@ -962,6 +1332,40 @@ mod tests {
     }
 
     #[test]
+    fn a_later_holder_supplies_handles_without_implying_ownership_or_tiers() {
+        let index = KvBlockIndexer::new();
+        let (a, b, c) = (owner("a"), owner("b"), owner("c"));
+        let keys: Vec<_> = (0..7).map(|byte| [byte; 32]).collect();
+        let named = Some("adapter");
+        for (owner, namespace, tier, positions) in [
+            (&b, named, StorageTier::Device, &[0][..]),
+            (&a, named, StorageTier::Device, &[1, 2, 3, 5, 6][..]),
+            (&a, named, StorageTier::HostPinned, &[3][..]),
+            (&c, named, StorageTier::Device, &[2, 6][..]),
+            (&b, None, StorageTier::Device, &[4][..]),
+        ] {
+            let hashes: Vec<_> = positions.iter().map(|&i| keys[i]).collect();
+            index.with_source_batch(&owner.target(), |tx| {
+                tx.store_hash_pages(owner, 0, tier, namespace, &hashes, false, 7)
+                    .unwrap();
+            });
+        }
+        let groups = index.collect_hash_groups(0u32..1, named, &keys);
+        for (owner, expected) in [
+            (&a, &[0, 1, 1, 3, 0, 1, 1][..]),
+            (&b, &[1][..]),
+            (&c, &[0, 0, 1, 0, 0, 0, 1][..]),
+        ] {
+            let tiers: Vec<_> = groups[&0.into()]
+                .for_owner(owner)
+                .iter()
+                .map(|value| value.0)
+                .collect();
+            assert_eq!(tiers, expected);
+        }
+    }
+
+    #[test]
     fn sparse_evidence_keeps_owner_group_and_tier_boundaries() {
         let index = KvBlockIndexer::new();
         let a = owner("a");
@@ -977,7 +1381,7 @@ mod tests {
             });
         }
         let keys = [[1; 32], [2; 32], [3; 32], [4; 32]];
-        let evidence = index.collect_hash_groups(0..2, None, &keys);
+        let evidence = index.collect_hash_groups(0u32..2, None, &keys);
         let snapshot = |owner: &ResidencyOwner| {
             index
                 .with_source_snapshot(&owner.target(), |view| {
@@ -990,6 +1394,38 @@ mod tests {
         };
         assert_eq!(snapshot(&a), vec![vec![1, 0, 1], vec![0, 0, 1]]);
         assert_eq!(snapshot(&b), vec![vec![0, 2], vec![]]);
+    }
+
+    #[test]
+    fn prefix_scan_keeps_tier_continuations_and_stops_at_an_empty_page() {
+        let index = KvBlockIndexer::new();
+        let holder = owner("a");
+        let keys = [[1; 32], [2; 32], [3; 32], [4; 32]];
+        let prefix = PageQuery {
+            group: 0,
+            stop_at_gap: true,
+        };
+        let complete = PageQuery::from(0);
+        index.with_source_batch(&holder.target(), |tx| {
+            for (tier, hashes) in [
+                (StorageTier::Device, &keys[..1]),
+                (StorageTier::HostPinned, &keys[1..2]),
+                (StorageTier::HostPinned, &keys[3..]),
+            ] {
+                tx.store_hash_pages(&holder, 0, tier, None, hashes, false, 8)
+                    .unwrap();
+            }
+        });
+        let groups = index.collect_hash_groups([prefix, complete].into_iter(), None, &keys);
+        let tiers = |query| {
+            groups[&query]
+                .for_owner(&holder)
+                .iter()
+                .map(|bits| bits.0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tiers(prefix), [1, 2]);
+        assert_eq!(tiers(complete), [1, 2, 0, 2]);
     }
 
     #[test]
@@ -1006,7 +1442,8 @@ mod tests {
                     start.wait();
                     for _ in 0..500 {
                         put(index, &owner, 0);
-                        let postings = index.collect_hash_groups(std::iter::once(0), None, &keys);
+                        let postings =
+                            index.collect_hash_groups(std::iter::once(0u32), None, &keys);
                         let pages = index
                             .with_source_snapshot(&owner.target(), |view| {
                                 view.hash_page_tiers(
@@ -1073,7 +1510,7 @@ mod tests {
                     let keys = [[7; 32]];
                     for _ in 0..500 {
                         let postings = (0..2)
-                            .map(|group| (group, index.collect_hash_pages(group, &keys)))
+                            .map(|group| (group.into(), index.collect_hash_pages(group, &keys)))
                             .collect();
                         let pages = index
                             .with_source_snapshot(&a.target(), |view| {

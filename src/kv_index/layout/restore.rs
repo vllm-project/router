@@ -1,7 +1,5 @@
 //! Compute the common restore boundary from cache-group evidence.
 
-use std::collections::HashSet;
-
 use super::{GroupEvidence, GroupRule};
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -10,7 +8,7 @@ pub(super) fn common_reusable_tokens(groups: &[GroupEvidence], max_reusable_toke
     restore_boundary(groups, max_reusable_tokens, None, 0).0
 }
 
-/// Find the common boundary and the raw dense hit for a verified tail-drop group.
+/// Find the common restore boundary for a layout verified at source binding.
 /// `fine_unit` is zero for block-aligned lookup.
 pub(super) fn restore_boundary(
     groups: &[GroupEvidence],
@@ -21,15 +19,6 @@ pub(super) fn restore_boundary(
     if groups.is_empty() || max_reusable_tokens == 0 {
         return (0, None);
     }
-    let mut group_ids = HashSet::with_capacity(groups.len());
-    if groups.iter().map(|evidence| evidence.group).any(|group| {
-        group.block_size == 0
-            || !group_ids.insert(group.group_idx)
-            || matches!(group.kind, GroupRule::SlidingWindow { window_tokens: 0 })
-    }) {
-        return (0, None);
-    }
-
     // Every cacheable group must supply its own pages. An empty sliding
     // store can mean masked or null pages; it does not make the group optional.
     if groups
@@ -43,13 +32,7 @@ pub(super) fn restore_boundary(
     // boundary it can restore under the current cap, the smallest one wins, and
     // the loop repeats because that smaller cap can invalidate a sliding
     // group's window.
-    let Some(mut cursors) = groups
-        .iter()
-        .map(BoundaryCursor::new)
-        .collect::<Option<Vec<_>>>()
-    else {
-        return (0, None);
-    };
+    let mut cursors: Vec<_> = groups.iter().map(BoundaryCursor::new).collect();
     let tail = match tail_drop_group {
         None => None,
         Some(group_idx) => {
@@ -114,14 +97,9 @@ struct BoundaryCursor {
 }
 
 impl BoundaryCursor {
-    fn new(evidence: &GroupEvidence) -> Option<Self> {
+    fn new(evidence: &GroupEvidence) -> Self {
         let group = evidence.group;
         let size = u64::from(group.block_size);
-        if let GroupRule::CompressedFullAttention { tokens_per_state } = group.kind {
-            if tokens_per_state == 0 || !group.block_size.is_multiple_of(tokens_per_state) {
-                return None;
-            }
-        }
         let segments = evidence.segments.iter().copied();
         let mut ranges = Vec::new();
         match group.kind {
@@ -186,13 +164,13 @@ impl BoundaryCursor {
             .collect();
         partials.sort_unstable();
         partials.dedup();
-        Some(Self {
+        Self {
             size,
             range_end: ranges.len(),
             ranges,
             partial_end: partials.len(),
             partials,
-        })
+        }
     }
 
     fn predecessor(&mut self, cap: u64) -> u64 {

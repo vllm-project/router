@@ -1,5 +1,12 @@
 #![cfg(all(test, feature = "cpu", feature = "ready"))]
 
+impl LayoutWorkerProvider {
+    fn is_trusted(&self) -> bool {
+        self.lifecycle
+            .trusted_at(&self.lifecycle.state.lock(), Instant::now)
+    }
+}
+
 #[test]
 fn only_confirming_probes_renew_trust() {
     assert!(probe_renews_trust(&StaticHybridMatch::Matches));
@@ -23,7 +30,7 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
     let lifecycle = Arc::new(WorkerLifecycle::new(active.clone(), true, None));
     lifecycle.state.lock().verified_at = Instant::now() - Duration::from_secs(6);
     let provider = LayoutWorkerProvider {
-        indexes: HashMap::new(),
+        indexes: HashMap::default(),
         lifecycle,
     };
     assert!(!provider.is_trusted());
@@ -1935,4 +1942,104 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
     assert_ne!(recovered[&base].revision, retired[&base].revision);
     supervisor.shutdown();
     task.abort();
+}
+
+#[test]
+fn rank_credit_does_not_cross_revocation_and_empty_replay() {
+    use crate::kv_index::source::test_support::{full_binding, warm_full};
+    use crate::policies::TieredMatchProvider;
+    let lifecycle = WorkerLifecycle::new(Arc::new(AtomicBool::new(true)), true, None);
+    let source = Arc::new(full_binding(
+        crate::kv_index::RoutableTarget {
+            instance_id: "p".into(),
+            dp_rank: 0,
+        },
+        16,
+    ));
+    source.begin_empty(0);
+    let tokens = vec![42; 17];
+    let mut cache = crate::kv_index::RequestHashCache::for_single_target();
+    let mut calls = 0;
+    let scored = lifecycle.read_rank(&source, None, Instant::now, || {
+        calls += 1;
+        if calls == 1 {
+            lifecycle.state.lock().trusted = false;
+            warm_full(&source, 0, &tokens[..16]);
+        }
+        let scores = source.matches_with_cache(&tokens, 16, None, 0, &mut cache);
+        if calls == 1 {
+            assert_eq!(scores[0].segments, [(0, 1)]);
+            assert_eq!(
+                lifecycle.observe_layout(&StaticHybridMatch::Matches),
+                SourceAction::Recover
+            );
+            let stream = crate::kv_index::EventStream::new(source.clone());
+            let lease = stream.begin_replay().unwrap();
+            stream.finish_replay(lease, 0).unwrap();
+            lifecycle.state.lock().trusted = true;
+        }
+        scores
+    });
+    assert!(scored.is_empty());
+    assert_eq!(calls, 2);
+}
+
+#[test]
+fn renewed_grants_do_not_price_pages_seen_only_after_expiry() {
+    use crate::kv_index::source::test_support::{event_batch, full_binding, full_store, warm_full};
+    use crate::kv_index::{BlockRemoved, KVEvent, RequestHashCache, RoutableTarget};
+    use crate::policies::TieredMatchProvider;
+    use std::cell::Cell;
+    for repeat in [false, true] {
+        let life = WorkerLifecycle::new(Arc::new(AtomicBool::new(true)), true, None);
+        let source = full_binding(
+            RoutableTarget {
+                instance_id: "p".into(),
+                dp_rank: 0,
+            },
+            16,
+        );
+        source.begin_empty(0);
+        let source_generation = source.control.generation();
+        let tokens = vec![16; 17];
+        let mut cache = RequestHashCache::for_single_target();
+        let clock = Cell::new(life.state.lock().verified_at);
+        let mut calls = 0;
+        let result = life.read_rank(
+            &source,
+            Some(clock.get()),
+            || clock.get(),
+            || {
+                calls += 1;
+                if calls == 2 && !repeat {
+                    return source.matches_with_cache(&tokens, 16, None, 0, &mut cache);
+                }
+                clock.set(clock.get() + Duration::from_secs(6));
+                assert!(!life.trusted_at(&life.state.lock(), || clock.get()));
+                let seq = 2 * (calls - 1);
+                warm_full(&source, seq, &tokens[..16]);
+                let hits = source.matches_with_cache(&tokens, 16, None, 0, &mut cache);
+                assert_eq!(hits[0].segments, [(0, 1)]);
+                let removed = KVEvent::BlockRemoved(BlockRemoved {
+                    block_hashes: full_store(&tokens[..16], 16, None).block_hashes,
+                    medium: Some("GPU".into()),
+                    group_idx: Some(0),
+                    locality: None,
+                    ownership: None,
+                });
+                source
+                    .apply_batch(seq + 1, &event_batch(1.0, vec![removed]))
+                    .unwrap();
+                assert_eq!(source.control.generation(), source_generation);
+                assert_eq!(
+                    life.observe_layout(&StaticHybridMatch::Matches),
+                    SourceAction::Keep
+                );
+                life.state.lock().verified_at = clock.get();
+                hits
+            },
+        );
+        assert!(result.is_empty());
+        assert_eq!(calls, 2);
+    }
 }

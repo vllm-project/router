@@ -1,10 +1,9 @@
 //! Shared hash-page storage and source transactions, for full and mixed attention.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::RwLock;
 
 use crate::kv_hash::SequenceHash;
@@ -13,13 +12,29 @@ mod records;
 pub(crate) mod source_transaction;
 
 use self::page_table::{ActivePages, PageTable};
-pub(crate) use self::page_table::{PageEvidence, PageTiers};
+pub(crate) use self::page_table::{PageEvidence, PageMatch, PageTiers};
 use self::source_transaction::SourceWrite;
 pub(crate) use self::source_transaction::{IndexBatch, IndexSnapshot};
 use self::source_transaction::{StreamControl, StreamPhase, StreamState};
 use crate::kv_index::types::{ResidencyOwner, RoutableTarget, SourceId, StorageTier, TierBits};
 
 type Fast = foldhash::fast::RandomState;
+pub(crate) type GroupPages = HashMap<PageQuery, PageEvidence, Fast>;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PageQuery {
+    pub(crate) group: u32,
+    pub(crate) stop_at_gap: bool,
+}
+
+impl From<u32> for PageQuery {
+    fn from(group: u32) -> Self {
+        Self {
+            group,
+            stop_at_gap: false,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PageWriteError {
@@ -31,8 +46,10 @@ pub(crate) enum PageWriteError {
 struct SourceLock {
     target: RoutableTarget,
     access: RwLock<SourceData>,
+    // Even generations are visible. Odd generations are suspended or retired.
     generation: AtomicU64,
     revision: AtomicU64,
+    planned: RwLock<Option<(u64, PageChanges)>>,
 }
 
 #[derive(Default)]
@@ -48,24 +65,31 @@ pub(crate) struct SourceVersion {
 }
 
 impl SourceLock {
-    fn new(target: RoutableTarget) -> Self {
+    fn new(target: RoutableTarget, committed: u64) -> Self {
         Self {
             target,
             access: RwLock::new(SourceData::default()),
             generation: AtomicU64::new(0),
-            revision: AtomicU64::new(0),
+            revision: AtomicU64::new(committed),
+            planned: RwLock::default(),
         }
+    }
+
+    fn committed_at(&self, scan: &PageScan) -> bool {
+        let revision = self.revision.load(Ordering::Acquire);
+        revision.is_multiple_of(2) && revision <= scan.committed
     }
 }
 
 /// One shared fact index per cache identity, sharded by cache group.
 pub struct KvBlockIndexer {
     hash_pages: PageTable,
-    suspended_sources: DashMap<(SourceId, u32), ()>,
     /// Gates may be removed only by `retire_source` under the global barrier.
     // Membership changes only on source attachment/retirement. A compact map
     // avoids scanning CPU-count-sized sets of empty shards on every query.
     source_locks: RwLock<HashMap<RoutableTarget, Arc<SourceLock>, Fast>>,
+    // A scan samples this once before reading any page. Only completed writes advance it.
+    committed: AtomicU64,
     /// Ordinary access shares the barrier; retirement excludes it.
     domain: RwLock<()>,
 }
@@ -74,20 +98,30 @@ impl KvBlockIndexer {
     pub fn new() -> Self {
         KvBlockIndexer {
             hash_pages: PageTable::default(),
-            suspended_sources: DashMap::new(),
             source_locks: RwLock::new(HashMap::default()),
+            committed: AtomicU64::new(0),
             domain: RwLock::new(()),
         }
     }
 
+    fn existing_source(&self, target: &RoutableTarget) -> Option<Arc<SourceLock>> {
+        self.source_locks.read().get(target).cloned()
+    }
+
     fn source_lock(&self, target: &RoutableTarget) -> Arc<SourceLock> {
-        if let Some(source) = self.source_locks.read().get(target) {
-            return source.clone();
+        if let Some(source) = self.existing_source(target) {
+            return source;
         }
         self.source_locks
             .write()
             .entry(target.clone())
-            .or_insert_with(|| Arc::new(SourceLock::new(target.clone())))
+            .or_insert_with(|| {
+                // A replacement must not validate observations taken before the old source retired.
+                Arc::new(SourceLock::new(
+                    target.clone(),
+                    self.committed.load(Ordering::Acquire),
+                ))
+            })
             .clone()
     }
 
@@ -95,25 +129,19 @@ impl KvBlockIndexer {
     /// valid snapshot transition; suspension, resume, or retirement invalidates
     /// the result. This does not reserve engine blocks.
     pub(crate) fn source_version_is_current(&self, version: &SourceVersion) -> bool {
-        // Resume and retirement increment the generation before revealing
-        // the source. Read it last to fence snapshots across that transition.
-        let target = &version.source.target;
-        !self
-            .suspended_sources
-            .contains_key(&(target.instance_id.clone(), target.dp_rank))
+        version.generation.is_multiple_of(2)
             && version.source.generation.load(Ordering::Acquire) == version.generation
     }
 
     /// Hide a source while contiguous replay repairs its observations.
     fn suspend_source_unlocked(&self, source: &SourceId, dp_rank: u32) {
-        self.suspended_sources.insert((source.clone(), dp_rank), ());
         let target = RoutableTarget {
             instance_id: source.clone(),
             dp_rank,
         };
         self.source_lock(&target)
             .generation
-            .fetch_add(1, Ordering::AcqRel);
+            .fetch_or(1, Ordering::AcqRel);
     }
 
     /// Permanently retire a fenced source. The global barrier drains all
@@ -127,11 +155,10 @@ impl KvBlockIndexer {
         };
         let gate = self.source_lock(&target);
         let mut data = gate.access.write();
-        let _revision = SourceWrite::new(&gate.revision);
+        let _revision = SourceWrite::new(&gate.revision, &self.committed);
         self.invalidate_source_unlocked(source, dp_rank, &mut data.active_pages);
         drop(data);
         self.source_locks.write().remove(&target);
-        self.suspended_sources.remove(&(source.clone(), dp_rank));
     }
 
     fn invalidate_source_unlocked(
@@ -153,13 +180,11 @@ impl KvBlockIndexer {
             instance_id: source.clone(),
             dp_rank,
         };
-        // Never hold a suspended-sources map entry while acquiring a
-        // source-lock map entry: final query checks access both maps.
         let gate = self.source_lock(&target);
-        if let Entry::Occupied(entry) = self.suspended_sources.entry((source.clone(), dp_rank)) {
-            // Fence the visibility transition before removing its hidden state.
-            gate.generation.fetch_add(1, Ordering::AcqRel);
-            entry.remove();
+        let generation = gate.generation.load(Ordering::Relaxed);
+        if !generation.is_multiple_of(2) {
+            gate.generation
+                .store(generation.wrapping_add(1), Ordering::Release);
         }
     }
 
@@ -171,7 +196,8 @@ impl KvBlockIndexer {
         control: &Arc<StreamControl>,
         f: impl FnOnce(&mut StreamState, &mut IndexBatch<'_>) -> R,
     ) -> R {
-        self.stream_batch(target, owner, control, true, f).unwrap()
+        self.stream_batch(target, owner, control, true, None, f)
+            .unwrap()
     }
 
     /// Cleanup must not recreate a gate or owner that discovery already retired.
@@ -182,7 +208,19 @@ impl KvBlockIndexer {
         control: &Arc<StreamControl>,
         f: impl FnOnce(&mut StreamState, &mut IndexBatch<'_>) -> R,
     ) -> Option<R> {
-        self.stream_batch(target, owner, control, false, f)
+        self.stream_batch(target, owner, control, false, None, f)
+    }
+
+    pub(crate) fn with_page_mutation_batch<R>(
+        &self,
+        target: &RoutableTarget,
+        owner: &ResidencyOwner,
+        control: &Arc<StreamControl>,
+        planned: Option<PageChanges>,
+        f: impl FnOnce(&mut StreamState, &mut IndexBatch<'_>) -> R,
+    ) -> R {
+        self.stream_batch(target, owner, control, true, planned, f)
+            .unwrap()
     }
 
     fn stream_batch<R>(
@@ -191,6 +229,7 @@ impl KvBlockIndexer {
         owner: &ResidencyOwner,
         control: &Arc<StreamControl>,
         create: bool,
+        planned: Option<PageChanges>,
         f: impl FnOnce(&mut StreamState, &mut IndexBatch<'_>) -> R,
     ) -> Option<R> {
         assert_eq!(owner.target(), *target, "stream crossed targets");
@@ -198,10 +237,12 @@ impl KvBlockIndexer {
         let source = if create {
             self.source_lock(target)
         } else {
-            self.source_locks.read().get(target)?.clone()
+            self.existing_source(target)?
         };
         let mut data = source.access.write();
-        let _revision = SourceWrite::new(&source.revision);
+        let _revision = SourceWrite::new(&source.revision, &self.committed);
+        let revision = source.revision.load(Ordering::Relaxed);
+        *source.planned.write() = planned.map(|changes| (revision, changes));
         let SourceData {
             active_pages,
             streams,
@@ -221,6 +262,7 @@ impl KvBlockIndexer {
             index: self,
             target,
             active_pages,
+            source: &source,
         };
         let result = f(state, &mut tx);
         if state.lease_id == 0 && state.next_seq.is_none() && !state.visible() {
@@ -231,7 +273,7 @@ impl KvBlockIndexer {
 
     pub(crate) fn stream_lease_is_active(&self, owner: &ResidencyOwner, lease: u64) -> bool {
         let _domain = self.domain.read();
-        let Some(source) = self.source_locks.read().get(&owner.target()).cloned() else {
+        let Some(source) = self.existing_source(&owner.target()) else {
             return false;
         };
         let data = source.access.read();
@@ -246,8 +288,9 @@ impl KvBlockIndexer {
         target: &RoutableTarget,
         f: impl FnOnce(&IndexSnapshot<'_>) -> R,
     ) -> Option<R> {
-        let _domain = self.domain.read();
-        let source = self.source_locks.read().get(target).cloned()?;
+        // Pin this gate across replacement. Retirement clears its pages and
+        // advances its generation while holding its write lock.
+        let source = self.existing_source(target)?;
         let data = source.access.read();
         Some(f(&IndexSnapshot {
             index: self,
@@ -262,32 +305,27 @@ impl KvBlockIndexer {
 
     pub(crate) fn collect_hash_groups(
         &self,
-        groups: impl Iterator<Item = u32>,
+        groups: impl Iterator<Item = impl Into<PageQuery>>,
         namespace: Option<&str>,
         keys: &[SequenceHash],
-    ) -> HashMap<u32, PageEvidence> {
+    ) -> GroupPages {
         let _domain = self.domain.read();
-        let versions = Arc::new(
-            self.source_locks
-                .read()
-                .iter()
-                .map(|(target, source)| {
-                    let gate = source.clone();
-                    let version = gate.revision.load(Ordering::Acquire);
-                    (target.clone(), (gate, version))
-                })
-                .collect(),
-        );
+        let scan = Arc::new(PageScan {
+            committed: self.committed.load(Ordering::Acquire),
+            request_tags: OnceLock::new(),
+            confirmed: OnceLock::new(),
+        });
         groups
-            .map(|group| {
+            .map(|query| {
+                let query = query.into();
                 let (prefix_len, head, holders) =
-                    self.hash_pages.collect_split(group, namespace, keys);
+                    self.hash_pages.collect_split(query, namespace, keys, self);
                 (
-                    group,
+                    query,
                     PageEvidence {
-                        versions: Arc::clone(&versions),
+                        scan: Arc::clone(&scan),
                         prefix_len,
-                        prefix: head.into_iter().collect(),
+                        prefix: head,
                         holders,
                     },
                 )
@@ -299,8 +337,69 @@ impl KvBlockIndexer {
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn collect_hash_pages(&self, group: u32, keys: &[SequenceHash]) -> PageEvidence {
         self.collect_hash_groups(std::iter::once(group), None, keys)
-            .remove(&group)
+            .remove(&PageQuery::from(group))
             .unwrap()
+    }
+}
+
+/// A tag collision only requires an exact source snapshot. Page equality still uses the full hash.
+fn page_tag(key: &SequenceHash) -> u32 {
+    u32::from_le_bytes(key[..4].try_into().unwrap())
+}
+
+struct PageScan {
+    committed: u64,
+    request_tags: OnceLock<HashSet<u32, Fast>>,
+    confirmed: OnceLock<bool>,
+}
+
+impl PageScan {
+    fn confirms_unchanged(&self, index: &KvBlockIndexer) -> bool {
+        let confirmed = self.confirmed.get_or_init(|| {
+            // Writers publish before releasing the domain barrier. Taking it
+            // exclusively without waiting accounts for any writes during the scan.
+            let Some(_domain) = index.domain.try_write() else {
+                return false;
+            };
+            index.committed.load(Ordering::Acquire) == self.committed
+        });
+        *confirmed && index.committed.load(Ordering::Acquire) == self.committed
+    }
+}
+
+/// At most one event batch is retained per source. Readers copy only a tag or an Arc
+/// before releasing the publication lock, regardless of batch and prompt length.
+#[derive(Clone)]
+pub(crate) enum PageChanges {
+    Inline(Option<u32>),
+    Batch(Arc<[u32]>),
+}
+
+impl PageChanges {
+    pub(crate) fn from_batches<'a>(
+        batches: impl Iterator<Item = Option<&'a [SequenceHash]>>,
+        max_entries: usize,
+    ) -> Option<Self> {
+        let mut tags = smallvec::SmallVec::<[u32; 1]>::new();
+        for batch in batches {
+            let hashes = batch?;
+            if hashes.len() > max_entries - tags.len() {
+                return None;
+            }
+            tags.extend(hashes.iter().map(page_tag));
+        }
+        Some(if tags.len() <= 1 {
+            Self::Inline(tags.pop())
+        } else {
+            Self::Batch(tags.into_vec().into())
+        })
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Inline(tag) => tag.as_slice(),
+            Self::Batch(tags) => tags,
+        }
     }
 }
 
