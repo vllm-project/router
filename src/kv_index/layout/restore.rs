@@ -37,8 +37,7 @@ pub(super) fn restore_boundary(
         None => None,
         Some(group_idx) => {
             let Some(index) = groups.iter().position(|evidence| {
-                evidence.group.group_idx == group_idx
-                    && evidence.group.kind == GroupRule::FullAttention
+                evidence.group.group_idx == group_idx && evidence.group.kind.is_dense_attention()
             }) else {
                 return (0, None);
             };

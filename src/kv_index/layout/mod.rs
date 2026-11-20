@@ -37,6 +37,15 @@ pub enum GroupRule {
     SlidingWindow { window_tokens: u64 },
 }
 
+impl GroupRule {
+    fn is_dense_attention(self) -> bool {
+        matches!(
+            self,
+            Self::FullAttention | Self::CompressedFullAttention { .. }
+        )
+    }
+}
+
 /// Restore coverage of one group in the source snapshot.
 ///
 /// Segment boundaries use group blocks. Tier costs come from the original pages.

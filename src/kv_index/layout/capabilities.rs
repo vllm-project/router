@@ -364,30 +364,35 @@ impl CacheCapabilities {
         if !valid_groups(&groups, hash_block_size as usize) {
             return Err("invalid group layout");
         }
-        let tail_drop_group = if tail_drop_groups.is_empty() {
-            None
-        } else {
+        // Circular buffers are excluded from vLLM's cache lookup even when
+        // the coordinator lists them as draft groups.
+        let mut tail_groups = tail_drop_groups.iter().copied().filter(|id| {
+            !rank.groups.iter().any(|group| {
+                group.group_idx == *id
+                    && !group.prefix_cacheable
+                    && group.spec_type == "CircularBufferSpec"
+            })
+        });
+        let tail_drop_group = if let Some(group_idx) = tail_groups.next() {
             let unsupported = "unsupported tail-drop layout. Set tail_drop_groups to the effective groups and use [] when the worker skips the drop";
             let mut dense = groups
                 .iter()
-                .filter(|group| group.kind == GroupRule::FullAttention);
+                .filter(|group| group.kind.is_dense_attention());
             let group = dense.next().ok_or(unsupported)?;
             if dense.next().is_some()
-                || tail_drop_groups != [group.group_idx]
-                || groups.len() != rank.groups.len()
-                || !rank.groups.iter().any(|declared| {
-                    declared.group_idx == group.group_idx
-                        && declared.spec_type == "FullAttentionSpec"
-                })
+                || group_idx != group.group_idx
+                || tail_groups.next().is_some()
                 || replay_tokens != 0
                 || groups.iter().any(|other| {
-                    !matches!(other.kind, GroupRule::FullAttention | GroupRule::Checkpoint)
+                    (!other.kind.is_dense_attention() && other.kind != GroupRule::Checkpoint)
                         || (!rank.partial_hash_hits && other.block_size != group.block_size)
                 })
             {
                 return Err(unsupported);
             }
-            Some(group.group_idx)
+            Some(group_idx)
+        } else {
+            None
         };
         Ok(VerifiedLayout {
             groups,

@@ -840,6 +840,26 @@ mod declarations {
         }]});
         assert!(bind_layout(&value, "kv-events").is_ok());
 
+        let mut speculative = value.clone();
+        let rank = &mut speculative["ranks"][0];
+        rank["speculative_tokens"] = 3.into();
+        rank["tail_drop_groups"] = serde_json::json!([3, 4]);
+        let binding = bind_layout(&speculative, "kv-events").unwrap();
+        assert_eq!(binding.tail_drop_group, Some(4));
+        let evidence: Vec<_> = binding
+            .groups
+            .into_iter()
+            .map(|group| GroupEvidence {
+                group,
+                segments: vec![(0, 2)],
+                partial_ends: Vec::new(),
+            })
+            .collect();
+        assert_eq!(
+            super::super::restore::restore_boundary(&evidence, 641, Some(4), 0).0,
+            320
+        );
+
         let ratio = value["ranks"][0]["groups"][4]
             .as_object_mut()
             .unwrap()
