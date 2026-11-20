@@ -209,6 +209,9 @@ mirror_hardwares:
               path: /fsx/hf_cache
               type: DirectoryOrCreate
   mi300_2:
+    # Uploader capability metadata, not a Buildkite step field. Any compatible
+    # single-host task can opt in with shared_gpu_count; the host checks capacity.
+    shared_gpu_queue: router_rocm_mi300_shared
     agents:
       queue: router_rocm_mi300_2
     plugins:
