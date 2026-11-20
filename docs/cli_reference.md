@@ -95,7 +95,6 @@ configuration, for example:
 ```json
 {
   "http://127.0.0.1:8000": {
-    "namespace": "engine-a",
     "rank": 0,
     "block_size": 16,
     "publisher_snapshot": {
@@ -111,6 +110,10 @@ Enroll only independently addressable workers running one plain full-attention
 engine with complete snapshot support. The router restores worker-local KV
 credit only after verifying the snapshot and live sequence. Missing or
 unusable evidence leaves that worker routable at full prefill cost.
+The router retains up to 4,096 distinct block descriptions since the last
+cache Clear or snapshot rebuild, including descriptions of removed blocks.
+Exceeding that limit withdraws credit until a fresh complete cut and live
+handoff are verified; the worker remains routable while the router retries.
 
 The Rust CLI requires worker URLs in regular mode unless service discovery is
 enabled. The Python launcher permits an empty worker list without service

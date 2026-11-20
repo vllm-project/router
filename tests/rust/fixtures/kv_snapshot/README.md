@@ -12,8 +12,9 @@ The synthetic public B16 token prefix is 100 through 131.
 - `removed`: complete cut with no resident references.
 
 The Rust socket peer replays the captured cut/payloads, supplies its own
-contiguous transport sequence, and adds disjoint positive marker prefixes after
-Remove. This exercises production socket acquisition, reference normalization,
+transport sequence (including a deliberate gap to exercise rebuild), and adds
+disjoint positive marker prefixes after Remove. This exercises production socket
+acquisition, reference normalization,
 fenced installation and actual HTTP admission/release without installing vLLM.
 It is not a stock Worker or hardware performance test. The publisher profile and
 strict request opcode are experimental; upstream acceptance is not implied.

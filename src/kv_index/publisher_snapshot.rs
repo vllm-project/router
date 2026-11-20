@@ -100,6 +100,8 @@ fn description_bytes(
 }
 
 struct Normalizer {
+    // Retain non-resident descriptions for ancestors and tokenless references.
+    // The history limit applies since the last Clear or snapshot rebuild.
     descriptions: HashMap<ExternalBlockHash, BlockStored>,
     references: HashMap<ExternalBlockHash, usize>,
     bytes: usize,
@@ -393,6 +395,38 @@ fn recv(
     Err("publisher deadline")
 }
 
+fn connect_live(
+    context: &zmq::Context,
+    protocol: &PublisherSnapshotSource,
+) -> Result<zmq::Socket, &'static str> {
+    let live = context.socket(zmq::SUB).map_err(|_| "publisher socket")?;
+    live.set_ipv6(true).map_err(|_| "publisher socket")?;
+    live.set_linger(0).map_err(|_| "publisher socket")?;
+    live.set_rcvhwm(LIMIT as i32)
+        .map_err(|_| "publisher socket")?;
+    live.set_maxmsgsize(BYTES as i64)
+        .map_err(|_| "publisher socket")?;
+    live.set_subscribe(protocol.topic.as_bytes())
+        .map_err(|_| "publisher socket")?;
+    live.connect(&protocol.endpoint)
+        .map_err(|_| "publisher connect")?;
+    Ok(live)
+}
+
+fn live_identity(payload: &[u8], expected_rank: u32) -> Result<[u8; 16], &'static str> {
+    let fields = envelope(payload)?;
+    let [timestamp, Value::Array(_), rank, Value::Binary(id)] = fields.as_slice() else {
+        return Err("publisher envelope");
+    };
+    if timestamp.as_f64().is_none() {
+        return Err("publisher timestamp");
+    }
+    if rank.as_u64() != Some(u64::from(expected_rank)) {
+        return Err("publisher rank");
+    }
+    id.as_slice().try_into().map_err(|_| "publisher identity")
+}
+
 struct Connection {
     _context: zmq::Context,
     live: zmq::Socket,
@@ -415,27 +449,11 @@ impl Connection {
     fn new(config: &KvSnapshotSource, cancelled: &dyn Fn() -> bool) -> Result<Self, &'static str> {
         let protocol = &config.publisher_snapshot;
         let context = zmq::Context::new();
-        let live = context.socket(zmq::SUB).map_err(|_| "publisher socket")?;
-        live.set_ipv6(true).map_err(|_| "publisher socket")?;
-        live.set_linger(0).map_err(|_| "publisher socket")?;
-        live.set_rcvhwm(LIMIT as i32)
-            .map_err(|_| "publisher socket")?;
-        live.set_maxmsgsize(BYTES as i64)
-            .map_err(|_| "publisher socket")?;
-        live.set_subscribe(protocol.topic.as_bytes())
-            .map_err(|_| "publisher socket")?;
-        live.connect(&protocol.endpoint)
-            .map_err(|_| "publisher connect")?;
+        let live = connect_live(&context, protocol)?;
         let first = recv(&live, Instant::now() + LIVE_TIMEOUT, cancelled)?;
-        if first.len() != 3 || first[0] != protocol.topic.as_bytes() {
-            return Err("publisher topic");
-        }
-        let fields = envelope(&first[2])?;
-        let Some(Value::Binary(id)) = fields.get(3) else {
-            return Err("missing publisher identity");
-        };
-        let publisher: [u8; 16] = id.as_slice().try_into().map_err(|_| "publisher identity")?;
-        let (first_seq, _) = live_batch(&first, &publisher, config)?;
+        let (first_seq, payload) = live_frame(&first, &protocol.topic)?;
+        let publisher = live_identity(payload, config.rank)?;
+        decode(payload, Some(&publisher))?;
         let snapshot = context.socket(zmq::REQ).map_err(|_| "publisher socket")?;
         snapshot.set_ipv6(true).map_err(|_| "publisher socket")?;
         snapshot.set_linger(0).map_err(|_| "publisher socket")?;
@@ -588,10 +606,15 @@ pub(super) async fn discover(config: KvSnapshotSource) -> Result<String, &'stati
     let probe = CancelProbe(Arc::new(AtomicBool::new(false)));
     let flag = probe.0.clone();
     tokio::task::spawn_blocking(move || {
-        let cancelled = || flag.load(Ordering::Acquire);
-        let connection = Connection::new(&config, &cancelled)?;
-        connection.cut(&config, &cancelled)?;
-        Ok(publisher_id(&connection.publisher))
+        let protocol = &config.publisher_snapshot;
+        let context = zmq::Context::new();
+        let live = connect_live(&context, protocol)?;
+        let first = recv(&live, Instant::now() + LIVE_TIMEOUT, &|| {
+            flag.load(Ordering::Acquire)
+        })?;
+        let (_, payload) = live_frame(&first, &protocol.topic)?;
+        let publisher = live_identity(payload, config.rank)?;
+        Ok(publisher_id(&publisher))
     })
     .await
     .map_err(|_| "publisher discovery task")?
@@ -768,15 +791,8 @@ fn sequence(
     Ok(true)
 }
 
-fn live_batch(
-    parts: &[Vec<u8>],
-    identity: &[u8],
-    config: &KvSnapshotSource,
-) -> Result<(i64, KVEventBatch), &'static str> {
-    if parts.len() != 3
-        || parts[0] != config.publisher_snapshot.topic.as_bytes()
-        || parts[1].len() != 8
-    {
+fn live_frame<'a>(parts: &'a [Vec<u8>], topic: &str) -> Result<(i64, &'a [u8]), &'static str> {
+    if parts.len() != 3 || parts[0] != topic.as_bytes() || parts[1].len() != 8 {
         return Err("publisher frames");
     }
     let seq = i64::from_be_bytes(
@@ -788,7 +804,16 @@ fn live_batch(
     if seq < 0 || seq == i64::MAX {
         return Err("publisher seq");
     }
-    let batch = decode(&parts[2], Some(identity))?;
+    Ok((seq, &parts[2]))
+}
+
+fn live_batch(
+    parts: &[Vec<u8>],
+    identity: &[u8],
+    config: &KvSnapshotSource,
+) -> Result<(i64, KVEventBatch), &'static str> {
+    let (seq, payload) = live_frame(parts, &config.publisher_snapshot.topic)?;
+    let batch = decode(payload, Some(identity))?;
     if batch.data_parallel_rank != Some(config.rank) {
         return Err("publisher rank");
     }
@@ -799,14 +824,22 @@ fn live_batch(
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod tests {
     use super::*;
+    use tokio::sync::watch;
+
+    enum PeerCommand {
+        Publish(Vec<u8>),
+        SkipSequence,
+        Stop,
+    }
 
     /// Socket peer replaying captured upstream wire; it does not emulate vLLM.
     pub(crate) struct CapturedPublisher {
         pub(crate) config: PublisherSnapshotSource,
-        commands: std::sync::mpsc::Sender<Option<Vec<u8>>>,
+        commands: std::sync::mpsc::Sender<PeerCommand>,
         thread: Option<std::thread::JoinHandle<()>>,
         publisher: Vec<u8>,
         serve_snapshot: Arc<AtomicBool>,
+        snapshot_requests: watch::Receiver<usize>,
     }
 
     impl CapturedPublisher {
@@ -842,22 +875,24 @@ pub(crate) mod tests {
             let mut parts = self::snapshot("two");
             let publisher = parts[1].clone();
             let id = publisher.clone();
-            let (commands, receiver) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+            let (commands, receiver) = std::sync::mpsc::channel();
             let serve_snapshot = Arc::new(AtomicBool::new(serve_snapshot));
             let serve = serve_snapshot.clone();
+            let (requests, snapshot_requests) = watch::channel(0);
             let thread = std::thread::spawn(move || {
                 let _context = context;
                 let deadline = Instant::now() + Duration::from_secs(30);
                 let mut heartbeat = Instant::now();
                 let mut seq = 2i64;
                 let empty = wire(vec![], &id);
+                let mut pending = false;
                 while Instant::now() < deadline {
                     let mut items = [
                         live.as_poll_item(zmq::POLLIN),
-                        snapshot.as_poll_item(if serve.load(Ordering::Acquire) {
-                            zmq::POLLIN
-                        } else {
+                        snapshot.as_poll_item(if pending {
                             zmq::PollEvents::empty()
+                        } else {
+                            zmq::POLLIN
                         }),
                     ];
                     zmq::poll(&mut items, 20).unwrap();
@@ -871,16 +906,27 @@ pub(crate) mod tests {
                     }
                     if items[1].is_readable() {
                         assert_eq!(snapshot.recv_bytes(0).unwrap(), STRICT_REQUEST);
+                        requests.send_modify(|count| *count += 1);
+                        pending = true;
+                    }
+                    if pending && serve.load(Ordering::Acquire) {
                         parts[0] = seq.to_be_bytes().to_vec();
                         snapshot.send_multipart(&parts, 0).unwrap();
+                        pending = false;
                     }
                     match receiver.try_recv() {
-                        Ok(Some(payload)) => {
+                        Ok(PeerCommand::Publish(payload)) => {
                             seq += 1;
                             live.send_multipart([b"".as_slice(), &seq.to_be_bytes(), &payload], 0)
                                 .unwrap();
                         }
-                        Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                        Ok(PeerCommand::SkipSequence) => {
+                            // Send the next heartbeat with a gap on the active SUB.
+                            seq += 1;
+                            heartbeat = Instant::now();
+                        }
+                        Ok(PeerCommand::Stop)
+                        | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                         Err(std::sync::mpsc::TryRecvError::Empty) => {}
                     }
                     if Instant::now() >= heartbeat {
@@ -897,11 +943,28 @@ pub(crate) mod tests {
                 thread: Some(thread),
                 publisher,
                 serve_snapshot,
+                snapshot_requests,
             }
         }
 
         pub(crate) fn resume_snapshot(&self) {
             self.serve_snapshot.store(true, Ordering::Release);
+        }
+
+        pub(crate) fn snapshot_requests(&self) -> usize {
+            *self.snapshot_requests.borrow()
+        }
+
+        pub(crate) async fn wait_for_snapshot_request(&mut self, count: usize) {
+            self.snapshot_requests
+                .wait_for(|received| *received >= count)
+                .await
+                .unwrap();
+        }
+
+        pub(crate) fn pause_and_skip_live_sequence(&self) {
+            self.serve_snapshot.store(false, Ordering::Release);
+            self.commands.send(PeerCommand::SkipSequence).unwrap();
         }
 
         pub(crate) fn remove_and_marker(&self, first: u32) {
@@ -941,14 +1004,17 @@ pub(crate) mod tests {
                 }
             }
             self.commands
-                .send(Some(wire(vec![event, marker], &self.publisher)))
+                .send(PeerCommand::Publish(wire(
+                    vec![event, marker],
+                    &self.publisher,
+                )))
                 .unwrap();
         }
     }
 
     impl Drop for CapturedPublisher {
         fn drop(&mut self) {
-            let _ = self.commands.send(None);
+            let _ = self.commands.send(PeerCommand::Stop);
             self.thread.take().unwrap().join().unwrap();
         }
     }
@@ -1042,7 +1108,6 @@ pub(crate) mod tests {
     }
     fn config() -> KvSnapshotSource {
         KvSnapshotSource {
-            namespace: "actual-public-synthetic-b16".into(),
             rank: 0,
             block_size: 16,
             publisher_snapshot: PublisherSnapshotSource {
@@ -1256,6 +1321,72 @@ pub(crate) mod tests {
         }
         assert!(accepted > 0);
         assert!(budget.operations < LIMIT && budget.bytes > BYTES);
+    }
+
+    #[test]
+    fn unique_b32_prefix_churn_limits_history_until_snapshot_rebuild() {
+        let mut config = config();
+        config.block_size = 32;
+        let captured = snapshot("one");
+        let KVEvent::BlockStored(seed) = decode(&captured[3], None).unwrap().events.remove(0)
+        else {
+            panic!("captured cut begins with a Store");
+        };
+        let batch = |event| KVEventBatch {
+            ts: 0.0,
+            data_parallel_rank: Some(config.rank),
+            events: vec![event],
+        };
+        let store = |n: usize| {
+            let first_token = n as u32 * config.block_size;
+            batch(KVEvent::BlockStored(BlockStored {
+                block_hashes: vec![ExternalBlockHash::Int(n as u64)],
+                parent_block_hash: None,
+                token_ids: (first_token..first_token + config.block_size).collect(),
+                block_size: config.block_size,
+                extra_keys: None,
+                ..seed.clone()
+            }))
+        };
+        let mut state = Normalizer::new(&config);
+        for n in 0..LIMIT {
+            let stored = state
+                .apply(store(n), false, &mut NormalizedBudget::default())
+                .unwrap_or_else(|reason| panic!("Store {n}: {reason}"));
+            assert!(matches!(&stored.events[..], [KVEvent::BlockStored(_)]));
+            assert_eq!(state.total, 1, "Store {n}");
+            let remove = batch(KVEvent::BlockRemoved(BlockRemoved {
+                block_hashes: vec![ExternalBlockHash::Int(n as u64)],
+                medium: seed.medium.clone(),
+                group_idx: seed.group_idx,
+                locality: None,
+                ownership: None,
+            }));
+            let removed = state
+                .apply(remove, false, &mut NormalizedBudget::default())
+                .unwrap_or_else(|reason| panic!("Remove {n}: {reason}"));
+            assert!(matches!(&removed.events[..], [KVEvent::BlockRemoved(_)]));
+            assert_eq!(state.total, 0, "Remove {n}");
+        }
+        assert_eq!(
+            state
+                .apply(store(LIMIT), false, &mut NormalizedBudget::default())
+                .unwrap_err(),
+            "publisher history capacity"
+        );
+
+        // A complete cut with no resident pages need not retain removed history.
+        let mut empty = snapshot("removed");
+        empty.truncate(3);
+        let mut proof: serde_json::Value = serde_json::from_slice(&empty[2]).unwrap();
+        proof["block_size"] = config.block_size.into();
+        empty[2] = serde_json::to_vec(&proof).unwrap();
+        let StagedCut { mut state, .. } = stage(&empty, &empty[1], &config).unwrap();
+        let stored = state
+            .apply(store(LIMIT), false, &mut NormalizedBudget::default())
+            .unwrap();
+        assert!(matches!(&stored.events[..], [KVEvent::BlockStored(_)]));
+        assert_eq!(state.total, 1);
     }
 
     #[test]

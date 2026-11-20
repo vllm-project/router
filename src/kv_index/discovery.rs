@@ -262,8 +262,7 @@ impl KvIndexSupervisor {
         let mut snapshot_endpoints = HashSet::new();
         for (worker, mut source) in sources {
             let origin = super::endpoints::canonical_worker(&worker)?.0;
-            if source.namespace.is_empty() || source.namespace.len() > 256 || source.block_size == 0
-            {
+            if source.block_size == 0 {
                 return Err("invalid snapshot enrollment".into());
             }
             let protocol = &mut source.publisher_snapshot;

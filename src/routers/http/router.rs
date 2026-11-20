@@ -4085,7 +4085,7 @@ mod tests {
     #[tokio::test]
     async fn completion_captured_publisher_snapshot_references_control_actual_cost() {
         use crate::config::{PolicyConfig, RouterConfig};
-        let peer = crate::kv_index::CapturedPublisher::paused_ipv4();
+        let mut peer = crate::kv_index::CapturedPublisher::paused_ipv4();
         let mut fixture = completion_response_fixture().await;
         let url = fixture.worker.url().to_owned();
         let config = RouterConfig {
@@ -4100,7 +4100,6 @@ mod tests {
             kv_snapshot_sources: HashMap::from([(
                 url.clone(),
                 crate::config::types::KvSnapshotSource {
-                    namespace: "captured-upstream-b16".into(),
                     rank: 0,
                     block_size: 16,
                     publisher_snapshot: peer.config.clone(),
@@ -4125,20 +4124,38 @@ mod tests {
         let policy = fixture.router.policy_registry.get_default_policy();
         let kv = kv_aware_policy(policy.as_ref()).unwrap();
         let manager = kv.slot_manager().unwrap();
-        let supervisor = fixture.router.kv_index_supervisor.as_ref().unwrap();
         let target = kv.target_for_worker(fixture.worker.as_ref());
         let mut fallback = None;
         // A miss alone cannot prove a Remove applied; the disjoint
         // markers prove each live batch was accepted while cache credit stayed on.
-        for (step, marker, prompt, expected) in [
-            ("pending fallback", None, 100, 33),
-            ("published cut", Some(100), 100, 1),
-            ("first remove keeps one reference", Some(500), 100, 1),
-            ("last remove drops credit", Some(600), 100, 33),
-            ("clear drops all earlier placement", Some(700), 500, 33),
-            ("new Store after clear receives credit", Some(700), 700, 1),
+        for (step, marker, prompt, expected, cuts) in [
+            ("pending fallback", None, 100, 33, 1),
+            ("published cut", Some(100), 100, 1, 1),
+            ("live gap revokes credit", None, 100, 33, 2),
+            ("rebuilt cut", Some(100), 100, 1, 2),
+            ("first remove keeps one reference", Some(500), 100, 1, 2),
+            ("last remove drops credit", Some(600), 100, 33, 2),
+            ("clear drops all earlier placement", Some(700), 500, 33, 2),
+            (
+                "new Store after clear receives credit",
+                Some(700),
+                700,
+                1,
+                2,
+            ),
         ] {
             match marker {
+                None => {
+                    if cuts == 2 {
+                        peer.pause_and_skip_live_sequence();
+                    }
+                    tokio::time::timeout(
+                        Duration::from_secs(7),
+                        peer.wait_for_snapshot_request(cuts),
+                    )
+                    .await
+                    .unwrap_or_else(|_| panic!("{step}: cut request reached the paused publisher"));
+                }
                 Some(100) => peer.resume_snapshot(),
                 Some(marker @ (500 | 600)) => peer.remove_and_marker(marker),
                 Some(700) if prompt == 500 => peer.clear_and_store(700),
@@ -4167,6 +4184,7 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("{step}: positive applied-prefix barrier"));
             }
+            assert_eq!(peer.snapshot_requests(), cuts, "{step}: complete cut count");
             assert_eq!(
                 kv.target_for_worker(fixture.worker.as_ref()),
                 target,
@@ -4205,7 +4223,6 @@ mod tests {
             // A was admitted in fallback and is already waiting in the
             // backend's response queue. Do not release it until B gets credit.
             if marker.is_none() {
-                assert!(supervisor.match_provider_for_worker(&url).is_none());
                 fallback = Some(dispatch);
                 continue;
             }

@@ -898,7 +898,7 @@ mod tests {
     fn snapshot_sources_file_reaches_native_config_and_is_bounded() {
         use std::io::Write;
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(br#"{"http://127.0.0.1:8000":{"namespace":"m","rank":3,"block_size":16,"publisher_snapshot":{"endpoint":"tcp://127.0.0.1:5557","snapshot_endpoint":"tcp://127.0.0.1:5558"}}}"#).unwrap();
+        file.write_all(br#"{"http://127.0.0.1:8000":{"rank":3,"block_size":16,"publisher_snapshot":{"endpoint":"tcp://127.0.0.1:5557","snapshot_endpoint":"tcp://127.0.0.1:5558"}}}"#).unwrap();
         let args = CliArgs::try_parse_from([
             "vllm-router",
             "--worker-urls",
@@ -914,7 +914,6 @@ mod tests {
         let enrolled = &config.kv_snapshot_sources["http://127.0.0.1:8000"];
         assert_eq!(enrolled.rank, 3);
         assert_eq!(enrolled.block_size, 16);
-        assert_eq!(enrolled.namespace, "m");
         assert_eq!(enrolled.publisher_snapshot.endpoint, "tcp://127.0.0.1:5557");
         assert!(config.validate().is_ok());
         let igw_args = CliArgs::try_parse_from([

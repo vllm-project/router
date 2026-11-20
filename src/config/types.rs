@@ -1204,7 +1204,6 @@ pub struct StaticKvEventSources {
 /// Explicit publisher enrollment. Endpoint trust is never inferred from metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KvSnapshotSource {
-    pub namespace: String,
     pub rank: u32,
     pub block_size: u32,
     pub publisher_snapshot: PublisherSnapshotSource,
