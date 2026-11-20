@@ -79,6 +79,11 @@ pub trait Worker: Send + Sync + fmt::Debug {
         // Workers that track load should override this
     }
 
+    /// Transfer load-metric ownership on registry registration or retirement.
+    /// Implementations publishing load must serialize this with load transitions;
+    /// retired workers still update their own counters for in-flight requests.
+    fn set_load_metrics_enabled(&self, _enabled: bool) {}
+
     /// Get the number of processed requests
     fn processed_requests(&self) -> usize;
 
@@ -305,6 +310,11 @@ pub struct BasicWorker {
     dp_size: Option<usize>,
     api_key: Option<Arc<str>>,
     load_counter: Arc<AtomicUsize>,
+    /// Cache the metric label once; load transitions run for every request.
+    load_gauge_key: metrics::Key,
+    /// Serialize transitions, publication and retirement across all clones.
+    /// The flag prevents retired instances from writing a replacement's series.
+    load_publish_lock: Arc<parking_lot::Mutex<bool>>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
     consecutive_failures: Arc<AtomicUsize>,
@@ -347,6 +357,8 @@ impl BasicWorker {
             dp_size: None,
             api_key: None,
             load_counter: Arc::new(AtomicUsize::new(0)),
+            load_gauge_key: RouterMetrics::worker_load_key(&url),
+            load_publish_lock: Arc::new(parking_lot::Mutex::new(true)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
@@ -497,19 +509,46 @@ impl Worker for BasicWorker {
     }
 
     fn increment_load(&self) {
-        self.load_counter.fetch_add(1, Ordering::Relaxed);
+        let publishing = self.load_publish_lock.lock();
+        let load = self.load_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if *publishing {
+            RouterMetrics::set_worker_load_by_key(&self.load_gauge_key, load);
+        }
     }
 
     fn decrement_load(&self) {
-        self.load_counter
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_sub(1)
-            })
-            .ok();
+        let publishing = self.load_publish_lock.lock();
+        // Publish only a successful release. The update closure may be retried,
+        // so derive the sample from the committed previous value.
+        if let Ok(previous) =
+            self.load_counter
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_sub(1)
+                })
+        {
+            if *publishing {
+                RouterMetrics::set_worker_load_by_key(&self.load_gauge_key, previous - 1);
+            }
+        }
     }
 
     fn reset_load(&self) {
+        let publishing = self.load_publish_lock.lock();
         self.load_counter.store(0, Ordering::Relaxed);
+        if *publishing {
+            RouterMetrics::set_worker_load_by_key(&self.load_gauge_key, 0);
+        }
+    }
+
+    fn set_load_metrics_enabled(&self, enabled: bool) {
+        let mut publishing = self.load_publish_lock.lock();
+        if enabled || *publishing {
+            // Retirement waits for every earlier publication, then clears the
+            // series before a new instance is allowed to publish its load.
+            let load = if enabled { self.load() } else { 0 };
+            RouterMetrics::set_worker_load_by_key(&self.load_gauge_key, load);
+        }
+        *publishing = enabled;
     }
 
     fn processed_requests(&self) -> usize {
@@ -621,6 +660,10 @@ impl Worker for DPAwareWorker {
 
     fn reset_load(&self) {
         self.base_worker.reset_load();
+    }
+
+    fn set_load_metrics_enabled(&self, enabled: bool) {
+        self.base_worker.set_load_metrics_enabled(enabled);
     }
 
     fn processed_requests(&self) -> usize {
@@ -1000,6 +1043,228 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
+
+    struct BlockingGauge {
+        value: AtomicUsize,
+        first_entered: std::sync::mpsc::SyncSender<()>,
+        second_entered: std::sync::mpsc::SyncSender<()>,
+        release_first: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl metrics::GaugeFn for BlockingGauge {
+        fn increment(&self, _: f64) {
+            unreachable!()
+        }
+        fn decrement(&self, _: f64) {
+            unreachable!()
+        }
+        fn set(&self, value: f64) {
+            if value == 1.0 {
+                self.first_entered.send(()).unwrap();
+                self.release_first
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            } else if value == 2.0 {
+                self.second_entered.send(()).unwrap();
+            }
+            self.value.store(value as usize, Ordering::SeqCst);
+        }
+    }
+    struct Recorder(Arc<BlockingGauge>);
+    impl metrics::Recorder for Recorder {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            if key.name() == "vllm_router_worker_load" {
+                metrics::Gauge::from_arc(self.0.clone())
+            } else {
+                metrics::Gauge::noop()
+            }
+        }
+    }
+
+    /// The load gauge is the only externally visible signal for load-accounting
+    /// drift; it must follow every transition of the counter.
+    #[test]
+    fn worker_load_gauge_tracks_every_transition() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://gauge-worker:8000".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let rendered_load = |handle: &metrics_exporter_prometheus::PrometheusHandle| {
+            handle
+                .render()
+                .lines()
+                .find(|line| line.starts_with("vllm_router_worker_load{"))
+                .map(str::to_string)
+        };
+
+        assert!(
+            rendered_load(&handle).is_none(),
+            "an untouched worker must not publish a load sample"
+        );
+
+        worker.decrement_load();
+        assert!(
+            rendered_load(&handle).is_none(),
+            "decrement at zero must not publish"
+        );
+        worker.increment_load();
+        worker.increment_load();
+        assert_eq!(
+            rendered_load(&handle).as_deref(),
+            Some("vllm_router_worker_load{worker=\"http://gauge-worker:8000\"} 2")
+        );
+
+        worker.decrement_load();
+        assert_eq!(
+            rendered_load(&handle).as_deref(),
+            Some("vllm_router_worker_load{worker=\"http://gauge-worker:8000\"} 1")
+        );
+
+        worker.decrement_load();
+        assert_eq!(
+            rendered_load(&handle).as_deref(),
+            Some("vllm_router_worker_load{worker=\"http://gauge-worker:8000\"} 0")
+        );
+
+        // A saturating decrement at zero releases nothing and must keep the
+        // published load at zero rather than going negative.
+        worker.decrement_load();
+        assert_eq!(
+            rendered_load(&handle).as_deref(),
+            Some("vllm_router_worker_load{worker=\"http://gauge-worker:8000\"} 0")
+        );
+        assert_eq!(worker.load(), 0);
+        worker.increment_load();
+        worker.reset_load();
+        assert_eq!(worker.load(), 0);
+        assert_eq!(
+            rendered_load(&handle).as_deref(),
+            Some("vllm_router_worker_load{worker=\"http://gauge-worker:8000\"} 0")
+        );
+    }
+
+    #[test]
+    fn worker_load_gauge_stays_current_when_clones_publish_concurrently() {
+        let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+        let (second_tx, second_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let gauge = Arc::new(BlockingGauge {
+            value: AtomicUsize::new(0),
+            first_entered: first_tx,
+            second_entered: second_tx,
+            release_first: std::sync::Mutex::new(release_rx),
+        });
+        let recorder = Recorder(gauge.clone());
+        let worker = BasicWorker::new("http://concurrent-gauge:8000".into(), WorkerType::Regular);
+        let worker_clone = worker.clone();
+        std::thread::scope(|scope| {
+            let first =
+                scope.spawn(|| metrics::with_local_recorder(&recorder, || worker.increment_load()));
+            first_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let second = scope.spawn(|| {
+                metrics::with_local_recorder(&recorder, || worker_clone.increment_load())
+            });
+            // Without publication ordering the second sample overtakes the blocked
+            // first one. With ordering, it waits until the first is released.
+            let _ = second_rx.recv_timeout(Duration::from_millis(100));
+            release_tx.send(()).unwrap();
+            first.join().unwrap();
+            second.join().unwrap();
+        });
+        assert_eq!(worker.load(), 2);
+        assert_eq!(gauge.value.load(Ordering::SeqCst), worker.load());
+    }
+
+    #[test]
+    fn worker_replacement_waits_for_in_progress_load_publication() {
+        let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+        let (second_tx, _) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let gauge = Arc::new(BlockingGauge {
+            value: AtomicUsize::new(0),
+            first_entered: first_tx,
+            second_entered: second_tx,
+            release_first: std::sync::Mutex::new(release_rx),
+        });
+        let recorder = Recorder(gauge.clone());
+        let registry = super::super::WorkerRegistry::new();
+        let old = Arc::new(BasicWorker::new(
+            "http://replacement-gauge:8000".into(),
+            WorkerType::Regular,
+        ));
+        registry.register(old.clone());
+        // The next release publishes 1 and blocks inside the recorder.
+        old.increment_load();
+        old.increment_load();
+        let current = Arc::new(BasicWorker::new(old.url().into(), WorkerType::Regular));
+        let (registered_tx, registered_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let release =
+                scope.spawn(|| metrics::with_local_recorder(&recorder, || old.decrement_load()));
+            first_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let replace = scope.spawn(|| {
+                metrics::with_local_recorder(&recorder, || {
+                    registry.register(current.clone());
+                    registered_tx.send(()).unwrap();
+                })
+            });
+            let completed_while_old_write_blocked =
+                registered_rx.recv_timeout(Duration::from_millis(100));
+            release_tx.send(()).unwrap();
+            release.join().unwrap();
+            replace.join().unwrap();
+            assert!(completed_while_old_write_blocked.is_err());
+        });
+        assert_eq!(old.load(), 1);
+        assert_eq!(current.load(), 0);
+        assert_eq!(gauge.value.load(Ordering::SeqCst), 0);
+        // A later old release must still drain its counter without publishing.
+        metrics::with_local_recorder(&recorder, || old.decrement_load());
+        assert_eq!(old.load(), 0);
+        assert_eq!(gauge.value.load(Ordering::SeqCst), 0);
+    }
 
     // Test WorkerType
     #[test]
