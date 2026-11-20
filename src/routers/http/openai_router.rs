@@ -1,6 +1,6 @@
 //! OpenAI router implementation (reqwest-based)
 
-use crate::config::CircuitBreakerConfig;
+use crate::config::{CircuitBreakerConfig, DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS};
 use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::protocols::spec::{
@@ -18,13 +18,17 @@ use futures_util::StreamExt;
 use std::{
     any::Any,
     sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
+
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Router for OpenAI backend
 #[derive(Debug)]
 pub struct OpenAIRouter {
     /// HTTP client for upstream OpenAI-compatible API
     client: reqwest::Client,
+    sse_forward_stall_timeout: Duration,
     /// Base URL for identification (no trailing slash)
     base_url: String,
     /// Circuit breaker
@@ -39,8 +43,21 @@ impl OpenAIRouter {
         base_url: String,
         circuit_breaker_config: Option<CircuitBreakerConfig>,
     ) -> Result<Self, String> {
+        Self::with_stall_timeout(
+            base_url,
+            circuit_breaker_config,
+            Duration::from_secs(DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS),
+        )
+        .await
+    }
+
+    pub(crate) async fn with_stall_timeout(
+        base_url: String,
+        circuit_breaker_config: Option<CircuitBreakerConfig>,
+        stall_timeout: Duration,
+    ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(CLIENT_TIMEOUT)
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
@@ -60,6 +77,7 @@ impl OpenAIRouter {
 
         Ok(Self {
             client,
+            sse_forward_stall_timeout: stall_timeout,
             base_url,
             circuit_breaker,
             healthy: AtomicBool::new(true),
@@ -332,28 +350,33 @@ impl super::super::RouterTrait for OpenAIRouter {
                 }
             }
         } else {
-            // Stream SSE bytes to client
+            // Stream SSE bytes to client, bounded by the same Router-owned queue
+            // the rest of the HTTP path uses: an unbounded hand-off lets this task
+            // pull from the worker faster than the client reads.
             let stream = resp.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            // Bound each wait for downstream capacity, independently of stream age.
+            let (forward, body_stream) = super::router::sse_forward_channel(
+                self.sse_forward_stall_timeout,
+                &self.base_url,
+                "/v1/chat/completions",
+            );
             tokio::spawn(async move {
                 let mut s = stream;
                 while let Some(chunk) = s.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
+                            if forward.send(bytes).await != super::router::HandOff::Sent {
                                 break;
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                            forward.fail(format!("Stream error: {}", e));
                             break;
                         }
                     }
                 }
             });
-            let mut response = Response::new(Body::from_stream(
-                tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
-            ));
+            let mut response = Response::new(Body::from_stream(body_stream));
             *response.status_mut() = status;
             response
                 .headers_mut()

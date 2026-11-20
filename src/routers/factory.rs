@@ -121,8 +121,12 @@ impl RouterFactory {
             .cloned()
             .ok_or_else(|| "OpenAI mode requires at least one worker URL".to_string())?;
 
-        let router =
-            OpenAIRouter::new(base_url, Some(ctx.router_config.circuit_breaker.clone())).await?;
+        let router = OpenAIRouter::with_stall_timeout(
+            base_url,
+            Some(ctx.router_config.circuit_breaker.clone()),
+            std::time::Duration::from_secs(ctx.router_config.sse_forward_stall_timeout_secs),
+        )
+        .await?;
 
         Ok(Box::new(router))
     }

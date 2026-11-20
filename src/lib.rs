@@ -84,6 +84,7 @@ struct Router {
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
     request_timeout_secs: u64,
+    sse_forward_stall_timeout_secs: u64,
     request_id_headers: Option<Vec<String>>,
     vllm_pd_disaggregation: bool,
     vllm_discovery_address: Option<String>,
@@ -239,6 +240,7 @@ impl Router {
             connection_mode: config::ConnectionMode::Http,
             max_payload_size: self.max_payload_size,
             request_timeout_secs: self.request_timeout_secs,
+            sse_forward_stall_timeout_secs: self.sse_forward_stall_timeout_secs,
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: self.worker_startup_check_interval,
             intra_node_data_parallel_size: self.intra_node_data_parallel_size,
@@ -387,6 +389,7 @@ impl Router {
         kv_event_block_size = 16,
         kv_event_model = None,
         kv_event_strict_recovery = false,
+        sse_forward_stall_timeout_secs = config::DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -465,6 +468,7 @@ impl Router {
         kv_event_block_size: u32,
         kv_event_model: Option<String>,
         kv_event_strict_recovery: bool,
+        sse_forward_stall_timeout_secs: u64,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -524,6 +528,7 @@ impl Router {
             prometheus_port,
             prometheus_host,
             request_timeout_secs,
+            sse_forward_stall_timeout_secs,
             request_id_headers,
             vllm_pd_disaggregation,
             vllm_discovery_address,
