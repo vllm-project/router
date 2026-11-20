@@ -108,16 +108,58 @@ impl ProgramScheduler {
     ) {
         let now = Instant::now();
         let mut state = self.state.lock();
+        // Reject duplicate/stale callbacks before any verification or ledger
+        // side effects, including when another attempt is still in flight.
+        if !state.runtime.is_live_attempt(dispatch) {
+            return;
+        }
         let Some(runtime_before) = state.runtime.view(dispatch.program()) else {
             return;
         };
         if runtime_before.placement.as_deref() != Some(dispatch.target_id.as_str()) {
             return;
         }
+        // Zero prompt usage is missing evidence, as in fingerprint verification.
+        // Normalize it before runtime, capacity and TTL accounting so it cannot
+        // erase a retained context reservation or become a zero-size sample.
+        let usage = ProgramUsageObservation {
+            prompt_tokens: usage.prompt_tokens.filter(|tokens| *tokens > 0),
+            ..usage
+        };
         let target_id = dispatch.target_id.clone();
-        let observed_prompt_tokens = usage
-            .prompt_tokens
-            .unwrap_or(dispatch.estimated_context_tokens());
+        let observed_prompt_tokens = usage.prompt_tokens.unwrap_or(dispatch.context_tokens());
+        // Reconcile the prepared fact the attempt carried. In shadow mode the
+        // applied decision used the estimate, so the prepared count lives in the
+        // counterfactual; reconciling it there is what lets a shadow rollout
+        // detect tokenizer/template drift before enabling exact mode.
+        let (reconcile_source, reconcile_fingerprint, reconcile_prepared_tokens) =
+            if dispatch.context_token_source().is_prepared() {
+                (
+                    dispatch.context_token_source(),
+                    dispatch.context_token_fingerprint(),
+                    Some(dispatch.context_tokens()),
+                )
+            } else if let Some(shadow) = dispatch.shadow_context_facts() {
+                (shadow.source(), shadow.fingerprint(), Some(shadow.tokens()))
+            } else {
+                (
+                    dispatch.context_token_source(),
+                    dispatch.context_token_fingerprint(),
+                    None,
+                )
+            };
+        // A failed/cancelled request without usage is not evidence that the
+        // backend lacks usage support.
+        if success || usage.prompt_tokens.is_some_and(|tokens| tokens > 0) {
+            self.reconcile_observed_prompt_tokens(
+                &mut state,
+                dispatch.program().model_pool(),
+                reconcile_source,
+                reconcile_fingerprint,
+                reconcile_prepared_tokens,
+                usage.prompt_tokens,
+            );
+        }
         let fallback_cached_tokens = state
             .rank_factors
             .get(&target_id)
@@ -307,11 +349,18 @@ impl ProgramScheduler {
                     || decision
                         .shared_prefix_fresh_until
                         .is_none_or(|deadline| now >= deadline));
+            let context_is_quiescent = runtime_after.as_ref().is_some_and(|runtime| {
+                runtime.in_flight_requests == 0 && runtime.waiting_requests == 0
+            });
+            let trusted_prepared = dispatch.context_token_source().is_prepared();
             if usage.prompt_tokens.is_some() {
-                decision.observe_completed_context(observed_prompt_tokens);
-            } else if observed_prompt_tokens >= decision.estimated_context_tokens {
-                decision.estimated_context_tokens = observed_prompt_tokens;
-                decision.context_shrink_observations = 0;
+                decision.observe_completed_context(
+                    observed_prompt_tokens,
+                    trusted_prepared,
+                    context_is_quiescent,
+                );
+            } else if observed_prompt_tokens >= decision.context.tokens() {
+                decision.set_context_tokens(observed_prompt_tokens);
             }
             if success {
                 RouterMetrics::record_agent_aware_cache_miss_impact(
@@ -462,9 +511,8 @@ impl ProgramScheduler {
         // update it before reconciling the active reservation below.
         if let Some(context_tokens) = state.runtime.front_request_context(dispatch.program()) {
             if let Some(decision) = state.decisions.get_mut(dispatch.program()) {
-                if self.config.pd_mode || context_tokens > decision.estimated_context_tokens {
-                    decision.estimated_context_tokens = context_tokens;
-                    decision.context_shrink_observations = 0;
+                if self.config.pd_mode || context_tokens > decision.context.tokens() {
+                    decision.set_context_tokens(context_tokens);
                 }
             }
         }
@@ -805,9 +853,9 @@ impl ProgramScheduler {
                         let input = if program.status == ProgramStatus::Acting {
                             decision
                                 .last_context_tokens
-                                .unwrap_or(decision.estimated_context_tokens)
+                                .unwrap_or(decision.context.tokens())
                         } else {
-                            decision.estimated_context_tokens
+                            decision.context.tokens()
                         };
                         let score = elapsed
                             * (1.0 / (input as f64 / average_prompt).max(1e-6).sqrt()).max(0.5);
@@ -912,6 +960,7 @@ impl ProgramScheduler {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::program_scheduling::{ProgramIdentity, ProgramSchedulerConfig, ProgramTarget};
@@ -939,7 +988,12 @@ mod tests {
             dp_rank: Some(0),
         };
         let dispatch = scheduler
-            .acquire(identity("p"), 100, &[target], None)
+            .acquire(
+                identity("p"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         scheduler.complete(
@@ -1258,7 +1312,12 @@ mod tests {
             .unwrap()
             .unwrap();
         let dispatch = scheduler
-            .acquire(identity, 100, &[target], None)
+            .acquire(
+                identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         scheduler.complete(&dispatch, true, false, Some(100), Some(0.1));
@@ -1272,6 +1331,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_prompt_usage_preserves_retained_context_and_capacity() {
+        use crate::program_scheduling::{ArrivalTokenFacts, TokenFacts, TokenizerFingerprint};
+
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig {
+            token_count_verification_settlements: 0,
+            ..Default::default()
+        });
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: None,
+        };
+        let identity = ProgramIdentity::from_request(
+            None,
+            Some(&json!({"vllm_xargs":{"agentic_context":{
+                "program_id":"zero-usage", "expected_resume":true,
+                "kv_retention_ttl_seconds":7.0
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap();
+        let context = scheduler.resolve_arrival_tokens(
+            "model",
+            ArrivalTokenFacts::new(
+                2000,
+                Some(TokenFacts::prepared_token_ids(
+                    1000,
+                    TokenizerFingerprint::from_parts(&["zero-usage"]),
+                )),
+            ),
+        );
+        let dispatch = scheduler
+            .acquire(identity, context, &[target], None)
+            .await
+            .unwrap();
+        assert!(dispatch.context_token_source().is_prepared());
+        let reserved_before = scheduler.diagnostics().ranks[0].router_estimated_used_tokens;
+        scheduler.complete(&dispatch, true, false, Some(0), Some(0.1));
+
+        let snapshot = scheduler.diagnostics();
+        assert_eq!(snapshot.ranks[0].programs[0].status, "acting");
+        assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 1000);
+        assert_eq!(
+            snapshot.ranks[0].router_estimated_used_tokens,
+            reserved_before
+        );
+        let state = scheduler.state.lock();
+        let decision = &state.decisions[dispatch.program()];
+        assert_eq!(decision.last_context_tokens, Some(1000));
+        assert!(decision.last_cache_miss_impact_seconds > 0.0);
+    }
+
+    #[tokio::test]
     async fn capacity_repair_does_not_remark_committed_future_relief() {
         let mut config = ProgramSchedulerConfig::default();
         config.progress_ttl.token_capacity = Some(400);
@@ -1282,11 +1395,21 @@ mod tests {
             dp_rank: Some(0),
         };
         let first = scheduler
-            .acquire(identity("first"), 100, std::slice::from_ref(&target), None)
+            .acquire(
+                identity("first"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                std::slice::from_ref(&target),
+                None,
+            )
             .await
             .unwrap();
         let second = scheduler
-            .acquire(identity("second"), 100, &[target], None)
+            .acquire(
+                identity("second"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         let now = Instant::now();
@@ -1301,12 +1424,12 @@ mod tests {
                 .decisions
                 .get_mut(first.program())
                 .unwrap()
-                .estimated_context_tokens = 140;
+                .set_context_tokens(140);
             state
                 .decisions
                 .get_mut(second.program())
                 .unwrap()
-                .estimated_context_tokens = 140;
+                .set_context_tokens(140);
             assert!(!scheduler.repair_capacity(&mut state, now));
             assert!(state.decisions[first.program()].pause_when_idle);
             assert!(!state.decisions[second.program()].pause_when_idle);
@@ -1420,7 +1543,7 @@ mod tests {
                 .decisions
                 .get_mut(dispatch.program())
                 .unwrap()
-                .estimated_context_tokens = 300;
+                .set_context_tokens(300);
         }
         let high = state.decisions.get_mut(high_value.program()).unwrap();
         high.ttl_deadline = Some(now + Duration::from_secs(10));
@@ -1454,14 +1577,19 @@ mod tests {
         let first = scheduler
             .acquire(
                 identity("segment"),
-                100,
+                crate::program_scheduling::ContextTokens::estimated(100),
                 std::slice::from_ref(&target),
                 None,
             )
             .await
             .unwrap();
         let second = scheduler
-            .acquire(identity("segment"), 130, &[target], None)
+            .acquire(
+                identity("segment"),
+                crate::program_scheduling::ContextTokens::estimated(130),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         assert!(first.placement_start_request());
@@ -1503,7 +1631,12 @@ mod tests {
             dp_rank: Some(0),
         };
         let dispatch = scheduler
-            .acquire(identity("missing-cache"), 100, &[target], None)
+            .acquire(
+                identity("missing-cache"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         scheduler.complete(
@@ -1530,7 +1663,12 @@ mod tests {
             dp_rank: Some(0),
         };
         let dispatch = scheduler
-            .acquire(identity("terminal"), 100, &[target], None)
+            .acquire(
+                identity("terminal"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(

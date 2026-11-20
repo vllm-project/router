@@ -63,8 +63,8 @@
 */
 
 use super::{
-    get_healthy_worker_indices, CacheAwareConfig, KvRequestTokens, LoadBalancingPolicy,
-    RequestHeaders, SelectionContext,
+    get_healthy_worker_indices, pick_tied, CacheAwareConfig, KvRequestTokens, LoadBalancingPolicy,
+    RequestHeaders, SelectionContext, WorkerTokenInputs,
 };
 use crate::core::{Worker, WorkerLoadGuard};
 use crate::metrics::RouterMetrics;
@@ -94,7 +94,7 @@ pub struct CacheAwarePlacement {
 }
 
 /// Prefix matching prepared before PD admission; selection samples fresh load.
-pub(crate) struct PreparedCacheSelection {
+pub struct PreparedCacheSelection {
     tree: Arc<Tree>,
     candidates: HashMap<String, (Vec<Arc<str>>, f64)>,
 }
@@ -363,9 +363,11 @@ impl CacheAwarePolicy {
             .map(|(_, rate)| *rate)
             .fold(0.0_f64, f64::max);
         let use_prefix = !imbalanced && best_rate > self.config.cache_threshold as f64;
-        let position = (0..healthy.len())
-            .filter(|&i| !use_prefix || matches[i].1 == best_rate)
-            .min_by_key(|&i| workers[healthy[i]].load())?;
+        let position = Self::pick_least_loaded(
+            (0..healthy.len())
+                .filter(|&i| !use_prefix || matches[i].1 == best_rate)
+                .map(|i| (i, workers[healthy[i]].load())),
+        )?;
         let index = healthy[position];
         for key in &matches[position].0 {
             prepared.tree.insert(key, workers[index].url());
@@ -446,10 +448,30 @@ impl CacheAwarePolicy {
     }
 
     fn least_loaded(workers: &[Arc<dyn Worker>], healthy: &[usize]) -> Option<usize> {
-        healthy
-            .iter()
-            .min_by_key(|&&idx| workers[idx].load())
-            .copied()
+        Self::pick_least_loaded(healthy.iter().map(|&idx| (idx, workers[idx].load())))
+    }
+
+    /// Picks uniformly among the `(id, load)` candidates with the lowest load
+    /// and returns the `id` of the chosen candidate.
+    ///
+    /// The `id` is opaque here: `least_loaded()` passes worker indices, while
+    /// `select_prepared()` passes indices into `healthy`.
+    ///
+    /// Each load is read once so that concurrent updates cannot change
+    /// which candidates count as tied.
+    fn pick_least_loaded(candidates: impl Iterator<Item = (usize, usize)>) -> Option<usize> {
+        let mut min_load = usize::MAX;
+        let mut tied = Vec::new();
+        for (id, load) in candidates {
+            if load < min_load {
+                min_load = load;
+                tied.clear();
+            }
+            if load == min_load {
+                tied.push(id);
+            }
+        }
+        pick_tied(&tied)
     }
 
     /// Choose using an approximate affinity observation, but current eligibility
@@ -476,7 +498,7 @@ impl CacheAwarePolicy {
             {
                 return Some((idx, false));
             }
-            return healthy.first().copied().map(|idx| (idx, true));
+            return Self::least_loaded(workers, healthy).map(|idx| (idx, true));
         }
         Self::least_loaded(workers, healthy).map(|idx| (idx, false))
     }
@@ -622,6 +644,29 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         "cache_aware"
     }
 
+    /// Re-running needs the prefix selection prepared at admission; without it
+    /// the request body would have to be carried across the Prefill.
+    fn can_redecide_at_dispatch(&self, decode_cache_ready: bool) -> bool {
+        decode_cache_ready
+    }
+
+    fn prepare_cache_selection(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        tokens: &WorkerTokenInputs,
+        model_id: Option<&str>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+    ) -> Option<PreparedCacheSelection> {
+        self.prepare_selection(
+            workers,
+            KvRequestTokens::PerWorker(tokens),
+            model_id,
+            lora_name,
+            cache_salt,
+        )
+    }
+
     fn needs_cache_routing_key(&self) -> bool {
         true
     }
@@ -740,6 +785,7 @@ impl Drop for CacheAwarePolicy {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
@@ -1065,7 +1111,10 @@ mod tests {
                 counts[idx] += 1;
                 sessions.push((ids, idx));
             }
-            assert_eq!(counts, [8, 8, 7, 7], "shared tokens: {common_tokens}");
+            // Load ties pick a random worker, so only the balance is fixed.
+            let mut sorted = counts;
+            sorted.sort_unstable_by(|a, b| b.cmp(a));
+            assert_eq!(sorted, [8, 8, 7, 7], "shared tokens: {common_tokens}");
 
             // A new turn must distinguish histories beyond the old 2048-token window.
             for (mut ids, owner) in sessions {
@@ -1096,13 +1145,77 @@ mod tests {
             )
         };
         let first = chat_key("甲");
-        assert_eq!(policy.select_worker(&workers, Some(&first)), Some(0));
-        workers[0].increment_load();
+        let owner = policy.select_worker(&workers, Some(&first)).unwrap();
+        workers[owner].increment_load();
         assert_eq!(
             policy.select_worker(&workers, Some(&chat_key("乙"))),
-            Some(1)
+            Some(1 - owner)
         );
-        assert_eq!(policy.select_worker(&workers, Some(&first)), Some(0));
+        assert_eq!(policy.select_worker(&workers, Some(&first)), Some(owner));
+    }
+
+    fn select_tokens(policy: &CacheAwarePolicy, workers: &[Arc<dyn Worker>], ids: &[u32]) -> usize {
+        policy
+            .select_worker_with_inputs(
+                workers,
+                KvRequestTokens::Shared(Some(ids)),
+                Some("model"),
+                None,
+                None,
+                "regular",
+            )
+            .unwrap()
+    }
+
+    /// Selects 64 times and records which workers were chosen.
+    /// A two-way tie misses a given candidate with probability 2^-64; the two
+    /// events are disjoint, so this check fails with probability 2^-63.
+    fn reached(worker_count: usize, mut select: impl FnMut(u32) -> usize) -> Vec<bool> {
+        let mut seen = vec![false; worker_count];
+        for round in 0..64 {
+            seen[select(round)] = true;
+        }
+        seen
+    }
+
+    #[test]
+    fn least_load_ties_spread_without_letting_a_busier_worker_win() {
+        let imbalanced = CacheAwareConfig {
+            balance_abs_threshold: 0,
+            balance_rel_threshold: 1.0,
+            ..Default::default()
+        };
+        for (path, config) in [
+            ("prefix_miss", CacheAwareConfig::default()),
+            ("missing_tokens", CacheAwareConfig::default()),
+            ("load_imbalance", imbalanced),
+        ] {
+            let (policy, workers) = cache_fixture(3, config);
+            workers[2].increment_load();
+            if path == "load_imbalance" {
+                // Only the imbalance guard may move this prompt off worker 2.
+                select_tokens(&policy, std::slice::from_ref(&workers[2]), &[7; 8]);
+            }
+            let seen = reached(3, |round| match path {
+                "prefix_miss" => select_tokens(&policy, &workers, &[round + 100; 8]),
+                "missing_tokens" => policy.select_prepared(&workers, None, "regular").unwrap(),
+                _ => select_tokens(&policy, &workers, &[7; 8]),
+            });
+            assert_eq!(seen, [true, true, false], "{path}");
+        }
+    }
+
+    #[test]
+    fn equal_prefix_matches_spread_ties_and_keep_the_match() {
+        let (policy, workers) = cache_fixture(3, CacheAwareConfig::default());
+        let ids = [7; 8];
+        // Worker 2 is idle but has no history, so it must never outrank a match.
+        for worker in &workers[..2] {
+            select_tokens(&policy, std::slice::from_ref(worker), &ids);
+            worker.increment_load();
+        }
+        let seen = reached(3, |_| select_tokens(&policy, &workers, &ids));
+        assert_eq!(seen, [true, true, false]);
     }
 
     #[test]

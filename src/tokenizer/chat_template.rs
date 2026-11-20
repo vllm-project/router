@@ -116,6 +116,7 @@ pub fn load_chat_template_from_config(config_path: &str) -> Result<Option<String
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

@@ -30,6 +30,77 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+/// Whether a decode policy can be re-run at dispatch and still produce a
+/// meaningful answer.
+///
+/// The policy owns the answer — kv_aware reads live occupancy, KV events and
+/// affinity; cache_aware re-runs from the prepared prefix selection the caller
+/// carries into the commitment — so this router-side helper only forwards the
+/// one input the policy cannot see.
+fn decode_policy_can_defer(
+    policy: &dyn LoadBalancingPolicy,
+    context: &PdRequestContext<'_>,
+) -> bool {
+    policy.can_redecide_at_dispatch(context.decode_cache.is_some())
+}
+
+/// Stage eligibility shared by admission and the deferred commitment.
+///
+/// Admission must not switch an endpoint between aggregate and per-rank
+/// accounting while requests are live, so existing granularities are indexed
+/// once instead of rescanning every load key for every candidate. Both entry
+/// points filter through this type, so the two cannot drift apart.
+struct Eligibility<'a, 'b> {
+    active_granularities: HashSet<(Stage, &'a str, bool)>,
+    context: &'a PdRequestContext<'b>,
+}
+
+impl<'a, 'b> Eligibility<'a, 'b> {
+    fn new(loads: &'a Loads, context: &'a PdRequestContext<'b>) -> Self {
+        let active_granularities = loads
+            .keys()
+            .map(|(stage, endpoint)| {
+                (
+                    *stage,
+                    endpoint.http_url.as_str(),
+                    endpoint.dp_rank.is_some(),
+                )
+            })
+            .collect();
+        Self {
+            active_granularities,
+            context,
+        }
+    }
+
+    fn is_eligible(&self, stage: Stage, worker: &dyn Worker, endpoint: &PdEndpoint) -> bool {
+        let granularity_matches = !self.active_granularities.contains(&(
+            stage,
+            endpoint.http_url.as_str(),
+            endpoint.dp_rank.is_none(),
+        ));
+        worker.is_available()
+            && granularity_matches
+            && model_eligible(worker, self.context.model_id)
+    }
+
+    /// Eligible worker indices for `stage`, with their endpoints in pool order.
+    fn pool(&self, stage: Stage, workers: &[Arc<dyn Worker>]) -> (Vec<PdEndpoint>, Vec<usize>) {
+        let endpoints: Vec<_> = workers
+            .iter()
+            .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
+            .collect();
+        let indices = workers
+            .iter()
+            .zip(&endpoints)
+            .enumerate()
+            .filter(|(_, (worker, endpoint))| self.is_eligible(stage, worker.as_ref(), endpoint))
+            .map(|(index, _)| index)
+            .collect();
+        (endpoints, indices)
+    }
+}
+
 /// Admission decision over the supplied load snapshot. Legacy policies
 /// retain their own selection semantics and text/header inputs.
 pub(super) fn select_pd_pair(
@@ -39,51 +110,11 @@ pub(super) fn select_pd_pair(
     prefill_policy: &dyn LoadBalancingPolicy,
     decode_policy: &dyn LoadBalancingPolicy,
     context: &PdRequestContext<'_>,
+    bind_decode: bool,
 ) -> Option<PdSelection> {
-    // Admission must not switch an endpoint between aggregate and per-rank
-    // accounting while requests are live. Index existing granularities once
-    // instead of rescanning every load key for every candidate.
-    let active_granularities: HashSet<(Stage, &str, bool)> = loads
-        .keys()
-        .map(|(stage, endpoint)| {
-            (
-                *stage,
-                endpoint.http_url.as_str(),
-                endpoint.dp_rank.is_some(),
-            )
-        })
-        .collect();
-    let eligible = |stage: Stage, worker: &dyn Worker, endpoint: &PdEndpoint| {
-        let granularity_matches = !active_granularities.contains(&(
-            stage,
-            endpoint.http_url.as_str(),
-            endpoint.dp_rank.is_none(),
-        ));
-        worker.is_available()
-            && granularity_matches
-            && context
-                .model_id
-                .is_none_or(|model| worker.model_id() == "unknown" || worker.model_id() == model)
-    };
-    let prefill_endpoints: Vec<_> = prefill_workers
-        .iter()
-        .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
-        .collect();
-    let decode_endpoints: Vec<_> = decode_workers
-        .iter()
-        .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
-        .collect();
-    let eligible_indices = |stage, workers: &[Arc<dyn Worker>], endpoints: &[PdEndpoint]| {
-        workers
-            .iter()
-            .zip(endpoints)
-            .enumerate()
-            .filter(|(_, (worker, endpoint))| eligible(stage, worker.as_ref(), endpoint))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>()
-    };
-    let prefill_indices = eligible_indices(Stage::Prefill, prefill_workers, &prefill_endpoints);
-    let decode_indices = eligible_indices(Stage::Decode, decode_workers, &decode_endpoints);
+    let eligibility = Eligibility::new(loads, context);
+    let (prefill_endpoints, prefill_indices) = eligibility.pool(Stage::Prefill, prefill_workers);
+    let (decode_endpoints, decode_indices) = eligibility.pool(Stage::Decode, decode_workers);
     if prefill_indices.is_empty() || decode_indices.is_empty() {
         return None;
     }
@@ -96,17 +127,89 @@ pub(super) fn select_pd_pair(
         prefill_policy,
         context,
     )?;
-    let decode = select_stage(
+    let decode = if bind_decode {
+        select_stage(
+            loads,
+            Stage::Decode,
+            decode_workers,
+            &decode_endpoints,
+            &decode_indices,
+            decode_policy,
+            context,
+        )?
+    } else {
+        // The deferred pickup is provisional: it only seeds the request identity
+        // and the Prefill KV parameters. Scoring it through the policy would
+        // consume the decode tie cursor, so the commitment - which advances the
+        // cursor itself - would start one tick late and break the tie rotation.
+        provisional_decode(loads, &decode_endpoints, &decode_indices)?
+    };
+
+    Some(PdSelection { prefill, decode })
+}
+
+/// Deterministic stand-in for a decode decision that will be taken later.
+///
+/// Uses the lowest projected occupancy, first index on a tie, and consults no
+/// policy state, so a pick that may be discarded cannot bias later decisions.
+fn provisional_decode(
+    loads: &Loads,
+    endpoints: &[PdEndpoint],
+    indices: &[usize],
+) -> Option<StageDecision> {
+    let (worker_index, endpoint) = indices
+        .iter()
+        .map(|&index| (index, endpoints[index].clone()))
+        .min_by_key(|(_, endpoint)| {
+            loads
+                .get(&(Stage::Decode, endpoint.clone()))
+                .copied()
+                .unwrap_or_default()
+                .occupancy(Stage::Decode)
+        })?;
+    Some(StageDecision {
+        fallback_reason: None,
+        credited_prefix_tokens: None,
+        worker_index,
+        endpoint,
+        score: None,
+        new_prefill_tokens: None,
+        affinity_outcome: None,
+        affinity: None,
+    })
+}
+
+/// Re-select the decode stage against a live load snapshot.
+///
+/// Used by the deferred commitment: the request has already been admitted for
+/// Prefill, and the decode target is chosen when the decode request is about to
+/// be sent.
+pub(super) fn select_decode_stage(
+    loads: &Loads,
+    decode_workers: &[Arc<dyn Worker>],
+    decode_policy: &dyn LoadBalancingPolicy,
+    context: &PdRequestContext<'_>,
+) -> Option<StageDecision> {
+    let (endpoints, indices) = Eligibility::new(loads, context).pool(Stage::Decode, decode_workers);
+    if indices.is_empty() {
+        return None;
+    }
+    select_stage(
         loads,
         Stage::Decode,
         decode_workers,
-        &decode_endpoints,
-        &decode_indices,
+        &endpoints,
+        &indices,
         decode_policy,
         context,
-    )?;
+    )
+}
 
-    Some(PdSelection { prefill, decode })
+/// Whether a worker can serve this request model: the part of candidate eligibility that
+/// does not depend on live load. Selection and pricing both use it, so a worker that cannot
+/// be chosen cannot deny credit to the ones that can.
+pub(super) fn model_eligible(worker: &dyn Worker, model_id: Option<&str>) -> bool {
+    model_id.is_none_or(|model| worker.model_id() == "unknown" || worker.model_id() == model)
 }
 
 fn select_stage(
@@ -124,16 +227,27 @@ fn select_stage(
     // order, which is the --prefill / --decode order. Sorting by endpoint URL
     // made round-robin follow port text instead of that order.
     let selected_indices = indices.to_vec();
+    // Decode ranks by the logical context it would hold, when every eligible
+    // candidate can supply it: one unknown prompt length mixes units across the
+    // pool, so the whole stage falls back to request counts instead.
+    let decode_tokens_known = stage == Stage::Decode
+        && kv_aware
+        && selected_indices.iter().all(|&index| {
+            loads
+                .get(&(stage, endpoints[index].clone()))
+                .is_none_or(|load| load.decode_tokens().is_some())
+        });
     let projected: Vec<Arc<dyn Worker>> = selected_indices
         .iter()
         .map(|&index| {
             let inner = workers[index].clone();
             let endpoint = endpoints[index].clone();
-            let load = loads
-                .get(&(stage, endpoint))
-                .copied()
-                .unwrap_or_default()
-                .occupancy(stage);
+            let load = loads.get(&(stage, endpoint)).copied().unwrap_or_default();
+            let load = if decode_tokens_known {
+                load.decode_tokens().unwrap_or(0) as usize
+            } else {
+                load.occupancy(stage)
+            };
             Arc::new(PolicyWorker { inner, load }) as Arc<dyn Worker>
         })
         .collect();
@@ -216,15 +330,35 @@ fn select_stage(
             );
         }
     }
+    let mut decode_prices_used = false;
     let (picked, affinity_outcome, affinity_binding) = if stage == Stage::Decode && kv_aware {
         // Decode never queries placement or applies the P temperature:
         // deterministic minimum occupancy with rotating equal-load ties, and
         // the optional decode session binding on top.
         let kv = kv_aware_ops(policy)?;
+        // `select_decode` itself discards a table that misses any eligible
+        // candidate; this mirror exists so `decode_prices_used` reports what the
+        // selector actually acted on.
+        //
+        // The table is keyed by `Worker::url()`, not `base_url()`: DP ranks of
+        // one engine have independent KV caches, so rank `@0` must not consume
+        // rank `@1`'s price.
+        let decode_prices = if !decode_tokens_known {
+            None
+        } else {
+            context.decode_context.filter(|prices| {
+                projected
+                    .iter()
+                    .all(|worker| prices.contains_key(worker.url()))
+            })
+        };
+        decode_prices_used = decode_prices.is_some();
         let pick = kv.select_decode(
             &projected,
             context.affinity_key.as_ref(),
+            context.lora_name,
             context.cache_salt,
+            decode_prices,
         )?;
         (
             pick.index,
@@ -273,12 +407,21 @@ fn select_stage(
         } else {
             "decode"
         };
+        // Recorded once, here, for every KV-aware decision: what a Decode
+        // decision ranked by is part of the answer, not a debugging detail.
         let outcome = if affinity_outcome == Some("sticky_hit") {
             "sticky_hit"
         } else if stage == Stage::Prefill {
             "load_fallback"
         } else {
-            "occupancy"
+            // Report what the selector actually used, not whether a table merely
+            // existed: a table that failed the completeness filter above fell back
+            // to occupancy even though `context.decode_context` was `Some`.
+            match (decode_tokens_known, decode_prices_used) {
+                (true, true) => "context_tokens_marginal",
+                (true, false) => "context_tokens",
+                (false, _) => "occupancy_unknown_tokens",
+            }
         };
         crate::metrics::RouterMetrics::record_prefix_routing_decision("kv_aware", phase, outcome);
     }
@@ -321,11 +464,22 @@ fn select_stage(
         credited_prefix_tokens: selected_tokens.map(|_| 0),
         worker_index,
         endpoint: endpoints[worker_index].clone(),
-        // Unknown P token work falls back to occupancy; D includes the
-        // incoming request, which does not change candidate ranking.
+        // Unknown P token work falls back to occupancy; Decode records the
+        // occupancy plus the same marginal context the selector compared.
         score: kv_aware.then_some(match stage {
             Stage::Prefill => worker.load() as f64,
-            Stage::Decode => (worker.load() + 1) as f64,
+            Stage::Decode => {
+                let additional = if decode_prices_used {
+                    context
+                        .decode_context
+                        .and_then(|prices| prices.get(worker.url()))
+                        .copied()
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                (worker.load() as u64).saturating_add(additional) as f64
+            }
         }),
         new_prefill_tokens: selected_tokens,
         affinity_outcome,
@@ -420,8 +574,8 @@ fn build_dp_workers(
     worker_type: WorkerType,
     circuit_breaker_config: &CircuitBreakerConfig,
     health_config: Option<&HealthConfig>,
-) -> Vec<Arc<dyn Worker>> {
-    let (base_url, pinned_rank) = dp_utils::parse_worker_url(url);
+) -> Result<Vec<Arc<dyn Worker>>, String> {
+    let (base_url, _) = dp_utils::parse_worker_url(url);
 
     // DPAwareWorker strips the @rank suffix in endpoint_url(), preventing
     // IPv6+DP URL corruption where HTTP clients read @N as userinfo (RFC 3986).
@@ -435,7 +589,7 @@ fn build_dp_workers(
         Arc::new(worker)
     };
 
-    dp_utils::expand_dp_ranks(pinned_rank, dp_size)
+    Ok(dp_utils::expand_dp_ranks(url, dp_size)?
         .into_iter()
         .map(|rank| match rank {
             Some(rank) => dp_worker(rank),
@@ -450,12 +604,12 @@ fn build_dp_workers(
                 Arc::new(worker) as Arc<dyn Worker>
             }
         })
-        .collect()
+        .collect())
 }
 
 impl PdRouterBase {
-    /// `router_prompts` are the router's token ids for `grpc://` pools. HTTP
-    /// pools pass `None` and each backend renders the request itself.
+    /// Prepare Prefill inputs for the cache_aware/no-KV path. KV-aware pools use
+    /// `PdKvState::prepare_stages`, which shares one hash cache across stages.
     pub(super) async fn prepare_prefill_inputs(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -465,15 +619,7 @@ impl PdRouterBase {
         router_prompts: Option<&Arc<[Vec<u32>]>>,
     ) -> Option<HashMap<String, super::pd_types::PdPrefillInput>> {
         let policy = self.policy_registry.get_prefill_policy();
-        if kv_aware_ops(policy.as_ref()).is_some() {
-            return Some(
-                self.kv_state
-                    .as_ref()?
-                    .prepare(workers, &policy, request, route, headers, router_prompts)
-                    .await,
-            );
-        }
-        if policy.name() != "cache_aware" {
+        if kv_aware_ops(policy.as_ref()).is_some() || policy.name() != "cache_aware" {
             return None;
         }
         let results = self
@@ -558,6 +704,16 @@ impl PdRouterBase {
         }
     }
 
+    /// Whether the shared KV state is needed at all: it exists for whichever
+    /// stage ranks by KV, and a mixed policy needs it as much as a KV-aware
+    /// prefill does.
+    pub(super) fn needs_kv_state(
+        prefill_policy: &dyn LoadBalancingPolicy,
+        decode_policy: &dyn LoadBalancingPolicy,
+    ) -> bool {
+        kv_aware_ops(prefill_policy).is_some() || kv_aware_ops(decode_policy).is_some()
+    }
+
     /// Shared entry point for static and discovered P/D pools. Selection and
     /// reservation are synchronous; no network work runs under admission.
     pub(super) fn select_and_admit(
@@ -566,14 +722,29 @@ impl PdRouterBase {
         decode_workers: &[Arc<dyn Worker>],
         context: &PdRequestContext<'_>,
     ) -> Option<(PdSelection, PdAttempt)> {
+        self.select_and_admit_with(prefill_workers, decode_workers, context, false)
+    }
+
+    /// Admission with a deferred decode commitment.
+    ///
+    /// `defer_decode` says the deployment can defer (see
+    /// `VllmPDRouter::decode_commit_can_defer`); the policy then decides whether
+    /// a dispatch-time re-selection is still meaningful. kv_aware reads live
+    /// occupancy and affinity, and cache_aware re-runs from the prepared prefix
+    /// selection, so both can decide at dispatch without re-rendering token
+    /// inputs. Policies that need the admission-time request text keep the
+    /// commitment they made.
+    pub(super) fn select_and_admit_with(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+        context: &PdRequestContext<'_>,
+        defer_decode: bool,
+    ) -> Option<(PdSelection, PdAttempt)> {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
-        let admitted = self.pd_load.admit(|loads| {
-            if let Some(kv) =
-                kv_aware_ops(decode_policy.as_ref()).filter(|kv| kv.session_affinity_enabled())
-            {
-                kv.reconcile_decode_workers(decode_workers);
-            }
+        let defer = defer_decode && decode_policy_can_defer(decode_policy.as_ref(), context);
+        let select = |loads: &Loads| {
             select_pd_pair(
                 loads,
                 prefill_workers,
@@ -581,9 +752,17 @@ impl PdRouterBase {
                 prefill_policy.as_ref(),
                 decode_policy.as_ref(),
                 context,
+                !defer,
             )
-        });
+        };
+        let reserve_decode = !context.probe;
+        let admitted = if defer {
+            self.pd_load.admit_deferred(select)
+        } else {
+            self.pd_load.admit_with(select, reserve_decode)
+        };
         if let Some((selection, attempt)) = &admitted {
+            let deferred = attempt.decode_pending_commit();
             if kv_aware_ops(prefill_policy.as_ref()).is_some() {
                 crate::metrics::RouterMetrics::record_pd_kv_decision(
                     selection.prefill.new_prefill_tokens,
@@ -591,8 +770,12 @@ impl PdRouterBase {
                     selection.prefill.fallback_reason,
                 );
             }
-            if let Some(outcome) = selection.decode.affinity_outcome {
-                crate::metrics::RouterMetrics::record_pd_affinity_decision("decode", outcome);
+            // A deferred decode decision is provisional, so its affinity
+            // outcome is recorded by the commit, not here.
+            if !deferred {
+                if let Some(outcome) = selection.decode.affinity_outcome {
+                    crate::metrics::RouterMetrics::record_pd_affinity_decision("decode", outcome);
+                }
             }
             // Selection indices come from these same slices, so the lookups
             // cannot fail today. If future filtering ever makes them fail,
@@ -602,17 +785,21 @@ impl PdRouterBase {
             // accounting of record); discovery pools rebuild their workers
             // per request, so for them the counters are write-only until
             // those workers are persisted.
-            if let (Some(prefill_worker), Some(decode_worker)) = (
-                prefill_workers.get(selection.prefill.worker_index),
-                decode_workers.get(selection.decode.worker_index),
-            ) {
-                attempt.attach_workers(prefill_worker.clone(), decode_worker.clone());
+            if let Some(prefill_worker) = prefill_workers.get(selection.prefill.worker_index) {
+                if deferred {
+                    attempt.attach_prefill_worker(prefill_worker.clone());
+                } else if let Some(decode_worker) =
+                    decode_workers.get(selection.decode.worker_index)
+                {
+                    attempt.attach_workers(prefill_worker.clone(), decode_worker.clone());
+                }
             }
             debug!(
                 version = 1,
                 route = context.route,
                 prefill_policy = prefill_policy.name(),
                 decode_policy = decode_policy.name(),
+                decode_deferred = deferred,
                 fallback = ?selection.prefill.fallback_reason,
                 new_prefill_tokens = ?selection.prefill.new_prefill_tokens,
                 credited_prefix_tokens = ?selection.prefill.credited_prefix_tokens,
@@ -632,6 +819,8 @@ impl PdRouterBase {
             &[url.to_string()],
             self.worker_startup_timeout_secs,
             self.worker_startup_check_interval_secs,
+            // PD health checks do not send the API key yet.
+            None,
         )
         .await
         .map_err(|_| PDRouterError::HealthCheckFailed {
@@ -848,7 +1037,8 @@ impl PdRouterBase {
             worker_type,
             &self.circuit_breaker_config,
             None,
-        );
+        )
+        .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
         if workers
             .iter()
@@ -886,10 +1076,25 @@ impl PdRouterBase {
         }
     }
 
+    async fn unregister_kv_worker(&self, url: &str, decode: bool) {
+        let policy = if decode {
+            self.policy_registry.get_decode_policy()
+        } else {
+            self.policy_registry.get_prefill_policy()
+        };
+        let Some(kv) = kv_aware_ops(policy.as_ref()) else {
+            return;
+        };
+        match self.kv_state.as_ref() {
+            Some(state) => state.unregister_worker(url, kv).await,
+            None => kv.unregister_worker(url),
+        }
+    }
+
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
         // A bare URL that is not registered as-is was expanded per DP rank.
         if !url.contains('@') && self.worker_registry.get_by_url(url).is_none() {
-            return self.remove_dp_expanded_workers(url, "prefill");
+            return self.remove_dp_expanded_workers(url, "prefill").await;
         }
 
         // Exact URL match (with @rank or dp_size==1)
@@ -905,6 +1110,7 @@ impl PdRouterBase {
         let removed = self.worker_registry.remove_by_url(url);
 
         if removed.is_some() {
+            self.unregister_kv_worker(url, false).await;
             self.policy_registry.on_worker_removed(&model_id);
             if let Some(policy) = self.policy_registry.get_policy(&model_id) {
                 if policy.name() == "cache_aware" {
@@ -930,7 +1136,7 @@ impl PdRouterBase {
 
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
         if !url.contains('@') && self.worker_registry.get_by_url(url).is_none() {
-            return self.remove_dp_expanded_workers(url, "decode");
+            return self.remove_dp_expanded_workers(url, "decode").await;
         }
 
         let model_id = match self.worker_registry.get_by_url(url) {
@@ -945,9 +1151,7 @@ impl PdRouterBase {
         let removed = self.worker_registry.remove_by_url(url);
 
         if removed.is_some() {
-            if let Some(kv) = kv_aware_ops(self.policy_registry.get_decode_policy().as_ref()) {
-                kv.unregister_worker(url);
-            }
+            self.unregister_kv_worker(url, true).await;
             // Notify PolicyRegistry about the removed worker
             self.policy_registry.on_worker_removed(&model_id);
 
@@ -977,7 +1181,11 @@ impl PdRouterBase {
     /// Remove all DP-expanded workers for a bare URL by prefix match.
     /// When a bare URL like "http://host:8000" was expanded into
     /// "http://host:8000@0", "@1", ..., "@N-1", this removes all of them.
-    fn remove_dp_expanded_workers(&self, url: &str, role: &str) -> Result<String, PDRouterError> {
+    async fn remove_dp_expanded_workers(
+        &self,
+        url: &str,
+        role: &str,
+    ) -> Result<String, PDRouterError> {
         let prefix = format!("{}@", url);
         let all_workers = self.worker_registry.get_all();
         let mut removed_count = 0;
@@ -985,13 +1193,7 @@ impl PdRouterBase {
             if w.url().starts_with(&prefix) {
                 let model_id = w.model_id().to_string();
                 if self.worker_registry.remove_by_url(w.url()).is_some() {
-                    if role == "decode" {
-                        if let Some(kv) =
-                            kv_aware_ops(self.policy_registry.get_decode_policy().as_ref())
-                        {
-                            kv.unregister_worker(w.url());
-                        }
-                    }
+                    self.unregister_kv_worker(w.url(), role == "decode").await;
                     self.policy_registry.on_worker_removed(&model_id);
                     if let Some(policy) = self.policy_registry.get_policy(&model_id) {
                         if policy.name() == "cache_aware" {
@@ -1037,6 +1239,10 @@ impl PdRouterBase {
             window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
+        if ctx.router_config.api_key.is_some() {
+            warn!("--api-key is not applied to P/D worker health checks yet");
+        }
+
         // Workers must be up before they can report their engine count.
         let prefill_base_urls: Vec<String> =
             prefill_urls.iter().map(|(url, _)| url.clone()).collect();
@@ -1046,6 +1252,8 @@ impl PdRouterBase {
                     urls,
                     ctx.router_config.worker_startup_timeout_secs,
                     ctx.router_config.worker_startup_check_interval_secs,
+                    // PD health checks do not send the API key yet.
+                    None,
                 )
                 .await?;
             }
@@ -1077,9 +1285,19 @@ impl PdRouterBase {
                 worker_type,
                 &core_cb_config,
                 Some(&health_config),
-            ) {
+            )? {
                 ctx.worker_registry.register(worker);
             }
+        }
+
+        if let Some(config) = &ctx.router_config.epd {
+            super::epd::EncoderStage::validate_consumers(
+                config,
+                ctx.worker_registry
+                    .get_prefill_workers()
+                    .iter()
+                    .map(|worker| worker.url()),
+            )?;
         }
 
         // Get all workers from registry for load monitoring
@@ -1134,14 +1352,22 @@ impl PdRouterBase {
         // Note: Health checking is now handled centrally by RouterManager
         // Individual routers no longer need to manage health checkers
 
-        let kv_state = if kv_aware_ops(prefill_policy.as_ref()).is_some() {
+        // Either stage may be the KV-aware one. Bind at construction through the
+        // same entry point as refresh so startup and periodic reconciliation
+        // cannot disagree about membership.
+        let kv_state = if Self::needs_kv_state(prefill_policy.as_ref(), decode_policy.as_ref()) {
             Some(
                 PdKvState::start(
                     ctx.client.clone(),
                     ctx.router_config.api_key.clone(),
                     ctx.router_config.pd_kv_event_sources.clone(),
-                    ctx.worker_registry.get_prefill_workers(),
-                    prefill_policy.clone(),
+                    Arc::clone(&ctx.worker_registry),
+                    kv_aware_ops(prefill_policy.as_ref())
+                        .is_some()
+                        .then(|| prefill_policy.clone()),
+                    kv_aware_ops(decode_policy.as_ref())
+                        .is_some()
+                        .then(|| decode_policy.clone()),
                 )
                 .await,
             )
@@ -1349,8 +1575,11 @@ impl PdRouterBase {
             decode_cache: None,
             headers: None,
             affinity_key: None,
+            lora_name: None,
             cache_salt: None,
+            decode_context: None,
             route: "/health_generate",
+            probe: true,
         };
         let (selection, _attempt) =
             match self.select_and_admit(prefill_workers, decode_workers, &context) {
@@ -1668,6 +1897,7 @@ impl PdRouterBase {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerFactory, WorkerType};
@@ -1878,8 +2108,11 @@ mod tests {
             decode_cache: None,
             headers: None,
             affinity_key: None,
+            lora_name: None,
             cache_salt: None,
+            decode_context: None,
             route: "/health_generate",
+            probe: true,
         };
         let (selection, attempt) = router
             .select_and_admit(&prefill_workers, &decode_workers, &context)
@@ -1906,8 +2139,11 @@ mod tests {
             decode_cache: None,
             headers: None,
             affinity_key: None,
+            lora_name: None,
             cache_salt: None,
+            decode_context: None,
             route: "/health_generate",
+            probe: true,
         };
         assert!(router.select_and_admit(&empty, &empty, &context).is_none());
         assert!(router.pd_load.snapshot().is_empty());
@@ -2338,8 +2574,8 @@ mod tests {
         assert_eq!(workers.len(), 4);
     }
 
-    #[test]
-    fn test_remove_dp_expanded_workers_by_prefix() {
+    #[tokio::test]
+    async fn test_remove_dp_expanded_workers_by_prefix() {
         let router = create_test_pd_router_with_dp(4);
         let bare_url = "http://10.0.0.1:8000";
 
@@ -2358,15 +2594,17 @@ mod tests {
         assert_eq!(router.worker_registry.get_prefill_workers().len(), 4);
 
         // Remove by bare URL prefix
-        let result = router.remove_dp_expanded_workers(bare_url, "prefill");
+        let result = router.remove_dp_expanded_workers(bare_url, "prefill").await;
         assert!(result.is_ok());
         assert_eq!(router.worker_registry.get_prefill_workers().len(), 0);
     }
 
-    #[test]
-    fn test_remove_dp_expanded_workers_not_found() {
+    #[tokio::test]
+    async fn test_remove_dp_expanded_workers_not_found() {
         let router = create_test_pd_router_with_dp(4);
-        let result = router.remove_dp_expanded_workers("http://nonexistent:8000", "prefill");
+        let result = router
+            .remove_dp_expanded_workers("http://nonexistent:8000", "prefill")
+            .await;
         assert!(result.is_err());
     }
 
@@ -2444,7 +2682,9 @@ mod tests {
         assert_eq!(workers.len(), 8, "2 hosts × 4 ranks = 8 workers");
 
         // Remove one host's workers
-        let result = router.remove_dp_expanded_workers("http://10.0.0.1:8000", "prefill");
+        let result = router
+            .remove_dp_expanded_workers("http://10.0.0.1:8000", "prefill")
+            .await;
         assert!(result.is_ok());
         assert_eq!(
             router.worker_registry.get_prefill_workers().len(),
@@ -2455,6 +2695,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod admission_tests {
     use super::super::pd_types::PdLoadSample;
     use super::*;
@@ -2527,11 +2768,10 @@ mod admission_tests {
                         prompts: Some(Arc::from(vec![tokens.to_vec()])),
                         work_by_rank: HashMap::from([(
                             worker.dp_rank(),
-                            kv_aware_ops(policy).unwrap().estimate_prefill_work(&[(
-                                worker.as_ref(),
-                                &[tokens.to_vec()],
-                                true,
-                            )])[0],
+                            kv_aware_ops(policy).unwrap().estimate_prefill_work(
+                                &[(worker.as_ref(), &[tokens.to_vec()], true)],
+                                &mut crate::policies::PromptHashes::new(),
+                            )[0],
                         )]),
                         allow_credit: true,
                         fallback_reason: None,
@@ -2557,14 +2797,14 @@ mod admission_tests {
         let mut context = context();
         context.prefill_inputs = Some(&inputs);
         let (first, a) = manager
-            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context))
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
             .unwrap();
         assert_eq!(first.prefill.worker_index, 1); // Warm P wins over the first idle P.
         assert_eq!(first.prefill.new_prefill_tokens, Some(1));
         assert_eq!(first.prefill.credited_prefix_tokens, Some(32));
         assert_eq!(first.prefill.fallback_reason, None);
         let (second, b) = manager
-            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context))
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
             .unwrap();
         assert_eq!(second.prefill.worker_index, 1);
         assert_eq!(second.prefill.score, Some(2.0));
@@ -2590,9 +2830,83 @@ mod admission_tests {
                 ..Default::default()
             },
         );
-        let selection = select_pd_pair(&loads, &p, &d, &policy, &policy, &context).unwrap();
+        let selection = select_pd_pair(&loads, &p, &d, &policy, &policy, &context, true).unwrap();
         assert_eq!(selection.prefill.worker_index, 0); // Token backlog outweighs warm residency.
         assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
+    }
+
+    #[test]
+    fn dp_rank_decode_prices_are_matched_by_worker_url() {
+        let p = pool("p", 1);
+        let d: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|rank| {
+                Arc::new(DPAwareWorker::new(
+                    "http://d:8000".to_string(),
+                    rank,
+                    2,
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        assert_eq!(d[0].base_url(), d[1].base_url());
+        assert_ne!(d[0].url(), d[1].url());
+
+        let mut loads = Loads::new();
+        loads.insert(
+            (Stage::Decode, PdEndpoint::for_worker(d[0].as_ref())),
+            PdLoadSample {
+                active_decode_tokens: 100,
+                ..Default::default()
+            },
+        );
+        loads.insert(
+            (Stage::Decode, PdEndpoint::for_worker(d[1].as_ref())),
+            PdLoadSample {
+                active_decode_tokens: 60,
+                ..Default::default()
+            },
+        );
+        let policy = KvAwarePolicy::default();
+
+        // Without prices the less occupied rank wins.
+        let baseline = select_pd_pair(&loads, &p, &d, &policy, &policy, &context(), true).unwrap();
+        assert_eq!(
+            baseline.decode.endpoint,
+            PdEndpoint::for_worker(d[1].as_ref())
+        );
+
+        // A fully cached prefix on @0 (0 new tokens) beats @1's 50-token gap.
+        // Both keys are `Worker::url()`; keying by `base_url()` would collapse
+        // the two ranks and leave the whole table unusable.
+        let prices = HashMap::from([
+            (d[0].url().to_owned(), 0u64),
+            (d[1].url().to_owned(), 50u64),
+        ]);
+        let priced = PdRequestContext {
+            decode_context: Some(&prices),
+            ..context()
+        };
+        let selection = select_pd_pair(&loads, &p, &d, &policy, &policy, &priced, true).unwrap();
+        assert_eq!(
+            selection.decode.endpoint,
+            PdEndpoint::for_worker(d[0].as_ref()),
+            "prefix credit on @0 must change the Decode choice"
+        );
+
+        // Missing one rank makes the table incomplete: the selector must ignore
+        // the price of the other rank and fall back to occupancy, where @1 wins.
+        let partial = HashMap::from([(d[0].url().to_owned(), 0u64)]);
+        let partial_context = PdRequestContext {
+            decode_context: Some(&partial),
+            ..context()
+        };
+        let fallback =
+            select_pd_pair(&loads, &p, &d, &policy, &policy, &partial_context, true).unwrap();
+        assert_eq!(
+            fallback.decode.endpoint,
+            PdEndpoint::for_worker(d[1].as_ref()),
+            "a price table missing one DP rank must not credit the others"
+        );
     }
 
     #[test]
@@ -2611,11 +2925,11 @@ mod admission_tests {
         context.prefill_inputs = Some(&inputs);
         let manager = Arc::new(PdLoadManager::default());
         let (first, a) = manager
-            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context))
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
             .unwrap();
         assert_eq!(first.prefill.worker_index, 1);
         let (second, b) = manager
-            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context))
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
             .unwrap();
         assert_eq!(
             second.prefill.worker_index, 0,
@@ -2632,13 +2946,13 @@ mod admission_tests {
         let tokens: Vec<u32> = (0..33).collect();
         let policy = resident_prefix_policy(&p, &tokens);
         let (_, unknown) = manager
-            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context()))
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context(), true))
             .unwrap();
         let inputs = token_inputs(&p, &tokens, &policy);
         let mut context = context();
         context.prefill_inputs = Some(&inputs);
         let (selection, known) = manager
-            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context))
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
             .unwrap();
         assert_eq!(
             selection.prefill.fallback_reason,
@@ -2670,8 +2984,11 @@ mod admission_tests {
             decode_cache: None,
             headers: None,
             affinity_key: None,
+            lora_name: None,
             cache_salt: None,
+            decode_context: None,
             route: "/v1/completions",
+            probe: false,
         }
     }
 
@@ -2682,8 +2999,47 @@ mod admission_tests {
     ) -> (PdSelection, PdAttempt) {
         let policy = KvAwarePolicy::default();
         manager
-            .admit(|loads| select_pd_pair(loads, p, d, &policy, &policy, &context()))
+            .admit(|loads| select_pd_pair(loads, p, d, &policy, &policy, &context(), true))
             .unwrap()
+    }
+
+    /// Deferral is a claim about the policy, not a user switch: only a policy
+    /// that can re-decide from live state gets to commit at dispatch.
+    #[test]
+    fn deferral_requires_a_policy_that_can_redecide_at_dispatch() {
+        use crate::policies::{CacheAwarePolicy, KvRequestTokens, WorkerTokenInputs};
+
+        let decode_pool = pool("d", 2);
+        let kv = KvAwarePolicy::default();
+        assert!(decode_policy_can_defer(&kv, &context()));
+
+        let cache = CacheAwarePolicy::new();
+        // Without the prepared prefix selection a dispatch-time cache_aware
+        // decision would silently degrade to load, so admission keeps its pick.
+        assert!(!decode_policy_can_defer(&cache, &context()));
+        let tokens: WorkerTokenInputs = [(
+            decode_pool[0].base_url().to_string(),
+            Arc::from([vec![1u32, 2, 3, 4]]),
+        )]
+        .into_iter()
+        .collect();
+        let prepared = cache
+            .prepare_selection(
+                &decode_pool,
+                KvRequestTokens::PerWorker(&tokens),
+                None,
+                None,
+                None,
+            )
+            .expect("prefix selection");
+        let prepared_context = PdRequestContext {
+            decode_cache: Some(&prepared),
+            ..context()
+        };
+        assert!(decode_policy_can_defer(&cache, &prepared_context));
+
+        let round_robin = RoundRobinPolicy::default();
+        assert!(!decode_policy_can_defer(&round_robin, &context()));
     }
 
     fn context_with_session(session: &str) -> PdRequestContext<'static> {
@@ -2695,8 +3051,11 @@ mod admission_tests {
             decode_cache: None,
             headers: None,
             affinity_key: Some(affinity_key(session)),
+            lora_name: None,
             cache_salt: None,
+            decode_context: None,
             route: "/v1/completions",
+            probe: false,
         }
     }
 
@@ -2719,7 +3078,7 @@ mod admission_tests {
         context: &PdRequestContext<'_>,
     ) -> (PdSelection, PdAttempt) {
         manager
-            .admit(|loads| select_pd_pair(loads, p, d, policy, policy, context))
+            .admit(|loads| select_pd_pair(loads, p, d, policy, policy, context, true))
             .unwrap()
     }
 
@@ -2729,6 +3088,152 @@ mod admission_tests {
             .get(&(stage, endpoint.clone()))
             .copied()
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn deferred_admission_leaves_decode_uncommitted_until_dispatch() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d = pool("d", 2);
+        let policy = KvAwarePolicy::default();
+        let (_, attempt) = manager
+            .admit_deferred(|loads| {
+                select_pd_pair(loads, &p, &d, &policy, &policy, &context(), false)
+            })
+            .unwrap();
+
+        // Nothing is charged for the provisional decode pick.
+        assert!(attempt.decode_pending_commit());
+        assert!(attempt.decode_endpoint().is_none());
+        assert!(manager
+            .snapshot()
+            .keys()
+            .all(|(stage, _)| *stage == Stage::Prefill));
+
+        // The commitment sees the live snapshot and charges exactly once.
+        let decision = manager
+            .commit_decode(&attempt, |loads| {
+                select_decode_stage(loads, &d, &policy, &context())
+            })
+            .unwrap();
+        assert!(!attempt.decode_pending_commit());
+        assert_eq!(attempt.decode_endpoint(), Some(decision.endpoint.clone()));
+        let pending = sample(&manager, Stage::Decode, &decision.endpoint);
+        // The placeholder had no known prompt length.
+        assert_eq!(
+            (
+                pending.pending_decode_requests,
+                pending.unknown_decode_requests,
+                pending.pending_decode_tokens
+            ),
+            (1, 1, 0)
+        );
+        // A second commit is a no-op on the books.
+        assert!(manager
+            .commit_decode(&attempt, |loads| {
+                select_decode_stage(loads, &d, &policy, &context())
+            })
+            .is_none());
+        assert_eq!(
+            sample(&manager, Stage::Decode, &decision.endpoint).pending_decode_requests,
+            1
+        );
+        attempt.begin_decode();
+        let active = sample(&manager, Stage::Decode, &decision.endpoint);
+        assert_eq!(
+            (
+                active.active_decode_requests,
+                active.active_decode_tokens,
+                active.unknown_decode_requests
+            ),
+            (1, 0, 1)
+        );
+        attempt.finish_prefill();
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn abandoned_deferred_attempt_cannot_commit_a_decode() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d = pool("d", 1);
+        let policy = KvAwarePolicy::default();
+        let (_, attempt) = manager
+            .admit_deferred(|loads| {
+                select_pd_pair(loads, &p, &d, &policy, &policy, &context(), false)
+            })
+            .unwrap();
+        attempt.finish_prefill();
+        // A cancelled request closes the unbound state before dispatch.
+        attempt.finish_decode();
+        assert!(manager
+            .commit_decode(&attempt, |loads| {
+                select_decode_stage(loads, &d, &policy, &context())
+            })
+            .is_none());
+        assert!(manager.snapshot().is_empty());
+
+        // A refused commit keeps the attempt open, so a retry can still land.
+        let (_, retry) = manager
+            .admit_deferred(|loads| {
+                select_pd_pair(loads, &p, &d, &policy, &policy, &context(), false)
+            })
+            .unwrap();
+        assert!(manager.commit_decode(&retry, |_| None).is_none());
+        assert!(retry.decode_pending_commit());
+        assert!(manager
+            .commit_decode(&retry, |loads| {
+                select_decode_stage(loads, &d, &policy, &context())
+            })
+            .is_some());
+        drop(retry);
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn provisional_decode_pick_does_not_consume_the_tie_cursor() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 1);
+        let d = pool("d", 2);
+        let policy = KvAwarePolicy::default();
+
+        // A pickup that may be discarded must leave the policy untouched, or the
+        // commitment starts one tie step late and the rotation degrades.
+        let provisional: Vec<_> = (0..3)
+            .map(|_| {
+                let (selection, attempt) = manager
+                    .admit_deferred(|loads| {
+                        select_pd_pair(loads, &p, &d, &policy, &policy, &context(), false)
+                    })
+                    .unwrap();
+                drop(attempt);
+                selection.decode.endpoint.http_url
+            })
+            .collect();
+        assert!(
+            provisional.windows(2).all(|pair| pair[0] == pair[1]),
+            "provisional pick moved: {provisional:?}"
+        );
+
+        // The commitment advances the cursor once per request, so idle ties rotate.
+        let committed: Vec<_> = (0..2)
+            .map(|_| {
+                let (_, attempt) = manager
+                    .admit_deferred(|loads| {
+                        select_pd_pair(loads, &p, &d, &policy, &policy, &context(), false)
+                    })
+                    .unwrap();
+                manager
+                    .commit_decode(&attempt, |loads| {
+                        select_decode_stage(loads, &d, &policy, &context())
+                    })
+                    .expect("the commitment should land")
+                    .endpoint
+                    .http_url
+            })
+            .collect();
+        assert_ne!(committed[0], committed[1]);
     }
 
     #[test]
@@ -2845,7 +3350,7 @@ mod admission_tests {
             .unwrap()
             .active_prefill_tokens = 40;
         let unbound_decode = KvAwarePolicy::default();
-        let next = select_pd_pair(&loads, &p, &d, &policy, &unbound_decode, &ctx).unwrap();
+        let next = select_pd_pair(&loads, &p, &d, &policy, &unbound_decode, &ctx, true).unwrap();
         assert_eq!(next.prefill.worker_index, 0);
         assert_eq!(next.prefill.new_prefill_tokens, Some(33));
         assert_eq!(next.prefill.affinity_outcome, None);
@@ -2980,9 +3485,32 @@ mod admission_tests {
         let d = pool("d", 1);
         let policy = KvAwarePolicy::default();
         assert!(manager
-            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &RejectDecode, &context()))
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &RejectDecode, &context(), true))
             .is_none());
         assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn cold_prefill_ties_use_every_worker_in_an_idle_pool() {
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("p", 3);
+        let d = pool("d", 1);
+        let policy = KvAwarePolicy::default();
+        let tokens: Vec<u32> = (0..33).collect();
+        let inputs = token_inputs(&p, &tokens, &policy);
+        let mut ctx = context();
+        ctx.prefill_inputs = Some(&inputs);
+
+        // Every admission starts from an idle pool again, so the same
+        // equal-cost tie is met on each turn.
+        let mut seen = [false; 3];
+        for _ in 0..32 {
+            let (selection, attempt) = admit_with(&manager, &p, &d, &policy, &ctx);
+            assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
+            seen[selection.prefill.worker_index] = true;
+            drop(attempt);
+        }
+        assert_eq!(seen, [true, true, true], "equal costs must use every P");
     }
 
     #[test]
@@ -3022,7 +3550,15 @@ mod admission_tests {
         assert_eq!(second.decode.endpoint.dp_rank, Some(1));
         let policy = KvAwarePolicy::default();
         assert!(manager
-            .admit(|loads| select_pd_pair(loads, &p, &pool("d", 1), &policy, &policy, &context()))
+            .admit(|loads| select_pd_pair(
+                loads,
+                &p,
+                &pool("d", 1),
+                &policy,
+                &policy,
+                &context(),
+                true,
+            ))
             .is_none());
         drop((a, b));
         let (_, attempt) = admit(&manager, &p, &pool("d", 1));
@@ -3091,7 +3627,7 @@ mod admission_tests {
             manager
                 .admit(|loads| {
                     let mut selection =
-                        select_pd_pair(loads, &p, &d, &policy, &policy, &context())?;
+                        select_pd_pair(loads, &p, &d, &policy, &policy, &context(), true)?;
                     selection.prefill.new_prefill_tokens = Some(tokens);
                     Some(selection)
                 })
@@ -3108,6 +3644,23 @@ mod admission_tests {
         assert_eq!(
             sample(&manager, Stage::Prefill, &selection.prefill.endpoint).active_prefill_tokens,
             31
+        );
+        let decode = sample(&manager, Stage::Decode, &selection.decode.endpoint);
+        assert_eq!(
+            (decode.pending_decode_tokens, decode.active_decode_tokens),
+            (48, 0)
+        );
+        a.begin_decode();
+        let decode = sample(&manager, Stage::Decode, &selection.decode.endpoint);
+        assert_eq!(
+            (decode.pending_decode_tokens, decode.active_decode_tokens),
+            (31, 17)
+        );
+        a.finish_decode();
+        let decode = sample(&manager, Stage::Decode, &selection.decode.endpoint);
+        assert_eq!(
+            (decode.pending_decode_tokens, decode.active_decode_tokens),
+            (31, 0)
         );
         drop((a, b));
         assert!(manager.snapshot().is_empty());
@@ -3152,7 +3705,7 @@ mod admission_tests {
         context.headers = Some(&headers);
         let policy = LegacyPolicy;
         let (second, b) = manager
-            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context))
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
             .unwrap();
         assert_ne!(first.prefill.endpoint, second.prefill.endpoint);
         assert_ne!(first.decode.endpoint, second.decode.endpoint);
@@ -3192,6 +3745,7 @@ mod admission_tests {
                             &prefill_policy,
                             &decode_policy,
                             &context(),
+                            true,
                         )
                     })
                     .unwrap();
@@ -3210,13 +3764,13 @@ mod admission_tests {
         let rr = RoundRobinPolicy::new();
         let kv = KvAwarePolicy::default();
         let (_, a) = manager
-            .admit(|loads| select_pd_pair(loads, &p, &d, &rr, &kv, &context()))
+            .admit(|loads| select_pd_pair(loads, &p, &d, &rr, &kv, &context(), true))
             .unwrap();
         let (second, b) = manager
-            .admit(|loads| select_pd_pair(loads, &p, &d, &rr, &kv, &context()))
+            .admit(|loads| select_pd_pair(loads, &p, &d, &rr, &kv, &context(), true))
             .unwrap();
         assert_eq!(second.prefill.score, None);
-        assert_eq!(second.decode.score, Some(2.0));
+        assert_eq!(second.decode.score, Some(1.0));
         drop((a, b));
     }
 
@@ -3249,8 +3803,11 @@ mod admission_tests {
                 decode_cache: None,
                 headers: None,
                 affinity_key: None,
+                lora_name: None,
                 cache_salt: None,
+                decode_context: None,
                 route: "/v1/completions",
+                probe: false,
             }
         }
 
@@ -3261,14 +3818,14 @@ mod admission_tests {
             unlabeled("http://p2"),
         ];
         let (selection, attempt) = manager
-            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &ctx("model-b")))
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &ctx("model-b"), true))
             .unwrap();
         assert_eq!(selection.prefill.endpoint.http_url, "http://p1");
         drop(attempt);
 
         // Request for model-c: only the unlabeled worker keeps it routable.
         let (selection, attempt) = manager
-            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &ctx("model-c")))
+            .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &ctx("model-c"), true))
             .unwrap();
         assert_eq!(selection.prefill.endpoint.http_url, "http://p2");
         drop(attempt);
@@ -3280,7 +3837,15 @@ mod admission_tests {
         ];
         assert!(manager
             .admit(|loads| {
-                select_pd_pair(loads, &only_labeled, &d, &policy, &policy, &ctx("model-c"))
+                select_pd_pair(
+                    loads,
+                    &only_labeled,
+                    &d,
+                    &policy,
+                    &policy,
+                    &ctx("model-c"),
+                    true,
+                )
             })
             .is_none());
         assert!(manager.snapshot().is_empty());

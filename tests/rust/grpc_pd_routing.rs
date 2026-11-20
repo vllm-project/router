@@ -26,7 +26,7 @@ use vllm_router_rs::config::{
     KvConnector, PdKvEventSources, PolicyConfig, RouterConfig, RoutingMode,
 };
 use vllm_router_rs::policies::PolicyFactory;
-use vllm_router_rs::protocols::spec::ChatCompletionRequest;
+use vllm_router_rs::protocols::spec::{ChatCompletionRequest, CompletionRequest};
 use vllm_router_rs::routers::http::vllm_pd_router::VllmPDRouter;
 use vllm_router_rs::routers::RouterTrait;
 
@@ -136,6 +136,145 @@ fn chat(stream: bool) -> ChatCompletionRequest {
     .unwrap()
 }
 
+fn completion(prompt: Value, stream: bool) -> CompletionRequest {
+    serde_json::from_value(json!({
+        "model": "test-model",
+        "prompt": prompt,
+        "max_tokens": 8,
+        "stream": stream,
+    }))
+    .unwrap()
+}
+
+/// Replay harnesses send token ids, so the router must accept them without a
+/// tokenizer round trip on either leg and answer in the completion shape.
+#[tokio::test]
+async fn grpc_pd_completion_passes_client_token_ids_to_both_legs() {
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        finish_kv_transfer_params: Some(prefill_kv()),
+        ..Default::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router(&prefill, &decode).await;
+    // No second pin: `pd_router` already pins ids the client does not send, which is
+    // what makes the captured client ids meaningful.
+
+    let response = router
+        .route_completion(None, &completion(json!([11, 12, 13, 14]), false), None)
+        .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["object"], "text_completion", "{json}");
+    assert!(json["choices"][0].get("message").is_none(), "{json}");
+    assert!(
+        json["id"].as_str().unwrap_or_default().starts_with("cmpl-"),
+        "{json}"
+    );
+
+    assert_eq!(prefill.captured()[0].token_ids, vec![11, 12, 13, 14]);
+    assert_eq!(decode.captured()[0].token_ids, vec![11, 12, 13, 14]);
+}
+
+/// The same path must serve a streaming completion: completion-shaped chunks carrying
+/// `choices[].text` (never chat deltas) and a terminal `[DONE]`.
+#[tokio::test]
+async fn grpc_pd_completion_streams_text_completion_events() {
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        finish_kv_transfer_params: Some(prefill_kv()),
+        ..Default::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router(&prefill, &decode).await;
+
+    let response = router
+        .route_completion(None, &completion(json!([11, 12, 13]), true), None)
+        .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("data: [DONE]"),
+        "stream must terminate: {text}"
+    );
+
+    let chunks: Vec<Value> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|payload| *payload != "[DONE]")
+        .filter_map(|payload| serde_json::from_str(payload).ok())
+        .collect();
+    assert!(!chunks.is_empty(), "{text}");
+
+    let mut streamed = String::new();
+    for chunk in &chunks {
+        assert_eq!(chunk["object"], "text_completion", "{chunk}");
+        let Some(choice) = chunk["choices"].get(0) else {
+            continue;
+        };
+        assert!(
+            choice.get("delta").is_none(),
+            "completion chunks must not use chat deltas: {chunk}"
+        );
+        if let Some(piece) = choice["text"].as_str() {
+            streamed.push_str(piece);
+        }
+    }
+    assert!(!streamed.is_empty(), "no text streamed: {text}");
+}
+
+/// A prompt the gRPC wire cannot carry is rejected before any worker is used.
+#[tokio::test]
+async fn grpc_pd_completion_rejects_text_prompts() {
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        finish_kv_transfer_params: Some(prefill_kv()),
+        ..Default::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router(&prefill, &decode).await;
+
+    let response = router
+        .route_completion(None, &completion(json!("hello"), false), None)
+        .await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert!(prefill.captured().is_empty());
+    assert!(decode.captured().is_empty());
+}
+
+#[tokio::test]
+async fn grpc_pd_unavailable_pool_rejects_before_request_preparation() {
+    let prefill = MockVllmRsServer::spawn().await;
+    let decode = MockVllmRsServer::spawn().await;
+    // Leave the tokenizer unpinned so preparing either request would try to
+    // resolve a model before reaching the availability guard.
+    let router = pd_router_with_pools(&[&prefill], &decode, 1, PolicyConfig::RoundRobin).await;
+    router.worker_registry().get_prefill_workers()[0].set_healthy(false);
+
+    let chat_response = router.route_chat(None, &chat(false), None).await;
+    let completion_response = router
+        .route_completion(None, &completion(json!([11, 12, 13]), false), None)
+        .await;
+    for response in [chat_response, completion_response] {
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"No available workers: 0 prefill, 1 decode");
+    }
+    assert!(prefill.captured().is_empty());
+    assert!(decode.captured().is_empty());
+}
+
 #[tokio::test]
 async fn grpc_pd_hands_prefill_kv_params_to_decode() {
     let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
@@ -177,6 +316,181 @@ async fn grpc_pd_hands_prefill_kv_params_to_decode() {
         assert!(!d.had_text_prompt && !p.had_text_prompt);
     }
     assert!(prefill.aborts().is_empty() && decode.aborts().is_empty());
+}
+
+#[tokio::test]
+async fn grpc_pd_selects_decode_after_prefill_finishes() {
+    check_grpc_deferred_decode(false, false).await;
+}
+
+#[tokio::test]
+async fn grpc_pd_cache_selection_refreshes_after_prefill() {
+    check_grpc_deferred_decode(true, false).await;
+}
+
+#[tokio::test]
+async fn grpc_pd_cache_selection_includes_new_decode_worker() {
+    check_grpc_deferred_decode(true, true).await;
+}
+
+async fn check_grpc_deferred_decode(cache_aware: bool, new_worker: bool) {
+    use common::mock_vllm_rs::HoldGate;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let p_gate = HoldGate::hold_all();
+    let d_gate = HoldGate::hold_all();
+    let p0 = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        hold: Some(p_gate.clone()),
+        finish_kv_transfer_params: Some(prefill_kv()),
+        ..Default::default()
+    })
+    .await;
+    let p1 = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        finish_kv_transfer_params: Some(prefill_kv()),
+        ..Default::default()
+    })
+    .await;
+    let d0 = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        hold: (!new_worker).then(|| d_gate.clone()),
+        ..Default::default()
+    })
+    .await;
+    let d1 = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        hold: new_worker.then(|| d_gate.clone()),
+        ..Default::default()
+    })
+    .await;
+    let p_urls = vec![(p0.grpc_url.clone(), None), (p1.grpc_url.clone(), None)];
+    let d_urls = if new_worker {
+        vec![d0.grpc_url.clone()]
+    } else {
+        vec![d0.grpc_url.clone(), d1.grpc_url.clone()]
+    };
+    let kv = PolicyConfig::KvAware {
+        router_temperature: 0.0,
+        kv_penalty_host: 0.8,
+        kv_penalty_external: 0.6,
+        kv_penalty_disk: 0.4,
+        static_kv_event_sources: Default::default(),
+    };
+    let decode_policy = if cache_aware {
+        PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 3600,
+            max_tree_size: 100_000,
+        }
+    } else {
+        kv
+    };
+    let config = RouterConfig {
+        mode: RoutingMode::VllmPrefillDecode {
+            prefill_urls: p_urls.clone(),
+            decode_urls: d_urls.clone(),
+            prefill_policy: Some(PolicyConfig::RoundRobin),
+            decode_policy: Some(decode_policy.clone()),
+            discovery_address: None,
+        },
+        kv_connector: KvConnector::Nixl,
+        worker_startup_timeout_secs: 5,
+        ..Default::default()
+    };
+    let ctx = create_test_context(config);
+    ctx.policy_registry
+        .set_prefill_policy(PolicyFactory::create_from_config(
+            &PolicyConfig::RoundRobin,
+            None,
+        ));
+    ctx.policy_registry
+        .set_decode_policy(PolicyFactory::create_from_config(&decode_policy, None));
+    let router = Arc::new(VllmPDRouter::new(p_urls, d_urls, None, &ctx).await.unwrap());
+    router.pin_test_token_ids(vec![1, 2, 3]);
+    let first = {
+        let router = router.clone();
+        tokio::spawn(async move { router.route_chat(None, &chat(false), None).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while p0.captured().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let removed = if new_worker {
+        let registry = router.worker_registry();
+        let old = registry.remove_by_url(&d0.grpc_url).unwrap();
+        registry.register(Arc::new(vllm_router_rs::core::BasicWorker::new(
+            d1.grpc_url.clone(),
+            vllm_router_rs::core::WorkerType::Decode,
+        )));
+        Some(old)
+    } else {
+        None
+    };
+    let second = {
+        let router = router.clone();
+        tokio::spawn(async move { router.route_chat(None, &chat(false), None).await })
+    };
+    // With two decode workers, cache-aware breaks the cold load tie at random,
+    // so record which worker the second request warmed.
+    let warmed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !new_worker && !d0.captured().is_empty() {
+                return &d0;
+            }
+            if (new_worker || cache_aware) && !d1.captured().is_empty() {
+                return &d1;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    if let Some(old) = removed {
+        router.worker_registry().register(old);
+    }
+    p_gate.release();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while d0.captured().len() + d1.captured().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    if new_worker {
+        assert_eq!(
+            d1.captured().len(),
+            2,
+            "new worker's warmed prefix must be scored at commit"
+        );
+    } else if cache_aware {
+        assert_eq!(
+            warmed.captured().len(),
+            2,
+            "the first request must see the prefix warmed while prefill waited"
+        );
+    } else {
+        assert_eq!(
+            d1.captured().len(),
+            1,
+            "the first request must see D0's new load"
+        );
+    }
+    d_gate.release();
+    assert!(tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .unwrap()
+        .unwrap()
+        .status()
+        .is_success());
+    assert!(tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .unwrap()
+        .unwrap()
+        .status()
+        .is_success());
 }
 
 #[tokio::test]
@@ -951,8 +1265,11 @@ async fn grpc_pd_nixl_push_client_disconnect_during_prefill_releases_both_legs()
     assert_eq!(d.load(), 0);
 }
 
+/// A route this path still does not serve is refused before either stage is used.
+/// Completions used to be that route; it is served now, so the guard is checked with one
+/// that remains unsupported instead of testing an internal entry point.
 #[tokio::test]
-async fn grpc_pd_rejects_non_chat_routes_before_dispatch() {
+async fn grpc_pd_rejects_unsupported_routes_before_dispatch() {
     let prefill = MockVllmRsServer::spawn().await;
     let decode = MockVllmRsServer::spawn().await;
     let router = pd_router(&prefill, &decode).await;
@@ -960,9 +1277,9 @@ async fn grpc_pd_rejects_non_chat_routes_before_dispatch() {
     let response = router
         .route_transparent(
             None,
-            "/v1/completions",
+            "/v1/embeddings",
             &axum::http::Method::POST,
-            json!({"model": "test-model", "prompt": "hi", "max_tokens": 4}),
+            json!({"model": "test-model", "input": "hi"}),
         )
         .await;
     assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
