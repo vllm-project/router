@@ -28,6 +28,12 @@ impl ConfigValidator {
 
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
+        if let Some(policy) = &config.prefill_policy {
+            Self::validate_policy(policy)?;
+        }
+        if let Some(policy) = &config.decode_policy {
+            Self::validate_policy(policy)?;
+        }
         Self::validate_server_settings(config)?;
         if let Some(program_scheduling) = &config.program_scheduling {
             Self::validate_program_scheduling(program_scheduling)?;

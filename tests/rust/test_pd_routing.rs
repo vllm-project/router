@@ -799,6 +799,8 @@ mod test_pd_routing {
                 pd_kv_event_sources: Default::default(),
                 kv_event_strict_recovery: false,
                 policy,
+                prefill_policy: None,
+                decode_policy: None,
                 host: "127.0.0.1".to_string(),
                 port: 3001,
                 max_payload_size: 1024 * 1024,
