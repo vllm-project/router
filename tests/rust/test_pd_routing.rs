@@ -806,6 +806,8 @@ mod test_pd_routing {
                 worker_startup_timeout_secs: 10,
                 worker_startup_check_interval_secs: 1,
                 intra_node_data_parallel_size: 1,
+                decode_intra_node_data_parallel_size: None,
+
                 api_key: None,
                 api_key_validation_urls: vec![],
                 discovery: None,

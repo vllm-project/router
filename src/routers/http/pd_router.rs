@@ -565,6 +565,9 @@ pub struct PdRouterBase {
     pub circuit_breaker_config: CircuitBreakerConfig,
     // Fallback DP size for servers that report no engine metrics
     pub dp_size: usize,
+    // Per-side explicit decode expansion; Some(n) bypasses the metrics
+    // self-report for decode endpoints.
+    decode_dp_size: Option<usize>,
 }
 
 /// Build the workers backing one server URL, one per engine the server fronts.
@@ -1013,12 +1016,13 @@ impl PdRouterBase {
         url: String,
         bootstrap_port: Option<u16>,
     ) -> Result<String, PDRouterError> {
-        self.add_server(url, "prefill", WorkerType::Prefill { bootstrap_port })
+        self.add_server(url, "prefill", WorkerType::Prefill { bootstrap_port }, None)
             .await
     }
 
     pub async fn add_decode_server(&self, url: String) -> Result<String, PDRouterError> {
-        self.add_server(url, "decode", WorkerType::Decode).await
+        self.add_server(url, "decode", WorkerType::Decode, self.decode_dp_size)
+            .await
     }
 
     async fn add_server(
@@ -1026,11 +1030,17 @@ impl PdRouterBase {
         url: String,
         role: &str,
         worker_type: WorkerType,
+        dp_size_override: Option<usize>,
     ) -> Result<String, PDRouterError> {
         // Wait for the new server to be healthy
         self.wait_for_server_health(&url).await?;
 
-        let dp_size = dp_utils::discover_dp_size(&self.client, &url, self.dp_size).await;
+        let dp_size = match dp_size_override {
+            // An explicit per-side value pins the expansion and bypasses the
+            // engine-count self-report.
+            Some(size) => size.max(1),
+            None => dp_utils::discover_dp_size(&self.client, &url, self.dp_size).await,
+        };
         let workers = build_dp_workers(
             &url,
             dp_size,
@@ -1260,6 +1270,7 @@ impl PdRouterBase {
         }
 
         let fallback_dp_size = ctx.router_config.intra_node_data_parallel_size.max(1);
+        let decode_dp_size = ctx.router_config.decode_intra_node_data_parallel_size;
         let health_config = HealthConfig {
             timeout_secs: ctx.router_config.health_check.timeout_secs,
             check_interval_secs: ctx.router_config.health_check.check_interval_secs,
@@ -1278,7 +1289,12 @@ impl PdRouterBase {
         });
         let decode_workers = decode_urls.iter().map(|url| (url, WorkerType::Decode));
         for (url, worker_type) in prefill_workers.chain(decode_workers) {
-            let dp_size = dp_utils::discover_dp_size(&ctx.client, url, fallback_dp_size).await;
+            let dp_size = match (&worker_type, decode_dp_size) {
+                // An explicit per-side value pins the expansion and bypasses
+                // the engine-count self-report.
+                (WorkerType::Decode, Some(size)) => size.max(1),
+                _ => dp_utils::discover_dp_size(&ctx.client, url, fallback_dp_size).await,
+            };
             for worker in build_dp_workers(
                 url,
                 dp_size,
@@ -1390,6 +1406,7 @@ impl PdRouterBase {
             api_key: ctx.router_config.api_key.clone(),
             circuit_breaker_config: core_cb_config,
             dp_size: fallback_dp_size,
+            decode_dp_size,
         })
     }
 
@@ -1921,6 +1938,7 @@ mod tests {
             api_key: None,
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size: 1,
+            decode_dp_size: None,
         }
     }
 
@@ -1942,6 +1960,7 @@ mod tests {
             api_key: None,
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size,
+            decode_dp_size: None,
         }
     }
 
@@ -2532,6 +2551,91 @@ mod tests {
         let mut ranks: Vec<usize> = workers.iter().filter_map(|w| w.dp_rank()).collect();
         ranks.sort();
         assert_eq!(ranks, vec![0, 1, 2, 3]);
+    }
+
+    // A minimal engine mock: /health answers "ok" and /metrics advertises
+    // `engine_count` engines, the self-report `discover_dp_size` counts.
+    async fn spawn_engine_mock(engine_count: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let metrics_body = (0..engine_count)
+            .map(|rank| format!("vllm:num_requests_waiting{{engine=\"dp{rank}\"}} 1\n"))
+            .collect::<String>();
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(|| async { "ok" }))
+            .route(
+                "/metrics",
+                axum::routing::get(move || {
+                    let body = metrics_body.clone();
+                    async move { body }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn test_decode_dp_override_pins_single_rankless_worker() {
+        // The engine self-reports 4 engines; an explicit per-side override of 1
+        // must pin a single rank-less worker regardless, bypassing discovery.
+        let url = spawn_engine_mock(4).await;
+        let mut router = create_test_pd_router_with_dp(4);
+        router.decode_dp_size = Some(1);
+
+        router
+            .add_decode_server(url.clone())
+            .await
+            .expect("server should be added");
+
+        let workers = router.worker_registry.get_decode_workers();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].url(), url);
+        assert!(workers[0].dp_rank().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_decode_dp_override_pins_multi_rank_expansion() {
+        // The engine self-reports only 2 engines; the override of 4 still
+        // expands to 4 DP-aware workers.
+        let url = spawn_engine_mock(2).await;
+        let mut router = create_test_pd_router_with_dp(4);
+        router.decode_dp_size = Some(4);
+
+        router
+            .add_decode_server(url)
+            .await
+            .expect("server should be added");
+
+        let mut ranks: Vec<usize> = router
+            .worker_registry
+            .get_decode_workers()
+            .iter()
+            .filter_map(|w| w.dp_rank())
+            .collect();
+        ranks.sort();
+        assert_eq!(ranks, vec![0, 1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_decode_dp_default_none_prefers_engine_self_report() {
+        // Without the override, expansion still follows the engine's own
+        // engine-count self-report (default behavior unchanged).
+        let url = spawn_engine_mock(2).await;
+        let router = create_test_pd_router_with_dp(4);
+
+        router
+            .add_decode_server(url)
+            .await
+            .expect("server should be added");
+
+        let mut ranks: Vec<usize> = router
+            .worker_registry
+            .get_decode_workers()
+            .iter()
+            .filter_map(|w| w.dp_rank())
+            .collect();
+        ranks.sort();
+        assert_eq!(ranks, vec![0, 1]);
     }
 
     #[test]
