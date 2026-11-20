@@ -5,10 +5,10 @@
 
 use super::request_pool::RequestPool;
 use super::{
-    ProgramDispatch, ProgramIdentity, ProgramRef, ProgramRequestHandle, ProgramRequestHints,
-    ProgramState, ProgramStatus, ProgramUsageObservation,
+    ContextTokens, ProgramDispatch, ProgramIdentity, ProgramRef, ProgramRequestHandle,
+    ProgramRequestHints, ProgramState, ProgramStatus, ProgramUsageObservation,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 /// Mutable protocol-neutral Program runtime owned by ProgramScheduler.
@@ -19,6 +19,7 @@ pub struct ProgramRuntime {
     released_generations_at: HashMap<RuntimeKey, Instant>,
     request_pool: RequestPool,
     next_placement_epoch: u64,
+    next_attempt_id: u64,
 }
 
 impl ProgramRuntime {
@@ -26,17 +27,16 @@ impl ProgramRuntime {
     pub fn retain_request(
         &mut self,
         identity: &ProgramIdentity,
-        estimated_context_tokens: usize,
+        context: impl Into<ContextTokens>,
         routing_text: Option<&str>,
         arrived_at: Instant,
     ) -> ProgramRequestHandle {
+        let context = context.into();
         let key = RuntimeKey::from(identity);
         self.released_generations_at.remove(&key);
         let program_ref = if let Some(program) = self.programs.get_mut(&key) {
             program.expected_resume = identity.expected_resume();
-            program.estimated_context_tokens = program
-                .estimated_context_tokens
-                .max(estimated_context_tokens);
+            program.context = program.context.max_with(context);
             program.reference.clone()
         } else {
             let generation = self
@@ -60,8 +60,9 @@ impl ProgramRuntime {
                     placement: None,
                     placement_epoch: 0,
                     placement_start_request_pending: false,
-                    estimated_context_tokens,
+                    context,
                     in_flight_requests: 0,
+                    active_attempts: HashSet::new(),
                 },
             );
             reference
@@ -72,7 +73,7 @@ impl ProgramRuntime {
         self.request_pool.retain(
             program_ref,
             arrived_at,
-            estimated_context_tokens,
+            context,
             routing_text,
             identity.request_hints().clone(),
         )
@@ -111,19 +112,70 @@ impl ProgramRuntime {
         program.placement_start_request_pending = false;
         let request = self.request_pool.take_front(handle)?;
         program.status = ProgramStatus::Reasoning;
+        self.next_attempt_id = self
+            .next_attempt_id
+            .checked_add(1)
+            .expect("Program attempt ID exhausted");
+        program.active_attempts.insert(self.next_attempt_id);
         program.in_flight_requests = program.in_flight_requests.saturating_add(1);
         self.request_pool.notify_front(&program.reference);
         Some(ProgramDispatch::new(
+            self.next_attempt_id,
             program.reference.clone(),
             target_id,
             program.placement_epoch,
             request.arrived_at,
             dispatched_at,
-            request.estimated_context_tokens,
+            request.context,
             starts_placement,
             request.routing_text,
             request.hints,
         ))
+    }
+
+    /// Replace a failed pre-output transport attempt without opening a successor's
+    /// serial slot. The scheduler independently rechecks the existing reservation.
+    pub(crate) fn restart_attempt(
+        &mut self,
+        old: &ProgramDispatch,
+        now: Instant,
+    ) -> Option<ProgramDispatch> {
+        if !self.is_live_attempt(old) {
+            return None;
+        }
+        self.next_attempt_id = self.next_attempt_id.checked_add(1)?;
+        let program = self.programs.get_mut(&RuntimeKey::from(old.program()))?;
+        program.active_attempts.remove(&old.attempt_id());
+        program.active_attempts.insert(self.next_attempt_id);
+        let mut replacement = ProgramDispatch::new(
+            self.next_attempt_id,
+            old.program().clone(),
+            old.target_id.clone(),
+            old.placement_epoch(),
+            old.request_arrived_at(),
+            now,
+            old.context_facts(),
+            old.placement_start_request(),
+            old.routing_text().map(str::to_string),
+            old.request_hints().clone(),
+        );
+        replacement.attach_prediction_context(
+            old.expected_resume(),
+            old.pending_output_prediction().cloned(),
+        );
+        Some(replacement)
+    }
+
+    /// Test an exact live attempt before accepting PD metadata.
+    pub fn is_live_attempt(&self, dispatch: &ProgramDispatch) -> bool {
+        self.programs
+            .get(&RuntimeKey::from(dispatch.program()))
+            .is_some_and(|p| {
+                p.reference == *dispatch.program()
+                    && p.placement.as_deref() == Some(dispatch.target_id.as_str())
+                    && p.placement_epoch == dispatch.placement_epoch()
+                    && p.active_attempts.contains(&dispatch.attempt_id())
+            })
     }
 
     /// Record one request completion if its generation and placement are current.
@@ -139,13 +191,14 @@ impl ProgramRuntime {
         if &program.reference != dispatch.program()
             || program.placement_epoch != dispatch.placement_epoch()
             || program.in_flight_requests == 0
+            || !program.active_attempts.remove(&dispatch.attempt_id())
         {
             return false;
         }
-        let prompt_tokens = usage
-            .prompt_tokens
-            .unwrap_or(dispatch.estimated_context_tokens());
-        program.estimated_context_tokens = program.estimated_context_tokens.max(prompt_tokens);
+        let prompt_tokens = usage.prompt_tokens.unwrap_or(dispatch.context_tokens());
+        program.context = program
+            .context
+            .max_with(ContextTokens::estimated(prompt_tokens));
         program.in_flight_requests -= 1;
         if program.in_flight_requests == 0 && self.request_pool.program_len(&program.reference) == 0
         {
@@ -281,6 +334,7 @@ impl ProgramRuntime {
         program.placement_epoch = self.next_placement_epoch;
         program.placement_start_request_pending = false;
         program.in_flight_requests = 0;
+        program.active_attempts.clear();
         true
     }
 
@@ -310,11 +364,6 @@ impl ProgramRuntime {
         self.request_pool.is_empty()
     }
 
-    /// Text retained with the exact front request, not the last completed step.
-    pub(crate) fn front_context_tokens(&self, program: &ProgramRef) -> Option<usize> {
-        self.request_pool.front_context_tokens(program)
-    }
-
     pub(crate) fn front_routing_text(&self, program_ref: &ProgramRef) -> Option<&str> {
         self.request_pool.front_routing_text(program_ref)
     }
@@ -325,6 +374,24 @@ impl ProgramRuntime {
         program_ref: &ProgramRef,
     ) -> Option<&ProgramRequestHints> {
         self.request_pool.front_hints(program_ref)
+    }
+
+    /// Prompt estimate belonging to the Program's front retained turn.
+    pub(crate) fn front_request_context(&self, program_ref: &ProgramRef) -> Option<usize> {
+        self.request_pool.front_context_tokens(program_ref)
+    }
+
+    pub(crate) fn update_retained_contexts(
+        &mut self,
+        update: impl FnMut(&ProgramRef, ContextTokens) -> ContextTokens,
+    ) -> Vec<(ProgramRef, ContextTokens)> {
+        let changes = self.request_pool.update_contexts(update);
+        for (reference, context) in &changes {
+            if let Some(program) = self.programs.get_mut(&RuntimeKey::from(reference)) {
+                program.context = program.context.max_with(*context);
+            }
+        }
+        changes
     }
 
     /// Immutable lifecycle view used by scheduling decisions under one lock.
@@ -349,7 +416,7 @@ impl ProgramRuntime {
             status: program.status,
             expected_resume: program.expected_resume,
             placement: program.placement.as_deref(),
-            estimated_context_tokens: program.estimated_context_tokens,
+            estimated_context_tokens: program.context.tokens(),
             in_flight_requests: program.in_flight_requests,
             waiting_requests: self.request_pool.program_len(&program.reference),
         })
@@ -417,13 +484,16 @@ struct RuntimeProgram {
     placement: Option<String>,
     placement_epoch: u64,
     placement_start_request_pending: bool,
-    estimated_context_tokens: usize,
+    context: ContextTokens,
     in_flight_requests: usize,
+    active_attempts: HashSet<u64>,
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use crate::program_scheduling::ContextTokens as CT;
     use serde_json::json;
 
     fn identity(program_id: &str) -> ProgramIdentity {
@@ -445,7 +515,8 @@ mod tests {
     #[test]
     fn retain_admit_complete_pause_and_release() {
         let mut runtime = ProgramRuntime::default();
-        let handle = runtime.retain_request(&identity("p"), 100, None, Instant::now());
+        let handle =
+            runtime.retain_request(&identity("p"), CT::estimated(100), None, Instant::now());
         assert_eq!(runtime.retained_request_count(), 1);
         let dispatch = runtime
             .admit_front(&handle, "rank-0".into(), Instant::now())
@@ -472,7 +543,8 @@ mod tests {
     #[test]
     fn stale_generation_cannot_mutate_replacement() {
         let mut runtime = ProgramRuntime::default();
-        let old_handle = runtime.retain_request(&identity("p"), 100, None, Instant::now());
+        let old_handle =
+            runtime.retain_request(&identity("p"), CT::estimated(100), None, Instant::now());
         let old_dispatch = runtime
             .admit_front(&old_handle, "rank-0".into(), Instant::now())
             .unwrap();
@@ -480,7 +552,8 @@ mod tests {
         assert!(runtime.pause_idle(old_dispatch.program()));
         assert!(runtime.release_idle(old_dispatch.program(), Instant::now()));
 
-        let new_handle = runtime.retain_request(&identity("p"), 200, None, Instant::now());
+        let new_handle =
+            runtime.retain_request(&identity("p"), CT::estimated(200), None, Instant::now());
         let new_dispatch = runtime
             .admit_front(&new_handle, "rank-1".into(), Instant::now())
             .unwrap();
@@ -495,7 +568,7 @@ mod tests {
         let now = Instant::now();
         let mut runtime = ProgramRuntime::default();
         let identity = identity("bounded");
-        let handle = runtime.retain_request(&identity, 10, None, now);
+        let handle = runtime.retain_request(&identity, CT::estimated(10), None, now);
         let dispatch = runtime.admit_front(&handle, "rank-0".into(), now).unwrap();
         assert!(runtime.complete_request(&dispatch, Some(10).into()));
         assert!(runtime.pause_idle(dispatch.program()));
@@ -512,11 +585,11 @@ mod tests {
     fn active_consecutive_request_keeps_placement_epoch() {
         let mut runtime = ProgramRuntime::default();
         let program = identity("p");
-        let first = runtime.retain_request(&program, 100, None, Instant::now());
+        let first = runtime.retain_request(&program, CT::estimated(100), None, Instant::now());
         let first_dispatch = runtime
             .admit_front(&first, "rank-0".into(), Instant::now())
             .unwrap();
-        let second = runtime.retain_request(&program, 110, None, Instant::now());
+        let second = runtime.retain_request(&program, CT::estimated(110), None, Instant::now());
         let second_dispatch = runtime
             .admit_front(&second, "rank-0".into(), Instant::now())
             .unwrap();
@@ -533,17 +606,39 @@ mod tests {
     fn cancelling_only_waiter_releases_active_reasoning_placement() {
         let mut runtime = ProgramRuntime::default();
         let program = identity("p");
-        let first = runtime.retain_request(&program, 100, None, Instant::now());
+        let first = runtime.retain_request(&program, CT::estimated(100), None, Instant::now());
         let dispatch = runtime
             .admit_front(&first, "rank-0".into(), Instant::now())
             .unwrap();
         assert!(runtime.complete_request(&dispatch, None.into()));
-        let waiting = runtime.retain_request(&program, 110, None, Instant::now());
+        let waiting = runtime.retain_request(&program, CT::estimated(110), None, Instant::now());
         assert!(runtime.cancel_request(&waiting));
         assert_eq!(runtime.placement(dispatch.program()), None);
         assert_eq!(
             runtime.state(dispatch.program()),
             Some((ProgramState::Paused, ProgramStatus::Acting))
         );
+    }
+    #[test]
+    fn duplicate_completion_cannot_settle_a_successor_in_the_same_epoch() {
+        let mut runtime = ProgramRuntime::default();
+        let program = identity("attempts");
+        let a = runtime.retain_request(&program, 100, None, Instant::now());
+        let first = runtime
+            .admit_front(&a, "rank-0".into(), Instant::now())
+            .unwrap();
+        assert!(runtime.complete_request(&first, None.into()));
+        let b = runtime.retain_request(&program, 110, None, Instant::now());
+        let second = runtime
+            .admit_front(&b, "rank-0".into(), Instant::now())
+            .unwrap();
+        assert_eq!(first.placement_epoch(), second.placement_epoch());
+        assert_ne!(first.attempt_id(), second.attempt_id());
+        assert!(!runtime.complete_request(&first, None.into()));
+        assert_eq!(
+            runtime.view(second.program()).unwrap().in_flight_requests,
+            1
+        );
+        assert!(runtime.complete_request(&second, None.into()));
     }
 }

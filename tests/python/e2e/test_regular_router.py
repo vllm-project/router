@@ -5,6 +5,10 @@ from types import SimpleNamespace
 import pytest
 import requests
 
+from tools.e2e.vllm_test_compat import import_run_eval
+
+run_eval = import_run_eval()
+
 
 @pytest.mark.e2e
 def test_mmlu(e2e_router_only_rr, e2e_two_workers_dp2, e2e_model):

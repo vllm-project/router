@@ -110,7 +110,7 @@ impl ProgramScheduler {
                             .map(|(target_index, target)| {
                                 let affinity =
                                     state.bindings.prefix_match_rate(&pool, text, target);
-                                let cached = (decision.estimated_context_tokens as f64
+                                let cached = (decision.context.tokens() as f64
                                     * affinity.clamp(0.0, 1.0))
                                 .floor() as usize;
                                 let index = assignments.len();
@@ -118,10 +118,7 @@ impl ProgramScheduler {
                                 OptionValue {
                                     target: target_index,
                                     tokens: cost.ceil() as usize,
-                                    value: (
-                                        cached as u128,
-                                        decision.estimated_context_tokens as u128,
-                                    ),
+                                    value: (cached as u128, decision.context.tokens() as u128),
                                     index,
                                 }
                             })
@@ -184,6 +181,7 @@ impl ProgramScheduler {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::program_scheduling::ProgramResumeOrder;

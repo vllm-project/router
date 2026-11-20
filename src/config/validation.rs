@@ -7,6 +7,15 @@ pub struct ConfigValidator;
 impl ConfigValidator {
     /// Validate a complete router configuration
     pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        if let Some(ttl_secs) = config.kv_aware_session_affinity_ttl_secs {
+            if !(1..=31_536_000).contains(&ttl_secs) {
+                return Err(ConfigError::InvalidValue {
+                    field: "kv_aware_session_affinity_ttl_secs".to_string(),
+                    value: ttl_secs.to_string(),
+                    reason: "Must be between 1 and 31536000 seconds".to_string(),
+                });
+            }
+        }
         // Check if service discovery is enabled (either via discovery config or vLLM mode)
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled)
             || matches!(
@@ -177,14 +186,15 @@ impl ConfigValidator {
                 reason: "Must be finite and > 0".to_string(),
             });
         }
+        // Zero admission bounds mean "auto" and are resolved from the P permit
+        // count when the scheduler is built, so they are valid here.
         if config.hash_virtual_nodes == 0
-            || config.max_active_programs_per_target == 0
             || config.stats_window_size == 0
             || config.max_segment_rounds == 0
             || config.token_capacity_per_dp_rank == Some(0)
         {
             return Err(ConfigError::ValidationFailed {
-                reason: "Program scheduling counts and configured token capacity must be > 0"
+                reason: "Program scheduling counts and configured token capacity must be > 0; zero admission bounds mean auto sizing"
                     .to_string(),
             });
         }
@@ -208,6 +218,61 @@ impl ConfigValidator {
                     .to_string(),
             });
         }
+        let prediction = &config.prediction_profile;
+        if !prediction.snapshot_interval_seconds.is_finite()
+            || prediction.snapshot_interval_seconds <= 0.0
+            || !prediction.prior_weight.is_finite()
+            || prediction.prior_weight < 0.0
+            || prediction.max_keys == 0
+            || prediction.return_time_min_support == 0
+            || prediction.output_length_min_support == 0
+            || prediction.output_length_tail_samples == 0
+            || prediction.stability_window_size == 0
+            || prediction.step_bucket_size == 0
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "Prediction profile intervals, weights, supports, windows, and limits must be valid and non-zero".to_string(),
+            });
+        }
+        if !prediction.return_time_horizon_seconds.is_finite()
+            || prediction.return_time_horizon_seconds <= 0.0
+            || !prediction.output_length_quantile.is_finite()
+            || !(0.0..1.0).contains(&prediction.output_length_quantile)
+            || !prediction.stability_tolerance.is_finite()
+            || prediction.stability_tolerance < 0.0
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "Prediction horizons, quantiles, and stability tolerance are invalid"
+                    .to_string(),
+            });
+        }
+        if !strictly_increasing_f64(&prediction.return_time_bucket_bounds_seconds)
+            || !strictly_increasing_usize(&prediction.output_length_bucket_bounds_tokens)
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason:
+                    "Prediction bucket bounds must be non-empty, positive, and strictly increasing"
+                        .to_string(),
+            });
+        }
+        if prediction.mode != PredictionMode::Off {
+            if let Some(path) = prediction.profile_path.as_deref() {
+                let raw = std::fs::read_to_string(path).map_err(|error| {
+                    ConfigError::ValidationFailed {
+                        reason: format!("Unable to read prediction profile '{path}': {error}"),
+                    }
+                })?;
+                crate::program_scheduling::prediction_profile::validate_profile_json(
+                    &raw,
+                    &prediction.return_time_bucket_bounds_seconds,
+                    &prediction.output_length_bucket_bounds_tokens,
+                    prediction.max_keys,
+                )
+                .map_err(|error| ConfigError::ValidationFailed {
+                    reason: format!("Invalid prediction profile '{path}': {error}"),
+                })?;
+            }
+        }
         Ok(())
     }
 
@@ -228,9 +293,9 @@ impl ConfigValidator {
                 })
             }
         };
-        if config.intra_node_data_parallel_size != 1 || config.enable_igw {
+        if config.enable_igw {
             return Err(ConfigError::ValidationFailed {
-                reason: "EPD currently requires DP=1 and proxy mode".into(),
+                reason: "EPD currently requires proxy mode".into(),
             });
         }
         if epd.encoder_urls.is_empty() {
@@ -249,18 +314,6 @@ impl ConfigValidator {
             }
         }
         if !epd.consumer_zmq_addrs.is_empty() {
-            if worker_urls.is_empty()
-                || epd.consumer_zmq_addrs.len() != worker_urls.len()
-                || worker_urls
-                    .iter()
-                    .any(|url| !epd.consumer_zmq_addrs.contains_key(*url))
-            {
-                return Err(ConfigError::ValidationFailed {
-                    reason:
-                        "EPD consumer_zmq_addrs must map every embedding consumer URL exactly once"
-                            .into(),
-                });
-            }
             for addr in epd.consumer_zmq_addrs.values() {
                 let parsed = url::Url::parse(addr).map_err(|e| ConfigError::ValidationFailed {
                     reason: format!("Invalid EC address: {e}"),
@@ -332,6 +385,18 @@ impl ConfigValidator {
                     all.extend(decode_urls.iter().cloned());
                     Self::reject_mixed_worker_urls(&all)?;
                 }
+                // Discovered P/D workers register as http://, so a grpc://
+                // static pool would end up mixed at runtime.
+                let has_grpc_url = prefill_urls
+                    .iter()
+                    .map(|(url, _)| url.as_str())
+                    .chain(decode_urls.iter().map(String::as_str))
+                    .any(crate::backend::is_grpc_url);
+                if has_service_discovery && has_grpc_url {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "grpc:// P/D workers cannot be combined with service discovery, which registers http:// workers".to_string(),
+                    });
+                }
 
                 // Validate bootstrap ports
                 for (_url, port) in prefill_urls {
@@ -393,7 +458,7 @@ impl ConfigValidator {
                     });
                 }
 
-                if *balance_rel_threshold < 1.0 {
+                if !(1.0..).contains(balance_rel_threshold) {
                     return Err(ConfigError::InvalidValue {
                         field: "balance_rel_threshold".to_string(),
                         value: balance_rel_threshold.to_string(),
@@ -422,6 +487,7 @@ impl ConfigValidator {
                 kv_penalty_host,
                 kv_penalty_external,
                 kv_penalty_disk,
+                static_kv_event_sources,
             } => {
                 if !router_temperature.is_finite() || *router_temperature < 0.0 {
                     return Err(ConfigError::InvalidValue {
@@ -443,6 +509,9 @@ impl ConfigValidator {
                         });
                     }
                 }
+                for (worker, source) in static_kv_event_sources.iter() {
+                    source.validate(worker)?;
+                }
             }
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs,
@@ -463,6 +532,10 @@ impl ConfigValidator {
                         reason: "Must be > 0".to_string(),
                     });
                 }
+            }
+            PolicyConfig::StickyLeastLoaded => {
+                // Session expiration is sourced from the environment; no
+                // structured config to validate here.
             }
             PolicyConfig::RendezvousHash => {
                 // No specific validation needed
@@ -610,7 +683,7 @@ impl ConfigValidator {
                 reason: "Must be >= initial_backoff_ms".to_string(),
             });
         }
-        if retry.backoff_multiplier < 1.0 {
+        if !(1.0..).contains(&retry.backoff_multiplier) {
             return Err(ConfigError::InvalidValue {
                 field: "retry.backoff_multiplier".to_string(),
                 value: retry.backoff_multiplier.to_string(),
@@ -662,34 +735,110 @@ impl ConfigValidator {
 
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
-        if config.program_scheduling.is_some()
-            && !matches!(config.mode, RoutingMode::Regular { .. })
-        {
-            return Err(ConfigError::IncompatibleConfig {
-                reason: "Program scheduling currently requires regular HTTP routing mode"
-                    .to_string(),
-            });
+        if let Some(program) = &config.program_scheduling {
+            let pd_mode = matches!(config.mode, RoutingMode::VllmPrefillDecode { .. });
+            if (!matches!(config.mode, RoutingMode::Regular { .. }) && !pd_mode)
+                || (pd_mode && config.connection_mode != ConnectionMode::Http)
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "Program scheduling requires regular HTTP mode or vLLM PD HTTP mode"
+                        .to_string(),
+                });
+            }
+            if pd_mode
+                && (program.dynamic_token_capacity
+                    || program.resume_order
+                        == crate::program_scheduling::ProgramResumeOrder::DpAdmissionTAO)
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "TAO admission and dynamic capacity are supported only in regular mode"
+                        .into(),
+                });
+            }
+            if pd_mode {
+                program
+                    .pd
+                    .validate()
+                    .map_err(|reason| ConfigError::IncompatibleConfig { reason })?;
+            } else if program.pd.warm_remote_enabled() {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "warm remote KV reuse and automatic TTL require HTTP PD mode".into(),
+                });
+            }
+            if let RoutingMode::VllmPrefillDecode {
+                prefill_urls,
+                decode_urls,
+                ..
+            } = &config.mode
+            {
+                if prefill_urls
+                    .iter()
+                    .map(|(url, _)| url.as_str())
+                    .chain(decode_urls.iter().map(String::as_str))
+                    .any(crate::backend::is_grpc_url)
+                {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason: "Program scheduling dispatches over HTTP and cannot run on grpc:// P/D workers".to_string(),
+                    });
+                }
+            }
+            if pd_mode
+                && (!(0.0..=1.0).contains(&program.pd.prefill_kv_high_watermark)
+                    || program.pd.prefill_kv_window_seconds <= 0.0
+                    || !program.pd.prefill_kv_window_seconds.is_finite())
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "PD prefill_kv_high_watermark must be within [0, 1] and prefill_kv_window_seconds must be finite and > 0; a zero watermark disables the guard".to_string(),
+                });
+            }
+            if pd_mode
+                && (program.binding_only
+                    || program.enable_batch_gain_admission
+                    || program.token_capacity_per_dp_rank.is_none()
+                    || program.pd.max_prefill_requests_per_target == 0
+                    || program.pd.max_prefill_requests_per_target > u32::MAX as usize
+                    || !matches!(
+                        program.pd.kv_hash_mode.as_str(),
+                        "sha256" | "python_hash_seed" | "xxhash_cbor"
+                    ))
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "PD scheduling requires per-rank capacity, positive bounded P concurrency and a known KV hash mode; binding_only and uncalibrated batch gain are unsupported".to_string(),
+                });
+            }
         }
         // IGW mode is independent - skip other compatibility checks when enabled
         if config.enable_igw {
             return Ok(());
         }
 
-        if let RoutingMode::VllmPrefillDecode {
-            prefill_policy,
-            decode_policy,
+        if let PolicyConfig::KvAware {
+            static_kv_event_sources,
             ..
-        } = &config.mode
+        } = &config.policy
         {
-            let effective_prefill = prefill_policy.as_ref().unwrap_or(&config.policy);
-            let effective_decode = decode_policy.as_ref().unwrap_or(&config.policy);
-            if matches!(effective_prefill, PolicyConfig::KvAware { .. })
-                || matches!(effective_decode, PolicyConfig::KvAware { .. })
-            {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "kv_aware is supported only in regular mode, not PD disaggregation"
-                        .to_string(),
-                });
+            if !static_kv_event_sources.is_empty() {
+                let RoutingMode::Regular { worker_urls } = &config.mode else {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason: "static --kv-event-source is only supported in regular mode"
+                            .to_string(),
+                    });
+                };
+                if !config
+                    .discovery
+                    .as_ref()
+                    .is_some_and(|discovery| discovery.enabled)
+                {
+                    for worker in static_kv_event_sources.keys() {
+                        if !worker_urls.contains(worker) {
+                            return Err(ConfigError::ValidationFailed {
+                                reason: format!(
+                                    "static KV event source worker '{worker}' is not in --worker-urls"
+                                ),
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -763,6 +912,91 @@ impl ConfigValidator {
             });
         }
 
+        // Static KV event sources are only meaningful with a KV-aware
+        // prefill policy; anything else would silently ignore them.
+        if !config.pd_kv_event_sources.is_empty() {
+            if let RoutingMode::VllmPrefillDecode {
+                prefill_urls,
+                decode_urls,
+                ..
+            } = &config.mode
+            {
+                for (url, sources) in &config.pd_kv_event_sources {
+                    // Sources are keyed by base URL; any KV-aware stage serving
+                    // a base with disjoint P/D ranks consumes its events.
+                    let prefill_keyed = prefill_urls
+                        .iter()
+                        .any(|(prefill, _)| base_url_without_rank(prefill) == url);
+                    let decode_keyed = decode_urls
+                        .iter()
+                        .any(|decode| base_url_without_rank(decode) == url);
+                    if !prefill_keyed && !decode_keyed {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason: format!(
+                                "pd_kv_event_sources key '{url}' is not a configured prefill or \
+                                 decode URL (use the base URL without the '@rank' suffix)"
+                            ),
+                        });
+                    }
+                    let prefill_kv = prefill_keyed
+                        && matches!(
+                            config.mode.get_prefill_policy(&config.policy),
+                            PolicyConfig::KvAware { .. }
+                        );
+                    let decode_kv = decode_keyed
+                        && matches!(
+                            config.mode.get_decode_policy(&config.policy),
+                            PolicyConfig::KvAware { .. }
+                        );
+                    if !prefill_kv && !decode_kv {
+                        let stage = match (prefill_keyed, decode_keyed) {
+                            (true, true) => "prefill and decode",
+                            (true, false) => "prefill",
+                            _ => "decode",
+                        };
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason: format!(
+                                "pd_kv_event_sources['{url}'] belongs to the {stage} stage, \
+                                 whose policy is not kv_aware; its subscribers would never start"
+                            ),
+                        });
+                    }
+                    if sources.endpoints.is_empty() {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason: format!("pd_kv_event_sources['{url}'] has no endpoints"),
+                        });
+                    }
+                    if sources.block_size == 0 {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason: format!("pd_kv_event_sources['{url}'] block_size must be > 0"),
+                        });
+                    }
+                    for endpoint in sources
+                        .endpoints
+                        .iter()
+                        .chain(sources.replay_endpoints.iter().flatten())
+                    {
+                        if !is_reachable_tcp_endpoint(endpoint)
+                            && endpoint
+                                .strip_prefix("ipc://")
+                                .is_none_or(|path| path.is_empty())
+                        {
+                            return Err(ConfigError::IncompatibleConfig {
+                                reason: format!(
+                                    "pd_kv_event_sources['{url}'] endpoint '{endpoint}' must be \
+                                     a reachable ZMQ address (tcp://HOST:PORT or ipc://PATH)"
+                                ),
+                            });
+                        }
+                    }
+                }
+            } else {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "pd_kv_event_sources requires vllm_prefill_decode mode".to_string(),
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -833,7 +1067,32 @@ impl ConfigValidator {
     }
 }
 
+fn strictly_increasing_f64(values: &[f64]) -> bool {
+    !values.is_empty()
+        && values.iter().all(|value| value.is_finite() && *value > 0.0)
+        && values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn strictly_increasing_usize(values: &[usize]) -> bool {
+    !values.is_empty()
+        && values.iter().all(|value| *value > 0)
+        && values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+/// Base URL without the optional `@dp_rank` suffix.
+///
+/// Mirrors `Worker::normalised_url()`: static KV event sources are looked up by
+/// `Worker::base_url()`, so a `http://host:port@1` prefill URL is keyed as
+/// `http://host:port`.
+fn base_url_without_rank(url: &str) -> &str {
+    match url.split_once('@') {
+        Some((base, rank)) if rank.parse::<usize>().is_ok() => base,
+        _ => url,
+    }
+}
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -934,6 +1193,25 @@ mod tests {
     }
 
     #[test]
+    fn session_affinity_ttl_is_optional_and_bounded() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.kv_aware_session_affinity_ttl_secs = Some(300);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        for ttl in [0, 31_536_001] {
+            config.kv_aware_session_affinity_ttl_secs = Some(ttl);
+            assert!(ConfigValidator::validate(&config).is_err());
+        }
+    }
+
+    #[test]
     fn test_validate_program_scheduling_boundaries() {
         let valid = ProgramSchedulingConfig::default();
         assert!(ConfigValidator::validate_program_scheduling(&valid).is_ok());
@@ -1004,6 +1282,16 @@ mod tests {
         for config in invalid {
             assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
         }
+    }
+
+    #[test]
+    fn prediction_off_skips_unused_profile_file_validation() {
+        let mut config = ProgramSchedulingConfig::default();
+        config.prediction_profile.mode = PredictionMode::Off;
+        config.prediction_profile.profile_path =
+            Some("/definitely/missing/prediction-profile.json".to_string());
+
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
     }
 
     #[test]
@@ -1174,6 +1462,32 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_cache_aware_balance_rel_threshold_bounds() {
+        let make_config = |balance_rel_threshold| {
+            RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec!["http://worker1:8000".to_string()],
+                },
+                PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                },
+            )
+        };
+
+        assert!(ConfigValidator::validate(&make_config(1.0)).is_ok());
+
+        let result = ConfigValidator::validate(&make_config(f32::NAN));
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "balance_rel_threshold"
+        ));
+    }
+
+    #[test]
     fn test_validate_cache_aware_single_worker() {
         // Cache-aware with single worker should be allowed (even if not optimal)
         let config = RouterConfig::new(
@@ -1205,6 +1519,46 @@ mod tests {
             PolicyConfig::Random,
         );
 
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn ttl_subknobs_alone_do_not_enable_the_warm_executor() {
+        let mode = || RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+            decode_urls: vec!["http://decode:8000".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+            discovery_address: None,
+        };
+        for pd in [
+            serde_json::json!({"feedback": true}),
+            serde_json::json!({"ttl_online": true}),
+        ] {
+            let mut config = RouterConfig::new(mode(), PolicyConfig::RoundRobin);
+            config.program_scheduling = Some(
+                serde_json::from_value(serde_json::json!({
+                    "token_capacity_per_dp_rank": 100000,
+                    "enable_batch_gain_admission": false,
+                    "pd": pd
+                }))
+                .unwrap(),
+            );
+            assert!(
+                ConfigValidator::validate(&config).is_err(),
+                "accepted a TTL sub-knob without automatic_ttl: {pd}"
+            );
+        }
+        // A master switch keeps the sub-knob valid.
+        let mut config = RouterConfig::new(mode(), PolicyConfig::RoundRobin);
+        config.program_scheduling = Some(
+            serde_json::from_value(serde_json::json!({
+                "token_capacity_per_dp_rank": 100000,
+                "enable_batch_gain_admission": false,
+                "pd": {"warm_remote": true, "feedback": true}
+            }))
+            .unwrap(),
+        );
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 
@@ -1302,7 +1656,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_kv_aware_for_disaggregated_pd_mode() {
+    fn test_accepts_kv_aware_for_disaggregated_pd_mode() {
         let config = RouterConfig::new(
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
@@ -1316,11 +1670,11 @@ mod tests {
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
             },
         );
 
-        let error = ConfigValidator::validate(&config).unwrap_err();
-        assert!(error.to_string().contains("not PD disaggregation"));
+        ConfigValidator::validate(&config).unwrap();
     }
 
     #[test]
@@ -1347,6 +1701,26 @@ mod tests {
         if let Err(e) = result {
             assert!(e.to_string().contains("prefill requires at least 2"));
         }
+    }
+
+    #[test]
+    fn test_validate_retry_backoff_multiplier_bounds() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+
+        config.retry.backoff_multiplier = 1.0;
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.retry.backoff_multiplier = f32::NAN;
+        let result = ConfigValidator::validate(&config);
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "retry.backoff_multiplier"
+        ));
     }
 
     #[test]
@@ -1385,5 +1759,323 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_grpc_pd_workers_reject_service_discovery() {
+        let pd_mode = |discovery_address: Option<String>| RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![("grpc://prefill:50051".to_string(), None)],
+            decode_urls: vec!["grpc://decode:50052".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+            discovery_address,
+        };
+
+        let zmq = RouterConfig::new(
+            pd_mode(Some("0.0.0.0:36367".to_string())),
+            PolicyConfig::Random,
+        );
+        let mut k8s = RouterConfig::new(pd_mode(None), PolicyConfig::Random);
+        k8s.discovery = Some(DiscoveryConfig {
+            enabled: true,
+            prefill_selector: vec![("role".to_string(), "prefill".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+        for config in [zmq, k8s] {
+            let err = ConfigValidator::validate(&config).unwrap_err();
+            assert!(err.to_string().contains("service discovery"), "{err}");
+        }
+
+        let static_only = RouterConfig::new(pd_mode(None), PolicyConfig::Random);
+        assert!(ConfigValidator::validate(&static_only).is_ok());
+    }
+
+    #[test]
+    fn tao_admission_and_dynamic_capacity_do_not_change_pd_scheduling() {
+        use crate::program_scheduling::ProgramResumeOrder;
+        for (order, dynamic) in [
+            (ProgramResumeOrder::DpAdmissionTAO, false),
+            (ProgramResumeOrder::DpAdmissionTAO, true),
+            (ProgramResumeOrder::Mru, true),
+        ] {
+            let mut config = pd_config_with_static_kv_sources();
+            config.program_scheduling = Some(ProgramSchedulingConfig {
+                token_capacity_per_dp_rank: Some(100000),
+                enable_batch_gain_admission: false,
+                ..ProgramSchedulingConfig::default()
+            });
+            let program = config.program_scheduling.as_mut().unwrap();
+            program.binding_strategy = ProgramBindingStrategy::CacheAware;
+            program.resume_order = order;
+            program.dynamic_token_capacity = dynamic;
+            if dynamic {
+                program.token_capacity_per_dp_rank = None;
+            }
+            let error = ConfigValidator::validate(&config).unwrap_err();
+            assert!(
+                error.to_string().contains("only in regular mode"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_grpc_pd_workers_reject_program_scheduling() {
+        let program: ProgramSchedulingConfig = serde_json::from_value(serde_json::json!({
+            "token_capacity_per_dp_rank": 100000,
+            "enable_batch_gain_admission": false,
+        }))
+        .unwrap();
+        let config = |prefill: &str, decode: &str| RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(prefill.to_string(), None)],
+                decode_urls: vec![decode.to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            program_scheduling: Some(program.clone()),
+            ..RouterConfig::default()
+        };
+        assert!(ConfigValidator::validate(&config("http://p:8000", "http://d:8000")).is_ok());
+        let err =
+            ConfigValidator::validate(&config("grpc://p:50051", "grpc://d:50052")).unwrap_err();
+        assert!(err.to_string().contains("grpc://"), "{err}");
+    }
+
+    fn pd_config_with_static_kv_sources() -> RouterConfig {
+        let mut config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            },
+        );
+        config.pd_kv_event_sources.insert(
+            "http://prefill:8000".to_string(),
+            PdKvEventSources {
+                endpoints: vec!["tcp://prefill:5557".to_string()],
+                replay_endpoints: None,
+                block_size: 16,
+                model: None,
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn test_pd_kv_event_sources_valid() {
+        assert!(ConfigValidator::validate(&pd_config_with_static_kv_sources()).is_ok());
+    }
+
+    /// A rank-pinned prefill URL is keyed by its base URL at runtime.
+    #[test]
+    fn test_pd_kv_event_sources_accepts_rank_pinned_prefill_url() {
+        let mut config = pd_config_with_static_kv_sources();
+        if let RoutingMode::VllmPrefillDecode { prefill_urls, .. } = &mut config.mode {
+            prefill_urls[0].0.push_str("@1");
+        }
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_pd_kv_event_sources_rejects_unknown_prefill_url() {
+        let mut config = pd_config_with_static_kv_sources();
+        let sources = config
+            .pd_kv_event_sources
+            .remove("http://prefill:8000")
+            .unwrap();
+        config
+            .pd_kv_event_sources
+            .insert("http://other:8000".to_string(), sources);
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(
+            err.contains("not a configured prefill or decode URL"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_pd_kv_event_sources_accept_a_decode_url() {
+        // A Decode engine that publishes KV events is the only way the Router
+        // can see which blocks a candidate already holds, so its URL must be
+        // accepted on both a shared policy and a Decode-only one. Prefill and
+        // Decode may differ: the stage whose policy is KV-aware is the stage
+        // that subscribes.
+        for decode_only_policy in [false, true] {
+            let mut config = pd_config_with_static_kv_sources();
+            if decode_only_policy {
+                config.policy = PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 5,
+                    balance_rel_threshold: 1.1,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 4096,
+                };
+                if let RoutingMode::VllmPrefillDecode { decode_policy, .. } = &mut config.mode {
+                    *decode_policy = Some(PolicyConfig::KvAware {
+                        router_temperature: 0.0,
+                        kv_penalty_host: 0.8,
+                        kv_penalty_external: 0.6,
+                        kv_penalty_disk: 0.3,
+                        static_kv_event_sources: Default::default(),
+                    });
+                }
+            }
+            let sources = config
+                .pd_kv_event_sources
+                .remove("http://prefill:8000")
+                .unwrap();
+            config
+                .pd_kv_event_sources
+                .insert("http://decode:8000".to_string(), sources);
+            assert!(
+                ConfigValidator::validate(&config).is_ok(),
+                "decode-keyed source rejected (decode_only_policy={decode_only_policy})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pd_kv_event_sources_accepts_a_decode_owned_base_on_disjoint_ranks() {
+        // Disjoint ranks share the base, and only Decode consumes the events.
+        let base = "http://host:8000";
+        let mut config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(format!("{base}@0"), None)],
+                decode_urls: vec![format!("{base}@1")],
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: Some(PolicyConfig::KvAware {
+                    router_temperature: 0.0,
+                    kv_penalty_host: 0.8,
+                    kv_penalty_external: 0.6,
+                    kv_penalty_disk: 0.3,
+                    static_kv_event_sources: Default::default(),
+                }),
+                discovery_address: None,
+            },
+            PolicyConfig::RoundRobin,
+        );
+        config.pd_kv_event_sources.insert(
+            base.to_string(),
+            PdKvEventSources {
+                endpoints: vec!["tcp://host:5557".to_string()],
+                replay_endpoints: None,
+                block_size: 16,
+                model: Some("m".to_string()),
+            },
+        );
+        ConfigValidator::validate(&config).unwrap();
+    }
+    #[test]
+    fn test_pd_kv_event_sources_rejects_a_source_whose_stage_is_not_kv_aware() {
+        // A Decode-keyed source with a count-based Decode policy would never be
+        // subscribed, which is the silent drop this guard exists to stop.
+        let mut config = pd_config_with_static_kv_sources();
+        let sources = config
+            .pd_kv_event_sources
+            .remove("http://prefill:8000")
+            .unwrap();
+        config
+            .pd_kv_event_sources
+            .insert("http://decode:8000".to_string(), sources);
+        if let RoutingMode::VllmPrefillDecode { decode_policy, .. } = &mut config.mode {
+            *decode_policy = Some(PolicyConfig::RoundRobin);
+        }
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("policy is not kv_aware"), "{err}");
+
+        // A Prefill-keyed source with a count-based Prefill policy is the same
+        // mistake on the other side.
+        let mut config = pd_config_with_static_kv_sources();
+        if let RoutingMode::VllmPrefillDecode { prefill_policy, .. } = &mut config.mode {
+            *prefill_policy = Some(PolicyConfig::RoundRobin);
+        }
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("policy is not kv_aware"), "{err}");
+    }
+
+    #[test]
+    fn test_pd_kv_event_sources_rejects_bad_endpoints() {
+        for (endpoints, block_size, message) in [
+            (
+                vec!["http://prefill:5557".to_string()],
+                16,
+                "must be a reachable ZMQ address",
+            ),
+            (vec!["tcp://*:5557".into()], 16, "reachable ZMQ"),
+            (vec!["tcp://0.0.0.0:5557".into()], 16, "reachable ZMQ"),
+            (vec!["tcp://[::]:5557".into()], 16, "reachable ZMQ"),
+            (vec!["tcp://prefill:0".into()], 16, "reachable ZMQ"),
+            (vec!["tcp://prefill".into()], 16, "reachable ZMQ"),
+            (vec!["ipc://".into()], 16, "reachable ZMQ"),
+            (vec![], 16, "no endpoints"),
+            (vec!["tcp://prefill:5557".to_string()], 0, "block_size"),
+        ] {
+            let mut config = pd_config_with_static_kv_sources();
+            let sources = config
+                .pd_kv_event_sources
+                .get_mut("http://prefill:8000")
+                .unwrap();
+            sources.endpoints = endpoints;
+            sources.block_size = block_size;
+            let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+            assert!(err.contains(message), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_pd_kv_event_sources_validates_replay_and_accepts_ipc_and_ipv6() {
+        let mut config = pd_config_with_static_kv_sources();
+        let source = config
+            .pd_kv_event_sources
+            .get_mut("http://prefill:8000")
+            .unwrap();
+        source.endpoints = vec!["ipc:///tmp/prefill-kv-events".into()];
+        source.replay_endpoints = Some(vec!["tcp://[::1]:5558".into()]);
+        assert!(ConfigValidator::validate(&config).is_ok());
+        config
+            .pd_kv_event_sources
+            .get_mut("http://prefill:8000")
+            .unwrap()
+            .replay_endpoints = Some(vec!["tcp://[::]:5558".into()]);
+        assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_pd_kv_event_sources_requires_pd_mode_and_kv_aware_policy() {
+        let mut config = pd_config_with_static_kv_sources();
+        config.mode = RoutingMode::Regular {
+            worker_urls: vec!["http://prefill:8000".to_string()],
+        };
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("requires vllm_prefill_decode mode"), "{err}");
+
+        let mut config = pd_config_with_static_kv_sources();
+        config.policy = PolicyConfig::RoundRobin;
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("policy is not kv_aware"), "{err}");
+
+        let mut config = pd_config_with_static_kv_sources();
+        config.policy = PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 5,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 60,
+            max_tree_size: 4096,
+        };
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("policy is not kv_aware"), "{err}");
     }
 }

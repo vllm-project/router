@@ -15,6 +15,20 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to create worker HTTP client")
 });
 
+/// GET request to a worker, with the router's API key as a bearer token when
+/// one is configured.
+pub(crate) fn worker_get(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = client.get(url);
+    match api_key {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    }
+}
+
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug {
@@ -58,7 +72,8 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Decrement the load counter
     fn decrement_load(&self);
 
-    /// Reset the load counter to 0 (for sync/recovery)
+    /// Reset the load counter to 0 for explicit recovery after active requests drain.
+    /// Health checks must not call this: active guards still own their reservations.
     fn reset_load(&self) {
         // Default implementation - does nothing
         // Workers that track load should override this
@@ -287,6 +302,8 @@ pub struct WorkerMetadata {
 #[derive(Clone)]
 pub struct BasicWorker {
     metadata: WorkerMetadata,
+    dp_size: Option<usize>,
+    api_key: Option<Arc<str>>,
     load_counter: Arc<AtomicUsize>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
@@ -299,6 +316,7 @@ impl fmt::Debug for BasicWorker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BasicWorker")
             .field("metadata", &self.metadata)
+            .field("dp_size", &self.dp_size)
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
             .field("circuit_breaker", &self.circuit_breaker)
             .finish()
@@ -326,6 +344,8 @@ impl BasicWorker {
 
         Self {
             metadata,
+            dp_size: None,
+            api_key: None,
             load_counter: Arc::new(AtomicUsize::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
@@ -340,8 +360,20 @@ impl BasicWorker {
         self
     }
 
+    /// Attach a known DP group size when this worker represents a single-rank endpoint.
+    pub fn with_dp_size(mut self, dp_size: usize) -> Self {
+        self.dp_size = Some(dp_size.max(1));
+        self
+    }
+
     pub fn with_health_config(mut self, config: HealthConfig) -> Self {
         self.metadata.health_config = config;
+        self
+    }
+
+    /// Set the API key sent as a bearer token on this worker's HTTP health checks.
+    pub fn with_worker_api_key(mut self, api_key: Option<Arc<str>>) -> Self {
+        self.api_key = api_key;
         self
     }
 
@@ -398,7 +430,7 @@ impl Worker for BasicWorker {
     async fn check_health_async(&self) -> WorkerResult<()> {
         use std::time::Duration;
 
-        let health_result = match &self.metadata.connection_mode {
+        let health_result: Result<(), String> = match &self.metadata.connection_mode {
             ConnectionMode::Http => {
                 // Perform HTTP health check
                 let url = self.normalised_url()?;
@@ -406,49 +438,57 @@ impl Worker for BasicWorker {
                 let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
 
                 // Use the shared client with a custom timeout for this request
-                match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
-                    Ok(response) => response.status().is_success(),
-                    Err(_) => false,
+                match worker_get(&WORKER_CLIENT, &health_url, self.api_key.as_deref())
+                    .timeout(timeout)
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status().is_success() => Ok(()),
+                    Ok(response) => Err(format!("HTTP health status {}", response.status())),
+                    Err(error) => Err(error.to_string()),
                 }
             }
             ConnectionMode::Grpc => {
                 let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
-                crate::backend::check_grpc_health(self.url(), timeout)
-                    .await
-                    .is_ok()
+                crate::backend::check_grpc_health(self.url(), timeout).await
             }
         };
 
-        if health_result {
-            // Health check succeeded
-            self.consecutive_failures.store(0, Ordering::Release);
-            let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
-
-            // Mark healthy if we've reached the success threshold
-            if !self.is_healthy()
-                && successes >= self.metadata.health_config.success_threshold as usize
-            {
-                self.set_healthy(true);
-                self.consecutive_successes.store(0, Ordering::Release);
-            }
-            Ok(())
-        } else {
-            // Health check failed
-            self.consecutive_successes.store(0, Ordering::Release);
-            let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
-
-            // Mark unhealthy if we've reached the failure threshold
-            if self.is_healthy()
-                && failures >= self.metadata.health_config.failure_threshold as usize
-            {
-                self.set_healthy(false);
+        match health_result {
+            Ok(()) => {
+                // Health check succeeded
                 self.consecutive_failures.store(0, Ordering::Release);
-            }
+                let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
 
-            Err(WorkerError::HealthCheckFailed {
-                url: self.metadata.url.clone(),
-                reason: format!("Health check failed (consecutive failures: {})", failures),
-            })
+                // Mark healthy if we've reached the success threshold
+                if !self.is_healthy()
+                    && successes >= self.metadata.health_config.success_threshold as usize
+                {
+                    self.set_healthy(true);
+                    self.consecutive_successes.store(0, Ordering::Release);
+                }
+                Ok(())
+            }
+            Err(reason) => {
+                // Health check failed
+                self.consecutive_successes.store(0, Ordering::Release);
+                let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+
+                // Mark unhealthy if we've reached the failure threshold
+                if self.is_healthy()
+                    && failures >= self.metadata.health_config.failure_threshold as usize
+                {
+                    // Logged once per transition; a rejected key shows as 401.
+                    tracing::warn!("Worker {} marked unhealthy: {}", self.metadata.url, reason);
+                    self.set_healthy(false);
+                    self.consecutive_failures.store(0, Ordering::Release);
+                }
+
+                Err(WorkerError::HealthCheckFailed {
+                    url: self.metadata.url.clone(),
+                    reason: format!("{} (consecutive failures: {})", reason, failures),
+                })
+            }
         }
     }
 
@@ -462,7 +502,7 @@ impl Worker for BasicWorker {
 
     fn decrement_load(&self) {
         self.load_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             })
             .ok();
@@ -486,6 +526,10 @@ impl Worker for BasicWorker {
 
     fn circuit_breaker(&self) -> &CircuitBreaker {
         &self.circuit_breaker
+    }
+
+    fn dp_size(&self) -> Option<usize> {
+        self.dp_size
     }
 }
 
@@ -526,6 +570,12 @@ impl DPAwareWorker {
     /// Configure health check settings for this worker
     pub fn with_health_config(mut self, config: HealthConfig) -> Self {
         self.base_worker = self.base_worker.with_health_config(config);
+        self
+    }
+
+    /// Set the API key sent as a bearer token on this worker's HTTP health checks.
+    pub fn with_worker_api_key(mut self, api_key: Option<Arc<str>>) -> Self {
+        self.base_worker = self.base_worker.with_worker_api_key(api_key);
         self
     }
 }
@@ -894,10 +944,6 @@ pub fn start_health_checker(
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
 
-        // Counter for periodic load reset (every 10 health check cycles)
-        let mut check_count = 0u64;
-        const LOAD_RESET_INTERVAL: u64 = 10;
-
         loop {
             interval.tick().await;
 
@@ -907,8 +953,6 @@ pub fn start_health_checker(
                 break;
             }
 
-            check_count += 1;
-
             // Check health of all workers
             let workers_to_check = match workers.read() {
                 Ok(guard) => guard.clone(),
@@ -917,22 +961,6 @@ pub fn start_health_checker(
                     continue;
                 }
             };
-
-            // Periodically reset load counters to prevent drift
-            // Only do this when we believe all workers should be idle
-            if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                let max_load = workers_to_check.iter().map(|w| w.load()).max().unwrap_or(0);
-                // Only reset if load appears to be very low (likely drift)
-                if max_load <= 2 {
-                    tracing::debug!(
-                        "Resetting load counters to prevent drift (max_load: {})",
-                        max_load
-                    );
-                    for worker in &workers_to_check {
-                        worker.reset_load();
-                    }
-                }
-            }
 
             // Perform health checks concurrently
             let health_checks = workers_to_check.iter().map(|worker| {
@@ -967,6 +995,7 @@ pub fn start_health_checker(
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::thread;
@@ -1090,6 +1119,19 @@ mod tests {
         assert_eq!(worker.metadata().health_config.timeout_secs, 15);
         assert_eq!(worker.metadata().health_config.check_interval_secs, 45);
         assert_eq!(worker.metadata().health_config.endpoint, "/custom-health");
+    }
+
+    #[test]
+    fn test_worker_api_key_is_redacted_from_debug_output() {
+        let api_key = "worker-secret";
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
+            .with_worker_api_key(Some(Arc::from(api_key)));
+        let dp_worker =
+            DPAwareWorker::new("http://test:8080".to_string(), 0, 2, WorkerType::Regular)
+                .with_worker_api_key(Some(Arc::from(api_key)));
+
+        assert!(!format!("{:?}", worker).contains(api_key));
+        assert!(!format!("{:?}", dp_worker).contains(api_key));
     }
 
     // Test Worker trait implementation

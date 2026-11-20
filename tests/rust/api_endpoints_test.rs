@@ -33,6 +33,8 @@ impl TestContext {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
+            pd_kv_event_sources: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3002,
@@ -57,6 +59,7 @@ impl TestContext {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: vllm_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -523,10 +526,12 @@ mod generation_tests {
             .is_some());
 
         let diagnostics = ctx.router.scheduling_diagnostics().unwrap();
+        // The legacy key stays for compatibility; the new key is authoritative.
         assert_eq!(
             diagnostics["ranks"][0]["programs"][0]["estimated_context_tokens"],
             10
         );
+        assert_eq!(diagnostics["ranks"][0]["programs"][0]["context_tokens"], 10);
         assert_eq!(diagnostics["ranks"][0]["programs"][0]["state"], "paused");
         ctx.shutdown().await;
     }
@@ -1578,6 +1583,8 @@ mod error_tests {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
+            pd_kv_event_sources: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3010,
@@ -1602,6 +1609,7 @@ mod error_tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: vllm_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -1942,6 +1950,8 @@ mod pd_mode_tests {
                 decode_policy: None,
                 discovery_address: None,
             },
+            pd_kv_event_sources: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3011,
@@ -1966,6 +1976,7 @@ mod pd_mode_tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: vllm_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -2109,6 +2120,8 @@ mod request_id_tests {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
+            pd_kv_event_sources: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3002,
@@ -2133,6 +2146,7 @@ mod request_id_tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            kv_aware_session_affinity_ttl_secs: None,
             health_check: vllm_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,

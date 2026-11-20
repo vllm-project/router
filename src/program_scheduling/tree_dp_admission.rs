@@ -105,7 +105,7 @@ impl ProgramScheduler {
                 continue;
             }
             let target = state.runtime.view(&p).and_then(|v| v.placement).unwrap();
-            let total = state.runtime.front_context_tokens(&p).unwrap_or(0);
+            let total = state.runtime.front_request_context(&p).unwrap_or(0);
             let text = state.runtime.front_routing_text(&p).unwrap_or_default();
             let ratio = state
                 .bindings
@@ -168,7 +168,7 @@ impl ProgramScheduler {
             let mut options: Vec<Vec<OptionValue>> = queued
                 .iter()
                 .map(|p| {
-                    let total = state.runtime.front_context_tokens(p).unwrap_or(0);
+                    let total = state.runtime.front_request_context(p).unwrap_or(0);
                     let text = state.runtime.front_routing_text(p).unwrap_or_default();
                     targets
                         .iter()
@@ -257,6 +257,7 @@ impl ProgramScheduler {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::super::{
         BackendObservation, ProgramIdentity, ProgramRequestHandle, ProgramSchedulerConfig,
@@ -304,7 +305,13 @@ mod tests {
         );
         s
     }
-    fn enqueue(s: &ProgramScheduler, id: &str, total: usize, text: &str) -> ProgramRequestHandle {
+    fn enqueue(
+        s: &ProgramScheduler,
+        id: &str,
+        total: impl Into<super::super::ContextTokens>,
+        text: &str,
+    ) -> ProgramRequestHandle {
+        let total = total.into();
         let identity = ProgramIdentity::from_request(
             None,
             Some(
@@ -333,6 +340,29 @@ mod tests {
             .bindings
             .commit_placement(h.program(), text, target);
     }
+    #[test]
+    fn kv_admission_uses_the_applied_input_fact_not_the_original_estimate() {
+        use super::super::{ContextTokens, TokenFacts, TokenizerFingerprint};
+        let fingerprint = TokenizerFingerprint::from_parts(&["model", "prepared"]);
+        // Arrival resolution has already selected which fact is applicable.
+        let exact =
+            ContextTokens::from_prepared(TokenFacts::client_token_ids(60, fingerprint), 600);
+        for (context, admitted) in [(exact, true), (ContextTokens::estimated(600), false)] {
+            let s = setup(&[100]);
+            let handle = enqueue(&s, "fact", context, "prompt");
+            let mut state = s.state.lock();
+            assert_eq!(s.schedule_waiting(&mut state, Instant::now()), admitted);
+            assert_eq!(
+                state.runtime.placement(handle.program()).is_some(),
+                admitted
+            );
+            assert_eq!(
+                state.decisions[handle.program()].tree_dp_reserved_tokens,
+                admitted.then_some(60),
+            );
+        }
+    }
+
     #[test]
     fn overdue_requests_use_deadline_order_before_cache_value() {
         let s = setup(&[100]);

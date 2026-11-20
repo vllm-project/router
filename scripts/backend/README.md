@@ -120,6 +120,8 @@ does not test live prefix-cache behavior.
 | Wave concurrency | `--concurrency` | | simultaneous requests per batch |
 | Wave request count | `--requests` | | total requests in the wave; use `2 * C` for two batches at concurrency `C` |
 | Cache warmup | `--warmup` | | serial miss/hit before the concurrent wave |
+| Prompt shape | `--shape` | `KVHIT_SHAPE` | `split` (default): one user message cut by `--hit-rate`; `turns`: shared earlier turns + unique last user turn, which the router L1 cache can reuse |
+| Shared turns | `--turns` | | user/assistant messages holding the shared part for `--shape turns` (default 8) |
 | Router | `--router-url` | `ROUTER_URL` | default `http://127.0.0.1:30000` |
 | Served name | `--model` | `MODEL` | request `model` field |
 | HTTP timeout | `--timeout` | | seconds (raise for long ISL) |

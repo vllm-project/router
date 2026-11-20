@@ -6,12 +6,11 @@
 //! implementations (Router, VllmPDRouter):
 //!   1. Headers are passed to select_worker_with_headers() for consistent hash routing
 //!   2. Workers are filtered by is_available() before selection
-//!   3. The inline header conversion pattern (used in vllm_pd_router) matches
-//!      the Router::headers_to_request_headers() output
+//!   3. The header conversion used by vllm_pd_router
+//!      (`header_utils::to_policy_headers`) feeds policies correctly
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod transparent_proxy_routing_tests {
-    use std::collections::HashMap;
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -21,6 +20,7 @@ mod transparent_proxy_routing_tests {
     use vllm_router_rs::policies::ConsistentHashPolicy;
     use vllm_router_rs::policies::LoadBalancingPolicy;
     use vllm_router_rs::policies::RequestHeaders;
+    use vllm_router_rs::routers::header_utils;
 
     /// Helper to create test workers
     fn create_workers(n: usize) -> Vec<Arc<dyn Worker>> {
@@ -277,13 +277,13 @@ mod transparent_proxy_routing_tests {
     }
 
     // =====================================================================
-    // Test 4: Inline header conversion correctness
+    // Test 4: Policy header conversion correctness
     // =====================================================================
-    // vllm_pd_router.rs uses an inline pattern to convert
-    // HeaderMap → HashMap<String, String>. Verify it produces correct output.
+    // vllm_pd_router.rs converts HeaderMap → HashMap<String, String> with
+    // header_utils::to_policy_headers. Verify it produces correct output.
 
     #[test]
-    fn test_inline_header_conversion_lowercases_keys() {
+    fn test_to_policy_headers_lowercases_keys() {
         use axum::http::HeaderMap;
         use axum::http::HeaderValue;
 
@@ -292,17 +292,7 @@ mod transparent_proxy_routing_tests {
         header_map.insert("X-USER-ID", HeaderValue::from_static("user-456"));
         header_map.insert("content-type", HeaderValue::from_static("application/json"));
 
-        // Simulate the inline pattern from vllm_pd_router.rs
-        let request_headers: Option<HashMap<String, String>> = Some(&header_map).map(|h| {
-            h.iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|v| (name.as_str().to_lowercase(), v.to_string()))
-                })
-                .collect()
-        });
+        let request_headers = header_utils::to_policy_headers(Some(&header_map));
 
         let headers = request_headers.unwrap();
 
@@ -314,30 +304,21 @@ mod transparent_proxy_routing_tests {
     }
 
     #[test]
-    fn test_inline_header_conversion_used_by_policy() {
+    fn test_to_policy_headers_used_by_policy() {
         use axum::http::HeaderMap;
         use axum::http::HeaderValue;
 
         let policy = ConsistentHashPolicy::new();
         let workers = create_workers(3);
 
-        // Convert via the inline pattern (as vllm_pd_router does)
+        // Convert via the shared helper (as vllm_pd_router does)
         let mut header_map = HeaderMap::new();
         header_map.insert(
             "x-session-id",
             HeaderValue::from_static("policy-test-session"),
         );
 
-        let request_headers: Option<HashMap<String, String>> = Some(&header_map).map(|h| {
-            h.iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|v| (name.as_str().to_lowercase(), v.to_string()))
-                })
-                .collect()
-        });
+        let request_headers = header_utils::to_policy_headers(Some(&header_map));
 
         // Use the converted headers with the policy (same as route_transparent now does)
         let mut selected: Vec<usize> = Vec::new();
@@ -356,7 +337,7 @@ mod transparent_proxy_routing_tests {
         for &idx in &selected {
             assert_eq!(
                 idx, first,
-                "Inline header conversion should produce sticky routing"
+                "Converted headers should produce sticky routing"
             );
         }
 
@@ -373,7 +354,7 @@ mod transparent_proxy_routing_tests {
         assert_eq!(
             workers[first].url(),
             workers[direct_result].url(),
-            "Inline conversion and direct headers should route to the same worker"
+            "Converted and direct headers should route to the same worker"
         );
     }
 

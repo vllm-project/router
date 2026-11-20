@@ -12,14 +12,121 @@ pip install pre-commit && pre-commit install
 
 ## Pipeline Files
 
-### `pipeline.yml`
-Main CI/CD pipeline that runs on all commits and pull requests. Includes:
+`pipeline.yml` runs a lightweight CPU bootstrap, following
+[vllm-omni's diff-aware bootstrap](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py).
+When every changed path is under `docs/`, ends in `.md`, or is
+`mkdocs.yml`, it succeeds without uploading build or test jobs. This includes
+documentation additions and deletions. Mixed code/documentation changes run CI.
+For PRs (including `merge-test`), the bootstrap fetches the target branch and
+compares its merge base with `HEAD`. Merge queues compare against Buildkite's
+recorded queue base commit. Default-branch pushes always run full CI because
+the bootstrap has no verified pre-push SHA to compare the complete push range.
+It does not fall back to `HEAD^1`, which could miss earlier code changes in a
+multi-commit push. Skipping post-merge pushes requires a verified push range
+from the webhook before it can be enabled safely.
+Renames include both the old and new paths. Empty or unresolved diffs run CI.
+Scheduled builds and `NIGHTLY=1` always run CI.
+PR labels `ready`, `merge-test`, and `nightly-test` do not override docs-only
+skipping; they select test levels only when the full pipeline is uploaded.
+GitHub Actions quality/security checks and release publishing
+remain enabled. Unlike Omni, pytest skip-mark changes do not qualify.
 
-- **Build**: Release builds for Rust binary and Python wheels
-- **Tests**: Comprehensive test suite (unit, integration, Python)
-- **P/D Disaggregation Test**: GPU-based integration test for prefill/decode disaggregation
-- **Benchmarks**: Optional performance benchmarks
-- **Docker Build**: Container image creation
+Otherwise the bootstrap uploads `bootstrap-upload-steps.yml`, which builds the release
+binary and wheel, pushes the NVIDIA CI image, then uploads L1, L2, and L3.
+Those uploads depend on the build step, not on each other. Jobs in each uploaded file depend on that upload step. The L1 and L3 NVIDIA P/D jobs, and the L3 gRPC perf job, also wait for `image-build`. `NIGHTLY=1` on this test pipeline selects tests. `NIGHTLY=1`
+on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
+
+| File | Level | When it is uploaded | What runs |
+| --- | --- | --- | --- |
+| `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, one NVIDIA P/D completion, and kv_aware e2e on 2× L4 (`ROCM_ONLY != 1` on the GPU jobs) |
+| `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), its merge queue, or any other branch labeled `merge-test` | one-mode xGMI smoke and RDMA `SMOKE_ONLY` |
+| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), router_policy TraceLab c16 on 4× L4 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA |
+| `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
+
+A pull request labeled `ready` uploads `test-ready.yml`, including forks,
+unless the bootstrap skips it as documentation-only. The same exception applies
+to `merge-test` and merge-queue L2 uploads. Default-branch push L2 uploads
+remain enabled.
+`test-merge.yml` has no per-job `if`. In `test-ready.yml` and `test-nightly.yml`, a job whose gate is narrower than the upload keeps its own `if`.
+
+GPU machine presets are in [`ci_mirror_hardwares.yml`](ci_mirror_hardwares.yml).
+A step names one with `mirror_hardwares`. `scripts/upload_pipeline.py` expands
+that name into `agents` and `plugins` before Buildkite upload. A preset that
+injects `VLLM_CI_HF_TOKEN` also exports that value as `HF_TOKEN` in the job
+shell. A build-level `HF_TOKEN` would override a pod env entry of the same name.
+
+| Name | Machine |
+| --- | --- |
+| `l4_2` | EKS `l4-k8s`, same `l4x4` pool, pod requests 2× L4, same CI image |
+| `l4_4` | EKS `l4-k8s`, 4× L4, image `public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT` (router_policy perf) |
+| `l4_1` | Same L4 pool and image, 1× L4 |
+| `h100_2` | `mithril-h100-pool`, 2× H100 SXM, us-west-2 pull-through cache of the router CI image, GPU limit 2 |
+| `mi300_2` | `router_rocm_mi300_2`, same-host xGMI Docker devices |
+| `mi300_rdma` | `router_rocm_mi300_2` coordinator, no Docker plugin |
+
+CPU steps keep `medium_cpu_queue_premerge` inline. Their command lives in the Docker plugin, so they do not use a preset. Dependency sets live in `ci_apt_packages.conf` and `scripts/install_packages.sh`. `rust` and `nvidia_pd` install apt packages. `router-bin` downloads the release binary and checks it. `lm-eval` installs the ROCm accuracy harness. A sourced `python` call downloads the binary and installs `.[dev]` into `/tmp/venv`. `python-wheel` uses that apt set and venv for `python -m build`.
+
+### Rust coverage artifacts
+
+The Rust unit and integration jobs in `test-nightly.yml`
+run through [`scripts/rust_coverage.sh`](scripts/rust_coverage.sh), using
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov/tree/v0.6.21)
+0.6.21 and pinned `nightly-2026-04-15` with its `llvm-tools-preview` component. Each job
+runs its existing `cpu,ready` test targets once with coverage instrumentation.
+Instrumentation is limited to the host target so nested WASM component builds
+do not inherit unsupported coverage flags.
+This adds tool installation and instrumented compilation time to those jobs.
+`test-ready.yml` runs ordinary Rust tests without coverage instrumentation.
+The nightly Rust jobs keep their existing scheduling condition, so a PR
+also labeled `ready` skips them and does not produce Rust coverage artifacts.
+
+Each job uploads one machine-readable LCOV file from the mounted checkout:
+
+| Artifact | Unit job | Integration job |
+| --- | --- | --- |
+| LCOV data | `target/coverage/rust-unit/lcov.info` | `target/coverage/rust-integration/lcov.info` |
+
+Reports exclude `tests/` and `benches/` files as well as inline test modules
+and test-only helpers marked with `#[cfg_attr(coverage_nightly, coverage(off))]`.
+The nightly toolchain enables this unstable attribute; ordinary stable builds
+do not enable it. Add the same marker to new test modules and test-only helpers.
+The existing `check-mark` pre-commit hook checks each test-only module,
+function and impl declaration under `src/` for this marker, including
+file-based `mod tests;` declarations.
+These are separate coverage
+measurements for each test group; their percentages must not be added or
+averaged to obtain total coverage. Python tests, doctests, ignored tests, and
+nightly-only branch coverage are outside this measurement. No minimum
+coverage threshold is enforced.
+Each run cleans workspace coverage artifacts so reports cannot include stale
+binaries from another toolchain or test group; dependency builds remain cached.
+
+Tests retain a failing job status when they fail. Report generation is
+attempted after test failures, but compilation failures or missing profiles
+may prevent reports from being generated. Report generation failures also
+fail the job.
+The previous report is removed before tool installation. A new report is
+written to a temporary file and renamed to `lcov.info` only after generation
+succeeds, so failed runs cannot publish stale or partially written reports.
+The completed report is set to mode `0644` before publication so the host
+Buildkite agent can read it even when the container runs as root.
+
+To reproduce with the same Rust image and dependency set as CI, run from the
+repository root (requires Docker and network access):
+
+```bash
+docker run --rm -v "$PWD:/workdir" -w /workdir rust:1.95.0-bookworm \
+  bash -euc 'bash .buildkite/scripts/install_packages.sh rust; bash .buildkite/scripts/rust_coverage.sh unit'
+docker run --rm -v "$PWD:/workdir" -w /workdir rust:1.95.0-bookworm \
+  bash -euc 'bash .buildkite/scripts/install_packages.sh rust; bash .buildkite/scripts/rust_coverage.sh integration'
+```
+
+On a Linux development host with Rust, rustup, and the `rust` apt dependency
+set already installed, use `bash .buildkite/scripts/rust_coverage.sh unit`
+or `bash .buildkite/scripts/rust_coverage.sh integration`. The script installs
+the pinned nightly toolchain, precompiled coverage tool from GitHub releases,
+and LLVM component, so it also
+needs network access.
 
 ### `release-pipeline.yml`
 Release pipeline for tagged versions, nightly Docker images, and versioned
@@ -56,49 +163,44 @@ The test script:
 
 ### CI Configuration
 
-The test runs in the pipeline at `.buildkite/pipeline.yml:97-132`:
-
-```yaml
-- label: ":satellite: P/D Disaggregation Test (4 GPUs)"
-  timeout_in_minutes: 30
-  retry:
-    automatic:
-      - exit_status: "*"
-        limit: 2
-```
+A `ready` label runs one completion from `test-ready.yml`
+(`SKIP_LM_EVAL=true`, `NUM_SANITY_REQUESTS=1`) when `ROCM_ONLY != 1`.
+Full GSM8K stays in `test-nightly.yml`. Both include forks.
 
 **Key features:**
 - Requires 4 GPUs (runs on `l4-k8s`)
-- 30 minute timeout
+- 60 minute timeout
 - Automatic retry (up to 2 attempts) for flaky failures
 - Manual retry option available
 
 ### ROCm MoRI coverage
 
-The dedicated `router_rocm_mi300_2` queue adds two MI300X matrices, each with
-`read_mode=true` and `read_mode=false`:
+The dedicated `router_rocm_mi300_2` queue covers two MoRI lanes:
 
 - `run_moriio_accuracy_test.sh` uses two GPUs on one host with the xGMI backend.
 - `run_moriio_rdma_accuracy_test.sh` uses one GPU on each of two hosts with the
   RDMA backend.
 
-The xGMI group is opt-in only: it runs solely for trusted manual/API builds
-with `RUN_ROCM_XGMI=1`, because the MI300X host readiness gate cannot find
-the digest-pinned ROCm image and fails automatic default-branch/PR/
-merge-queue builds before any test runs
-(https://github.com/vllm-project/router/issues/363). The original automatic
-triggers are kept in a comment at the group definition for a minimal-diff
-restore once the host is fixed. The RDMA matrix runs for scheduled builds
-with `NIGHTLY=1`, or trusted manual/API builds with `RUN_ROCM_RDMA=1`.
-When active, group-level filtering prevents Docker plugin hooks from running
-for untrusted fork pull requests.
+The hosts restore the digest-pinned ROCm image before each job
+(https://github.com/vllm-project/router/issues/363). L2 xGMI is one
+`read_mode` plus `LM_EVAL_LIMIT=20`, and runs for a default-branch push, the
+default-branch merge queue, or any pull request labeled `merge-test`. L3
+xGMI is the read+write matrix. It runs for `NIGHTLY=1`, any pull request
+labeled `nightly-test`, or a manual/API build with `RUN_ROCM_XGMI=1`. These
+are the L2/L3 triggers, not the old "every trusted PR" condition.
+
+L2 RDMA (`test-merge.yml`) sets `SMOKE_ONLY=true` and `read_mode=true`. Both
+L2 jobs run whenever that file is uploaded. L3 RDMA runs both directions for
+scheduled `NIGHTLY=1`, a pull request labeled `nightly-test`, or a manual/API
+build with `RUN_ROCM_RDMA=1`.
 
 ROCm-only scheduled builds should set both `NIGHTLY=1` and `ROCM_ONLY=1`.
-`ROCM_ONLY=1` skips the unrelated NVIDIA four-GPU P/D step while retaining the
-CPU build that supplies the router artifact to both ROCm matrices.
+`ROCM_ONLY=1` skips the NVIDIA four-GPU step, the H100 gRPC perf job, and the
+L4 router_policy perf job while retaining the CPU build that supplies the router
+artifact to the ROCm jobs.
 
-Both matrices use a digest-pinned ROCm vLLM image and run health, sanity, and
-500-example GSM8K accuracy checks. The RDMA job is coordinator-owned and
+The L3 matrices use a digest-pinned ROCm vLLM image and run health, sanity,
+and 500-example GSM8K accuracy checks. The RDMA job is coordinator-owned and
 controls the second host through the strict `vllm-router-rocm-worker` SSH alias.
 
 ### Environment Variables
@@ -116,6 +218,8 @@ The test script supports these environment variables for customization:
 | `NUM_DECODE_INSTANCES` | `1` | Number of decode instances |
 | `PREFILLER_TP_SIZE` | `1` | Tensor parallel size for prefill |
 | `DECODER_TP_SIZE` | `1` | Tensor parallel size for decode |
+| `NUM_SANITY_REQUESTS` | `20` | Completions before GSM8K |
+| `SKIP_LM_EVAL` | `false` | Skip GSM8K |
 
 ### Artifacts
 
@@ -156,9 +260,17 @@ bash ./run_accuracy_test.sh
 ## Additional Pipeline Steps
 
 ### Build
-Creates release artifacts:
+The `build` group in `bootstrap-upload-steps.yml` creates release artifacts:
 - Rust binary (`target/release/vllm-router`)
 - Python wheels and source distribution
+
+Each step has a premerge variant and a nightly variant. Premerge builds
+skip thin LTO and raise `codegen-units` to 16 for faster CI turnaround.
+Nightly builds (triggered by `NIGHTLY=1` or the `nightly-test` label)
+keep the repository release profile so that perf baselines match the
+published binary. Only one variant of each pair runs per build.
+
+L1, L2, and L3 uploads depend on this group. L2 and L3 do not depend on the L1 upload.
 
 ### Tests
 Comprehensive test suite:
@@ -176,8 +288,9 @@ Builds Docker image for the router.
 
 ## Agent Queues
 
-- `cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
-- `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation)
+- `medium_cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
+- `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation; 4-GPU router_policy c16)
+- `mithril-h100-pool`: NVIDIA H100 SXM tests (2-GPU gRPC prefix-KV perf)
 - `router_rocm_mi300_2`: dedicated two-node MI300X MoRI tests (`spawn=1`)
 - `default`: General purpose queue
 
@@ -187,7 +300,7 @@ To add a new test step:
 
 1. Choose appropriate location in pipeline
 2. Define test command and dependencies
-3. Specify agent queue
+3. Set `mirror_hardwares` to a name in `ci_mirror_hardwares.yml` (GPU) or an agent queue (CPU)
 4. Add artifact collection
 5. Consider retry logic for flaky tests
 6. Update this documentation
@@ -198,7 +311,7 @@ Example:
   command: |
     # Test commands here
   agents:
-    queue: "cpu_queue_premerge"
+    queue: "medium_cpu_queue_premerge"
   depends_on: "build"
   artifact_paths:
     - "test-results/**/*"
@@ -219,3 +332,25 @@ Buildkite provides these built-in variables:
 - [vLLM Documentation](https://docs.vllm.ai/)
 - [Project README](../README.md)
 - [Example P/D Setup Scripts](../scripts/llama3.1/)
+
+## Docker Hub release credentials
+
+Docker publishing and nightly cleanup use the Buildkite secret
+`ROUTER_DOCKERHUB_TOKEN`, mapped to `RELEASE_DOCKERHUB_TOKEN` only on Docker jobs.
+Agents must support step-level secrets (Buildkite agent 3.106.0 or newer).
+Configure an organization access token for `vllm/vllm-router` and use `vllm`
+as the Docker Hub username. Image Push grants image pull/push; Tag Admin
+grants tag listing/deletion for nightly cleanup. Do not grant access to
+other repositories or organization management.
+
+Restrict the secret's access policy to the immutable `router-release` pipeline
+ID, main or an approved version ref, and the CPU and ARM release queues. A job's `secrets` entry
+controls injection; the access policy controls whether other jobs may
+retrieve the secret. Protect release refs and pipeline settings as well.
+
+The cleanup script uses Docker Hub's `/v2/auth/token` exchange and
+namespace-scoped tag API. Shell tracing stays disabled to avoid exposing
+credentials or bearer tokens. The legacy S3 `DOCKERHUB_TOKEN` variable is
+not used by these Docker jobs. After validating the replacement, remove
+obsolete S3 copies and revoke shared tokens only after all consumers have
+migrated. Never commit token values to this repository.

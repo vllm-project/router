@@ -52,6 +52,7 @@ impl TokenBucket {
     }
 
     /// Try to acquire tokens immediately
+    #[allow(clippy::result_unit_err)]
     pub async fn try_acquire(&self, tokens: f64) -> Result<(), ()> {
         let mut inner = self.inner.lock();
 
@@ -169,6 +170,7 @@ impl TokenBucket {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

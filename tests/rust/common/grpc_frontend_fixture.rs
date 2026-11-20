@@ -28,6 +28,50 @@ pub fn model_fixture() -> TempDir {
     dir
 }
 
+/// Same tiny BPE, with Qwen added tokens and the Qwen2.5 chat template.
+/// L1 only stores a prefix that ends on an added-token boundary, and this
+/// template places `<|im_start|>` / `<|im_end|>` between turns.
+pub fn qwen_model_fixture() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tokenizer: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/tokenizer/byte_level_bpe.json")).unwrap();
+    let added = tokenizer["added_tokens"].as_array_mut().unwrap();
+    for (i, content) in [
+        "<|endoftext|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<tool_call>",
+        "</tool_call>",
+        "<think>",
+        "</think>",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        added.push(json!({
+            "id": 293 + i, "content": content, "single_word": false, "lstrip": false,
+            "rstrip": false, "normalized": false, "special": true
+        }));
+    }
+    std::fs::write(dir.path().join("tokenizer.json"), tokenizer.to_string()).unwrap();
+    std::fs::write(
+        dir.path().join("config.json"),
+        json!({"model_type": "qwen2", "vocab_size": 300}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("tokenizer_config.json"),
+        json!({
+            "eos_token": "<|im_end|>",
+            "pad_token": "<|endoftext|>",
+            "chat_template": include_str!("../fixtures/tokenizer/qwen2_5_chat_template.jinja"),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    dir
+}
+
 pub fn chat_request(model: &TempDir, text: &str, stream: bool) -> ChatCompletionRequest {
     serde_json::from_value(json!({
         "model": model.path().to_str().unwrap(),
