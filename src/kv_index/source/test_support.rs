@@ -83,7 +83,6 @@ pub(crate) fn stored_block(
         kv_cache_spec_sliding_window: None,
         locality: None,
         ownership: None,
-        session_id: None,
         lookahead_token_ids: None,
     }
 }

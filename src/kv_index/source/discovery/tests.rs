@@ -50,7 +50,7 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
         SourceAction::Recover
     );
     assert!(!provider.is_trusted()); // Replay must be started before publication.
-    provider.lifecycle.state.lock().trusted = true;
+    assert!(provider.lifecycle.finish_layout_recovery(true));
     assert!(provider.is_trusted());
     provider.lifecycle.state.lock().verified_at = Instant::now() - Duration::from_secs(6);
     assert!(provider.lifecycle.expire_if_needed());
@@ -60,7 +60,17 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
             .observe_layout(&StaticHybridMatch::Unavailable(SourcesProbe::Unsupported)),
         SourceAction::Recover
     );
-    active.store(false, Ordering::Release);
+    let revision = {
+        let mut state = provider.lifecycle.state.lock();
+        state.info = Some(WorkerKvInfo::default());
+        state.revision
+    };
+    assert!(!provider.lifecycle.finish_layout_recovery(false));
+    {
+        let state = provider.lifecycle.state.lock();
+        assert!(state.info.is_none());
+        assert_ne!(state.revision, revision);
+    }
     assert_eq!(
         provider
             .lifecycle
@@ -724,12 +734,14 @@ async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
         hybrid: Some(layout),
     };
     let client = reqwest::Client::new();
+    let discovery = static_worker_discovery(&worker, &config);
     assert_eq!(
-        static_hybrid_sources_match(&client, &worker, None, &config, None).await,
+        static_hybrid_sources_match(&client, &worker, None, &discovery, None).await,
         StaticHybridMatch::Matches
     );
     let mut live_only = config.clone();
     live_only.replay_endpoints = None;
+    let live_only = static_worker_discovery(&worker, &live_only);
     assert_eq!(
         static_hybrid_sources_match(&client, &worker, None, &live_only, None).await,
         StaticHybridMatch::Differs
@@ -748,7 +760,7 @@ async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
     *sources.lock() = with_replay;
     sources.lock()["1"]["topic"] = serde_json::json!("boot-2-rank-1");
     assert_eq!(
-        static_hybrid_sources_match(&client, &worker, None, &config, None).await,
+        static_hybrid_sources_match(&client, &worker, None, &discovery, None).await,
         StaticHybridMatch::Differs
     );
     let installed = HashMap::from([(
@@ -760,12 +772,12 @@ async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
         },
     )]);
     assert_eq!(
-        static_hybrid_sources_match(&client, &worker, None, &config, Some(&installed)).await,
+        static_hybrid_sources_match(&client, &worker, None, &discovery, Some(&installed)).await,
         StaticHybridMatch::Matches
     );
     sources.lock()["0"]["topic"] = serde_json::json!("boot-2-rank-0");
     assert_eq!(
-        static_hybrid_sources_match(&client, &worker, None, &config, Some(&installed)).await,
+        static_hybrid_sources_match(&client, &worker, None, &discovery, Some(&installed)).await,
         StaticHybridMatch::Differs
     );
     task.abort();
@@ -807,6 +819,7 @@ async fn hybrid_discovery_binds_only_ranks_for_the_worker_model() {
         }),
         sources: Ok(sources.clone()),
         model_id: Ok(Some("qwen".into())),
+        base_models: None,
         hybrid: Some(capability),
         assumed_plain_full: false,
     };
@@ -983,7 +996,7 @@ async fn exercise_static_hybrid(pd: bool) {
         let revision = supervisor.worker_registrations()[&worker_url].revision;
         hybrid.lifecycle.state.lock().checked = Some(Instant::now() - Duration::from_secs(30));
         let refreshed = supervisor
-            .refresh_workers(&HashSet::from([worker_url.clone()]))
+            .refresh_workers(&HashSet::from([worker_url.clone()]), &HashSet::new())
             .await;
         assert_eq!(
             refreshed[&worker_url].revision, revision,
@@ -1084,6 +1097,7 @@ fn declared_full_worker(
             },
         )])),
         model_id: Ok(Some(model.into())),
+        base_models: None,
         hybrid: Some(layout),
         assumed_plain_full: false,
     }
@@ -1469,6 +1483,13 @@ fn static_pd_discovery_builds_one_source_per_rank() {
     assert_eq!(sources["1"].endpoint, "tcp://10.0.0.5:5559");
 }
 
+fn static_pd_discovery(
+    worker_url: &str,
+    config: &crate::config::PdKvEventSources,
+) -> WorkerDiscovery {
+    static_worker_discovery(worker_url, &pd_static_source(worker_url, config))
+}
+
 #[test]
 fn static_pd_discovery_falls_back_to_worker_url_as_model() {
     let config = crate::config::types::PdKvEventSources {
@@ -1596,6 +1617,110 @@ async fn layout_without_endpoints_discovers_publishers_for_the_declared_topic() 
         }
         task.abort();
     }
+}
+
+#[tokio::test]
+async fn hybrid_discovery_uses_reported_fields_in_colocated_and_pd_modes() {
+    use axum::{http::StatusCode, routing::get, Json, Router};
+    use serde_json::json;
+
+    let (endpoint, replay, _publisher_socket, _replay_socket) = layout_endpoints();
+    let sources = Arc::new(Mutex::new(json!({"0": {
+        "endpoint": endpoint, "replay_endpoint": replay, "topic": "boot-1",
+        "publisher": "zmq"
+    }})));
+    let mut config = layout_only_sources("boot-1", 576, "qwen");
+    config.block_size = 16;
+    let layout = config.hybrid.as_mut().unwrap();
+    layout.ranks[0].declared_groups = Some(2);
+    layout.ranks[0].hash_block_size = Some(16);
+    layout.ranks[0].partial_hash_hits = true;
+    let reported = Arc::new(Mutex::new(Some(automatic_layout(layout.clone()))));
+    let app = Router::new()
+        .route(
+            "/kv_routing_capabilities",
+            get({
+                let reported = reported.clone();
+                move || {
+                    let reported = reported.lock().clone();
+                    async move { reported.map(Json).ok_or(StatusCode::NOT_FOUND) }
+                }
+            }),
+        )
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data": [{"id": "qwen", "root": "qwen"}]})) }),
+        );
+    let info =
+        json!({"model_id":"qwen", "kv_block_size":576, "effective_attention_block_size":576});
+    let (worker, server) = source_boundary_worker_with_routes(app, info, sources).await;
+    let bases = HashSet::from([worker.clone()]);
+
+    let (regular, _) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
+    let registered = regular.on_worker_added(&worker).await.unwrap();
+    assert_eq!(registered.ranks, [0]);
+    assert_eq!(registered.block_size, Some(16));
+    let layout = regular.discover(&worker).await.hybrid.unwrap();
+    assert!(layout.ranks[0].partial_hash_hits);
+    let report = reported.lock().take();
+    assert!(regular.discover(&worker).await.hybrid.is_none());
+    *reported.lock() = report;
+    regular.shutdown();
+
+    let (pd, _) = KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMap::new());
+    assert!(pd.refresh_workers(&bases, &HashSet::new()).await[&worker]
+        .provider
+        .is_some());
+    // A worker moving from Decode to Prefill must stop receiving hybrid credit
+    // until a compatible Decode target has been configured.
+    assert!(pd.refresh_workers(&bases, &bases).await[&worker]
+        .provider
+        .is_none());
+    assert!(pd.match_provider_for_worker(&worker).is_none());
+    pd.shutdown();
+
+    let source = crate::config::PdKvEventSources {
+        endpoints: Vec::new(),
+        replay_endpoints: None,
+        block_size: 16,
+        model: None,
+        hybrid: None,
+        compatible_decode_urls: vec!["http://decode".into()],
+    };
+    let (pd, _) = KvIndexSupervisor::new_pd(
+        reqwest::Client::new(),
+        HashMap::from([(worker.clone(), source.clone())]),
+    );
+    assert!(pd.refresh_workers(&bases, &HashSet::new()).await[&worker]
+        .provider
+        .is_some());
+    reported.lock().take();
+    assert!(pd.discover(&worker).await.hybrid.is_none());
+    pd.shutdown();
+
+    let mut manual = config.hybrid.unwrap();
+    manual.ranks[0].model.clear();
+    manual.ranks[0].publisher_topic = None;
+    let (pd, _) = KvIndexSupervisor::new_pd(
+        reqwest::Client::new(),
+        HashMap::from([(
+            worker.clone(),
+            crate::config::PdKvEventSources {
+                hybrid: Some(manual),
+                ..source
+            },
+        )]),
+    );
+    let discovered = pd.discover(&worker).await.hybrid.unwrap();
+    assert_eq!(discovered.ranks[0].model, "qwen");
+    assert_eq!(
+        discovered.ranks[0].publisher_topic.as_deref(),
+        Some("boot-1")
+    );
+    assert!(pd.refresh_workers(&bases, &HashSet::new()).await[&worker]
+        .provider
+        .is_some());
+    server.abort();
 }
 
 /// One PUB and one ROUTER endpoint, like a real rank's ZMQ pair.
@@ -1740,6 +1865,7 @@ fn descriptor_refresh_covers_identity_changes_and_failure_threshold() {
             }),
             sources: Ok(HashMap::new()),
             model_id: Ok(Some("model".into())),
+            base_models: None,
             hybrid: None,
             assumed_plain_full: false,
         })
@@ -1833,7 +1959,7 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
         supervisor.lifecycles.lock()[&base].state.lock().checked =
             Some(Instant::now() - REFRESH_INTERVAL - CONTROL_TIMEOUT);
     };
-    let initial = supervisor.refresh_workers(&bases).await;
+    let initial = supervisor.refresh_workers(&bases, &HashSet::new()).await;
     assert!(initial[&base].info.is_some());
     let provider = initial[&base].provider.as_ref().unwrap();
     boundary_subscription(&publisher, "kv/boot", false).await;
@@ -1844,21 +1970,21 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
     let valid = metadata.lock()["0"].clone();
     *metadata.lock() = serde_json::json!({"not-a-rank": valid.clone()});
     rewind();
-    let rejected = supervisor.refresh_workers(&bases).await;
+    let rejected = supervisor.refresh_workers(&bases, &HashSet::new()).await;
     assert!(rejected[&base].info.is_none());
     assert!(rejected[&base].provider.is_none());
     assert!(hits().is_empty());
     assert!(!supervisor.installed.workers.lock().contains_key(&base));
     *metadata.lock() = serde_json::json!({"0": valid});
     rewind();
-    let restored = supervisor.refresh_workers(&bases).await;
+    let restored = supervisor.refresh_workers(&bases, &HashSet::new()).await;
     assert!(restored[&base].info.is_some());
     assert_ne!(restored[&base].revision, initial[&base].revision);
 
     healthy.store(false, Ordering::Relaxed);
     for failures in 1..MAX_PROBE_FAILURES {
         rewind();
-        let registration = supervisor.refresh_workers(&bases).await;
+        let registration = supervisor.refresh_workers(&bases, &HashSet::new()).await;
         assert!(registration[&base].info.is_some());
         assert!(supervisor.worker_model_eligibility(std::slice::from_ref(&base), Some("m"))[&base]);
         assert_eq!(
@@ -1870,7 +1996,7 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
         );
     }
     rewind();
-    let retired = supervisor.refresh_workers(&bases).await;
+    let retired = supervisor.refresh_workers(&bases, &HashSet::new()).await;
     assert!(retired[&base].info.is_none());
     assert!(retired[&base].provider.is_none());
     assert!(!supervisor.worker_model_eligibility(std::slice::from_ref(&base), Some("m"))[&base]);
@@ -1883,7 +2009,7 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
     );
     healthy.store(true, Ordering::Relaxed);
     rewind();
-    let recovered = supervisor.refresh_workers(&bases).await;
+    let recovered = supervisor.refresh_workers(&bases, &HashSet::new()).await;
     assert!(recovered[&base].info.is_some());
     assert_ne!(recovered[&base].revision, retired[&base].revision);
     supervisor.shutdown();

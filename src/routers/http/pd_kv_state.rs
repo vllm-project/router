@@ -40,6 +40,7 @@ pub(super) struct PdKvState {
     // Serializes updates to the target bindings in both policies.
     targets: Mutex<HashMap<String, TargetRegistration>>,
     hybrid_pairs: Option<HashMap<String, HashSet<String>>>,
+    allow_hybrid_layouts: bool,
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
     credit_gate: Mutex<()>,
 }
@@ -63,9 +64,11 @@ impl PdKvState {
         prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
         decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
         strict_recovery: bool,
+        allow_hybrid_layouts: bool,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
         state.api_key = api_key;
+        state.allow_hybrid_layouts = allow_hybrid_layouts;
         state.supervisor.set_api_key(state.api_key.clone());
         state.supervisor.set_strict_recovery(strict_recovery);
         state
@@ -125,6 +128,7 @@ impl PdKvState {
             decode_policy: None,
             targets: Mutex::new(HashMap::new()),
             hybrid_pairs: (!pairs.is_empty()).then_some(pairs),
+            allow_hybrid_layouts: true,
             #[cfg(all(test, feature = "cpu", feature = "ready"))]
             credit_gate: Mutex::new(()),
         }
@@ -191,12 +195,28 @@ impl PdKvState {
     }
 
     async fn bind_pools(&self, pools: [StagePool<'_>; 2]) {
-        let bases = pools
+        let bases: HashSet<String> = pools
             .iter()
             .filter(|(_, policy)| policy.is_some())
             .flat_map(|(workers, _)| workers.iter().map(|worker| worker.base_url().to_owned()))
             .collect();
-        let registrations = self.supervisor.refresh_workers(&bases).await;
+        let (prefill, prefill_policy) = pools[0];
+        let plain_only = if self.allow_hybrid_layouts {
+            prefill
+                .iter()
+                .filter(|worker| {
+                    prefill_policy.is_some()
+                        && self
+                            .hybrid_pairs
+                            .as_ref()
+                            .is_none_or(|pairs| !pairs.contains_key(worker.base_url()))
+                })
+                .map(|worker| worker.base_url().to_owned())
+                .collect()
+        } else {
+            bases.clone()
+        };
+        let registrations = self.supervisor.refresh_workers(&bases, &plain_only).await;
 
         let mut targets = self.targets.lock().await;
         // A source probe may outlive the worker it started for.
@@ -1188,6 +1208,7 @@ mod kv_input_tests {
             Some(prefill_policy.clone()),
             Some(decode_policy.clone()),
             false,
+            true,
         )
         .await;
         tokio::join!(

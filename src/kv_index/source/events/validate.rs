@@ -39,6 +39,12 @@ fn complete_blocks(store: &BlockStored) -> bool {
         == Some(store.token_ids.len())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum StoreValidationError {
+    Contract,
+    Packing,
+}
+
 /// Return false for a secondary page size that proves no prefix evidence.
 pub(super) fn validate_store(
     group: &CacheGroup,
@@ -46,7 +52,7 @@ pub(super) fn validate_store(
     hash_block_size: usize,
     lookahead_tokens: usize,
     partial_hash_hits: bool,
-) -> Result<bool, ()> {
+) -> Result<bool, StoreValidationError> {
     if store.locality.as_deref().is_some_and(|s| s != "LOCAL")
         || match &store.lookahead_token_ids {
             None => lookahead_tokens != 0 && !store.block_hashes.is_empty(),
@@ -62,7 +68,7 @@ pub(super) fn validate_store(
             .is_some_and(|hash| sequence_hash(hash).is_none())
         || !event_kind_matches(group.kind, store)
     {
-        return Err(());
+        return Err(StoreValidationError::Contract);
     }
     if let Some(keys) = store
         .extra_keys
@@ -70,11 +76,11 @@ pub(super) fn validate_store(
         .filter(|_| store.lora_name.is_none())
     {
         if keys.len() != store.block_hashes.len() {
-            return Err(());
+            return Err(StoreValidationError::Contract);
         }
         if let Some((first, rest)) = keys.split_first() {
             if !rest.iter().all(rmpv::Value::is_nil) {
-                return Err(());
+                return Err(StoreValidationError::Contract);
             }
             if !first.is_nil() {
                 // vLLM folds cache_salt into the first block's native hash.
@@ -85,7 +91,7 @@ pub(super) fn validate_store(
                 }) {
                     Ok(false)
                 } else {
-                    Err(())
+                    Err(StoreValidationError::Contract)
                 };
             }
         }
@@ -96,6 +102,9 @@ pub(super) fn validate_store(
         && store.block_size as usize == hash_block_size
         && store.block_hashes.len() == 1
         && store.token_ids.len() == hash_block_size;
+    if store.block_size == 0 {
+        return Err(StoreValidationError::Contract);
+    }
     if store.block_size != group.block_size && !partial {
         tracing::debug!(
             group_idx = group.group_idx,
@@ -106,8 +115,7 @@ pub(super) fn validate_store(
         return Ok(false);
     }
     let block_size = store.block_size as usize;
-    if block_size == 0
-        || store.token_ids.is_empty()
+    if store.token_ids.is_empty()
         || !store.token_ids.len().is_multiple_of(block_size)
         || !match group.kind {
             GroupRule::Checkpoint | GroupRule::SlidingWindow { .. } => {
@@ -116,13 +124,16 @@ pub(super) fn validate_store(
             _ => complete_blocks(store),
         }
     {
-        return Err(());
+        return Err(StoreValidationError::Packing);
     }
     Ok(true)
 }
 
 pub(in crate::kv_index) fn event_kind_matches(kind: GroupRule, store: &BlockStored) -> bool {
     let spec = store.kv_cache_spec_kind.as_deref();
+    // Both forms of MLA publish the same wire kind. The verified layout
+    // declares compression; absent that declaration, MLA uses the
+    // root-contiguous FullAttention restore rule.
     match kind {
         GroupRule::FullAttention => {
             matches!(spec, Some("full_attention") | Some("mla_attention"))
@@ -165,11 +176,20 @@ mod tests {
         store
             .block_hashes
             .push(ExternalBlockHash::Bytes(vec![0; 32]));
-        assert_eq!(validate_store(&group, &store, 2, 1, true), Err(()));
+        assert_eq!(
+            validate_store(&group, &store, 2, 1, true),
+            Err(StoreValidationError::Contract)
+        );
         store.lookahead_token_ids = Some(vec![vec![9, 10]]);
-        assert_eq!(validate_store(&group, &store, 2, 1, true), Err(()));
+        assert_eq!(
+            validate_store(&group, &store, 2, 1, true),
+            Err(StoreValidationError::Contract)
+        );
         store.lookahead_token_ids = Some(vec![vec![9]]);
         assert_eq!(validate_store(&group, &store, 2, 1, true), Ok(true));
-        assert_eq!(validate_store(&group, &store, 2, 0, true), Err(()));
+        assert_eq!(
+            validate_store(&group, &store, 2, 0, true),
+            Err(StoreValidationError::Contract)
+        );
     }
 }

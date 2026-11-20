@@ -37,8 +37,6 @@ clap's implicit append action. Put non-repeatable list values after one flag.
 Rust rejects repeated scalar options; Python keeps the last value for scalar
 and non-append list options.
 
-The Rust HTTP backend connection pool has a two-second idle timeout by default; `--pool-idle-timeout-secs 0` disables reuse. This is a Rust-only CLI option.
-
 Rust integer types are unsigned: `u16` is 0–65535, `u32` is 0–4294967295,
 `u64` is 0–18446744073709551615, and `usize` depends on the target pointer
 width. `f32` and `f64` are floating-point values. Python's `integer` and

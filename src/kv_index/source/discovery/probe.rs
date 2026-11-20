@@ -28,6 +28,14 @@ pub(super) struct WorkerDescriptor {
     assumed_plain_full: bool,
 }
 
+impl WorkerDescriptor {
+    pub(super) fn has_nonplain_layout(&self) -> bool {
+        self.hybrid
+            .as_ref()
+            .is_some_and(|layout| !layout.is_plain_full_attention())
+    }
+}
+
 pub(super) fn worker_descriptor(worker: &WorkerDiscovery) -> Result<WorkerDescriptor, String> {
     let server_info = worker.server_info.as_ref().map_err(Clone::clone)?.clone();
     let sources = match &worker.sources {
@@ -45,35 +53,33 @@ pub(super) fn worker_descriptor(worker: &WorkerDiscovery) -> Result<WorkerDescri
 }
 
 impl KvIndexSupervisor {
-    pub(super) async fn probe_registration(&self, base: &str) -> Result<RegistrationProbe, String> {
-        let worker = self.discover(base).await;
-        let descriptor = worker_descriptor(&worker)?;
-        let base_models = if crate::backend::is_grpc_url(base) {
-            crate::backend::control::get_grpc_model_info(base, CONTROL_TIMEOUT)
-                .await
-                .ok()
-                .map(|info| info.model_id)
-                .filter(|model| !model.trim().is_empty())
-                .into_iter()
-                .collect()
-        } else {
-            let request = worker_get(
-                &self.client,
-                &format!("{}/v1/models", base.trim_end_matches('/')),
-                self.api_key.as_deref(),
-            );
-            let models = match request.send().await {
-                Ok(response) if response.status().is_success() => {
-                    response.json::<serde_json::Value>().await.ok()
-                }
-                _ => None,
-            };
-            models
+    pub(super) async fn probe_registration(
+        &self,
+        base: &str,
+        plain_only: bool,
+    ) -> Result<RegistrationProbe, String> {
+        let mut worker = self.discover(base).await;
+        if plain_only
+            && worker
+                .hybrid
                 .as_ref()
-                .into_iter()
-                .flat_map(served_base_model_ids)
-                .map(str::to_owned)
-                .collect()
+                .is_some_and(|layout| !layout.is_plain_full_attention())
+        {
+            tracing::debug!(
+                worker = base,
+                "the current P/D configuration cannot use a hybrid KV layout"
+            );
+            worker.hybrid = None;
+        }
+        let descriptor = worker_descriptor(&worker)?;
+        let base_models = if let Some(models) = worker.base_models.take() {
+            models
+        } else {
+            query_model_list(&self.client, base, self.api_key.as_deref())
+                .await
+                .as_ref()
+                .map(base_model_names)
+                .unwrap_or_default()
         };
         Ok(RegistrationProbe {
             descriptor,
@@ -151,13 +157,17 @@ pub(super) fn grpc_model_id(
     })
 }
 
-/// Fetch the HTTP KV event source route. A 404/405 reports
-/// [`SourcesProbe::Unsupported`], not a transport failure.
+/// Fetch event publishers from either worker transport.
 pub(super) async fn fetch_kv_event_sources(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
 ) -> Result<KvEventSourcesResponse, SourcesUnavailable> {
+    if crate::backend::is_grpc_url(worker_url) {
+        let response =
+            crate::backend::control::get_grpc_kv_event_sources(worker_url, CONTROL_TIMEOUT).await?;
+        return Ok(grpc_kv_event_source_entries(worker_url, response.sources));
+    }
     let url = format!("{}/kv_event_sources", worker_url.trim_end_matches('/'));
     let response = worker_get(client, &url, api_key)
         .send()
@@ -186,7 +196,7 @@ pub(super) async fn fetch_kv_event_sources(
 }
 
 /// Read the source list and its automatically published cache contract.
-pub(super) async fn fetch_native_full_sources(
+pub(super) async fn fetch_native_sources(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
@@ -209,7 +219,7 @@ pub(super) async fn fetch_native_full_sources(
         let layout = match response.kv_routing_capabilities.as_deref() {
             Some(bytes) => serde_json::from_slice(bytes)
                 .map_err(|error| format!("kv_routing_capabilities parse: {error}"))
-                .and_then(parse_native_full_layout)
+                .and_then(parse_native_layout)
                 .map(Some),
             None => Ok(None),
         };
@@ -218,7 +228,7 @@ pub(super) async fn fetch_native_full_sources(
 
     let (sources, layout) = tokio::join!(
         fetch_kv_event_sources(client, worker_url, api_key),
-        tokio::time::timeout(timeout, fetch_http_full_layout(client, worker_url, api_key)),
+        tokio::time::timeout(timeout, fetch_http_layout(client, worker_url, api_key)),
     );
     (
         sources,
@@ -226,7 +236,7 @@ pub(super) async fn fetch_native_full_sources(
     )
 }
 
-async fn fetch_http_full_layout(
+async fn fetch_http_layout(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
@@ -250,36 +260,36 @@ async fn fetch_http_full_layout(
         .json()
         .await
         .map_err(|error| format!("kv_routing_capabilities parse: {error}"))?;
-    parse_native_full_layout(body).map(Some)
+    parse_native_layout(body).map(Some)
 }
 
-/// Automatic discovery accepts only a complete plain full-attention contract.
 /// Invalid or incompatible declarations are distinct from an absent endpoint.
-fn parse_native_full_layout(body: serde_json::Value) -> Result<CacheCapabilities, String> {
-    // A plain capability may omit the empty adapter list and null transfer.
-    if !body
-        .get("adapters")
-        .is_none_or(|adapters| adapters.as_array().is_some_and(Vec::is_empty))
-        || !body
-            .get("ranks")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|ranks| {
-                !ranks.is_empty()
-                    && ranks
-                        .iter()
-                        .all(|rank| rank.get("transfer").is_none_or(serde_json::Value::is_null))
-            })
-    {
-        return Err("worker did not confirm a plain cache capability".into());
+fn parse_native_layout(body: serde_json::Value) -> Result<CacheCapabilities, String> {
+    let ranks = body
+        .get("ranks")
+        .and_then(serde_json::Value::as_array)
+        .filter(|ranks| !ranks.is_empty())
+        .ok_or("worker did not report rank layouts")?;
+    if ranks.iter().any(|rank| {
+        rank.get("transfer")
+            .is_some_and(|transfer| !transfer.is_null())
+    }) {
+        return Err("worker did not report a complete cache lookup contract".into());
     }
+    let reports_partial_hits = ranks
+        .iter()
+        .all(|rank| rank.get("partial_hash_hits").is_some());
     let mut capability: CacheCapabilities =
         serde_json::from_value(body).map_err(|e| format!("kv_routing_capabilities parse: {e}"))?;
+    if !capability.is_plain_full_attention() && !reports_partial_hits {
+        return Err("worker did not report partial hash hit support".into());
+    }
     if capability
         .ranks
         .iter()
-        .any(|rank| rank.declared_groups != Some(1) || !rank.has_plain_full_attention_shape())
+        .any(|rank| rank.declared_groups != u32::try_from(rank.groups.len()).ok())
     {
-        return Err("worker does not declare a single full-attention group".into());
+        return Err("worker did not declare the number of KV groups".into());
     }
     capability.ranks.sort_unstable_by_key(|rank| rank.rank);
     Ok(capability)
@@ -349,6 +359,16 @@ pub(crate) async fn query_worker_metadata(
     worker_url: &str,
     api_key: Option<&str>,
 ) -> Result<ServerInfo, String> {
+    query_worker_metadata_and_models(client, worker_url, api_key)
+        .await
+        .map(|(info, _)| info)
+}
+
+pub(super) async fn query_worker_metadata_and_models(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Result<(ServerInfo, Option<HashSet<String>>), String> {
     let mut attempts: Vec<String> = Vec::new();
     let record_metadata = |path, result: Result<ServerInfo, String>| {
         let info = result?;
@@ -362,7 +382,7 @@ pub(crate) async fn query_worker_metadata(
         "get_server_info",
         query_worker_json(client, worker_url, "get_server_info", true, api_key).await,
     ) {
-        Ok(info) => return Ok(info),
+        Ok(info) => return Ok((info, None)),
         Err(error) => attempts.push(error),
     }
 
@@ -371,19 +391,20 @@ pub(crate) async fn query_worker_metadata(
         "server_info",
         query_server_info_json(client, worker_url, api_key).await,
     ) {
-        Ok(info) => return Ok(info),
+        Ok(info) => return Ok((info, None)),
         Err(error) => attempts.push(error),
     }
 
     // 3. Prometheus scrape. Always on, no dev mode required.
-    record_metadata(
-        "metrics",
-        query_metrics_metadata(client, worker_url, api_key).await,
-    )
-    .map_err(|error| {
-        attempts.push(error);
-        attempts.join("; ")
-    })
+    query_metrics_metadata(client, worker_url, api_key)
+        .await
+        .and_then(|(info, models)| {
+            record_metadata("metrics", Ok(info)).map(|info| (info, Some(models)))
+        })
+        .map_err(|error| {
+            attempts.push(error);
+            attempts.join("; ")
+        })
 }
 
 /// Engine configuration exposed by `vllm serve` behind `VLLM_SERVER_DEV_MODE=1`.
@@ -431,7 +452,7 @@ async fn query_metrics_metadata(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-) -> Result<ServerInfo, String> {
+) -> Result<(ServerInfo, HashSet<String>), String> {
     let text = query_worker_text(client, worker_url, "metrics", true, api_key).await?;
     let engines = metrics_meta::parse_cache_config_info(&text);
     if engines.is_empty() {
@@ -449,28 +470,37 @@ async fn query_metrics_metadata(
             worker_url, layout
         );
     }
-    let (model_id, model_path) = query_served_model(client, worker_url, api_key)
-        .await
-        .unzip();
-    Ok(ServerInfo {
+    let models = query_model_list(client, worker_url, api_key).await;
+    let (model_id, model_path) = models.as_ref().and_then(served_model).unzip();
+    let info = ServerInfo {
         model_id,
         model_path: model_path.flatten(),
         kv_block_size: hash_unit,
         ..Default::default()
-    })
+    };
+    Ok((
+        info,
+        models.as_ref().map(base_model_names).unwrap_or_default(),
+    ))
 }
 
-/// The served alias and its model path from the same base-model entry.
-async fn query_served_model(
+pub(super) async fn query_model_list(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-) -> Option<(String, Option<String>)> {
-    let models: serde_json::Value =
-        query_worker_json(client, worker_url, "v1/models", true, api_key)
-            .await
-            .ok()?;
-    let id = served_base_model_ids(&models).next()?;
+) -> Option<serde_json::Value> {
+    query_worker_json(client, worker_url, "v1/models", true, api_key)
+        .await
+        .ok()
+}
+
+pub(super) fn base_model_names(models: &serde_json::Value) -> HashSet<String> {
+    served_base_model_ids(models).map(str::to_owned).collect()
+}
+
+/// The served alias and its model path from the same base-model entry.
+pub(super) fn served_model(models: &serde_json::Value) -> Option<(String, Option<String>)> {
+    let id = served_base_model_ids(models).next()?;
     let path = models
         .get("data")?
         .as_array()?

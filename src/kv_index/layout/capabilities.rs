@@ -31,6 +31,7 @@ pub struct RankCapability {
     /// that do not publish cache events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_groups: Option<u32>,
+    #[serde(default)]
     pub model: String,
     pub weight_version: String,
     pub weight_identity: Option<String>,
@@ -76,7 +77,7 @@ pub struct GroupCapability {
 
 impl RankCapability {
     pub(crate) fn has_plain_full_attention_shape(&self) -> bool {
-        self.declared_groups.is_none_or(|count| count == 1)
+        self.declared_groups == Some(1)
             && self.hash_lookahead_tokens == 0
             && self.speculative_tokens == 0
             && !self.partial_hash_hits
@@ -147,6 +148,12 @@ pub(crate) struct VerifiedLayout {
 }
 
 impl CacheCapabilities {
+    pub(crate) fn is_plain_full_attention(&self) -> bool {
+        self.ranks
+            .iter()
+            .all(RankCapability::has_plain_full_attention_shape)
+    }
+
     /// The capability declared for one DP rank. Ranks are independent
     /// instances: a rank that is absent here simply gets no hybrid credit and
     /// must not invalidate the other ranks of the same worker.
@@ -251,7 +258,6 @@ impl CacheCapabilities {
                         (group.kind.as_str(), group.spec_type.as_str()),
                         ("sliding_window", "SlidingWindowSpec")
                             | ("sliding_window_mla", "SlidingWindowMLASpec")
-                            | ("mla_attention", "MLAAttentionSpec")
                     )
                 {
                     // Bounded replay: the engine rebuilds this group's trailing

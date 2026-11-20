@@ -18,7 +18,7 @@ type PrefillArgs = (String, Option<u16>);
 #[derive(serde::Deserialize)]
 struct WorkerKvLayout {
     #[serde(flatten)]
-    layout: CacheCapabilities,
+    layout: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     endpoints: Vec<String>,
     replay_endpoints: Option<Vec<String>>,
@@ -621,23 +621,38 @@ impl CliArgs {
                     replay_endpoints,
                     compatible_decode_urls,
                 } = config;
-                let rank = layout
-                    .ranks
-                    .first()
-                    .ok_or_else(|| ConfigError::ValidationFailed {
-                        reason: format!(
-                            "KV cache layout for '{worker}' must declare at least one rank"
-                        ),
-                    })?;
-                let block_size = rank.hash_block_size.unwrap_or(16);
-                let model = rank.model.clone();
-                if matches!(&mode, RoutingMode::VllmPrefillDecode { .. }) {
+                let pd = matches!(&mode, RoutingMode::VllmPrefillDecode { .. });
+                let layout: Option<CacheCapabilities> =
+                    if pd && !compatible_decode_urls.is_empty() && layout.is_empty() {
+                        None
+                    } else {
+                        let layout: CacheCapabilities = serde_json::from_value(
+                            serde_json::Value::Object(layout),
+                        )
+                        .map_err(|error| ConfigError::ValidationFailed {
+                            reason: format!("invalid KV cache layout for '{worker}': {error}"),
+                        })?;
+                        if layout.ranks.is_empty() {
+                            return Err(ConfigError::ValidationFailed {
+                                reason: format!(
+                                    "KV cache layout for '{worker}' must declare at least one rank"
+                                ),
+                            });
+                        }
+                        Some(layout)
+                    };
+                let rank = layout.as_ref().and_then(|layout| layout.ranks.first());
+                let block_size = rank.and_then(|rank| rank.hash_block_size).unwrap_or(16);
+                let model = rank
+                    .map(|rank| rank.model.clone())
+                    .filter(|model| !model.is_empty());
+                if pd {
                     let source = PdKvEventSources {
                         endpoints,
                         replay_endpoints,
                         block_size,
-                        model: Some(model),
-                        hybrid: Some(layout),
+                        model,
+                        hybrid: layout,
                         compatible_decode_urls,
                     };
                     if pd_kv_event_sources.insert(worker.clone(), source).is_some() {
@@ -651,17 +666,19 @@ impl CliArgs {
                             reason: format!("duplicate KV event endpoints for '{worker}'"),
                         });
                     }
-                    source.hybrid = Some(layout);
+                    source.hybrid = layout;
                 } else {
                     static_kv_event_sources.insert(
                         worker,
                         StaticKvEventSources {
                             endpoints,
                             replay_endpoints,
-                            topic: rank.publisher_topic.clone().unwrap_or_default(),
+                            topic: rank
+                                .and_then(|rank| rank.publisher_topic.clone())
+                                .unwrap_or_default(),
                             block_size,
-                            model,
-                            hybrid: Some(layout),
+                            model: model.unwrap_or_default(),
+                            hybrid: layout,
                         },
                     );
                 }
@@ -860,21 +877,11 @@ impl CliArgs {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
-    println!("DEBUG: Main function started");
 
     // Parse prefill arguments manually before clap parsing
-    println!("DEBUG: Parsing prefill arguments");
     let (prefill_urls, filtered_args) = split_prefill_args_from_others(std::env::args())?;
-    println!("DEBUG: Prefill URLs parsed: {:?}", prefill_urls);
     // Parse CLI arguments with clap using filtered args
-    println!("DEBUG: Parsing CLI arguments with clap");
-    println!("DEBUG: Filtered args: {:?}", filtered_args);
     let cli_args = CliArgs::parse_from(filtered_args);
-    println!("DEBUG: CLI args parsed successfully");
-    println!(
-        "DEBUG: vllm_pd_disaggregation: {}",
-        cli_args.vllm_pd_disaggregation
-    );
 
     // Print startup info
     println!("VLLM Router starting...");
@@ -912,34 +919,18 @@ Provide --worker-urls or PD flags as usual.",
     }
 
     // Convert to RouterConfig
-    println!("DEBUG: Converting to RouterConfig");
     let router_config = cli_args.to_router_config(prefill_urls)?;
-    println!("DEBUG: RouterConfig created successfully");
 
     // Validate configuration
-    println!("DEBUG: Validating configuration");
     router_config.validate()?;
-    println!("DEBUG: Configuration validated successfully");
 
     // Create ServerConfig
-    println!("DEBUG: Creating ServerConfig");
-    println!(
-        "DEBUG: CLI host: {}, port: {}",
-        cli_args.host, cli_args.port
-    );
     let server_config = cli_args.to_server_config(router_config);
-    println!(
-        "DEBUG: ServerConfig created successfully - host: {}, port: {}",
-        server_config.host, server_config.port
-    );
 
     // Create a new runtime for the server (like Python binding does)
-    println!("DEBUG: Creating Tokio runtime");
     let runtime = tokio::runtime::Runtime::new()?;
-    println!("DEBUG: Tokio runtime created successfully");
 
     // Block on the async startup function
-    println!("DEBUG: Starting server startup function");
     runtime.block_on(async move {
         let result = server::startup(server_config).await;
         // Shut down OTel while the Tokio runtime is still alive so the
@@ -1017,6 +1008,22 @@ mod tests {
                 assert_eq!(source.block_size, 16);
                 assert!(source.hybrid.is_some());
             }
+
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    (prefill): {"compatible_decode_urls": [decode]}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let config = args
+                .to_router_config(vec![(prefill.to_owned(), None)])
+                .unwrap();
+            config.validate().unwrap();
+            let source = &config.pd_kv_event_sources[prefill];
+            assert_eq!(source.compatible_decode_urls, [decode]);
+            assert!(source.hybrid.is_none());
         }
     }
 

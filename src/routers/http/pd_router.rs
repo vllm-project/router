@@ -1391,6 +1391,7 @@ impl PdRouterBase {
                         .is_some()
                         .then(|| decode_policy.clone()),
                     ctx.router_config.kv_event_strict_recovery,
+                    ctx.router_config.program_scheduling.is_none(),
                 )
                 .await,
             )

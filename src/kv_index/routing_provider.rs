@@ -5,7 +5,7 @@ use crate::kv_index::layout::align_down;
 use crate::kv_index::request_hash::BlockKeyGenerator;
 use crate::kv_index::storage::{GroupPages, PageQuery};
 use crate::kv_index::SourceBinding;
-use crate::kv_index::{KvBlockIndexer, Locality, TierMatch};
+use crate::kv_index::{KvBlockIndexer, TierMatch};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -58,10 +58,13 @@ impl crate::policies::TieredMatchProvider for SourceBinding {
             else {
                 return Vec::new();
             };
+            let Some(group_claims) = claims.pop() else {
+                return Vec::new();
+            };
             let hits = crate::kv_index::layout::full_attention_matches(
                 &self.target,
                 &self.groups[0],
-                claims.pop().expect("one group in the snapshot"),
+                group_claims,
                 self.keys.block_size(),
                 block_size,
                 prompt_cap as u64,
@@ -90,7 +93,6 @@ impl crate::policies::TieredMatchProvider for SourceBinding {
         vec![TierMatch {
             target: self.target.clone(),
             tier: credit,
-            locality: Locality::Local,
             segments: vec![(0, blocks)],
         }]
     }

@@ -33,7 +33,7 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
     if !(2..=3).contains(&batch.len()) {
         return Err("KV batch requires timestamp, events, and optional rank".into());
     }
-    let ts = batch[0]
+    let _timestamp = batch[0]
         .as_f64()
         .filter(|ts| ts.is_finite() && *ts >= 0.0)
         .ok_or("invalid KV event timestamp")?;
@@ -55,7 +55,8 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
         .map(decode_event)
         .collect::<Result<_, _>>()?;
     Ok(KVEventBatch {
-        ts,
+        #[cfg(test)]
+        ts: _timestamp,
         events,
         data_parallel_rank,
     })
@@ -228,7 +229,6 @@ mod tests {
             kv_cache_spec_sliding_window: None,
             locality: Some("LOCAL".into()),
             ownership: None,
-            session_id: None,
             lookahead_token_ids: None,
         });
         // vLLM emits tagged maps; generic Value serialization uses positional
@@ -293,7 +293,6 @@ mod tests {
         assert_eq!(event.medium.as_deref(), Some("CPU"));
         assert_eq!(event.ownership.as_deref(), Some("TRANSFERRED"));
         assert_eq!(event.locality.as_deref(), Some("REMOTE"));
-        assert_eq!(event.session_id.as_deref(), Some("session"));
         assert_eq!(event.lora_id, Some(9));
         assert_eq!(event.lora_name.as_deref(), Some("adapter"));
         assert_eq!(event.extra_keys, Some(vec!["salt".into()]));

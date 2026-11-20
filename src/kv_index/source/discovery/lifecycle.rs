@@ -10,7 +10,7 @@ use tracing::info;
 
 use super::probe::WorkerDescriptor;
 use super::reconcile::{
-    native_full_sources_match, probe_keeps_trust, probe_renews_trust, static_hybrid_sources_match,
+    native_sources_match, probe_keeps_trust, probe_renews_trust, static_hybrid_sources_match,
     BoundSource, BoundSources, StaticHybridMatch,
 };
 use super::{CacheKey, InstalledWorkers, KvIndexSupervisor, WorkerKvInfo, WorkerSubs};
@@ -200,14 +200,7 @@ impl WorkerLifecycle {
     pub(super) fn observe_layout(&self, outcome: &StaticHybridMatch) -> SourceAction {
         let mut state = self.state.lock();
         if !self.active.load(Ordering::Acquire) || !probe_keeps_trust(outcome) {
-            if self.active.swap(false, Ordering::AcqRel) {
-                state.checked = None;
-            }
-            state.trusted = false;
-            state.base_models.clear();
-            if state.info.take().is_some() {
-                state.revision = crate::kv_index::next_owner_incarnation();
-            }
+            self.stop_layout(&mut state);
             return SourceAction::Stop;
         }
         if probe_renews_trust(outcome) {
@@ -217,6 +210,27 @@ impl WorkerLifecycle {
             }
         }
         SourceAction::Keep
+    }
+
+    fn stop_layout(&self, state: &mut LifecycleState) {
+        if self.active.swap(false, Ordering::AcqRel) {
+            state.checked = None;
+        }
+        state.trusted = false;
+        state.base_models.clear();
+        if state.info.take().is_some() {
+            state.revision = crate::kv_index::next_owner_incarnation();
+        }
+    }
+
+    pub(super) fn finish_layout_recovery(&self, recovered: bool) -> bool {
+        let mut state = self.state.lock();
+        if recovered && self.active.load(Ordering::Acquire) {
+            state.trusted = true;
+            return true;
+        }
+        self.stop_layout(&mut state);
+        false
     }
 }
 
@@ -346,7 +360,7 @@ impl KvIndexSupervisor {
                     )
                     .await
                 } else {
-                    native_full_sources_match(
+                    native_sources_match(
                         &client,
                         &worker,
                         api_key.as_deref(),
@@ -366,13 +380,7 @@ impl KvIndexSupervisor {
                     invalidate(&handles);
                 }
                 match provider.lifecycle.observe_layout(&outcome) {
-                    SourceAction::Stop => {
-                        invalidate(&handles);
-                        if let Some(installed) = installed.upgrade() {
-                            installed.retire_if_current(&worker, &provider.lifecycle);
-                        }
-                        break;
-                    }
+                    SourceAction::Stop => {}
                     SourceAction::Recover => {
                         handles.clear();
                         let mut recovered = true;
@@ -393,22 +401,20 @@ impl KvIndexSupervisor {
                         }
                         // Retirement can race the awaited probe and the new
                         // subscriptions. Never make it active again.
-                        if !provider.lifecycle.active.load(Ordering::Acquire) || !recovered {
-                            for handle in &handles {
-                                handle.shutdown();
-                            }
-                            if !provider.lifecycle.active.load(Ordering::Acquire) {
-                                break;
-                            }
-                        } else {
-                            provider.lifecycle.state.lock().trusted = true;
+                        if provider.lifecycle.finish_layout_recovery(recovered) {
+                            continue;
                         }
                     }
-                    SourceAction::Keep => {}
+                    SourceAction::Keep => continue,
                     SourceAction::Rebuild => {
                         unreachable!("layout probe cannot install a descriptor")
                     }
                 }
+                invalidate(&handles);
+                if let Some(installed) = installed.upgrade() {
+                    installed.retire_if_current(&worker, &provider.lifecycle);
+                }
+                break;
             }
         });
     }

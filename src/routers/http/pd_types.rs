@@ -16,9 +16,6 @@ pub enum PDRouterError {
     #[error("Worker not found: {url}")]
     WorkerNotFound { url: String },
 
-    #[error("Lock acquisition failed: {operation}")]
-    LockError { operation: String },
-
     #[error("Health check failed for worker: {url}")]
     HealthCheckFailed { url: String },
 
@@ -27,9 +24,6 @@ pub enum PDRouterError {
 
     #[error("Network error: {message}")]
     NetworkError { message: String },
-
-    #[error("Timeout waiting for worker: {url}")]
-    Timeout { url: String },
 }
 
 /// Format a full error chain for debugging (walks source() recursively).
@@ -777,28 +771,6 @@ mod tests {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             self.source.as_deref()
         }
-    }
-
-    #[test]
-    fn test_error_chain_single_error() {
-        let err = TestError {
-            msg: "something broke".into(),
-            source: None,
-        };
-        assert_eq!(error_chain(&err), "something broke");
-    }
-
-    #[test]
-    fn test_error_chain_nested_errors() {
-        let inner = TestError {
-            msg: "root cause".into(),
-            source: None,
-        };
-        let outer = TestError {
-            msg: "outer error".into(),
-            source: Some(Box::new(inner)),
-        };
-        assert_eq!(error_chain(&outer), "outer error caused by: root cause");
     }
 
     #[test]

@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::StaticKvEventSources;
 use crate::kv_index::storage::KvBlockIndexer;
+use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::EventSubscriberHandle;
 use crate::kv_index::{CacheCapabilities, GroupCapability, RankCapability};
 use crate::kv_index::{IngestionSignal, SourceId};
@@ -32,7 +33,8 @@ use reconcile::{static_hybrid_sources_match, StaticHybridMatch};
 
 pub(crate) use probe::query_worker_metadata;
 use probe::{
-    fetch_kv_event_sources, fetch_native_full_sources, grpc_model_id, layout_model, server_model_id,
+    base_model_names, fetch_kv_event_sources, fetch_native_sources, grpc_model_id, layout_model,
+    query_model_list, query_worker_metadata_and_models, served_model, server_model_id,
 };
 
 /// The worker-stable core of a cache identity. One indexer per key.
@@ -44,8 +46,7 @@ pub struct CacheKey {
     pub block_size: u32,
 }
 
-/// One per-DP-rank entry from the KV event source control probe (gRPC
-/// `GetKvEventSources` or HTTP `/kv_event_sources`). Mirrors KVEventsConfig.
+/// One DP rank's event publisher, reported by the worker control plane.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct KvEventSourceEntry {
     #[serde(default)]
@@ -57,9 +58,9 @@ pub struct KvEventSourceEntry {
     #[serde(default)]
     pub hwm: Option<i32>,
     #[serde(default)]
-    pub publisher: Option<String>, // "zmq" | "null"
+    pub publisher: Option<String>,
     #[serde(default)]
-    pub encoding: Option<String>, // "msgpack"
+    pub encoding: Option<String>,
     #[serde(default)]
     pub schema_version: Option<u32>,
     #[serde(default)]
@@ -68,6 +69,43 @@ pub struct KvEventSourceEntry {
 
 /// /kv_event_sources body: a JSON object keyed by DP rank (as string).
 pub type KvEventSourcesResponse = HashMap<String, KvEventSourceEntry>;
+
+fn event_sources_for_worker(
+    worker_url: &str,
+    source: &SourceId,
+    sources: &KvEventSourcesResponse,
+    include_replay: bool,
+) -> Result<Vec<EventSource>, String> {
+    let host = worker_host(worker_url).unwrap_or_else(|| worker_url.to_owned());
+    let mut ranks = HashSet::new();
+    sources
+        .iter()
+        .filter(|(_, entry)| events_enabled(entry))
+        .map(|(rank, entry)| {
+            let dp_rank = rank.parse().map_err(|_| "invalid KV source rank")?;
+            if !ranks.insert(dp_rank) {
+                return Err("duplicate normalized KV source rank".into());
+            }
+            let pub_endpoint = resolve_endpoint(&entry.endpoint, &host)
+                .map_err(|error| format!("invalid KV publisher endpoint: {error}"))?;
+            let replay_endpoint = entry
+                .replay_endpoint
+                .as_deref()
+                .filter(|_| include_replay)
+                .map(|address| resolve_endpoint(address, &host))
+                .transpose()
+                .map_err(|error| format!("invalid KV replay endpoint: {error}"))?;
+            Ok(EventSource {
+                source: source.clone(),
+                dp_rank,
+                pub_endpoint,
+                replay_endpoint,
+                topic: entry.topic.clone(),
+                hwm: entry.hwm,
+            })
+        })
+        .collect()
+}
 
 /// What on_worker_added learned and spawned.
 #[derive(Debug, Clone, Default)]
@@ -86,6 +124,8 @@ pub(crate) struct WorkerDiscovery {
     /// gRPC has a separate GetModelInfo RPC; preserve its failure instead of
     /// silently turning the worker URL into a cache identity.
     model_id: Result<Option<String>, String>,
+    /// Aliases already read during discovery, if a model-list probe was needed.
+    base_models: Option<HashSet<String>>,
     pub(crate) hybrid: Option<CacheCapabilities>,
     pub(super) assumed_plain_full: bool,
 }
@@ -277,53 +317,56 @@ impl KvIndexSupervisor {
     /// (`base@0`, `base@1`) into the base entry. Regular startup discovers the
     /// base URL and fans it out to its DP ranks afterwards, so a declaration
     /// keyed by rank has to be merged here or it is never applied.
-    fn resolved_static_source(&self, worker_url: &str) -> Option<StaticKvEventSources> {
-        let exact = self.static_sources.get(worker_url).cloned();
-        if worker_url.contains('@') {
-            return exact;
+    fn resolved_static_source(&self, worker_url: &str) -> Option<WorkerDiscovery> {
+        let exact = self.static_sources.get(worker_url);
+        if split_worker_rank(worker_url).1.is_some() {
+            return exact.map(|source| static_worker_discovery(worker_url, source));
         }
         let prefix = format!("{worker_url}@");
-        let mut per_rank: Vec<(u32, &StaticKvEventSources)> = Vec::new();
+        let mut per_rank = Vec::new();
         for (key, source) in &self.static_sources {
             if let Some(rank) = key
                 .strip_prefix(prefix.as_str())
                 .and_then(|suffix| suffix.parse::<u32>().ok())
             {
-                per_rank.push((rank, source));
+                per_rank.push((rank, key, source));
             }
         }
-        if per_rank.is_empty() {
-            return exact;
-        }
-        per_rank.sort_by_key(|(rank, _)| *rank);
-        let mut merged = exact.or_else(|| per_rank.first().map(|(_, source)| (*source).clone()))?;
-        // Every rank publishes its own endpoints: collect them instead of
-        // keeping only the first non-empty list, or the second rank's publisher
-        // and replay channel are silently dropped.
-        let mut endpoints = merged.endpoints.clone();
-        let mut replay_endpoints = merged.replay_endpoints.clone().unwrap_or_default();
-        for (rank, source) in per_rank {
-            for endpoint in &source.endpoints {
-                if !endpoints.contains(endpoint) {
-                    endpoints.push(endpoint.clone());
+        per_rank.sort_by_key(|(rank, _, _)| *rank);
+        let mut per_rank = per_rank.into_iter();
+        let mut merged = if let Some(source) = exact {
+            static_worker_discovery(worker_url, source)
+        } else {
+            let (_, key, source) = per_rank.next()?;
+            let mut first = static_worker_discovery(key, source);
+            if let Ok(info) = &mut first.server_info {
+                info.instance_id = Some(worker_url.to_owned());
+            }
+            first
+        };
+        for (rank, key, source) in per_rank {
+            let overlay = static_worker_discovery(key, source);
+            // Overlay publishers by DP rank, keeping each replay address
+            // attached to its live publisher, even across sparse rank IDs.
+            let (Ok(sources), Ok(new_sources)) = (&mut merged.sources, overlay.sources) else {
+                return Some(failed_hybrid_discovery(format!(
+                    "invalid static KV event sources for {worker_url}"
+                )));
+            };
+            sources.extend(new_sources);
+            if merged
+                .model_id
+                .as_ref()
+                .is_ok_and(|model| model.as_deref().is_none_or(str::is_empty))
+            {
+                merged.model_id = overlay.model_id;
+                if let Ok(info) = &mut merged.server_info {
+                    info.model_id = merged.model_id.as_ref().ok().and_then(Clone::clone);
                 }
             }
-            if let Some(list) = &source.replay_endpoints {
-                for endpoint in list {
-                    if !replay_endpoints.contains(endpoint) {
-                        replay_endpoints.push(endpoint.clone());
-                    }
-                }
-            }
-            if merged.topic.is_empty() {
-                merged.topic = source.topic.clone();
-            }
-            if merged.model.is_empty() {
-                merged.model = source.model.clone();
-            }
-            match (&mut merged.hybrid, &source.hybrid) {
-                (Some(base), Some(overlay)) => merge_hybrid_layout(base, overlay),
-                (None, Some(overlay)) => merged.hybrid = Some(overlay.clone()),
+            match (&mut merged.hybrid, overlay.hybrid) {
+                (Some(base), Some(overlay)) => merge_hybrid_layout(base, &overlay),
+                (None, Some(overlay)) => merged.hybrid = Some(overlay),
                 _ => {}
             }
             tracing::debug!(
@@ -332,8 +375,6 @@ impl KvIndexSupervisor {
                 "merged a rank-pinned hybrid declaration into its base worker"
             );
         }
-        merged.endpoints = endpoints;
-        merged.replay_endpoints = (!replay_endpoints.is_empty()).then_some(replay_endpoints);
         Some(merged)
     }
 
@@ -363,90 +404,152 @@ impl KvIndexSupervisor {
 
     /// Prepare metadata once; P/D refresh fingerprints and installs this same snapshot.
     pub(crate) async fn discover(&self, worker_url: &str) -> WorkerDiscovery {
-        if self.http_pd {
-            return match self.static_pd_sources.get(worker_url) {
-                Some(config) => {
-                    let source = pd_static_source(worker_url, config);
-                    if let Err(reason) = self.verify_static_source(worker_url, &source).await {
-                        return failed_hybrid_discovery(reason.into());
-                    }
-                    static_pd_discovery(worker_url, config)
-                }
-                None => {
-                    discover_worker(&self.client, worker_url, true, self.api_key.as_deref()).await
-                }
-            };
-        }
-        let grpc = crate::backend::is_grpc_url(worker_url);
-        let static_source = self.resolved_static_source(worker_url);
-        let full_attention_http = !grpc && self.full_attention_http;
-        match &static_source {
-            // A layout entry without endpoints: the declaration carries the
-            // identity and groups, the engine reports the publishers.
-            Some(config) if layout_only(config) => {
-                let discovery =
-                    discover_worker(&self.client, worker_url, false, self.api_key.as_deref()).await;
-                match discovery.sources {
-                    Ok(sources) if !sources.is_empty() => {
-                        match layout_topic_mismatch(config, &sources) {
-                            Some(reason) => failed_hybrid_discovery(reason),
-                            None => static_worker_discovery_with_sources(
-                                worker_url,
-                                config,
-                                Ok(sources),
-                            ),
-                        }
-                    }
-                    Ok(_) => failed_hybrid_discovery(format!(
-                        "engine reports no KV event sources for the declared hybrid layout \
-                         ({worker_url}); declare --kv-event-source"
-                    )),
-                    Err(unavailable) => {
-                        // No endpoints to fall back to, so this worker gets no
-                        // KV subscribers; the reason is already logged.
-                        log_static_layout_trusted(worker_url, unavailable.probe);
-                        static_worker_discovery_with_sources(worker_url, config, Err(unavailable))
-                    }
-                }
+        let static_source = if self.http_pd {
+            self.static_pd_sources
+                .get(worker_url)
+                .filter(|config| config.hybrid.is_some() || !config.endpoints.is_empty())
+                .map(|config| {
+                    static_worker_discovery(worker_url, &pd_static_source(worker_url, config))
+                })
+        } else {
+            self.resolved_static_source(worker_url)
+        };
+        match static_source {
+            Some(discovery) if layout_only(&discovery) => {
+                self.discover_declared_layout(worker_url, discovery).await
             }
-            Some(config) => {
-                info!(
-                    worker_url,
-                    model = %config.model,
-                    block_size = config.block_size,
-                    ranks = config.endpoints.len(),
-                    "using configured static KV event sources"
-                );
-                if let Err(reason) = self.verify_static_source(worker_url, config).await {
+            Some(discovery) => {
+                if discovery.sources.is_err() {
+                    return discovery;
+                }
+                if let Err(reason) = self.verify_static_source(worker_url, &discovery).await {
                     return failed_hybrid_discovery(reason.into());
                 }
-                static_worker_discovery(worker_url, config)
+                info!(worker_url, "using configured static KV event sources");
+                discovery
             }
-            None if full_attention_http => {
-                discover_full_attention_http_worker(
+            None => {
+                let mut discovery = discover_worker(
                     &self.client,
                     worker_url,
+                    self.http_pd || self.full_attention_http,
                     self.api_key.as_deref(),
                 )
-                .await
+                .await;
+                if discovery.assumed_plain_full
+                    && (self
+                        .static_pd_sources
+                        .get(worker_url)
+                        .is_some_and(|source| !source.compatible_decode_urls.is_empty())
+                        || self
+                            .lifecycles
+                            .lock()
+                            .get(worker_url)
+                            .is_some_and(|lifecycle| {
+                                lifecycle
+                                    .state
+                                    .lock()
+                                    .descriptor
+                                    .as_ref()
+                                    .is_some_and(probe::WorkerDescriptor::has_nonplain_layout)
+                            }))
+                {
+                    // Do not assume a plain layout for a known hybrid worker
+                    // or for a pairing-only entry waiting for its report.
+                    discovery.hybrid = None;
+                    discovery.assumed_plain_full = false;
+                }
+                discovery
             }
-            None => discover_worker(&self.client, worker_url, false, self.api_key.as_deref()).await,
         }
+    }
+
+    async fn discover_declared_layout(
+        &self,
+        worker_url: &str,
+        mut discovery: WorkerDiscovery,
+    ) -> WorkerDiscovery {
+        let (base, _) = split_worker_rank(worker_url);
+        let api_key = self.api_key.as_deref();
+        let grpc = crate::backend::is_grpc_url(base);
+        let (sources, (model, base_models)) =
+            tokio::join!(fetch_kv_event_sources(&self.client, base, api_key), async {
+                if let Some(model) = discovery
+                    .model_id
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .filter(|model| !model.trim().is_empty())
+                {
+                    (Some(model.clone()), None)
+                } else if grpc {
+                    let model = grpc_model_id(
+                        crate::backend::control::get_grpc_model_info(base, CONTROL_TIMEOUT).await,
+                    )
+                    .ok()
+                    .flatten();
+                    let base_models = model.iter().cloned().collect();
+                    (model, Some(base_models))
+                } else {
+                    let models = query_model_list(&self.client, base, api_key)
+                        .await
+                        .unwrap_or_default();
+                    (
+                        served_model(&models).map(|(model, _)| model),
+                        Some(base_model_names(&models)),
+                    )
+                }
+            },);
+        let Ok(sources) = sources else {
+            discovery.sources = sources;
+            return discovery;
+        };
+        if sources.is_empty() {
+            return failed_hybrid_discovery("worker reports no KV event sources".into());
+        }
+        if let Some(reason) = layout_topic_mismatch(discovery.hybrid.as_ref(), &sources) {
+            return failed_hybrid_discovery(reason);
+        }
+        let Some(model) = model else {
+            return failed_hybrid_discovery(
+                "worker reports no served base model for KV layout".into(),
+            );
+        };
+        if let Ok(info) = &mut discovery.server_info {
+            info.model_id = Some(model.clone());
+        }
+        discovery.model_id = Ok(Some(model.clone()));
+        discovery.base_models = base_models;
+        if let Some(layout) = &mut discovery.hybrid {
+            for rank in &mut layout.ranks {
+                if rank.model.trim().is_empty() {
+                    rank.model.clone_from(&model);
+                }
+                if rank.publisher_topic.is_none() {
+                    rank.publisher_topic = sources
+                        .get(&rank.rank.to_string())
+                        .filter(|entry| events_enabled(entry))
+                        .map(|entry| entry.topic.clone());
+                }
+            }
+        }
+        discovery.sources = Ok(sources);
+        discovery
     }
 
     async fn verify_static_source(
         &self,
         worker_url: &str,
-        config: &StaticKvEventSources,
+        discovery: &WorkerDiscovery,
     ) -> Result<(), &'static str> {
-        if config.hybrid.is_none() {
+        if discovery.hybrid.is_none() {
             return Ok(());
         }
         match static_hybrid_sources_match(
             &self.client,
             worker_url,
             self.api_key.as_deref(),
-            config,
+            discovery,
             None,
         )
         .await
@@ -530,6 +633,7 @@ fn failed_hybrid_discovery(error: String) -> WorkerDiscovery {
             detail: error.clone(),
         }),
         model_id: Err(error),
+        base_models: None,
         hybrid: None,
         assumed_plain_full: false,
     }
@@ -570,7 +674,7 @@ async fn discover_worker(
         let (server, model, (sources, layout)) = tokio::join!(
             crate::backend::control::get_grpc_server_info(worker_url, timeout),
             crate::backend::control::get_grpc_model_info(worker_url, timeout),
-            fetch_native_full_sources(client, worker_url, api_key, timeout),
+            fetch_native_sources(client, worker_url, api_key, timeout),
         );
         let model_id = grpc_model_id(model);
         let server_info = server.map(|server| ServerInfo {
@@ -582,7 +686,16 @@ async fn discover_worker(
                 .and_then(|size| u32::try_from(size).ok()),
             ..Default::default()
         });
-        return native_worker_discovery(worker_url, server_info, sources, model_id, layout);
+        let base_models = model_id
+            .as_ref()
+            .ok()
+            .into_iter()
+            .flat_map(|id| id.iter().cloned())
+            .collect();
+        let mut discovery =
+            native_worker_discovery(worker_url, server_info, sources, model_id, layout);
+        discovery.base_models = Some(base_models);
+        return discovery;
     }
     if !http_pd {
         return WorkerDiscovery {
@@ -592,6 +705,7 @@ async fn discover_worker(
             ),
             sources: fetch_kv_event_sources(client, worker_url, api_key).await,
             model_id: Ok(Some(worker_url.to_string())),
+            base_models: None,
             hybrid: None,
             assumed_plain_full: false,
         };
@@ -620,20 +734,22 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         kv_block_size: Some(config.block_size),
         ..Default::default()
     };
-    if rank_suffix.is_some()
-        && (config.endpoints.len() > 1
-            || config
-                .replay_endpoints
-                .as_ref()
-                .is_some_and(|endpoints| endpoints.len() > 1))
+    if (rank_suffix.is_some() && config.endpoints.len() > 1)
+        || config
+            .replay_endpoints
+            .as_ref()
+            .is_some_and(|endpoints| endpoints.len() > config.endpoints.len())
     {
         return WorkerDiscovery {
             server_info: Ok(server_info),
             sources: Err(SourcesUnavailable {
                 probe: SourcesProbe::Failed,
-                detail: format!("rank-pinned KV source '{worker_url}' can have only one publisher and one replay endpoint"),
+                detail: format!(
+                    "invalid static publisher and replay endpoint counts for '{worker_url}'"
+                ),
             }),
             model_id: Ok(Some(model)),
+            base_models: None,
             hybrid: config.hybrid.clone(),
             assumed_plain_full: false,
         };
@@ -675,35 +791,25 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         server_info: Ok(server_info),
         sources: Ok(sources),
         model_id: Ok(Some(model)),
+        base_models: None,
         hybrid: config.hybrid.clone(),
         assumed_plain_full: false,
     }
 }
 
 /// A declared hybrid layout whose per-rank publishers the engine reports.
-fn layout_only(config: &StaticKvEventSources) -> bool {
-    config.hybrid.is_some() && config.endpoints.is_empty()
-}
-
-/// Same identity as [`static_worker_discovery`], with endpoints from the engine.
-fn static_worker_discovery_with_sources(
-    worker_url: &str,
-    config: &StaticKvEventSources,
-    sources: Result<KvEventSourcesResponse, SourcesUnavailable>,
-) -> WorkerDiscovery {
-    let mut discovery = static_worker_discovery(worker_url, config);
-    discovery.sources = sources;
-    discovery
+fn layout_only(discovery: &WorkerDiscovery) -> bool {
+    discovery.hybrid.is_some() && discovery.sources.as_ref().is_ok_and(HashMap::is_empty)
 }
 
 /// The layout names the publisher topic each rank must use. A discovered
 /// publisher that advertises another topic belongs to a different boot, so
 /// subscribing to it would index the wrong stream.
 fn layout_topic_mismatch(
-    config: &StaticKvEventSources,
+    layout: Option<&CacheCapabilities>,
     sources: &KvEventSourcesResponse,
 ) -> Option<String> {
-    let layout = config.hybrid.as_ref()?;
+    let layout = layout?;
     for (rank, entry) in sources {
         let Ok(rank) = rank.parse::<u32>() else {
             continue;
@@ -732,20 +838,26 @@ async fn discover_full_attention_http_worker(
     worker_url: &str,
     api_key: Option<&str>,
 ) -> WorkerDiscovery {
-    let (server_info, (sources, layout)) = tokio::join!(
-        query_worker_metadata(client, worker_url, api_key),
-        fetch_native_full_sources(client, worker_url, api_key, CONTROL_TIMEOUT),
+    let (server, (sources, layout)) = tokio::join!(
+        query_worker_metadata_and_models(client, worker_url, api_key),
+        fetch_native_sources(client, worker_url, api_key, CONTROL_TIMEOUT),
     );
+    let (server_info, base_models) = match server {
+        Ok((info, base_models)) => (Ok(info), base_models),
+        Err(error) => (Err(error), None),
+    };
     let model_id = server_info
         .as_ref()
         .map(|info| Some(server_model_id(info).unwrap_or_else(|| worker_url.to_string())))
         .map_err(Clone::clone);
-    native_worker_discovery(worker_url, server_info, sources, model_id, layout)
+    let mut discovery = native_worker_discovery(worker_url, server_info, sources, model_id, layout);
+    discovery.base_models = base_models;
+    discovery
 }
 
 fn native_worker_discovery(
     worker_url: &str,
-    server_info: Result<ServerInfo, String>,
+    mut server_info: Result<ServerInfo, String>,
     sources: Result<KvEventSourcesResponse, SourcesUnavailable>,
     model_id: Result<Option<String>, String>,
     layout: Result<Option<CacheCapabilities>, String>,
@@ -753,6 +865,7 @@ fn native_worker_discovery(
     let (hybrid, assumed_plain_full) = match (&server_info, &sources, &model_id, layout) {
         (Ok(info), Ok(sources), Ok(Some(model)), Ok(Some(layout))) => {
             let engine_model = layout_model(info, model, &layout);
+            let plain = layout.is_plain_full_attention();
             let mut active = sources.iter().filter(|(_, source)| events_enabled(source));
             let mut topics = HashSet::new();
             let matches = active.clone().count() == layout.ranks.len()
@@ -761,7 +874,7 @@ fn native_worker_discovery(
                         key == &rank.to_string()
                             && topics.insert(source.topic.as_str())
                             && layout.rank_capability(rank).is_some_and(|capability| {
-                                capability.hash_block_size == discovered_block_size(info)
+                                !plain || capability.hash_block_size == discovered_block_size(info)
                             })
                             && layout
                                 .verify_layout(
@@ -774,10 +887,7 @@ fn native_worker_discovery(
                     })
                 });
             if matches {
-                info!(
-                    worker_url,
-                    "using discovered full-attention KV hash contract"
-                );
+                info!(worker_url, "using the worker's discovered KV cache layout");
             }
             (matches.then_some(layout), false)
         }
@@ -798,10 +908,19 @@ fn native_worker_discovery(
         }
         _ => (None, false),
     };
+    if let (Ok(info), Some(layout)) = (&mut server_info, &hybrid) {
+        if !layout.is_plain_full_attention() {
+            // Policy matching uses hash units. The attention block can be
+            // larger than the hash unit when partial pages are reusable.
+            info.kv_block_size = layout.ranks.first().and_then(|rank| rank.hash_block_size);
+            info.effective_attention_block_size = None;
+        }
+    }
     WorkerDiscovery {
         server_info,
         sources,
         model_id,
+        base_models: None,
         hybrid,
         assumed_plain_full,
     }
@@ -873,15 +992,6 @@ fn synthesize_plain_full_layout(
     })
 }
 
-/// Build a discovery result purely from static configuration, without
-/// querying the worker's HTTP control plane.
-fn static_pd_discovery(
-    worker_url: &str,
-    config: &crate::config::types::PdKvEventSources,
-) -> WorkerDiscovery {
-    static_worker_discovery(worker_url, &pd_static_source(worker_url, config))
-}
-
 fn pd_static_source(
     worker_url: &str,
     config: &crate::config::types::PdKvEventSources,
@@ -891,7 +1001,11 @@ fn pd_static_source(
             .model
             .as_deref()
             .filter(|model| !model.trim().is_empty())
-            .unwrap_or(worker_url)
+            .unwrap_or(if config.hybrid.is_some() && config.endpoints.is_empty() {
+                ""
+            } else {
+                worker_url
+            })
             .to_owned(),
         block_size: config.block_size,
         endpoints: config.endpoints.clone(),
@@ -1018,10 +1132,11 @@ mod rank_merge_tests {
             }),
         );
         sources.insert(
-            format!("{base}@1"),
+            format!("{base}@3"),
             serde_json::json!({
-                "endpoints": ["tcp://rank1:5557"], "topic": "topic-1", "block_size": 16, "model": "m1",
-                "hybrid": {"schema_version": 1, "ranks": [rank(1, "m1")]},
+                "endpoints": ["tcp://rank3:5557"], "replay_endpoints": ["tcp://rank3:5558"],
+                "topic": "topic-3", "block_size": 16, "model": "m3",
+                "hybrid": {"schema_version": 1, "ranks": [rank(3, "m3")]},
             }),
         );
         let (mut supervisor, _signals) = KvIndexSupervisor::indexed(reqwest::Client::new());
@@ -1034,16 +1149,16 @@ mod rank_merge_tests {
         assert_eq!(hybrid.ranks.len(), 2);
         assert_eq!(hybrid.ranks[0].rank, 0);
         assert_eq!(hybrid.ranks[0].model, "m0");
-        assert_eq!(hybrid.ranks[1].rank, 1);
-        assert_eq!(hybrid.ranks[1].model, "m1");
-        // Both ranks keep their publisher: keeping only the first non-empty
-        // list silently drops the second rank's stream.
+        assert_eq!(hybrid.ranks[1].rank, 3);
+        assert_eq!(hybrid.ranks[1].model, "m3");
+        let sources = resolved.sources.unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources["0"].endpoint, "tcp://base:5557");
+        assert!(sources["0"].replay_endpoint.is_none());
+        assert_eq!(sources["3"].endpoint, "tcp://rank3:5557");
         assert_eq!(
-            resolved.endpoints,
-            vec![
-                "tcp://base:5557".to_string(),
-                "tcp://rank1:5557".to_string()
-            ]
+            sources["3"].replay_endpoint.as_deref(),
+            Some("tcp://rank3:5558")
         );
     }
 }

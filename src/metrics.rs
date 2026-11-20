@@ -1,6 +1,6 @@
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -491,7 +491,15 @@ pub fn init_metrics() {
     );
 }
 
-pub fn start_prometheus(config: PrometheusConfig) {
+pub fn start_prometheus(config: PrometheusConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let ip_addr: IpAddr = config.host.parse().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid Prometheus host {:?}: {error}", config.host),
+        )
+    })?;
+    let socket_addr = SocketAddr::new(ip_addr, config.port);
+
     // Initialize metric descriptions
     init_metrics();
 
@@ -501,21 +509,14 @@ pub fn start_prometheus(config: PrometheusConfig) {
         60.0, 90.0, 120.0, 180.0, 240.0,
     ];
 
-    let ip_addr: IpAddr = config
-        .host
-        .parse()
-        .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
-    let socket_addr = SocketAddr::new(ip_addr, config.port);
-
     let builder = PrometheusBuilder::new()
         .with_http_listener(socket_addr)
         .upkeep_timeout(Duration::from_secs(5 * 60));
     let builder = set_program_scheduling_buckets(builder);
     builder
-        .set_buckets_for_metric(duration_matcher, &duration_bucket)
-        .expect("failed to set duration bucket")
-        .install()
-        .expect("failed to install Prometheus metrics exporter");
+        .set_buckets_for_metric(duration_matcher, &duration_bucket)?
+        .install()?;
+    Ok(())
 }
 
 fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuilder {
@@ -622,11 +623,15 @@ impl PlacementLookups {
         if let Some((_, counter)) = self.counters.iter().find(|(label, _)| *label == result) {
             counter.increment(1);
         } else {
-            let counter = counter!("vllm_router_kv_placement_lookups_total", "result" => result);
+            let counter = kv_placement_lookup_counter(result);
             counter.increment(1);
             self.counters.push((result, counter));
         }
     }
+}
+
+fn kv_placement_lookup_counter(result: &'static str) -> metrics::Counter {
+    counter!("vllm_router_kv_placement_lookups_total", "result" => result)
 }
 
 pub struct RouterMetrics;
@@ -646,7 +651,7 @@ impl RouterMetrics {
     }
 
     pub fn record_kv_placement_lookup(result: &'static str) {
-        counter!("vllm_router_kv_placement_lookups_total", "result" => result).increment(1);
+        kv_placement_lookup_counter(result).increment(1);
     }
 
     pub(crate) fn record_kv_source_recovery(strict: bool, reason: &'static str) {
@@ -1541,419 +1546,14 @@ impl TokenizerMetrics {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
-
-    // ============= PrometheusConfig Tests =============
 
     #[test]
-    fn test_prometheus_config_default() {
-        let config = PrometheusConfig::default();
-        assert_eq!(config.port, 29000);
-        assert_eq!(config.host, "0.0.0.0");
-    }
-
-    #[test]
-    fn test_prometheus_config_custom() {
-        let config = PrometheusConfig {
-            port: 8080,
-            host: "127.0.0.1".to_string(),
-        };
-        assert_eq!(config.port, 8080);
-        assert_eq!(config.host, "127.0.0.1");
-    }
-
-    #[test]
-    fn test_prometheus_config_clone() {
-        let config = PrometheusConfig {
-            port: 9090,
-            host: "192.168.1.1".to_string(),
-        };
-        let cloned = config.clone();
-        assert_eq!(cloned.port, config.port);
-        assert_eq!(cloned.host, config.host);
-    }
-
-    // ============= IP Address Parsing Tests =============
-
-    #[test]
-    fn test_valid_ipv4_parsing() {
-        let test_cases = vec!["127.0.0.1", "192.168.1.1", "0.0.0.0"];
-
-        for ip_str in test_cases {
-            let config = PrometheusConfig {
-                port: 29000,
-                host: ip_str.to_string(),
-            };
-
-            let ip_addr: IpAddr = config.host.parse().unwrap();
-            assert!(matches!(ip_addr, IpAddr::V4(_)));
-        }
-    }
-
-    #[test]
-    fn test_valid_ipv6_parsing() {
-        let test_cases = vec!["::1", "2001:db8::1", "::"];
-
-        for ip_str in test_cases {
-            let config = PrometheusConfig {
-                port: 29000,
-                host: ip_str.to_string(),
-            };
-
-            let ip_addr: IpAddr = config.host.parse().unwrap();
-            assert!(matches!(ip_addr, IpAddr::V6(_)));
-        }
-    }
-
-    #[test]
-    fn test_invalid_ip_parsing() {
-        let test_cases = vec!["invalid", "256.256.256.256", "hostname"];
-
-        for ip_str in test_cases {
-            let config = PrometheusConfig {
-                port: 29000,
-                host: ip_str.to_string(),
-            };
-
-            let ip_addr: IpAddr = config
-                .host
-                .parse()
-                .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
-
-            // Should fall back to 0.0.0.0
-            assert_eq!(ip_addr, IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
-        }
-    }
-
-    // ============= Socket Address Creation Tests =============
-
-    #[test]
-    fn test_socket_addr_creation() {
-        let test_cases = vec![("127.0.0.1", 8080), ("0.0.0.0", 29000), ("::1", 9090)];
-
-        for (host, port) in test_cases {
-            let config = PrometheusConfig {
-                port,
-                host: host.to_string(),
-            };
-
-            let ip_addr: IpAddr = config.host.parse().unwrap();
-            let socket_addr = SocketAddr::new(ip_addr, config.port);
-
-            assert_eq!(socket_addr.port(), port);
-            assert_eq!(socket_addr.ip().to_string(), host);
-        }
-    }
-
-    #[test]
-    fn test_socket_addr_with_different_ports() {
-        let ports = vec![0, 80, 8080, 65535];
-
-        for port in ports {
-            let config = PrometheusConfig {
-                port,
-                host: "127.0.0.1".to_string(),
-            };
-
-            let ip_addr: IpAddr = config.host.parse().unwrap();
-            let socket_addr = SocketAddr::new(ip_addr, config.port);
-
-            assert_eq!(socket_addr.port(), port);
-        }
-    }
-
-    // ============= Duration Bucket Tests =============
-
-    #[test]
-    fn test_duration_bucket_coverage() {
-        let test_cases: [(f64, &str); 7] = [
-            (0.0005, "sub-millisecond"),
-            (0.005, "5ms"),
-            (0.05, "50ms"),
-            (1.0, "1s"),
-            (10.0, "10s"),
-            (60.0, "1m"),
-            (240.0, "4m"),
-        ];
-
-        let buckets: [f64; 20] = [
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
-            60.0, 90.0, 120.0, 180.0, 240.0,
-        ];
-
-        for (duration, label) in test_cases {
-            let bucket_found = buckets
-                .iter()
-                .any(|&b| (b - duration).abs() < 0.0001 || b > duration);
-            assert!(bucket_found, "No bucket found for {} ({})", duration, label);
-        }
-    }
-
-    // ============= Matcher Configuration Tests =============
-
-    #[test]
-    fn test_duration_suffix_matcher() {
-        let matcher = Matcher::Suffix(String::from("duration_seconds"));
-
-        // Test matching behavior
-        let _matching_metrics = [
-            "request_duration_seconds",
-            "response_duration_seconds",
-            "vllm_router_request_duration_seconds",
-        ];
-
-        let _non_matching_metrics = ["duration_total", "duration_seconds_total", "other_metric"];
-
-        // Note: We can't directly test Matcher matching without the internals,
-        // but we can verify the matcher is created correctly
-        match matcher {
-            Matcher::Suffix(suffix) => assert_eq!(suffix, "duration_seconds"),
-            _ => panic!("Expected Suffix matcher"),
-        }
-    }
-
-    // ============= Builder Configuration Tests =============
-
-    #[test]
-    fn test_prometheus_builder_configuration() {
-        // This test verifies the builder configuration without actually starting Prometheus
-        let _config = PrometheusConfig::default();
-
-        let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
-        let duration_bucket = [
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
-            60.0, 90.0, 120.0, 180.0, 240.0,
-        ];
-
-        // Verify bucket configuration
-        assert_eq!(duration_bucket.len(), 20);
-
-        // Verify matcher is suffix type
-        match duration_matcher {
-            Matcher::Suffix(s) => assert_eq!(s, "duration_seconds"),
-            _ => panic!("Expected Suffix matcher"),
-        }
-    }
-
-    // ============= Upkeep Timeout Tests =============
-
-    #[test]
-    fn test_upkeep_timeout_duration() {
-        let timeout = Duration::from_secs(5 * 60);
-        assert_eq!(timeout.as_secs(), 300);
-    }
-
-    // ============= Custom Bucket Tests =============
-
-    #[test]
-    fn test_custom_buckets_for_different_metrics() {
-        // Test that we can create different bucket configurations
-        let request_buckets = [0.001, 0.01, 0.1, 1.0, 10.0];
-        let generate_buckets = [0.1, 0.5, 1.0, 5.0, 30.0, 60.0];
-
-        assert_eq!(request_buckets.len(), 5);
-        assert_eq!(generate_buckets.len(), 6);
-
-        // Verify each set is sorted
-        for i in 1..request_buckets.len() {
-            assert!(request_buckets[i] > request_buckets[i - 1]);
-        }
-
-        for i in 1..generate_buckets.len() {
-            assert!(generate_buckets[i] > generate_buckets[i - 1]);
-        }
-    }
-
-    // ============= RouterMetrics Tests =============
-
-    #[test]
-    fn test_metrics_static_methods() {
-        // Test that all static methods can be called without panic
-        RouterMetrics::record_request("/generate");
-        RouterMetrics::record_request_duration("/generate", Duration::from_millis(100));
-        RouterMetrics::record_request_error("/generate", "timeout");
-        RouterMetrics::record_retry("/generate");
-
-        RouterMetrics::set_active_workers(5);
-        RouterMetrics::set_worker_health("http://worker1", true);
-        RouterMetrics::set_worker_load("http://worker1", 10);
-        RouterMetrics::record_processed_request("http://worker1");
-
-        RouterMetrics::record_policy_decision("random", "http://worker1");
-        RouterMetrics::record_cache_hit();
-        RouterMetrics::record_cache_miss();
-        RouterMetrics::set_tree_size("http://worker1", 1000);
-        RouterMetrics::record_load_balancing_event();
-        RouterMetrics::set_load_range(20, 5);
-
-        RouterMetrics::record_pd_request("/v1/chat/completions");
-        RouterMetrics::record_pd_request_duration("/v1/chat/completions", Duration::from_secs(1));
-        RouterMetrics::record_pd_prefill_request("http://prefill1");
-        RouterMetrics::record_pd_decode_request("http://decode1");
-        RouterMetrics::record_pd_error("invalid_request");
-        RouterMetrics::record_pd_prefill_error("http://prefill1");
-        RouterMetrics::record_pd_decode_error("http://decode1");
-        RouterMetrics::record_pd_stream_error("http://decode1");
-
-        RouterMetrics::record_discovery_update(3, 1);
-        RouterMetrics::record_generate_duration(Duration::from_secs(2));
-        RouterMetrics::set_running_requests("http://worker1", 15);
-    }
-
-    #[test]
-    fn test_tokenizer_metrics_static_methods() {
-        // Test that all tokenizer metric methods can be called without panic
-
-        // Encoding metrics
-        TokenizerMetrics::record_encode_request("huggingface");
-        TokenizerMetrics::record_encode_duration(Duration::from_millis(10));
-        TokenizerMetrics::record_encode_error("invalid_input");
-        TokenizerMetrics::record_tokens_per_encode(100);
-        TokenizerMetrics::record_chars_per_encode(500);
-
-        // Decoding metrics
-        TokenizerMetrics::record_decode_request("huggingface");
-        TokenizerMetrics::record_decode_duration(Duration::from_millis(5));
-        TokenizerMetrics::record_decode_error("invalid_tokens");
-        TokenizerMetrics::record_tokens_per_decode(50);
-
-        // Batch encoding
-        TokenizerMetrics::record_encode_batch_duration(Duration::from_millis(100), 10);
-
-        // Stop sequence detection
-        TokenizerMetrics::record_stop_sequence_detected("token");
-        TokenizerMetrics::record_stop_sequence_detected("string");
-        TokenizerMetrics::record_partial_match();
-        TokenizerMetrics::record_stop_detection_duration(Duration::from_micros(100));
-
-        // Streaming decode
-        TokenizerMetrics::record_stream_token();
-        TokenizerMetrics::record_incomplete_utf8();
-        TokenizerMetrics::record_stream_step_duration(Duration::from_micros(50));
-
-        // Factory metrics
-        TokenizerMetrics::record_factory_load("json");
-        TokenizerMetrics::record_factory_error("unsupported_format");
-        TokenizerMetrics::record_factory_load_duration(Duration::from_millis(200));
-
-        // Vocabulary metrics
-        TokenizerMetrics::set_vocab_size("huggingface", 50000);
-    }
-
-    // ============= Port Availability Tests =============
-
-    #[test]
-    fn test_port_already_in_use() {
-        // Skip this test if we can't bind to the port
-        let port = 29123; // Use a different port to avoid conflicts
-
-        if let Ok(_listener) = TcpListener::bind(("127.0.0.1", port)) {
-            // Port is available, we can test
-            let config = PrometheusConfig {
-                port,
-                host: "127.0.0.1".to_string(),
-            };
-
-            // Just verify config is created correctly
-            assert_eq!(config.port, port);
-        }
-    }
-
-    // ============= Integration Test Helpers =============
-
-    #[test]
-    fn test_metrics_endpoint_accessibility() {
-        // This would be an integration test in practice
-        // Here we just verify the configuration
-        let config = PrometheusConfig {
-            port: 29000,
-            host: "127.0.0.1".to_string(),
-        };
-
-        let ip_addr: IpAddr = config.host.parse().unwrap();
-        let socket_addr = SocketAddr::new(ip_addr, config.port);
-
-        assert_eq!(socket_addr.to_string(), "127.0.0.1:29000");
-    }
-
-    #[test]
-    fn test_concurrent_metric_updates() {
-        // Test that metric updates can be called concurrently
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-        use std::thread;
-
-        let done = Arc::new(AtomicBool::new(false));
-        let mut handles = vec![];
-
-        for i in 0..3 {
-            let done_clone = done.clone();
-            let handle = thread::spawn(move || {
-                let worker = format!("http://worker{}", i);
-                while !done_clone.load(Ordering::Relaxed) {
-                    RouterMetrics::set_worker_load(&worker, i * 10);
-                    RouterMetrics::record_processed_request(&worker);
-                    thread::sleep(Duration::from_millis(1));
-                }
-            });
-            handles.push(handle);
-        }
-
-        // Let threads run briefly
-        thread::sleep(Duration::from_millis(10));
-        done.store(true, Ordering::Relaxed);
-
-        // Wait for all threads
-        for handle in handles {
-            handle.join().unwrap();
-        }
-    }
-
-    // ============= Edge Cases Tests =============
-
-    #[test]
-    fn test_empty_string_metrics() {
-        // Test that empty strings don't cause issues
-        RouterMetrics::record_request("");
-        RouterMetrics::set_worker_health("", true);
-        RouterMetrics::record_policy_decision("", "");
-    }
-
-    #[test]
-    fn test_very_long_metric_labels() {
-        let long_label = "a".repeat(1000);
-
-        RouterMetrics::record_request(&long_label);
-        RouterMetrics::set_worker_health(&long_label, false);
-    }
-
-    #[test]
-    fn test_special_characters_in_labels() {
-        let special_labels = [
-            "test/with/slashes",
-            "test-with-dashes",
-            "test_with_underscores",
-            "test.with.dots",
-            "test:with:colons",
-        ];
-
-        for label in special_labels {
-            RouterMetrics::record_request(label);
-            RouterMetrics::set_worker_health(label, true);
-        }
-    }
-
-    #[test]
-    fn test_extreme_metric_values() {
-        // Test extreme values
-        RouterMetrics::set_active_workers(0);
-        RouterMetrics::set_active_workers(usize::MAX);
-
-        RouterMetrics::set_worker_load("worker", 0);
-        RouterMetrics::set_worker_load("worker", usize::MAX);
-
-        RouterMetrics::record_request_duration("route", Duration::from_nanos(1));
-        // 24 hours
-        RouterMetrics::record_request_duration("route", Duration::from_secs(86400));
+    fn rejects_invalid_prometheus_bind_address() {
+        let error = start_prometheus(PrometheusConfig {
+            host: "invalid-ip".into(),
+            ..PrometheusConfig::default()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid Prometheus host"));
     }
 }

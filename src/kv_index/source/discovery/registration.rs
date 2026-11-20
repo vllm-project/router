@@ -10,11 +10,10 @@ use tracing::{debug, info, warn};
 use super::lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
 use super::probe::{layout_model, worker_descriptor};
 use super::{
-    discovered_block_size, event_source_label, events_enabled, metadata_source_label,
-    resolve_endpoint, worker_host, CacheKey, KvIndexSupervisor, LiveSource, SourcesProbe,
-    WorkerDiscovery, WorkerKvInfo, WorkerSubs,
+    discovered_block_size, event_source_label, event_sources_for_worker, metadata_source_label,
+    CacheKey, KvIndexSupervisor, LiveSource, SourcesProbe, WorkerDiscovery, WorkerKvInfo,
+    WorkerSubs,
 };
-use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::{EventStream, SourceId};
 use crate::protocols::worker_spec::ServerInfo;
 
@@ -158,37 +157,8 @@ impl KvIndexSupervisor {
             model: Arc::from(model_id.as_str()),
             block_size,
         };
-        let worker_host = worker_host(worker_url).unwrap_or_else(|| worker_url.to_string());
         let source_id: SourceId = Arc::from(instance_id.as_str());
-        let mut event_sources = Vec::with_capacity(sources.len());
-        let mut normalized_ranks = HashSet::new();
-
-        for (rank_str, entry) in &sources {
-            if !events_enabled(entry) {
-                continue;
-            }
-            let rank: u32 = rank_str.parse().map_err(|_| "invalid KV source rank")?;
-            if !normalized_ranks.insert(rank) {
-                return Err("duplicate normalized KV source rank".into());
-            }
-            let pub_endpoint = resolve_endpoint(&entry.endpoint, &worker_host)
-                .map_err(|error| format!("invalid KV publisher endpoint: {error}"))?;
-            let replay_endpoint = entry
-                .replay_endpoint
-                .as_deref()
-                .map(|e| resolve_endpoint(e, &worker_host))
-                .transpose()
-                .map_err(|error| format!("invalid KV replay endpoint: {error}"))?;
-            let ev = EventSource {
-                source: source_id.clone(),
-                dp_rank: rank,
-                pub_endpoint,
-                replay_endpoint,
-                topic: entry.topic.clone(),
-                hwm: entry.hwm,
-            };
-            event_sources.push(ev);
-        }
+        let mut event_sources = event_sources_for_worker(worker_url, &source_id, &sources, true)?;
 
         // Admit each rank on its own verified contract.
         let engine_model = layout_model(&server_info, &model_id, &capability);

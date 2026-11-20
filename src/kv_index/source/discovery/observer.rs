@@ -1,16 +1,15 @@
 //! Advisory publishers can report invalidation without a cache lookup contract.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use super::{
-    discovered_block_size, events_enabled, fetch_kv_event_sources, query_worker_metadata,
-    resolve_endpoint, server_model_id, worker_host, CacheKey, KvIndexSupervisor, SourcesProbe,
-    WorkerKvInfo,
+    discovered_block_size, event_sources_for_worker, fetch_kv_event_sources, query_worker_metadata,
+    server_model_id, CacheKey, KvIndexSupervisor, SourcesProbe, WorkerKvInfo,
 };
-use crate::kv_index::source::events::subscriber::{spawn_observer, EventSource, SubscriberHandle};
+use crate::kv_index::source::events::subscriber::{spawn_observer, SubscriberHandle};
 use crate::kv_index::SourceId;
 
 pub(super) struct WorkerObservation {
@@ -49,32 +48,11 @@ impl KvIndexSupervisor {
             });
         };
         let model = server_model_id(&info).unwrap_or_else(|| worker_url.to_owned());
-        let host = worker_host(worker_url).unwrap_or_else(|| worker_url.to_owned());
         let source: SourceId = Arc::from(format!(
             "{instance_id}#observation-{}",
             crate::kv_index::next_owner_incarnation()
         ));
-        let mut ranks = HashSet::new();
-        let mut sources: Vec<_> = sources
-            .into_iter()
-            .filter(|(_, entry)| events_enabled(entry))
-            .map(|(rank, entry)| {
-                let dp_rank = rank.parse().map_err(|_| "invalid KV source rank")?;
-                if !ranks.insert(dp_rank) {
-                    return Err("duplicate normalized KV source rank".into());
-                }
-                let pub_endpoint = resolve_endpoint(&entry.endpoint, &host)
-                    .map_err(|error| format!("invalid KV publisher endpoint: {error}"))?;
-                Ok(EventSource {
-                    source: source.clone(),
-                    dp_rank,
-                    pub_endpoint,
-                    replay_endpoint: None,
-                    topic: entry.topic,
-                    hwm: entry.hwm,
-                })
-            })
-            .collect::<Result<_, String>>()?;
+        let mut sources = event_sources_for_worker(worker_url, &source, &sources, false)?;
         sources.sort_unstable_by_key(|entry| entry.dp_rank);
         let ranks: Vec<_> = sources.iter().map(|source| source.dp_rank).collect();
         if ranks.is_empty() {

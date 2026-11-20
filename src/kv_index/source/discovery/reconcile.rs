@@ -6,12 +6,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::lifecycle::{SourceAction, WorkerLifecycle, WorkerRegistration, CONTROL_TIMEOUT};
-use super::probe::{fetch_native_full_sources, grpc_kv_event_source_entries};
+use super::probe::{fetch_kv_event_sources, fetch_native_sources};
 use super::{
-    events_enabled, layout_topic_mismatch, resolve_endpoint, split_worker_rank,
-    static_worker_discovery, worker_host, KvEventSourceEntry, KvIndexSupervisor, SourcesProbe,
+    events_enabled, layout_topic_mismatch, resolve_endpoint, split_worker_rank, worker_host,
+    KvEventSourceEntry, KvIndexSupervisor, SourcesProbe, WorkerDiscovery,
 };
-use crate::config::StaticKvEventSources;
 use crate::kv_index::CacheCapabilities;
 
 impl KvIndexSupervisor {
@@ -106,14 +105,24 @@ impl KvIndexSupervisor {
     pub(crate) async fn refresh_workers(
         &self,
         bases: &HashSet<String>,
+        plain_only: &HashSet<String>,
     ) -> HashMap<String, WorkerRegistration> {
         let _refresh = self.refresh_lock.lock().await;
         let removed: Vec<_> = self
             .lifecycles
             .lock()
-            .keys()
-            .filter(|base| !bases.contains(*base))
-            .cloned()
+            .iter()
+            .filter(|(base, lifecycle)| {
+                !bases.contains(*base)
+                    || (plain_only.contains(*base)
+                        && lifecycle
+                            .state
+                            .lock()
+                            .descriptor
+                            .as_ref()
+                            .is_some_and(super::probe::WorkerDescriptor::has_nonplain_layout))
+            })
+            .map(|(base, _)| base.clone())
             .collect();
         for base in removed {
             self.on_worker_removed(&base);
@@ -135,7 +144,7 @@ impl KvIndexSupervisor {
                 })
                 .collect()
         };
-        self.refresh_registrations(refresh).await;
+        self.refresh_registrations(refresh, plain_only).await;
         self.worker_registrations()
     }
 
@@ -149,7 +158,16 @@ impl KvIndexSupervisor {
                 .lock()
                 .iter()
                 .filter(|(base, lifecycle)| {
-                    lifecycle.layout_rebind_due() && self.resolved_static_source(base).is_none()
+                    lifecycle.layout_rebind_due()
+                        && self.resolved_static_source(base).is_none_or(|source| {
+                            super::layout_only(&source)
+                                && source.hybrid.as_ref().is_some_and(|layout| {
+                                    layout
+                                        .ranks
+                                        .iter()
+                                        .any(|rank| rank.publisher_topic.is_none())
+                                })
+                        })
                 })
                 .map(|(base, lifecycle)| {
                     (
@@ -160,7 +178,7 @@ impl KvIndexSupervisor {
                 })
                 .collect()
         };
-        let changed = self.refresh_registrations(refresh).await;
+        let changed = self.refresh_registrations(refresh, &HashSet::new()).await;
         if changed.is_empty() {
             return HashMap::new();
         }
@@ -172,14 +190,18 @@ impl KvIndexSupervisor {
     async fn refresh_registrations(
         &self,
         refresh: Vec<(String, Arc<WorkerLifecycle>, Option<Arc<AtomicBool>>)>,
+        plain_only: &HashSet<String>,
     ) -> HashSet<String> {
         use futures_util::{stream, StreamExt};
         let probes: Vec<_> = stream::iter(refresh.into_iter().map(
             |(base, lifecycle, owner)| async move {
-                let probe = tokio::time::timeout(CONTROL_TIMEOUT, self.probe_registration(&base))
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
+                let probe = tokio::time::timeout(
+                    CONTROL_TIMEOUT,
+                    self.probe_registration(&base, plain_only.contains(&base)),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok);
                 (base, lifecycle, owner, probe)
             },
         ))
@@ -260,7 +282,7 @@ pub(super) type BoundSources = HashMap<u32, BoundSource>;
 /// Check that the bound publishers and their reported layout are unchanged.
 /// A default layout has no worker report. Its hash and block size are checked
 /// in the publisher's event stream, bound to the topic for this boot.
-pub(super) async fn native_full_sources_match(
+pub(super) async fn native_sources_match(
     client: &reqwest::Client,
     worker: &str,
     api_key: Option<&str>,
@@ -270,7 +292,7 @@ pub(super) async fn native_full_sources_match(
     let timeout = Duration::from_secs(2);
     let observed = tokio::time::timeout(
         timeout,
-        fetch_native_full_sources(client, worker, api_key, timeout),
+        fetch_native_sources(client, worker, api_key, timeout),
     )
     .await;
     let Ok((Ok(sources), Ok(layout))) = observed else {
@@ -311,42 +333,22 @@ pub(super) async fn static_hybrid_sources_match(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-    config: &StaticKvEventSources,
+    discovery: &WorkerDiscovery,
     bound: Option<&BoundSources>,
 ) -> StaticHybridMatch {
     // A rank-pinned worker URL (`base@1`) still queries the engine's HTTP
     // control plane on the base URL.
     let (http_url, _) = split_worker_rank(worker_url);
     // Revalidate with the same probe (gRPC or HTTP) discovery used.
-    let observed = if crate::backend::is_grpc_url(worker_url) {
-        match tokio::time::timeout(
-            Duration::from_secs(2),
-            crate::backend::control::get_grpc_kv_event_sources(worker_url, Duration::from_secs(2)),
-        )
-        .await
-        {
-            Ok(Ok(response)) => grpc_kv_event_source_entries(worker_url, response.sources),
-            Ok(Err(crate::backend::control::KvEventSourcesError::Unimplemented)) => {
-                return StaticHybridMatch::Unavailable(SourcesProbe::Unsupported);
-            }
-            Ok(Err(_)) | Err(_) => return StaticHybridMatch::Unavailable(SourcesProbe::Failed),
-        }
-    } else {
-        match tokio::time::timeout(
-            Duration::from_secs(2),
-            super::probe::fetch_kv_event_sources(client, http_url, api_key),
-        )
-        .await
-        {
-            Ok(Ok(sources)) => sources,
-            Ok(Err(unavailable)) => {
-                // A declared layout is authoritative when the engine cannot answer;
-                // refusing it would make static configuration unusable on engines
-                // without the control endpoint.
-                return StaticHybridMatch::Unavailable(unavailable.probe);
-            }
-            Err(_) => return StaticHybridMatch::Unavailable(SourcesProbe::Failed),
-        }
+    let observed = match tokio::time::timeout(
+        Duration::from_secs(2),
+        fetch_kv_event_sources(client, http_url, api_key),
+    )
+    .await
+    {
+        Ok(Ok(sources)) => sources,
+        Ok(Err(unavailable)) => return StaticHybridMatch::Unavailable(unavailable.probe),
+        Err(_) => return StaticHybridMatch::Unavailable(SourcesProbe::Failed),
     };
     let Some(host) = worker_host(http_url) else {
         return StaticHybridMatch::Differs;
@@ -358,7 +360,7 @@ pub(super) async fn static_hybrid_sources_match(
             StaticHybridMatch::Differs
         };
     }
-    let Ok(expected) = static_worker_discovery(worker_url, config).sources else {
+    let Ok(expected) = &discovery.sources else {
         return StaticHybridMatch::Differs;
     };
     // A layout-only binding declares no endpoints, so check the answer
@@ -368,10 +370,10 @@ pub(super) async fn static_hybrid_sources_match(
         if observed.is_empty() {
             return StaticHybridMatch::Differs;
         }
-        if layout_topic_mismatch(config, &observed).is_some() {
+        if layout_topic_mismatch(discovery.hybrid.as_ref(), &observed).is_some() {
             return StaticHybridMatch::Differs;
         }
-        let missing_rank = config.hybrid.as_ref().is_some_and(|layout| {
+        let missing_rank = discovery.hybrid.as_ref().is_some_and(|layout| {
             layout.ranks.iter().any(|rank| {
                 rank.publisher_topic
                     .as_deref()

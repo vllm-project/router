@@ -10,7 +10,6 @@ pub struct TierMatch {
     /// Held block intervals `[start, end)`, each maximal; a gap closes a
     /// segment but later segments survive.
     pub segments: Vec<(u32, u32)>,
-    pub locality: Locality,
 }
 
 /// Where a request goes — one (worker, rank) target.
@@ -62,22 +61,6 @@ impl ResidencyOwner {
         RoutableTarget {
             instance_id: source.clone(),
             dp_rank,
-        }
-    }
-
-    /// Locality derived from the domain: Worker = Local, CacheOwner = Remote.
-    pub fn locality(&self) -> Locality {
-        match self {
-            ResidencyOwner::Worker { .. } => Locality::Local,
-            ResidencyOwner::CacheOwner { .. } => Locality::Remote,
-        }
-    }
-
-    /// Which domain this owner belongs to — drives `clear` scoping.
-    pub fn domain(&self) -> ClearScope {
-        match self {
-            ResidencyOwner::Worker { .. } => ClearScope::Worker,
-            ResidencyOwner::CacheOwner { .. } => ClearScope::CacheOwner,
         }
     }
 }
@@ -144,23 +127,6 @@ impl StorageTier {
         warn_unknown_medium(medium);
         None
     }
-}
-
-/// Whether a residency is local or remote relative to the reading target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Locality {
-    Local,
-    Remote,
-}
-
-/// Scope of a `clear`. `Worker` clears a worker's device/host residency;
-/// `CacheOwner` clears shared-pool residency; `All` clears both domains.
-/// A `Worker` clear never crosses into `CacheOwner`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ClearScope {
-    Worker,
-    CacheOwner,
-    All,
 }
 
 /// Stable, bounded reasons for source recovery events.
@@ -268,24 +234,6 @@ mod tests {
         for medium in ["external", "pool", "shared", "nonsense", "MOONCAKE"] {
             assert_eq!(StorageTier::from_medium(Some(medium)), None, "{medium}");
         }
-    }
-
-    #[test]
-    fn locality_and_domain_derived_from_owner() {
-        let w = ResidencyOwner::Worker {
-            source: Arc::from("w"),
-            dp_rank: 0,
-            incarnation: 0,
-        };
-        let p = ResidencyOwner::CacheOwner {
-            pool_id: Arc::from("p"),
-            source: Arc::from("w"),
-            dp_rank: 0,
-        };
-        assert_eq!(w.locality(), Locality::Local);
-        assert_eq!(p.locality(), Locality::Remote);
-        assert_eq!(w.domain(), ClearScope::Worker);
-        assert_eq!(p.domain(), ClearScope::CacheOwner);
     }
 
     #[test]

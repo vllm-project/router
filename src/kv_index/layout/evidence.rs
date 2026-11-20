@@ -4,7 +4,7 @@ use super::{align_down, restore::restore_boundary, CacheGroup, GroupEvidence, Gr
 use crate::kv_index::{
     storage::PageTiers,
     types::{TierBits, TierMatch},
-    Locality, RoutableTarget, StorageTier,
+    RoutableTarget, StorageTier,
 };
 
 /// Preserve the full-attention policy's per-tier segments, including gaps and
@@ -96,7 +96,6 @@ pub(in crate::kv_index) fn full_attention_matches(
         .map(|(tier, segments)| TierMatch {
             target: target.clone(),
             tier,
-            locality: Locality::Local,
             segments,
         })
         .collect()

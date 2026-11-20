@@ -135,7 +135,10 @@ fn parse_event_source_spec<'a>(spec: &'a str, flag: &str) -> ConfigResult<(&'a s
 
 impl StaticKvEventSources {
     pub(crate) fn validate(&self, worker: &str) -> ConfigResult<()> {
-        if worker.trim().is_empty() || self.model.trim().is_empty() {
+        if worker.trim().is_empty()
+            || (self.model.trim().is_empty()
+                && (self.hybrid.is_none() || !self.endpoints.is_empty()))
+        {
             return Err(ConfigError::ValidationFailed {
                 reason: "static KV event sources require worker URLs and model identity"
                     .to_string(),

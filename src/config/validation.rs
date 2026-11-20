@@ -972,7 +972,8 @@ impl ConfigValidator {
                             ),
                         });
                     }
-                    if sources.endpoints.is_empty() {
+                    let has_pairs = !sources.compatible_decode_urls.is_empty();
+                    if sources.endpoints.is_empty() && sources.hybrid.is_none() && !has_pairs {
                         return Err(ConfigError::IncompatibleConfig {
                             reason: format!("pd_kv_event_sources['{url}'] has no endpoints"),
                         });
@@ -982,64 +983,70 @@ impl ConfigValidator {
                             reason: format!("pd_kv_event_sources['{url}'] block_size must be > 0"),
                         });
                     }
-                    if let Some(layout) = &sources.hybrid {
-                        let invalid = |reason: &str| ConfigError::IncompatibleConfig {
-                            reason: format!("PD cache layout for '{url}': {reason}"),
-                        };
-                        let hybrid_layout = !layout
-                            .ranks
+                    let invalid = |reason: &str| ConfigError::IncompatibleConfig {
+                        reason: format!("PD cache layout for '{url}': {reason}"),
+                    };
+                    let hybrid_layout = sources
+                        .hybrid
+                        .as_ref()
+                        .is_some_and(|layout| !layout.is_plain_full_attention());
+                    if has_pairs && !prefill_kv {
+                        return Err(invalid(
+                            "compatible decode URLs require a KV-aware prefill worker",
+                        ));
+                    }
+                    if (hybrid_layout || has_pairs) && config.program_scheduling.is_some() {
+                        return Err(invalid(
+                            "hybrid PD sources do not support Program scheduling",
+                        ));
+                    }
+                    if hybrid_layout && prefill_keyed && !has_pairs {
+                        return Err(invalid("requires at least one compatible decode URL"));
+                    }
+                    if let Some(decode) = sources.compatible_decode_urls.iter().find(|url| {
+                        !decode_urls
                             .iter()
-                            .all(crate::kv_index::RankCapability::has_plain_full_attention_shape);
-                        let has_pairs = !sources.compatible_decode_urls.is_empty();
-                        if has_pairs && !prefill_kv {
-                            return Err(invalid(
-                                "compatible decode URLs require a KV-aware prefill worker",
-                            ));
+                            .any(|decode| base_url_without_rank(decode) == *url)
+                    }) {
+                        return Err(invalid(&format!(
+                            "decode URL '{decode}' is not a configured decode base URL"
+                        )));
+                    }
+                    if let Some(layout) = &sources.hybrid {
+                        if sources.endpoints.is_empty() {
+                            if sources.replay_endpoints.is_some() || layout.ranks.is_empty() {
+                                return Err(invalid("discovered publishers require a rank layout and no static replay endpoints"));
+                            }
+                        } else {
+                            let model = sources
+                                .model
+                                .as_deref()
+                                .filter(|model| !model.trim().is_empty())
+                                .ok_or_else(|| invalid("model must not be empty"))?;
+                            let replay = sources
+                                .replay_endpoints
+                                .as_ref()
+                                .filter(|endpoints| endpoints.len() == sources.endpoints.len())
+                                .ok_or_else(|| invalid("requires one replay endpoint per rank"))?;
+                            if layout.ranks.len() != sources.endpoints.len() {
+                                return Err(invalid(
+                                    "layout must declare one capability per endpoint",
+                                ));
+                            }
+                            for (rank, replay_endpoint) in replay.iter().enumerate() {
+                                layout
+                                    .validate_declared_source(rank as u32, model, replay_endpoint)
+                                    .map_err(|reason| ConfigError::IncompatibleConfig {
+                                        reason: format!(
+                                            "invalid PD layout for '{url}' rank {rank}: {reason}"
+                                        ),
+                                    })?;
+                            }
                         }
-                        if (hybrid_layout || has_pairs) && config.program_scheduling.is_some() {
-                            return Err(ConfigError::IncompatibleConfig {
-                                reason: "hybrid PD sources do not support Program scheduling"
-                                    .into(),
-                            });
-                        }
-                        let model = sources
-                            .model
-                            .as_deref()
-                            .filter(|model| !model.trim().is_empty())
-                            .ok_or_else(|| invalid("model must not be empty"))?;
-                        let replay = sources
-                            .replay_endpoints
-                            .as_ref()
-                            .filter(|endpoints| endpoints.len() == sources.endpoints.len())
-                            .ok_or_else(|| invalid("requires one replay endpoint per rank"))?;
-                        if hybrid_layout && prefill_keyed && !has_pairs {
-                            return Err(invalid("requires at least one compatible decode URL"));
-                        }
-                        if let Some(decode) = sources.compatible_decode_urls.iter().find(|url| {
-                            !decode_urls
-                                .iter()
-                                .any(|decode| base_url_without_rank(decode) == *url)
-                        }) {
-                            return Err(invalid(&format!(
-                                "decode URL '{decode}' is not a configured decode base URL"
-                            )));
-                        }
-                        if layout.ranks.len() != sources.endpoints.len() {
-                            return Err(invalid("layout must declare one capability per endpoint"));
-                        }
-                        for (rank, replay_endpoint) in replay.iter().enumerate() {
-                            layout
-                                .validate_declared_source(rank as u32, model, replay_endpoint)
-                                .map_err(|reason| ConfigError::IncompatibleConfig {
-                                    reason: format!(
-                                        "invalid PD layout for '{url}' rank {rank}: {reason}"
-                                    ),
-                                })?;
-                        }
-                    } else if !sources.compatible_decode_urls.is_empty() {
-                        return Err(ConfigError::IncompatibleConfig {
-                            reason: format!("PD source '{url}' declares compatible decode URLs without a hybrid layout"),
-                        });
+                    } else if has_pairs
+                        && (!sources.endpoints.is_empty() || sources.replay_endpoints.is_some())
+                    {
+                        return Err(invalid("static publishers require an explicit rank layout"));
                     }
                     for endpoint in sources
                         .endpoints

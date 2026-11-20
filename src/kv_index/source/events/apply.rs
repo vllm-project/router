@@ -1,14 +1,14 @@
 //! Prepare engine events before committing their native hashes.
 
 use crate::kv_hash::SequenceHash;
-use crate::kv_index::storage::source_transaction::StreamState as State;
+use crate::kv_index::storage::source_transaction::{StreamPhase, StreamState as State};
 use crate::kv_index::storage::{IndexBatch, PageChanges, PageWriteError};
 use crate::kv_index::wire::BlockStored;
 use crate::kv_index::{
     KVEvent, KVEventBatch, ResidencyOwner, SourceBinding, SourceError, StorageTier,
 };
 
-use super::validate::{publishes_int_hash, sequence_hash, validate_store};
+use super::validate::{publishes_int_hash, sequence_hash, validate_store, StoreValidationError};
 
 pub(super) enum PreparedEvent<'a> {
     Store {
@@ -125,26 +125,8 @@ impl SourceBinding {
         for event in &batch.events {
             match event {
                 KVEvent::BlockStored(store) => {
-                    match self.prepare_store(store) {
-                        Ok(Some(event)) => prepared.push(event),
-                        Ok(None) => {}
-                        Err(SourceError::InvalidBatch)
-                            if store
-                                .lora_name
-                                .as_deref()
-                                .is_some_and(|name| self.adapter_path(name).is_some()) =>
-                        {
-                            // A rejected Store contributes no evidence or copy count.
-                            // Keep the other stores and evictions in this sequence.
-                            tracing::warn!(
-                                source = %self.target.instance_id,
-                                rank = self.target.dp_rank,
-                                adapter = ?store.lora_name,
-                                group = ?store.group_idx,
-                                "ignoring malformed KV store for a declared adapter"
-                            );
-                        }
-                        Err(error) => return Err(error),
+                    if let Some(event) = self.prepare_store(store)? {
+                        prepared.push(event);
                     }
                 }
                 KVEvent::BlockRemoved(remove) => {
@@ -207,6 +189,7 @@ impl SourceBinding {
             Ok(prepared) => prepared,
             Err(error) => return Self::fail(state, tx, &self.owner, error),
         };
+        let mut proved_root = false;
         for event in prepared {
             if self.requires_root_proof && !state.root_verified {
                 if let PreparedEvent::Store { proves_root, .. } = &event {
@@ -216,6 +199,7 @@ impl SourceBinding {
                         continue;
                     }
                     state.root_verified = true;
+                    proved_root = true;
                     tracing::debug!(
                         source = %self.target.instance_id,
                         rank = self.target.dp_rank,
@@ -233,6 +217,10 @@ impl SourceBinding {
             }
         }
         state.next_seq = Some(seq + 1);
+        if proved_root && state.phase == StreamPhase::Live && !state.visible() {
+            tx.resume_source(&self.target.instance_id, self.target.dp_rank);
+            state.publish();
+        }
         Ok(())
     }
 
@@ -268,16 +256,26 @@ impl SourceBinding {
         if self.strict_event_block_size && store.block_size != group.block_size {
             return Err(SourceError::InvalidBatch);
         }
-        if !validate_store(
+        match validate_store(
             group,
             store,
             self.keys.block_size(),
             self.keys.lookahead_tokens(),
             self.partial_hash_hits,
-        )
-        .map_err(|()| SourceError::InvalidBatch)?
-        {
-            return Ok(None);
+        ) {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
+            Err(StoreValidationError::Packing) if namespace.is_some() => {
+                tracing::warn!(
+                    source = %self.target.instance_id,
+                    rank = self.target.dp_rank,
+                    adapter = ?namespace,
+                    group = group.group_idx,
+                    "ignoring malformed token packing in an adapter KV store"
+                );
+                return Ok(None);
+            }
+            Err(_) => return Err(SourceError::InvalidBatch),
         }
         let hashes = store
             .block_hashes

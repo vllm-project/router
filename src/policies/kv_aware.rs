@@ -837,7 +837,7 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
             .min(u32::MAX as usize) as u32,
     );
 
-    let mut best_continuation = (0_u32, 0.0_f64);
+    let mut best_continuation = 0.0_f64;
     for hit in candidate
         .matches
         .iter()
@@ -847,17 +847,12 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
             if start <= device_blocks && device_blocks < end {
                 let blocks = end - device_blocks;
                 let credit = params.transfer_credits.for_tier(hit.tier);
-                if blocks > best_continuation.0
-                    || (blocks == best_continuation.0 && credit > best_continuation.1)
-                {
-                    best_continuation = (blocks, credit);
-                }
+                best_continuation = best_continuation.max(f64::from(blocks) * credit);
             }
         }
     }
 
-    let credited_blocks =
-        f64::from(device_blocks) + f64::from(best_continuation.0) * best_continuation.1;
+    let credited_blocks = f64::from(device_blocks) + best_continuation;
     // External reuse may have a different alignment, but it cannot eliminate
     // the last-token logits work either.
     (credited_blocks * f64::from(params.block_size))
@@ -2096,8 +2091,7 @@ impl KvAwareOps for KvAwarePolicy {
                     // this request becomes an existing one. Multiplying by `n` here made
                     // a request cost more before admission than after, so the two sides of
                     // the comparison disagreed.
-                    additional =
-                        additional.saturating_add(context.saturating_sub(reused.max(0.0) as u64));
+                    additional = additional.saturating_add(context.saturating_sub(reused as u64));
                 }
                 DecodeWorkEstimate {
                     additional_tokens: Some(additional),
@@ -2387,7 +2381,7 @@ mod tests {
     use crate::kv_index::source::test_support::{
         event_batch, full_binding, full_binding_with_adapter, full_store, warm_full,
     };
-    use crate::kv_index::{KVEvent, Locality, SourceBinding};
+    use crate::kv_index::{KVEvent, SourceBinding};
     use crate::policies::RoundRobinPolicy;
 
     fn target(name: &str, rank: u32) -> RoutableTarget {
@@ -2459,7 +2453,6 @@ mod tests {
             target: target.clone(),
             tier,
             segments: segments.to_vec(),
-            locality: Locality::Local,
         }
     }
 
@@ -2964,7 +2957,7 @@ mod tests {
         let matches = vec![
             tier_match(&t, StorageTier::Device, &[(0, 5)]),
             tier_match(&t, StorageTier::HostPinned, &[(5, 9)]),
-            tier_match(&t, StorageTier::Disk, &[(5, 8)]),
+            tier_match(&t, StorageTier::Disk, &[(5, 10)]),
         ];
         let candidate = CandidateView {
             target: &t,

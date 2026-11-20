@@ -35,6 +35,7 @@ fn inferred_full_waits_for_root_evidence_after_a_replay_restart() {
 
     index.begin_replay(0);
     index.finish_replay(0).unwrap();
+    assert_eq!(index.control.generation(), 0);
     index.apply_batch(0, &suffix).unwrap();
     assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 0);
     index.apply_batch(1, &root).unwrap();
@@ -43,6 +44,7 @@ fn inferred_full_waits_for_root_evidence_after_a_replay_restart() {
     index.begin_replay(0);
     index.apply_batch(0, &suffix).unwrap();
     index.finish_replay(1).unwrap();
+    assert_eq!(index.control.generation(), 0);
     assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 0);
     index.apply_batch(1, &root).unwrap();
     assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 32);
@@ -1240,7 +1242,7 @@ fn malformed_adapter_store_preserves_base_credit_and_sequence() {
     let KVEvent::BlockStored(store) = &mut batch.events[0] else {
         panic!("expected store");
     };
-    store.group_idx = Some(u32::MAX);
+    store.token_ids.pop();
     assert_eq!(index.apply_batch(1, &batch), Ok(()));
     assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
     assert_eq!(
@@ -1255,6 +1257,12 @@ fn malformed_adapter_store_preserves_base_credit_and_sequence() {
         index.reusable_tokens_in(Some("lora1"), &prompt(), usize::MAX),
         528
     );
+    let KVEvent::BlockStored(store) = &mut batch.events[0] else {
+        panic!("expected store");
+    };
+    store.group_idx = Some(u32::MAX);
+    assert_eq!(index.apply_batch(3, &batch), Err(SourceError::InvalidBatch));
+    assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
 }
 
 #[test]

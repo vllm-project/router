@@ -293,11 +293,14 @@ impl SourceBinding {
         tx: &mut IndexBatch<'_>,
         expected_next_seq: u64,
     ) -> Result<(), SourceError> {
-        if state.visible() || state.next_seq != Some(expected_next_seq) {
+        if state.phase != StreamPhase::Replaying || state.next_seq != Some(expected_next_seq) {
             return Self::fail(state, tx, &self.owner, SourceError::Sequence);
         }
-        tx.resume_source(&self.target.instance_id, self.target.dp_rank);
-        state.publish();
+        if !self.requires_root_proof || state.root_verified {
+            tx.resume_source(&self.target.instance_id, self.target.dp_rank);
+            state.publish();
+        }
+        // Track subsequent sequences even if no root store has been seen yet.
         state.phase = StreamPhase::Live;
         Ok(())
     }
@@ -378,10 +381,9 @@ impl CacheCapabilities {
             .with_tail_drop_group(layout.tail_drop_group)
             .with_adapters(layout.adapters)
             .with_partial_hash_hits(layout.partial_hash_hits);
-        binding.strict_event_block_size =
-            self.rank_capability(source.dp_rank).is_some_and(|rank| {
-                rank.declared_groups == Some(1) && rank.has_plain_full_attention_shape()
-            });
+        binding.strict_event_block_size = self
+            .rank_capability(source.dp_rank)
+            .is_some_and(|rank| rank.has_plain_full_attention_shape());
         Ok(binding)
     }
 

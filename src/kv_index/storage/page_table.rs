@@ -1,7 +1,7 @@
 //! Hash-addressed page facts; reverse memberships live in the source transaction.
 
 use std::borrow::{Borrow, Cow};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -40,8 +40,6 @@ impl PageKey {
 
 impl Hash for PageKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Rehashing either index only needs the cached bucket hash. Equality
-        // still includes the complete digest and group.
         state.write_u32(self.fingerprint);
     }
 }
@@ -546,27 +544,48 @@ impl PageTable {
         if hashes.is_empty() {
             return Ok(());
         }
+        // The source gate keeps memberships stable until the whole store is applied.
+        let check_capacity = |keys: Option<&Pages>| {
+            let remaining = max_entries.saturating_sub(keys.map_or(0, Pages::len));
+            if hashes.len() > remaining {
+                let mut new = HashSet::<_, Fast>::default();
+                for hash in hashes {
+                    if keys.is_some_and(|keys| keys.contains_key(&PageKey::new(group, *hash))) {
+                        continue;
+                    }
+                    if remaining == 0 || (new.insert(hash) && new.len() > remaining) {
+                        return Err(PageWriteError::Capacity);
+                    }
+                }
+            }
+            Ok(())
+        };
         let pages = match active.entry_ref(owner) {
-            EntryRef::Occupied(entry) => entry.into_mut(),
-            EntryRef::Vacant(entry) => entry.insert_with_key(
-                Arc::new(owner.clone()),
-                OwnerPages {
-                    owner: Arc::new(PageOwner {
-                        // AtomicU64 retries CAS contention. Only ID exhaustion
-                        // rejects the owner allocation.
-                        id: self
-                            .next_owner
-                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-                                id.checked_add(1)
-                            })
-                            .map_err(|_| PageWriteError::Capacity)?,
-                        owner: owner.clone(),
-                    }),
-                    base: Pages::default(),
-                    named: Namespaces::default(),
-                    non_device_tiers: 0,
-                },
-            ),
+            EntryRef::Occupied(entry) => {
+                check_capacity(entry.get().pages(namespace))?;
+                entry.into_mut()
+            }
+            EntryRef::Vacant(entry) => {
+                check_capacity(None)?;
+                entry.insert_with_key(
+                    Arc::new(owner.clone()),
+                    OwnerPages {
+                        owner: Arc::new(PageOwner {
+                            // Only ID exhaustion rejects the owner allocation.
+                            id: self
+                                .next_owner
+                                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+                                    id.checked_add(1)
+                                })
+                                .map_err(|_| PageWriteError::Capacity)?,
+                            owner: owner.clone(),
+                        }),
+                        base: Pages::default(),
+                        named: Namespaces::default(),
+                        non_device_tiers: 0,
+                    },
+                )
+            }
         };
         let (namespace, keys) = match namespace {
             None => (None, &mut pages.base),
@@ -593,16 +612,12 @@ impl PageTable {
         };
         for &hash in hashes {
             let page = PageKey::new(group, hash);
-            let at_limit = keys.len() >= max_entries;
             match keys.entry_ref(&page) {
                 EntryRef::Occupied(member) => {
                     // This source keeps the row attached while its write gate is held.
                     observe_page(member.key())?;
                 }
                 EntryRef::Vacant(member) => {
-                    if at_limit {
-                        return Err(PageWriteError::Capacity);
-                    }
                     // Hold the directory entry until both the row and its membership exist.
                     let entry = self.rows.get_sync(&page).unwrap_or_else(|| {
                         self.rows
@@ -1107,6 +1122,51 @@ mod tests {
         });
         index.with_source_batch(&a.target(), |tx| {
             tx.remove_hash_pages(&a, 0, StorageTier::Device, &[hash], true)
+        });
+        assert!(index.hash_pages.rows.is_empty());
+    }
+
+    #[test]
+    fn an_over_capacity_store_leaves_memberships_and_replica_counts_unchanged() {
+        let index = KvBlockIndexer::new();
+        let worker = owner("worker");
+        let existing = [7; 32];
+        let admitted = [8; 32];
+        let rejected = [9; 32];
+        put(&index, &worker, 0);
+        index.with_source_batch(&worker.target(), |tx| {
+            assert_eq!(
+                tx.store_hash_pages(
+                    &worker,
+                    0,
+                    StorageTier::Device,
+                    None,
+                    &[existing, admitted, rejected],
+                    true,
+                    2,
+                ),
+                Err(PageWriteError::Capacity)
+            );
+            tx.remove_hash_pages(&worker, 0, StorageTier::Device, &[existing], true);
+        });
+        assert!(index.hash_pages.rows.is_empty());
+
+        index.with_source_batch(&worker.target(), |tx| {
+            tx.store_hash_pages(
+                &worker,
+                0,
+                StorageTier::Device,
+                None,
+                &[admitted; 2],
+                true,
+                1,
+            )
+            .unwrap();
+            tx.remove_hash_pages(&worker, 0, StorageTier::Device, &[admitted], true);
+        });
+        assert!(!index.hash_pages.rows.is_empty());
+        index.with_source_batch(&worker.target(), |tx| {
+            tx.remove_hash_pages(&worker, 0, StorageTier::Device, &[admitted], true);
         });
         assert!(index.hash_pages.rows.is_empty());
     }

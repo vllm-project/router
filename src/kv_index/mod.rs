@@ -38,10 +38,7 @@ pub use source::events::event_stream::{
 };
 pub use source::SourceError;
 pub use storage::KvBlockIndexer;
-pub use types::{
-    CacheOwnerId, ClearScope, Locality, ResidencyOwner, RoutableTarget, SourceId, StorageTier,
-    TierMatch,
-};
+pub use types::{CacheOwnerId, ResidencyOwner, RoutableTarget, SourceId, StorageTier, TierMatch};
 pub use wire::{AllBlocksCleared, BlockRemoved, BlockStored, KVEvent, KVEventBatch};
 
 // Compatibility export; the consumer owns the port and the index implements it.

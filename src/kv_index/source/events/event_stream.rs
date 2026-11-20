@@ -92,7 +92,7 @@ impl EventStream {
             if state.phase == Phase::Replaying {
                 return Ok(());
             }
-            if !state.visible() {
+            if state.phase != Phase::Live {
                 return Err(StreamError::Index(SourceError::Untrusted));
             }
             tx.suspend_source(&self.index.target.instance_id, self.index.target.dp_rank);
@@ -217,7 +217,7 @@ impl EventStream {
                     .publish_stream(state, tx, seq + 1)
                     .map_err(StreamError::Index)?;
             }
-            if state.phase == Phase::Live {
+            if state.visible() {
                 if cleared {
                     self.record_recovery(Reason::ClearBarrier);
                 } else if fresh {
@@ -252,7 +252,7 @@ impl EventStream {
                     state.phase = Phase::Replaying;
                     StreamError::Index(error)
                 })?;
-            if next_seq != 0 {
+            if next_seq != 0 && state.visible() {
                 self.record_recovery(reason);
             }
             Ok(())
@@ -490,6 +490,47 @@ mod tests {
             EventStream::new(Arc::new(index)).begin_replay(),
             Err(StreamError::Index(SourceError::Untrusted))
         );
+    }
+
+    #[test]
+    fn fresh_observation_stays_hidden_until_a_root_store_arrives() {
+        use crate::kv_index::source::test_support::{event_payload, full_binding, full_store};
+        use crate::kv_index::wire::ExternalBlockHash;
+
+        let index = Arc::new(
+            full_binding(
+                RoutableTarget {
+                    instance_id: Arc::from("worker"),
+                    dp_rank: 0,
+                },
+                16,
+            )
+            .require_root_proof(),
+        );
+        let stream = EventStream::new(index.clone());
+        let lease = stream.begin_replay().unwrap();
+        let tokens: Vec<_> = (0..33).collect();
+        let root = full_store(&tokens[..32], 16, None);
+        let mut suffix = root.clone();
+        suffix.parent_block_hash = Some(ExternalBlockHash::Bytes(vec![7; 32]));
+        stream
+            .observe_live(
+                lease,
+                20,
+                &event_payload(1.0, &[KVEvent::BlockStored(suffix)], Some(0)),
+            )
+            .unwrap();
+        assert_eq!(index.control.generation(), 0);
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 0);
+        stream
+            .apply_publisher_payload(
+                lease,
+                21,
+                &event_payload(2.0, &[KVEvent::BlockStored(root)], Some(0)),
+            )
+            .unwrap();
+        assert_ne!(index.control.generation(), 0);
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 32);
     }
 
     #[test]
