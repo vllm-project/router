@@ -167,3 +167,26 @@ pub struct ServerInfo {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub served_model_aliases: Vec<String>,
 }
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::ServerInfo;
+
+    #[test]
+    fn server_info_accepts_legacy_block_size_and_optional_kv_fields() {
+        for field in ["kv_block_size", "block_size"] {
+            let info: ServerInfo = serde_json::from_value(serde_json::json!({
+                "model_id": "m", (field): 16, "instance_id": "x", "data_parallel_size": 2
+            }))
+            .unwrap();
+            assert_eq!(info.model_id.as_deref(), Some("m"));
+            assert_eq!(info.instance_id.as_deref(), Some("x"));
+            assert_eq!(info.kv_block_size, Some(16));
+        }
+        assert_eq!(
+            serde_json::from_str::<ServerInfo>("{}").unwrap(),
+            ServerInfo::default()
+        );
+    }
+}

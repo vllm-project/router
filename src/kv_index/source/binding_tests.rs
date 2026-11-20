@@ -773,22 +773,9 @@ fn host_store(
 }
 
 #[test]
-fn host_resident_pages_are_credited_at_their_tier() {
+fn evicting_the_device_copy_keeps_the_host_credit() {
     use crate::policies::TieredMatchProvider;
 
-    let index = fresh_index(16);
-    assert_eq!(
-        index.apply_batch(0, &host_store(&qwen_batch(), "CPU")),
-        Ok(())
-    );
-    assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
-    let matches = index.matches(&prompt(), 528, None, 0);
-    assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].tier, crate::kv_index::StorageTier::HostPinned);
-}
-
-#[test]
-fn evicting_the_device_copy_keeps_the_host_credit() {
     let index = fresh_index(16);
     assert_eq!(index.apply_batch(0, &qwen_batch()), Ok(()));
     assert_eq!(
@@ -804,6 +791,9 @@ fn evicting_the_device_copy_keeps_the_host_credit() {
     }
     assert_eq!(index.apply_batch(2, &removed), Ok(()));
     assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+    let matches = index.matches(&prompt(), 528, None, 0);
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].tier, crate::kv_index::StorageTier::HostPinned);
 }
 
 #[test]

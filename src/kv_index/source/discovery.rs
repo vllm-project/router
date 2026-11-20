@@ -500,6 +500,7 @@ impl KvIndexSupervisor {
                     )
                 }
             },);
+        discovery.base_models = base_models;
         let Ok(sources) = sources else {
             discovery.sources = sources;
             return discovery;
@@ -519,7 +520,6 @@ impl KvIndexSupervisor {
             info.model_id = Some(model.clone());
         }
         discovery.model_id = Ok(Some(model.clone()));
-        discovery.base_models = base_models;
         if let Some(layout) = &mut discovery.hybrid {
             for rank in &mut layout.ranks {
                 if rank.model.trim().is_empty() {
@@ -864,32 +864,16 @@ fn native_worker_discovery(
 ) -> WorkerDiscovery {
     let (hybrid, assumed_plain_full) = match (&server_info, &sources, &model_id, layout) {
         (Ok(info), Ok(sources), Ok(Some(model)), Ok(Some(layout))) => {
-            let engine_model = layout_model(info, model, &layout);
-            let plain = layout.is_plain_full_attention();
-            let mut active = sources.iter().filter(|(_, source)| events_enabled(source));
-            let mut topics = HashSet::new();
-            let matches = active.clone().count() == layout.ranks.len()
-                && active.all(|(key, source)| {
-                    key.parse::<u32>().ok().is_some_and(|rank| {
-                        key == &rank.to_string()
-                            && topics.insert(source.topic.as_str())
-                            && layout.rank_capability(rank).is_some_and(|capability| {
-                                !plain || capability.hash_block_size == discovered_block_size(info)
-                            })
-                            && layout
-                                .verify_layout(
-                                    rank,
-                                    Some(engine_model),
-                                    Some(&source.topic),
-                                    source.replay_endpoint.as_deref(),
-                                )
-                                .is_ok()
-                    })
-                });
-            if matches {
-                info!(worker_url, "using the worker's discovered KV cache layout");
+            match validate_native_publishers(&layout, sources, info, model) {
+                Ok(()) => {
+                    info!(worker_url, "using the worker's discovered KV cache layout");
+                    (Some(layout), false)
+                }
+                Err(reason) => {
+                    debug!(worker_url, %reason, "worker-reported KV layout rejected");
+                    (None, false)
+                }
             }
-            (matches.then_some(layout), false)
         }
         (Ok(info), Ok(sources), Ok(Some(model)), Ok(None)) => {
             let layout = synthesize_plain_full_layout(info, sources, model);
@@ -903,7 +887,20 @@ fn native_worker_discovery(
             (layout, assumed)
         }
         (_, _, _, Err(error)) => {
-            debug!(worker_url, %error, "worker cache capability is incompatible");
+            debug!(worker_url, reason = %error, "worker-reported KV layout rejected");
+            (None, false)
+        }
+        (_, _, _, Ok(Some(_))) => {
+            let reason = if let Err(error) = &server_info {
+                error.as_str()
+            } else if let Err(error) = &sources {
+                error.detail.as_str()
+            } else if let Err(error) = &model_id {
+                error.as_str()
+            } else {
+                "worker did not report a served model"
+            };
+            debug!(worker_url, %reason, "worker-reported KV layout rejected");
             (None, false)
         }
         _ => (None, false),
@@ -924,6 +921,48 @@ fn native_worker_discovery(
         hybrid,
         assumed_plain_full,
     }
+}
+
+fn validate_native_publishers(
+    layout: &CacheCapabilities,
+    sources: &KvEventSourcesResponse,
+    info: &ServerInfo,
+    model: &str,
+) -> Result<(), String> {
+    let active = sources.iter().filter(|(_, source)| events_enabled(source));
+    if active.clone().count() != layout.ranks.len() {
+        return Err(
+            "the reported layouts and enabled event sources have different rank counts".into(),
+        );
+    }
+    let engine_model = layout_model(info, model, layout);
+    let plain = layout.is_plain_full_attention();
+    let mut topics = HashSet::new();
+    for (key, source) in active {
+        let rejected = |reason| format!("DP rank {key}: {reason}");
+        let rank = key
+            .parse::<u32>()
+            .ok()
+            .filter(|rank| key == &rank.to_string())
+            .ok_or_else(|| rejected("invalid event source rank"))?;
+        if !topics.insert(source.topic.as_str()) {
+            return Err(rejected("event topic is shared by multiple ranks"));
+        }
+        let verified = layout
+            .verify_layout(
+                rank,
+                Some(engine_model),
+                Some(&source.topic),
+                source.replay_endpoint.as_deref(),
+            )
+            .map_err(rejected)?;
+        if plain && Some(verified.hash_block_size) != discovered_block_size(info) {
+            return Err(rejected(
+                "layout hash block size differs from worker metadata",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Omitting a layout declares ordinary single-group attention. Root and block

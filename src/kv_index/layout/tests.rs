@@ -802,6 +802,17 @@ mod declarations {
         }]});
         assert!(bind_layout(&value, "kv-events").is_ok());
 
+        let ratio = value["ranks"][0]["groups"][4]
+            .as_object_mut()
+            .unwrap()
+            .remove("tokens_per_state")
+            .unwrap();
+        assert!(matches!(
+            bind_layout(&value, "kv-events"),
+            Err("sparse MLA group must declare tokens_per_state")
+        ));
+        value["ranks"][0]["groups"][4]["tokens_per_state"] = ratio;
+
         for (path, invalid) in [(4, serde_json::json!("3")), (4, serde_json::json!("field"))] {
             let saved = value["ranks"][0]["groups"][path]["tokens_per_state"].clone();
             value["ranks"][0]["groups"][path]["tokens_per_state"] = invalid;

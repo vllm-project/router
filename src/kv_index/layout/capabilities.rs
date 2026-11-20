@@ -192,15 +192,14 @@ impl CacheCapabilities {
         if topic.is_none_or(str::is_empty) {
             return Err("invalid capability or source binding");
         }
-        if rank.model.is_empty()
-            || rank.weight_version.is_empty()
-            || !rank.instance_topic
-            || observed_topic.is_some_and(|observed| topic != Some(observed))
-            || rank.hash_algorithm != "sha256_cbor"
-            || !rank.full_hashes
-            || !rank.prefix_caching
-        {
-            return Err("unsupported engine identity or hash contract");
+        if rank.model.is_empty() || rank.weight_version.is_empty() {
+            return Err("missing engine model or weight version");
+        }
+        if !rank.instance_topic || observed_topic.is_some_and(|observed| topic != Some(observed)) {
+            return Err("layout publisher topic does not identify the observed worker instance");
+        }
+        if rank.hash_algorithm != "sha256_cbor" || !rank.full_hashes || !rank.prefix_caching {
+            return Err("KV layout requires prefix caching and full-width sha256_cbor hashes");
         }
         let tail_drop_groups = rank.tail_drop_groups.as_deref().unwrap_or_default();
         if (rank.speculative_tokens == 0 && rank.hash_lookahead_tokens != 0)
@@ -291,8 +290,6 @@ impl CacheCapabilities {
                             .is_none_or(|role| role == "sparse") =>
                 {
                     // A compressed group names the tokens one state covers.
-                    // Without that declaration, restore from the root like a
-                    // full-attention block instead of rejecting the layout.
                     match group.tokens_per_state.as_deref() {
                         // Declared but malformed: the engine would not honor
                         // this shape, so the layout is refused.
@@ -303,7 +300,9 @@ impl CacheCapabilities {
                                 .ok_or("unsupported compressed attention group")?;
                             GroupRule::CompressedFullAttention { tokens_per_state }
                         }
-                        // No declaration: the page restores from the root.
+                        None if group.cache_role.as_deref() == Some("sparse") => {
+                            return Err("sparse MLA group must declare tokens_per_state");
+                        }
                         None => GroupRule::FullAttention,
                     }
                 }

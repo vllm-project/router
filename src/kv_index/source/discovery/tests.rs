@@ -296,24 +296,6 @@ fn grpc_model_id_preserves_errors_and_rejects_empty_ids() {
 }
 
 #[test]
-fn server_info_parses_kv_fields_and_aliases() {
-    let s: ServerInfo = serde_json::from_str(
-        r#"{"model_id":"m","kv_block_size":16,"instance_id":"x","data_parallel_size":2}"#,
-    )
-    .unwrap();
-    assert_eq!(s.model_id.as_deref(), Some("m"));
-    assert_eq!(s.kv_block_size, Some(16));
-    assert_eq!(s.instance_id.as_deref(), Some("x"));
-    // `data_parallel_size` is tolerated but unused; rank comes from /kv_event_sources.
-    // block_size alias.
-    let s: ServerInfo = serde_json::from_str(r#"{"block_size":32}"#).unwrap();
-    assert_eq!(s.kv_block_size, Some(32));
-    // empty body → defaults, no error.
-    let s: ServerInfo = serde_json::from_str("{}").unwrap();
-    assert!(s.kv_block_size.is_none());
-}
-
-#[test]
 fn zero_block_size_is_treated_as_missing() {
     for (configured, effective, expected) in [
         (8, 16, Some(16)),
@@ -469,6 +451,37 @@ async fn source_boundary_worker_with_routes(
     let worker = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (worker, task)
+}
+
+#[test]
+fn native_layout_rejection_identifies_the_rank_and_reason() {
+    let layout = plain_full_layout("model", "boot-1", 16);
+    let info = ServerInfo {
+        kv_block_size: Some(32),
+        ..Default::default()
+    };
+    let mut sources = HashMap::from([(
+        "0".to_owned(),
+        KvEventSourceEntry {
+            endpoint: "tcp://127.0.0.1:5557".into(),
+            replay_endpoint: Some("tcp://127.0.0.1:5558".into()),
+            publisher: Some("zmq".into()),
+            topic: "boot-1".into(),
+            ..Default::default()
+        },
+    )]);
+    assert_eq!(
+        validate_native_publishers(&layout, &sources, &info, "model"),
+        Err("DP rank 0: layout hash block size differs from worker metadata".into())
+    );
+    sources.get_mut("0").unwrap().topic = "boot-2".into();
+    assert_eq!(
+        validate_native_publishers(&layout, &sources, &info, "model"),
+        Err(
+            "DP rank 0: layout publisher topic does not identify the observed worker instance"
+                .into()
+        )
+    );
 }
 
 #[tokio::test]

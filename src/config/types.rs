@@ -211,10 +211,14 @@ impl Default for PredictionProfileConfig {
 pub struct PdProgramSchedulingConfig {
     /// Event residency is advisory and never authorizes a warm transfer.
     pub kv_events: bool,
-    /// Compatibility field for existing Program scheduling configurations.
+    /// Accept old Program scheduling configurations without retaining the obsolete value.
     #[doc(hidden)]
-    #[serde(skip_serializing)]
-    pub kv_hash_mode: String,
+    #[serde(
+        rename = "kv_hash_mode",
+        skip_serializing,
+        deserialize_with = "discard_kv_hash_mode"
+    )]
+    pub _legacy_kv_hash_mode: (),
     pub max_prefill_requests_per_target: usize,
     /// Only bounded explicit TTL is supported; otherwise Acting TTL is zero.
     pub explicit_ttl: bool,
@@ -284,11 +288,15 @@ pub struct PdProgramSchedulingConfig {
     pub calibration: Option<crate::program_scheduling::pd_cost::PdCalibration>,
 }
 
+fn discard_kv_hash_mode<'de, D: Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer).map(drop)
+}
+
 impl Default for PdProgramSchedulingConfig {
     fn default() -> Self {
         Self {
             kv_events: false,
-            kv_hash_mode: "sha256".to_string(),
+            _legacy_kv_hash_mode: (),
             max_prefill_requests_per_target: 1,
             explicit_ttl: false,
             exclusive_capacity_accounting: true,

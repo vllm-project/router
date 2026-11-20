@@ -131,9 +131,8 @@ pub(super) fn validate_store(
 
 pub(in crate::kv_index) fn event_kind_matches(kind: GroupRule, store: &BlockStored) -> bool {
     let spec = store.kv_cache_spec_kind.as_deref();
-    // Both forms of MLA publish the same wire kind. The verified layout
-    // declares compression; absent that declaration, MLA uses the
-    // root-contiguous FullAttention restore rule.
+    // Both forms of MLA publish the same wire kind. Compression is
+    // determined by the verified cache-group layout.
     match kind {
         GroupRule::FullAttention => {
             matches!(spec, Some("full_attention") | Some("mla_attention"))

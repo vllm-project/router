@@ -943,7 +943,7 @@ Both worker transports accept `/v1/chat/completions` through the Router. On gRPC
 
 ## Versions
 
-Use the same vLLM release for the engine and its gRPC frontend. In all versions below, gRPC discovers live and replay addresses through `GetKvEventSources`. The table covers the engine and event protocol. The Router's local gRPC chat renderer uses `vllm-chat` from vLLM 0.30.0. Check [gRPC API capabilities](../backend/grpc.md#api-compatibility) for model-specific rendering and output features.
+Pair the gRPC worker's `vllm-rs` and Python engine from the same release. The table covers worker KV event discovery and layout support.
 
 | vLLM release | HTTP event discovery | Layout support | vLLM Ascend pairing |
 | --- | --- | --- | --- |
@@ -952,6 +952,8 @@ Use the same vLLM release for the engine and its gRPC frontend. In all versions 
 | [0.33.0](https://github.com/vllm-project/vllm/tree/v0.33.0) | `/kv_event_sources` | Adds nonzero hash lookahead via `BlockStored.lookahead_token_ids`. The GPU recipes use this release. | Use an Ascend build compatible with vLLM 0.33. |
 | [0.34.0](https://github.com/vllm-project/vllm/tree/v0.34.0) | `/kv_event_sources` | Defaults to 64-token blocks when the backend has no preferred size. Use the actual block size in an explicit layout. | Use an Ascend build compatible with vLLM 0.34. |
 
+All listed gRPC worker releases discover live and replay addresses through `GetKvEventSources`. For chat routed to gRPC workers, the Router renders locally using `vllm-chat` pinned to vLLM 0.30.0. Model-specific rendering and output features follow the [Router's gRPC API compatibility](../backend/grpc.md#api-compatibility).
+
 ## CLI options
 
 See [worker and KV event options](../cli_reference.md#workers-and-backend), [routing policy options](../cli_reference.md#routing-policies), and [P/D disaggregation options](../cli_reference.md#prefilldecode-disaggregation) for value types and defaults.
@@ -959,6 +961,7 @@ See [worker and KV event options](../cli_reference.md#workers-and-backend), [rou
 ## Troubleshooting
 
 - If the engine reports hits and the Router does not, check the layout's model and topic, the hash flags, and whether both event ports are reachable from the Router.
+- If a worker-reported layout is rejected, run the Router with `--log-level debug` and look for `worker-reported KV layout rejected` to see the reason.
 - For `unsupported tail-drop layout`, check the worker's [MTP recipe](#qwen38-27b-with-mtp).
 - If vLLM reports `Address already in use`, check the live and replay port ranges before starting it again. Inspect the actual event addresses in `/kv_event_sources` for HTTP or `Control.GetKvEventSources` for gRPC.
 - When a worker restarts, rerun the worker settings for a fresh topic. Update the layout only if it explicitly pins the topic or other layout fields changed. On a Router-only restart, replay recovers the events still in the worker's history.
