@@ -316,14 +316,14 @@ impl ProgramScheduler {
             let used = self.target_usage(&state, target_id, now).round().max(0.0) as usize;
             let capacity = self.config.progress_ttl.token_capacity;
             let vllm_usage_scaled_tokens = observation
-                .and_then(|value| value.kv_cache_usage)
+                .and_then(|value| value.backend.kv_cache_usage)
                 .zip(capacity)
                 .map(|(ratio, tokens)| (ratio * tokens as f64).round() as usize);
             let observed_active_reasoning_tokens = observation
-                .and_then(|value| value.estimated_active_reasoning_tokens)
+                .and_then(|value| value.accounting.estimated_active_reasoning_tokens)
                 .map(|tokens| tokens.round().max(0.0) as usize);
             let observed_active_program_tokens = observation
-                .and_then(|value| value.estimated_active_program_tokens)
+                .and_then(|value| value.accounting.estimated_active_program_tokens)
                 .map(|tokens| tokens.round().max(0.0) as usize);
             let active_acting_private_tokens = programs
                 .iter()
@@ -388,7 +388,7 @@ impl ProgramScheduler {
                 dp_rank: target.dp_rank,
                 configured_token_capacity: capacity,
                 effective_token_capacity: self.target_capacity(&state, target_id, now),
-                token_capacity_source: if self.tree_dp_mode()
+                token_capacity_source: if self.kv_dp_mode()
                     && self.capacity_ready(&state, target_id, now)
                 {
                     "vllm_usage_plus_reservations_tree_dp"
@@ -400,17 +400,17 @@ impl ProgramScheduler {
                     "backend_unavailable"
                 },
                 backend_usable_token_capacity: observation
-                    .and_then(|o| o.backend_usable_token_capacity),
+                    .and_then(|o| o.backend.backend_usable_token_capacity),
                 backend_reference_token_capacity: observation
-                    .and_then(|o| o.backend_token_capacity),
+                    .and_then(|o| o.backend.backend_token_capacity),
                 backend_available_tokens_at_observation: observation
-                    .and_then(|o| o.backend_available_tokens),
+                    .and_then(|o| o.backend.backend_available_tokens),
                 dynamic_admission_headroom_tokens: self
                     .config
                     .dynamic_token_capacity
                     .then(|| self.dynamic_headroom(&state, target_id, now))
                     .flatten(),
-                router_reasoning_reserved_tokens: if self.tree_dp_mode() {
+                router_reasoning_reserved_tokens: if self.kv_dp_mode() {
                     self.tree_dp_used(&state, target_id) as f64
                 } else {
                     self.reasoning_reservations(&state, target_id)
@@ -428,11 +428,11 @@ impl ProgramScheduler {
                     .map(|program| program.in_flight_requests)
                     .sum(),
                 observed_router_active_reasoning_programs: observation
-                    .map(|value| value.router_active_reasoning_programs),
+                    .map(|value| value.accounting.router_active_reasoning_programs),
                 observed_router_active_reasoning_requests: observation
-                    .map(|value| value.router_active_reasoning_requests),
+                    .map(|value| value.accounting.router_active_reasoning_requests),
                 active_program_token_delta_since_observation: observation
-                    .map(|value| value.active_program_token_delta),
+                    .map(|value| value.accounting.active_program_token_delta),
                 future_pause_relief_tokens,
                 active_acting_private_tokens,
                 router_minus_vllm_used_tokens: vllm_usage_scaled_tokens.map(|native| {
@@ -457,11 +457,12 @@ impl ProgramScheduler {
                     .iter()
                     .map(|program| program.waiting_requests)
                     .sum(),
-                vllm_kv_cache_usage: observation.and_then(|value| value.kv_cache_usage),
-                vllm_running_requests: observation.and_then(|value| value.running_requests),
-                vllm_waiting_requests: observation.and_then(|value| value.waiting_requests),
+                vllm_kv_cache_usage: observation.and_then(|value| value.backend.kv_cache_usage),
+                vllm_running_requests: observation.and_then(|value| value.backend.running_requests),
+                vllm_waiting_requests: observation.and_then(|value| value.backend.waiting_requests),
                 observation_age_seconds: observation.and_then(|value| {
                     value
+                        .backend
                         .observed_at
                         .map(|at| now.saturating_duration_since(at).as_secs_f64())
                 }),
@@ -585,8 +586,9 @@ mod tests {
         {
             let mut state = scheduler.state.lock();
             let observation = state.observations.get_mut(&target.id).unwrap();
-            observation.observed_at = Some(Instant::now() - std::time::Duration::from_secs(4));
-            observation.estimated_active_program_tokens = Some(250.0);
+            observation.backend.observed_at =
+                Some(Instant::now() - std::time::Duration::from_secs(4));
+            observation.accounting.estimated_active_program_tokens = Some(250.0);
         }
 
         let snapshot = scheduler.diagnostics();

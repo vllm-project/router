@@ -20,52 +20,26 @@ impl ProgramScheduler {
         for model_pool in model_pools {
             loop {
                 let queued = self.global_local_resume_order(state, &model_pool, now);
-                let admissible = queued.into_iter().filter_map(|program| {
+                let Some((program, target_id, plan)) = queued.into_iter().find_map(|program| {
                     let target_id = state.decisions.get(&program)?.last_target.clone()?;
                     self.rank_admission_plan(state, &program, &target_id, now)
                         .map(|plan| (program, target_id, plan))
-                });
-                let selected = self.select_resume_admissions(state, admissible, now);
-                let mut committed = false;
-                for (program, target_id, _) in selected {
-                    if let Some(plan) = self.rank_admission_plan(state, &program, &target_id, now) {
-                        committed |= self.commit_admission(state, &program, &target_id, plan, now);
-                    }
-                }
-                if !committed {
+                }) else {
                     break;
-                }
+                };
+                self.commit_admission(state, &program, &target_id, plan, now);
                 changed = true;
             }
 
             loop {
                 let queued = self.global_cross_rank_order(state, &model_pool, now);
-                let admissible = queued.into_iter().flat_map(|program| {
-                    let candidates = if self.config.resume_order == super::ProgramResumeOrder::Dp {
-                        self.cross_rank_admissions(state, &program, now)
-                    } else {
-                        self.select_cross_rank_admission(state, &program, now)
-                            .into_iter()
-                            .collect()
-                    };
-                    candidates
-                        .into_iter()
-                        .map(move |(target, plan)| (program.clone(), target, plan))
-                });
-                let selected = self.select_resume_admissions(state, admissible, now);
-                let mut committed = false;
-                for (program, target_id, _) in selected {
-                    if let Some((_, plan)) = self
-                        .cross_rank_admissions(state, &program, now)
-                        .into_iter()
-                        .find(|(target, _)| target == &target_id)
-                    {
-                        committed |= self.commit_admission(state, &program, &target_id, plan, now);
-                    }
-                }
-                if !committed {
+                let Some((program, target_id, plan)) = queued.into_iter().find_map(|program| {
+                    self.select_cross_rank_admission(state, &program, now)
+                        .map(|(target, plan)| (program, target, plan))
+                }) else {
                     break;
-                }
+                };
+                self.commit_admission(state, &program, &target_id, plan, now);
                 changed = true;
             }
         }
@@ -173,7 +147,7 @@ impl ProgramScheduler {
                     .observations
                     .get(target_id)
                     .filter(|observation| self.observation_is_fresh(observation, now))
-                    .and_then(|observation| observation.waiting_requests)
+                    .and_then(|observation| observation.backend.waiting_requests)
                     .unwrap_or(0)
             };
             let pressure = |target_id: &str, plan: &RankAdmissionPlan| {
@@ -266,7 +240,7 @@ impl ProgramScheduler {
         let backend_waiting = source
             .and_then(|target| state.observations.get(target))
             .filter(|observation| self.observation_is_fresh(observation, now))
-            .and_then(|observation| observation.waiting_requests)
+            .and_then(|observation| observation.backend.waiting_requests)
             .is_some_and(|waiting| waiting >= threshold);
         backend_waiting || self.higher_priority_source_waiters(state, program, now) >= 1
     }

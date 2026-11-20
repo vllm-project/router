@@ -270,7 +270,9 @@ impl ProgramScheduler {
                 let ledger_checkpoint = state
                     .observations
                     .get(&target.id)
-                    .map_or(0.0, |observation| observation.active_program_token_delta);
+                    .map_or(0.0, |observation| {
+                        observation.accounting.active_program_token_delta
+                    });
                 (
                     target.id.clone(),
                     ObservationCheckpoint {
@@ -278,7 +280,7 @@ impl ProgramScheduler {
                         debit_checkpoint: state
                             .observations
                             .get(&target.id)
-                            .map_or(0.0, |o| o.admitted_token_debits),
+                            .map_or(0.0, |o| o.accounting.admitted_token_debits),
                         ..ObservationCheckpoint::default()
                     },
                 )
@@ -345,7 +347,7 @@ impl ProgramScheduler {
             if state
                 .observations
                 .get(&target_id)
-                .and_then(|o| o.observed_at)
+                .and_then(|o| o.backend.observed_at)
                 .is_some_and(|previous| raw.observed_at <= previous)
             {
                 continue;
@@ -360,6 +362,10 @@ impl ProgramScheduler {
                 .map(|((capacity, blocks), usage)| {
                     // vLLM's usage denominator excludes the reserved null block,
                     // whereas its reference token capacity uses the full pool.
+                    // This is reference-token headroom, not an exact allocation
+                    // oracle for hybrid KV layouts: cache groups, sliding-window
+                    // reclamation and state allocation make candidate block cost
+                    // depend on the request, not only its logical token count.
                     ((1.0 - usage) * capacity as f64 * (blocks - 1) as f64 / blocks as f64).floor()
                 });
             let native_used_tokens = raw
@@ -380,27 +386,31 @@ impl ProgramScheduler {
             let estimated_active_program_tokens = estimated_reasoning_tokens
                 .map(|reasoning| reasoning + checkpoint.active_acting_private_tokens);
             let observation = state.observations.entry(target_id.clone()).or_default();
-            observation.active_program_token_delta -= checkpoint.ledger_checkpoint;
-            observation.admitted_token_debits =
-                (observation.admitted_token_debits - checkpoint.debit_checkpoint).max(0.0);
-            observation.backend_token_capacity = raw.token_capacity;
-            observation.backend_usable_token_capacity = raw
+            observation.accounting.active_program_token_delta -= checkpoint.ledger_checkpoint;
+            observation.accounting.admitted_token_debits =
+                (observation.accounting.admitted_token_debits - checkpoint.debit_checkpoint)
+                    .max(0.0);
+            observation.backend.backend_token_capacity = raw.token_capacity;
+            observation.backend.backend_usable_token_capacity = raw
                 .token_capacity
                 .zip(raw.num_gpu_blocks)
                 .filter(|(capacity, blocks)| *capacity > 0 && *blocks > 1)
                 .map(|(capacity, blocks)| {
                     ((capacity as u128 * (blocks - 1) as u128) / blocks as u128) as usize
                 });
-            observation.backend_available_tokens = backend_available_tokens;
-            observation.kv_cache_usage = raw.kv_cache_usage;
-            observation.running_requests = raw.running_requests;
-            observation.waiting_requests = raw.waiting_requests;
-            observation.router_active_reasoning_programs = checkpoint.active_reasoning_programs;
-            observation.router_active_reasoning_requests = checkpoint.active_reasoning_requests;
-            observation.estimated_active_reasoning_tokens = estimated_reasoning_tokens;
-            observation.estimated_active_program_tokens = estimated_active_program_tokens;
-            observation.observed_at = Some(raw.observed_at);
-            let active_program_token_delta = observation.active_program_token_delta;
+            observation.backend.backend_available_tokens = backend_available_tokens;
+            observation.backend.kv_cache_usage = raw.kv_cache_usage;
+            observation.backend.running_requests = raw.running_requests;
+            observation.backend.waiting_requests = raw.waiting_requests;
+            observation.accounting.router_active_reasoning_programs =
+                checkpoint.active_reasoning_programs;
+            observation.accounting.router_active_reasoning_requests =
+                checkpoint.active_reasoning_requests;
+            observation.accounting.estimated_active_reasoning_tokens = estimated_reasoning_tokens;
+            observation.accounting.estimated_active_program_tokens =
+                estimated_active_program_tokens;
+            observation.backend.observed_at = Some(raw.observed_at);
+            let active_program_token_delta = observation.accounting.active_program_token_delta;
             let estimated_total_tokens = self.target_usage(&state, &target_id, raw.observed_at);
             debug!(
                 event = "capacity_observation",
@@ -578,7 +588,7 @@ impl ProgramScheduler {
         observation: &RankObservationState,
         now: Instant,
     ) -> bool {
-        observation.observed_at.is_some_and(|observed_at| {
+        observation.backend.observed_at.is_some_and(|observed_at| {
             now.saturating_duration_since(observed_at)
                 <= self.config.metrics_interval.saturating_mul(3)
         })
@@ -592,18 +602,18 @@ impl ProgramScheduler {
         if self.config.dynamic_token_capacity {
             return if observation.is_some_and(|o| {
                 self.observation_is_fresh(o, now)
-                    && if self.tree_dp_mode() {
-                        o.backend_token_capacity.is_some_and(|c| c > 0)
-                            && o.backend_available_tokens.is_some_and(|free| {
+                    && if self.kv_dp_mode() {
+                        o.backend.backend_token_capacity.is_some_and(|c| c > 0)
+                            && o.backend.backend_available_tokens.is_some_and(|free| {
                                 free.is_finite()
                                     && free >= 0.0
-                                    && free <= o.backend_token_capacity.unwrap() as f64
+                                    && free <= o.backend.backend_token_capacity.unwrap() as f64
                             })
                     } else {
-                        o.backend_available_tokens.is_some()
+                        o.backend.backend_available_tokens.is_some()
                     }
             }) {
-                if self.tree_dp_mode() {
+                if self.kv_dp_mode() {
                     CapacityAccountingSource::BackendCacheConfigTreeDp
                 } else {
                     CapacityAccountingSource::BackendHeadroomEstimate
@@ -615,7 +625,7 @@ impl ProgramScheduler {
         let Some(observation) = observation else {
             return CapacityAccountingSource::RouterLedgerMissingObservation;
         };
-        let Some(observed_at) = observation.observed_at else {
+        let Some(observed_at) = observation.backend.observed_at else {
             return CapacityAccountingSource::RouterLedgerMissingObservation;
         };
         if now.saturating_duration_since(observed_at)
@@ -623,7 +633,11 @@ impl ProgramScheduler {
         {
             return CapacityAccountingSource::RouterLedgerStaleObservation;
         }
-        if observation.estimated_active_program_tokens.is_none() {
+        if observation
+            .accounting
+            .estimated_active_program_tokens
+            .is_none()
+        {
             return CapacityAccountingSource::RouterLedgerMissingTokenEstimate;
         }
         CapacityAccountingSource::BackendObservation
@@ -643,6 +657,7 @@ impl ProgramScheduler {
                 continue;
             }
             let observation_age_seconds = observation
+                .backend
                 .observed_at
                 .map(|observed_at| now.saturating_duration_since(observed_at).as_secs_f64());
             if matches!(
@@ -681,7 +696,7 @@ impl ProgramScheduler {
         target_id: &str,
         now: Instant,
     ) -> f64 {
-        if self.tree_dp_mode() {
+        if self.kv_dp_mode() {
             return self.tree_dp_accounted_used(state, target_id) as f64;
         }
         if self.config.dynamic_token_capacity {
@@ -716,8 +731,11 @@ impl ProgramScheduler {
             .filter(|observation| self.observation_is_fresh(observation, now))
             .and_then(|observation| {
                 observation
+                    .accounting
                     .estimated_active_program_tokens
-                    .map(|tokens| (tokens + observation.active_program_token_delta).max(0.0))
+                    .map(|tokens| {
+                        (tokens + observation.accounting.active_program_token_delta).max(0.0)
+                    })
             })
     }
 
@@ -727,8 +745,8 @@ impl ProgramScheduler {
         delta_tokens: f64,
     ) {
         let observation = state.observations.entry(target_id.to_string()).or_default();
-        observation.active_program_token_delta += delta_tokens;
-        observation.admitted_token_debits += delta_tokens.max(0.0);
+        observation.accounting.active_program_token_delta += delta_tokens;
+        observation.accounting.admitted_token_debits += delta_tokens.max(0.0);
     }
 }
 
@@ -863,7 +881,7 @@ mod tests {
             state
                 .observations
                 .get(&target.id)
-                .and_then(|observation| observation.kv_cache_usage),
+                .and_then(|observation| observation.backend.kv_cache_usage),
             None
         );
     }

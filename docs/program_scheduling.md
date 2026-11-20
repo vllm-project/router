@@ -89,7 +89,7 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 | `program_scheduling_enable_key` | `vllm_xargs.agentic_context` | Selects which identity inputs opt a request into Program scheduling. The default accepts only canonical `vllm_xargs.agentic_context`; `auto` additionally accepts the documented `agent_hint` and framework Header schemas. |
 | `binding_only` | `false` | Preserves Program identity and initial Program-to-Rank binding but bypasses RequestPool admission, Progress-TTL pause, and resume scheduling. This isolates the effect of Program affinity. |
 | `global_queue` | `false` | When `false`, a paused Program can resume only on its bound Rank. When `true`, resume first tries the previous Rank and may then select another Rank that passes the cross-Rank capacity gates. |
-| `resume_order` | `mru` | `mru` and `fcfs` retain native ordering; `dp` selects a subset subject to native admission; `dp_admission` lets DP decide admission directly. Both DP modes require `cache_aware` binding plus either explicit token capacity or `dynamic_token_capacity: true`. See the DP sections below. |
+| `resume_order` | `mru` | `mru` and `fcfs` retain native ordering; `dp_admission_tao` lets DP decide admission directly. TAO requires `cache_aware` binding plus either explicit token capacity or `dynamic_token_capacity: true`. See the DP sections below. |
 | `cross_rank_headroom_ratio` | `1.2` | Controls cross-Rank migration conservatism. A destination must have at least the source Rank's free capacity plus this multiple of the Program's complete estimated context. It has no effect when `global_queue` is `false`. |
 | `binding_strategy` | `consistent_hash` | Selects the initial home Rank for each new Program generation. Supported values are `consistent_hash`, `program_round_robin`, `least_program_count`, `reasoning_token_balance`, and `cache_aware`; it does not replace admission or resume decisions. |
 | `hash_virtual_nodes` | `160` | Sets the number of virtual nodes used by `consistent_hash` initial binding. It has no effect on the other binding strategies. |
@@ -165,10 +165,11 @@ Merge this into the existing Program scheduling configuration, retaining its
 configured `token_capacity_per_dp_rank`:
 
 ```json
-{"binding_strategy": "cache_aware", "resume_order": "dp_admission"}
+{"binding_strategy": "cache_aware", "resume_order": "dp_admission_tao"}
 ```
 
-This is a separate mode; `resume_order: "dp"` below is unchanged.
+The old native-prefiltered `resume_order: "dp"` mode has been removed.
+`resume_solver_strategy: "dp"` still selects the DP solver inside TAO admission.
 
 - **Candidates:** all live paused Programs with waiting requests. Native
   growth-reserve, batch-gain, low-watermark and backend-waiting-count tests do
@@ -203,7 +204,14 @@ It can do so even if native future-growth reserve would reject all three.
 
 This path replaces the fixed-binding direct-DP budget described above
 when `dynamic_token_capacity=true`, `binding_strategy="cache_aware"`,
-and `resume_order="dp_admission"`.
+and `resume_order="dp_admission_tao"` (`kv_dp_mode` internally).
+
+Overdue waiting requests are considered in earliest-deadline order. Each uses
+its best-value currently feasible backend without exceeding its token budget;
+an unplaceable overdue request does not block other work. The configured solver
+then selects ordinary admissions from the remaining budget. Deadline expiry is
+a scheduling priority, not a guarantee that an oversized request can be served.
+The fixed-binding TAO path applies the same deadline ordering on its bound targets.
 
 The backend's cache configuration still supplies total reference capacity C.
 The existing metrics converter supplies sampled free reference tokens F, with
@@ -239,44 +247,6 @@ The `tree_dp_admission` INFO event also records backend unavailable tokens,
 aggregate router reservations and the remaining budget after selection.
 TTL settings, shared-prefix observation updates, tree values/costs, quantum,
 solver/BFD and the MRU path are unchanged. Existing launch arguments work.
-
-### DP selection with native admission (aggregated HTTP only)
-
-Set `binding_strategy: "cache_aware"`, `resume_order: "dp"`, and the existing
-`token_capacity_per_dp_rank` to enable DP selection. For example, merge these
-fields into the deployment's existing Program scheduling JSON, keeping its
-measured capacity and other settings:
-
-```json
-{"binding_strategy": "cache_aware", "resume_order": "dp"}
-```
-
-DP queries the **same prefix tree** used for cache-aware binding. Its estimated
-cached-token value is the target's matched-character fraction times the
-Program's estimated context tokens, rounded down. This is a text-affinity
-estimate, not a physical KV-block inventory; querying it does not update the tree.
-
-For ordinary waiters within each native priority/yield tier, DP maximizes the sum of
-`(estimated_cached_tokens, context_tokens)` lexicographically under native
-immediate token and Program-count budgets. A Program is assigned at most once.
-The existing local-before-cross-rank order and cross-rank eligibility gates
-remain in force. The native admission check still owns growth reserve,
-batch-gain behavior. Forced resumes retain native ordered admission, including
-its existing capacity bypass. Each selected admission is rechecked before
-commit against current capacity and request state.
-Thus DP optimizes the snapshot's additive selection problem, not the nonlinear
-batch-gain model or a joint local/cross-rank placement problem.
-
-No new reserve, shared-prefix, decay, pause or capacity policy is introduced.
-Equal-value choices use native FCFS/program-ID order. The shared solver uses
-`dp_capacity_quantum`, optional `dp_state_budget`, and BFD on budget exhaustion;
-see [solver configuration](#solver-configuration).
-Omitting `resume_order: "dp"` preserves the default MRU behavior. PD
-disaggregation remains outside this feature.
-
-For an algorithm comparison, use the same aggregated backends, capacity,
-cache-aware binding, workload and concurrency, changing only `resume_order`
-between the native baseline and `dp`.
 
 ### Native ordering
 
@@ -372,8 +342,7 @@ The Rust metrics provider reads each worker's `/metrics` every
 sum ranks. Multiple models/duplicate series for the same rank are rejected as
 ambiguous. An unlabelled metric is rank 0 only, never broadcast across DP ranks.
 
-The mode examples are `examples/configs/program_dynamic_dp.json` and
-`program_dynamic_dp_admission.json`.
+See `examples/configs/program_dynamic_dp_admission.json`.
 
 ### What is measured, and what is estimated
 
@@ -398,9 +367,8 @@ effective_capacity = max(0, floor(current_router_active_private_tokens
 
 DP therefore gets a changing per-rank budget, rather than a user-supplied total.
 An overdraw remains visible as capacity pressure to the existing pause policy.
-The original admission watermarks/reserves still apply to DP-filter; direct DP
-continues to use the full available budget without those native
-admission filters. Each successful positive occupancy adjustment immediately
+Native MRU/FCFS retain their admission watermarks/reserves; TAO admission
+uses the full available budget without those native admission filters. Each successful positive occupancy adjustment immediately
 consumes the sampled budget. Logical pause/finish does **not** replenish that
 budget until a new backend scrape. A scrape begun before an admission preserves
 its intervening charge, using the existing observation-epoch fence.
@@ -459,7 +427,7 @@ Exhaustion recomputes from the full candidate set with best-fit decreasing on ra
 token costs, respecting allowed target options and slots; it no longer defers
 solely for state budget. The cap applies to each solver invocation.
 `resume_solver_strategy` is `dp` (default) or objective-ranked `greedy`. Use with
-`resume_order=dp`/`dp_admission`. `greedy` is a solver
+`resume_order=dp_admission_tao`. `greedy` is a solver
 choice, not a replacement for the lifecycle scheduling policy.
 Diagnostics expose all three fields.
 `program_resume` supplements `program_admit` for activations with a recorded

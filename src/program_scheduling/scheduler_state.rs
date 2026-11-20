@@ -21,10 +21,9 @@ pub enum ProgramResumeOrder {
     /// Prefer the Program that most recently completed a request.
     #[default]
     Mru,
-    /// Select a cache-value subset with DP, then apply native admission.
-    Dp,
     /// Let DP decide admission directly from waiting Programs and capacity.
-    DpAdmission,
+    #[serde(rename = "dp_admission_tao")]
+    DpAdmissionTAO,
 }
 
 /// Complete opt-in Program scheduler configuration.
@@ -293,24 +292,36 @@ impl ProgramDecisionState {
     }
 }
 
-/// Most recent raw backend observation plus Router epoch accounting.
+/// Most recent backend facts paired with Router accounting for that epoch.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RankObservationState {
+    pub(crate) backend: BackendCapacityObservation,
+    pub(crate) accounting: RouterCapacityAccounting,
+    pub(crate) reported_capacity_source: Option<CapacityAccountingSource>,
+}
+
+/// Backend-reported facts and reference-token conversions, without Router debits.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BackendCapacityObservation {
     pub(crate) backend_token_capacity: Option<usize>,
     pub(crate) backend_available_tokens: Option<f64>,
     pub(crate) backend_usable_token_capacity: Option<usize>,
-    // Monotonic charges between scrapes: logical pauses do not free physical KV.
-    pub(crate) admitted_token_debits: f64,
     pub(crate) kv_cache_usage: Option<f64>,
     pub(crate) running_requests: Option<usize>,
     pub(crate) waiting_requests: Option<usize>,
+    pub(crate) observed_at: Option<Instant>,
+}
+
+/// Router estimates and changes since the backend observation epoch began.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RouterCapacityAccounting {
+    // Monotonic charges between scrapes: logical pauses do not free physical KV.
+    pub(crate) admitted_token_debits: f64,
     pub(crate) router_active_reasoning_programs: usize,
     pub(crate) router_active_reasoning_requests: usize,
     pub(crate) estimated_active_reasoning_tokens: Option<f64>,
     pub(crate) estimated_active_program_tokens: Option<f64>,
-    pub(crate) observed_at: Option<Instant>,
     pub(crate) active_program_token_delta: f64,
-    pub(crate) reported_capacity_source: Option<CapacityAccountingSource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

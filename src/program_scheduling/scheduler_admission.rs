@@ -199,7 +199,7 @@ impl ProgramScheduler {
                     // Direct DP never forces an over-capacity admission. Once
                     // the priority deadline expires, wait for a notification or
                     // the queue deadline rather than spinning on a past timer.
-                    self.config.resume_order != ProgramResumeOrder::DpAdmission || *force > now
+                    self.config.resume_order != ProgramResumeOrder::DpAdmissionTAO || *force > now
                 })
                 .map_or(deadline, |force| force.min(deadline));
             if tokio::time::timeout(wake_at.saturating_duration_since(now), notified)
@@ -253,7 +253,7 @@ impl ProgramScheduler {
         {
             return None;
         }
-        if self.tree_dp_mode() && state.runtime.view(handle.program())?.in_flight_requests > 0 {
+        if self.kv_dp_mode() && state.runtime.view(handle.program())?.in_flight_requests > 0 {
             return None;
         }
         let target = state.runtime.placement(handle.program())?.to_string();
@@ -296,7 +296,7 @@ impl ProgramScheduler {
             return;
         }
         let after = state.runtime.view(handle.program());
-        if self.tree_dp_mode() && after.as_ref().is_some_and(|v| v.in_flight_requests == 0) {
+        if self.kv_dp_mode() && after.as_ref().is_some_and(|v| v.in_flight_requests == 0) {
             if let Some(d) = state.decisions.get_mut(handle.program()) {
                 d.tree_dp_reserved_tokens = None;
             }
@@ -373,22 +373,13 @@ impl ProgramScheduler {
                     .cloned()
                     .collect::<Vec<_>>();
                 self.order_resume_candidates(state, &mut queued, now);
-                let admissible = queued.into_iter().filter_map(|candidate| {
+                let Some((candidate, plan)) = queued.into_iter().find_map(|candidate| {
                     self.rank_admission_plan(state, &candidate, &target_id, now)
-                        .map(|plan| (candidate, target_id.clone(), plan))
-                });
-                let selected = self.select_resume_admissions(state, admissible, now);
-                let mut committed = false;
-                for (candidate, _, _) in selected {
-                    if let Some(plan) = self.rank_admission_plan(state, &candidate, &target_id, now)
-                    {
-                        committed |=
-                            self.commit_admission(state, &candidate, &target_id, plan, now);
-                    }
-                }
-                if !committed {
+                        .map(|plan| (candidate, plan))
+                }) else {
                     break;
-                }
+                };
+                self.commit_admission(state, &candidate, &target_id, plan, now);
                 changed = true;
             }
         }
@@ -396,10 +387,10 @@ impl ProgramScheduler {
     }
 
     pub(crate) fn schedule_waiting(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {
-        if self.tree_dp_mode() {
+        if self.kv_dp_mode() {
             return self.schedule_tree_dp(state, now);
         }
-        if self.config.resume_order == ProgramResumeOrder::DpAdmission {
+        if self.config.resume_order == ProgramResumeOrder::DpAdmissionTAO {
             return self.schedule_dp_admission(state, now);
         }
         if self.config.global_queue {
@@ -502,7 +493,7 @@ impl ProgramScheduler {
         let left_state = &state.decisions[left];
         let right_state = &state.decisions[right];
         match self.config.resume_order {
-            ProgramResumeOrder::Fcfs | ProgramResumeOrder::Dp | ProgramResumeOrder::DpAdmission => {
+            ProgramResumeOrder::Fcfs | ProgramResumeOrder::DpAdmissionTAO => {
                 self.fcfs_resume_cmp(state, left, right)
             }
             ProgramResumeOrder::Mru => right_state
@@ -551,7 +542,7 @@ impl ProgramScheduler {
                 .observations
                 .get(target_id)
                 .filter(|observation| self.observation_is_fresh(observation, now))
-                .and_then(|observation| observation.waiting_requests)
+                .and_then(|observation| observation.backend.waiting_requests)
                 .is_some_and(|waiting| waiting >= self.config.admission_waiting_request_threshold)
         {
             return None;
@@ -752,11 +743,14 @@ impl ProgramScheduler {
                     required_tokens: plan.required_tokens,
                     reserve_tokens: plan.reserve_tokens,
                     capacity_tokens: plan.capacity_tokens,
-                    backend_kv_usage_ratio: observation.and_then(|value| value.kv_cache_usage),
-                    backend_running_requests: observation.and_then(|value| value.running_requests),
-                    backend_waiting_requests: observation.and_then(|value| value.waiting_requests),
+                    backend_kv_usage_ratio: observation
+                        .and_then(|value| value.backend.kv_cache_usage),
+                    backend_running_requests: observation
+                        .and_then(|value| value.backend.running_requests),
+                    backend_waiting_requests: observation
+                        .and_then(|value| value.backend.waiting_requests),
                     observation_age: observation
-                        .and_then(|value| value.observed_at)
+                        .and_then(|value| value.backend.observed_at)
                         .map(|observed_at| now.saturating_duration_since(observed_at)),
                 },
             );
@@ -869,7 +863,9 @@ impl Drop for AdmissionGuard<'_> {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
-    use crate::program_scheduling::scheduler_state::RankObservationState;
+    use crate::program_scheduling::scheduler_state::{
+        BackendCapacityObservation, RankObservationState,
+    };
     use crate::program_scheduling::ProgramSchedulerConfig;
     use serde_json::json;
     use std::time::Duration;
@@ -1242,8 +1238,11 @@ mod tests {
         state.observations.insert(
             "rank-0".into(),
             RankObservationState {
-                waiting_requests: Some(1),
-                observed_at: Some(now),
+                backend: BackendCapacityObservation {
+                    waiting_requests: Some(1),
+                    observed_at: Some(now),
+                    ..BackendCapacityObservation::default()
+                },
                 ..RankObservationState::default()
             },
         );
@@ -1271,6 +1270,7 @@ mod tests {
                 .observations
                 .get_mut("rank-0")
                 .unwrap()
+                .accounting
                 .active_program_token_delta = 100.0;
         }
         let second = scheduler
@@ -1279,7 +1279,9 @@ mod tests {
             .unwrap();
         let state = scheduler.state.lock();
         assert_eq!(
-            state.observations["rank-0"].active_program_token_delta,
+            state.observations["rank-0"]
+                .accounting
+                .active_program_token_delta,
             100.0
         );
         drop(state);

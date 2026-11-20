@@ -45,21 +45,19 @@ impl ConfigValidator {
     }
 
     fn validate_program_scheduling(config: &ProgramSchedulingConfig) -> ConfigResult<()> {
-        if matches!(
-            config.resume_order,
-            ProgramResumeOrder::Dp | ProgramResumeOrder::DpAdmission
-        ) && (config.binding_strategy != ProgramBindingStrategy::CacheAware
-            || (config.token_capacity_per_dp_rank.is_none() && !config.dynamic_token_capacity))
+        if matches!(config.resume_order, ProgramResumeOrder::DpAdmissionTAO)
+            && (config.binding_strategy != ProgramBindingStrategy::CacheAware
+                || (config.token_capacity_per_dp_rank.is_none() && !config.dynamic_token_capacity))
         {
             return Err(ConfigError::ValidationFailed {
                 reason:
-                    "dp/dp_admission requires cache_aware binding and static or dynamic token capacity"
+                    "dp_admission_tao requires cache_aware binding and static or dynamic token capacity"
                         .to_string(),
             });
         }
-        if config.resume_order == ProgramResumeOrder::DpAdmission && config.binding_only {
+        if config.resume_order == ProgramResumeOrder::DpAdmissionTAO && config.binding_only {
             return Err(ConfigError::ValidationFailed {
-                reason: "dp_admission cannot be combined with binding_only".to_string(),
+                reason: "dp_admission_tao cannot be combined with binding_only".to_string(),
             });
         }
         if config.binding_strategy == ProgramBindingStrategy::ReasoningTokenBalance
@@ -880,12 +878,12 @@ mod tests {
     #[test]
     fn direct_dp_admission_is_a_separate_validated_configuration() {
         let mut config: ProgramSchedulingConfig = serde_json::from_str(
-            r#"{"resume_order":"dp_admission","binding_strategy":"cache_aware","token_capacity_per_dp_rank":1200}"#,
+            r#"{"resume_order":"dp_admission_tao","binding_strategy":"cache_aware","token_capacity_per_dp_rank":1200}"#,
         ).unwrap();
         assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
         assert_eq!(
             serde_json::to_value(&config).unwrap()["resume_order"],
-            "dp_admission"
+            "dp_admission_tao"
         );
         config.binding_only = true;
         assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
@@ -899,38 +897,40 @@ mod tests {
 
     #[test]
     fn dynamic_capacity_replaces_static_requirement_but_not_binding_constraints() {
-        for order in ["dp", "dp_admission"] {
-            let mut config: ProgramSchedulingConfig = serde_json::from_value(serde_json::json!({
-                "resume_order": order,
-                "binding_strategy": "cache_aware", "dynamic_token_capacity": true
-            }))
-            .unwrap();
-            assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
-            assert!(
-                serde_json::to_value(&config).unwrap()["dynamic_token_capacity"]
-                    .as_bool()
-                    .unwrap()
-            );
-            config.token_capacity_per_dp_rank = Some(1000);
-            assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
-            config.token_capacity_per_dp_rank = None;
-            config.binding_strategy = ProgramBindingStrategy::ConsistentHash;
-            assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
-        }
+        let mut config: ProgramSchedulingConfig = serde_json::from_value(serde_json::json!({
+            "resume_order": "dp_admission_tao",
+            "binding_strategy": "cache_aware", "dynamic_token_capacity": true
+        }))
+        .unwrap();
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
+        assert!(
+            serde_json::to_value(&config).unwrap()["dynamic_token_capacity"]
+                .as_bool()
+                .unwrap()
+        );
+        config.token_capacity_per_dp_rank = Some(1000);
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+        config.token_capacity_per_dp_rank = None;
+        config.binding_strategy = ProgramBindingStrategy::ConsistentHash;
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
     }
 
     #[test]
-    fn dp_resume_requires_native_cache_tree_and_token_capacity() {
-        let mut config: ProgramSchedulingConfig = serde_json::from_str(
-            r#"{"resume_order":"dp","binding_strategy":"cache_aware","token_capacity_per_dp_rank":1200}"#,
-        ).unwrap();
-        assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
-        assert_eq!(serde_json::to_value(&config).unwrap()["resume_order"], "dp");
-        config.token_capacity_per_dp_rank = None;
-        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
-        config.token_capacity_per_dp_rank = Some(1200);
-        config.binding_strategy = ProgramBindingStrategy::ConsistentHash;
-        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+    fn tao_resume_order_uses_only_its_canonical_wire_name() {
+        let config: ProgramSchedulingConfig =
+            serde_json::from_value(serde_json::json!({"resume_order": "dp_admission_tao"}))
+                .unwrap();
+        assert_eq!(config.resume_order, ProgramResumeOrder::DpAdmissionTAO);
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["resume_order"],
+            "dp_admission_tao"
+        );
+        for name in ["dp_admission", "dp"] {
+            assert!(serde_json::from_value::<ProgramSchedulingConfig>(
+                serde_json::json!({"resume_order": name}),
+            )
+            .is_err());
+        }
     }
 
     #[test]

@@ -115,7 +115,7 @@ impl ProgramScheduler {
             return;
         }
         let runtime_after = state.runtime.view(dispatch.program());
-        if self.tree_dp_mode()
+        if self.kv_dp_mode()
             && runtime_after
                 .as_ref()
                 .is_some_and(|v| v.in_flight_requests == 0)
@@ -526,7 +526,7 @@ impl ProgramScheduler {
     }
 
     fn repair_capacity(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {
-        if self.tree_dp_mode() {
+        if self.kv_dp_mode() {
             return false;
         }
         let target_ids = state.targets.keys().cloned().collect::<Vec<_>>();
@@ -886,12 +886,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            scheduler.state.lock().observations["rank-0"].active_program_token_delta,
+            scheduler.state.lock().observations["rank-0"]
+                .accounting
+                .active_program_token_delta,
             200.0
         );
         scheduler.complete(&dispatch, true, true, Some(100), Some(0.1));
         let state = scheduler.state.lock();
-        assert_eq!(state.observations["rank-0"].active_program_token_delta, 0.0);
+        assert_eq!(
+            state.observations["rank-0"]
+                .accounting
+                .active_program_token_delta,
+            0.0
+        );
         assert!(!state.decisions.contains_key(dispatch.program()));
     }
 }

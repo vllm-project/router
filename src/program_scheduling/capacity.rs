@@ -1,5 +1,5 @@
 //! Live backend headroom expressed in vLLM reference-token units.
-//! This is not an exact candidate-specific admission oracle for hybrid models.
+//! This is not an exact candidate-specific admission oracle for **hybrid** models.
 use super::scheduler_state::ProgramSchedulerState;
 use super::{ProgramScheduler, ProgramState, ProgramStatus};
 use std::time::Instant;
@@ -22,7 +22,7 @@ impl ProgramScheduler {
         target: &str,
         now: Instant,
     ) -> Option<usize> {
-        if self.tree_dp_mode() {
+        if self.kv_dp_mode() {
             return self.tree_dp_capacity(state, target, now);
         }
         if !self.config.dynamic_token_capacity {
@@ -32,21 +32,26 @@ impl ProgramScheduler {
         if !self.observation_is_fresh(observation, now) {
             return None;
         }
-        observation.backend_available_tokens.map(|available| {
-            // Physical usage already reflects idle Acting cache. Keep the full
-            // logical ledger for policy scoring, but reserve execution capacity
-            // only for programs with pending/in-flight model work. Backend
-            // waiters must retain that reservation across metrics scrapes.
-            let ledger = self.ledger_usage(state, target);
-            let physical_limit = ledger + available - observation.admitted_token_debits;
-            let limit = observation
-                .backend_usable_token_capacity
-                .map_or(physical_limit, |total| {
-                    physical_limit
-                        .min(ledger + total as f64 - self.reasoning_reservations(state, target))
-                });
-            limit.max(0.0).floor() as usize
-        })
+        observation
+            .backend
+            .backend_available_tokens
+            .map(|available| {
+                // Physical usage already reflects idle Acting cache. Keep the full
+                // logical ledger for policy scoring, but reserve execution capacity
+                // only for programs with pending/in-flight model work. Backend
+                // waiters must retain that reservation across metrics scrapes.
+                let ledger = self.ledger_usage(state, target);
+                let physical_limit =
+                    ledger + available - observation.accounting.admitted_token_debits;
+                let limit = observation.backend.backend_usable_token_capacity.map_or(
+                    physical_limit,
+                    |total| {
+                        physical_limit
+                            .min(ledger + total as f64 - self.reasoning_reservations(state, target))
+                    },
+                );
+                limit.max(0.0).floor() as usize
+            })
     }
 
     pub(crate) fn capacity_ready(
@@ -85,7 +90,7 @@ impl ProgramScheduler {
         program: &super::ProgramRef,
         now: Instant,
     ) {
-        if self.tree_dp_mode() {
+        if self.kv_dp_mode() {
             return;
         }
         if !self.config.dynamic_token_capacity || self.config.binding_only {
@@ -102,10 +107,12 @@ impl ProgramScheduler {
         };
         let fits = state.observations.get(&target).is_some_and(|o| {
             self.observation_is_fresh(o, now)
-                && o.backend_available_tokens.is_some()
-                && o.backend_usable_token_capacity.is_some_and(|total| {
-                    self.reasoning_reservations(state, &target) <= total as f64
-                })
+                && o.backend.backend_available_tokens.is_some()
+                && o.backend
+                    .backend_usable_token_capacity
+                    .is_some_and(|total| {
+                        self.reasoning_reservations(state, &target) <= total as f64
+                    })
         });
         if !fits {
             self.pause_idle(
@@ -206,8 +213,8 @@ mod tests {
     }
 
     #[test]
-    fn both_dp_modes_wait_for_backend_then_obey_changing_headroom() {
-        for order in [ProgramResumeOrder::Dp, ProgramResumeOrder::DpAdmission] {
+    fn native_and_tao_modes_wait_for_backend_then_obey_changing_headroom() {
+        for order in [ProgramResumeOrder::Mru, ProgramResumeOrder::DpAdmissionTAO] {
             let s = scheduler(order);
             let a = enqueue(&s, "a", 300);
             let b = enqueue(&s, "b", 300);
@@ -246,7 +253,7 @@ mod tests {
 
     #[test]
     fn fresh_low_usage_does_not_readmit_reserved_backend_queue_capacity() {
-        for order in [ProgramResumeOrder::Dp, ProgramResumeOrder::DpAdmission] {
+        for order in [ProgramResumeOrder::Mru, ProgramResumeOrder::DpAdmissionTAO] {
             let s = scheduler(order);
             let a = enqueue(&s, "a", 600);
             observe(&s, 0.0);
@@ -277,7 +284,7 @@ mod tests {
 
     #[test]
     fn idle_acting_context_does_not_consume_live_reasoning_reservation_twice() {
-        for order in [ProgramResumeOrder::Dp, ProgramResumeOrder::DpAdmission] {
+        for order in [ProgramResumeOrder::Mru, ProgramResumeOrder::DpAdmissionTAO] {
             let s = scheduler(order);
             let a = enqueue(&s, "acting", 600);
             observe(&s, 0.0);
@@ -333,7 +340,7 @@ mod tests {
     #[test]
     fn retained_active_turn_cannot_bypass_invalid_or_stale_usage() {
         for invalid in [true, false] {
-            let s = scheduler(ProgramResumeOrder::DpAdmission);
+            let s = scheduler(ProgramResumeOrder::DpAdmissionTAO);
             let a = enqueue(&s, "a", 600);
             observe(&s, 0.0);
             s.schedule_waiting(&mut s.state.lock(), Instant::now());
@@ -358,7 +365,7 @@ mod tests {
 
     #[test]
     fn epoch_preserves_new_charges_and_does_not_credit_logical_releases() {
-        let s = scheduler(ProgramResumeOrder::DpAdmission);
+        let s = scheduler(ProgramResumeOrder::DpAdmissionTAO);
         observe(&s, 0.0);
         {
             let mut state = s.state.lock();
@@ -380,7 +387,7 @@ mod tests {
 
     #[test]
     fn missing_stale_invalid_and_full_observations_are_distinct_and_safe() {
-        let s = scheduler(ProgramResumeOrder::Dp);
+        let s = scheduler(ProgramResumeOrder::Mru);
         let p = enqueue(&s, "forced", 1);
         observe(&s, 1.0);
         {
@@ -399,8 +406,12 @@ mod tests {
         observe(&s, 0.0);
         {
             let mut state = s.state.lock();
-            state.observations.get_mut("rank").unwrap().observed_at =
-                Some(Instant::now() - Duration::from_secs(4));
+            state
+                .observations
+                .get_mut("rank")
+                .unwrap()
+                .backend
+                .observed_at = Some(Instant::now() - Duration::from_secs(4));
             assert_eq!(s.dynamic_headroom(&state, "rank", Instant::now()), None);
             assert!(!s.schedule_waiting(&mut state, Instant::now()));
         }
@@ -417,7 +428,7 @@ mod tests {
 
     #[test]
     fn overdraw_keeps_pressure_instead_of_inflating_capacity_to_current_usage() {
-        let s = scheduler(ProgramResumeOrder::DpAdmission);
+        let s = scheduler(ProgramResumeOrder::DpAdmissionTAO);
         let _p = enqueue(&s, "active", 600);
         observe(&s, 0.0);
         let mut state = s.state.lock();
@@ -437,7 +448,7 @@ mod tests {
 
     #[test]
     fn independent_ranks_do_not_share_a_budget_or_static_override() {
-        let s = scheduler(ProgramResumeOrder::DpAdmission);
+        let s = scheduler(ProgramResumeOrder::DpAdmissionTAO);
         let mut targets = targets();
         targets.push(ProgramTarget {
             id: "other".into(),
@@ -459,7 +470,7 @@ mod tests {
 
     #[test]
     fn stale_target_epoch_and_out_of_order_samples_cannot_restore_budget() {
-        let s = scheduler(ProgramResumeOrder::DpAdmission);
+        let s = scheduler(ProgramResumeOrder::DpAdmissionTAO);
         let old = raw("rank", 0.0);
         observe(&s, 1.0);
         s.apply_observations(s.begin_observation(&targets()), [old]);

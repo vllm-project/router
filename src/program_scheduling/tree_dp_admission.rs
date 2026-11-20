@@ -11,10 +11,10 @@ use super::{
 use std::time::Instant;
 
 impl ProgramScheduler {
-    pub(crate) fn tree_dp_mode(&self) -> bool {
+    pub(crate) fn kv_dp_mode(&self) -> bool {
         self.config.dynamic_token_capacity
             && !self.config.binding_only
-            && self.config.resume_order == ProgramResumeOrder::DpAdmission
+            && self.config.resume_order == ProgramResumeOrder::DpAdmissionTAO
             && self.config.binding_strategy == ProgramBindingStrategy::CacheAware
     }
 
@@ -26,7 +26,7 @@ impl ProgramScheduler {
     ) -> Option<usize> {
         let o = state.observations.get(target)?;
         (self.observation_is_fresh(o, now) && self.tree_dp_backend_used(state, target).is_some())
-            .then_some(o.backend_token_capacity)
+            .then_some(o.backend.backend_token_capacity)
             .flatten()
             .filter(|c| *c > 0)
     }
@@ -55,8 +55,8 @@ impl ProgramScheduler {
         target: &str,
     ) -> Option<usize> {
         let o = state.observations.get(target)?;
-        let total = o.backend_token_capacity.filter(|c| *c > 0)?;
-        let available = o.backend_available_tokens?;
+        let total = o.backend.backend_token_capacity.filter(|c| *c > 0)?;
+        let available = o.backend.backend_available_tokens?;
         if !available.is_finite() || available < 0.0 || available > total as f64 {
             return None;
         }
@@ -153,7 +153,7 @@ impl ProgramScheduler {
                 .map(|v| v.reference.clone())
                 .collect();
             queued.sort_by(|a, b| a.program_id().cmp(b.program_id()));
-            let budgets: Vec<_> = targets
+            let mut budgets: Vec<_> = targets
                 .iter()
                 .map(|t| {
                     (
@@ -165,7 +165,7 @@ impl ProgramScheduler {
                 })
                 .collect();
             let mut assignments = Vec::new();
-            let options: Vec<Vec<OptionValue>> = queued
+            let mut options: Vec<Vec<OptionValue>> = queued
                 .iter()
                 .map(|p| {
                     let total = state.runtime.front_context_tokens(p).unwrap_or(0);
@@ -194,15 +194,49 @@ impl ProgramScheduler {
                         .collect()
                 })
                 .collect();
-            let selected = resume_dp::solve(&options, &budgets, &self.config);
-            for index in selected {
+            // Deadlines affect admission order, never permission to exceed
+            // capacity. Choose the best feasible backend for each overdue
+            // request, then optimize the remaining candidates and budget.
+            let mut overdue: Vec<_> = queued
+                .iter()
+                .enumerate()
+                .filter_map(|(index, program)| {
+                    state.decisions[program]
+                        .force_resume_deadline
+                        .filter(|deadline| *deadline <= now)
+                        .map(|deadline| (deadline, index))
+                })
+                .collect();
+            overdue.sort_unstable();
+            let mut selected = Vec::new();
+            for (_, index) in overdue {
+                let chosen = options[index]
+                    .iter()
+                    .filter(|option| {
+                        let (tokens, slots) = budgets[option.target];
+                        slots > 0 && option.tokens <= tokens
+                    })
+                    .max_by_key(|option| (option.value, std::cmp::Reverse(option.target)));
+                if let Some(option) = chosen {
+                    budgets[option.target].0 -= option.tokens;
+                    budgets[option.target].1 -= 1;
+                    selected.push((option.index, true));
+                    options[index].clear();
+                }
+            }
+            selected.extend(
+                resume_dp::solve(&options, &budgets, &self.config)
+                    .into_iter()
+                    .map(|index| (index, false)),
+            );
+            for (index, overdue) in selected {
                 let (p, t, total, cached, cost) = &assignments[index];
                 let plan = RankAdmissionPlan {
                     used_tokens: self.tree_dp_accounted_used(state, t) as f64,
                     required_tokens: *cost as f64,
                     reserve_tokens: 0.0,
                     capacity_tokens: self.tree_dp_capacity(state, t, now),
-                    forced: false,
+                    forced: overdue,
                     batch_gain: false,
                 };
                 if self.commit_admission(state, p, t, plan, now) {
@@ -233,7 +267,7 @@ mod tests {
     fn setup(capacities: &[usize]) -> ProgramScheduler {
         let mut cfg = ProgramSchedulerConfig {
             dynamic_token_capacity: true,
-            resume_order: ProgramResumeOrder::DpAdmission,
+            resume_order: ProgramResumeOrder::DpAdmissionTAO,
             binding_strategy: ProgramBindingStrategy::CacheAware,
             dp_capacity_quantum: 1,
             max_active_programs_per_target: 1,
@@ -299,6 +333,94 @@ mod tests {
             .bindings
             .commit_placement(h.program(), text, target);
     }
+    #[test]
+    fn overdue_requests_use_deadline_order_before_cache_value() {
+        let s = setup(&[100]);
+        let older = enqueue(&s, "z-older", 60, "older");
+        let later = enqueue(&s, "a-later", 300, "abcdefghij");
+        seed(&s, &later, "abcdefgh", "t0");
+        let now = Instant::now();
+        let mut st = s.state.lock();
+        st.decisions
+            .get_mut(older.program())
+            .unwrap()
+            .force_resume_deadline = Some(now - std::time::Duration::from_secs(2));
+        st.decisions
+            .get_mut(later.program())
+            .unwrap()
+            .force_resume_deadline = Some(now - std::time::Duration::from_secs(1));
+        assert!(s.schedule_waiting(&mut st, now));
+        assert_eq!(st.runtime.placement(older.program()), Some("t0"));
+        assert_eq!(st.runtime.placement(later.program()), None);
+        assert_eq!(s.tree_dp_used(&st, "t0"), 60);
+    }
+
+    #[test]
+    fn overdue_oversized_request_does_not_block_remaining_dp_budget() {
+        let s = setup(&[100]);
+        let oversized = enqueue(&s, "oversized", 101, "oversized");
+        let due = enqueue(&s, "due", 60, "due");
+        let hit = enqueue(&s, "hit", 200, "abcdefghij");
+        let miss = enqueue(&s, "miss", 40, "other");
+        seed(&s, &hit, "abcdefgh", "t0");
+        let now = Instant::now();
+        let mut st = s.state.lock();
+        st.decisions
+            .get_mut(oversized.program())
+            .unwrap()
+            .force_resume_deadline = Some(now - std::time::Duration::from_secs(2));
+        st.decisions
+            .get_mut(due.program())
+            .unwrap()
+            .force_resume_deadline = Some(now);
+        st.decisions
+            .get_mut(hit.program())
+            .unwrap()
+            .force_resume_deadline = Some(now + std::time::Duration::from_secs(1));
+        assert!(s.schedule_waiting(&mut st, now));
+        assert_eq!(st.runtime.placement(oversized.program()), None);
+        assert_eq!(st.runtime.placement(due.program()), Some("t0"));
+        assert_eq!(st.runtime.placement(hit.program()), Some("t0"));
+        assert_eq!(st.runtime.placement(miss.program()), None);
+        assert_eq!(s.tree_dp_used(&st, "t0"), 100);
+    }
+
+    #[test]
+    fn overdue_request_uses_best_feasible_backend_without_dp_quantization() {
+        let mut s = setup(&[40, 80, 80]);
+        s.config.dp_capacity_quantum = 512;
+        let due = enqueue(&s, "due", 100, "abcdefghij");
+        seed(&s, &due, "abcde", "t0");
+        seed(&s, &due, "abcd", "t1");
+        seed(&s, &due, "abc", "t2");
+        let now = Instant::now();
+        let mut st = s.state.lock();
+        st.decisions
+            .get_mut(due.program())
+            .unwrap()
+            .force_resume_deadline = Some(now);
+        assert!(s.schedule_waiting(&mut st, now));
+        assert_eq!(st.runtime.placement(due.program()), Some("t1"));
+        assert_eq!(s.tree_dp_used(&st, "t0"), 0);
+        assert_eq!(s.tree_dp_used(&st, "t1"), 60);
+        assert_eq!(s.tree_dp_used(&st, "t2"), 0);
+    }
+
+    #[test]
+    fn overdue_request_still_requires_fresh_backend_capacity() {
+        let s = setup(&[100]);
+        let due = enqueue(&s, "due", 60, "due");
+        let now = Instant::now();
+        let mut st = s.state.lock();
+        st.decisions
+            .get_mut(due.program())
+            .unwrap()
+            .force_resume_deadline = Some(now);
+        assert!(!s.schedule_waiting(&mut st, now + s.config.metrics_interval * 4));
+        assert_eq!(st.runtime.placement(due.program()), None);
+        assert_eq!(s.tree_dp_used(&st, "t0"), 0);
+    }
+
     #[test]
     fn tree_cost_ignores_prior_cached_feedback_and_native_request_count_gates() {
         let s = setup(&[100]);
