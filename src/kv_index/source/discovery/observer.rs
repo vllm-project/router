@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 
 use super::{
     discovered_block_size, event_sources_for_worker, fetch_kv_event_sources, query_worker_metadata,
-    server_model_id, CacheKey, KvIndexSupervisor, SourcesProbe, WorkerKvInfo,
+    server_instance_id, server_model_id, CacheKey, KvIndexSupervisor, SourcesProbe, WorkerKvInfo,
 };
 use crate::kv_index::source::events::subscriber::{spawn_observer, SubscriberHandle};
 use crate::kv_index::SourceId;
@@ -36,11 +36,7 @@ impl KvIndexSupervisor {
             Err(error) => return Err(error.detail),
         };
         let info = info?;
-        let instance_id = info
-            .instance_id
-            .clone()
-            .filter(|instance| !instance.is_empty())
-            .unwrap_or_else(|| worker_url.to_owned());
+        let instance_id = server_instance_id(&info, worker_url);
         let Some(block_size) = discovered_block_size(&info) else {
             return Ok(WorkerKvInfo {
                 instance_id,

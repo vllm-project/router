@@ -31,10 +31,11 @@ use lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
 use observer::WorkerObservation;
 use reconcile::{static_hybrid_sources_match, StaticHybridMatch};
 
-pub(crate) use probe::query_worker_metadata;
+pub(crate) use probe::query_worker_control_metadata;
 use probe::{
     base_model_names, fetch_kv_event_sources, fetch_native_sources, grpc_model_id, layout_model,
-    query_model_list, query_worker_metadata_and_models, served_model, server_model_id,
+    query_model_list, query_worker_metadata, query_worker_metadata_and_models, served_model,
+    server_instance_id, server_model_id,
 };
 
 /// The worker-stable core of a cache identity. One indexer per key.

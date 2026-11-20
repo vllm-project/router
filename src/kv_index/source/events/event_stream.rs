@@ -501,9 +501,10 @@ mod tests {
     }
 
     #[test]
-    fn fresh_observation_stays_hidden_until_a_root_store_arrives() {
-        use crate::kv_index::source::test_support::{event_payload, full_binding, full_store};
-        use crate::kv_index::wire::ExternalBlockHash;
+    fn fresh_observation_keeps_suffix_pages_hidden_until_a_root_store_arrives() {
+        use crate::kv_index::source::test_support::{
+            event_payload, full_binding, full_store, gpu_remove,
+        };
 
         let index = Arc::new(
             full_binding(
@@ -517,20 +518,24 @@ mod tests {
         );
         let stream = EventStream::new(index.clone());
         let lease = stream.begin_replay().unwrap();
-        let tokens: Vec<_> = (0..33).collect();
-        let root = full_store(&tokens[..32], 16, None);
-        let root_payload = event_payload(1.0, &[KVEvent::BlockStored(root.clone())], Some(0));
+        let tokens: Vec<_> = (0..49).collect();
+        let mut root = full_store(&tokens[..48], 16, None);
+        let mut suffix = root.clone();
+        suffix.parent_block_hash = Some(suffix.block_hashes.remove(0));
+        suffix.token_ids.drain(..16);
+        let evicted = gpu_remove(Some(0), vec![suffix.block_hashes[1].clone()]);
+        root.block_hashes.truncate(1);
+        root.token_ids.truncate(16);
+        let root_payload = event_payload(1.0, &[KVEvent::BlockStored(root)], Some(0));
         stream
             .apply_publisher_payload(lease, 0, &root_payload)
             .unwrap();
         stream.finish_replay(lease, 1).unwrap();
-        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 32);
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 16);
         stream
             .restart_replay(lease, true, Reason::RetryExhausted)
             .unwrap();
 
-        let mut suffix = root.clone();
-        suffix.parent_block_hash = Some(ExternalBlockHash::Bytes(vec![7; 32]));
         stream
             .observe_live(
                 lease,
@@ -541,7 +546,10 @@ mod tests {
         assert_eq!(index.control.generation(), 0);
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 0);
         stream
-            .apply_publisher_payload(lease, 21, &root_payload)
+            .apply_publisher_payload(lease, 21, &event_payload(1.0, &[evicted], Some(0)))
+            .unwrap();
+        stream
+            .apply_publisher_payload(lease, 22, &root_payload)
             .unwrap();
         assert_ne!(index.control.generation(), 0);
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 32);

@@ -6386,6 +6386,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn served_model_alias_probe_queries_the_model_list_only_once() {
+        use axum::{routing::get, Json};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/models",
+                get(move || async move {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    Json(serde_json::json!({"data": [{"id": "model"}]}))
+                }),
+            )
+            .route(
+                "/metrics",
+                get(|| async { "vllm:cache_config_info{block_size=\"16\",engine=\"0\"} 1.0\n" }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let labels =
+            crate::routers::served_model_labels(&Client::new(), &url, None, None, true).await;
+        assert_eq!(labels["served_model_aliases"], "model");
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn monitored_routes_reject_full_before_forwarding() {
         let mut fixture =
             http_kv_fixture([vec![vec![1, 2, 3, 4]], vec![vec![1, 2, 3, 4]]], 0, true).await;

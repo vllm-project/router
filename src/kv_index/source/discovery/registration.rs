@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use super::lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
-use super::probe::{layout_model, worker_descriptor};
+use super::probe::{layout_model, server_instance_id, worker_descriptor};
 use super::{
     discovered_block_size, event_source_label, event_sources_for_worker, metadata_source_label,
     CacheKey, KvIndexSupervisor, LiveSource, SourcesProbe, WorkerDiscovery, WorkerKvInfo,
@@ -58,11 +58,7 @@ impl KvIndexSupervisor {
             }
         });
 
-        let instance_id = server_info
-            .instance_id
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| worker_url.to_string());
+        let instance_id = server_instance_id(&server_info, worker_url);
         let block_size = discovered_block_size(&server_info);
         let model_id = match discovery.model_id {
             Ok(Some(model_id)) if !model_id.trim().is_empty() => Some(model_id),

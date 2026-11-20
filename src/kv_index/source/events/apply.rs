@@ -191,22 +191,25 @@ impl SourceBinding {
         };
         let mut proved_root = false;
         for event in prepared {
-            if self.requires_root_proof && !state.root_verified {
-                if let PreparedEvent::Store { proves_root, .. } = &event {
-                    if !proves_root {
-                        // Verified native hashing starts at a root store. A
-                        // suffix from replay cannot establish that contract.
-                        continue;
+            // Keep observations before the root proof under the same source
+            // barrier. Removes and clears must still apply while it is hidden.
+            if !state.root_verified
+                && matches!(
+                    &event,
+                    PreparedEvent::Store {
+                        proves_root: true,
+                        ..
                     }
-                    state.root_verified = true;
-                    proved_root = true;
-                    tracing::debug!(
-                        source = %self.target.instance_id,
-                        rank = self.target.dp_rank,
-                        seq,
-                        "verified default KV hash root"
-                    );
-                }
+                )
+            {
+                state.root_verified = true;
+                proved_root = true;
+                tracing::debug!(
+                    source = %self.target.instance_id,
+                    rank = self.target.dp_rank,
+                    seq,
+                    "verified default KV hash root"
+                );
             }
             let clear = matches!(event, PreparedEvent::Clear);
             if event.apply(tx, &self.owner, self.max_entries).is_err() {

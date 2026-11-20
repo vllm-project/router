@@ -137,6 +137,14 @@ pub(super) fn server_model_id(server_info: &ServerInfo) -> Option<String> {
         })
 }
 
+pub(super) fn server_instance_id(info: &ServerInfo, worker_url: &str) -> String {
+    info.instance_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .unwrap_or(worker_url)
+        .to_owned()
+}
+
 pub(super) fn layout_model<'a>(
     info: &'a ServerInfo,
     served_model: &'a str,
@@ -354,7 +362,7 @@ async fn query_worker_json<T: serde::de::DeserializeOwned>(
 /// Every source is optional; the error names what each one said, so an operator
 /// can tell a missing endpoint from an endpoint that answered without a block
 /// size.
-pub(crate) async fn query_worker_metadata(
+pub(super) async fn query_worker_metadata(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
@@ -369,42 +377,54 @@ pub(super) async fn query_worker_metadata_and_models(
     worker_url: &str,
     api_key: Option<&str>,
 ) -> Result<(ServerInfo, Option<HashSet<String>>), String> {
-    let mut attempts: Vec<String> = Vec::new();
-    let record_metadata = |path, result: Result<ServerInfo, String>| {
-        let info = result?;
-        let size = discovered_block_size(&info).ok_or_else(|| format!("{path}: no block_size"))?;
-        info!("kv_index {worker_url}: worker cache metadata from /{path} (block_size={size})");
-        Ok(info)
+    let control_error = match query_worker_control_metadata(client, worker_url, api_key).await {
+        Ok(info) => return Ok((info, None)),
+        Err(error) => error,
     };
 
-    // 1. Multi-backend control metadata. Absent from stock vLLM.
-    match record_metadata(
-        "get_server_info",
-        query_worker_json(client, worker_url, "get_server_info", true, api_key).await,
-    ) {
-        Ok(info) => return Ok((info, None)),
-        Err(error) => attempts.push(error),
-    }
-
-    // 2. Native engine configuration. Requires VLLM_SERVER_DEV_MODE=1.
-    match record_metadata(
-        "server_info",
-        query_server_info_json(client, worker_url, api_key).await,
-    ) {
-        Ok(info) => return Ok((info, None)),
-        Err(error) => attempts.push(error),
-    }
-
-    // 3. Prometheus scrape. Always on, no dev mode required.
     query_metrics_metadata(client, worker_url, api_key)
         .await
         .and_then(|(info, models)| {
-            record_metadata("metrics", Ok(info)).map(|info| (info, Some(models)))
+            validate_worker_metadata(worker_url, "metrics", Ok(info))
+                .map(|info| (info, Some(models)))
         })
-        .map_err(|error| {
-            attempts.push(error);
-            attempts.join("; ")
-        })
+        .map_err(|error| format!("{control_error}; {error}"))
+}
+
+/// The control endpoints can report server aliases. A metrics scrape cannot.
+pub(crate) async fn query_worker_control_metadata(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Result<ServerInfo, String> {
+    // 1. Multi-backend control metadata. Absent from stock vLLM.
+    let first_error = match validate_worker_metadata(
+        worker_url,
+        "get_server_info",
+        query_worker_json(client, worker_url, "get_server_info", true, api_key).await,
+    ) {
+        Ok(info) => return Ok(info),
+        Err(error) => error,
+    };
+
+    // 2. Native engine configuration. Requires VLLM_SERVER_DEV_MODE=1.
+    validate_worker_metadata(
+        worker_url,
+        "server_info",
+        query_server_info_json(client, worker_url, api_key).await,
+    )
+    .map_err(|error| format!("{first_error}; {error}"))
+}
+
+fn validate_worker_metadata(
+    worker_url: &str,
+    path: &str,
+    result: Result<ServerInfo, String>,
+) -> Result<ServerInfo, String> {
+    let info = result?;
+    let size = discovered_block_size(&info).ok_or_else(|| format!("{path}: no block_size"))?;
+    info!("kv_index {worker_url}: worker cache metadata from /{path} (block_size={size})");
+    Ok(info)
 }
 
 /// Engine configuration exposed by `vllm serve` behind `VLLM_SERVER_DEV_MODE=1`.
