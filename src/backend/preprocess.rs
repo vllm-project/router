@@ -235,16 +235,32 @@ pub(crate) async fn prepare_http_token_inputs(
         1
     };
     let tokenize_fallback = std::sync::OnceLock::new();
-    // A worker still preparing when the budget runs out keeps this entry, so
-    // a slow worker is reported apart from one that could not be reached.
+    // Probes run at most eight at a time under one shared deadline, so a
+    // worker can miss the budget without ever being contacted. Workers left
+    // without a result are reported as preparation_timeout if their probe
+    // started and preparation_not_started if it never did.
     let mut inputs: std::collections::HashMap<_, _> = urls
         .iter()
-        .map(|url| (url.clone(), Err("preparation_timeout")))
+        .map(|url| (url.clone(), Err("preparation_not_started")))
         .collect();
+    // A Mutex rather than a RefCell keeps the future Send for the handlers.
+    let started = std::sync::Mutex::new(std::collections::HashSet::new());
+    let deadline = tokio::time::Instant::now() + budget;
     let results = stream::iter(urls)
         .map(|url| {
+            // Never contact a worker once the shared budget is spent.
+            let late = tokio::time::Instant::now() >= deadline;
+            if !late {
+                started
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(url.clone());
+            }
             let tokenize_fallback = &tokenize_fallback;
             async move {
+                if late {
+                    return (url, Err("preparation_not_started"));
+                }
                 let result = async {
                     let (prompts, source) =
                         match http_input_json(client, &url, path, body, headers, api_key, budget)
@@ -293,9 +309,16 @@ pub(crate) async fn prepare_http_token_inputs(
         })
         .buffer_unordered(8);
     futures_util::pin_mut!(results);
-    let deadline = tokio::time::Instant::now() + budget;
     while let Ok(Some((url, result))) = tokio::time::timeout_at(deadline, results.next()).await {
         inputs.insert(url, result);
+    }
+    let started = started
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for url in started.iter() {
+        if let Some(entry @ Err("preparation_not_started")) = inputs.get_mut(url) {
+            *entry = Err("preparation_timeout");
+        }
     }
     inputs
 }
@@ -1147,6 +1170,47 @@ mod tests {
         assert_eq!(
             results[&slow].as_ref().ok().unwrap().prompts.as_ref(),
             &[vec![1, 2, 3]]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_preparation_reports_workers_never_contacted_apart_from_slow_ones() {
+        use super::prepare_http_token_inputs;
+        use axum::{routing::post, Json, Router};
+        use serde_json::json;
+        // Nine slow workers: eight probes start at once and run past the
+        // budget, so the ninth (last in sorted order) is never contacted.
+        let app = Router::new().route(
+            "/{worker}/v1/completions/render",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Json(json!([{"token_ids":[1]}]))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let urls: Vec<String> = (0..9).map(|i| format!("{base}/w{i}")).collect();
+        let body = json!({"model":"m","prompt":"hello"});
+        let client = reqwest::Client::new();
+
+        let results = prepare_http_token_inputs(
+            &client,
+            urls.clone(),
+            &body,
+            "/v1/completions",
+            None,
+            None,
+            Duration::from_millis(100),
+        )
+        .await;
+        for url in &urls[..8] {
+            assert_eq!(results[url].as_ref().err(), Some(&"preparation_timeout"));
+        }
+        assert_eq!(
+            results[&urls[8]].as_ref().err(),
+            Some(&"preparation_not_started")
         );
         server.abort();
     }

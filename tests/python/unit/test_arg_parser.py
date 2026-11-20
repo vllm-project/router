@@ -6,6 +6,7 @@ without starting actual router instances.
 """
 
 import argparse
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -580,6 +581,20 @@ class TestParseRouterArgs:
         with patch("vllm_router.router._Router") as native_router:
             Router.from_args(args)
         assert native_router.call_args.kwargs["prefix_preparation_timeout_ms"] == 2500
+
+    def test_prefix_preparation_timeout_keeps_positional_fields(self):
+        # Adding the field must not shift existing positional arguments.
+        fields = dataclasses.fields(RouterArgs)
+        names = [f.name for f in fields]
+        assert names[-1] == "prefix_preparation_timeout_ms"
+        positional = [
+            f.default if f.default is not dataclasses.MISSING else f.default_factory()
+            for f in fields[:-1]
+        ]
+        positional[names.index("kv_event_source")] = ["http://w=tcp://h:5557"]
+        args = RouterArgs(*positional)
+        assert args.kv_event_source == ["http://w=tcp://h:5557"]
+        assert args.prefix_preparation_timeout_ms == 1000
 
     @pytest.mark.parametrize("ms", [0, -1, 60_001])
     def test_prefix_preparation_timeout_rejects_invalid_values(self, ms):

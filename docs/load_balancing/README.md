@@ -257,7 +257,7 @@ vllm-router --policy kv_aware \
   --worker-urls grpc://worker1:8000 grpc://worker2:8000
 ```
 
-Enable KV events on the workers. HTTP text requests also need a render endpoint or, for simple prompts, `/tokenize`. Without usable KV information, routing falls back to load. Each worker gets `--prefix-preparation-timeout-ms` (default 1000) to prepare a request; a worker that answers later is counted as `preparation_timeout` in `vllm_router_kv_routing_inputs_total`.
+Enable KV events on the workers. HTTP text requests also need a render endpoint or, for simple prompts, `/tokenize`. Without usable KV information, routing falls back to load. Each worker gets `--prefix-preparation-timeout-ms` (default 1000) to prepare a request; a worker that answers later is counted as `preparation_timeout` in `vllm_router_kv_routing_inputs_total`. At most eight workers are probed at a time under that shared budget, so a worker that was never contacted before it ran out is counted as `preparation_not_started` instead.
 
 For regular pools without event discovery, configure `--kv-event-source WORKER_URL=tcp://HOST:PORT` per worker, plus matching `--kv-event-model` and `--kv-event-block-size`.
 

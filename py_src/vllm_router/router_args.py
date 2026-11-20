@@ -31,7 +31,6 @@ class RouterArgs:
     kv_penalty_external: float = 0.6
     kv_penalty_disk: float = 0.3
     kv_aware_session_affinity_ttl_secs: Optional[int] = None
-    prefix_preparation_timeout_ms: int = 1000
     kv_event_source: List[str] = dataclasses.field(default_factory=list)
     kv_event_replay_source: List[str] = dataclasses.field(default_factory=list)
     kv_event_block_size: int = 16
@@ -104,6 +103,9 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+    # Last so existing positional RouterArgs(...) calls keep their binding;
+    # dataclass kw_only needs Python 3.10 and this package supports 3.8.
+    prefix_preparation_timeout_ms: int = 1000
 
     @staticmethod
     def add_cli_args(
