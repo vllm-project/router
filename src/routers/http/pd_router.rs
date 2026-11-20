@@ -607,6 +607,13 @@ fn build_dp_workers(
         .collect())
 }
 
+pub(super) enum ProfilingStartOutcome {
+    Accepted,
+    Rejected,
+    /// The worker may have received the request, but no outcome was confirmed.
+    Uncertain,
+}
+
 impl PdRouterBase {
     /// Prepare Prefill inputs for the cache_aware/no-KV path. KV-aware pools use
     /// `PdKvState::prepare_stages`, which shares one hash cache across stages.
@@ -886,38 +893,80 @@ impl PdRouterBase {
             .collect()
     }
 
-    /// Start profiling on a backend server
+    /// Start profiling on a backend server.
     pub async fn start_profiling(&self, worker_url: &str) {
+        self.start_profiling_with_outcome(worker_url, None).await;
+    }
+
+    /// Distinguish a confirmed start, a definite failure, and an unconfirmed result.
+    pub(super) async fn start_profiling_with_outcome(
+        &self,
+        worker_url: &str,
+        timeout: Option<Duration>,
+    ) -> ProfilingStartOutcome {
         // Extract base URL if worker_url is in DP-aware format (e.g., http://127.0.0.1:8081@2)
         let (base_url, _) = super::dp_utils::parse_worker_url(worker_url);
 
         let url = format!("{}/start_profile", base_url);
-        match self.client.post(&url).send().await {
+        let mut request = self.client.post(&url);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        match request.send().await {
             Ok(res) if res.status().is_success() => {
                 info!("Started profiling on {}", base_url);
+                ProfilingStartOutcome::Accepted
             }
             Ok(res) => {
+                let status = res.status();
                 warn!(
                     "Failed to start profiling on {}: status {}",
-                    base_url,
-                    res.status()
+                    base_url, status
                 );
+                // A gateway can fail to relay the response after the worker starts.
+                if matches!(
+                    status,
+                    StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT
+                ) {
+                    ProfilingStartOutcome::Uncertain
+                } else {
+                    ProfilingStartOutcome::Rejected
+                }
             }
             Err(e) => {
                 warn!("Error starting profiling on {}: {}", base_url, e);
+                if e.is_builder() || e.is_connect() {
+                    ProfilingStartOutcome::Rejected
+                } else {
+                    ProfilingStartOutcome::Uncertain
+                }
             }
         }
     }
 
-    /// Stop profiling on a backend server
+    /// Stop profiling on a backend server.
     pub async fn stop_profiling(&self, worker_url: &str) {
+        self.stop_profiling_with_result(worker_url, None).await;
+    }
+
+    /// Return whether the backend accepted the profiling stop.
+    pub(super) async fn stop_profiling_with_result(
+        &self,
+        worker_url: &str,
+        timeout: Option<Duration>,
+    ) -> bool {
         // Extract base URL if worker_url is in DP-aware format (e.g., http://127.0.0.1:8081@2)
         let (base_url, _) = super::dp_utils::parse_worker_url(worker_url);
 
         let url = format!("{}/stop_profile", base_url);
-        match self.client.post(&url).send().await {
+        let mut request = self.client.post(&url);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        match request.send().await {
             Ok(res) if res.status().is_success() => {
                 info!("Stopped profiling on {}", base_url);
+                true
             }
             Ok(res) => {
                 warn!(
@@ -925,9 +974,11 @@ impl PdRouterBase {
                     base_url,
                     res.status()
                 );
+                false
             }
             Err(e) => {
                 warn!("Error stopping profiling on {}: {}", base_url, e);
+                false
             }
         }
     }
