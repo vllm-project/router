@@ -3808,6 +3808,7 @@ mod tests {
     use super::*;
     use crate::backend::outcome::EngineUsage;
     use crate::routers::http::program_adapter::MAX_SSE_LINE_BYTES;
+    use crate::routers::test_support::start_admin_auth_mock_server;
     use std::collections::HashMap;
 
     struct CompletionResponseFixture {
@@ -8003,35 +8004,6 @@ mod tests {
         server.abort();
     }
 
-    /// Helper: start a mock server whose /health returns 200 only for the given
-    /// bearer token, or only without an Authorization header when the key is
-    /// `None`. Anything else gets 401.
-    async fn start_auth_mock_server(
-        api_key: Option<&str>,
-    ) -> (String, tokio::task::JoinHandle<()>) {
-        use axum::{http::header::AUTHORIZATION, routing::get, Router as AxumRouter};
-        use tokio::net::TcpListener;
-
-        let expected = api_key.map(|key| format!("Bearer {key}"));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let app = AxumRouter::new().route(
-            "/health",
-            get(move |headers: HeaderMap| async move {
-                let sent = headers.get(AUTHORIZATION).map(|value| value.as_bytes());
-                if sent == expected.as_deref().map(str::as_bytes) {
-                    StatusCode::OK
-                } else {
-                    StatusCode::UNAUTHORIZED
-                }
-            }),
-        );
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (format!("http://{}", addr), handle)
-    }
-
     /// Helper: start a server that accepts connections and never answers.
     /// Also returns the number of connections it has accepted.
     async fn start_silent_mock_server() -> (
@@ -8074,8 +8046,8 @@ mod tests {
     async fn assert_health_checks_pass(api_key: Option<&str>, dp_size: usize) {
         use crate::config::RouterConfig;
 
-        let (startup_url, startup_server) = start_auth_mock_server(api_key).await;
-        let (added_url, added_server) = start_auth_mock_server(api_key).await;
+        let (startup_url, startup_server, _) = start_admin_auth_mock_server(api_key).await;
+        let (added_url, added_server, _) = start_admin_auth_mock_server(api_key).await;
         let config = RouterConfig {
             api_key: api_key.map(str::to_owned),
             intra_node_data_parallel_size: dp_size,
@@ -8127,7 +8099,7 @@ mod tests {
     async fn test_wait_for_healthy_workers_reports_rejected_api_key() {
         use crate::config::RouterConfig;
 
-        let (url, server) = start_auth_mock_server(Some("worker-key")).await;
+        let (url, server, _) = start_admin_auth_mock_server(Some("worker-key")).await;
 
         let error =
             Router::wait_for_healthy_workers(std::slice::from_ref(&url), 1, 1, Some("other-key"))
@@ -8155,74 +8127,10 @@ mod tests {
         server.abort();
     }
 
-    /// Mock worker that requires `api_key` on `/health`, `/flush_cache`, and
-    /// `/get_load`. Health is enough to start the router; the other two are the
-    /// admin paths that previously omitted the bearer token.
-    async fn start_admin_auth_mock_server(
-        api_key: Option<&str>,
-    ) -> (String, tokio::task::JoinHandle<()>) {
-        use axum::{
-            http::header::AUTHORIZATION,
-            routing::{get, post},
-            Json, Router as AxumRouter,
-        };
-        use tokio::net::TcpListener;
-
-        let expected = api_key.map(|key| format!("Bearer {key}"));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let expected = std::sync::Arc::new(expected);
-        let authorize = {
-            let expected = expected.clone();
-            move |headers: HeaderMap| {
-                let sent = headers.get(AUTHORIZATION).map(|value| value.as_bytes());
-                sent == expected.as_deref().map(str::as_bytes)
-            }
-        };
-        let health_ok = authorize.clone();
-        let flush_ok = authorize.clone();
-        let load_ok = authorize;
-        let app = AxumRouter::new()
-            .route(
-                "/health",
-                get(move |headers: HeaderMap| async move {
-                    if health_ok(headers) {
-                        StatusCode::OK
-                    } else {
-                        StatusCode::UNAUTHORIZED
-                    }
-                }),
-            )
-            .route(
-                "/flush_cache",
-                post(move |headers: HeaderMap| async move {
-                    if flush_ok(headers) {
-                        StatusCode::OK
-                    } else {
-                        StatusCode::UNAUTHORIZED
-                    }
-                }),
-            )
-            .route(
-                "/get_load",
-                get(move |headers: HeaderMap| async move {
-                    if load_ok(headers) {
-                        (StatusCode::OK, Json(serde_json::json!({"load": 7}))).into_response()
-                    } else {
-                        StatusCode::UNAUTHORIZED.into_response()
-                    }
-                }),
-            );
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (format!("http://{}", addr), handle)
-    }
-
     async fn assert_admin_requests_use_api_key(api_key: Option<&str>) {
         use crate::config::RouterConfig;
 
-        let (url, server) = start_admin_auth_mock_server(api_key).await;
+        let (url, server, _) = start_admin_auth_mock_server(api_key).await;
         let config = RouterConfig {
             api_key: api_key.map(str::to_owned),
             worker_startup_timeout_secs: 5,
@@ -8263,7 +8171,7 @@ mod tests {
     async fn test_flush_cache_and_get_load_fail_without_matching_api_key() {
         use crate::config::RouterConfig;
 
-        let (url, server) = start_admin_auth_mock_server(Some("worker-key")).await;
+        let (url, server, _) = start_admin_auth_mock_server(Some("worker-key")).await;
         let config = RouterConfig {
             api_key: Some("other-key".to_string()),
             worker_startup_timeout_secs: 1,

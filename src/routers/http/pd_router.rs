@@ -896,7 +896,10 @@ impl PdRouterBase {
         let (base_url, _) = super::dp_utils::parse_worker_url(worker_url);
 
         let url = format!("{}/start_profile", base_url);
-        match self.client.post(&url).send().await {
+        match worker_post(&self.client, &url, self.api_key.as_deref())
+            .send()
+            .await
+        {
             Ok(res) if res.status().is_success() => {
                 info!("Started profiling on {}", base_url);
             }
@@ -919,7 +922,10 @@ impl PdRouterBase {
         let (base_url, _) = super::dp_utils::parse_worker_url(worker_url);
 
         let url = format!("{}/stop_profile", base_url);
-        match self.client.post(&url).send().await {
+        match worker_post(&self.client, &url, self.api_key.as_deref())
+            .send()
+            .await
+        {
             Ok(res) if res.status().is_success() => {
                 info!("Stopped profiling on {}", base_url);
             }
@@ -1619,11 +1625,10 @@ impl PdRouterBase {
         let (decode_base_url, _) = super::dp_utils::parse_worker_url(decode.url());
 
         let prefill_url = format!("{}/health_generate", prefill_base_url);
+        let decode_url = format!("{}/health_generate", decode_base_url);
         let (prefill_result, decode_result) = tokio::join!(
-            self.client.get(&prefill_url).send(),
-            self.client
-                .get(format!("{}/health_generate", decode_base_url))
-                .send()
+            worker_get(&self.client, &prefill_url, self.api_key.as_deref()).send(),
+            worker_get(&self.client, &decode_url, self.api_key.as_deref()).send()
         );
 
         // Check results
@@ -1919,6 +1924,7 @@ impl PdRouterBase {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerFactory, WorkerType};
+    use crate::routers::test_support::start_admin_auth_mock_server;
 
     fn create_test_pd_router() -> PdRouterBase {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1968,67 +1974,6 @@ mod tests {
         Box::new(worker)
     }
 
-    async fn start_admin_auth_mock_server(
-        api_key: Option<&str>,
-    ) -> (String, tokio::task::JoinHandle<()>) {
-        use axum::{
-            http::header::AUTHORIZATION,
-            routing::{get, post},
-            Json, Router as AxumRouter,
-        };
-        use tokio::net::TcpListener;
-
-        let expected = api_key.map(|key| format!("Bearer {key}"));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let expected = std::sync::Arc::new(expected);
-        let authorize = {
-            let expected = expected.clone();
-            move |headers: HeaderMap| {
-                let sent = headers.get(AUTHORIZATION).map(|value| value.as_bytes());
-                sent == expected.as_deref().map(str::as_bytes)
-            }
-        };
-        let health_ok = authorize.clone();
-        let flush_ok = authorize.clone();
-        let load_ok = authorize;
-        let app = AxumRouter::new()
-            .route(
-                "/health",
-                get(move |headers: HeaderMap| async move {
-                    if health_ok(headers) {
-                        StatusCode::OK
-                    } else {
-                        StatusCode::UNAUTHORIZED
-                    }
-                }),
-            )
-            .route(
-                "/flush_cache",
-                post(move |headers: HeaderMap| async move {
-                    if flush_ok(headers) {
-                        StatusCode::OK
-                    } else {
-                        StatusCode::UNAUTHORIZED
-                    }
-                }),
-            )
-            .route(
-                "/get_load",
-                get(move |headers: HeaderMap| async move {
-                    if load_ok(headers) {
-                        (StatusCode::OK, Json(serde_json::json!({"load": 7}))).into_response()
-                    } else {
-                        StatusCode::UNAUTHORIZED.into_response()
-                    }
-                }),
-            );
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (format!("http://{}", addr), handle)
-    }
-
     fn pd_router_with_api_key(api_key: Option<&str>) -> PdRouterBase {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry =
@@ -2049,10 +1994,79 @@ mod tests {
         }
     }
 
+    // Expected worker key, configured router key, and status returned by the worker.
+    const ADMIN_AUTH_CASES: [(Option<&str>, Option<&str>, StatusCode); 3] = [
+        (Some("worker-key"), Some("worker-key"), StatusCode::OK),
+        (Some("worker-key"), None, StatusCode::UNAUTHORIZED),
+        (None, None, StatusCode::OK),
+    ];
+
+    #[tokio::test]
+    async fn test_pd_profiling_worker_auth() {
+        for (expected_key, router_key, status) in ADMIN_AUTH_CASES {
+            let (url, server, requests) = start_admin_auth_mock_server(expected_key).await;
+            let router = pd_router_with_api_key(router_key);
+            router.start_profiling(&url).await;
+            router.stop_profiling(&url).await;
+            assert_eq!(
+                *requests.borrow(),
+                [
+                    ("/start_profile".into(), status),
+                    ("/stop_profile".into(), status)
+                ]
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pd_health_generate_worker_auth() {
+        for (expected_key, router_key, status) in ADMIN_AUTH_CASES {
+            let (prefill_url, prefill_server, prefill_requests) =
+                start_admin_auth_mock_server(expected_key).await;
+            let (decode_url, decode_server, decode_requests) =
+                start_admin_auth_mock_server(expected_key).await;
+            let prefill = create_test_worker(
+                prefill_url.clone(),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                true,
+            );
+            let decode = create_test_worker(decode_url.clone(), WorkerType::Decode, true);
+            let response = pd_router_with_api_key(router_key)
+                .health_generate_for_workers(&[Arc::from(prefill)], &[Arc::from(decode)])
+                .await;
+            let response_status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = std::str::from_utf8(&body).unwrap();
+            for requests in [prefill_requests, decode_requests] {
+                assert_eq!(*requests.borrow(), [("/health_generate".into(), status)]);
+            }
+            if status == StatusCode::OK {
+                assert_eq!(response_status, StatusCode::OK);
+                assert_eq!(body, format!("Health generate passed on selected pair: prefill={prefill_url}, decode={decode_url}"));
+            } else {
+                assert_eq!(response_status, StatusCode::SERVICE_UNAVAILABLE);
+                for (role, url) in [("Prefill", prefill_url), ("Decode", decode_url)] {
+                    assert!(
+                        body.contains(&format!("{role} {url} returned status {status}")),
+                        "{body}"
+                    );
+                }
+            }
+            prefill_server.abort();
+            decode_server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn test_pd_flush_cache_and_get_load_send_api_key() {
-        let (prefill_url, prefill_server) = start_admin_auth_mock_server(Some("worker-key")).await;
-        let (decode_url, decode_server) = start_admin_auth_mock_server(Some("worker-key")).await;
+        let (prefill_url, prefill_server, _) =
+            start_admin_auth_mock_server(Some("worker-key")).await;
+        let (decode_url, decode_server, _) = start_admin_auth_mock_server(Some("worker-key")).await;
         let router = pd_router_with_api_key(Some("worker-key"));
         router
             .worker_registry
@@ -2100,8 +2114,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_pd_flush_cache_and_get_load_fail_without_matching_api_key() {
-        let (prefill_url, prefill_server) = start_admin_auth_mock_server(Some("worker-key")).await;
-        let (decode_url, decode_server) = start_admin_auth_mock_server(Some("worker-key")).await;
+        let (prefill_url, prefill_server, _) =
+            start_admin_auth_mock_server(Some("worker-key")).await;
+        let (decode_url, decode_server, _) = start_admin_auth_mock_server(Some("worker-key")).await;
         let router = pd_router_with_api_key(Some("other-key"));
         router
             .worker_registry
