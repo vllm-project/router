@@ -216,6 +216,14 @@ impl EventStream {
                 self.index
                     .publish_stream(state, tx, seq + 1)
                     .map_err(StreamError::Index)?;
+                if !state.visible() {
+                    tracing::debug!(
+                        source = %self.index.target.instance_id,
+                        rank = self.index.target.dp_rank,
+                        seq,
+                        "fresh KV stream is waiting for a first-block Store to verify the hash root"
+                    );
+                }
             }
             if state.visible() {
                 if cleared {
@@ -511,6 +519,16 @@ mod tests {
         let lease = stream.begin_replay().unwrap();
         let tokens: Vec<_> = (0..33).collect();
         let root = full_store(&tokens[..32], 16, None);
+        let root_payload = event_payload(1.0, &[KVEvent::BlockStored(root.clone())], Some(0));
+        stream
+            .apply_publisher_payload(lease, 0, &root_payload)
+            .unwrap();
+        stream.finish_replay(lease, 1).unwrap();
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 32);
+        stream
+            .restart_replay(lease, true, Reason::RetryExhausted)
+            .unwrap();
+
         let mut suffix = root.clone();
         suffix.parent_block_hash = Some(ExternalBlockHash::Bytes(vec![7; 32]));
         stream
@@ -523,11 +541,7 @@ mod tests {
         assert_eq!(index.control.generation(), 0);
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 0);
         stream
-            .apply_publisher_payload(
-                lease,
-                21,
-                &event_payload(2.0, &[KVEvent::BlockStored(root)], Some(0)),
-            )
+            .apply_publisher_payload(lease, 21, &root_payload)
             .unwrap();
         assert_ne!(index.control.generation(), 0);
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 32);

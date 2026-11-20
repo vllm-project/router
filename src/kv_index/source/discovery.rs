@@ -734,11 +734,12 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         kv_block_size: Some(config.block_size),
         ..Default::default()
     };
+    let requires_rank_alignment = rank_suffix.is_some() || config.hybrid.is_some();
     if (rank_suffix.is_some() && config.endpoints.len() > 1)
-        || config
-            .replay_endpoints
-            .as_ref()
-            .is_some_and(|endpoints| endpoints.len() > config.endpoints.len())
+        || config.replay_endpoints.as_ref().is_some_and(|replay| {
+            replay.len() > config.endpoints.len()
+                || (requires_rank_alignment && replay.len() != config.endpoints.len())
+        })
     {
         return WorkerDiscovery {
             server_info: Ok(server_info),
@@ -1199,5 +1200,26 @@ mod rank_merge_tests {
             sources["3"].replay_endpoint.as_deref(),
             Some("tcp://rank3:5558")
         );
+
+        let pinned = format!("{base}@3");
+        supervisor
+            .static_sources
+            .get_mut(&pinned)
+            .unwrap()
+            .replay_endpoints = Some(Vec::new());
+        assert!(supervisor
+            .resolved_static_source(&pinned)
+            .unwrap()
+            .sources
+            .is_err());
+
+        let declaration = supervisor.static_sources.get_mut(base).unwrap();
+        declaration.endpoints.push("tcp://rank1:5557".into());
+        declaration.replay_endpoints = Some(vec!["tcp://rank1:5558".into()]);
+        assert!(supervisor
+            .resolved_static_source(base)
+            .unwrap()
+            .sources
+            .is_err());
     }
 }

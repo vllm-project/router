@@ -962,6 +962,7 @@ See [worker and KV event options](../cli_reference.md#workers-and-backend), [rou
 
 - If the engine reports hits and the Router does not, check the layout's model and topic, the hash flags, and whether both event ports are reachable from the Router.
 - If a worker-reported layout is rejected, run the Router with `--log-level debug` and look for `worker-reported KV layout rejected` to see the reason.
+- If replay history is incomplete, an inferred full-attention layout resumes cache credit after the Router verifies a first-block Store against the default hash root.
 - For `unsupported tail-drop layout`, check the worker's [MTP recipe](#qwen38-27b-with-mtp).
 - If vLLM reports `Address already in use`, check the live and replay port ranges before starting it again. Inspect the actual event addresses in `/kv_event_sources` for HTTP or `Control.GetKvEventSources` for gRPC.
 - When a worker restarts, rerun the worker settings for a fresh topic. Update the layout only if it explicitly pins the topic or other layout fields changed. On a Router-only restart, replay recovers the events still in the worker's history.

@@ -99,7 +99,7 @@ fn changed_layout_rebinds_without_waiting_for_the_descriptor_interval() {
 }
 
 use super::lifecycle::SourceAction;
-use super::probe::{grpc_kv_event_source_entries, worker_descriptor};
+use super::probe::worker_descriptor;
 use super::reconcile::{bound_source_moved, probe_keeps_trust, probe_renews_trust, BoundSource};
 use super::*;
 use crate::kv_index::source::test_support::{event_payload, full_store};
@@ -272,30 +272,6 @@ fn events_enabled_gates_on_publisher_and_endpoint() {
 }
 
 #[test]
-fn grpc_model_id_preserves_errors_and_rejects_empty_ids() {
-    let error = "GetModelInfo unavailable".to_string();
-    assert_eq!(grpc_model_id(Err(error.clone())), Err(error));
-    assert_eq!(
-        grpc_model_id(Ok(crate::backend::pb::ModelInfo::default())),
-        Ok(None)
-    );
-    assert_eq!(
-        grpc_model_id(Ok(crate::backend::pb::ModelInfo {
-            model_id: "   ".into(),
-            ..Default::default()
-        })),
-        Ok(None)
-    );
-    assert_eq!(
-        grpc_model_id(Ok(crate::backend::pb::ModelInfo {
-            model_id: "model-a".into(),
-            ..Default::default()
-        })),
-        Ok(Some("model-a".into()))
-    );
-}
-
-#[test]
 fn zero_block_size_is_treated_as_missing() {
     for (configured, effective, expected) in [
         (8, 16, Some(16)),
@@ -324,30 +300,6 @@ fn kv_event_sources_decodes_rank_map() {
     assert_eq!(m["0"].encoding.as_deref(), Some("msgpack"));
     assert_eq!(m["0"].schema_version, Some(1));
     assert!(m["1"].replay_endpoint.is_none());
-}
-
-#[test]
-fn grpc_sources_without_rank_are_skipped_instead_of_positionally_assigned() {
-    let source = |rank| crate::backend::pb::KvEventSource {
-        transport: "zmq".to_string(),
-        endpoint: "tcp://worker:5557".to_string(),
-        topic: String::new(),
-        replay_endpoint: String::new(),
-        data_parallel_rank: rank,
-        encoding: "msgpack".to_string(),
-        schema_version: 1,
-        buffer_steps: 1,
-        hwm: 100,
-        max_queue_size: 0,
-    };
-
-    let entries =
-        grpc_kv_event_source_entries("grpc://worker:8000", vec![source(None), source(Some(3))]);
-
-    assert_eq!(entries.len(), 1);
-    assert!(entries.contains_key("3"));
-    assert_eq!(entries["3"].publisher.as_deref(), Some("zmq"));
-    assert_eq!(entries["3"].enable_kv_cache_events, Some(true));
 }
 
 #[test]

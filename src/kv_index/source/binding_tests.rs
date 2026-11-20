@@ -1247,12 +1247,30 @@ fn malformed_adapter_store_preserves_base_credit_and_sequence() {
         index.reusable_tokens_in(Some("lora1"), &prompt(), usize::MAX),
         528
     );
-    let KVEvent::BlockStored(store) = &mut batch.events[0] else {
-        panic!("expected store");
-    };
-    store.group_idx = Some(u32::MAX);
-    assert_eq!(index.apply_batch(3, &batch), Err(SourceError::InvalidBatch));
-    assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
+}
+
+#[test]
+fn declared_adapter_store_does_not_hide_layout_errors() {
+    for error in ["group", "kind", "locality", "block size"] {
+        let index = fresh_index(16).with_adapters(vec![("lora1".into(), "/adapters/lora1".into())]);
+        index.apply_batch(0, &qwen_batch()).unwrap();
+        let mut batch = adapter_batch("lora1", "/adapters/lora1");
+        let KVEvent::BlockStored(store) = &mut batch.events[0] else {
+            panic!("expected store");
+        };
+        match error {
+            "group" => store.group_idx = Some(u32::MAX),
+            "kind" => store.kv_cache_spec_kind = Some("sliding_window".into()),
+            "locality" => store.locality = Some("REMOTE".into()),
+            _ => store.block_size = 0,
+        }
+        assert_eq!(
+            index.apply_batch(1, &batch),
+            Err(SourceError::InvalidBatch),
+            "{error}"
+        );
+        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
+    }
 }
 
 #[test]

@@ -511,3 +511,57 @@ pub(super) fn served_model(models: &serde_json::Value) -> Option<(String, Option
         .map(str::to_owned);
     Some((id.to_owned(), path))
 }
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grpc_model_id_preserves_errors_and_rejects_empty_ids() {
+        let error = "GetModelInfo unavailable".to_string();
+        assert_eq!(grpc_model_id(Err(error.clone())), Err(error));
+        assert_eq!(
+            grpc_model_id(Ok(crate::backend::pb::ModelInfo::default())),
+            Ok(None)
+        );
+        assert_eq!(
+            grpc_model_id(Ok(crate::backend::pb::ModelInfo {
+                model_id: "   ".into(),
+                ..Default::default()
+            })),
+            Ok(None)
+        );
+        assert_eq!(
+            grpc_model_id(Ok(crate::backend::pb::ModelInfo {
+                model_id: "model-a".into(),
+                ..Default::default()
+            })),
+            Ok(Some("model-a".into()))
+        );
+    }
+
+    #[test]
+    fn grpc_sources_without_rank_are_skipped_instead_of_positionally_assigned() {
+        let source = |rank| crate::backend::pb::KvEventSource {
+            transport: "zmq".to_string(),
+            endpoint: "tcp://worker:5557".to_string(),
+            topic: String::new(),
+            replay_endpoint: String::new(),
+            data_parallel_rank: rank,
+            encoding: "msgpack".to_string(),
+            schema_version: 1,
+            buffer_steps: 1,
+            hwm: 100,
+            max_queue_size: 0,
+        };
+
+        let entries =
+            grpc_kv_event_source_entries("grpc://worker:8000", vec![source(None), source(Some(3))]);
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries.contains_key("3"));
+        assert_eq!(entries["3"].publisher.as_deref(), Some("zmq"));
+        assert_eq!(entries["3"].enable_kv_cache_events, Some(true));
+    }
+}
