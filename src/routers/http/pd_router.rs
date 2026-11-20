@@ -552,6 +552,7 @@ impl Worker for PolicyWorker {
 
 #[derive(Debug, Clone)]
 pub struct PdRouterBase {
+    pub(super) worker_auth: crate::backend::WorkerAuth,
     pub(super) kv_state: Option<Arc<PdKvState>>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub(super) pd_load: Arc<PdLoadManager>,
@@ -1246,6 +1247,13 @@ impl PdRouterBase {
         // Workers must be up before they can report their engine count.
         let prefill_base_urls: Vec<String> =
             prefill_urls.iter().map(|(url, _)| url.clone()).collect();
+        let worker_auth = crate::backend::WorkerAuth::new(
+            ctx.router_config.api_key.as_deref(),
+            prefill_base_urls
+                .iter()
+                .chain(decode_urls.iter())
+                .map(String::as_str),
+        )?;
         for urls in [&prefill_base_urls, &decode_urls] {
             if !urls.is_empty() {
                 crate::routers::http::router::Router::wait_for_healthy_workers(
@@ -1359,7 +1367,7 @@ impl PdRouterBase {
             Some(
                 PdKvState::start(
                     ctx.client.clone(),
-                    ctx.router_config.api_key.clone(),
+                    worker_auth.clone(),
                     ctx.router_config.pd_kv_event_sources.clone(),
                     Arc::clone(&ctx.worker_registry),
                     kv_aware_ops(prefill_policy.as_ref())
@@ -1376,6 +1384,7 @@ impl PdRouterBase {
             None
         };
         Ok(PdRouterBase {
+            worker_auth,
             kv_state,
             pd_load: Arc::new(PdLoadManager::default()),
             worker_registry: Arc::clone(&ctx.worker_registry),
@@ -1668,8 +1677,12 @@ impl PdRouterBase {
 
     pub async fn get_server_info(&self, _req: Request<Body>) -> Response {
         if let Some(worker_url) = self.first_grpc_prefill_url() {
-            return match crate::backend::get_grpc_server_info(&worker_url, Duration::from_secs(2))
-                .await
+            return match crate::backend::control::get_grpc_server_info_with_auth(
+                &worker_url,
+                self.worker_auth.key_for(&worker_url).as_deref(),
+                Duration::from_secs(2),
+            )
+            .await
             {
                 Ok(info) => (
                     StatusCode::OK,
@@ -1692,7 +1705,13 @@ impl PdRouterBase {
     ) -> Option<Response> {
         let worker_url = self.first_grpc_prefill_url()?;
         Some(
-            match crate::backend::get_grpc_model_info(&worker_url, Duration::from_secs(2)).await {
+            match crate::backend::control::get_grpc_model_info_with_auth(
+                &worker_url,
+                self.worker_auth.key_for(&worker_url).as_deref(),
+                Duration::from_secs(2),
+            )
+            .await
+            {
                 Ok(info) => (StatusCode::OK, Json(render(&info))).into_response(),
                 Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
             },
@@ -1909,6 +1928,7 @@ mod tests {
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
 
         PdRouterBase {
+            worker_auth: Default::default(),
             kv_state: None,
             pd_load: Arc::new(PdLoadManager::default()),
             worker_registry,
@@ -1930,6 +1950,7 @@ mod tests {
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
 
         PdRouterBase {
+            worker_auth: Default::default(),
             kv_state: None,
             pd_load: Arc::new(PdLoadManager::default()),
             worker_registry,

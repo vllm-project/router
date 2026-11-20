@@ -84,6 +84,15 @@ impl EngineFrontend {
         }
     }
 
+    pub(crate) fn with_worker_auth(mut self, auth: super::WorkerAuth) -> Self {
+        self.grpc.auth = auth;
+        self
+    }
+
+    pub(crate) fn worker_key(&self, url: &str) -> Option<Arc<str>> {
+        self.grpc.auth.key_for(url)
+    }
+
     /// Enable L0 with a shared budget across models.
     pub fn with_tokenizer_cache(
         request_timeout: Duration,

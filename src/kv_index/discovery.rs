@@ -103,7 +103,7 @@ struct LiveSource {
 /// identity.
 pub struct KvIndexSupervisor {
     client: reqwest::Client,
-    api_key: Option<String>,
+    worker_auth: crate::backend::WorkerAuth,
     hash_mode: HashMode,
     full_attention_http: bool,
     strict_recovery: bool,
@@ -147,7 +147,7 @@ impl KvIndexSupervisor {
         let (signal_tx, signal_rx) = mpsc::channel::<IngestionSignal>(256);
         let supervisor = KvIndexSupervisor {
             client,
-            api_key: None,
+            worker_auth: Default::default(),
             hash_mode,
             full_attention_http: false,
             strict_recovery: false,
@@ -204,8 +204,8 @@ impl KvIndexSupervisor {
         self.strict_recovery = enabled;
     }
 
-    pub(crate) fn set_api_key(&mut self, api_key: Option<String>) {
-        self.api_key = api_key;
+    pub(crate) fn set_worker_auth(&mut self, worker_auth: crate::backend::WorkerAuth) {
+        self.worker_auth = worker_auth;
     }
 
     pub fn with_static_sources(
@@ -227,18 +227,22 @@ impl KvIndexSupervisor {
             .lock()
             .get(worker_url)
             .map(|worker| worker.active.clone());
-        let discovery = self.discover(worker_url).await;
+        let discovery = self
+            .discover(worker_url, self.worker_auth.key_for(worker_url).as_deref())
+            .await;
         self.install_observed_worker(worker_url, discovery, observed)
     }
 
     /// Prepare metadata once; P/D refresh fingerprints and installs this same snapshot.
-    pub(crate) async fn discover(&self, worker_url: &str) -> WorkerDiscovery {
+    pub(crate) async fn discover(
+        &self,
+        worker_url: &str,
+        api_key: Option<&str>,
+    ) -> WorkerDiscovery {
         if self.http_pd {
             return match self.static_pd_sources.get(worker_url) {
                 Some(config) => static_pd_discovery(worker_url, config),
-                None => {
-                    discover_worker(&self.client, worker_url, true, self.api_key.as_deref()).await
-                }
+                None => discover_worker(&self.client, worker_url, true, api_key).await,
             };
         }
         let grpc = crate::backend::is_grpc_url(worker_url);
@@ -256,14 +260,9 @@ impl KvIndexSupervisor {
                 static_worker_discovery(worker_url, config)
             }
             None if full_attention_http => {
-                discover_full_attention_http_worker(
-                    &self.client,
-                    worker_url,
-                    self.api_key.as_deref(),
-                )
-                .await
+                discover_full_attention_http_worker(&self.client, worker_url, api_key).await
             }
-            None => discover_worker(&self.client, worker_url, false, self.api_key.as_deref()).await,
+            None => discover_worker(&self.client, worker_url, false, api_key).await,
         }
     }
 
@@ -660,10 +659,17 @@ async fn discover_worker(
 ) -> WorkerDiscovery {
     if crate::backend::is_grpc_url(worker_url) {
         let timeout = Duration::from_secs(10);
-        let server = crate::backend::control::get_grpc_server_info(worker_url, timeout).await;
-        let model =
-            grpc_model_id(crate::backend::control::get_grpc_model_info(worker_url, timeout).await);
-        let sources = crate::backend::control::get_grpc_kv_event_sources(worker_url, timeout).await;
+        let server =
+            crate::backend::control::get_grpc_server_info_with_auth(worker_url, api_key, timeout)
+                .await;
+        let model = grpc_model_id(
+            crate::backend::control::get_grpc_model_info_with_auth(worker_url, api_key, timeout)
+                .await,
+        );
+        let sources = crate::backend::control::get_grpc_kv_event_sources_with_auth(
+            worker_url, api_key, timeout,
+        )
+        .await;
         let server_info = server.map(|server| {
             let model_id = model.as_ref().ok().and_then(|model| model.clone());
             ServerInfo {

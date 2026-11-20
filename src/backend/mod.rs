@@ -16,6 +16,10 @@
 //! `VLLM_ROUTER_STAGES=1` emits stage clocks. gRPC always tokenizes; HTTP
 //! remains a transparent proxy and reports worker header/first-byte timings.
 
+mod auth;
+use auth::set_bearer_auth;
+pub(crate) use auth::WorkerAuth;
+
 pub mod completion;
 pub mod control;
 pub mod convert;

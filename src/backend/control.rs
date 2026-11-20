@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use tonic::service::{interceptor::InterceptedService, Interceptor};
 use tonic::transport::Channel;
 
 use super::detect::grpc_connect_uri;
@@ -13,11 +14,13 @@ use super::pb::{
     control_client::ControlClient, GetKvEventSourcesRequest, GetKvEventSourcesResponse,
     GetModelInfoRequest, GetServerInfoRequest, ModelInfo, ServerInfo,
 };
+use super::set_bearer_auth;
 
-async fn control_client(
+async fn control_client<'a>(
     worker_url: &str,
+    api_key: Option<&'a str>,
     timeout: Duration,
-) -> Result<ControlClient<Channel>, String> {
+) -> Result<ControlClient<InterceptedService<Channel, impl Interceptor + 'a>>, String> {
     let uri = grpc_connect_uri(worker_url)?;
     let channel = Channel::from_shared(uri.clone())
         .map_err(|e| format!("invalid grpc uri {uri}: {e}"))?
@@ -26,12 +29,26 @@ async fn control_client(
         .connect()
         .await
         .map_err(|e| format!("grpc control connect {uri}: {e}"))?;
-    Ok(ControlClient::new(channel))
+    Ok(ControlClient::with_interceptor(
+        channel,
+        move |mut request| {
+            set_bearer_auth(&mut request, api_key).map_err(tonic::Status::invalid_argument)?;
+            Ok(request)
+        },
+    ))
 }
 
 pub async fn get_grpc_model_info(worker_url: &str, timeout: Duration) -> Result<ModelInfo, String> {
+    get_grpc_model_info_with_auth(worker_url, None, timeout).await
+}
+
+pub(crate) async fn get_grpc_model_info_with_auth(
+    worker_url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<ModelInfo, String> {
     let uri = grpc_connect_uri(worker_url)?;
-    let mut client = control_client(worker_url, timeout).await?;
+    let mut client = control_client(worker_url, api_key, timeout).await?;
     tokio::time::timeout(timeout, client.get_model_info(GetModelInfoRequest {}))
         .await
         .map_err(|_| format!("grpc GetModelInfo timeout {uri}"))?
@@ -43,8 +60,16 @@ pub async fn get_grpc_server_info(
     worker_url: &str,
     timeout: Duration,
 ) -> Result<ServerInfo, String> {
+    get_grpc_server_info_with_auth(worker_url, None, timeout).await
+}
+
+pub(crate) async fn get_grpc_server_info_with_auth(
+    worker_url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<ServerInfo, String> {
     let uri = grpc_connect_uri(worker_url)?;
-    let mut client = control_client(worker_url, timeout).await?;
+    let mut client = control_client(worker_url, api_key, timeout).await?;
     tokio::time::timeout(timeout, client.get_server_info(GetServerInfoRequest {}))
         .await
         .map_err(|_| format!("grpc GetServerInfo timeout {uri}"))?
@@ -56,8 +81,16 @@ pub async fn get_grpc_kv_event_sources(
     worker_url: &str,
     timeout: Duration,
 ) -> Result<GetKvEventSourcesResponse, String> {
+    get_grpc_kv_event_sources_with_auth(worker_url, None, timeout).await
+}
+
+pub(crate) async fn get_grpc_kv_event_sources_with_auth(
+    worker_url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<GetKvEventSourcesResponse, String> {
     let uri = grpc_connect_uri(worker_url)?;
-    let mut client = control_client(worker_url, timeout).await?;
+    let mut client = control_client(worker_url, api_key, timeout).await?;
     tokio::time::timeout(
         timeout,
         client.get_kv_event_sources(GetKvEventSourcesRequest {}),
@@ -99,14 +132,27 @@ pub fn grpc_engine_version_older_than_0_30(version: &str) -> bool {
     (major, minor, patch) < (0, 30, 0)
 }
 
+pub async fn warn_old_grpc_pd_workers<'a>(urls: impl IntoIterator<Item = &'a str>) {
+    warn_old_grpc_pd_workers_with_auth(urls, &super::WorkerAuth::default()).await;
+}
+
 /// Log when a gRPC P/D worker will abort every decode. Health checks pass on
 /// vLLM 0.29.x; the float-port failure only shows up on the first request.
-pub async fn warn_old_grpc_pd_workers<'a>(urls: impl IntoIterator<Item = &'a str>) {
+pub(crate) async fn warn_old_grpc_pd_workers_with_auth<'a>(
+    urls: impl IntoIterator<Item = &'a str>,
+    auth: &super::WorkerAuth,
+) {
     for url in urls {
         if !crate::backend::is_grpc_url(url) {
             continue;
         }
-        match get_grpc_server_info(url, Duration::from_secs(2)).await {
+        match get_grpc_server_info_with_auth(
+            url,
+            auth.key_for(url).as_deref(),
+            Duration::from_secs(2),
+        )
+        .await
+        {
             Ok(info) if grpc_engine_version_older_than_0_30(&info.engine_version) => {
                 tracing::warn!(
                     worker = %url,

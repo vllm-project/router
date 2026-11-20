@@ -391,6 +391,10 @@ impl Router {
 
         // All-http or all-grpc. Mixed schemes fail here (not a silent fallback).
         let pool_kind = crate::backend::classify_worker_urls(&worker_urls)?;
+        let worker_auth = crate::backend::WorkerAuth::new(
+            ctx.router_config.api_key.as_deref(),
+            worker_urls.iter().map(String::as_str),
+        )?;
         let default_policy = ctx.policy_registry.get_default_policy();
         let pending_kv_supervisor = if kv_aware_ops(default_policy.as_ref()).is_some() {
             let (mut supervisor, signals) =
@@ -398,7 +402,7 @@ impl Router {
                     ctx.client.clone(),
                     crate::kv_index::HashMode::Sha256,
                 );
-            supervisor.set_api_key(ctx.router_config.api_key.clone());
+            supervisor.set_worker_auth(worker_auth.clone());
             supervisor.set_strict_recovery(ctx.router_config.kv_event_strict_recovery);
             let static_sources = match &ctx.router_config.policy {
                 crate::config::PolicyConfig::KvAware {
@@ -435,7 +439,8 @@ impl Router {
         } else {
             crate::backend::EngineFrontend::from_env(request_timeout)
                 .map_err(|error| format!("tokenizer cache: {error}"))?
-        };
+        }
+        .with_worker_auth(worker_auth.clone());
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
         if !worker_urls.is_empty() {
             Self::wait_for_healthy_workers(
@@ -1290,7 +1295,13 @@ impl Router {
 
                 let check_health = tokio::spawn(async move {
                     if crate::backend::is_grpc_url(&url_clone) {
-                        match check_grpc_health_within(&url_clone, probe_timeout).await {
+                        match check_grpc_health_within(
+                            &url_clone,
+                            api_key.as_deref(),
+                            probe_timeout,
+                        )
+                        .await
+                        {
                             Ok(()) => None,
                             Err(e) => Some((url_clone, e)),
                         }
@@ -1407,7 +1418,13 @@ impl Router {
         };
 
         if crate::backend::is_grpc_url(health_url) {
-            return match check_grpc_health_within(health_url, Duration::from_secs(2)).await {
+            return match check_grpc_health_within(
+                health_url,
+                self.frontend.worker_key(health_url).as_deref(),
+                Duration::from_secs(2),
+            )
+            .await
+            {
                 Ok(()) => StatusCode::OK.into_response(),
                 Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
             };
@@ -2648,7 +2665,7 @@ impl Router {
             .timeout(health_timeout)
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-        let worker_api_key: Option<Arc<str>> = self.api_key.as_deref().map(Arc::from);
+        let worker_api_key = self.frontend.worker_key(worker_url);
         let mut last_health_error = String::from("none");
 
         loop {
@@ -2664,7 +2681,12 @@ impl Router {
             let health_result = if crate::backend::is_grpc_url(worker_url) {
                 // No test covers this limit: it shortens a 2 s probe, so a test
                 // would hinge on a sub-second wall-clock bound.
-                check_grpc_health_within(worker_url, budget.probe(Duration::from_secs(2))).await
+                check_grpc_health_within(
+                    worker_url,
+                    worker_api_key.as_deref(),
+                    budget.probe(Duration::from_secs(2)),
+                )
+                .await
             } else {
                 let health_url = format!("{}/health", worker_url);
                 match worker_get(&client, &health_url, self.api_key.as_deref())
@@ -3106,8 +3128,9 @@ impl RouterTrait for Router {
     async fn get_server_info(&self, req: Request<Body>) -> Response {
         match self.select_first_worker() {
             Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
-                return match crate::backend::get_grpc_server_info(
+                return match crate::backend::control::get_grpc_server_info_with_auth(
                     &worker_url,
+                    self.frontend.worker_key(&worker_url).as_deref(),
                     Duration::from_secs(2),
                 )
                 .await
@@ -3129,8 +3152,9 @@ impl RouterTrait for Router {
     async fn get_models(&self, req: Request<Body>) -> Response {
         match self.select_first_worker() {
             Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
-                return match crate::backend::get_grpc_model_info(
+                return match crate::backend::control::get_grpc_model_info_with_auth(
                     &worker_url,
+                    self.frontend.worker_key(&worker_url).as_deref(),
                     Duration::from_secs(2),
                 )
                 .await
@@ -3152,8 +3176,9 @@ impl RouterTrait for Router {
     async fn get_model_info(&self, req: Request<Body>) -> Response {
         match self.select_first_worker() {
             Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
-                return match crate::backend::get_grpc_model_info(
+                return match crate::backend::control::get_grpc_model_info_with_auth(
                     &worker_url,
+                    self.frontend.worker_key(&worker_url).as_deref(),
                     Duration::from_secs(2),
                 )
                 .await

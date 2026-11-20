@@ -262,14 +262,11 @@ has tracing support.
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key for the router's own requests to workers, including HTTP health checks. |
+| `--api-key` | `string` | `unset` | `string` | `unset` | Bearer token for HTTP worker requests and [configured gRPC workers](backend/grpc.md#worker-authentication). |
 | `--api-key-validation-urls` | `string [0..] (repeatable)` | `[]` | — | — | Validation URLs; an empty list falls back to comma-separated `API_KEY_VALIDATION_URLS` from the environment or `.env`. |
 
-The key is the bearer token the router sends on its own requests to HTTP
-workers, including health checks; clients authenticate to the router
-separately with `--api-key-validation-urls`. It is not sent yet on
-`/flush_cache`, `/get_load`, gRPC requests, or PD and `--enable-igw` health
-checks.
+The router uses `--api-key` for its own worker requests. Clients authenticate
+to the router separately with `--api-key-validation-urls`.
 
 The startup wait and `add_worker` always probe `/health`, regardless of
 `--health-check-endpoint`.

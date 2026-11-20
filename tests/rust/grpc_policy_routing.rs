@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::create_test_context;
-use common::mock_vllm_rs::{MockVllmRs, MockVllmRsServer};
+use common::mock_vllm_rs::{AuthorizationCheck, MockVllmRs, MockVllmRsServer};
 use serde_json::{json, Value};
 use vllm_router_rs::config::{PolicyConfig, RouterConfig, RoutingMode};
 use vllm_router_rs::protocols::spec::CompletionRequest;
@@ -546,5 +546,160 @@ async fn power_of_two_prefers_the_less_loaded_worker() {
     assert_eq!(
         avoided, 12,
         "power-of-two should avoid the in-flight worker"
+    );
+}
+
+async fn assert_control_requests(router: &Router, server: &MockVllmRsServer) {
+    // KV discovery tolerates failed RPCs, so check what the worker saw at startup.
+    server.assert_control_authorization(&["GetModelInfo", "GetServerInfo", "GetKvEventSources"]);
+    let get = || axum::http::Request::new(axum::body::Body::empty());
+    for (path, response) in [
+        ("/get_model_info", router.get_model_info(get()).await),
+        ("/get_server_info", router.get_server_info(get()).await),
+        ("/v1/models", router.get_models(get()).await),
+    ] {
+        assert_eq!(response.status(), axum::http::StatusCode::OK, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn api_key_reaches_grpc_health_control_and_generate() {
+    let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        authorization: AuthorizationCheck::Bearer("worker-secret".to_string()),
+        health_authorization: AuthorizationCheck::Bearer("worker-secret".to_string()),
+        ..MockVllmRs::default()
+    })
+    .await;
+    let urls = vec![server.grpc_url.clone()];
+    let mut cfg = config(urls.clone(), kv_aware());
+    cfg.api_key = Some("worker-secret".to_string());
+    let router = Router::new(urls, &create_test_context(cfg))
+        .await
+        .expect("the startup grpc health check must pass with the api key");
+    assert_control_requests(&router, &server).await;
+    router.pin_test_token_ids(vec![1]);
+
+    let response = router.send_health_check(&server.grpc_url).await;
+    assert!(
+        response.status().is_success(),
+        "the manual health probe must carry the api key too"
+    );
+
+    complete(
+        &router,
+        std::slice::from_ref(&server),
+        prompt(&[1], json!({})),
+    )
+    .await;
+    let captured = server.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].authorization.as_deref(),
+        Some("Bearer worker-secret"),
+        "generate must send the api key as authorization metadata"
+    );
+}
+
+/// Without `--api-key` no `authorization` metadata is sent at all.
+#[tokio::test]
+async fn without_api_key_no_authorization_metadata_is_sent() {
+    let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        authorization: AuthorizationCheck::Absent,
+        health_authorization: AuthorizationCheck::Absent,
+        ..MockVllmRs::default()
+    })
+    .await;
+    let urls = vec![server.grpc_url.clone()];
+    let router = Router::new(urls.clone(), &create_test_context(config(urls, kv_aware())))
+        .await
+        .expect("grpc health must pass without credentials");
+    assert_control_requests(&router, &server).await;
+    router.pin_test_token_ids(vec![1]);
+
+    complete(
+        &router,
+        std::slice::from_ref(&server),
+        prompt(&[1], json!({})),
+    )
+    .await;
+    let captured = server.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].authorization, None,
+        "no authorization metadata may be invented without --api-key"
+    );
+}
+
+#[tokio::test]
+async fn igw_registration_discovery_and_inference_omit_the_shared_api_key() {
+    use vllm_router_rs::routers::{
+        http::vllm_pd_router::VllmPDRouter,
+        router_manager::{RouterId, RouterManager},
+    };
+
+    let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        authorization: AuthorizationCheck::Absent,
+        ..MockVllmRs::default()
+    })
+    .await;
+    let mut cfg = config(vec![], kv_aware());
+    cfg.enable_igw = true;
+    cfg.api_key = Some("worker-secret".into());
+    let ctx = create_test_context(cfg);
+    let manager = RouterManager::new(
+        ctx.router_config.clone(),
+        ctx.client.clone(),
+        ctx.worker_registry.clone(),
+        ctx.policy_registry.clone(),
+    );
+    let regular = Router::new(vec![], &ctx).await.unwrap();
+    regular.pin_test_token_ids(vec![1]);
+    manager.register_router(RouterId::new("http-regular".into()), Arc::new(regular));
+    let registration =
+        serde_json::from_value(json!({"url": server.grpc_url, "worker_type": "prefill"})).unwrap();
+    let worker = manager
+        .add_worker(registration)
+        .await
+        .unwrap()
+        .worker
+        .unwrap();
+    assert_eq!(worker.model_id, "mock-model");
+
+    // P/D refresh reads the same registry as IGW registration.
+    let _router = VllmPDRouter::new(vec![], vec![], None, &ctx).await.unwrap();
+    server.assert_control_authorization(&["GetModelInfo", "GetServerInfo", "GetKvEventSources"]);
+
+    manager
+        .remove_worker_from_registry(&server.grpc_url)
+        .unwrap();
+    let registration =
+        serde_json::from_value(json!({"url": server.grpc_url, "model_id": "mock-model"})).unwrap();
+    manager.add_worker(registration).await.unwrap();
+    let request = serde_json::from_value(prompt(&[1], json!({"model": "mock-model"}))).unwrap();
+    let response = manager.route_completion(None, &request, None).await;
+    assert!(response.status().is_success(), "{}", response.status());
+    assert!(server.captured().last().unwrap().authorization.is_none());
+}
+
+/// A wrong key surfaces as a failed startup wait, as on the HTTP path.
+#[tokio::test]
+async fn wrong_api_key_fails_the_grpc_startup_health_check() {
+    let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        authorization: AuthorizationCheck::Bearer("worker-secret".to_string()),
+        health_authorization: AuthorizationCheck::Bearer("worker-secret".to_string()),
+        ..MockVllmRs::default()
+    })
+    .await;
+    let urls = vec![server.grpc_url.clone()];
+    let mut cfg = config(urls.clone(), PolicyConfig::RoundRobin);
+    cfg.api_key = Some("other-key".to_string());
+    let error = Router::new(urls, &create_test_context(cfg))
+        .await
+        .expect_err("a wrong key must fail the startup wait");
+    assert!(
+        error
+            .to_ascii_lowercase()
+            .contains("authentication credentials"),
+        "the rejection should surface in the startup error: {error}"
     );
 }
