@@ -562,6 +562,7 @@ pub struct PdRouterBase {
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub client: Client,
     api_key: Option<String>,
+    health_config: HealthConfig,
     pub circuit_breaker_config: CircuitBreakerConfig,
     // Fallback DP size for servers that report no engine metrics
     pub dp_size: usize,
@@ -573,7 +574,7 @@ fn build_dp_workers(
     dp_size: usize,
     worker_type: WorkerType,
     circuit_breaker_config: &CircuitBreakerConfig,
-    health_config: Option<&HealthConfig>,
+    health_config: &HealthConfig,
 ) -> Result<Vec<Arc<dyn Worker>>, String> {
     let (base_url, _) = dp_utils::parse_worker_url(url);
 
@@ -581,11 +582,8 @@ fn build_dp_workers(
     // IPv6+DP URL corruption where HTTP clients read @N as userinfo (RFC 3986).
     let dp_worker = |rank: usize| -> Arc<dyn Worker> {
         let worker = DPAwareWorker::new(base_url.clone(), rank, dp_size, worker_type.clone())
-            .with_circuit_breaker_config(circuit_breaker_config.clone());
-        let worker = match health_config {
-            Some(config) => worker.with_health_config(config.clone()),
-            None => worker,
-        };
+            .with_circuit_breaker_config(circuit_breaker_config.clone())
+            .with_health_config(health_config.clone());
         Arc::new(worker)
     };
 
@@ -596,11 +594,8 @@ fn build_dp_workers(
             None => {
                 let worker = BasicWorker::new(url.to_string(), worker_type.clone())
                     .with_dp_size(dp_size)
-                    .with_circuit_breaker_config(circuit_breaker_config.clone());
-                let worker = match health_config {
-                    Some(config) => worker.with_health_config(config.clone()),
-                    None => worker,
-                };
+                    .with_circuit_breaker_config(circuit_breaker_config.clone())
+                    .with_health_config(health_config.clone());
                 Arc::new(worker) as Arc<dyn Worker>
             }
         })
@@ -819,6 +814,7 @@ impl PdRouterBase {
             &[url.to_string()],
             self.worker_startup_timeout_secs,
             self.worker_startup_check_interval_secs,
+            &self.health_config.endpoint,
             // PD health checks do not send the API key yet.
             None,
         )
@@ -1036,7 +1032,7 @@ impl PdRouterBase {
             dp_size,
             worker_type,
             &self.circuit_breaker_config,
-            None,
+            &self.health_config,
         )
         .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
@@ -1252,6 +1248,7 @@ impl PdRouterBase {
                     urls,
                     ctx.router_config.worker_startup_timeout_secs,
                     ctx.router_config.worker_startup_check_interval_secs,
+                    &ctx.router_config.health_check.endpoint,
                     // PD health checks do not send the API key yet.
                     None,
                 )
@@ -1260,13 +1257,7 @@ impl PdRouterBase {
         }
 
         let fallback_dp_size = ctx.router_config.intra_node_data_parallel_size.max(1);
-        let health_config = HealthConfig {
-            timeout_secs: ctx.router_config.health_check.timeout_secs,
-            check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-            endpoint: ctx.router_config.health_check.endpoint.clone(),
-            failure_threshold: ctx.router_config.health_check.failure_threshold,
-            success_threshold: ctx.router_config.health_check.success_threshold,
-        };
+        let health_config = HealthConfig::from(&ctx.router_config.health_check);
 
         let prefill_workers = prefill_urls.iter().map(|(url, bootstrap_port)| {
             (
@@ -1279,13 +1270,9 @@ impl PdRouterBase {
         let decode_workers = decode_urls.iter().map(|url| (url, WorkerType::Decode));
         for (url, worker_type) in prefill_workers.chain(decode_workers) {
             let dp_size = dp_utils::discover_dp_size(&ctx.client, url, fallback_dp_size).await;
-            for worker in build_dp_workers(
-                url,
-                dp_size,
-                worker_type,
-                &core_cb_config,
-                Some(&health_config),
-            )? {
+            for worker in
+                build_dp_workers(url, dp_size, worker_type, &core_cb_config, &health_config)?
+            {
                 ctx.worker_registry.register(worker);
             }
         }
@@ -1388,6 +1375,7 @@ impl PdRouterBase {
             load_monitor_handle,
             client: ctx.client.clone(),
             api_key: ctx.router_config.api_key.clone(),
+            health_config,
             circuit_breaker_config: core_cb_config,
             dp_size: fallback_dp_size,
         })
@@ -1919,6 +1907,7 @@ mod tests {
             load_monitor_handle: None,
             client: Client::new(),
             api_key: None,
+            health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size: 1,
         }
@@ -1940,6 +1929,7 @@ mod tests {
             load_monitor_handle: None,
             client: Client::new(),
             api_key: None,
+            health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size,
         }

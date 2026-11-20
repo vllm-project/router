@@ -228,6 +228,9 @@ The bootstrap port annotation is fixed to `vllm.ai/bootstrap-port`.
 | `--health-check-interval-secs` | `u64` | `60` | `integer` | `60` | Seconds between runtime health checks. |
 | `--health-check-endpoint` | `string` | `/health` | `string` | `/health` | Worker health endpoint path. |
 
+HTTP startup, registration, and runtime probes append `--health-check-endpoint`
+to the worker URL. gRPC workers use the standard gRPC Health service.
+
 ## Logging and metrics
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
@@ -270,9 +273,6 @@ workers, including health checks; clients authenticate to the router
 separately with `--api-key-validation-urls`. It is not sent yet on
 `/flush_cache`, `/get_load`, gRPC requests, or PD and `--enable-igw` health
 checks.
-
-The startup wait and `add_worker` always probe `/health`, regardless of
-`--health-check-endpoint`.
 
 ## WASM middleware
 

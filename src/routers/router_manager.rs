@@ -5,7 +5,7 @@
 //! - Multi-Router Mode (enable_igw=true): RouterManager coordinates everything
 
 use crate::config::RouterConfig;
-use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
+use crate::core::{BasicWorker, Worker, WorkerRegistry, WorkerType};
 use crate::policies::kv_aware_ops;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
@@ -61,7 +61,6 @@ pub struct RouterManager {
     client: reqwest::Client,
 
     /// Configuration
-    #[allow(dead_code)] // May be used in future enhancements
     config: RouterConfig,
 }
 
@@ -184,27 +183,18 @@ impl RouterManager {
             labels.insert("cost".to_string(), cost.to_string());
         }
 
-        let worker = match config.worker_type.as_deref() {
-            Some("prefill") => WorkerFactory::create_prefill_with_labels(
-                config.url.clone(),
-                config.bootstrap_port,
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
-            Some("decode") => WorkerFactory::create_decode_with_labels(
-                config.url.clone(),
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
-            _ => WorkerFactory::create_regular_with_labels(
-                config.url.clone(),
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
+        let worker_type = match config.worker_type.as_deref() {
+            Some("prefill") => WorkerType::Prefill {
+                bootstrap_port: config.bootstrap_port,
+            },
+            Some("decode") => WorkerType::Decode,
+            _ => WorkerType::Regular,
         };
-
-        // Register worker
-        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+        let worker_arc: Arc<dyn Worker> = Arc::new(
+            BasicWorker::new(config.url.clone(), worker_type)
+                .with_labels(labels.clone())
+                .with_health_config((&self.config.health_check).into()),
+        );
         let worker_id = self.worker_registry.register(worker_arc.clone());
 
         // Notify PolicyRegistry about the new worker
