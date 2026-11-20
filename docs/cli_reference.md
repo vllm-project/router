@@ -87,7 +87,7 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | `--kv-event-block-size` | `u32` | `16` | `integer` | `16` | KV cache block size in tokens for workers registered through `--kv-event-source`. |
 | `--kv-event-model` | `string` | `unset` | `string` | `unset` | Model id advertised to static KV-event sources; `unset` keeps the served model id. |
 | `--kv-event-strict-recovery` | `flag` | `false` | `flag` | `false` | Require complete worker recovery or a worker KV clear before granting cache credit. Requests remain routable by load while the source is recovering. |
-| `--kv-hybrid-layout` | `std::path::PathBuf` | `unset` | — | — | Hybrid-attention layout JSON, keyed by worker URL. [Setup](load_balancing/kv_aware.md#hybrid-attention-models). |
+| `--kv-hybrid-layout` | `std::path::PathBuf` | `unset` | — | — | KV cache layout JSON for colocated or P/D routing, keyed by worker URL. [Setup](load_balancing/kv_aware.md#explicit-layouts). |
 
 The Rust CLI requires worker URLs in regular mode unless service discovery is
 enabled. The Python launcher permits an empty worker list without service
@@ -137,7 +137,7 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--vllm-discovery-address` | `string` | `unset` | `string` | `unset` | ZMQ registration address for vLLM workers, e.g. `0.0.0.0:30001`. |
 | `--kv-connector` | `nixl, mooncake, moriio` | `nixl` | `nixl, mooncake, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. |
 | `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static KV publishers for a KV-aware prefill or decode stage. Use URL=ENDPOINT[,ENDPOINT...] in DP-rank order. Block size is 16. |
-| `--pd-hybrid-config` | `std::path::PathBuf` | `unset` | — | — | Experimental hybrid P/D configuration. [Setup](load_balancing/kv_aware.md#pd-routing). |
+| `--pd-hybrid-config` | `std::path::PathBuf` | `unset` | — | — | Legacy P/D layout format. Use [`--kv-hybrid-layout`](load_balancing/kv_aware.md#pd-layout) for new deployments. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
 discovery. For static configuration, provide both prefill and decode workers:

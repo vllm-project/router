@@ -376,6 +376,8 @@ pub(super) struct PendingLive {
     bytes: usize,
 }
 
+pub(super) const MAX_PENDING_LIVE_FRAMES: usize = 1024;
+
 impl PendingLive {
     pub(super) fn pop(&mut self) -> Option<Vec<Vec<u8>>> {
         let frames = self.frames.pop_front()?;
@@ -414,7 +416,6 @@ pub(super) async fn while_connected(
     pending: &mut PendingLive,
     topic: &[u8],
 ) -> io::Result<ReplayPoll> {
-    const MAX_FRAMES: usize = 1024;
     const MAX_BYTES: usize = 64 * 1024 * 1024;
     tokio::pin!(replay);
     loop {
@@ -439,7 +440,8 @@ pub(super) async fn while_connected(
                     }
                     pending.bytes += frames.iter().map(Vec::len).sum::<usize>();
                     pending.frames.push_back(frames);
-                    if pending.frames.len() >= MAX_FRAMES || pending.bytes >= MAX_BYTES {
+                    if pending.frames.len() >= MAX_PENDING_LIVE_FRAMES || pending.bytes >= MAX_BYTES
+                    {
                         return Ok(ReplayPoll::BufferFull);
                     }
                 }

@@ -675,10 +675,10 @@ impl RouterMetrics {
         .increment(1);
     }
 
-    pub fn clear_kv_source_recovery_state(state: &'static str, reason: &'static str) {
+    pub fn clear_kv_source_recovery_state(state: &'static str, previous_reason: &'static str) {
         gauge!("vllm_router_kv_source_recovery_state",
             "state" => state,
-            "reason" => reason)
+            "reason" => previous_reason)
         .decrement(1.0);
         counter!("vllm_router_kv_source_recovery_transitions_total",
             "from" => state,

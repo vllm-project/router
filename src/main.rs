@@ -8,11 +8,23 @@ use vllm_router_rs::config::{
     ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, StaticKvEventSources,
     TraceConfig,
 };
+use vllm_router_rs::kv_index::CacheCapabilities;
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
 use vllm_router_rs::service_discovery::ServiceDiscoveryConfig;
 
 type PrefillArgs = (String, Option<u16>);
+
+#[derive(serde::Deserialize)]
+struct WorkerKvLayout {
+    #[serde(flatten)]
+    layout: CacheCapabilities,
+    #[serde(default)]
+    endpoints: Vec<String>,
+    replay_endpoints: Option<Vec<String>>,
+    #[serde(default)]
+    compatible_decode_urls: Vec<String>,
+}
 
 fn read_json_config<T: serde::de::DeserializeOwned>(
     path: &std::path::Path,
@@ -174,8 +186,8 @@ struct CliArgs {
         value_name = "URL=ENDPOINT[,ENDPOINT...]"
     )]
     pd_kv_events: Vec<String>,
-    /// Experimental P/D version of `--kv-hybrid-layout`, keyed by prefill URL.
-    #[arg(long)]
+    /// Legacy P/D layout configuration.
+    #[arg(long, hide = true, conflicts_with = "kv_hybrid_layout")]
     pd_hybrid_config: Option<std::path::PathBuf>,
 
     /// Specific policy for prefill nodes in PD mode. kv_aware uses the prefill load profile.
@@ -238,7 +250,7 @@ struct CliArgs {
     /// Require complete KV event recovery or a worker KV clear to restore placement credit.
     #[arg(long, default_value_t = false)]
     kv_event_strict_recovery: bool,
-    /// Cache layout JSON for hybrid attention models, keyed by worker URL.
+    /// KV cache layouts for colocated or P/D workers, keyed by worker URL.
     #[arg(long)]
     kv_hybrid_layout: Option<std::path::PathBuf>,
     /// Transfer credit for host-resident KV blocks.
@@ -509,32 +521,6 @@ impl CliArgs {
             self.kv_event_block_size,
             self.kv_event_model.as_deref(),
         )?;
-        if let Some(path) = &self.kv_hybrid_layout {
-            let layouts: HashMap<String, vllm_router_rs::kv_index::CacheCapabilities> =
-                read_json_config(path, "hybrid layout")?;
-            for (worker, layout) in layouts {
-                // A layout without declared endpoints is legal: the engine can
-                // report its own publishers (gRPC GetKvEventSources, or the HTTP
-                // /kv_event_sources route since vLLM 0.31.0). Identity and the
-                // hash block size then come from the layout itself.
-                let source = static_kv_event_sources
-                    .entry(worker.clone())
-                    .or_insert_with(|| {
-                        let rank = layout.ranks.first();
-                        StaticKvEventSources {
-                            endpoints: Vec::new(),
-                            replay_endpoints: None,
-                            topic: rank
-                                .and_then(|rank| rank.publisher_topic.clone())
-                                .unwrap_or_default(),
-                            block_size: rank.and_then(|rank| rank.hash_block_size).unwrap_or(16),
-                            model: rank.map_or_else(|| worker.clone(), |rank| rank.model.clone()),
-                            hybrid: None,
-                        }
-                    });
-                source.hybrid = Some(layout);
-            }
-        }
         // Determine routing mode
         let mode = if self.enable_igw {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
@@ -613,6 +599,72 @@ impl CliArgs {
             }
         };
 
+        let mut pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
+        if let Some(path) = &self.pd_hybrid_config {
+            let configured: HashMap<String, PdKvEventSources> =
+                read_json_config(path, "PD hybrid config")?;
+            for (worker, source) in configured {
+                if pd_kv_event_sources.insert(worker.clone(), source).is_some() {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: format!("duplicate PD KV event source for '{worker}'"),
+                    });
+                }
+            }
+        }
+        if let Some(path) = &self.kv_hybrid_layout {
+            let layouts: HashMap<String, WorkerKvLayout> =
+                read_json_config(path, "KV cache layout")?;
+            for (worker, config) in layouts {
+                let WorkerKvLayout {
+                    layout,
+                    endpoints,
+                    replay_endpoints,
+                    compatible_decode_urls,
+                } = config;
+                let rank = layout.ranks.first();
+                let block_size = rank.and_then(|rank| rank.hash_block_size).unwrap_or(16);
+                let model = rank.map(|rank| rank.model.clone());
+                if matches!(&mode, RoutingMode::VllmPrefillDecode { .. }) {
+                    let source = PdKvEventSources {
+                        endpoints,
+                        replay_endpoints,
+                        block_size,
+                        model,
+                        hybrid: Some(layout),
+                        compatible_decode_urls,
+                    };
+                    if pd_kv_event_sources.insert(worker.clone(), source).is_some() {
+                        return Err(ConfigError::ValidationFailed {
+                            reason: format!("duplicate PD KV event source for '{worker}'"),
+                        });
+                    }
+                } else {
+                    let source = static_kv_event_sources
+                        .entry(worker.clone())
+                        .or_insert_with(|| StaticKvEventSources {
+                            endpoints: Vec::new(),
+                            replay_endpoints: None,
+                            topic: rank
+                                .and_then(|rank| rank.publisher_topic.clone())
+                                .unwrap_or_default(),
+                            block_size,
+                            model: model.unwrap_or_else(|| worker.clone()),
+                            hybrid: None,
+                        });
+                    if !endpoints.is_empty() || replay_endpoints.is_some() {
+                        if !source.endpoints.is_empty() {
+                            return Err(ConfigError::ValidationFailed {
+                                reason: format!("duplicate KV event endpoints for '{worker}'"),
+                            });
+                        }
+                        source.endpoints = endpoints;
+                        source.replay_endpoints = replay_endpoints;
+                    }
+                    source.hybrid = Some(layout);
+                }
+            }
+        }
+
         // Main policy
         let mut policy = self.parse_policy(&self.policy);
         if let PolicyConfig::KvAware {
@@ -623,7 +675,7 @@ impl CliArgs {
             **configured = static_kv_event_sources;
         } else if !static_kv_event_sources.is_empty() {
             return Err(ConfigError::IncompatibleConfig {
-                reason: "--kv-event-source requires --policy kv_aware in regular mode".to_string(),
+                reason: "--kv-event-source and --kv-hybrid-layout require --policy kv_aware in regular mode".to_string(),
             });
         }
 
@@ -667,19 +719,6 @@ impl CliArgs {
             self.enable_program_scheduling,
             self.program_scheduling_config_json.as_deref(),
         )?;
-
-        let mut pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
-        if let Some(path) = &self.pd_hybrid_config {
-            let configured: HashMap<String, PdKvEventSources> =
-                read_json_config(path, "PD hybrid config")?;
-            for (worker, source) in configured {
-                if pd_kv_event_sources.insert(worker.clone(), source).is_some() {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: format!("duplicate PD KV event source for '{worker}'"),
-                    });
-                }
-            }
-        }
 
         // Build RouterConfig
         Ok(RouterConfig {
@@ -915,6 +954,68 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loads_one_kv_layout_for_both_pd_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        for (prefill, decode) in [
+            ("http://prefill:8000", "http://decode:8000"),
+            ("grpc://prefill:50051", "grpc://decode:50051"),
+        ] {
+            let source = |host: &str| {
+                serde_json::json!({
+                    "schema_version": 1,
+                    "endpoints": [format!("tcp://{host}:5557")],
+                    "replay_endpoints": [format!("tcp://{host}:5558")],
+                    "ranks": [{
+                        "rank": 0, "model": "model", "weight_version": "v1",
+                        "publisher_topic": format!("boot-{host}"), "instance_topic": true,
+                        "hash_algorithm": "sha256_cbor", "hash_seed": "0", "full_hashes": true,
+                        "hash_block_size": 16, "hash_lookahead_tokens": 0, "declared_groups": 1,
+                        "speculative_tokens": 0, "prefix_caching": true,
+                        "groups": [{
+                            "group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec",
+                            "block_size": 16, "prefix_cacheable": true, "prefix_replay_tokens": 0
+                        }]
+                    }]
+                })
+            };
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    (prefill): source("prefill"),
+                    (decode): source("decode")
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let args = CliArgs::try_parse_from([
+                "vllm-router",
+                "--vllm-pd-disaggregation",
+                "--decode",
+                decode,
+                "--prefill-policy",
+                "kv_aware",
+                "--decode-policy",
+                "kv_aware",
+                "--kv-hybrid-layout",
+                path.to_str().unwrap(),
+            ])
+            .unwrap();
+            let config = args
+                .to_router_config(vec![(prefill.to_owned(), None)])
+                .unwrap();
+            config.validate().unwrap();
+            assert_eq!(config.pd_kv_event_sources.len(), 2);
+            for worker in [prefill, decode] {
+                let source = &config.pd_kv_event_sources[worker];
+                assert_eq!(source.model.as_deref(), Some("model"));
+                assert_eq!(source.block_size, 16);
+                assert!(source.hybrid.is_some());
+            }
+        }
+    }
 
     #[test]
     fn parses_pd_kv_aware_with_affinity_ttl() {

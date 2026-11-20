@@ -8,7 +8,7 @@ Clients send OpenAI HTTP requests to the Router with either HTTP or gRPC workers
 | --- | --- |
 | [Ordinary single-group full attention](#colocated-prefill-and-decode), HTTP or gRPC | Omit the layout. The Router derives group 0 and verifies the default hash root. |
 | Hybrid or sliding-window attention, speculative decoding, or custom hash seed | Pass an [explicit layout](#explicit-layouts) with `--kv-hybrid-layout`. |
-| [P/D disaggregation](#pd-routing), HTTP or gRPC | Pass [`pd-layout.json`](#pd-layout) with `--pd-hybrid-config` for this guide's `sha256_cbor` Prefill setup. |
+| [P/D disaggregation](#pd-routing), HTTP or gRPC | Use the same `--kv-hybrid-layout` file for both stages that need an [explicit layout](#pd-layout). |
 
 To upgrade, apply the worker settings below and restart workers whose hash or publisher settings change. The Router rebuilds its in-memory index from live and replay events.
 
@@ -178,26 +178,26 @@ Use `--max-model-len 4096 --prefix-match-unit 16`. Copy the Qwen3.5 rank fields 
 
 For the base checkpoint, use the [Qwen3.6 settings](#qwen36-27b) with the Qwen3.8 weights and served model name. Update the rank when enabling speculation.
 
-Enable MTP or DSpark on the worker with `--speculative-config`. In Router's layout, `speculative_tokens` is the configured draft length and `hash_lookahead_tokens` is the number of tokens after each block that enter its hash. For lookahead 1 and a 16-token block, token 17 is part of the hash of tokens 1–16. For lookahead 0, list the groups where the worker actually drops a trailing unit during cache lookup in `tail_drop_groups`. Use `[]` when the worker skips the drop. For P/D disaggregation, declare the rules in effect on Prefill.
+Enable MTP or DSpark on the worker with `--speculative-config`. Set `speculative_tokens` to the draft length and `hash_lookahead_tokens` to the number of tokens after each block included in its hash. With zero lookahead, set `tail_drop_groups` to the groups where cache lookup drops a trailing unit, or `[]` if the worker skips the drop. Check the effective rule even for groups marked EAGLE. In P/D, use each worker's actual rule.
 
 | vLLM configuration | Rank settings |
 | --- | --- |
 | `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` in colocated routing | Keep the four base groups. Set `speculative_tokens: 3` and `hash_lookahead_tokens: 1`. |
-| MTP with `"disable_lookahead_block_hashes":true` added to the worker's `--speculative-config`, or the tested Mooncake P/D setup | Keep the four base groups. Set `speculative_tokens: 3`, `hash_lookahead_tokens: 0` and `tail_drop_groups: [3]`. |
+| MTP with `"disable_lookahead_block_hashes":true` in `--speculative-config` | Keep the four base groups. Set `speculative_tokens: 3`, `hash_lookahead_tokens: 0` and `tail_drop_groups: [3]` when the worker drops group 3. |
 | `--speculative-config '{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.8-27B-speculator.dspark"}'` | Set `speculative_tokens: 8`, `hash_lookahead_tokens: 0`, `tail_drop_groups: []` and `partial_hash_hits: false`. Keep `hash_block_size: 16`. |
 
 With the [Qwen3.8 DSpark draft](https://huggingface.co/RedHatAI/Qwen3.8-27B-speculator.dspark), set `declared_groups: 15`. Groups 0–9 use the 832-token Mamba settings above, and groups 10–13 use the 832-token full-attention settings. Group 14 uses `kind: "sliding_window"`, `spec_type: "SlidingWindowSpec"`, `block_size: 832`, `sliding_window: 2048`, `prefix_cacheable: true` and `prefix_replay_tokens: 0`.
 
 ### Ascend with vLLM 0.32
 
-On vllm-ascend builds with the [Ascend tail-drop rule](https://github.com/vllm-project/vllm-ascend/blob/450e556980df9f1b09392b77952d552d75e4cba2/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py#L42-L61), colocated workers and pure Prefill producers skip the tail drop. Keep the block sizes and group IDs reported by each worker. Use the following rank fields for MTP or DSpark workers that publish zero-lookahead hashes. For P/D disaggregation, put the Prefill layout in the [`hybrid` field](#pd-layout).
+Colocated workers and pure Prefill producers using the [Ascend lookup rule](https://github.com/vllm-project/vllm-ascend/blob/450e556980df9f1b09392b77952d552d75e4cba2/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py#L42-L61) can use these rank fields with zero-lookahead hashes. Keep the group IDs and block sizes reported by the worker.
 
 | Worker configuration | `speculative_tokens` | `hash_lookahead_tokens` | `tail_drop_groups` |
 | --- | ---: | ---: | --- |
 | Qwen3.5 or Qwen3.8 MTP with three draft tokens | `3` | `0` | `[]` |
 | Qwen3.8 DSpark with eight draft tokens | `8` | `0` | `[]` |
 
-Use a bind address such as `tcp://*:5557` for the worker's live publisher. Use a reachable worker address when configuring a static Router subscriber. Decode workers that perform a tail drop require their own layout. Use load-based Decode routing for tail-drop rules outside the supported layout.
+Decode workers that perform a tail drop require their own layout. Use load-based Decode routing for rules outside the supported layout.
 
 For HTTP P/D, set `kv_connector: "MooncakeConnectorV1"` in the Ascend workers' KV transfer config and use `--kv-connector mooncake` on Router. Use the [P/D layout](#pd-layout) and omit the optional bootstrap port when Prefill returns the transfer parameters. Router uses the Prefill lookup boundary for Mamba and bounded-replay layouts.
 
@@ -273,42 +273,42 @@ To [check reuse](#3-check-cache-reuse) for a hybrid model, use its served name a
 
 ## P/D routing
 
-P/D disaggregation puts prompt processing on Prefill workers and token generation on Decode workers. This example uses NIXL and enables KV-aware routing for Prefill.
+P/D disaggregation puts prompt processing on Prefill workers and token generation on Decode workers. The example below uses NIXL and enables `kv_aware` on both stages.
 
 1. Start two workers on different GPUs with the same checkpoint, vLLM version, connector and transport. Keep Prefill on HTTP port `8000` or gRPC port `50051`. Move Decode to HTTP port `8001` and, for a gRPC worker, gRPC port `50052`.
 2. Set `VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1` on both workers. Set `VLLM_NIXL_SIDE_CHANNEL_PORT=5600` on Prefill and `5601` on Decode. For separate hosts, use reachable addresses.
-3. Add `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'` to Prefill and the same option with `"kv_role":"kv_consumer"` to Decode. Enable events and replay on Prefill. Omit `--kv-events-config` on Decode for this setup. For gRPC, pass these engine options after `--`.
-4. Create [`pd-layout.json`](#pd-layout) with the Prefill layout, its live and replay addresses, and the compatible Decode URL. Leave Program scheduling disabled for declared P/D layouts.
+3. Add `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'` to Prefill and the same option with `"kv_role":"kv_consumer"` to Decode. Enable prefix caching, `sha256_cbor`, and live and replay events on both stages. Give each process a distinct event port and topic. For gRPC, pass the engine options after `--`.
+4. If a worker needs an [explicit layout](#explicit-layouts), put its entry in the shared [P/D layout file](#pd-layout). Ordinary single-group workers with event discovery can omit their entries.
 
-For text or chat over HTTP, add `--enable-scale-out` to each worker scored by `kv_aware`. For gRPC, export `VLLM_ROUTER_TOKENIZER` with the model directory in the Router terminal.
+Follow the transport setup for each scored worker and the Router ([HTTP](#http-workers) or [gRPC](#grpc-workers)).
 
 ```bash
 PREFILL=http://127.0.0.1:8000
 DECODE=http://127.0.0.1:8001
 # For gRPC, use grpc://127.0.0.1:50051 and grpc://127.0.0.1:50052.
 vllm-router --port 19000 --vllm-pd-disaggregation --prefill "$PREFILL" --decode "$DECODE" \
-  --prefill-policy kv_aware --decode-policy round_robin --kv-connector nixl \
-  --pd-hybrid-config pd-layout.json
+  --prefill-policy kv_aware --decode-policy kv_aware --kv-connector nixl
 ```
+
+With HTTP workers, use explicit prompt token IDs to get Decode cache credit. With gRPC workers, the Router can also use tokens from its own tokenizer. For a Prefill-only setup, set `--decode-policy round_robin` and omit Decode's event settings and layout entry.
 
 Use the same client URL and [reuse check](#3-check-cache-reuse). To check NIXL transfer, send a fresh prompt and compare `vllm:nixl_bytes_transferred_sum` on Decode's HTTP metrics port `8001` before and after the request.
 
 ### P/D layout
 
-Save this as `pd-layout.json`. Replace the empty `hybrid` object with the value under the Prefill URL in your colocated layout. Match `model` and `block_size` to the Prefill rank's model and `hash_block_size`. List addresses in rank order. Read the allocated replay endpoints from Prefill's `/kv_event_sources` for HTTP or `Control.GetKvEventSources` for gRPC. For gRPC workers, use their gRPC URLs as the Prefill key and Decode URL.
+Start with the [same worker entries](#explicit-layouts) used for colocated routing. Key each entry by its Prefill or Decode base URL, using `grpc://` URLs for gRPC workers. Add the following fields alongside `schema_version` and `ranks`. List live and replay addresses in rank order. For allocated replay ports, use the address reported by `/kv_event_sources` or gRPC `GetKvEventSources`.
 
 ```json
 {
-  "http://127.0.0.1:8000": {
-    "endpoints": ["tcp://127.0.0.1:5557"],
-    "replay_endpoints": ["<advertised-prefill-replay-endpoint>"],
-    "block_size": 16,
-    "model": "qwen3",
-    "hybrid": {},
-    "compatible_decode_urls": ["http://127.0.0.1:8001"]
-  }
+  "endpoints": ["tcp://127.0.0.1:5557"],
+  "replay_endpoints": ["tcp://127.0.0.1:5558"],
+  "compatible_decode_urls": ["http://127.0.0.1:8001"]
 }
 ```
+
+For a hybrid Prefill entry, list the Decode URLs compatible with its connector and layout. For a Decode entry, omit `compatible_decode_urls` and use that worker's own ports, topic and rank layout. Leave Program scheduling disabled for hybrid P/D layouts.
+
+Pass the file once by appending `--kv-hybrid-layout layout.json` to the Router command.
 
 ## Versions
 
@@ -325,13 +325,12 @@ Use the same vLLM release for the engine and its gRPC frontend. In all versions 
 
 | Option | Value format or example | Rust type | Default | Description |
 | --- | --- | --- | --- | --- |
-| `--kv-hybrid-layout` | `layout.json` | path | unset | Loads a colocated full- or hybrid-attention layout keyed by worker URL. |
+| `--kv-hybrid-layout` | `layout.json` | path | unset | Loads cache layouts keyed by worker URL for colocated or P/D routing. |
 | `--kv-event-source` | `WORKER_URL=ENDPOINT[,ENDPOINT...]` | string, repeatable | `[]` | Supplies live ZMQ addresses when event discovery is unavailable. |
 | `--kv-event-replay-source` | `WORKER_URL=ENDPOINT[,ENDPOINT...]` | string, repeatable | `[]` | Supplies replay addresses for a matching static live source. |
 | `--kv-event-block-size` | `16` | `u32` | `16` | Sets the block size in tokens for static colocated sources. |
 | `--kv-event-model` | `qwen3` | string | unset | Sets the served model name when using static colocated sources. |
 | `--kv-event-strict-recovery` | Set the flag | flag | off | Requires complete event history or a worker KV clear before restoring cache credit. Requests continue routing by load during recovery. |
-| `--pd-hybrid-config` | `pd-layout.json` | path | unset | Supplies Prefill sources, their layouts and compatible Decode URLs. |
 | `--pd-kv-events` | `WORKER_URL=ENDPOINT[,ENDPOINT...]` | string, repeatable | `[]` | Supplies live publishers for 16-token P/D sources without a declared layout. |
 | `--router-temperature` | finite value ≥ `0` | `f64` | `0.0` | Samples more broadly with higher values in colocated routing and P/D Prefill. Zero selects the lowest-cost worker. |
 | `--kv-penalty-host` | `0.0` to `1.0` | `f64` | `0.8` | Sets the fraction of full cache credit for a hit in host memory. |
@@ -344,6 +343,6 @@ For session affinity, send the same `x-session-id` or `session_params.session_id
 ## Troubleshooting
 
 - If the engine reports hits and the Router does not, check the layout's model and topic, the hash flags, and whether both event ports are reachable from the Router.
-- For `unsupported tail-drop layout`, check the effective lookup rule on the worker. Use `tail_drop_groups: []` if it skips the drop. An EAGLE group ID alone indicates model membership.
+- For `unsupported tail-drop layout`, check the worker's [lookup rule](#qwen38-27b).
 - If vLLM reports `Address already in use`, check the live and replay port ranges before starting it again. Inspect the actual event addresses in `/kv_event_sources` for HTTP or `Control.GetKvEventSources` for gRPC.
 - When a worker restarts, rerun the worker settings for a fresh topic. If you use a layout file, regenerate it with the new topic and restart the Router to load it. On a Router-only restart, replay recovers the events still in the worker's history.

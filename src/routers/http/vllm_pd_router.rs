@@ -5,7 +5,9 @@ use super::logprobs_merge;
 use super::pd_cached_tokens;
 use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_router::PdRouterBase;
-use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext};
+use super::pd_types::{
+    bounded_pull_metadata, error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext,
+};
 use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
@@ -109,7 +111,7 @@ pub struct VllmPDRouter {
     /// KV connector type
     kv_connector: KvConnector,
     /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
-    mooncake_prefill_info: HashMap<String, MooncakePrefillInfo>,
+    mooncake_prefill_info: HashMap<url::Url, MooncakePrefillInfo>,
     /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
     nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, Value>>>,
     /// Tokenizer and tonic clients for `grpc://` prefill and decode pools.
@@ -241,6 +243,7 @@ fn prefill_pins_commitment(
 /// Buffer budget for stage responses. Oversized Decode bodies are streamed;
 /// Prefill control responses must fit in memory to extract transfer metadata.
 const PD_BUFFERED_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const MOONCAKE_PULL_METADATA_LIMIT_BYTES: usize = 1024 * 1024;
 const MAX_JSON_REWRITE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Prefill control metadata must fit in the buffer; Decode may stream the rest.
@@ -743,21 +746,17 @@ impl VllmPDRouter {
     /// the Prefill peer directly. The Decode worker interprets the group lists.
     fn mooncake_pull_params(prefill_response: &Value) -> Option<&Value> {
         let params = prefill_response.get("kv_transfer_params")?;
+        // Ascend identifies pull by the role flag and can omit transfer_mode.
         (params.get("do_remote_prefill").and_then(Value::as_bool) == Some(true)
-            && params.get("remote_block_ids").is_some_and(Value::is_array)
             && params
-                .get("remote_port")
-                .and_then(Value::as_u64)
-                .is_some_and(|port| (1..=u64::from(u16::MAX)).contains(&port))
-            && ["remote_engine_id", "remote_request_id", "remote_host"]
-                .into_iter()
-                .all(|key| {
-                    params
-                        .get(key)
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| !value.is_empty())
-                }))
+                .get("transfer_mode")
+                .is_none_or(|mode| mode.as_str() == Some("pull"))
+            && bounded_pull_metadata(params, MOONCAKE_PULL_METADATA_LIMIT_BYTES))
         .then_some(params)
+    }
+
+    fn mooncake_worker_url(url: &str) -> Result<url::Url, url::ParseError> {
+        url::Url::parse(crate::backend::strip_dp_suffix(url).trim_end_matches('/'))
     }
 
     /// Look up Mooncake prefill info for a given prefill URL and dp_rank
@@ -766,7 +765,8 @@ impl VllmPDRouter {
         prefill_url: &str,
         dp_rank: Option<usize>,
     ) -> Option<(String, String)> {
-        let prefill = self.mooncake_prefill_info.get(prefill_url)?;
+        let worker_url = Self::mooncake_worker_url(prefill_url).ok()?;
+        let prefill = self.mooncake_prefill_info.get(&worker_url)?;
         let ids = prefill
             .dp_engine_ids
             .get_or_try_init(|| {
@@ -3300,17 +3300,11 @@ impl VllmPDRouter {
             let mut mooncake_prefill_info = HashMap::new();
             if matches!(kv_connector, KvConnector::Mooncake) {
                 for (url, bootstrap_port) in &prefill_urls {
-                    let parsed = url::Url::parse(url)
+                    let parsed = Self::mooncake_worker_url(url)
                         .map_err(|e| format!("Invalid prefill URL '{}': {}", url, e))?;
                     let host = parsed.host_str().unwrap_or("127.0.0.1");
                     let port = bootstrap_port.unwrap_or(8998);
                     let bootstrap_addr = format!("http://{}:{}", host, port);
-                    let base_url = format!(
-                        "{}://{}:{}",
-                        parsed.scheme(),
-                        host,
-                        parsed.port().unwrap_or(8000)
-                    );
 
                     // Declared HTTP hybrid Prefill workers can return the pull
                     // parameters themselves. Resolve the default bootstrap only
@@ -3321,7 +3315,8 @@ impl VllmPDRouter {
                         && ctx.router_config.pd_kv_event_sources.iter().any(
                             |(endpoint, source)| {
                                 source.hybrid.is_some()
-                                    && (endpoint == url || endpoint == &base_url)
+                                    && Self::mooncake_worker_url(endpoint)
+                                        .is_ok_and(|endpoint| endpoint == parsed)
                             },
                         );
                     let dp_engine_ids = if defer_bootstrap {
@@ -3332,7 +3327,7 @@ impl VllmPDRouter {
                         ))
                     };
                     mooncake_prefill_info.insert(
-                        base_url,
+                        parsed,
                         MooncakePrefillInfo {
                             bootstrap_addr,
                             dp_engine_ids,
@@ -3901,8 +3896,13 @@ mod tests {
         .await;
         let mut router = test_vllm_pd_router().await;
         router.kv_connector = KvConnector::Mooncake;
+        let worker_url = VllmPDRouter::mooncake_worker_url("http://prefill:80/").unwrap();
+        assert_eq!(
+            worker_url,
+            VllmPDRouter::mooncake_worker_url("http://prefill@3").unwrap()
+        );
         router.mooncake_prefill_info.insert(
-            "http://prefill".into(),
+            worker_url.clone(),
             MooncakePrefillInfo {
                 bootstrap_addr: bootstrap_addr.clone(),
                 dp_engine_ids: OnceCell::new(),
@@ -3911,13 +3911,15 @@ mod tests {
         let pull = json!({
             "do_remote_prefill": true,
             "do_remote_decode": false,
-            "remote_block_ids": [[1, 2], [3]],
+            "remote_block_ids": [[1, 2], [], [3]],
             "remote_engine_id": "prefill",
             "remote_request_id": "request",
             "remote_host": "127.0.0.1",
             "remote_port": 9000,
+            "remote_multi_nodes_meta_mapping": {"0": {"host": "127.0.0.1"}},
+            "last_token_id": 323
         });
-        let mut response = json!({"kv_transfer_params": pull});
+        let response = json!({"kv_transfer_params": pull});
         assert_eq!(
             router
                 .build_decode_kv_transfer_params(
@@ -3931,14 +3933,33 @@ mod tests {
                 .await,
             Some(pull)
         );
-        assert!(!router.mooncake_prefill_info["http://prefill"]
+        assert!(!router.mooncake_prefill_info[&worker_url]
             .dp_engine_ids
             .initialized());
+
+        let mut response = response;
+        for (key, invalid) in [
+            ("transfer_mode", json!("push")),
+            ("remote_block_ids", json!([[1, -2]])),
+            ("remote_block_ids", json!([1, 2])),
+            ("remote_block_ids", json!(vec![Vec::<u64>::new(); 129])),
+            (
+                "extra_metadata",
+                json!("x".repeat(MOONCAKE_PULL_METADATA_LIMIT_BYTES)),
+            ),
+        ] {
+            let mut invalid_response = response.clone();
+            invalid_response["kv_transfer_params"][key] = invalid;
+            assert!(
+                VllmPDRouter::mooncake_pull_params(&invalid_response).is_none(),
+                "{key}"
+            );
+        }
 
         response["kv_transfer_params"]["remote_port"] = Value::Null;
         let params = router
             .build_decode_kv_transfer_params(
-                "http://prefill",
+                "http://prefill:80/",
                 Some(&response),
                 None,
                 None,
@@ -3949,7 +3970,7 @@ mod tests {
             .unwrap();
         assert_eq!(params["remote_bootstrap_addr"], bootstrap_addr);
         assert_eq!(params["remote_engine_id"], "bootstrap-engine");
-        assert!(router.mooncake_prefill_info["http://prefill"]
+        assert!(router.mooncake_prefill_info[&worker_url]
             .dp_engine_ids
             .initialized());
     }

@@ -232,6 +232,8 @@ impl SourceBinding {
             return Err(SourceError::InvalidBatch);
         }
         let namespace = store.lora_name.as_deref();
+        // Undeclared adapters have no claims in this source. Declared adapters
+        // share the source sequence and must pass the batch's layout checks.
         if namespace.is_some_and(|name| self.adapter_path(name).is_none())
             || (self.requires_root_proof && store.lora_id.is_some())
             || store.ownership.is_some()

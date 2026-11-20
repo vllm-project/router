@@ -1,5 +1,6 @@
 //! Explicitly gated, exact-token NIXL multi-turn orchestration.
 //! Metadata is engine-owned and single-use. Neither leases nor cost estimates grant capacity.
+use super::pd_types::bounded_pull_metadata;
 use super::{dp_utils, pd_program_adapter::PdProgramRuntime, program_adapter::ProgramCompletion};
 use crate::config::types::PdProgramSchedulingConfig;
 use crate::core::Worker;
@@ -374,36 +375,8 @@ fn request_identity(request: &Value) -> [u8; 32] {
     Sha256::digest(serde_json::to_vec(&v).unwrap_or_default()).into()
 }
 fn bounded_metadata(params: &Value, max: usize) -> bool {
-    params.is_object()
-        && serde_json::to_vec(params).is_ok_and(|v| v.len() <= max)
-        && params
-            .get("remote_engine_id")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty() && s.len() <= 256)
-        && params
-            .get("remote_request_id")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty() && s.len() <= 512)
-        && params
-            .get("remote_host")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty() && s.len() <= 256)
-        && params
-            .get("remote_port")
-            .and_then(Value::as_u64)
-            .is_some_and(|p| p > 0 && p <= 65535)
-        && params
-            .get("remote_block_ids")
-            .and_then(Value::as_array)
-            .is_some_and(|groups| {
-                !groups.is_empty()
-                    && groups.len() <= 128
-                    && groups.iter().all(|g| {
-                        g.as_array()
-                            .is_some_and(|ids| ids.iter().all(|id| id.as_u64().is_some()))
-                    })
-            })
-        && params.get("transfer_mode").and_then(Value::as_str) == Some("pull")
+    params.get("transfer_mode").and_then(Value::as_str) == Some("pull")
+        && bounded_pull_metadata(params, max)
 }
 /// Capability probes sit on the turn's hot path; a failed probe safely falls
 /// back to the cold path, so do not stall a turn for the engine-core queue.

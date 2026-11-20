@@ -192,6 +192,13 @@ impl KvIndexSupervisor {
 
         // Admit each rank on its own verified contract.
         let engine_model = layout_model(&server_info, &model_id, &capability);
+        // Only Prefill declares compatible Decode targets. Decode looks up its
+        // own request without Mooncake's Prefill truncation.
+        let mooncake_prefill = self.mooncake_prefill
+            && self
+                .static_pd_sources
+                .get(worker_url)
+                .is_some_and(|source| !source.compatible_decode_urls.is_empty());
         let mut bindings = HashMap::new();
         event_sources.retain(|source| {
             match capability.bind_worker_source(source, engine_model, 1_000_000) {
@@ -203,7 +210,7 @@ impl KvIndexSupervisor {
                     };
                     bindings.insert(
                         source.dp_rank,
-                        binding.with_mooncake_prefill(self.mooncake_prefill),
+                        binding.with_mooncake_prefill(mooncake_prefill),
                     );
                     true
                 }

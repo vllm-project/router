@@ -69,9 +69,14 @@ struct TcpReplay {
 
 impl TcpReplay {
     fn new() -> Self {
+        Self::with_hwm(64)
+    }
+
+    fn with_hwm(hwm: i32) -> Self {
         let ctx = Arc::new(zmq::Context::new());
         let publisher = ctx.socket(zmq::XPUB).unwrap();
         publisher.set_linger(0).unwrap();
+        publisher.set_sndhwm(hwm).unwrap();
         // Report replacement subscriptions even when the old pipe is closing.
         publisher.set_xpub_verbose(true).unwrap();
         publisher.bind("tcp://127.0.0.1:*").unwrap();
@@ -84,7 +89,7 @@ impl TcpReplay {
             replay,
             publisher: Some(publisher),
             endpoint,
-            hwm: 64,
+            hwm,
         }
     }
 
@@ -319,7 +324,7 @@ async fn exhausted_replay_recovers_on_the_configured_live_boundary() {
 }
 
 #[tokio::test]
-async fn delayed_replay_keeps_live_removal_with_a_small_receive_queue() {
+async fn delayed_replay_applies_gap_batch_and_drains_the_live_queue() {
     let mut tcp = TcpReplay::new();
     tcp.hwm = 2;
     let index = Arc::new(full_binding(target("buffered-recovery"), BLOCK_SIZE));
@@ -333,17 +338,41 @@ async fn delayed_replay_keeps_live_removal_with_a_small_receive_queue() {
     tcp.history(&tcp.request(0).await, &[]);
     tcp.live(0, &warm);
     wait_until(|| credit(&index) == 4).await;
-    tcp.live(2, &empty);
+    tcp.live(2, &remove);
     let request = tcp.request(1).await;
     for seq in 3..24 {
         tcp.live(seq, &empty);
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    tcp.live(24, &remove);
+    tcp.live(24, &empty);
     assert_eq!(credit(&index), 0);
-    tcp.history(&request, &[(1, &empty), (2, &empty)]);
+    tcp.history(&request, &[(1, &empty)]);
     wait_until(|| next_seq(&index) == Some(25)).await;
     assert_eq!(credit(&index), 0);
+}
+
+#[tokio::test]
+async fn repeated_live_buffer_overflow_does_not_exhaust_replay() {
+    use super::super::transport::MAX_PENDING_LIVE_FRAMES;
+
+    let tcp = TcpReplay::with_hwm(4096);
+    let index = Arc::new(full_binding(target("live-backpressure"), BLOCK_SIZE));
+    let _handle = tcp.start_with_recovery(index.clone(), None, true);
+    let empty = batch_payload(&[]);
+    tcp.subscribed().await;
+
+    let mut seq = 0;
+    for _ in 0..MAX_REPLAY_FAILURES {
+        tcp.request(0).await;
+        for _ in 0..MAX_PENDING_LIVE_FRAMES {
+            tcp.live(seq, &empty);
+            seq += 1;
+        }
+        assert_eq!(credit(&index), 0);
+    }
+    // Each aborted replay still has a retry available after the next buffer
+    // overflow. Backpressure alone never enters the live-only fallback.
+    tcp.request(0).await;
 }
 
 #[tokio::test]
@@ -359,6 +388,7 @@ async fn replay_requires_continuous_history_and_valid_topic_rank_and_payload() {
         "early_eof",
         "wrong_rank",
         "wrong_topic",
+        "conflicting_live_batch",
     ] {
         let tcp = TcpReplay::new();
         let index = Arc::new(full_binding(target("replay"), BLOCK_SIZE));
@@ -390,6 +420,10 @@ async fn replay_requires_continuous_history_and_valid_topic_rank_and_payload() {
             "early_eof" => {}
             "wrong_rank" => tcp.reply(&request, 1, &bad_rank),
             "wrong_topic" => tcp.reply_topic(&request, b"kv-other", 1, &empty),
+            "conflicting_live_batch" => {
+                tcp.reply(&request, 1, &empty);
+                tcp.reply(&request, 2, &store);
+            }
             _ => unreachable!(),
         }
         tcp.reply(&request, END_SEQ, &[]);

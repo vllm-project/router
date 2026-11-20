@@ -1,7 +1,7 @@
 //! Source-scoped cache updates and consistent snapshots.
 
 use super::*;
-use crate::kv_index::types::{SourceRecoveryReason, SourceRecoveryState, SourceRecoveryStatus};
+use crate::kv_index::types::{SourceRecoveryReason, SourceRecoveryState};
 use crate::metrics::RouterMetrics;
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -229,7 +229,7 @@ pub(crate) struct StreamState {
     pub(crate) root_verified: bool,
     pub(crate) history_complete: bool,
     pub(crate) rejection_reported: bool,
-    recovery: Option<SourceRecoveryStatus>,
+    recovery_labels: Option<(SourceRecoveryState, SourceRecoveryReason)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -258,7 +258,7 @@ impl StreamState {
             root_verified: false,
             history_complete: false,
             rejection_reported: false,
-            recovery: None,
+            recovery_labels: None,
         }
     }
 
@@ -318,11 +318,14 @@ impl StreamState {
         state: SourceRecoveryState,
         reason: SourceRecoveryReason,
     ) {
-        let status = SourceRecoveryStatus { state, reason };
-        if self.recovery != Some(status) {
-            let previous = self.recovery.replace(status);
+        let labels = (state, reason);
+        if self.recovery_labels != Some(labels) {
+            let previous = self
+                .recovery_labels
+                .replace(labels)
+                .map(|(state, reason)| (state.as_str(), reason.as_str()));
             RouterMetrics::record_kv_source_recovery_transition(
-                previous.map(|status| (status.state.as_str(), status.reason.as_str())),
+                previous,
                 state.as_str(),
                 reason.as_str(),
             );
@@ -330,11 +333,8 @@ impl StreamState {
     }
 
     pub(crate) fn forget_recovery(&mut self) {
-        if let Some(status) = self.recovery.take() {
-            RouterMetrics::clear_kv_source_recovery_state(
-                status.state.as_str(),
-                status.reason.as_str(),
-            );
+        if let Some((state, reason)) = self.recovery_labels.take() {
+            RouterMetrics::clear_kv_source_recovery_state(state.as_str(), reason.as_str());
         }
     }
 }

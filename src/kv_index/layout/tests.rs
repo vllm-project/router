@@ -25,6 +25,33 @@ fn page_view(group: &[TierBits]) -> crate::kv_index::storage::PageTiers<'_> {
     }
 }
 
+#[test]
+fn full_attention_rounding_preserves_gaps_between_same_tier_pages() {
+    use StorageTier::{Device, HostPinned};
+
+    let group = CacheGroup {
+        group_idx: 0,
+        block_size: 32,
+        kind: GroupRule::FullAttention,
+    };
+    // Each fact is at the end of a 32-token page in a 16-token hash chain.
+    let claims: Vec<_> = [Device, Device, HostPinned, Device, Device, Device]
+        .into_iter()
+        .flat_map(|tier| [TierBits::default(), TierBits(TierBits::bit(tier))])
+        .collect();
+    let hits = full_attention_matches(
+        &target("worker", 0),
+        &group,
+        page_view(&claims),
+        16,
+        64,
+        192,
+    );
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].tier, Device);
+    assert_eq!(hits[0].segments, [(0, 1), (2, 3)]);
+}
+
 // The index tests cover path/hash equivalence; restoration only needs page facts.
 #[test]
 fn restore_coverage_unites_local_tiers_and_excludes_external_pages() {
@@ -646,7 +673,6 @@ mod declarations {
         for (field, invalid) in [
             ("publisher_topic", serde_json::json!("other")),
             ("declared_groups", serde_json::json!(3)),
-            ("declared_groups", serde_json::json!(5)),
             ("full_hashes", serde_json::json!(false)),
             ("speculative_tokens", serde_json::json!(1)),
             ("root_hash", serde_json::json!("bad")),

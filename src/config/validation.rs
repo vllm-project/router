@@ -986,14 +986,17 @@ impl ConfigValidator {
                         let invalid = |reason: &str| ConfigError::IncompatibleConfig {
                             reason: format!("PD cache layout for '{url}': {reason}"),
                         };
-                        let paired_layout =
-                            !layout.ranks.iter().all(
-                                crate::kv_index::RankCapability::has_plain_full_attention_shape,
-                            ) || !sources.compatible_decode_urls.is_empty();
-                        if paired_layout && !prefill_kv {
-                            return Err(invalid("requires a KV-aware prefill worker"));
+                        let hybrid_layout = !layout
+                            .ranks
+                            .iter()
+                            .all(crate::kv_index::RankCapability::has_plain_full_attention_shape);
+                        let has_pairs = !sources.compatible_decode_urls.is_empty();
+                        if has_pairs && !prefill_kv {
+                            return Err(invalid(
+                                "compatible decode URLs require a KV-aware prefill worker",
+                            ));
                         }
-                        if paired_layout && config.program_scheduling.is_some() {
+                        if (hybrid_layout || has_pairs) && config.program_scheduling.is_some() {
                             return Err(ConfigError::IncompatibleConfig {
                                 reason: "hybrid PD sources do not support Program scheduling"
                                     .into(),
@@ -1009,7 +1012,7 @@ impl ConfigValidator {
                             .as_ref()
                             .filter(|endpoints| endpoints.len() == sources.endpoints.len())
                             .ok_or_else(|| invalid("requires one replay endpoint per rank"))?;
-                        if paired_layout && sources.compatible_decode_urls.is_empty() {
+                        if hybrid_layout && prefill_keyed && !has_pairs {
                             return Err(invalid("requires at least one compatible decode URL"));
                         }
                         if let Some(decode) = sources.compatible_decode_urls.iter().find(|url| {
@@ -1879,9 +1882,23 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("requires a KV-aware prefill worker"),
+            error.contains("compatible decode URLs require a KV-aware prefill worker"),
             "{error}"
         );
+        decode_layout
+            .pd_kv_event_sources
+            .get_mut("http://decode:8000")
+            .unwrap()
+            .compatible_decode_urls
+            .clear();
+        assert!(ConfigValidator::validate(&decode_layout).is_ok());
+        if let RoutingMode::VllmPrefillDecode { decode_policy, .. } = &mut decode_layout.mode {
+            *decode_policy = Some(PolicyConfig::RoundRobin);
+        }
+        assert!(ConfigValidator::validate(&decode_layout)
+            .unwrap_err()
+            .to_string()
+            .contains("whose policy is not kv_aware"));
         for (case, expected) in [
             ("decode", "not a configured decode base URL"),
             ("replay", "one replay endpoint per rank"),

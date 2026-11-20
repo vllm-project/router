@@ -167,7 +167,7 @@ pub enum ClearScope {
 ///
 /// `Observed` is compatibility-mode credit for fresh observations, not a claim
 /// that the publisher's complete history has been reconstructed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceRecoveryState {
     /// Worker history is complete; the external pool has no proven baseline.
     WorkerExact,
@@ -191,11 +191,13 @@ impl SourceRecoveryState {
 
 /// Stable, bounded reasons for source recovery state transitions.
 /// Each variant is a metric label; add a reason only when a distinct alert needs it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceRecoveryReason {
     Registered,
     InitialSequence,
     SequenceGap,
+    IdleCatchup,
+    LiveBufferFull,
     ReplayApplied,
     RetryExhausted,
     ReplayFailed,
@@ -211,6 +213,8 @@ impl SourceRecoveryReason {
             Self::Registered => "registered",
             Self::InitialSequence => "initial_sequence",
             Self::SequenceGap => "sequence_gap",
+            Self::IdleCatchup => "idle_catchup",
+            Self::LiveBufferFull => "live_buffer_full",
             Self::ReplayApplied => "replay_applied",
             Self::RetryExhausted => "retry_exhausted",
             Self::ReplayFailed => "replay_failed",
@@ -220,13 +224,6 @@ impl SourceRecoveryReason {
             Self::FreshObservation => "fresh_observation",
         }
     }
-}
-
-/// Current externally observable recovery status for one source/rank.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct SourceRecoveryStatus {
-    pub(crate) state: SourceRecoveryState,
-    pub(crate) reason: SourceRecoveryReason,
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]

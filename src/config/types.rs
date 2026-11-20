@@ -1033,7 +1033,7 @@ pub struct PdKvEventSources {
     /// served-model check then relies on `/v1/models`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Router-managed cache layout for this prefill worker.
+    /// Router-managed cache layout for this prefill or decode worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hybrid: Option<crate::kv_index::CacheCapabilities>,
     /// Decode base URLs explicitly verified for this hybrid prefill worker.

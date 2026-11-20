@@ -3,6 +3,7 @@ use crate::policies::{AffinityKey, AffinityRecord, RequestHeaders};
 use axum::body::Body;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -41,6 +42,53 @@ pub fn error_chain(err: &dyn std::error::Error) -> String {
         source = s.source();
     }
     chain.join(" caused by: ")
+}
+
+/// Common bounds for engine-owned block lists used by pull connectors.
+pub(super) fn bounded_pull_metadata(params: &Value, max_bytes: usize) -> bool {
+    struct Budget(usize);
+
+    impl std::io::Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(bytes.len())
+                .ok_or(std::io::ErrorKind::WriteZero)?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    [
+        ("remote_engine_id", 256),
+        ("remote_request_id", 512),
+        ("remote_host", 256),
+    ]
+    .into_iter()
+    .all(|(key, limit)| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty() && s.len() <= limit)
+    }) && params
+        .get("remote_port")
+        .and_then(Value::as_u64)
+        .is_some_and(|p| (1..=u64::from(u16::MAX)).contains(&p))
+        && params
+            .get("remote_block_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|groups| {
+                !groups.is_empty()
+                    && groups.len() <= 128
+                    && groups.iter().all(|g| {
+                        g.as_array()
+                            .is_some_and(|ids| ids.iter().all(|id| id.as_u64().is_some()))
+                    })
+            })
+        && serde_json::to_writer(Budget(max_bytes), params).is_ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

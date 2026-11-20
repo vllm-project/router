@@ -33,7 +33,6 @@ pub struct RankCapability {
     pub declared_groups: Option<u32>,
     pub model: String,
     pub weight_version: String,
-    /// Compared as part of the worker descriptor when refreshing the binding.
     pub weight_identity: Option<String>,
     pub publisher_topic: Option<String>,
     pub instance_topic: bool,

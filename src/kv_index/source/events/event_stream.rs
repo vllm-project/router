@@ -92,7 +92,11 @@ impl EventStream {
         })
     }
 
-    pub(super) fn suspend_for_replay(&self, lease: StreamLease) -> Result<(), StreamError> {
+    pub(super) fn suspend_for_replay(
+        &self,
+        lease: StreamLease,
+        reason: Reason,
+    ) -> Result<(), StreamError> {
         self.with_state(lease, |state, tx| {
             if state.phase == Phase::Replaying {
                 return Ok(());
@@ -103,7 +107,7 @@ impl EventStream {
             tx.suspend_source(&self.index.target.instance_id, self.index.target.dp_rank);
             state.hide();
             state.phase = Phase::Replaying;
-            state.recovery_transition(Recovery::Degraded, Reason::SequenceGap);
+            state.recovery_transition(Recovery::Degraded, reason);
             Ok(())
         })
     }
@@ -591,7 +595,9 @@ mod tests {
         stream.apply_payload(current, 0, payload).unwrap();
         stream.finish_replay(current, 1).unwrap();
         assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 528);
-        stream.suspend_for_replay(current).unwrap();
+        stream
+            .suspend_for_replay(current, Reason::SequenceGap)
+            .unwrap();
         assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 0);
         stream.finish_replay(current, 1).unwrap();
         stream.retire(current).unwrap();
