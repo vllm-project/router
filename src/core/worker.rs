@@ -15,6 +15,17 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to create worker HTTP client")
 });
 
+/// Attach the router's API key as a bearer token when one is configured.
+pub(crate) fn worker_request(
+    request: reqwest::RequestBuilder,
+    api_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match api_key {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    }
+}
+
 /// GET request to a worker, with the router's API key as a bearer token when
 /// one is configured.
 pub(crate) fn worker_get(
@@ -22,10 +33,43 @@ pub(crate) fn worker_get(
     url: &str,
     api_key: Option<&str>,
 ) -> reqwest::RequestBuilder {
-    let request = client.get(url);
-    match api_key {
-        Some(key) => request.bearer_auth(key),
-        None => request,
+    worker_request(client.get(url), api_key)
+}
+
+/// POST request to a worker, with the router's API key as a bearer token when
+/// one is configured.
+pub(crate) fn worker_post(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    worker_request(client.post(url), api_key)
+}
+
+/// Read the load reported by an HTTP worker after the caller resolves its DP URL.
+pub(crate) async fn fetch_worker_load(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Option<isize> {
+    let url = format!("{base_url}/get_load");
+    let response = match worker_get(client, &url, api_key).send().await {
+        Ok(response) if response.status().is_success() => response,
+        Ok(response) => {
+            tracing::debug!(%base_url, status = %response.status(), "Worker load request failed");
+            return None;
+        }
+        Err(error) => {
+            tracing::debug!(%base_url, %error, "Failed to request worker load");
+            return None;
+        }
+    };
+    match response.json::<serde_json::Value>().await {
+        Ok(body) => body.get("load")?.as_i64().map(|load| load as isize),
+        Err(error) => {
+            tracing::debug!(%base_url, %error, "Failed to read worker load");
+            None
+        }
     }
 }
 

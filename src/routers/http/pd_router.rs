@@ -7,7 +7,7 @@ use super::pd_types::{
     PdSelection, Stage, StageDecision,
 };
 use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs, HttpTokenInput};
-use crate::core::worker::WorkerMetadata;
+use crate::core::worker::{fetch_worker_load, worker_post, WorkerMetadata};
 use crate::core::{
     BasicWorker, CircuitBreaker, CircuitBreakerConfig, ConnectionMode, DPAwareWorker, HealthConfig,
     Worker, WorkerRegistry, WorkerResult, WorkerType,
@@ -828,26 +828,20 @@ impl PdRouterBase {
         })
     }
 
-    // Generic helper for processing all workers with an endpoint
-    async fn process_workers(
+    async fn flush_worker_caches(
         &self,
-        worker_type_enum: WorkerType,
+        urls: Vec<String>,
         worker_type: &str,
-        endpoint: &str,
     ) -> (Vec<String>, Vec<String>) {
         let mut results = Vec::new();
         let mut errors = Vec::new();
-
-        // Get workers from registry based on type
-        let workers = self.worker_registry.get_by_type(&worker_type_enum);
-        let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
-
-        // Process each worker
         for worker_url in urls {
-            // Extract base URL if DP-aware format (e.g., http://127.0.0.1:8081@0 → http://127.0.0.1:8081)
             let (base_url, _) = super::dp_utils::parse_worker_url(&worker_url);
-            let url = format!("{}/{}", base_url, endpoint);
-            match self.client.post(&url).send().await {
+            let url = format!("{base_url}/flush_cache");
+            match worker_post(&self.client, &url, self.api_key.as_deref())
+                .send()
+                .await
+            {
                 Ok(res) if res.status().is_success() => {
                     results.push(format!("{} {}: OK", worker_type, worker_url));
                 }
@@ -1331,6 +1325,7 @@ impl PdRouterBase {
                     .collect();
                 let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
                 let monitor_client = ctx.client.clone();
+                let monitor_api_key = ctx.router_config.api_key.clone();
                 let prefill_policy_clone = Arc::clone(&prefill_policy);
                 let decode_policy_clone = Arc::clone(&decode_policy);
 
@@ -1340,6 +1335,7 @@ impl PdRouterBase {
                         tx,
                         monitor_interval,
                         monitor_client,
+                        monitor_api_key,
                         prefill_policy_clone,
                         decode_policy_clone,
                     )
@@ -1399,6 +1395,7 @@ impl PdRouterBase {
         tx: tokio::sync::watch::Sender<HashMap<String, isize>>,
         interval_secs: u64,
         client: Client,
+        api_key: Option<String>,
         prefill_policy: Arc<dyn LoadBalancingPolicy>,
         decode_policy: Arc<dyn LoadBalancingPolicy>,
     ) {
@@ -1409,9 +1406,10 @@ impl PdRouterBase {
                 .iter()
                 .map(|url| {
                     let client = client.clone();
+                    let api_key = api_key.as_deref();
                     let url = url.clone();
                     async move {
-                        let load = get_worker_load(&client, &url).await.unwrap_or(0);
+                        let load = get_worker_load(&client, &url, api_key).await.unwrap_or(0);
                         (url, load)
                     }
                 })
@@ -1442,37 +1440,13 @@ impl PdRouterBase {
 
 // Helper functions
 
-async fn get_worker_load(client: &Client, worker_url: &str) -> Option<isize> {
-    match client.get(format!("{}/get_load", worker_url)).send().await {
-        Ok(res) if res.status().is_success() => match res.bytes().await {
-            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-                Ok(data) => data
-                    .get("load")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v as isize),
-                Err(e) => {
-                    debug!("Failed to parse load response from {}: {}", worker_url, e);
-                    None
-                }
-            },
-            Err(e) => {
-                debug!("Failed to read load response from {}: {}", worker_url, e);
-                None
-            }
-        },
-        Ok(res) => {
-            debug!(
-                "Worker {} returned non-success status: {}",
-                worker_url,
-                res.status()
-            );
-            None
-        }
-        Err(e) => {
-            debug!("Failed to get load from {}: {}", worker_url, e);
-            None
-        }
-    }
+async fn get_worker_load(
+    client: &Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Option<isize> {
+    let (base_url, _) = super::dp_utils::parse_worker_url(worker_url);
+    fetch_worker_load(client, &base_url, api_key).await
 }
 
 impl PdRouterBase {
@@ -1769,16 +1743,10 @@ impl PdRouterBase {
         }
         // Process both prefill and decode workers
         let (prefill_results, prefill_errors) = self
-            .process_workers(
-                WorkerType::Prefill {
-                    bootstrap_port: None,
-                },
-                "Prefill",
-                "flush_cache",
-            )
+            .flush_worker_caches(self.get_prefill_worker_urls(), "Prefill")
             .await;
         let (decode_results, decode_errors) = self
-            .process_workers(WorkerType::Decode, "Decode", "flush_cache")
+            .flush_worker_caches(self.get_decode_worker_urls(), "Decode")
             .await;
 
         // Combine results and errors
@@ -1812,7 +1780,7 @@ impl PdRouterBase {
         // Process prefill workers
         let prefill_urls = self.get_prefill_worker_urls();
         for worker_url in prefill_urls {
-            match get_worker_load(&self.client, &worker_url).await {
+            match get_worker_load(&self.client, &worker_url, self.api_key.as_deref()).await {
                 Some(load) => {
                     loads.insert(format!("prefill_{}", worker_url), load);
                 }
@@ -1825,7 +1793,7 @@ impl PdRouterBase {
         // Process decode workers
         let decode_urls = self.get_decode_worker_urls();
         for worker_url in decode_urls {
-            match get_worker_load(&self.client, &worker_url).await {
+            match get_worker_load(&self.client, &worker_url, self.api_key.as_deref()).await {
                 Some(load) => {
                     loads.insert(format!("decode_{}", worker_url), load);
                 }
@@ -1902,6 +1870,7 @@ impl PdRouterBase {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerFactory, WorkerType};
+    use crate::routers::test_support::start_admin_auth_mock_server;
 
     fn create_test_pd_router() -> PdRouterBase {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1949,6 +1918,110 @@ mod tests {
         let worker = BasicWorker::new(url, worker_type);
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    fn pd_router_with_api_key(api_key: &str) -> PdRouterBase {
+        PdRouterBase {
+            api_key: Some(api_key.to_owned()),
+            ..create_test_pd_router()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pd_flush_cache_and_get_load_send_api_key() {
+        let (prefill_url, prefill_server, prefill_requests) =
+            start_admin_auth_mock_server(Some("worker-key")).await;
+        let (decode_url, decode_server, decode_requests) =
+            start_admin_auth_mock_server(Some("worker-key")).await;
+        let router = pd_router_with_api_key("worker-key");
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                prefill_url.clone(),
+                WorkerType::Prefill {
+                    bootstrap_port: Some(9000),
+                },
+                true,
+            )));
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                decode_url.clone(),
+                WorkerType::Decode,
+                true,
+            )));
+
+        let flush = router.flush_cache().await;
+        assert_eq!(flush.status(), StatusCode::OK, "flush_cache");
+        for requests in [&prefill_requests, &decode_requests] {
+            assert_eq!(
+                *requests.borrow(),
+                [("/flush_cache".into(), StatusCode::OK)]
+            );
+        }
+        let loads = router.get_worker_loads().await;
+        assert_eq!(loads.status(), StatusCode::OK, "get_loads");
+        let body = axum::body::to_bytes(loads.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["loads"][format!("prefill_{prefill_url}")],
+            7,
+            "{payload}"
+        );
+        assert_eq!(
+            payload["loads"][format!("decode_{decode_url}")],
+            7,
+            "{payload}"
+        );
+        assert!(
+            payload["errors"].as_array().unwrap().is_empty(),
+            "{payload}"
+        );
+
+        prefill_server.abort();
+        decode_server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_pd_flush_cache_and_get_load_fail_without_matching_api_key() {
+        let (prefill_url, prefill_server, _) =
+            start_admin_auth_mock_server(Some("worker-key")).await;
+        let (decode_url, decode_server, _) = start_admin_auth_mock_server(Some("worker-key")).await;
+        let router = pd_router_with_api_key("other-key");
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                prefill_url.clone(),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                true,
+            )));
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                decode_url.clone(),
+                WorkerType::Decode,
+                true,
+            )));
+
+        let flush = router.flush_cache().await;
+        assert_eq!(flush.status(), StatusCode::PARTIAL_CONTENT, "flush_cache");
+        let loads = router.get_worker_loads().await;
+        let body = axum::body::to_bytes(loads.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            payload["loads"].as_object().unwrap().is_empty(),
+            "{payload}"
+        );
+        assert_eq!(payload["errors"].as_array().unwrap().len(), 2, "{payload}");
+
+        prefill_server.abort();
+        decode_server.abort();
     }
 
     // ============= Worker Management Tests =============
