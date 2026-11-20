@@ -552,6 +552,8 @@ impl PageTable {
                 Arc::new(owner.clone()),
                 OwnerPages {
                     owner: Arc::new(PageOwner {
+                        // AtomicU64 retries CAS contention. Only ID exhaustion
+                        // rejects the owner allocation.
                         id: self
                             .next_owner
                             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
@@ -959,6 +961,31 @@ mod tests {
             tx.store_hash_pages(owner, group, StorageTier::Device, None, &[[7; 32]], true, 1)
                 .unwrap();
         });
+    }
+
+    #[test]
+    fn concurrent_owner_registration_keeps_all_shared_page_claims() {
+        let index = KvBlockIndexer::new();
+        let threads = 8;
+        let owners_per_thread = 128;
+        let barrier = std::sync::Barrier::new(threads);
+        std::thread::scope(|scope| {
+            for thread in 0..threads {
+                let (index, barrier) = (&index, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    for slot in 0..owners_per_thread {
+                        put(index, &owner(&format!("worker-{thread}-{slot}")), 0);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            index.hash_pages.read_row(&PageKey::new(0, [7; 32]), |row| {
+                row.holders(None).unwrap().values().count()
+            }),
+            Some(threads * owners_per_thread)
+        );
     }
 
     #[test]

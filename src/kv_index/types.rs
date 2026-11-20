@@ -163,33 +163,7 @@ pub enum ClearScope {
     All,
 }
 
-/// Trust state for one independently addressed KV event source.
-///
-/// `Observed` is compatibility-mode credit for fresh observations, not a claim
-/// that the publisher's complete history has been reconstructed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SourceRecoveryState {
-    /// Worker history is complete; the external pool has no proven baseline.
-    WorkerExact,
-    Exact,
-    Observed,
-    Degraded,
-    Fallback,
-}
-
-impl SourceRecoveryState {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::WorkerExact => "worker_exact",
-            Self::Exact => "exact",
-            Self::Observed => "observed",
-            Self::Degraded => "degraded",
-            Self::Fallback => "fallback",
-        }
-    }
-}
-
-/// Stable, bounded reasons for source recovery state transitions.
+/// Stable, bounded reasons for source recovery events.
 /// Each variant is a metric label; add a reason only when a distinct alert needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceRecoveryReason {

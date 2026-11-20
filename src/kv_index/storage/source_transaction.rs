@@ -1,8 +1,6 @@
 //! Source-scoped cache updates and consistent snapshots.
 
 use super::*;
-use crate::kv_index::types::{SourceRecoveryReason, SourceRecoveryState};
-use crate::metrics::RouterMetrics;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 
@@ -227,9 +225,7 @@ pub(crate) struct StreamState {
     pub(crate) lease_id: u64,
     pub(crate) phase: StreamPhase,
     pub(crate) root_verified: bool,
-    pub(crate) history_complete: bool,
     pub(crate) rejection_reported: bool,
-    recovery_labels: Option<(SourceRecoveryState, SourceRecoveryReason)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -256,9 +252,7 @@ impl StreamState {
             lease_id: 0,
             phase: StreamPhase::Retired,
             root_verified: false,
-            history_complete: false,
             rejection_reported: false,
-            recovery_labels: None,
         }
     }
 
@@ -292,7 +286,6 @@ impl StreamState {
         self.bump_generation();
         self.next_seq = next_seq;
         self.root_verified = false;
-        self.history_complete = false;
         self.phase = if visible {
             StreamPhase::Live
         } else if next_seq.is_some() {
@@ -311,36 +304,5 @@ impl StreamState {
         self.lease_id = next_generation();
         self.rejection_reported = false;
         self.lease_id
-    }
-
-    pub(crate) fn recovery_transition(
-        &mut self,
-        state: SourceRecoveryState,
-        reason: SourceRecoveryReason,
-    ) {
-        let labels = (state, reason);
-        if self.recovery_labels != Some(labels) {
-            let previous = self
-                .recovery_labels
-                .replace(labels)
-                .map(|(state, reason)| (state.as_str(), reason.as_str()));
-            RouterMetrics::record_kv_source_recovery_transition(
-                previous,
-                state.as_str(),
-                reason.as_str(),
-            );
-        }
-    }
-
-    pub(crate) fn forget_recovery(&mut self) {
-        if let Some((state, reason)) = self.recovery_labels.take() {
-            RouterMetrics::clear_kv_source_recovery_state(state.as_str(), reason.as_str());
-        }
-    }
-}
-
-impl Drop for StreamState {
-    fn drop(&mut self) {
-        self.forget_recovery();
     }
 }

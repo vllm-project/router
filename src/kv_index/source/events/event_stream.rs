@@ -14,8 +14,9 @@ use crate::kv_index::source::endpoints::EventSource;
 use crate::kv_index::source::events::transport::retry_backoff;
 use crate::kv_index::storage::source_transaction::{StreamPhase as Phase, StreamState};
 use crate::kv_index::storage::IndexBatch;
-use crate::kv_index::types::{SourceRecoveryReason as Reason, SourceRecoveryState as Recovery};
+use crate::kv_index::types::SourceRecoveryReason as Reason;
 use crate::kv_index::{IngestionSignal, KVEvent, SourceBinding, SourceError};
+use crate::metrics::RouterMetrics;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamLease(pub(crate) u64);
@@ -48,12 +49,8 @@ impl EventStream {
         self
     }
 
-    fn exact_state(&self) -> Recovery {
-        if self.strict_recovery {
-            Recovery::WorkerExact
-        } else {
-            Recovery::Exact
-        }
+    fn record_recovery(&self, reason: Reason) {
+        RouterMetrics::record_kv_source_recovery(self.strict_recovery, reason.as_str());
     }
 
     /// The caller must first establish that sequence zero represents an empty
@@ -64,7 +61,6 @@ impl EventStream {
                 self.index.with_stream_batch(|state, tx| {
                     let lease = StreamLease(state.begin_lease());
                     self.index.reset_stream(state, tx, Some(0), false);
-                    state.recovery_transition(Recovery::Degraded, Reason::Registered);
                     lease
                 })
             })
@@ -82,12 +78,7 @@ impl EventStream {
                 crate::kv_index::record_signal_loss();
             }
             self.index.reset_stream(state, tx, Some(0), false);
-            let recovery = if reason == Reason::RetryExhausted {
-                Recovery::Fallback
-            } else {
-                Recovery::Degraded
-            };
-            state.recovery_transition(recovery, reason);
+            self.record_recovery(reason);
             Ok(())
         })
     }
@@ -107,7 +98,7 @@ impl EventStream {
             tx.suspend_source(&self.index.target.instance_id, self.index.target.dp_rank);
             state.hide();
             state.phase = Phase::Replaying;
-            state.recovery_transition(Recovery::Degraded, reason);
+            self.record_recovery(reason);
             Ok(())
         })
     }
@@ -221,7 +212,6 @@ impl EventStream {
                 state.phase = Phase::Replaying;
                 return Err(StreamError::Index(error));
             }
-            state.history_complete |= cleared || (!fresh && seq == 0);
             if fresh {
                 self.index
                     .publish_stream(state, tx, seq + 1)
@@ -229,11 +219,11 @@ impl EventStream {
             }
             if state.phase == Phase::Live {
                 if cleared {
-                    state.recovery_transition(self.exact_state(), Reason::ClearBarrier);
+                    self.record_recovery(Reason::ClearBarrier);
                 } else if fresh {
-                    state.recovery_transition(Recovery::Observed, Reason::FreshObservation);
+                    self.record_recovery(Reason::FreshObservation);
                 } else if seq == 0 {
-                    state.recovery_transition(self.exact_state(), Reason::InitialSequence);
+                    self.record_recovery(Reason::InitialSequence);
                 }
             }
             Ok(cleared)
@@ -263,12 +253,7 @@ impl EventStream {
                     StreamError::Index(error)
                 })?;
             if next_seq != 0 {
-                let recovery = if state.history_complete {
-                    self.exact_state()
-                } else {
-                    Recovery::Observed
-                };
-                state.recovery_transition(recovery, reason);
+                self.record_recovery(reason);
             }
             Ok(())
         })
@@ -285,7 +270,6 @@ impl EventStream {
                     Self::check(state, lease)?;
                     self.index.reset_stream(state, tx, None, false);
                     state.lease_id = 0;
-                    state.forget_recovery();
                     Ok(())
                 },
             )

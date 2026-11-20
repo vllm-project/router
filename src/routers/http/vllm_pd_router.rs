@@ -756,7 +756,8 @@ impl VllmPDRouter {
     }
 
     fn mooncake_worker_url(url: &str) -> Result<url::Url, url::ParseError> {
-        url::Url::parse(crate::backend::strip_dp_suffix(url).trim_end_matches('/'))
+        // Url canonicalizes an empty HTTP path and the default port.
+        url::Url::parse(crate::backend::strip_dp_suffix(url))
     }
 
     /// Look up Mooncake prefill info for a given prefill URL and dp_rank
@@ -3900,6 +3901,10 @@ mod tests {
         assert_eq!(
             worker_url,
             VllmPDRouter::mooncake_worker_url("http://prefill@3").unwrap()
+        );
+        assert_ne!(
+            VllmPDRouter::mooncake_worker_url("http://prefill/inference").unwrap(),
+            VllmPDRouter::mooncake_worker_url("http://prefill/inference/@3").unwrap()
         );
         router.mooncake_prefill_info.insert(
             worker_url.clone(),

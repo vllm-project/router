@@ -621,15 +621,22 @@ impl CliArgs {
                     replay_endpoints,
                     compatible_decode_urls,
                 } = config;
-                let rank = layout.ranks.first();
-                let block_size = rank.and_then(|rank| rank.hash_block_size).unwrap_or(16);
-                let model = rank.map(|rank| rank.model.clone());
+                let rank = layout
+                    .ranks
+                    .first()
+                    .ok_or_else(|| ConfigError::ValidationFailed {
+                        reason: format!(
+                            "KV cache layout for '{worker}' must declare at least one rank"
+                        ),
+                    })?;
+                let block_size = rank.hash_block_size.unwrap_or(16);
+                let model = rank.model.clone();
                 if matches!(&mode, RoutingMode::VllmPrefillDecode { .. }) {
                     let source = PdKvEventSources {
                         endpoints,
                         replay_endpoints,
                         block_size,
-                        model,
+                        model: Some(model),
                         hybrid: Some(layout),
                         compatible_decode_urls,
                     };
@@ -638,29 +645,25 @@ impl CliArgs {
                             reason: format!("duplicate PD KV event source for '{worker}'"),
                         });
                     }
-                } else {
-                    let source = static_kv_event_sources
-                        .entry(worker.clone())
-                        .or_insert_with(|| StaticKvEventSources {
-                            endpoints: Vec::new(),
-                            replay_endpoints: None,
-                            topic: rank
-                                .and_then(|rank| rank.publisher_topic.clone())
-                                .unwrap_or_default(),
-                            block_size,
-                            model: model.unwrap_or_else(|| worker.clone()),
-                            hybrid: None,
-                        });
+                } else if let Some(source) = static_kv_event_sources.get_mut(&worker) {
                     if !endpoints.is_empty() || replay_endpoints.is_some() {
-                        if !source.endpoints.is_empty() {
-                            return Err(ConfigError::ValidationFailed {
-                                reason: format!("duplicate KV event endpoints for '{worker}'"),
-                            });
-                        }
-                        source.endpoints = endpoints;
-                        source.replay_endpoints = replay_endpoints;
+                        return Err(ConfigError::ValidationFailed {
+                            reason: format!("duplicate KV event endpoints for '{worker}'"),
+                        });
                     }
                     source.hybrid = Some(layout);
+                } else {
+                    static_kv_event_sources.insert(
+                        worker,
+                        StaticKvEventSources {
+                            endpoints,
+                            replay_endpoints,
+                            topic: rank.publisher_topic.clone().unwrap_or_default(),
+                            block_size,
+                            model,
+                            hybrid: Some(layout),
+                        },
+                    );
                 }
             }
         }
@@ -1015,6 +1018,32 @@ mod tests {
                 assert!(source.hybrid.is_some());
             }
         }
+    }
+
+    #[test]
+    fn rejects_empty_worker_layout_before_creating_a_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        std::fs::write(
+            &path,
+            r#"{"http://worker:8000":{"schema_version":1,"ranks":[]}}"#,
+        )
+        .unwrap();
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--policy",
+            "kv_aware",
+            "--worker-urls",
+            "http://worker:8000",
+            "--kv-hybrid-layout",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(args
+            .to_router_config(Vec::new())
+            .unwrap_err()
+            .to_string()
+            .contains("http://worker:8000' must declare at least one rank"));
     }
 
     #[test]

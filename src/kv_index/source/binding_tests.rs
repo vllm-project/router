@@ -1232,7 +1232,7 @@ fn salted_events_leave_replay_open_for_the_unsalted_chain() {
 }
 
 #[test]
-fn malformed_event_for_declared_adapter_revokes_the_source() {
+fn malformed_adapter_store_preserves_base_credit_and_sequence() {
     let index = fresh_index(16).with_adapters(vec![("lora1".into(), "/adapters/lora1".into())]);
     index.apply_batch(0, &qwen_batch()).unwrap();
     assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
@@ -1241,8 +1241,20 @@ fn malformed_event_for_declared_adapter_revokes_the_source() {
         panic!("expected store");
     };
     store.group_idx = Some(u32::MAX);
-    assert_eq!(index.apply_batch(1, &batch), Err(SourceError::InvalidBatch));
-    assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
+    assert_eq!(index.apply_batch(1, &batch), Ok(()));
+    assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
+    assert_eq!(
+        index.reusable_tokens_in(Some("lora1"), &prompt(), usize::MAX),
+        0
+    );
+    assert_eq!(
+        index.apply_batch(2, &adapter_batch("lora1", "/adapters/lora1")),
+        Ok(())
+    );
+    assert_eq!(
+        index.reusable_tokens_in(Some("lora1"), &prompt(), usize::MAX),
+        528
+    );
 }
 
 #[test]

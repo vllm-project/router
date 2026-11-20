@@ -83,13 +83,9 @@ pub fn init_metrics() {
         "vllm_router_kv_placement_lookups_total",
         "KV-aware placement lookups and reasons for skipping them"
     );
-    describe_gauge!(
-        "vllm_router_kv_source_recovery_state",
-        "Current number of registered KV event sources by recovery state and reason"
-    );
     describe_counter!(
-        "vllm_router_kv_source_recovery_transitions_total",
-        "KV event source recovery transitions aggregated by state and reason"
+        "vllm_router_kv_source_recovery_events_total",
+        "KV event source recovery events by mode and reason"
     );
     describe_counter!(
         "vllm_router_kv_replay_outcomes_total",
@@ -653,37 +649,10 @@ impl RouterMetrics {
         counter!("vllm_router_kv_placement_lookups_total", "result" => result).increment(1);
     }
 
-    pub fn record_kv_source_recovery_transition(
-        previous: Option<(&'static str, &'static str)>,
-        state: &'static str,
-        reason: &'static str,
-    ) {
-        if let Some((previous_state, previous_reason)) = previous {
-            gauge!("vllm_router_kv_source_recovery_state",
-                "state" => previous_state,
-                "reason" => previous_reason)
-            .decrement(1.0);
-        }
-        gauge!("vllm_router_kv_source_recovery_state",
-            "state" => state,
+    pub(crate) fn record_kv_source_recovery(strict: bool, reason: &'static str) {
+        counter!("vllm_router_kv_source_recovery_events_total",
+            "mode" => if strict { "strict" } else { "compatible" },
             "reason" => reason)
-        .increment(1.0);
-        counter!("vllm_router_kv_source_recovery_transitions_total",
-            "from" => previous.map_or("unregistered", |(state, _)| state),
-            "to" => state,
-            "reason" => reason)
-        .increment(1);
-    }
-
-    pub fn clear_kv_source_recovery_state(state: &'static str, previous_reason: &'static str) {
-        gauge!("vllm_router_kv_source_recovery_state",
-            "state" => state,
-            "reason" => previous_reason)
-        .decrement(1.0);
-        counter!("vllm_router_kv_source_recovery_transitions_total",
-            "from" => state,
-            "to" => "forgotten",
-            "reason" => "source_retired")
         .increment(1);
     }
 

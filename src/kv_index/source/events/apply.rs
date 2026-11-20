@@ -125,8 +125,26 @@ impl SourceBinding {
         for event in &batch.events {
             match event {
                 KVEvent::BlockStored(store) => {
-                    if let Some(event) = self.prepare_store(store)? {
-                        prepared.push(event);
+                    match self.prepare_store(store) {
+                        Ok(Some(event)) => prepared.push(event),
+                        Ok(None) => {}
+                        Err(SourceError::InvalidBatch)
+                            if store
+                                .lora_name
+                                .as_deref()
+                                .is_some_and(|name| self.adapter_path(name).is_some()) =>
+                        {
+                            // A rejected Store contributes no evidence or copy count.
+                            // Keep the other stores and evictions in this sequence.
+                            tracing::warn!(
+                                source = %self.target.instance_id,
+                                rank = self.target.dp_rank,
+                                adapter = ?store.lora_name,
+                                group = ?store.group_idx,
+                                "ignoring malformed KV store for a declared adapter"
+                            );
+                        }
+                        Err(error) => return Err(error),
                     }
                 }
                 KVEvent::BlockRemoved(remove) => {
@@ -232,8 +250,7 @@ impl SourceBinding {
             return Err(SourceError::InvalidBatch);
         }
         let namespace = store.lora_name.as_deref();
-        // Undeclared adapters have no claims in this source. Declared adapters
-        // share the source sequence and must pass the batch's layout checks.
+        // Undeclared adapters have no claims in this source.
         if namespace.is_some_and(|name| self.adapter_path(name).is_none())
             || (self.requires_root_proof && store.lora_id.is_some())
             || store.ownership.is_some()
