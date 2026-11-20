@@ -104,6 +104,7 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+    kv_aware_completion_history: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -240,6 +241,12 @@ class RouterArgs:
             "(1-31536000). P/D uses decode-only soft affinity based on pending "
             "plus active decode requests. Prefill remains token-cost based. "
             "Omit to disable affinity.",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-aware-completion-history",
+            action="store_true",
+            default=RouterArgs.kv_aware_completion_history,
+            help="Use bounded prefix history to break eligible Regular kv_aware ties",
         )
         parser.add_argument(
             f"--{prefix}kv-event-source",

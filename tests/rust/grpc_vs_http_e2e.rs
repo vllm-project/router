@@ -31,6 +31,9 @@ use vllm_router_rs::config::{
 use vllm_router_rs::core::WorkerFactory;
 use vllm_router_rs::routers::http::router::Router;
 
+#[path = "grpc_vs_http_e2e/history.rs"]
+mod history;
+
 fn test_config(worker_urls: Vec<String>) -> RouterConfig {
     RouterConfig {
         epd: None,
@@ -65,6 +68,7 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
         disable_retries: true,
         disable_circuit_breaker: true,
         kv_aware_session_affinity_ttl_secs: None,
+        kv_aware_completion_history: false,
         health_check: vllm_router_rs::config::HealthCheckConfig::default(),
         enable_igw: false,
         connection_mode: ConnectionMode::Http,

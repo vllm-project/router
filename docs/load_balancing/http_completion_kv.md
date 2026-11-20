@@ -35,3 +35,9 @@ real-Worker acceptance requirements.
 
 For compatibility versus opt-in strict event recovery, see
 [`--kv-event-strict-recovery`](../cli_reference.md#workers-and-backend).
+
+### Optional prefix history
+
+Add `--kv-aware-completion-history` to a Regular `--policy kv_aware --router-temperature 0` invocation (off by default). With no usable session binding or positive event credit, a recently observed whole-block token prefix can break a load tie. A hint expires about 60 seconds after the last successful observation. This is a preference, not evidence that KV is still resident.
+
+It requires a registered single-rank worker with a verified model, block size and KV source, and one eligible prompt with backend-effective IDs. HTTP workers support single-prompt Completion and Chat through the existing input preparation; gRPC workers support token-ID Completion. Responses, native generation and gRPC Chat keep ordinary routing without history.

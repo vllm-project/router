@@ -1,4 +1,4 @@
-//! Request-level Completion preparation and forwarding, separate from attempts.
+//! Request-level generation eligibility and Completion forwarding.
 
 use std::sync::Arc;
 
@@ -55,7 +55,16 @@ pub(super) fn prepare_completion_route(
 ) -> CompletionRoute {
     // Worker preparation models these modifiers. Unknown identity extensions
     // still execute normally but cannot acquire cache credit.
-    let worker_credit = request.lora_path.is_none()
+    let worker_credit = supports_completion_credit(request);
+    CompletionRoute {
+        worker_credit,
+        raw_body,
+        echo: request.echo,
+    }
+}
+
+fn supports_completion_credit(request: &CompletionRequest) -> bool {
+    request.lora_path.is_none()
         && request
             .other
             .iter()
@@ -64,12 +73,17 @@ pub(super) fn prepare_completion_route(
                 "priority" => value.is_i64() || value.is_u64(),
                 "truncate_prompt_tokens" => true,
                 _ => false,
-            });
-    CompletionRoute {
-        worker_credit,
-        raw_body,
-        echo: request.echo,
-    }
+            })
+}
+
+/// History uses one effective Completion prompt, not a concatenated batch.
+pub(super) fn completion_history_input(request: &CompletionRequest) -> bool {
+    supports_completion_credit(request)
+        && matches!(
+            request.prompt,
+            crate::protocols::spec::PromptInput::String(_)
+                | crate::protocols::spec::PromptInput::IntArray(_)
+        )
 }
 
 pub(super) fn placement_eligibility(

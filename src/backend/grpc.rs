@@ -563,7 +563,7 @@ async fn stream_openai(
         request_timeout,
         mut stages,
         t_req,
-        on_first_output: _,
+        on_first_output,
         fail_on_abort: _,
         abort,
         observer,
@@ -580,6 +580,7 @@ async fn stream_openai(
                 .map(|t| decode_stream(&**t, prompt_ids.as_ref(), skip_special));
             let mut first = true;
             let mut first_token_logged = false;
+            let mut first_output_seen = false;
             let mut prompt_tokens = n_prompt_tokens as u32;
             let mut engine_prompt_tokens: Option<u32> = None;
             let mut completion_tokens = 0u32;
@@ -686,6 +687,14 @@ async fn stream_openai(
                                 break;
                             }
                             first = false;
+                        }
+                        if !tx.is_closed() {
+                            notify_first_output(
+                                &msg,
+                                &text,
+                                &mut first_output_seen,
+                                on_first_output.as_ref(),
+                            );
                         }
                         if finish.is_some() {
                             if let Some(observer) = &observer {
