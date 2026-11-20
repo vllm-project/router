@@ -16,6 +16,10 @@
 //! `VLLM_ROUTER_STAGES=1` emits stage clocks. gRPC always tokenizes; HTTP
 //! remains a transparent proxy and reports worker header/first-byte timings.
 
+mod auth;
+use auth::set_bearer_auth;
+pub(crate) use auth::WorkerAuth;
+
 pub mod completion;
 pub mod control;
 pub mod convert;
@@ -40,28 +44,6 @@ pub fn stages_enabled() -> bool {
     )
 }
 
-/// Metadata key carrying the worker credential on gRPC requests, mirroring
-/// the HTTP `Authorization` header set by `worker_get`.
-pub(crate) const AUTHORIZATION_METADATA: &str = "authorization";
-
-/// Attach the router's API key as a `Bearer` token on a gRPC request — the
-/// counterpart of `worker_get`'s `bearer_auth` on the HTTP path. No metadata
-/// is sent when no key is configured; a key that is not valid ASCII metadata
-/// is skipped with a warning.
-pub(crate) fn set_bearer_auth<T>(request: &mut tonic::Request<T>, api_key: Option<&str>) {
-    if let Some(key) = api_key {
-        match format!("Bearer {key}").parse::<tonic::metadata::AsciiMetadataValue>() {
-            Ok(mut value) if key.is_ascii() => {
-                value.set_sensitive(true);
-                request.metadata_mut().insert(AUTHORIZATION_METADATA, value);
-            }
-            _ => tracing::warn!(
-                "worker api key is not valid gRPC metadata; sending no authorization"
-            ),
-        }
-    }
-}
-
 pub use completion::{
     prepare_completion, prepare_completion_classified, validate_completion_tokenizer_definition,
     CompletionPreparationError,
@@ -84,29 +66,6 @@ pub use preprocess::TokenizerCache;
 
 /// Prost/Tonic bindings for vLLM Inference + Control (`vllm-proto` on crates.io).
 pub use vllm_proto as pb;
-
-#[cfg(all(test, feature = "cpu", feature = "ready"))]
-#[cfg_attr(coverage_nightly, coverage(off))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn worker_bearer_metadata_is_sensitive_and_skips_invalid_keys() {
-        let mut request = tonic::Request::new(());
-        set_bearer_auth(&mut request, Some("test-key"));
-        assert!(request
-            .metadata()
-            .get(AUTHORIZATION_METADATA)
-            .unwrap()
-            .is_sensitive());
-
-        for key in ["invalid\nkey", "non-ascii-ü"] {
-            let mut request = tonic::Request::new(());
-            set_bearer_auth(&mut request, Some(key));
-            assert!(!request.metadata().contains_key(AUTHORIZATION_METADATA));
-        }
-    }
-}
 
 // Shared by gRPC emission and HTTP response consumption.
 pub(crate) mod stream_output {

@@ -84,11 +84,13 @@ impl EngineFrontend {
         }
     }
 
-    /// Send this worker API key as `authorization` metadata on every gRPC
-    /// request (inference, Control.Abort), mirroring the HTTP path.
-    pub fn with_api_key(mut self, api_key: Option<Arc<str>>) -> Self {
-        self.grpc = self.grpc.with_api_key(api_key);
+    pub(crate) fn with_worker_auth(mut self, auth: super::WorkerAuth) -> Self {
+        self.grpc.auth = auth;
         self
+    }
+
+    pub(crate) fn worker_key(&self, url: &str) -> Option<Arc<str>> {
+        self.grpc.auth.key_for(url)
     }
 
     /// Enable L0 with a shared budget across models.

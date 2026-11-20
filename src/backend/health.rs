@@ -14,7 +14,11 @@ use super::detect::grpc_connect_uri;
 use super::set_bearer_auth;
 
 /// `Ok(())` when `grpc.health.v1` reports `SERVING`.
-pub async fn check_grpc_health(
+pub async fn check_grpc_health(worker_url: &str, timeout: Duration) -> Result<(), String> {
+    check_grpc_health_with_auth(worker_url, None, timeout).await
+}
+
+pub(crate) async fn check_grpc_health_with_auth(
     worker_url: &str,
     api_key: Option<&str>,
     timeout: Duration,
@@ -31,7 +35,7 @@ pub async fn check_grpc_health(
     let mut request = tonic::Request::new(HealthCheckRequest {
         service: String::new(),
     });
-    set_bearer_auth(&mut request, api_key);
+    set_bearer_auth(&mut request, api_key)?;
     let resp = tokio::time::timeout(timeout, client.check(request))
         .await
         .map_err(|_| format!("grpc health check timeout {uri}"))?
@@ -51,7 +55,10 @@ pub(crate) async fn check_grpc_health_within(
     api_key: Option<&str>,
     limit: Duration,
 ) -> Result<(), String> {
-    tokio::time::timeout(limit, check_grpc_health(worker_url, api_key, limit))
-        .await
-        .unwrap_or_else(|_| Err(format!("grpc health check timed out: {worker_url}")))
+    tokio::time::timeout(
+        limit,
+        check_grpc_health_with_auth(worker_url, api_key, limit),
+    )
+    .await
+    .unwrap_or_else(|_| Err(format!("grpc health check timed out: {worker_url}")))
 }

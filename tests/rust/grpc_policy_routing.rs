@@ -631,9 +631,10 @@ async fn without_api_key_no_authorization_metadata_is_sent() {
 }
 
 #[tokio::test]
-async fn igw_grpc_registration_and_kv_discovery_omit_the_shared_api_key() {
+async fn igw_registration_discovery_and_inference_omit_the_shared_api_key() {
     use vllm_router_rs::routers::{
-        http::vllm_pd_router::VllmPDRouter, router_manager::RouterManager,
+        http::vllm_pd_router::VllmPDRouter,
+        router_manager::{RouterId, RouterManager},
     };
 
     let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
@@ -651,6 +652,9 @@ async fn igw_grpc_registration_and_kv_discovery_omit_the_shared_api_key() {
         ctx.worker_registry.clone(),
         ctx.policy_registry.clone(),
     );
+    let regular = Router::new(vec![], &ctx).await.unwrap();
+    regular.pin_test_token_ids(vec![1]);
+    manager.register_router(RouterId::new("http-regular".into()), Arc::new(regular));
     let registration =
         serde_json::from_value(json!({"url": server.grpc_url, "worker_type": "prefill"})).unwrap();
     let worker = manager
@@ -664,6 +668,17 @@ async fn igw_grpc_registration_and_kv_discovery_omit_the_shared_api_key() {
     // P/D refresh reads the same registry as IGW registration.
     let _router = VllmPDRouter::new(vec![], vec![], None, &ctx).await.unwrap();
     server.assert_control_authorization(&["GetModelInfo", "GetServerInfo", "GetKvEventSources"]);
+
+    manager
+        .remove_worker_from_registry(&server.grpc_url)
+        .unwrap();
+    let registration =
+        serde_json::from_value(json!({"url": server.grpc_url, "model_id": "mock-model"})).unwrap();
+    manager.add_worker(registration).await.unwrap();
+    let request = serde_json::from_value(prompt(&[1], json!({"model": "mock-model"}))).unwrap();
+    let response = manager.route_completion(None, &request, None).await;
+    assert!(response.status().is_success(), "{}", response.status());
+    assert!(server.captured().last().unwrap().authorization.is_none());
 }
 
 /// A wrong key surfaces as a failed startup wait, as on the HTTP path.

@@ -3169,8 +3169,7 @@ impl VllmPDRouter {
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
-                grpc_frontend: crate::backend::EngineFrontend::new()
-                    .with_api_key(ctx.router_config.api_key.as_deref().map(Arc::from)),
+                grpc_frontend: crate::backend::EngineFrontend::new(),
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -3190,8 +3189,7 @@ impl VllmPDRouter {
                     .map_err(|error| format!("tokenizer cache: {error}"))?
             } else {
                 crate::backend::EngineFrontend::with_request_timeout(request_timeout)
-            }
-            .with_api_key(ctx.router_config.api_key.as_deref().map(Arc::from));
+            };
 
             // Create underlying PD router with provided worker lists
             let grpc_workers: Vec<String> = prefill_urls
@@ -3201,6 +3199,7 @@ impl VllmPDRouter {
                 .filter(|url| crate::backend::is_grpc_url(url))
                 .collect();
             let pd_router = PdRouterBase::new(prefill_urls.clone(), decode_urls, ctx).await?;
+            let grpc_frontend = grpc_frontend.with_worker_auth(pd_router.worker_auth.clone());
 
             // No service discovery in direct URL mode
             let service_registry = Arc::new(ServiceRegistry::new());
@@ -3268,9 +3267,9 @@ impl VllmPDRouter {
             }
 
             if !grpc_workers.is_empty() {
-                crate::backend::warn_old_grpc_pd_workers(
+                crate::backend::control::warn_old_grpc_pd_workers_with_auth(
                     grpc_workers.iter().map(String::as_str),
-                    ctx.router_config.api_key.as_deref(),
+                    &pd_router.worker_auth,
                 )
                 .await;
             }

@@ -50,6 +50,20 @@ vLLM HTTP where that happens only under `echo`.
 `return_hidden_states`, `documents`, negative prompt ids, and unknown
 passthrough keys return 400 instead of being dropped.
 
+## Worker authentication
+
+For a configured gRPC worker or authentication proxy that requires bearer
+metadata, set the router's `--api-key`. The router attaches the credential to
+inference, cancellation, model/server/KV discovery, and regular worker
+health checks. The configured transport address covers its DP ranks. A new
+address supplied by worker registration, including IGW registration, receives
+no shared credential. Invalid ASCII metadata is rejected during configuration
+of a gRPC pool.
+
+The router's `grpc://` transport uses h2c. Deploy credentialed gRPC on a
+trusted link or behind transport protection. On the P/D path, startup and
+periodic Health probes still follow the separate P/D health-auth work.
+
 ## Pool Behavior
 
 A worker pool is all HTTP or all gRPC. Mixed schemes fail during startup or

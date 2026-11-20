@@ -1135,8 +1135,12 @@ async fn grpc_pd_client_disconnect_cancels_decode_stream() {
         ..Default::default()
     })
     .await;
-    let decode = MockVllmRsServer::spawn_with_state(slow_decode()).await;
-    let router = pd_router(&prefill, &decode).await;
+    let decode = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        authorization: AuthorizationCheck::Bearer("worker-secret".into()),
+        ..slow_decode()
+    })
+    .await;
+    let router = pd_router_with_api_key(&prefill, &decode, "worker-secret").await;
 
     disconnect_before_first_token(&router, &decode, 0).await;
     let p = router
