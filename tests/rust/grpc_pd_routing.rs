@@ -12,6 +12,8 @@
 mod common;
 #[path = "common/grpc_frontend_fixture.rs"]
 mod fixture;
+#[path = "common/grpc_kv_fixture.rs"]
+mod kv_fixture;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::Ordering;
@@ -19,6 +21,7 @@ use std::sync::OnceLock;
 
 use common::create_test_context;
 use common::mock_vllm_rs::{MockVllmRs, MockVllmRsServer};
+use kv_fixture::KvPublisher;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde_json::{json, Value};
 use vllm_router_rs::backend::EngineFrontend;
@@ -54,6 +57,15 @@ fn worker_counter(name: &str, worker: &str) -> f64 {
         .render()
         .lines()
         .find_map(|line| line.strip_prefix(&prefix).and_then(|n| n.parse().ok()))
+        .unwrap_or(0.0)
+}
+
+fn placement_hits() -> f64 {
+    let prefix = "vllm_router_kv_placement_lookups_total{result=\"hit\"} ";
+    metrics()
+        .render()
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix).and_then(|n| n.parse().ok()))
         .unwrap_or(0.0)
 }
 
@@ -703,48 +715,9 @@ async fn grpc_pd_power_of_two_uses_local_prefill_load() {
     drop(held);
 }
 
-/// One prefill's KV event publisher, as `--pd-kv-events` would name it.
-struct KvPublisher {
-    _context: zmq::Context,
-    socket: zmq::Socket,
-    endpoint: String,
-}
-
-impl KvPublisher {
-    fn bind() -> Self {
-        let context = zmq::Context::new();
-        let socket = context.socket(zmq::PUB).unwrap();
-        socket.bind("tcp://127.0.0.1:*").unwrap();
-        let endpoint = socket.get_last_endpoint().unwrap().unwrap();
-        Self {
-            _context: context,
-            socket,
-            endpoint,
-        }
-    }
-
-    /// vLLM's `BlockStored` batch for two 16-token blocks.
-    fn store_blocks(&self, token_ids: &[u32]) {
-        let payload = rmp_serde::to_vec(&(
-            1.0,
-            vec![json!({
-                "type": "BlockStored", "block_hashes": [1, 2], "parent_block_hash": null,
-                "token_ids": token_ids, "block_size": 16,
-                "lora_id": null, "lora_name": null, "medium": "GPU",
-            })],
-            0_u32,
-        ))
-        .unwrap();
-        let seq = 0_u64.to_be_bytes();
-        self.socket
-            .send_multipart([b"".as_slice(), seq.as_slice(), payload.as_slice()], 0)
-            .unwrap();
-    }
-}
-
 /// kv_aware on `grpc://` prefills scores the router's own token ids against
 /// each prefill's KV events, and sends a request to the prefill that already
-/// holds its prefix. The sources carry no model, as with `--pd-kv-events`.
+/// holds its prefix. The sources use the full-attention SHA256/CBOR contract.
 #[tokio::test]
 async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
     // Run with each prefill warm so a cold tie-break cannot pass the test.
@@ -771,9 +744,11 @@ async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
                     prefill.grpc_url.clone(),
                     PdKvEventSources {
                         endpoints: vec![publisher.endpoint.clone()],
-                        replay_endpoints: None,
+                        replay_endpoints: Some(vec![publisher.replay_endpoint.clone()]),
                         block_size: 16,
-                        model: None,
+                        model: Some("mock-model".into()),
+                        hybrid: Some(publisher.layout("mock-model", 16)),
+                        compatible_decode_urls: vec![decode.grpc_url.clone()],
                     },
                 )
             })
@@ -791,27 +766,19 @@ async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
         let prompt: Vec<u32> = (0..33).collect();
         router.pin_test_token_ids(prompt.clone());
 
+        publishers[warm_index].restore(&prompt[..32], 16).await;
+        publishers[1 - warm_index].restore(&[], 16).await;
         let warm = &prefills[warm_index];
         let cold = &prefills[1 - warm_index];
-        // The subscriber connects asynchronously; republish until a request
-        // lands on the warm prefill.
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                publishers[warm_index].store_blocks(&prompt[..32]);
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                let before = warm.captured().len();
-                send_chat_ok(&router).await;
-                if warm.captured().len() > before {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("kv_aware never picked the warm prefill");
 
         let (warm_before, cold_before) = (warm.captured().len(), cold.captured().len());
         for _ in 0..8 {
+            let hits_before = placement_hits();
             send_chat_ok(&router).await;
+            assert!(
+                placement_hits() > hits_before,
+                "placement lookup did not hit"
+            );
         }
         assert_eq!(
             warm.captured().len(),
@@ -839,10 +806,36 @@ async fn send_chat_ok(router: &VllmPDRouter) {
 
 #[tokio::test]
 async fn grpc_pd_nixl_push_dispatches_both_legs_once_identity_is_cached() {
-    let (prefill, decode, router) = push_pair().await;
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        finish_kv_transfer_params: Some(push_kv()),
+        reply_gate: Some(gate.clone()),
+        ..Default::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router(&prefill, &decode).await;
+    gate.add_permits(1);
+    let warmup = router.route_chat(None, &chat(false), None).await;
+    assert!(warmup.status().is_success());
 
-    for stream in [false, false, true] {
-        let response = router.route_chat(None, &chat(stream), None).await;
+    for (index, stream) in [false, true].into_iter().enumerate() {
+        let request = chat(stream);
+        let mut response = Box::pin(router.route_chat(None, &request, None));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                _ = &mut response => panic!("request returned before held Prefill replied"),
+                _ = async {
+                    while decode.captured().len() < index + 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .expect("Decode must be sent while Prefill is still held");
+        gate.add_permits(1);
+        let response = response.await;
         assert!(response.status().is_success(), "stream={stream}");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -852,19 +845,13 @@ async fn grpc_pd_nixl_push_dispatches_both_legs_once_identity_is_cached() {
 
     let (p, d) = (prefill.captured(), decode.captured());
     assert_eq!((p.len(), d.len()), (3, 3));
-    for (i, (p, d)) in p.iter().zip(&d).enumerate() {
+    for (p, d) in p.iter().zip(&d) {
         assert!(p.unary);
         assert_eq!(p.request_id, d.request_id);
         assert_eq!(
             d.kv_transfer_params.as_ref(),
             Some(&push_decode_kv(&d.request_id))
         );
-        let gap = d.received_at.unwrap() - p.received_at.unwrap();
-        if i == 0 {
-            assert!(gap >= PREFILL_DELAY, "first request learns the identity");
-        } else {
-            assert!(gap < PREFILL_DELAY / 2, "request {i}: D waited {gap:?}");
-        }
     }
 }
 

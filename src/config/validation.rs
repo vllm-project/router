@@ -304,7 +304,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate routing mode configuration
     fn validate_mode(mode: &RoutingMode, has_service_discovery: bool) -> ConfigResult<()> {
         match mode {
             RoutingMode::Regular { worker_urls } => {
@@ -409,7 +408,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate policy configuration
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
             PolicyConfig::Random | PolicyConfig::RoundRobin => {
@@ -516,7 +514,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate server configuration
     fn validate_server_settings(config: &RouterConfig) -> ConfigResult<()> {
         if config.port == 0 {
             return Err(ConfigError::InvalidValue {
@@ -561,7 +558,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate service discovery configuration
     fn validate_discovery(discovery: &DiscoveryConfig, mode: &RoutingMode) -> ConfigResult<()> {
         if !discovery.enabled {
             return Ok(()); // No validation needed if disabled
@@ -611,7 +607,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate metrics configuration
     fn validate_metrics(metrics: &MetricsConfig) -> ConfigResult<()> {
         if metrics.port == 0 {
             return Err(ConfigError::InvalidValue {
@@ -632,7 +627,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate retry configuration
     fn validate_retry(retry: &RetryConfig) -> ConfigResult<()> {
         if retry.max_retries < 1 {
             return Err(ConfigError::InvalidValue {
@@ -672,7 +666,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate circuit breaker configuration
     fn validate_circuit_breaker(cb: &CircuitBreakerConfig) -> ConfigResult<()> {
         if cb.failure_threshold < 1 {
             return Err(ConfigError::InvalidValue {
@@ -705,13 +698,10 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
         if let Some(program) = &config.program_scheduling {
             let pd_mode = matches!(config.mode, RoutingMode::VllmPrefillDecode { .. });
-            if (!matches!(config.mode, RoutingMode::Regular { .. }) && !pd_mode)
-                || (pd_mode && config.connection_mode != ConnectionMode::Http)
-            {
+            if !matches!(config.mode, RoutingMode::Regular { .. }) && !pd_mode {
                 return Err(ConfigError::IncompatibleConfig {
                     reason: "Program scheduling requires regular HTTP mode or vLLM PD HTTP mode"
                         .to_string(),
@@ -758,14 +748,10 @@ impl ConfigValidator {
                     || program.enable_batch_gain_admission
                     || program.token_capacity_per_dp_rank.is_none()
                     || program.pd.max_prefill_requests_per_target == 0
-                    || program.pd.max_prefill_requests_per_target > u32::MAX as usize
-                    || !matches!(
-                        program.pd.kv_hash_mode.as_str(),
-                        "sha256" | "python_hash_seed" | "xxhash_cbor"
-                    ))
+                    || program.pd.max_prefill_requests_per_target > u32::MAX as usize)
             {
                 return Err(ConfigError::IncompatibleConfig {
-                    reason: "PD scheduling requires per-rank capacity, positive bounded P concurrency and a known KV hash mode; binding_only and uncalibrated batch gain are unsupported".to_string(),
+                    reason: "PD scheduling requires per-rank capacity and positive bounded P concurrency. Binding-only mode and uncalibrated batch gain are unsupported".to_string(),
                 });
             }
         }
@@ -792,7 +778,32 @@ impl ConfigValidator {
                     .is_some_and(|discovery| discovery.enabled)
                 {
                     for worker in static_kv_event_sources.keys() {
-                        if !worker_urls.contains(worker) {
+                        use crate::kv_index::source::discovery::split_worker_rank;
+                        let (base, pinned) = split_worker_rank(worker);
+                        let exact = worker_urls.iter().any(|url| url == worker);
+                        let covers_ranks = pinned.is_none()
+                            && worker_urls.iter().any(|url| {
+                                let (url_base, rank) = split_worker_rank(url);
+                                rank.is_some() && url_base == worker
+                            });
+                        let rank_pinned_under_base =
+                            pinned.is_some() && !exact && worker_urls.iter().any(|url| url == base);
+                        if rank_pinned_under_base {
+                            // The KV index resolves static sources by exact
+                            // worker URL, so a rank-pinned declaration under a
+                            // plain base URL is accepted here and then never
+                            // applied. Ask for the rank-pinned URLs instead of
+                            // silently disabling the source.
+                            return Err(ConfigError::ValidationFailed {
+                                reason: format!(
+                                    "static KV event source '{worker}' is rank-pinned but \
+                                     --worker-urls configures only its base URL; declare the \
+                                     source under that base URL with one entry per rank, or \
+                                     enable discovery"
+                                ),
+                            });
+                        }
+                        if !exact && !covers_ranks {
                             return Err(ConfigError::ValidationFailed {
                                 reason: format!(
                                     "static KV event source worker '{worker}' is not in --worker-urls"
@@ -804,9 +815,7 @@ impl ConfigValidator {
             }
         }
 
-        // Check if service discovery is enabled for worker count validation.
-        // This covers both K8s service discovery (config.discovery) and vLLM ZMQ
-        // service discovery (VllmPrefillDecode { discovery_address: Some(_) }).
+        // Check whether vLLM supplies the P/D worker list dynamically.
         let has_vllm_discovery = matches!(
             &config.mode,
             RoutingMode::VllmPrefillDecode {
@@ -814,6 +823,7 @@ impl ConfigValidator {
                 ..
             }
         );
+        // Either K8s or vLLM discovery can supply the worker list.
         let has_service_discovery =
             config.discovery.as_ref().is_some_and(|d| d.enabled) || has_vllm_discovery;
 
@@ -863,6 +873,27 @@ impl ConfigValidator {
         // DP-aware routing is now automatically enabled when data_parallel_size > 1
         // and is compatible with service discovery
 
+        // `base@rank` in --worker-urls is a per-rank address, not a URL: a
+        // worker is created per rank only by intra-node DP. Treating it as a
+        // plain URL silently requests `http://0.0.0.0/...` because `@rank`
+        // parses as URL userinfo, so refuse it instead.
+        if config.intra_node_data_parallel_size == 1 {
+            if let RoutingMode::Regular { worker_urls } = &config.mode {
+                if let Some(url) = worker_urls.iter().find(|url| {
+                    crate::kv_index::source::discovery::split_worker_rank(url)
+                        .1
+                        .is_some()
+                }) {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: format!(
+                            "worker URL '{url}' pins a data-parallel rank; declare the base URL \
+                             and set --intra-node-data-parallel-size to the number of ranks"
+                        ),
+                    });
+                }
+            }
+        }
+
         // MoRI-IO requires service discovery: ZMQ addresses are obtained via instance
         // registration and are not available in direct URL mode.
         if config.kv_connector == KvConnector::MoriIO && !has_vllm_discovery {
@@ -874,8 +905,7 @@ impl ConfigValidator {
             });
         }
 
-        // Static KV event sources are only meaningful with a KV-aware
-        // prefill policy; anything else would silently ignore them.
+        // Static KV event sources require a KV-aware policy on the owning stage.
         if !config.pd_kv_event_sources.is_empty() {
             if let RoutingMode::VllmPrefillDecode {
                 prefill_urls,
@@ -923,7 +953,8 @@ impl ConfigValidator {
                             ),
                         });
                     }
-                    if sources.endpoints.is_empty() {
+                    let has_pairs = !sources.compatible_decode_urls.is_empty();
+                    if sources.endpoints.is_empty() && sources.hybrid.is_none() && !has_pairs {
                         return Err(ConfigError::IncompatibleConfig {
                             reason: format!("pd_kv_event_sources['{url}'] has no endpoints"),
                         });
@@ -932,6 +963,76 @@ impl ConfigValidator {
                         return Err(ConfigError::IncompatibleConfig {
                             reason: format!("pd_kv_event_sources['{url}'] block_size must be > 0"),
                         });
+                    }
+                    let invalid = |reason: &str| ConfigError::IncompatibleConfig {
+                        reason: format!("PD cache layout for '{url}': {reason}"),
+                    };
+                    let hybrid_layout = sources
+                        .hybrid
+                        .as_ref()
+                        .is_some_and(|layout| !layout.is_plain_full_attention());
+                    if has_pairs && !prefill_kv {
+                        return Err(invalid(
+                            "compatible decode URLs require a KV-aware prefill worker",
+                        ));
+                    }
+                    if (hybrid_layout || has_pairs) && config.program_scheduling.is_some() {
+                        return Err(invalid(
+                            "hybrid PD sources do not support Program scheduling",
+                        ));
+                    }
+                    if hybrid_layout && prefill_keyed && !has_pairs {
+                        return Err(invalid("requires at least one compatible decode URL"));
+                    }
+                    if let Some(decode) = sources.compatible_decode_urls.iter().find(|url| {
+                        !decode_urls
+                            .iter()
+                            .any(|decode| base_url_without_rank(decode) == *url)
+                    }) {
+                        return Err(invalid(&format!(
+                            "decode URL '{decode}' is not a configured decode base URL"
+                        )));
+                    }
+                    if let Some(layout) = &sources.hybrid {
+                        if !layout.matches_hash_block_size(None, sources.block_size) {
+                            return Err(invalid(
+                                "block_size must match the layout hash_block_size",
+                            ));
+                        }
+                        if sources.endpoints.is_empty() {
+                            if sources.replay_endpoints.is_some() || layout.ranks.is_empty() {
+                                return Err(invalid("discovered publishers require a rank layout and no static replay endpoints"));
+                            }
+                        } else {
+                            let model = sources
+                                .model
+                                .as_deref()
+                                .filter(|model| !model.trim().is_empty())
+                                .ok_or_else(|| invalid("model must not be empty"))?;
+                            let replay = sources
+                                .replay_endpoints
+                                .as_ref()
+                                .filter(|endpoints| endpoints.len() == sources.endpoints.len())
+                                .ok_or_else(|| invalid("requires one replay endpoint per rank"))?;
+                            if layout.ranks.len() != sources.endpoints.len() {
+                                return Err(invalid(
+                                    "layout must declare one capability per endpoint",
+                                ));
+                            }
+                            for (rank, replay_endpoint) in replay.iter().enumerate() {
+                                layout
+                                    .validate_declared_source(rank as u32, model, replay_endpoint)
+                                    .map_err(|reason| ConfigError::IncompatibleConfig {
+                                        reason: format!(
+                                            "invalid PD layout for '{url}' rank {rank}: {reason}"
+                                        ),
+                                    })?;
+                            }
+                        }
+                    } else if has_pairs
+                        && (!sources.endpoints.is_empty() || sources.replay_endpoints.is_some())
+                    {
+                        return Err(invalid("static publishers require an explicit rank layout"));
                     }
                     for endpoint in sources
                         .endpoints
@@ -974,7 +1075,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate URL format
     fn validate_urls(urls: &[String]) -> ConfigResult<()> {
         for url in urls {
             if url.is_empty() {
@@ -1074,6 +1174,29 @@ mod tests {
         for ttl in [0, 31_536_001] {
             config.kv_aware_session_affinity_ttl_secs = Some(ttl);
             assert!(ConfigValidator::validate(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn rank_pinned_worker_url_requires_data_parallel_size() {
+        for scheme in ["http", "grpc"] {
+            let mut config = RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec![format!("{scheme}://worker:8000@1")],
+                },
+                PolicyConfig::Random,
+            );
+            let error = ConfigValidator::validate(&config).unwrap_err();
+            assert!(
+                error.to_string().contains("pins a data-parallel rank"),
+                "{error}"
+            );
+
+            config.intra_node_data_parallel_size = 2;
+            config.mode = RoutingMode::Regular {
+                worker_urls: vec![format!("{scheme}://worker:8000")],
+            };
+            assert!(ConfigValidator::validate(&config).is_ok());
         }
     }
 
@@ -1255,12 +1378,13 @@ mod tests {
             RoutingMode::Regular {
                 worker_urls: vec![
                     "grpc://worker:50051".to_string(),
-                    "grpc://worker:50052@0".to_string(),
+                    "grpc://worker:50052".to_string(),
                 ],
             },
             PolicyConfig::Random,
         );
 
+        assert_eq!(config.connection_mode, ConnectionMode::Grpc);
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 
@@ -1706,6 +1830,8 @@ mod tests {
                 replay_endpoints: None,
                 block_size: 16,
                 model: None,
+                hybrid: None,
+                compatible_decode_urls: Vec::new(),
             },
         );
         config
@@ -1714,6 +1840,122 @@ mod tests {
     #[test]
     fn test_pd_kv_event_sources_valid() {
         assert!(ConfigValidator::validate(&pd_config_with_static_kv_sources()).is_ok());
+    }
+
+    #[test]
+    fn hybrid_pd_requires_known_pair_and_replay() {
+        let mut config = pd_config_with_static_kv_sources();
+        let source = config
+            .pd_kv_event_sources
+            .get_mut("http://prefill:8000")
+            .unwrap();
+        source.model = Some("model".into());
+        source.replay_endpoints = Some(vec!["tcp://prefill:5558".into()]);
+        source.compatible_decode_urls = vec!["http://decode:8000".into()];
+        source.hybrid = Some(serde_json::from_value(serde_json::json!({"schema_version":1,"ranks":[{
+            "rank":0,"model":"model","weight_version":"v1","publisher_topic":"boot-1",
+            "instance_topic":true,"hash_algorithm":"sha256_cbor","full_hashes":true,
+            "root_hash":"4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+            "hash_block_size":16,"hash_lookahead_tokens":0,
+            "speculative_tokens":0,"prefix_caching":true,"groups":[
+                {"group_idx":0,"kind":"mamba","spec_type":"MambaSpec","block_size":16,
+                 "prefix_cacheable":true,"prefix_replay_tokens":0,"mamba_cache_mode":"align"},
+                {"group_idx":1,"kind":"full_attention","spec_type":"FullAttentionSpec","block_size":16,
+                 "prefix_cacheable":true,"prefix_replay_tokens":0}
+            ]
+        }]})).unwrap());
+        assert!(ConfigValidator::validate(&config).is_ok());
+        let mut decode_layout = config.clone();
+        let source = decode_layout
+            .pd_kv_event_sources
+            .remove("http://prefill:8000")
+            .unwrap();
+        decode_layout
+            .pd_kv_event_sources
+            .insert("http://decode:8000".into(), source);
+        let error = ConfigValidator::validate(&decode_layout)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("compatible decode URLs require a KV-aware prefill worker"),
+            "{error}"
+        );
+        decode_layout
+            .pd_kv_event_sources
+            .get_mut("http://decode:8000")
+            .unwrap()
+            .compatible_decode_urls
+            .clear();
+        assert!(ConfigValidator::validate(&decode_layout).is_ok());
+        if let RoutingMode::VllmPrefillDecode { decode_policy, .. } = &mut decode_layout.mode {
+            *decode_policy = Some(PolicyConfig::RoundRobin);
+        }
+        assert!(ConfigValidator::validate(&decode_layout)
+            .unwrap_err()
+            .to_string()
+            .contains("whose policy is not kv_aware"));
+        for (case, expected) in [
+            ("decode", "not a configured decode base URL"),
+            ("replay", "one replay endpoint per rank"),
+            ("model", "model must not be empty"),
+            ("rank", "rank 0: missing rank capability"),
+            ("rank-model", "model does not match source model"),
+            ("empty-replay", "invalid capability or source binding"),
+            ("missing-topic", "invalid capability or source binding"),
+            ("hash-root", "invalid root hash"),
+            ("group-size", "invalid group layout"),
+            ("duplicate-rank", "invalid capability or source binding"),
+        ] {
+            let mut invalid = config.clone();
+            let source = invalid
+                .pd_kv_event_sources
+                .get_mut("http://prefill:8000")
+                .unwrap();
+            match case {
+                "decode" => source.compatible_decode_urls = vec!["http://unlisted:8000".into()],
+                "replay" => source.replay_endpoints = None,
+                "model" => source.model = None,
+                "rank" => source.hybrid.as_mut().unwrap().ranks[0].rank = 1,
+                "rank-model" => source.hybrid.as_mut().unwrap().ranks[0].model = "other".into(),
+                "empty-replay" => source.replay_endpoints = Some(vec![String::new()]),
+                "missing-topic" => source.hybrid.as_mut().unwrap().ranks[0].publisher_topic = None,
+                "hash-root" => {
+                    source.hybrid.as_mut().unwrap().ranks[0].root_hash = Some("bad".into())
+                }
+                "group-size" => source.hybrid.as_mut().unwrap().ranks[0].groups[0].block_size = 17,
+                "duplicate-rank" => {
+                    source.endpoints.push("tcp://prefill:5559".into());
+                    source
+                        .replay_endpoints
+                        .as_mut()
+                        .unwrap()
+                        .push("tcp://prefill:5560".into());
+                    let ranks = &mut source.hybrid.as_mut().unwrap().ranks;
+                    ranks.push(ranks[0].clone());
+                }
+                _ => unreachable!(),
+            }
+            let error = ConfigValidator::validate(&invalid).unwrap_err().to_string();
+            assert!(error.contains(expected), "{case}: {error}");
+        }
+        let source = config
+            .pd_kv_event_sources
+            .get_mut("http://prefill:8000")
+            .unwrap();
+        source.endpoints.push("tcp://prefill:5559".into());
+        source
+            .replay_endpoints
+            .as_mut()
+            .unwrap()
+            .push("tcp://prefill:5560".into());
+        let ranks = &mut source.hybrid.as_mut().unwrap().ranks;
+        let mut second = ranks[0].clone();
+        second.rank = 1;
+        second.publisher_topic = Some("boot-2".into());
+        ranks.insert(0, second);
+        assert!(ConfigValidator::validate(&config).is_ok());
+        config.program_scheduling = Some(ProgramSchedulingConfig::default());
+        assert!(ConfigValidator::validate(&config).is_err());
     }
 
     /// A rank-pinned prefill URL is keyed by its base URL at runtime.
@@ -1811,6 +2053,8 @@ mod tests {
                 replay_endpoints: None,
                 block_size: 16,
                 model: Some("m".to_string()),
+                hybrid: None,
+                compatible_decode_urls: Vec::new(),
             },
         );
         ConfigValidator::validate(&config).unwrap();

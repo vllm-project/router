@@ -3,7 +3,8 @@ use crate::policies::{AffinityKey, AffinityRecord, RequestHeaders};
 use axum::body::Body;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 // Custom error type for PD router operations
@@ -15,9 +16,6 @@ pub enum PDRouterError {
     #[error("Worker not found: {url}")]
     WorkerNotFound { url: String },
 
-    #[error("Lock acquisition failed: {operation}")]
-    LockError { operation: String },
-
     #[error("Health check failed for worker: {url}")]
     HealthCheckFailed { url: String },
 
@@ -26,9 +24,6 @@ pub enum PDRouterError {
 
     #[error("Network error: {message}")]
     NetworkError { message: String },
-
-    #[error("Timeout waiting for worker: {url}")]
-    Timeout { url: String },
 }
 
 /// Format a full error chain for debugging (walks source() recursively).
@@ -41,6 +36,53 @@ pub fn error_chain(err: &dyn std::error::Error) -> String {
         source = s.source();
     }
     chain.join(" caused by: ")
+}
+
+/// Common bounds for engine-owned block lists used by pull connectors.
+pub(super) fn bounded_pull_metadata(params: &Value, max_bytes: usize) -> bool {
+    struct Budget(usize);
+
+    impl std::io::Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(bytes.len())
+                .ok_or(std::io::ErrorKind::WriteZero)?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    [
+        ("remote_engine_id", 256),
+        ("remote_request_id", 512),
+        ("remote_host", 256),
+    ]
+    .into_iter()
+    .all(|(key, limit)| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty() && s.len() <= limit)
+    }) && params
+        .get("remote_port")
+        .and_then(Value::as_u64)
+        .is_some_and(|p| (1..=u64::from(u16::MAX)).contains(&p))
+        && params
+            .get("remote_block_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|groups| {
+                !groups.is_empty()
+                    && groups.len() <= 128
+                    && groups.iter().all(|g| {
+                        g.as_array()
+                            .is_some_and(|ids| ids.iter().all(|id| id.as_u64().is_some()))
+                    })
+            })
+        && serde_json::to_writer(Budget(max_bytes), params).is_ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -158,6 +200,9 @@ impl PdLoadSample {
             && self.unknown_prefill_requests == 0
             && self.pending_decode_requests == 0
             && self.active_decode_requests == 0
+            && self.pending_decode_tokens == 0
+            && self.active_decode_tokens == 0
+            && self.unknown_decode_requests == 0
     }
 }
 
@@ -176,7 +221,9 @@ pub struct PdPrefillInput {
 
 /// Token inputs are keyed by the P base URL: each backend renders its own
 /// effective input, so different tokenizer/template configurations never mix.
+#[derive(Clone)]
 pub struct PdRequestContext<'a> {
+    pub hybrid_pairs: Option<&'a HashSet<(PdEndpoint, PdEndpoint)>>,
     pub prefill_inputs: Option<&'a HashMap<String, PdPrefillInput>>,
     pub model_id: Option<&'a str>,
     pub legacy_policy_input: Option<&'a str>,
@@ -493,11 +540,11 @@ impl AttemptInner {
         let mut loads = self.loads.lock();
         let key = (Stage::Prefill, self.prefill.clone());
         if let Some(load) = loads.get_mut(&key) {
-            load.prefill_requests -= 1;
+            load.prefill_requests = load.prefill_requests.saturating_sub(1);
             if let Some(tokens) = self.prefill_tokens {
-                load.active_prefill_tokens -= tokens;
+                load.active_prefill_tokens = load.active_prefill_tokens.saturating_sub(tokens);
             } else {
-                load.unknown_prefill_requests -= 1;
+                load.unknown_prefill_requests = load.unknown_prefill_requests.saturating_sub(1);
             }
             load.publish(Stage::Prefill, &self.prefill);
             if load.idle() {
@@ -727,28 +774,6 @@ mod tests {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             self.source.as_deref()
         }
-    }
-
-    #[test]
-    fn test_error_chain_single_error() {
-        let err = TestError {
-            msg: "something broke".into(),
-            source: None,
-        };
-        assert_eq!(error_chain(&err), "something broke");
-    }
-
-    #[test]
-    fn test_error_chain_nested_errors() {
-        let inner = TestError {
-            msg: "root cause".into(),
-            source: None,
-        };
-        let outer = TestError {
-            msg: "outer error".into(),
-            source: Some(Box::new(inner)),
-        };
-        assert_eq!(error_chain(&outer), "outer error caused by: root cause");
     }
 
     #[test]

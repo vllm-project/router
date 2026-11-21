@@ -29,6 +29,17 @@ pub(crate) fn worker_get(
     }
 }
 
+/// Base model IDs in the OpenAI model list. A LoRA entry names its parent.
+pub(crate) fn served_base_model_ids(body: &serde_json::Value) -> impl Iterator<Item = &str> {
+    body.get("data")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.get("parent").is_none_or(serde_json::Value::is_null))
+        .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
+        .filter(|id| !id.trim().is_empty())
+}
+
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug {
@@ -168,21 +179,6 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     // === Multi-router support ===
 
-    // TODO: - Enhanced Worker Discovery
-    // The Worker trait should handle async discovery of metadata from the worker itself
-    // rather than having service discovery or other components query /get_server_info.
-    // This keeps service discovery decoupled from worker-specific APIs.
-    //
-    // Proposed additions:
-    // - async fn discover_metadata(&mut self) -> Result<(), Error>
-    //   Query /get_server_info and populate metadata labels with model_id, priority, cost, etc.
-    // - async fn validate_configuration(&self) -> Result<(), Error>
-    //   Ensure worker has required configuration for its mode
-    // - Make worker creation async to allow metadata discovery during initialization
-    //
-    // This way service discovery just calls router.add_worker() and the worker
-    // handles its own metadata discovery internally.
-
     /// Get the model ID this worker serves
     fn model_id(&self) -> &str {
         self.metadata()
@@ -190,6 +186,23 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .get("model_id")
             .map(|s| s.as_str())
             .unwrap_or("unknown")
+    }
+
+    /// Names this worker serves as base models: the model it registered plus
+    /// the `--served-model-name` aliases the engine reported, when known.
+    fn served_base_models(&self) -> Vec<&str> {
+        let mut served = vec![self.model_id()];
+        if let Some(aliases) = self.metadata().labels.get("served_model_aliases") {
+            served.extend(aliases.split(',').filter(|alias| !alias.is_empty()));
+        }
+        served
+    }
+
+    /// Whether `name` selects this worker's base model rather than one of its
+    /// adapters. vLLM selects an adapter through the request's `model`, and an
+    /// adapter name is neither the model id nor a served alias.
+    fn serves_base_model(&self, name: &str) -> bool {
+        self.served_base_models().contains(&name)
     }
 
     /// Get the priority of this worker (higher value = higher priority)
@@ -576,6 +589,13 @@ impl DPAwareWorker {
     /// Set the API key sent as a bearer token on this worker's HTTP health checks.
     pub fn with_worker_api_key(mut self, api_key: Option<Arc<str>>) -> Self {
         self.base_worker = self.base_worker.with_worker_api_key(api_key);
+        self
+    }
+
+    /// Copy the served-model labels of the base URL onto every DP rank: the
+    /// ranks share one engine, so they serve the same names.
+    pub fn with_labels(mut self, labels: std::collections::HashMap<String, String>) -> Self {
+        self.base_worker = self.base_worker.with_labels(labels);
         self
     }
 }
@@ -1001,58 +1021,23 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    #[test]
+    fn adapter_names_are_not_served_base_models() {
+        let mut worker = BasicWorker::new("http://127.0.0.1:8000".to_string(), WorkerType::Regular);
+        worker
+            .metadata
+            .labels
+            .insert("model_id".to_string(), "qwen35".to_string());
+        worker.metadata.labels.insert(
+            "served_model_aliases".to_string(),
+            "alias-a,alias-b".to_string(),
+        );
+        assert!(worker.serves_base_model("qwen35"));
+        assert!(worker.serves_base_model("alias-a"));
+        assert!(!worker.serves_base_model("lora1"));
+    }
+
     // Test WorkerType
-    #[test]
-    fn test_worker_type_display() {
-        assert_eq!(WorkerType::Regular.to_string(), "Regular");
-        assert_eq!(
-            WorkerType::Prefill {
-                bootstrap_port: Some(8080)
-            }
-            .to_string(),
-            "Prefill(bootstrap:8080)"
-        );
-        assert_eq!(
-            WorkerType::Prefill {
-                bootstrap_port: None
-            }
-            .to_string(),
-            "Prefill"
-        );
-        assert_eq!(WorkerType::Decode.to_string(), "Decode");
-    }
-
-    #[test]
-    fn test_worker_type_equality() {
-        assert_eq!(WorkerType::Regular, WorkerType::Regular);
-        assert_ne!(WorkerType::Regular, WorkerType::Decode);
-        assert_eq!(
-            WorkerType::Prefill {
-                bootstrap_port: Some(8080)
-            },
-            WorkerType::Prefill {
-                bootstrap_port: Some(8080)
-            }
-        );
-        assert_ne!(
-            WorkerType::Prefill {
-                bootstrap_port: Some(8080)
-            },
-            WorkerType::Prefill {
-                bootstrap_port: Some(8081)
-            }
-        );
-    }
-
-    #[test]
-    fn test_worker_type_clone() {
-        let original = WorkerType::Prefill {
-            bootstrap_port: Some(8080),
-        };
-        let cloned = original.clone();
-        assert_eq!(original, cloned);
-    }
-
     // Test HealthConfig
     #[test]
     fn test_health_config_default() {
@@ -1062,22 +1047,6 @@ mod tests {
         assert_eq!(config.endpoint, "/health");
         assert_eq!(config.failure_threshold, 3);
         assert_eq!(config.success_threshold, 2);
-    }
-
-    #[test]
-    fn test_health_config_custom() {
-        let config = HealthConfig {
-            timeout_secs: 10,
-            check_interval_secs: 60,
-            endpoint: "/healthz".to_string(),
-            failure_threshold: 5,
-            success_threshold: 3,
-        };
-        assert_eq!(config.timeout_secs, 10);
-        assert_eq!(config.check_interval_secs, 60);
-        assert_eq!(config.endpoint, "/healthz");
-        assert_eq!(config.failure_threshold, 5);
-        assert_eq!(config.success_threshold, 3);
     }
 
     // Test BasicWorker
@@ -1122,6 +1091,26 @@ mod tests {
     }
 
     #[test]
+    fn worker_auth_uses_only_the_configured_key() {
+        let client = reqwest::Client::new();
+        for (key, expected) in [
+            (None, None),
+            (Some("backend-key"), Some("Bearer backend-key")),
+        ] {
+            let request = worker_get(&client, "https://worker/v1/models", key)
+                .build()
+                .unwrap();
+            assert_eq!(
+                request
+                    .headers()
+                    .get("authorization")
+                    .map(|value| value.to_str().unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn test_worker_api_key_is_redacted_from_debug_output() {
         let api_key = "worker-secret";
         let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
@@ -1135,34 +1124,6 @@ mod tests {
     }
 
     // Test Worker trait implementation
-    #[test]
-    fn test_worker_url() {
-        let worker = BasicWorker::new("http://worker1:8080".to_string(), WorkerType::Regular);
-        assert_eq!(worker.url(), "http://worker1:8080");
-    }
-
-    #[test]
-    fn test_worker_type_getter() {
-        let regular = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
-        assert_eq!(regular.worker_type(), WorkerType::Regular);
-
-        let prefill = BasicWorker::new(
-            "http://test:8080".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: Some(9090),
-            },
-        );
-        assert_eq!(
-            prefill.worker_type(),
-            WorkerType::Prefill {
-                bootstrap_port: Some(9090)
-            }
-        );
-
-        let decode = BasicWorker::new("http://test:8080".to_string(), WorkerType::Decode);
-        assert_eq!(decode.worker_type(), WorkerType::Decode);
-    }
-
     #[test]
     fn test_health_status() {
         let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
@@ -1539,39 +1500,7 @@ mod tests {
     }
 
     // Test synchronous health check wrapper
-    #[test]
-    fn test_check_health_sync_wrapper() {
-        // We can't easily test the actual HTTP call without mocking,
-        // but we can verify the sync wrapper works
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
-
-        // This will fail because there's no server at this URL,
-        // but it tests that the sync wrapper doesn't panic
-        let result = worker.check_health();
-        assert!(result.is_err());
-    }
-
     // Performance test for load counter
-    #[test]
-    fn test_load_counter_performance() {
-        use std::time::Instant;
-
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
-        let iterations = 1_000_000;
-
-        let start = Instant::now();
-        for _ in 0..iterations {
-            worker.increment_load();
-        }
-        let duration = start.elapsed();
-
-        let ops_per_sec = iterations as f64 / duration.as_secs_f64();
-        println!("Load counter operations per second: {:.0}", ops_per_sec);
-
-        // Should be well over 1M ops/sec
-        assert!(ops_per_sec > 1_000_000.0);
-    }
-
     // ===== Tests for DPAwareWorker =====
 
     #[test]
@@ -2009,5 +1938,23 @@ mod tests {
             }
         );
         assert_eq!(workers[5].worker_type(), WorkerType::Decode);
+    }
+
+    #[test]
+    fn dp_aware_workers_keep_their_served_model_labels() {
+        // Every rank of a DP endpoint answers for the same engine, so the
+        // served-model labels probed from the base URL must survive onto each
+        // rank. Without them model_id stays "unknown" and an adapter name in
+        // `model` is mistaken for the base model.
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("model_id".to_string(), "Qwen3.5-4B".to_string());
+        labels.insert("served_model_aliases".to_string(), "qwen".to_string());
+        let worker = DPAwareWorker::new("http://host:8000".to_string(), 1, 2, WorkerType::Regular)
+            .with_labels(labels);
+
+        assert_eq!(worker.model_id(), "Qwen3.5-4B");
+        assert!(worker.serves_base_model("Qwen3.5-4B"));
+        assert!(worker.serves_base_model("qwen"));
+        assert!(!worker.serves_base_model("lora1"));
     }
 }

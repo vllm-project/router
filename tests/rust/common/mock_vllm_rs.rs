@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
+use vllm_router_rs::backend::control::KvEventSourcesResponse;
 use vllm_router_rs::backend::convert::{json_to_proto_struct, proto_struct_to_json};
 use vllm_router_rs::backend::pb::{
     self,
@@ -58,6 +59,7 @@ pub struct MockVllmRs {
     pub finish_kv_transfer_params: Option<serde_json::Value>,
     /// Wait before sending any output, as a long prefill would.
     pub reply_delay: Duration,
+    pub reply_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// Streams the client cancelled before their first output.
     pub cancelled: Arc<AtomicUsize>,
     /// Streams to fail with a gRPC error after their prompt info, i.e.
@@ -69,6 +71,7 @@ pub struct MockVllmRs {
     pub aborts: Arc<Mutex<Vec<String>>>,
     /// After `hold_after` recorded requests, wait until [`HoldGate::release`].
     pub hold: Option<HoldGate>,
+    pub kv_block_size: u32,
 }
 
 /// Blocks requests after the first `hold_after` ones until [`HoldGate::release`].
@@ -126,11 +129,13 @@ impl Default for MockVllmRs {
             failures_remaining: Arc::new(AtomicUsize::new(0)),
             finish_kv_transfer_params: None,
             reply_delay: Duration::ZERO,
+            reply_gate: None,
             cancelled: Arc::new(AtomicUsize::new(0)),
             stream_failures_remaining: Arc::new(AtomicUsize::new(0)),
             aborted_finishes_remaining: Arc::new(AtomicUsize::new(0)),
             aborts: Arc::new(Mutex::new(Vec::new())),
             hold: None,
+            kv_block_size: 0,
         }
     }
 }
@@ -148,6 +153,27 @@ impl MockVllmRsServer {
     }
 
     pub async fn spawn_with_state(state: MockVllmRs) -> Self {
+        Self::spawn_with_control(state, None).await
+    }
+
+    pub async fn spawn_with_kv_event_sources(
+        kv_block_size: u32,
+        sources: KvEventSourcesResponse,
+    ) -> Self {
+        Self::spawn_with_control(
+            MockVllmRs {
+                kv_block_size,
+                ..Default::default()
+            },
+            Some(sources),
+        )
+        .await
+    }
+
+    async fn spawn_with_control(
+        state: MockVllmRs,
+        kv_event_sources: Option<KvEventSourcesResponse>,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
@@ -158,11 +184,38 @@ impl MockVllmRsServer {
             .await;
         let svc = InferenceServer::new(state.clone());
         let control = ControlServer::new(state.clone());
+        let routes = tonic::service::Routes::new(health_service)
+            .add_service(svc)
+            .add_service(control);
+        let routes = if let Some(sources) = kv_event_sources {
+            // Keep the stock Control services. Override only the additive RPC
+            // response while the published protobuf still has the old fields.
+            routes
+                .into_axum_router()
+                .route(
+                    "/vllm.Control/GetKvEventSources",
+                    axum::routing::post(move |request: http::Request<axum::body::Body>| {
+                        let sources = sources.clone();
+                        async move {
+                            let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::<
+                                KvEventSourcesResponse,
+                                pb::GetKvEventSourcesRequest,
+                            >::default(
+                            ));
+                            let describe = tower::service_fn(move |_| {
+                                std::future::ready(Ok::<_, Status>(Response::new(sources.clone())))
+                            });
+                            grpc.unary(describe, request).await
+                        }
+                    }),
+                )
+                .into()
+        } else {
+            routes
+        };
         let handle = tokio::spawn(async move {
             Server::builder()
-                .add_service(health_service)
-                .add_service(svc)
-                .add_service(control)
+                .add_routes(routes)
                 .serve_with_incoming(incoming)
                 .await
                 .unwrap();
@@ -292,6 +345,7 @@ impl Inference for MockVllmRs {
             .as_ref()
             .map(|params| json_to_proto_struct(params).expect("JSON object"));
         let reply_delay = self.reply_delay;
+        let reply_gate = self.reply_gate.clone();
         let cancelled = self.cancelled.clone();
         let fail_stream = self
             .stream_failures_remaining
@@ -308,7 +362,13 @@ impl Inference for MockVllmRs {
         };
         tokio::spawn(async move {
             tokio::select! {
-                _ = tokio::time::sleep(reply_delay) => {}
+                _ = async {
+                    if let Some(gate) = reply_gate {
+                        gate.acquire().await.expect("test reply gate closed").forget();
+                    } else {
+                        tokio::time::sleep(reply_delay).await;
+                    }
+                } => {}
                 _ = tx.closed() => {
                     cancelled.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -393,6 +453,7 @@ macro_rules! mock_control {
             ) -> Result<Response<pb::ServerInfo>, Status> {
                 Ok(Response::new(pb::ServerInfo {
                     engine_version: "mock".into(),
+                    kv_block_size: self.kv_block_size,
                     ..Default::default()
                 }))
             }

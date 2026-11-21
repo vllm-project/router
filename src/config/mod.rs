@@ -54,6 +54,7 @@ pub fn parse_static_kv_event_sources(
             topic: String::new(),
             block_size,
             model: model.to_owned(),
+            hybrid: None,
         };
         if sources.insert(worker_url.to_owned(), source).is_some() {
             return Err(ConfigError::ValidationFailed {
@@ -97,6 +98,8 @@ pub fn parse_pd_kv_events(
                     replay_endpoints: None,
                     block_size: 16,
                     model: None,
+                    hybrid: None,
+                    compatible_decode_urls: Vec::new(),
                 },
             )
             .is_some()
@@ -132,18 +135,31 @@ fn parse_event_source_spec<'a>(spec: &'a str, flag: &str) -> ConfigResult<(&'a s
 
 impl StaticKvEventSources {
     pub(crate) fn validate(&self, worker: &str) -> ConfigResult<()> {
-        if worker.trim().is_empty() || self.model.trim().is_empty() {
+        if worker.trim().is_empty()
+            || (self.model.trim().is_empty()
+                && (self.hybrid.is_none() || !self.endpoints.is_empty()))
+        {
             return Err(ConfigError::ValidationFailed {
                 reason: "static KV event sources require worker URLs and model identity"
                     .to_string(),
             });
         }
-        if self.block_size == 0 || self.endpoints.is_empty() {
+        // With a layout, discovery can supply the endpoints and outer model
+        // identity. Registration checks the observed model against each rank.
+        if self.block_size == 0 || (self.endpoints.is_empty() && self.hybrid.is_none()) {
             return Err(ConfigError::ValidationFailed {
                 reason: format!(
                     "static KV event source for '{worker}' needs a nonzero block size and at least one endpoint"
                 ),
             });
+        }
+        if let Some(layout) = &self.hybrid {
+            let rank = crate::kv_index::source::discovery::split_worker_rank(worker).1;
+            if !layout.matches_hash_block_size(rank, self.block_size) {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!("static KV source for '{worker}' block_size must match the layout hash_block_size"),
+                });
+            }
         }
         if self
             .replay_endpoints
@@ -153,6 +169,17 @@ impl StaticKvEventSources {
             return Err(ConfigError::ValidationFailed {
                 reason: format!(
                     "static KV replay endpoint count for '{worker}' must match its event endpoint count"
+                ),
+            });
+        }
+        if crate::kv_index::source::discovery::split_worker_rank(worker)
+            .1
+            .is_some()
+            && self.endpoints.len() > 1
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: format!(
+                    "rank-pinned KV source '{worker}' can have only one publisher and one replay endpoint"
                 ),
             });
         }
@@ -272,5 +299,55 @@ mod static_kv_event_source_tests {
         for worker in ["grpc://worker:50051", "http://worker:8000/engine"] {
             source.validate(worker).unwrap();
         }
+        assert!(source.validate("http://worker:8000@1").is_err());
+    }
+
+    /// A layout without declared endpoints is legal: the declaration still
+    /// fixes the block size and the model identity, and discovery supplies the
+    /// publishers.
+    #[test]
+    fn hybrid_layout_without_endpoints_validates() {
+        let layout: crate::kv_index::CacheCapabilities =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "ranks": [{
+                    "rank": 0, "model": "m", "weight_version": "v1",
+                    "publisher_topic": "kv-hybrid", "instance_topic": true,
+                    "hash_algorithm": "sha256_cbor",
+                    "root_hash": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+                    "full_hashes": true, "hash_block_size": 64,
+                    "hash_lookahead_tokens": 0, "speculative_tokens": 0,
+                    "prefix_caching": true,
+                    "groups": [
+                        {"group_idx": 0, "kind": "mamba", "spec_type": "MambaSpec",
+                         "block_size": 64, "prefix_cacheable": true,
+                         "prefix_replay_tokens": 0, "mamba_cache_mode": "align"},
+                        {"group_idx": 1, "kind": "full_attention",
+                         "spec_type": "FullAttentionSpec", "block_size": 64,
+                         "prefix_cacheable": true, "prefix_replay_tokens": 0}
+                    ]
+                }]
+            }))
+            .unwrap();
+        let source: StaticKvEventSources = serde_json::from_value(serde_json::json!({
+            "endpoints": [], "block_size": 64, "model": "m"
+        }))
+        .unwrap();
+        let mut source = source;
+        source.hybrid = Some(layout);
+        source.validate("http://worker:8000").unwrap();
+
+        let mut mismatched = source.clone();
+        mismatched.block_size = 16;
+        assert!(mismatched.validate("http://worker:8000").is_err());
+        let layout = mismatched.hybrid.as_mut().unwrap();
+        layout.ranks.clear();
+        assert!(!layout.is_plain_full_attention());
+        assert!(mismatched.validate("http://worker:8000").is_err());
+
+        // Without a layout the endpoint list is still mandatory.
+        let mut generic = source.clone();
+        generic.hybrid = None;
+        assert!(generic.validate("http://worker:8000").is_err());
     }
 }

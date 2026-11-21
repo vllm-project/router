@@ -3,15 +3,41 @@
 use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
+    HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
+    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, StaticKvEventSources,
+    TraceConfig,
 };
+use vllm_router_rs::kv_index::CacheCapabilities;
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
 use vllm_router_rs::service_discovery::ServiceDiscoveryConfig;
 
 type PrefillArgs = (String, Option<u16>);
+
+#[derive(serde::Deserialize)]
+struct WorkerKvLayout {
+    #[serde(flatten)]
+    layout: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    endpoints: Vec<String>,
+    replay_endpoints: Option<Vec<String>>,
+    #[serde(default)]
+    compatible_decode_urls: Vec<String>,
+}
+
+fn read_json_config<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+    description: &str,
+) -> ConfigResult<T> {
+    let data = std::fs::read(path).map_err(|error| ConfigError::ValidationFailed {
+        reason: format!("cannot read {description} {}: {error}", path.display()),
+    })?;
+    serde_json::from_slice(&data).map_err(|error| ConfigError::ValidationFailed {
+        reason: format!("invalid {description} {}: {error}", path.display()),
+    })
+}
+
 fn split_prefill_args_from_others(
     args: impl IntoIterator<Item = String>,
 ) -> Result<(Vec<PrefillArgs>, Vec<String>), String> {
@@ -149,9 +175,9 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
 
-    /// Statically configured KV event sources as
-    /// "PREFILL_URL=ZMQ_PUB_ENDPOINT[,ENDPOINT...]"; the Nth endpoint is DP
-    /// rank N. Can be specified multiple times, once per prefill worker.
+    /// Static KV event publishers for KV-aware prefill or decode workers.
+    /// Specify "URL=ZMQ_PUB_ENDPOINT[,ENDPOINT...]" once per worker in DP-rank
+    /// order. Block size defaults to 16.
     /// Replay endpoints, block size, and model are only configurable via the
     /// YAML/JSON config file.
     #[arg(
@@ -160,7 +186,6 @@ struct CliArgs {
         value_name = "URL=ENDPOINT[,ENDPOINT...]"
     )]
     pd_kv_events: Vec<String>,
-
     /// Specific policy for prefill nodes in PD mode. kv_aware uses the prefill load profile.
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
     prefill_policy: Option<String>,
@@ -218,13 +243,12 @@ struct CliArgs {
     /// Shared model identity for workers using static event publishers.
     #[arg(long)]
     kv_event_model: Option<String>,
-    /// Require complete KV event recovery before restoring placement credit.
-    /// External pool tiers stay uncredited until an independent pool baseline exists.
-    /// Sources can remain in fallback; requests stay routable without cache credit.
-    /// After retry exhaustion, an operator-initiated worker KV clear restores worker-local credit.
-    /// Monitor vllm_router_kv_source_recovery_state and vllm_router_kv_source_recovery_transitions_total.
+    /// Require complete KV event recovery or a worker KV clear to restore placement credit.
     #[arg(long, default_value_t = false)]
     kv_event_strict_recovery: bool,
+    /// KV cache layouts for colocated or P/D workers, keyed by worker URL.
+    #[arg(long)]
+    kv_hybrid_layout: Option<std::path::PathBuf>,
     /// Transfer credit for host-resident KV blocks.
     #[arg(long, default_value_t = 0.8)]
     kv_penalty_host: f64,
@@ -428,7 +452,7 @@ struct CliArgs {
     #[arg(long, default_value_t = false)]
     profile: bool,
 
-    /// KV connector type for PD disaggregation (nixl or mooncake)
+    /// KV connector for P/D disaggregation
     #[arg(long, value_enum, default_value_t = KvConnector::Nixl)]
     kv_connector: KvConnector,
 }
@@ -487,7 +511,7 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
-        let static_kv_event_sources = vllm_router_rs::config::parse_static_kv_event_sources(
+        let mut static_kv_event_sources = vllm_router_rs::config::parse_static_kv_event_sources(
             &self.kv_event_source,
             &self.kv_event_replay_source,
             self.kv_event_block_size,
@@ -571,6 +595,87 @@ impl CliArgs {
             }
         };
 
+        let mut pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
+        if let Some(path) = &self.kv_hybrid_layout {
+            let layouts: HashMap<String, WorkerKvLayout> =
+                read_json_config(path, "KV cache layout")?;
+            for (worker, config) in layouts {
+                let WorkerKvLayout {
+                    layout,
+                    endpoints,
+                    replay_endpoints,
+                    compatible_decode_urls,
+                } = config;
+                let pd = matches!(&mode, RoutingMode::VllmPrefillDecode { .. });
+                let layout: Option<CacheCapabilities> =
+                    if pd && !compatible_decode_urls.is_empty() && layout.is_empty() {
+                        None
+                    } else {
+                        let layout: CacheCapabilities = serde_json::from_value(
+                            serde_json::Value::Object(layout),
+                        )
+                        .map_err(|error| ConfigError::ValidationFailed {
+                            reason: format!("invalid KV cache layout for '{worker}': {error}"),
+                        })?;
+                        if layout.ranks.is_empty() {
+                            return Err(ConfigError::ValidationFailed {
+                                reason: format!(
+                                    "KV cache layout for '{worker}' must declare at least one rank"
+                                ),
+                            });
+                        }
+                        Some(layout)
+                    };
+                let rank = layout.as_ref().and_then(|layout| {
+                    if let Some(rank) = vllm_router_rs::backend::parse_dp_rank(&worker) {
+                        layout.rank_capability(rank)
+                    } else {
+                        layout.ranks.iter().min_by_key(|rank| rank.rank)
+                    }
+                });
+                let block_size = rank.and_then(|rank| rank.hash_block_size).unwrap_or(16);
+                let model = rank
+                    .map(|rank| rank.model.clone())
+                    .filter(|model| !model.is_empty());
+                if pd {
+                    let source = PdKvEventSources {
+                        endpoints,
+                        replay_endpoints,
+                        block_size,
+                        model,
+                        hybrid: layout,
+                        compatible_decode_urls,
+                    };
+                    if pd_kv_event_sources.insert(worker.clone(), source).is_some() {
+                        return Err(ConfigError::ValidationFailed {
+                            reason: format!("duplicate PD KV event source for '{worker}'"),
+                        });
+                    }
+                } else if let Some(source) = static_kv_event_sources.get_mut(&worker) {
+                    if !endpoints.is_empty() || replay_endpoints.is_some() {
+                        return Err(ConfigError::ValidationFailed {
+                            reason: format!("duplicate KV event endpoints for '{worker}'"),
+                        });
+                    }
+                    source.hybrid = layout;
+                } else {
+                    static_kv_event_sources.insert(
+                        worker,
+                        StaticKvEventSources {
+                            endpoints,
+                            replay_endpoints,
+                            topic: rank
+                                .and_then(|rank| rank.publisher_topic.clone())
+                                .unwrap_or_default(),
+                            block_size,
+                            model: model.unwrap_or_default(),
+                            hybrid: layout,
+                        },
+                    );
+                }
+            }
+        }
+
         // Main policy
         let mut policy = self.parse_policy(&self.policy);
         if let PolicyConfig::KvAware {
@@ -581,7 +686,7 @@ impl CliArgs {
             **configured = static_kv_event_sources;
         } else if !static_kv_event_sources.is_empty() {
             return Err(ConfigError::IncompatibleConfig {
-                reason: "--kv-event-source requires --policy kv_aware in regular mode".to_string(),
+                reason: "--kv-event-source and --kv-hybrid-layout require --policy kv_aware in regular mode".to_string(),
             });
         }
 
@@ -607,7 +712,7 @@ impl CliArgs {
             host: self.prometheus_host.clone(),
         });
 
-        let connection_mode = ConnectionMode::Http;
+        let connection_mode = mode.connection_mode();
 
         let api_key_validation_urls = if !self.api_key_validation_urls.is_empty() {
             self.api_key_validation_urls.clone()
@@ -625,8 +730,6 @@ impl CliArgs {
             self.enable_program_scheduling,
             self.program_scheduling_config_json.as_deref(),
         )?;
-
-        let pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
 
         // Build RouterConfig
         Ok(RouterConfig {
@@ -765,21 +868,11 @@ impl CliArgs {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
-    println!("DEBUG: Main function started");
 
     // Parse prefill arguments manually before clap parsing
-    println!("DEBUG: Parsing prefill arguments");
     let (prefill_urls, filtered_args) = split_prefill_args_from_others(std::env::args())?;
-    println!("DEBUG: Prefill URLs parsed: {:?}", prefill_urls);
     // Parse CLI arguments with clap using filtered args
-    println!("DEBUG: Parsing CLI arguments with clap");
-    println!("DEBUG: Filtered args: {:?}", filtered_args);
     let cli_args = CliArgs::parse_from(filtered_args);
-    println!("DEBUG: CLI args parsed successfully");
-    println!(
-        "DEBUG: vllm_pd_disaggregation: {}",
-        cli_args.vllm_pd_disaggregation
-    );
 
     // Print startup info
     println!("VLLM Router starting...");
@@ -817,34 +910,18 @@ Provide --worker-urls or PD flags as usual.",
     }
 
     // Convert to RouterConfig
-    println!("DEBUG: Converting to RouterConfig");
     let router_config = cli_args.to_router_config(prefill_urls)?;
-    println!("DEBUG: RouterConfig created successfully");
 
     // Validate configuration
-    println!("DEBUG: Validating configuration");
     router_config.validate()?;
-    println!("DEBUG: Configuration validated successfully");
 
     // Create ServerConfig
-    println!("DEBUG: Creating ServerConfig");
-    println!(
-        "DEBUG: CLI host: {}, port: {}",
-        cli_args.host, cli_args.port
-    );
     let server_config = cli_args.to_server_config(router_config);
-    println!(
-        "DEBUG: ServerConfig created successfully - host: {}, port: {}",
-        server_config.host, server_config.port
-    );
 
     // Create a new runtime for the server (like Python binding does)
-    println!("DEBUG: Creating Tokio runtime");
     let runtime = tokio::runtime::Runtime::new()?;
-    println!("DEBUG: Tokio runtime created successfully");
 
     // Block on the async startup function
-    println!("DEBUG: Starting server startup function");
     runtime.block_on(async move {
         let result = server::startup(server_config).await;
         // Shut down OTel while the Tokio runtime is still alive so the
@@ -862,6 +939,110 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loads_one_kv_layout_for_both_pd_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        for (prefill, decode) in [
+            ("http://prefill:8000", "http://decode:8000"),
+            ("grpc://prefill:50051", "grpc://decode:50051"),
+        ] {
+            let source = |host: &str| {
+                serde_json::json!({
+                    "schema_version": 1,
+                    "endpoints": [format!("tcp://{host}:5557")],
+                    "replay_endpoints": [format!("tcp://{host}:5558")],
+                    "ranks": [{
+                        "rank": 0, "model": "model", "weight_version": "v1",
+                        "publisher_topic": format!("boot-{host}"), "instance_topic": true,
+                        "hash_algorithm": "sha256_cbor", "hash_seed": "0", "full_hashes": true,
+                        "hash_block_size": 16, "hash_lookahead_tokens": 0, "declared_groups": 1,
+                        "speculative_tokens": 0, "prefix_caching": true,
+                        "groups": [{
+                            "group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec",
+                            "block_size": 16, "prefix_cacheable": true, "prefix_replay_tokens": 0
+                        }]
+                    }]
+                })
+            };
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    (prefill): source("prefill"),
+                    (decode): source("decode")
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let args = CliArgs::try_parse_from([
+                "vllm-router",
+                "--vllm-pd-disaggregation",
+                "--decode",
+                decode,
+                "--prefill-policy",
+                "kv_aware",
+                "--decode-policy",
+                "kv_aware",
+                "--kv-hybrid-layout",
+                path.to_str().unwrap(),
+            ])
+            .unwrap();
+            let config = args
+                .to_router_config(vec![(prefill.to_owned(), None)])
+                .unwrap();
+            config.validate().unwrap();
+            assert_eq!(config.pd_kv_event_sources.len(), 2);
+            for worker in [prefill, decode] {
+                let source = &config.pd_kv_event_sources[worker];
+                assert_eq!(source.model.as_deref(), Some("model"));
+                assert_eq!(source.block_size, 16);
+                assert!(source.hybrid.is_some());
+            }
+
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    (prefill): {"compatible_decode_urls": [decode]}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let config = args
+                .to_router_config(vec![(prefill.to_owned(), None)])
+                .unwrap();
+            config.validate().unwrap();
+            let source = &config.pd_kv_event_sources[prefill];
+            assert_eq!(source.compatible_decode_urls, [decode]);
+            assert!(source.hybrid.is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_empty_worker_layout_before_creating_a_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        std::fs::write(
+            &path,
+            r#"{"http://worker:8000":{"schema_version":1,"ranks":[]}}"#,
+        )
+        .unwrap();
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--policy",
+            "kv_aware",
+            "--worker-urls",
+            "http://worker:8000",
+            "--kv-hybrid-layout",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(args
+            .to_router_config(Vec::new())
+            .unwrap_err()
+            .to_string()
+            .contains("http://worker:8000' must declare at least one rank"));
+    }
 
     #[test]
     fn parses_pd_kv_aware_with_affinity_ttl() {

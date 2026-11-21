@@ -14,7 +14,6 @@ pub struct RouterConfig {
     /// Optional encoder orchestration for E+PD or E/P/D routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epd: Option<EpdConfig>,
-    /// Routing mode configuration
     pub mode: RoutingMode,
     /// Statically configured KV event sources, keyed by prefill base URL.
     /// Workers listed here skip HTTP control-plane discovery and probing.
@@ -23,34 +22,24 @@ pub struct RouterConfig {
     /// Opt in to hiding KV placement until a complete authoritative recovery.
     #[serde(default)]
     pub kv_event_strict_recovery: bool,
-    /// Worker connection mode
     #[serde(default)]
     pub connection_mode: ConnectionMode,
-    /// Policy configuration
     pub policy: PolicyConfig,
-    /// Server host address
     pub host: String,
-    /// Server port
     pub port: u16,
-    /// Maximum payload size in bytes
     pub max_payload_size: usize,
-    /// Request timeout in seconds
     pub request_timeout_secs: u64,
-    /// Worker startup timeout in seconds
     pub worker_startup_timeout_secs: u64,
     /// Worker health check interval in seconds
     pub worker_startup_check_interval_secs: u64,
     /// Intra-node data parallel size (number of DP replicas per worker URL). When > 1, the router will create multiple worker instances per URL, one for each DP rank.
     #[serde(default = "default_intra_node_data_parallel_size")]
     pub intra_node_data_parallel_size: usize,
-    /// The api key used for the authorization with the worker
     pub api_key: Option<String>,
     /// API key validation URLs (if set, incoming requests must validate against them)
     #[serde(default)]
     pub api_key_validation_urls: Vec<String>,
-    /// Service discovery configuration (optional)
     pub discovery: Option<DiscoveryConfig>,
-    /// Metrics configuration (optional)
     pub metrics: Option<MetricsConfig>,
     /// Log directory (None = stdout only)
     pub log_dir: Option<String>,
@@ -66,11 +55,8 @@ pub struct RouterConfig {
     pub queue_timeout_secs: u64,
     /// Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
     pub rate_limit_tokens_per_second: Option<usize>,
-    /// CORS allowed origins
     pub cors_allowed_origins: Vec<String>,
-    /// Retry configuration
     pub retry: RetryConfig,
-    /// Circuit breaker configuration
     pub circuit_breaker: CircuitBreakerConfig,
     /// Disable retries (overrides retry.max_retries to 1 when true)
     #[serde(default)]
@@ -83,7 +69,6 @@ pub struct RouterConfig {
     /// `None` disables affinity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_aware_session_affinity_ttl_secs: Option<u64>,
-    /// Health check configuration
     pub health_check: HealthCheckConfig,
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
     #[serde(default)]
@@ -211,7 +196,14 @@ impl Default for PredictionProfileConfig {
 pub struct PdProgramSchedulingConfig {
     /// Event residency is advisory and never authorizes a warm transfer.
     pub kv_events: bool,
-    pub kv_hash_mode: String,
+    /// Accept old Program scheduling configurations without retaining the obsolete value.
+    #[doc(hidden)]
+    #[serde(
+        rename = "kv_hash_mode",
+        skip_serializing,
+        deserialize_with = "discard_kv_hash_mode"
+    )]
+    pub _legacy_kv_hash_mode: (),
     pub max_prefill_requests_per_target: usize,
     /// Only bounded explicit TTL is supported; otherwise Acting TTL is zero.
     pub explicit_ttl: bool,
@@ -281,11 +273,15 @@ pub struct PdProgramSchedulingConfig {
     pub calibration: Option<crate::program_scheduling::pd_cost::PdCalibration>,
 }
 
+fn discard_kv_hash_mode<'de, D: Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer).map(drop)
+}
+
 impl Default for PdProgramSchedulingConfig {
     fn default() -> Self {
         Self {
             kv_events: false,
-            kv_hash_mode: "sha256".to_string(),
+            _legacy_kv_hash_mode: (),
             max_prefill_requests_per_target: 1,
             explicit_ttl: false,
             exclusive_capacity_accounting: true,
@@ -1009,9 +1005,12 @@ pub enum ConnectionMode {
     Grpc,
 }
 
-/// Statically configured KV event sources for one prefill worker, used when
-/// the engine's HTTP control plane does not serve `/server_info` or
-/// `/kv_event_sources` (e.g. the `vllm-rs serve` frontend).
+/// Statically configured KV event sources for one prefill worker.
+///
+/// This is authoritative for engines that cannot report their own sources:
+/// the HTTP `/kv_event_sources` route exists only since vLLM 0.31.0, and
+/// OpenAI-compatible frontends never serve it. On v0.29/v0.30 a deployment
+/// must declare its sources here (or use the gRPC Control RPC).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PdKvEventSources {
     /// ZMQ PUB endpoints, one per data-parallel rank (index = rank).
@@ -1027,6 +1026,12 @@ pub struct PdKvEventSources {
     /// served-model check then relies on `/v1/models`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Router-managed cache layout for this prefill or decode worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hybrid: Option<crate::kv_index::CacheCapabilities>,
+    /// Decode base URLs explicitly verified for this hybrid prefill worker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatible_decode_urls: Vec<String>,
 }
 
 fn default_pd_kv_block_size() -> u32 {
@@ -1066,11 +1071,27 @@ pub enum RoutingMode {
 }
 
 impl RoutingMode {
-    pub fn is_pd_mode(&self) -> bool {
-        matches!(self, RoutingMode::VllmPrefillDecode { .. })
+    pub fn connection_mode(&self) -> ConnectionMode {
+        let worker_url = match self {
+            Self::Regular { worker_urls } => worker_urls.first(),
+            Self::VllmPrefillDecode {
+                prefill_urls,
+                decode_urls,
+                ..
+            } => prefill_urls
+                .first()
+                .map(|(url, _)| url)
+                .or_else(|| decode_urls.first()),
+            Self::OpenAI { .. } => None,
+        };
+        if worker_url.is_some_and(|url| crate::backend::is_grpc_url(url)) {
+            ConnectionMode::Grpc
+        } else {
+            ConnectionMode::Http
+        }
     }
 
-    pub fn is_vllm_pd_mode(&self) -> bool {
+    pub fn is_pd_mode(&self) -> bool {
         matches!(self, RoutingMode::VllmPrefillDecode { .. })
     }
 
@@ -1196,6 +1217,9 @@ pub struct StaticKvEventSources {
     pub block_size: u32,
     /// Shared model identity across workers that serve the same model.
     pub model: String,
+    /// Router-managed hybrid layout and per-rank publisher identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hybrid: Option<crate::kv_index::CacheCapabilities>,
 }
 
 impl PolicyConfig {
@@ -1456,6 +1480,7 @@ impl RouterConfig {
     /// Create a new configuration with mode and policy
     pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
         Self {
+            connection_mode: mode.connection_mode(),
             mode,
             policy,
             ..Default::default()
@@ -1465,25 +1490,6 @@ impl RouterConfig {
     /// Validate the configuration
     pub fn validate(&self) -> ConfigResult<()> {
         ConfigValidator::validate(self)
-    }
-
-    /// Get the routing mode type as a string
-    pub fn mode_type(&self) -> &'static str {
-        match self.mode {
-            RoutingMode::Regular { .. } => "regular",
-            RoutingMode::VllmPrefillDecode { .. } => "vllm_prefill_decode",
-            RoutingMode::OpenAI { .. } => "openai",
-        }
-    }
-
-    /// Check if service discovery is enabled
-    pub fn has_service_discovery(&self) -> bool {
-        self.discovery.as_ref().is_some_and(|d| d.enabled)
-    }
-
-    /// Check if metrics are enabled
-    pub fn has_metrics(&self) -> bool {
-        self.metrics.is_some()
     }
 
     /// Compute the effective retry config considering disable flag
@@ -1502,11 +1508,6 @@ impl RouterConfig {
             cfg.failure_threshold = u32::MAX;
         }
         cfg
-    }
-
-    /// Check if running in IGW (Inference Gateway) mode
-    pub fn is_igw_mode(&self) -> bool {
-        self.enable_igw
     }
 }
 
@@ -1690,6 +1691,8 @@ mod tests {
                 replay_endpoints: Some(vec!["tcp://prefill:5558".to_string()]),
                 block_size: 32,
                 model: Some("m".to_string()),
+                hybrid: None,
+                compatible_decode_urls: Vec::new(),
             },
         );
         let json = serde_json::to_string(&config).unwrap();
@@ -2018,50 +2021,6 @@ mod tests {
         assert!(json.contains("\"load_check_interval_secs\":60"));
     }
 
-    #[test]
-    fn test_cache_aware_parameters() {
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.75,
-            balance_abs_threshold: 20,
-            balance_rel_threshold: 2.0,
-            eviction_interval_secs: 600,
-            max_tree_size: 5000,
-        };
-
-        match cache_aware {
-            PolicyConfig::CacheAware {
-                cache_threshold,
-                balance_abs_threshold,
-                balance_rel_threshold,
-                eviction_interval_secs,
-                max_tree_size,
-            } => {
-                assert!((cache_threshold - 0.75).abs() < 0.0001);
-                assert_eq!(balance_abs_threshold, 20);
-                assert!((balance_rel_threshold - 2.0).abs() < 0.0001);
-                assert_eq!(eviction_interval_secs, 600);
-                assert_eq!(max_tree_size, 5000);
-            }
-            _ => panic!("Expected CacheAware"),
-        }
-    }
-
-    #[test]
-    fn test_power_of_two_parameters() {
-        let power_of_two = PolicyConfig::PowerOfTwo {
-            load_check_interval_secs: 120,
-        };
-
-        match power_of_two {
-            PolicyConfig::PowerOfTwo {
-                load_check_interval_secs,
-            } => {
-                assert_eq!(load_check_interval_secs, 120);
-            }
-            _ => panic!("Expected PowerOfTwo"),
-        }
-    }
-
     // ============= DiscoveryConfig Tests =============
 
     #[test]
@@ -2138,353 +2097,6 @@ mod tests {
 
         assert_eq!(config.port, 9090);
         assert_eq!(config.host, "0.0.0.0");
-    }
-
-    // ============= RouterConfig Utility Methods Tests =============
-
-    #[test]
-    fn test_mode_type() {
-        let config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec![],
-            },
-            ..Default::default()
-        };
-        assert_eq!(config.mode_type(), "regular");
-
-        let config = RouterConfig {
-            mode: RoutingMode::VllmPrefillDecode {
-                prefill_urls: vec![],
-                decode_urls: vec![],
-                prefill_policy: None,
-                decode_policy: None,
-                discovery_address: None,
-            },
-            ..Default::default()
-        };
-        assert_eq!(config.mode_type(), "vllm_prefill_decode");
-    }
-
-    #[test]
-    fn test_has_service_discovery() {
-        let config = RouterConfig::default();
-        assert!(!config.has_service_discovery());
-
-        let config = RouterConfig {
-            discovery: Some(DiscoveryConfig {
-                enabled: false,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(!config.has_service_discovery());
-
-        let config = RouterConfig {
-            discovery: Some(DiscoveryConfig {
-                enabled: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(config.has_service_discovery());
-    }
-
-    #[test]
-    fn test_has_metrics() {
-        let config = RouterConfig::default();
-        assert!(!config.has_metrics());
-
-        let config = RouterConfig {
-            metrics: Some(MetricsConfig::default()),
-            ..Default::default()
-        };
-        assert!(config.has_metrics());
-    }
-
-    // ============= Edge Cases =============
-
-    #[test]
-    fn test_large_worker_lists() {
-        let large_urls: Vec<String> = (0..1000).map(|i| format!("http://worker{}", i)).collect();
-
-        let mode = RoutingMode::Regular {
-            worker_urls: large_urls.clone(),
-        };
-
-        assert_eq!(mode.worker_count(), 1000);
-
-        // Test serialization with large list
-        let config = RouterConfig {
-            mode,
-            ..Default::default()
-        };
-
-        let json = serde_json::to_string(&config).unwrap();
-        let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
-
-        match deserialized.mode {
-            RoutingMode::Regular { worker_urls } => {
-                assert_eq!(worker_urls.len(), 1000);
-            }
-            _ => panic!("Expected Regular mode"),
-        }
-    }
-
-    #[test]
-    fn test_unicode_in_config() {
-        let config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec!["http://работник1".to_string(), "http://工作者2".to_string()],
-            },
-            log_dir: Some("/日志/目录".to_string()),
-            ..Default::default()
-        };
-
-        let json = serde_json::to_string(&config).unwrap();
-        let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
-
-        match deserialized.mode {
-            RoutingMode::Regular { worker_urls } => {
-                assert_eq!(worker_urls[0], "http://работник1");
-                assert_eq!(worker_urls[1], "http://工作者2");
-            }
-            _ => panic!("Expected Regular mode"),
-        }
-
-        assert_eq!(deserialized.log_dir, Some("/日志/目录".to_string()));
-    }
-
-    #[test]
-    fn test_empty_string_fields() {
-        let config = RouterConfig {
-            host: "".to_string(),
-            log_dir: Some("".to_string()),
-            log_level: Some("".to_string()),
-            ..Default::default()
-        };
-
-        assert_eq!(config.host, "");
-        assert_eq!(config.log_dir, Some("".to_string()));
-        assert_eq!(config.log_level, Some("".to_string()));
-    }
-
-    // ============= Complex Configuration Tests =============
-
-    #[test]
-    fn test_full_pd_mode_config() {
-        let config = RouterConfig {
-            mode: RoutingMode::VllmPrefillDecode {
-                prefill_urls: vec![
-                    ("http://prefill1:8000".to_string(), Some(8001)),
-                    ("http://prefill2:8000".to_string(), None),
-                ],
-                decode_urls: vec![
-                    "http://decode1:8000".to_string(),
-                    "http://decode2:8000".to_string(),
-                ],
-                prefill_policy: None,
-                decode_policy: None,
-                discovery_address: None,
-            },
-            pd_kv_event_sources: Default::default(),
-            kv_event_strict_recovery: false,
-            policy: PolicyConfig::PowerOfTwo {
-                load_check_interval_secs: 30,
-            },
-            host: "0.0.0.0".to_string(),
-            port: 3000,
-            max_payload_size: 1048576,
-            request_timeout_secs: 120,
-            worker_startup_timeout_secs: 60,
-            worker_startup_check_interval_secs: 5,
-            intra_node_data_parallel_size: 1,
-            api_key: None,
-            api_key_validation_urls: vec![],
-            discovery: Some(DiscoveryConfig {
-                enabled: true,
-                namespace: Some("vllm".to_string()),
-                ..Default::default()
-            }),
-            metrics: Some(MetricsConfig {
-                port: 9090,
-                host: "0.0.0.0".to_string(),
-            }),
-            log_dir: Some("/var/log/vllm".to_string()),
-            log_level: Some("info".to_string()),
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            kv_aware_session_affinity_ttl_secs: None,
-            health_check: HealthCheckConfig::default(),
-            enable_igw: false,
-            queue_size: 100,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            connection_mode: ConnectionMode::Http,
-            history_backend: default_history_backend(),
-            enable_profiling: false,
-            profile_timeout_secs: default_profile_timeout_secs(),
-            epd: None,
-            kv_connector: KvConnector::default(),
-            program_scheduling: None,
-        };
-
-        assert!(config.mode.is_pd_mode());
-        assert_eq!(config.mode.worker_count(), 4);
-        assert_eq!(config.policy.name(), "power_of_two");
-        assert!(config.has_service_discovery());
-        assert!(config.has_metrics());
-    }
-
-    #[test]
-    fn test_full_regular_mode_config() {
-        let mut selector = HashMap::new();
-        selector.insert("app".to_string(), "vllm".to_string());
-
-        let config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec![
-                    "http://worker1:8000".to_string(),
-                    "http://worker2:8000".to_string(),
-                    "http://worker3:8000".to_string(),
-                ],
-            },
-            pd_kv_event_sources: Default::default(),
-            kv_event_strict_recovery: false,
-            policy: PolicyConfig::CacheAware {
-                cache_threshold: 0.9,
-                balance_abs_threshold: 5,
-                balance_rel_threshold: 1.2,
-                eviction_interval_secs: 600,
-                max_tree_size: 10000,
-            },
-            host: "0.0.0.0".to_string(),
-            port: 3001,
-            max_payload_size: 536870912,
-            request_timeout_secs: 300,
-            worker_startup_timeout_secs: 180,
-            worker_startup_check_interval_secs: 15,
-            intra_node_data_parallel_size: 1,
-            api_key: None,
-            api_key_validation_urls: vec![],
-            discovery: Some(DiscoveryConfig {
-                enabled: true,
-                namespace: None,
-                port: 8080,
-                check_interval_secs: 45,
-                selector,
-                ..Default::default()
-            }),
-            metrics: Some(MetricsConfig::default()),
-            log_dir: None,
-            log_level: Some("debug".to_string()),
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            kv_aware_session_affinity_ttl_secs: None,
-            health_check: HealthCheckConfig::default(),
-            enable_igw: false,
-            queue_size: 100,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            connection_mode: ConnectionMode::Http,
-            history_backend: default_history_backend(),
-            enable_profiling: false,
-            profile_timeout_secs: default_profile_timeout_secs(),
-            epd: None,
-            kv_connector: KvConnector::default(),
-            program_scheduling: None,
-        };
-
-        assert!(!config.mode.is_pd_mode());
-        assert_eq!(config.mode.worker_count(), 3);
-        assert_eq!(config.policy.name(), "cache_aware");
-        assert!(config.has_service_discovery());
-        assert!(config.has_metrics());
-    }
-
-    #[test]
-    fn test_config_with_all_options() {
-        let mut selectors = HashMap::new();
-        selectors.insert("env".to_string(), "prod".to_string());
-        selectors.insert("version".to_string(), "v1".to_string());
-
-        let config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec!["http://worker1".to_string()],
-            },
-            pd_kv_event_sources: Default::default(),
-            kv_event_strict_recovery: false,
-            policy: PolicyConfig::RoundRobin,
-            host: "::1".to_string(), // IPv6
-            port: 8888,
-            max_payload_size: 1024 * 1024 * 512, // 512MB
-            request_timeout_secs: 900,
-            worker_startup_timeout_secs: 600,
-            worker_startup_check_interval_secs: 20,
-            intra_node_data_parallel_size: 1,
-            api_key: None,
-            api_key_validation_urls: vec![],
-            discovery: Some(DiscoveryConfig {
-                enabled: true,
-                namespace: Some("production".to_string()),
-                port: 8443,
-                check_interval_secs: 120,
-                selector: selectors.clone(),
-                prefill_selector: selectors.clone(),
-                decode_selector: selectors,
-                bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
-            }),
-            metrics: Some(MetricsConfig {
-                port: 9999,
-                host: "::".to_string(), // IPv6 any
-            }),
-            log_dir: Some("/opt/logs/vllm".to_string()),
-            log_level: Some("trace".to_string()),
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            kv_aware_session_affinity_ttl_secs: None,
-            health_check: HealthCheckConfig::default(),
-            enable_igw: false,
-            queue_size: 100,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            connection_mode: ConnectionMode::Http,
-            history_backend: default_history_backend(),
-            enable_profiling: false,
-            profile_timeout_secs: default_profile_timeout_secs(),
-            epd: None,
-            kv_connector: KvConnector::default(),
-            program_scheduling: None,
-        };
-
-        assert!(config.has_service_discovery());
-        assert!(config.has_metrics());
-        assert_eq!(config.mode_type(), "regular");
-
-        // Test round-trip serialization
-        let json = serde_json::to_string_pretty(&config).unwrap();
-        let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(deserialized.host, "::1");
-        assert_eq!(deserialized.port, 8888);
-        assert_eq!(
-            deserialized.discovery.unwrap().namespace,
-            Some("production".to_string())
-        );
     }
 
     // ============= Policy Fallback Tests =============

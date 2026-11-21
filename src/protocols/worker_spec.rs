@@ -136,7 +136,7 @@ pub struct WorkerErrorResponse {
 }
 
 /// Worker metadata used when constructing a KV cache identity.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct ServerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
@@ -162,4 +162,37 @@ pub struct ServerInfo {
     pub kv_block_size: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_attention_block_size: Option<u32>,
+    /// Whether the worker's Mooncake connector trims compressed-model Prefill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mooncake_truncates_compressed: Option<bool>,
+    /// Engine revision used to interpret versioned cache lookup rules.
+    #[serde(skip)]
+    pub(crate) vllm_version: Option<(u32, u32)>,
+    /// `--served-model-name` aliases, so the router can tell a base-model alias
+    /// from a LoRA adapter selected through the request's `model`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub served_model_aliases: Vec<String>,
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::ServerInfo;
+
+    #[test]
+    fn server_info_accepts_legacy_block_size_and_optional_kv_fields() {
+        for field in ["kv_block_size", "block_size"] {
+            let info: ServerInfo = serde_json::from_value(serde_json::json!({
+                "model_id": "m", (field): 16, "instance_id": "x", "data_parallel_size": 2
+            }))
+            .unwrap();
+            assert_eq!(info.model_id.as_deref(), Some("m"));
+            assert_eq!(info.instance_id.as_deref(), Some("x"));
+            assert_eq!(info.kv_block_size, Some(16));
+        }
+        assert_eq!(
+            serde_json::from_str::<ServerInfo>("{}").unwrap(),
+            ServerInfo::default()
+        );
+    }
 }

@@ -1,7 +1,5 @@
 //! Request-level Completion preparation and forwarding, separate from attempts.
 
-use std::sync::Arc;
-
 use axum::{
     body::Bytes,
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
@@ -9,11 +7,10 @@ use axum::{
 use reqwest::{Client, RequestBuilder};
 
 use super::completion_output::CompletionOutputObserver;
-use crate::core::Worker;
 use crate::protocols::spec::CompletionRequest;
 
 pub(super) struct CompletionRoute {
-    pub(super) worker_credit: bool,
+    pub(super) cache_read_fallback: Option<&'static str>,
     pub(super) raw_body: Option<Bytes>,
     pub(super) echo: bool,
 }
@@ -53,28 +50,111 @@ pub(super) fn prepare_completion_route(
     request: &CompletionRequest,
     raw_body: Option<Bytes>,
 ) -> CompletionRoute {
-    // Worker preparation models these modifiers. Unknown identity extensions
-    // still execute normally but cannot acquire cache credit.
-    let worker_credit = request.lora_path.is_none()
-        && request
-            .other
-            .iter()
-            .all(|(field, value)| match field.as_str() {
-                "add_special_tokens" => value.is_boolean(),
-                "priority" => value.is_i64() || value.is_u64(),
-                "truncate_prompt_tokens" => true,
-                _ => false,
-            });
+    let cache_read_fallback = crate::backend::preprocess::completion_cache_read_fallback(request);
     CompletionRoute {
-        worker_credit,
+        cache_read_fallback,
         raw_body,
         echo: request.echo,
     }
 }
 
-pub(super) fn placement_eligibility(
-    completion: &CompletionRoute,
-    workers: &[Arc<dyn Worker>],
-) -> Option<Vec<bool>> {
-    (!completion.worker_credit).then(|| vec![false; workers.len()])
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod tests {
+    use super::*;
+    use crate::routers::reject_full_report;
+    use serde_json::json;
+
+    #[test]
+    fn return_token_ids_preserves_cache_credit_only_for_boolean_values() {
+        for (value, expected) in [
+            (json!(true), true),
+            (json!(false), true),
+            (json!(null), true),
+            (json!("true"), false),
+        ] {
+            let request: CompletionRequest = serde_json::from_value(json!({
+                "prompt": [1, 2, 3], "stream": true, "return_token_ids": value
+            }))
+            .unwrap();
+            assert_eq!(
+                prepare_completion_route(&request, None)
+                    .cache_read_fallback
+                    .is_none(),
+                expected
+            );
+        }
+        let unknown: CompletionRequest = serde_json::from_value(json!({
+            "prompt": [1, 2, 3], "future_identity_extension": true
+        }))
+        .unwrap();
+        assert!(prepare_completion_route(&unknown, None)
+            .cache_read_fallback
+            .is_some());
+    }
+
+    #[test]
+    fn full_report_is_rejected_only_for_monitored_streams() {
+        for (monitored, mode, rejected) in [
+            (true, json!({"kv_cache_report_mode": "full"}), true),
+            (true, json!({"kv_cache_report_mode": "incremental"}), false),
+            (true, json!({}), false),
+            (false, json!({"kv_cache_report_mode": "full"}), false),
+        ] {
+            assert_eq!(
+                reject_full_report(monitored, Some(&mode)).is_some(),
+                rejected
+            );
+        }
+        assert!(reject_full_report(true, None).is_none());
+    }
+
+    #[test]
+    fn session_and_report_mode_preserve_cache_credit_only_for_known_values() {
+        for (extension, expected) in [
+            (json!({"echo": true, "logprobs": 0}), false),
+            (
+                json!({"echo": true, "logprobs": 0, "return_token_ids": true}),
+                false,
+            ),
+            (json!({"echo": false, "logprobs": 0}), true),
+            (json!({"session_id": "shared"}), true),
+            (json!({"session_id": null}), true),
+            (json!({"session_id": 7}), false),
+            (
+                json!({"vllm_xargs": {"kv_cache_report_mode": "incremental"}}),
+                true,
+            ),
+            (
+                json!({"vllm_xargs": {"kv_cache_report_mode": "full"}}),
+                false,
+            ),
+            (json!({"vllm_xargs": {}}), true),
+            (json!({"vllm_xargs": null}), true),
+            (
+                json!({"vllm_xargs": {"kv_cache_report_mode": "unknown"}}),
+                false,
+            ),
+            (json!({"vllm_xargs": {"kv_cache_report_mode": true}}), false),
+            (json!({"vllm_xargs": {"other": 1}}), false),
+            (
+                json!({"vllm_xargs": {"kv_cache_report_mode": "full", "cache_salt": "x"}}),
+                false,
+            ),
+            (json!({"vllm_xargs": "full"}), false),
+        ] {
+            let mut body = json!({"prompt": [1, 2, 3]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extension.as_object().unwrap().clone());
+            let request: CompletionRequest = serde_json::from_value(body).unwrap();
+            assert_eq!(
+                prepare_completion_route(&request, None)
+                    .cache_read_fallback
+                    .is_none(),
+                expected,
+                "{extension}"
+            );
+        }
+    }
 }

@@ -33,10 +33,7 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
     if !(2..=3).contains(&batch.len()) {
         return Err("KV batch requires timestamp, events, and optional rank".into());
     }
-    let ts = batch[0]
-        .as_f64()
-        .filter(|ts| ts.is_finite() && *ts >= 0.0)
-        .ok_or("invalid KV event timestamp")?;
+    // Ordering comes from the sequence frame. The first slot is publisher time.
     let data_parallel_rank = match batch.get(2) {
         None | Some(Value::Nil) => None,
         Some(rank) => Some(
@@ -55,15 +52,32 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
         .map(decode_event)
         .collect::<Result<_, _>>()?;
     Ok(KVEventBatch {
-        ts,
         events,
         data_parallel_rank,
     })
 }
 
 fn decode_event(event: Value) -> Result<KVEvent, String> {
+    const STORED_FIELDS: &[&str] = &[
+        "type",
+        "block_hashes",
+        "parent_block_hash",
+        "token_ids",
+        "block_size",
+        "lora_id",
+        "medium",
+        "lora_name",
+        "extra_keys",
+        "group_idx",
+        "kv_cache_spec_kind",
+        "kv_cache_spec_sliding_window",
+        "locality",
+        "ownership",
+        "session_id", // Accepted for older publishers. Residency does not use it.
+        "lookahead_token_ids",
+    ];
     let pairs = event.as_map().ok_or("KV event must be a tagged map")?;
-    let mut keys = HashSet::new();
+    let mut keys = HashSet::with_capacity(pairs.len().min(STORED_FIELDS.len()));
     for (key, _) in pairs {
         let key = key.as_str().ok_or("KV event keys must be strings")?;
         if !keys.insert(key) {
@@ -75,25 +89,10 @@ fn decode_event(event: Value) -> Result<KVEvent, String> {
         .find(|(key, _)| key.as_str() == Some("type"))
         .and_then(|(_, value)| value.as_str())
         .ok_or("missing or invalid KV event type")?;
-    let (allowed, required): (&[&str], &[&str]) = match kind {
+    type Decode = fn(Value) -> Result<KVEvent, rmpv::ext::Error>;
+    let (allowed, required, decode): (&[&str], &[&str], Decode) = match kind {
         "BlockStored" => (
-            &[
-                "type",
-                "block_hashes",
-                "parent_block_hash",
-                "token_ids",
-                "block_size",
-                "lora_id",
-                "medium",
-                "lora_name",
-                "extra_keys",
-                "group_idx",
-                "kv_cache_spec_kind",
-                "kv_cache_spec_sliding_window",
-                "locality",
-                "ownership",
-                "session_id",
-            ],
+            STORED_FIELDS,
             &[
                 "block_hashes",
                 "parent_block_hash",
@@ -103,6 +102,7 @@ fn decode_event(event: Value) -> Result<KVEvent, String> {
                 "medium",
                 "lora_name",
             ],
+            |value| rmpv::ext::from_value(value).map(KVEvent::BlockStored),
         ),
         "BlockRemoved" => (
             &[
@@ -114,8 +114,11 @@ fn decode_event(event: Value) -> Result<KVEvent, String> {
                 "ownership",
             ],
             &["block_hashes", "medium"],
+            |value| rmpv::ext::from_value(value).map(KVEvent::BlockRemoved),
         ),
-        "AllBlocksCleared" => (&["type"], &[]),
+        "AllBlocksCleared" => (&["type"], &[], |value| {
+            rmpv::ext::from_value(value).map(KVEvent::AllBlocksCleared)
+        }),
         _ => return Err(format!("unsupported KV event type: {kind}")),
     };
     if let Some(key) = keys.iter().filter(|key| !allowed.contains(key)).min() {
@@ -127,19 +130,35 @@ fn decode_event(event: Value) -> Result<KVEvent, String> {
     for (key, value) in pairs {
         match key.as_str() {
             Some("block_hashes") => {
-                let hashes = value
-                    .as_array()
-                    .filter(|hashes| !hashes.is_empty())
-                    .ok_or("KV event hashes must be a nonempty array")?;
+                // Structure only. vLLM emits an empty list for a Mamba checkpoint
+                // group whose states in a chunk were all skipped, so whether an
+                // empty list is acceptable depends on the group and is decided by
+                // each consumer, not by the shared decoder.
+                let hashes = value.as_array().ok_or("KV event hashes must be an array")?;
                 for hash in hashes {
                     validate_wire_hash(hash)?;
                 }
             }
             Some("parent_block_hash") if !value.is_nil() => validate_wire_hash(value)?,
-            Some(
-                "medium" | "lora_name" | "kv_cache_spec_kind" | "locality" | "ownership"
-                | "session_id",
-            ) if !matches!(value, Value::String(_) | Value::Nil) => {
+            Some("lookahead_token_ids") if !value.is_nil() => {
+                let blocks = value
+                    .as_array()
+                    .ok_or("KV lookahead tokens must be an array of token arrays")?;
+                for block in blocks {
+                    let tokens = block
+                        .as_array()
+                        .ok_or("KV lookahead tokens must be an array of token arrays")?;
+                    if !tokens
+                        .iter()
+                        .all(|token| token.as_u64().is_some_and(|id| u32::try_from(id).is_ok()))
+                    {
+                        return Err("KV lookahead tokens must be unsigned 32-bit integers".into());
+                    }
+                }
+            }
+            Some("medium" | "lora_name" | "kv_cache_spec_kind" | "locality" | "ownership")
+                if !matches!(value, Value::String(_) | Value::Nil) =>
+            {
                 return Err(format!("KV event field {key} must be a string or nil"));
             }
             _ => {}
@@ -148,7 +167,7 @@ fn decode_event(event: Value) -> Result<KVEvent, String> {
     // The Value deserializer turns invalid UTF-8 strings into bytes, including
     // opaque extra-key values and map keys. Reject them before DTO conversion.
     validate_utf8_strings(&event)?;
-    rmpv::ext::from_value(event).map_err(|error| format!("invalid KV event: {error}"))
+    decode(event).map_err(|error| format!("invalid KV event: {error}"))
 }
 
 fn validate_utf8_strings(value: &Value) -> Result<(), String> {
@@ -158,7 +177,9 @@ fn validate_utf8_strings(value: &Value) -> Result<(), String> {
         }
         Value::Array(values) => {
             for value in values {
-                validate_utf8_strings(value)?;
+                if matches!(value, Value::String(_) | Value::Map(_) | Value::Array(_)) {
+                    validate_utf8_strings(value)?;
+                }
             }
             Ok(())
         }
@@ -185,7 +206,6 @@ fn validate_wire_hash(hash: &Value) -> Result<(), String> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::kv_index::validate_device_batch;
     use crate::kv_index::wire::{BlockStored, ExternalBlockHash};
 
     fn stored() -> Value {
@@ -203,7 +223,7 @@ mod tests {
             kv_cache_spec_sliding_window: None,
             locality: Some("LOCAL".into()),
             ownership: None,
-            session_id: None,
+            lookahead_token_ids: None,
         });
         // vLLM emits tagged maps; generic Value serialization uses positional
         // structs. Use the common DTO's named MessagePack representation.
@@ -211,13 +231,13 @@ mod tests {
         rmpv::decode::read_value(&mut Cursor::new(bytes)).unwrap()
     }
 
-    fn encode(events: Vec<Value>, rank: Value) -> Vec<u8> {
+    fn encode(events: Vec<Value>, rank: impl Into<Option<Value>>) -> Vec<u8> {
+        let mut batch = vec![1.25.into(), Value::Array(events)];
+        if let Some(rank) = rank.into() {
+            batch.push(rank);
+        }
         let mut bytes = Vec::new();
-        rmpv::encode::write_value(
-            &mut bytes,
-            &Value::Array(vec![1.25.into(), Value::Array(events), rank]),
-        )
-        .unwrap();
+        rmpv::encode::write_value(&mut bytes, &Value::Array(batch)).unwrap();
         bytes
     }
 
@@ -242,15 +262,14 @@ mod tests {
             ("medium", "CPU".into()),
             ("ownership", "TRANSFERRED".into()),
             ("locality", "REMOTE".into()),
-            ("session_id", "session".into()),
+            ("session_id", 42.into()),
             ("lora_id", 9.into()),
             ("lora_name", "adapter".into()),
             ("extra_keys", Value::Array(vec!["salt".into()])),
         ] {
             change(&mut event, key, value);
         }
-        let batch = decode_batch(&encode(vec![event], 3.into())).unwrap();
-        assert_eq!(batch.ts, 1.25);
+        let batch = decode_batch(&encode(vec![event], Value::from(3))).unwrap();
         assert_eq!(batch.data_parallel_rank, Some(3));
         let KVEvent::BlockStored(event) = &batch.events[0] else {
             panic!("stored expected")
@@ -267,30 +286,95 @@ mod tests {
         assert_eq!(event.medium.as_deref(), Some("CPU"));
         assert_eq!(event.ownership.as_deref(), Some("TRANSFERRED"));
         assert_eq!(event.locality.as_deref(), Some("REMOTE"));
-        assert_eq!(event.session_id.as_deref(), Some("session"));
         assert_eq!(event.lora_id, Some(9));
         assert_eq!(event.lora_name.as_deref(), Some("adapter"));
         assert_eq!(event.extra_keys, Some(vec!["salt".into()]));
-        assert!(validate_device_batch(&batch, 2).is_err());
     }
 
     #[test]
-    fn device_admission_is_separate_and_conservative() {
-        let batch = decode_batch(&encode(vec![stored()], Value::Nil)).unwrap();
-        assert!(validate_device_batch(&batch, 2).is_ok());
-        for (key, value) in [
-            ("medium", "CPU".into()),
-            ("medium", Value::Nil),
-            ("ownership", "UNKNOWN".into()),
-            ("locality", "UNKNOWN".into()),
-            ("group_idx", 1.into()),
-            ("token_ids", Value::Array(vec![1.into()])),
-            ("parent_block_hash", Value::Binary(vec![8; 31])),
+    fn lookahead_tokens_are_preserved_as_one_array_per_hash() {
+        let mut event = stored();
+        change(
+            &mut event,
+            "lookahead_token_ids",
+            Value::Array(vec![Value::Array(vec![42.into(), Value::from(u32::MAX)])]),
+        );
+        let batch = decode_batch(&encode(vec![event.clone()], None)).unwrap();
+        let KVEvent::BlockStored(store) = &batch.events[0] else {
+            panic!("stored expected")
+        };
+        assert_eq!(store.lookahead_token_ids, Some(vec![vec![42, u32::MAX]]));
+
+        for malformed in [
+            Value::Binary(vec![42]),
+            Value::Array(vec![42.into()]),
+            Value::Array(vec![Value::Array(vec![(-1).into()])]),
+            Value::Array(vec![Value::Array(vec![Value::from(
+                u64::from(u32::MAX) + 1,
+            )])]),
+        ] {
+            change(&mut event, "lookahead_token_ids", malformed);
+            assert!(decode_batch(&encode(vec![event.clone()], None)).is_err());
+        }
+    }
+
+    #[test]
+    fn event_rank_preserves_absent_nil_zero_and_nonzero() {
+        for event in [
+            stored(),
+            Value::Map(vec![
+                ("type".into(), "BlockRemoved".into()),
+                (
+                    "block_hashes".into(),
+                    Value::Array(vec![Value::Binary(vec![7; 32])]),
+                ),
+                ("medium".into(), "GPU".into()),
+            ]),
+            Value::Map(vec![("type".into(), "AllBlocksCleared".into())]),
+        ] {
+            for rank in [None, Some(Value::Nil), Some(0.into()), Some(7.into())] {
+                let expected = rank
+                    .as_ref()
+                    .and_then(Value::as_u64)
+                    .map(|rank| rank as u32);
+                let batch = decode_batch(&encode(vec![event.clone()], rank)).unwrap();
+                assert_eq!(batch.data_parallel_rank, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn extra_key_shapes_are_preserved_before_admission() {
+        let extension = Value::Array(vec![Value::Ext(7, vec![0xc1, 0xff])]);
+        for (wire, expected) in [
+            (None, None),
+            (Some(Value::Nil), None),
+            (Some(Value::Array(vec![Value::Nil])), Some(vec![Value::Nil])),
+            (
+                Some(Value::Array(vec![extension.clone()])),
+                Some(vec![extension]),
+            ),
+            (
+                Some(Value::Array(vec![
+                    Value::Nil,
+                    Value::Binary(vec![0xc1, 0xff]),
+                ])),
+                Some(vec![Value::Nil, Value::Binary(vec![0xc1, 0xff])]),
+            ),
         ] {
             let mut event = stored();
-            change(&mut event, key, value);
-            let batch = decode_batch(&encode(vec![event], 0.into())).unwrap();
-            assert!(validate_device_batch(&batch, 2).is_err(), "{key}");
+            let Value::Map(fields) = &mut event else {
+                unreachable!()
+            };
+            fields.retain(|(key, _)| key.as_str() != Some("extra_keys"));
+            if let Some(wire) = wire {
+                change(&mut event, "extra_keys", wire);
+            }
+            let batch = decode_batch(&encode(vec![event], Value::Nil)).unwrap();
+            let KVEvent::BlockStored(event) = &batch.events[0] else {
+                unreachable!()
+            };
+            assert_eq!(event.extra_keys, expected);
         }
     }
 
@@ -314,7 +398,7 @@ mod tests {
                 Value::Map(vec![("type".into(), "AllBlocksCleared".into())]),
             ),
         ] {
-            assert!(decode_batch(&encode(vec![template.clone()], 0.into())).is_ok());
+            assert!(decode_batch(&encode(vec![template.clone()], Value::from(0))).is_ok());
             for (unknown_keys, expected) in [
                 (&["zzzz", "aaaa"][..], "aaaa"),
                 (&["aaaa", "zzzz"][..], "aaaa"),
@@ -325,7 +409,7 @@ mod tests {
                     change(&mut event, key, Value::Nil);
                 }
                 assert_eq!(
-                    decode_batch(&encode(vec![stored(), event], 0.into())).unwrap_err(),
+                    decode_batch(&encode(vec![stored(), event], Value::from(0))).unwrap_err(),
                     format!("unsupported KV event field: {expected}"),
                     "{kind}: {unknown_keys:?}"
                 );
@@ -361,7 +445,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                decode_batch(&encode(vec![stored(), event], 0.into())).unwrap_err(),
+                decode_batch(&encode(vec![stored(), event], Value::from(0))).unwrap_err(),
                 expected
             );
         }
@@ -373,11 +457,10 @@ mod tests {
                 Value::Array(vec![Value::Binary(vec![7; 32])]),
             ),
         ]);
-        let batch = decode_batch(&encode(vec![removed], 0.into())).unwrap();
+        let batch = decode_batch(&encode(vec![removed], Value::from(0))).unwrap();
         assert!(
             matches!(&batch.events[0], KVEvent::BlockRemoved(event) if event.medium.as_deref() == Some("CPU"))
         );
-        assert!(validate_device_batch(&batch, 2).is_err());
     }
 
     #[test]
@@ -389,9 +472,10 @@ mod tests {
             Value::Array(vec![Value::Binary(vec![0xc1; 32])]),
         );
         change(&mut event, "parent_block_hash", Value::Nil);
-        let mut payload = encode(vec![event], 0.into());
+        let mut payload = encode(vec![event], Value::from(0));
         let batch = decode_batch(&payload).unwrap();
-        assert!(validate_device_batch(&batch, 2).is_ok());
+        assert!(matches!(&batch.events[0], KVEvent::BlockStored(event)
+            if event.block_hashes == [ExternalBlockHash::Bytes(vec![0xc1; 32])]));
 
         let key = b"parent_block_hash";
         let parent = payload
@@ -411,7 +495,7 @@ mod tests {
             "block_hashes",
             Value::Array(vec![Value::Binary(vec![0xff; 32])]),
         );
-        let mut payload = encode(vec![event], 0.into());
+        let mut payload = encode(vec![event], Value::from(0));
         assert!(decode_batch(&payload).is_ok());
         let hash = payload
             .windows(34)
@@ -430,13 +514,12 @@ mod tests {
             let extras = vec![Value::Map(vec![(key, value)])];
             let mut event = stored();
             change(&mut event, "extra_keys", Value::Array(extras.clone()));
-            let mut payload = encode(vec![event], 0.into());
+            let mut payload = encode(vec![event], Value::from(0));
             let batch = decode_batch(&payload).unwrap();
             let KVEvent::BlockStored(event) = &batch.events[0] else {
                 panic!("stored expected")
             };
             assert_eq!(event.extra_keys.as_ref(), Some(&extras));
-            assert!(validate_device_batch(&batch, 2).is_err());
 
             let opaque = payload
                 .windows(34)
@@ -451,8 +534,8 @@ mod tests {
     fn bounded_messagepack_and_trailing_bytes() {
         assert!(decode_batch(&vec![0; MAX_PAYLOAD_BYTES + 1]).is_err());
         let clear = Value::Map(vec![("type".into(), "AllBlocksCleared".into())]);
-        assert!(decode_batch(&encode(vec![clear; 4097], 0.into())).is_err());
-        let mut payload = encode(vec![stored()], 0.into());
+        assert!(decode_batch(&encode(vec![clear; 4097], Value::from(0))).is_err());
+        let mut payload = encode(vec![stored()], Value::from(0));
         payload.push(0);
         assert!(decode_batch(&payload).is_err());
         let mut deep = Value::Nil;
@@ -461,7 +544,7 @@ mod tests {
         }
         let mut event = stored();
         change(&mut event, "extra_keys", deep);
-        assert!(decode_batch(&encode(vec![event], 0.into())).is_err());
+        assert!(decode_batch(&encode(vec![event], Value::from(0))).is_err());
     }
 
     #[test]
@@ -483,7 +566,6 @@ mod tests {
                     "kv_cache_spec_kind",
                     "locality",
                     "ownership",
-                    "session_id",
                 ][..],
             ),
             (removed, &["medium", "locality", "ownership"][..]),
@@ -493,7 +575,7 @@ mod tests {
                     let mut event = template.clone();
                     change(&mut event, field, valid);
                     assert!(
-                        decode_batch(&encode(vec![event], 0.into())).is_ok(),
+                        decode_batch(&encode(vec![event], Value::from(0))).is_ok(),
                         "{field}"
                     );
                 }
@@ -507,7 +589,7 @@ mod tests {
                     let mut event = template.clone();
                     change(&mut event, field, invalid.clone());
                     assert!(
-                        decode_batch(&encode(vec![stored(), event], 0.into())).is_err(),
+                        decode_batch(&encode(vec![stored(), event], Value::from(0))).is_err(),
                         "{field}: {invalid:?}"
                     );
                 }
@@ -521,7 +603,7 @@ mod tests {
             let mut event = stored();
             change(&mut event, "block_hashes", Value::Array(vec![hash.clone()]));
             change(&mut event, "parent_block_hash", hash);
-            assert!(decode_batch(&encode(vec![event], 0.into())).is_ok());
+            assert!(decode_batch(&encode(vec![event], Value::from(0))).is_ok());
         }
         for field in ["block_hashes", "parent_block_hash"] {
             let mut event = stored();
@@ -531,7 +613,7 @@ mod tests {
                 (-1).into()
             };
             change(&mut event, field, value);
-            assert!(decode_batch(&encode(vec![event], 0.into())).is_err());
+            assert!(decode_batch(&encode(vec![event], Value::from(0))).is_err());
         }
     }
 
@@ -544,5 +626,18 @@ mod tests {
             nested.extend_from_slice(&payload);
             assert!(decode_batch(&nested).is_err(), "nested marker {marker:#x}");
         }
+    }
+
+    #[test]
+    fn empty_hash_list_decodes_for_consumers_to_judge() {
+        let mut event = stored();
+        change(&mut event, "block_hashes", Value::Array(vec![]));
+        change(&mut event, "extra_keys", Value::Nil);
+        let batch = decode_batch(&encode(vec![event], Value::from(0))).unwrap();
+        assert_eq!(batch.events.len(), 1);
+        // Non-array hashes are still structurally invalid.
+        let mut bad = stored();
+        change(&mut bad, "block_hashes", Value::Nil);
+        assert!(decode_batch(&encode(vec![bad], Value::from(0))).is_err());
     }
 }
