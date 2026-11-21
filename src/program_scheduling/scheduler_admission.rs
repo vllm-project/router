@@ -6,6 +6,7 @@
 use super::output_length;
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::{ProgramPauseReason, ProgramResumeOrder, ProgramSchedulerState};
+use super::ContextTokens;
 use super::{
     BatchGainInputs, ContinuitySample, ProgramDispatch, ProgramIdentity, ProgramRef,
     ProgramRequestHandle, ProgramState, ProgramStatus, ProgramTarget, ScheduleError,
@@ -70,12 +71,12 @@ impl ProgramScheduler {
     pub async fn acquire(
         &self,
         identity: ProgramIdentity,
-        estimated_context_tokens: usize,
+        context: impl Into<ContextTokens>,
         targets: &[ProgramTarget],
         routing_text: Option<String>,
     ) -> Result<ProgramDispatch, ScheduleError> {
         self.sync_targets(identity.model_pool(), targets);
-        self.acquire_synced(identity, estimated_context_tokens, targets, routing_text)
+        self.acquire_synced(identity, context.into(), targets, routing_text)
             .await
     }
 
@@ -83,24 +84,19 @@ impl ProgramScheduler {
     pub async fn acquire_from_snapshot(
         &self,
         identity: ProgramIdentity,
-        estimated_context_tokens: usize,
+        context: ContextTokens,
         targets: Arc<[ProgramTarget]>,
         routing_text: Option<String>,
     ) -> Result<ProgramDispatch, ScheduleError> {
         self.sync_target_snapshot(identity.model_pool(), targets.clone());
-        self.acquire_synced(
-            identity,
-            estimated_context_tokens,
-            targets.as_ref(),
-            routing_text,
-        )
-        .await
+        self.acquire_synced(identity, context, targets.as_ref(), routing_text)
+            .await
     }
 
     async fn acquire_synced(
         &self,
         identity: ProgramIdentity,
-        estimated_context_tokens: usize,
+        context: ContextTokens,
         targets: &[ProgramTarget],
         routing_text: Option<String>,
     ) -> Result<ProgramDispatch, ScheduleError> {
@@ -111,9 +107,12 @@ impl ProgramScheduler {
         let expected_resume = identity.expected_resume();
         let (handle, pending_output_prediction) = {
             let mut state = self.state.lock();
+            // Resolution happens before acquiring this lock; a settlement may
+            // have revoked the fingerprint in the meantime.
+            let context = self.revalidate_context(&state, identity.model_pool(), context);
             let handle = state.runtime.retain_request(
                 &identity,
-                estimated_context_tokens,
+                context,
                 routing_text.as_deref(),
                 arrived_at,
             );
@@ -206,7 +205,7 @@ impl ProgramScheduler {
                 &mut state,
                 &identity,
                 reference.clone(),
-                estimated_context_tokens,
+                context,
                 arrived_at,
                 routing_text.as_deref(),
             );
@@ -256,6 +255,24 @@ impl ProgramScheduler {
                     decision.latest_output_prediction = Some(pending.clone());
                 }
                 pending_output_prediction = Some(pending);
+            }
+
+            // Shadow rollout samples the prepared counterfactual once the
+            // decision state reflects this arrival.
+            if let Some(shadow_tokens) = context.shadow_tokens() {
+                if let Some(target_id) = state
+                    .decisions
+                    .get(&reference)
+                    .and_then(|decision| decision.last_target.clone())
+                {
+                    self.record_shadow_admission(
+                        &state,
+                        &reference,
+                        &target_id,
+                        arrived_at,
+                        shadow_tokens,
+                    );
+                }
             }
             let current_tokens = state.decisions[&reference]
                 .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
@@ -426,9 +443,8 @@ impl ProgramScheduler {
         // now the Program's active turn, and later admission must account for
         // its real prompt rather than the previous front's smaller one.
         if let Some(decision) = state.decisions.get_mut(dispatch.program()) {
-            if dispatch.estimated_context_tokens() > decision.estimated_context_tokens {
-                decision.estimated_context_tokens = dispatch.estimated_context_tokens();
-                decision.context_shrink_observations = 0;
+            if dispatch.context_tokens() > decision.context.tokens() {
+                decision.set_context_tokens(dispatch.context_tokens());
             }
         }
         RouterMetrics::record_agent_aware_queue_wait(
@@ -450,7 +466,7 @@ impl ProgramScheduler {
                 .dispatched_at()
                 .saturating_duration_since(dispatch.request_arrived_at())
                 .as_secs_f64(),
-            estimated_context_tokens = dispatch.estimated_context_tokens(),
+            context_tokens = dispatch.context_tokens(),
             placement_epoch = dispatch.placement_epoch(),
             placement_start_request = dispatch.placement_start_request(),
             "Program scheduling diagnostic"
@@ -484,9 +500,8 @@ impl ProgramScheduler {
             if let Some(decision) = state.decisions.get_mut(handle.program()) {
                 decision.output_token_reservation = next_output;
                 if let Some(context_tokens) = next_context {
-                    if context_tokens != decision.estimated_context_tokens {
-                        decision.estimated_context_tokens = context_tokens;
-                        decision.context_shrink_observations = 0;
+                    if context_tokens != decision.context.tokens() {
+                        decision.set_context_tokens(context_tokens);
                     }
                 }
             }
@@ -715,6 +730,22 @@ impl ProgramScheduler {
         target_id: &str,
         now: Instant,
     ) -> Option<RankAdmissionPlan> {
+        self.rank_admission_plan_for_context(state, program, target_id, now, None)
+    }
+
+    /// Admission gate for an explicit demand, without mutating state.
+    ///
+    /// `None` uses the queued front turn's applied context; `Some(tokens)`
+    /// evaluates the same count/reserve/batch-gain checks for a counterfactual
+    /// demand (for example the prepared count in shadow mode).
+    pub(crate) fn rank_admission_plan_for_context(
+        &self,
+        state: &ProgramSchedulerState,
+        program: &ProgramRef,
+        target_id: &str,
+        now: Instant,
+        context_override: Option<usize>,
+    ) -> Option<RankAdmissionPlan> {
         let runtime = state.runtime.view(program)?;
         let decision = state.decisions.get(program)?;
         if !self.config.global_queue && decision.last_target.as_deref() != Some(target_id) {
@@ -762,11 +793,14 @@ impl ProgramScheduler {
             .front_request_hints(program)
             .and_then(|hints| hints.expected_output_tokens);
         // Charge the front turn's own prompt. A later retained turn with a
-        // larger prompt must not inflate the front turn's capacity check.
-        let context_tokens = state
-            .runtime
-            .front_request_context(program)
-            .unwrap_or(decision.estimated_context_tokens);
+        // larger prompt must not inflate the front turn's capacity check. A
+        // counterfactual caller supplies its own demand instead.
+        let context_tokens = context_override.unwrap_or_else(|| {
+            state
+                .runtime
+                .front_request_context(program)
+                .unwrap_or(decision.context.tokens())
+        });
         let required_tokens = decision.private_tokens_from_context(
             context_tokens,
             self.config.progress_ttl.decode_buffer_tokens,
@@ -851,18 +885,16 @@ impl ProgramScheduler {
                     state
                         .decisions
                         .get(active.reference)
-                        .map(|decision| decision.estimated_context_tokens)
+                        .map(|decision| decision.context.tokens())
                 })
                 .sum(),
-            candidate_context_tokens: decision.estimated_context_tokens,
+            candidate_context_tokens: context_tokens,
             used_tokens,
             required_tokens,
             protected_remaining_rounds: &protected_rounds,
             protected_recovery_cost_seconds: &protected_costs,
             candidate_recovery_cost_seconds: self.policy.cache_miss_impact_seconds(
-                decision
-                    .estimated_context_tokens
-                    .saturating_sub(decision.shared_prefix_tokens),
+                context_tokens.saturating_sub(decision.shared_prefix_tokens),
             ),
         });
         estimate.admits.then_some(RankAdmissionPlan {
@@ -912,9 +944,8 @@ impl ProgramScheduler {
         // its observed shrink policy.
         if let Some(context_tokens) = state.runtime.front_request_context(program) {
             if let Some(decision) = state.decisions.get_mut(program) {
-                if self.config.pd_mode || context_tokens > decision.estimated_context_tokens {
-                    decision.estimated_context_tokens = context_tokens;
-                    decision.context_shrink_observations = 0;
+                if self.config.pd_mode || context_tokens > decision.context.tokens() {
+                    decision.set_context_tokens(context_tokens);
                 }
             }
         }
@@ -1161,7 +1192,12 @@ mod tests {
     async fn first_program_is_admitted_and_dispatched() {
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
         let dispatch = scheduler
-            .acquire(identity("p"), 100, &[target()], None)
+            .acquire(
+                identity("p"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                &[target()],
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(dispatch.target_id, "rank-0");
@@ -1177,7 +1213,12 @@ mod tests {
         let scheduler = ProgramScheduler::new(config);
         let target = target();
         let first = scheduler
-            .acquire(identity("first"), 100, std::slice::from_ref(&target), None)
+            .acquire(
+                identity("first"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                std::slice::from_ref(&target),
+                None,
+            )
             .await
             .unwrap();
         {
@@ -1186,7 +1227,12 @@ mod tests {
         }
         let second = tokio::time::timeout(
             std::time::Duration::from_millis(10),
-            scheduler.acquire(identity("second"), 100, &[target], None),
+            scheduler.acquire(
+                identity("second"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                &[target],
+                None,
+            ),
         )
         .await;
         assert!(second.is_err());
@@ -1204,7 +1250,7 @@ mod tests {
         let first = scheduler
             .acquire(
                 identity("program"),
-                100,
+                crate::program_scheduling::ContextTokens::estimated(100),
                 std::slice::from_ref(&target),
                 None,
             )
@@ -1212,7 +1258,12 @@ mod tests {
             .unwrap();
         scheduler.complete(&first, true, false, Some(100), Some(0.1));
         let second = scheduler
-            .acquire(identity("program"), 110, &[target], None)
+            .acquire(
+                identity("program"),
+                crate::program_scheduling::ContextTokens::estimated(110),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         let state = scheduler.state.lock();
@@ -1355,13 +1406,18 @@ mod tests {
         let mut refs = Vec::new();
         for name in ["old", "new", "forced"] {
             let identity = identity(name);
-            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            let handle = state.runtime.retain_request(
+                &identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                None,
+                now,
+            );
             let reference = handle.program().clone();
             scheduler.ensure_decision_state(
                 &mut state,
                 &identity,
                 reference.clone(),
-                100,
+                crate::program_scheduling::ContextTokens::estimated(100),
                 now,
                 None,
             );
@@ -1406,13 +1462,18 @@ mod tests {
         let mut refs = Vec::new();
         for (index, name) in ["first", "second"].into_iter().enumerate() {
             let identity = identity(name);
-            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            let handle = state.runtime.retain_request(
+                &identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                None,
+                now,
+            );
             let reference = handle.program().clone();
             scheduler.ensure_decision_state(
                 &mut state,
                 &identity,
                 reference.clone(),
-                100,
+                crate::program_scheduling::ContextTokens::estimated(100),
                 now,
                 None,
             );
@@ -1440,13 +1501,18 @@ mod tests {
         let mut queued = Vec::new();
         for (name, priority, yielded) in specifications {
             let identity = identity_with_priority(name, priority);
-            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            let handle = state.runtime.retain_request(
+                &identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                None,
+                now,
+            );
             let reference = handle.program().clone();
             scheduler.ensure_decision_state(
                 &mut state,
                 &identity,
                 reference.clone(),
-                100,
+                crate::program_scheduling::ContextTokens::estimated(100),
                 now,
                 None,
             );
@@ -1470,12 +1536,17 @@ mod tests {
         let now = Instant::now();
         let identity = identity("yielded");
         let mut state = scheduler.state.lock();
-        let handle = state.runtime.retain_request(&identity, 100, None, now);
+        let handle = state.runtime.retain_request(
+            &identity,
+            crate::program_scheduling::ContextTokens::estimated(100),
+            None,
+            now,
+        );
         scheduler.ensure_decision_state(
             &mut state,
             &identity,
             handle.program().clone(),
-            100,
+            crate::program_scheduling::ContextTokens::estimated(100),
             now,
             None,
         );
@@ -1501,12 +1572,17 @@ mod tests {
         let now = Instant::now();
         let identity = identity_with_expected_output("program", 200);
         let mut state = scheduler.state.lock();
-        let handle = state.runtime.retain_request(&identity, 100, None, now);
+        let handle = state.runtime.retain_request(
+            &identity,
+            crate::program_scheduling::ContextTokens::estimated(100),
+            None,
+            now,
+        );
         scheduler.ensure_decision_state(
             &mut state,
             &identity,
             handle.program().clone(),
-            100,
+            crate::program_scheduling::ContextTokens::estimated(100),
             now,
             None,
         );
@@ -1646,7 +1722,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            state.decisions[first_handle.program()].estimated_context_tokens,
+            state.decisions[first_handle.program()].context.tokens(),
             100,
             "the queued tail must not overwrite the front turn's context scope"
         );
@@ -1660,7 +1736,7 @@ mod tests {
         scheduler.cancel_retained_request(&second_handle);
         let state = scheduler.state.lock();
         assert_eq!(
-            state.decisions[first_handle.program()].estimated_context_tokens,
+            state.decisions[first_handle.program()].context.tokens(),
             100
         );
         let plan = scheduler
@@ -1739,7 +1815,9 @@ mod tests {
             .claim_dispatch(&second_handle)
             .expect("successor dispatches");
         assert_eq!(
-            scheduler.state.lock().decisions[second_handle.program()].estimated_context_tokens,
+            scheduler.state.lock().decisions[second_handle.program()]
+                .context
+                .tokens(),
             1_000,
             "dispatch promotes the admitted turn's context scope"
         );
@@ -1844,16 +1922,13 @@ mod tests {
                 .decisions
                 .get_mut(handle.program())
                 .unwrap()
-                .estimated_context_tokens = 800;
+                .set_context_tokens(800);
             let plan = scheduler
                 .rank_admission_plan(&state, handle.program(), "rank-0", now)
                 .expect("compacted turn fits the 900-token low watermark");
             assert_eq!(plan.required_tokens, 300.0);
             assert!(scheduler.commit_admission(&mut state, handle.program(), "rank-0", plan, now));
-            assert_eq!(
-                state.decisions[handle.program()].estimated_context_tokens,
-                100
-            );
+            assert_eq!(state.decisions[handle.program()].context.tokens(), 100);
             assert_eq!(state.decisions[handle.program()].private_tokens(10), 300.0);
             handle
         };
@@ -1908,7 +1983,9 @@ mod tests {
         scheduler.complete(&first_dispatch, true, false, None, None);
         pd_observe(&scheduler, 0.0);
         assert_eq!(
-            scheduler.state.lock().decisions[second_handle.program()].estimated_context_tokens,
+            scheduler.state.lock().decisions[second_handle.program()]
+                .context
+                .tokens(),
             100
         );
         assert!(
@@ -1998,7 +2075,9 @@ mod tests {
 
         scheduler.cancel_retained_request(&first_handle);
         assert_eq!(
-            scheduler.state.lock().decisions[second_handle.program()].estimated_context_tokens,
+            scheduler.state.lock().decisions[second_handle.program()]
+                .context
+                .tokens(),
             1_000,
             "cancellation must promote the retained front turn's context"
         );
@@ -2017,12 +2096,17 @@ mod tests {
         let now = Instant::now();
         let handle = {
             let mut state = scheduler.state.lock();
-            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            let handle = state.runtime.retain_request(
+                &identity,
+                crate::program_scheduling::ContextTokens::estimated(100),
+                None,
+                now,
+            );
             scheduler.ensure_decision_state(
                 &mut state,
                 &identity,
                 handle.program().clone(),
-                100,
+                crate::program_scheduling::ContextTokens::estimated(100),
                 now,
                 None,
             );
@@ -2051,12 +2135,17 @@ mod tests {
         let now = Instant::now();
         let identity = identity("forced");
         let mut state = scheduler.state.lock();
-        let handle = state.runtime.retain_request(&identity, 100, None, now);
+        let handle = state.runtime.retain_request(
+            &identity,
+            crate::program_scheduling::ContextTokens::estimated(100),
+            None,
+            now,
+        );
         scheduler.ensure_decision_state(
             &mut state,
             &identity,
             handle.program().clone(),
-            100,
+            crate::program_scheduling::ContextTokens::estimated(100),
             now,
             None,
         );
@@ -2083,7 +2172,12 @@ mod tests {
         let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
         let target = target();
         let first = scheduler
-            .acquire(identity("marked"), 100, std::slice::from_ref(&target), None)
+            .acquire(
+                identity("marked"),
+                crate::program_scheduling::ContextTokens::estimated(100),
+                std::slice::from_ref(&target),
+                None,
+            )
             .await
             .unwrap();
         {
@@ -2100,7 +2194,12 @@ mod tests {
                 .active_program_token_delta = 100.0;
         }
         let second = scheduler
-            .acquire(identity("marked"), 200, &[target], None)
+            .acquire(
+                identity("marked"),
+                crate::program_scheduling::ContextTokens::estimated(200),
+                &[target],
+                None,
+            )
             .await
             .unwrap();
         let state = scheduler.state.lock();
