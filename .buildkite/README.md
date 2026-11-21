@@ -40,7 +40,7 @@ on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 | --- | --- | --- | --- |
 | `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, one NVIDIA P/D completion, and kv_aware e2e on 2× L4 (`ROCM_ONLY != 1` on the GPU jobs) |
 | `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), its merge queue, or any other branch labeled `merge-test` | one-mode xGMI smoke and RDMA `SMOKE_ONLY` |
-| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), router_policy TraceLab c16 on 4× L4 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA |
+| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), router_policy TraceLab c16 on 4× L4 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA, kv_aware e2e on 2× MI300X |
 | `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
 
 A pull request labeled `ready` uploads `test-ready.yml`, including forks,
@@ -278,6 +278,22 @@ Comprehensive test suite:
 - Rust integration tests
 - Python tests with coverage
 
+### ROCm KV-aware e2e
+
+`rocm-kv-aware-e2e` in `test-nightly.yml` reuses the L4 functional test on
+two MI300X GPUs on one host. It runs whenever L3 is uploaded, including
+`ROCM_ONLY=1` builds, and does not require the NVIDIA image build.
+The pinned ROCm image supplies `vllm-rs`; the router binary comes from this
+build. See the [test configuration](../tests/python/e2e/function/kv_aware/config.py)
+for the prefix-reuse scenario and worker settings; this is not a P/D test.
+
+Router installation and Python dependency installation each have a ten-minute
+bound; pytest has a separate 30-minute bound. On forced termination, container
+teardown remains the final cleanup boundary for workers. JUnit and worker logs
+are collected under `target/ci-logs/kv-aware-rocm`; pytest output is in the
+Buildkite console. See [shared host leases](#shared-host-leases-and-timeouts)
+for the overall job timeout.
+
 ### Benchmarks
 Not part of the pipeline. Run them locally with `scripts/run_benchmarks.py`
 (criterion) or the router overhead harness; see
@@ -291,8 +307,20 @@ Builds Docker image for the router.
 - `medium_cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
 - `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation; 4-GPU router_policy c16)
 - `mithril-h100-pool`: NVIDIA H100 SXM tests (2-GPU gRPC prefix-KV perf)
-- `router_rocm_mi300_2`: dedicated two-node MI300X MoRI tests (`spawn=1`)
+- `router_rocm_mi300_2`: MI300X MoRI tests and the single-host, two-GPU KV-aware functional lane (`spawn=1`)
 - `default`: General purpose queue
+
+### Shared host leases and timeouts
+
+The `router_rocm_mi300_2` hosts are shared. Their `pre-command` hook invokes
+`vllm-router-rocm-hold-cluster-lease` after the agent accepts the job, so lease
+acquisition counts toward Buildkite's step timeout. The hook can wait up to
+360 minutes; jobs have previously timed out here before their test command ran.
+
+The KV-aware lane allows 450 minutes: 360 for the lease plus 90 for setup and
+execution. #508 aligns the MoRI lanes with this budget. A manual retry starts
+a fresh, independently bounded attempt rather than continuing the previous
+attempt's budget. Lane-specific command timeouts still bound actual test work.
 
 ## Adding New Tests
 
