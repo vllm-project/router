@@ -1688,12 +1688,8 @@ mod tests {
         .unwrap();
     }
 
-    fn stored_block(hash: i64, tokens: &[u32], block_size: u32, medium: &str) -> serde_json::Value {
-        serde_json::json!({
-            "type": "BlockStored", "block_hashes": [hash], "parent_block_hash": null,
-            "token_ids": tokens, "block_size": block_size, "medium": medium,
-            "lora_id": null, "lora_name": null
-        })
+    fn stored_block(_id: i64, tokens: &[u32], block_size: u32, medium: &str) -> rmpv::Value {
+        crate::kv_index::test_store_event(tokens, block_size, medium, None)
     }
 
     fn store_payload(
@@ -1716,7 +1712,7 @@ mod tests {
         rmp_serde::to_vec(&(
             1.0,
             [
-                serde_json::json!({"type": "AllBlocksCleared"}),
+                rmpv::Value::Map(vec![("type".into(), "AllBlocksCleared".into())]),
                 stored_block(hash, tokens, block_size, medium),
             ],
             rank,
@@ -1727,7 +1723,7 @@ mod tests {
     fn block_query(tokens: &[u32], block_size: u32, tiers: &[StorageTier]) -> MatchQuery {
         MatchQuery {
             group_idx: 0,
-            local_hashes: crate::kv_index::local_block_hash_strings(tokens, block_size, None),
+            hashes: crate::kv_index::ordinary_block_hashes(tokens, block_size),
             tiers_of_interest: tiers.to_vec(),
         }
     }
@@ -2984,8 +2980,6 @@ mod tests {
 
     #[tokio::test]
     async fn pd_static_full_attention_rejects_entire_bad_batch_with_source_block_size() {
-        use serde_json::json;
-
         let context = zmq::Context::new();
         let publisher = context.socket(zmq::XPUB).unwrap();
         publisher.bind("tcp://127.0.0.1:*").unwrap();
@@ -3018,8 +3012,15 @@ mod tests {
         let batch = rmp_serde::to_vec(&(
             1.0,
             [
-                json!({"type": "BlockRemoved", "block_hashes": [9], "medium": "GPU"}),
-                json!({"type": "AllBlocksCleared"}),
+                rmpv::Value::Map(vec![
+                    ("type".into(), "BlockRemoved".into()),
+                    (
+                        "block_hashes".into(),
+                        rmpv::Value::Array(vec![rmpv::Value::Binary(vec![9; 32])]),
+                    ),
+                    ("medium".into(), "GPU".into()),
+                ]),
+                rmpv::Value::Map(vec![("type".into(), "AllBlocksCleared".into())]),
                 stored(1, 20, 4),
                 stored(2, 100, 8),
             ],

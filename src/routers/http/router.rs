@@ -762,7 +762,10 @@ impl Router {
         self.frontend.pin_test_token_ids(token_ids);
     }
 
-    async fn discover_kv_worker(&self, worker_url: &str) -> Option<crate::kv_index::WorkerKvInfo> {
+    pub(crate) async fn discover_kv_worker(
+        &self,
+        worker_url: &str,
+    ) -> Option<crate::kv_index::WorkerKvInfo> {
         let supervisor = self.kv_index_supervisor.as_ref()?;
         let policy = self.policy_registry.get_default_policy();
         kv_aware_ops(policy.as_ref())?;
@@ -779,26 +782,44 @@ impl Router {
         }
     }
 
-    fn register_kv_target(
+    pub(crate) fn register_kv_target(
         &self,
         worker: &dyn Worker,
         info: Option<&crate::kv_index::WorkerKvInfo>,
     ) {
-        let policy = self.policy_registry.get_default_policy();
-        let Some(kv_aware) = kv_aware_ops(policy.as_ref()) else {
-            return;
-        };
+        let policy = self
+            .policy_registry
+            .get_policy_or_default(worker.model_id());
+        let default = self.policy_registry.get_default_policy();
         let provider = self
             .kv_index_supervisor
             .as_ref()
             .and_then(|supervisor| supervisor.match_provider_for_worker(worker.base_url()));
-        kv_aware.register_worker(worker, info, provider);
+        if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
+            kv_aware.register_worker(worker, info, provider.clone());
+        }
+        if !Arc::ptr_eq(&policy, &default) {
+            if let Some(kv_aware) = kv_aware_ops(default.as_ref()) {
+                kv_aware.register_worker(worker, info, provider);
+            }
+        }
+    }
+
+    pub(crate) fn retire_unused_kv_source(&self, worker_url: &str) {
+        if let Some(supervisor) = &self.kv_index_supervisor {
+            if !self
+                .worker_registry
+                .get_by_type(&WorkerType::Regular)
+                .iter()
+                .any(|worker| worker.base_url() == worker_url)
+            {
+                supervisor.on_worker_removed(worker_url);
+            }
+        }
     }
 
     fn remove_kv_worker(&self, worker_url: &str, target_urls: &[String]) {
-        if let Some(supervisor) = &self.kv_index_supervisor {
-            supervisor.on_worker_removed(worker_url);
-        }
+        self.retire_unused_kv_source(worker_url);
         let policy = self.policy_registry.get_default_policy();
         if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
             for target_url in target_urls {
@@ -3374,6 +3395,10 @@ impl RouterTrait for Router {
         .into_response()
     }
 
+    fn monitors_kv_events(&self) -> bool {
+        self.kv_index_supervisor.is_some()
+    }
+
     fn router_type(&self) -> &'static str {
         "regular"
     }
@@ -4060,7 +4085,7 @@ mod tests {
             .unwrap();
         let query = MatchQuery {
             group_idx: 0,
-            local_hashes: crate::kv_index::local_block_hash_strings(&[1; 8], 8, None),
+            hashes: crate::kv_index::ordinary_block_hashes(&[1; 8], 8),
             tiers_of_interest: vec![StorageTier::Device],
         };
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -4202,10 +4227,9 @@ mod tests {
                 };
             let query = |token| MatchQuery {
                 group_idx: 0,
-                local_hashes: crate::kv_index::local_block_hash_strings(
+                hashes: crate::kv_index::ordinary_block_hashes(
                     &vec![token; expected as usize],
                     expected,
-                    None,
                 ),
                 tiers_of_interest: vec![StorageTier::HostPinned],
             };
@@ -4771,7 +4795,10 @@ mod tests {
         .expect("subscriber handshake");
         let event = KVEvent::BlockStored(BlockStored {
             extra_keys: None,
-            block_hashes: vec![ExternalBlockHash::Int(1), ExternalBlockHash::Int(2)],
+            block_hashes: crate::kv_index::ordinary_block_hashes(&[1, 3, 4, 3, 4, 3, 4, 3], 4)
+                .into_iter()
+                .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
+                .collect(),
             parent_block_hash: None,
             token_ids: vec![1, 3, 4, 3, 4, 3, 4, 3],
             block_size: 4,
@@ -5195,12 +5222,8 @@ mod tests {
             );
             if worker_index == warm {
                 worker.increment_load();
-                for (prompt_index, ids) in inputs[warm].iter().enumerate() {
-                    let blocks: Vec<_> = KvAwarePolicy::local_hashes(&ids[..4], 2)
-                        .into_iter()
-                        .enumerate()
-                        .map(|(block, hash)| (Arc::from(format!("{prompt_index}-{block}")), hash))
-                        .collect();
+                for ids in inputs[warm].iter() {
+                    let blocks = KvAwarePolicy::block_hashes(&ids[..4], 2);
                     index.store(
                         0,
                         ResidencyOwner::Worker {
@@ -5209,7 +5232,6 @@ mod tests {
                             incarnation: 0,
                         },
                         StorageTier::Device,
-                        None,
                         &blocks,
                     );
                 }

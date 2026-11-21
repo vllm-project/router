@@ -1206,11 +1206,12 @@ mod kv_input_tests {
             assert!(initial[&base].work_by_rank[&None].placement_verified);
             let payload = rmp_serde::to_vec(&(
                 1.0,
-                vec![json!({
-                    "type":"BlockStored", "block_hashes":[1,2], "parent_block_hash":null,
-                    "token_ids":(0..32).collect::<Vec<u32>>(), "block_size":16,
-                    "lora_id":null, "lora_name":null, "medium":"GPU"
-                })],
+                [crate::kv_index::test_store_event(
+                    &tokens[..32],
+                    16,
+                    "GPU",
+                    None,
+                )],
                 0_u32,
             ))
             .unwrap();
@@ -1242,7 +1243,7 @@ mod kv_input_tests {
                 let provider = state.supervisor.match_provider_for_worker(&base).unwrap();
                 let query = MatchQuery {
                     group_idx: 0,
-                    local_hashes: crate::kv_index::local_block_hash_strings(&tokens, 16, None),
+                    hashes: crate::kv_index::ordinary_block_hashes(&tokens, 16),
                     tiers_of_interest: vec![StorageTier::Device],
                 };
                 assert_eq!(provider.find_tiered_matches(&query).len(), 1);
@@ -1361,16 +1362,11 @@ mod kv_input_tests {
                 let offset = (stage * 64) as u32;
                 let worker_tokens: Vec<u32> = (offset..offset + 16).collect();
                 let pool_tokens: Vec<u32> = (offset + 16..offset + 32).collect();
-                let store = |hash, tokens: &[u32], ownership| {
-                    json!({"type":"BlockStored", "block_hashes":[hash], "parent_block_hash":null,
-                        "token_ids":tokens, "block_size":16, "lora_id":null,
-                        "lora_name":null, "medium":"GPU", "ownership":ownership})
-                };
                 let payload = rmp_serde::to_vec(&(
                     1.0,
-                    vec![
-                        store(1, &worker_tokens, None),
-                        store(2, &pool_tokens, Some("pool")),
+                    [
+                        crate::kv_index::test_store_event(&worker_tokens, 16, "GPU", None),
+                        crate::kv_index::test_store_event(&pool_tokens, 16, "GPU", Some("pool")),
                     ],
                     0_u32,
                 ))
@@ -1381,7 +1377,7 @@ mod kv_input_tests {
                     .unwrap();
                 let query = |tokens: &[u32], tier| MatchQuery {
                     group_idx: 0,
-                    local_hashes: crate::kv_index::local_block_hash_strings(tokens, 16, None),
+                    hashes: crate::kv_index::ordinary_block_hashes(tokens, 16),
                     tiers_of_interest: vec![tier],
                 };
                 let seq = 0_u64.to_be_bytes();

@@ -32,6 +32,17 @@ pub enum ResidencyOwner {
 }
 
 impl ResidencyOwner {
+    pub(crate) fn target_parts(&self) -> (&SourceId, u32) {
+        match self {
+            Self::Worker {
+                source, dp_rank, ..
+            }
+            | Self::CacheOwner {
+                source, dp_rank, ..
+            } => (source, *dp_rank),
+        }
+    }
+
     /// The target a hit on this owner routes to.
     pub fn target(&self) -> RoutableTarget {
         let (source, dp_rank) = match self {
@@ -94,6 +105,28 @@ pub enum StorageTier {
     HostPinned,
     Disk,
     External,
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct TierBits(pub(crate) u8);
+
+impl TierBits {
+    pub(crate) fn bit(tier: StorageTier) -> u8 {
+        match tier {
+            StorageTier::Device => 1,
+            StorageTier::HostPinned => 2,
+            StorageTier::Disk => 4,
+            StorageTier::External => 8,
+        }
+    }
+
+    pub(crate) fn contains(self, tier: StorageTier) -> bool {
+        self.0 & Self::bit(tier) != 0
+    }
+
+    pub(crate) fn add(&mut self, tier: StorageTier) {
+        self.0 |= Self::bit(tier);
+    }
 }
 
 impl StorageTier {
