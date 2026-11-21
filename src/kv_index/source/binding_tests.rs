@@ -98,6 +98,35 @@ fn unknown_medium_does_not_revoke_known_residency() {
 }
 
 #[test]
+fn inferred_full_skips_foreign_and_unconfigured_adapter_shapes() {
+    use crate::kv_index::source::test_support::{full_binding, full_store};
+
+    let index = full_binding(target(), 16).require_root_proof();
+    index.begin_empty(0);
+    let tokens: Vec<_> = (0..33).collect();
+    let local = full_store(&tokens[..32], 16, None);
+    index
+        .apply_batch(0, &event_batch(vec![KVEvent::BlockStored(local.clone())]))
+        .unwrap();
+    let mut foreign = local.clone();
+    foreign.group_idx = Some(1);
+    foreign.ownership = Some("offload".into());
+    let mut adapter = local;
+    adapter.block_size = 8;
+    adapter.lora_name = Some("unconfigured".into());
+    index
+        .apply_batch(
+            1,
+            &event_batch(vec![
+                KVEvent::BlockStored(foreign),
+                KVEvent::BlockStored(adapter),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 32);
+}
+
+#[test]
 fn inferred_full_revokes_credit_on_an_incompatible_root_or_event_shape() {
     use crate::kv_index::source::test_support::{full_binding, full_store};
 

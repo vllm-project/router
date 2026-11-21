@@ -11,7 +11,60 @@ use std::sync::Arc;
 
 use foldhash::fast::RandomState;
 
+/// Cache domain and hash contract for a plain group-zero prefix lookup.
+pub struct SharedPrefixLookup {
+    index: Arc<KvBlockIndexer>,
+    keys: BlockKeyGenerator,
+}
+
+impl SharedPrefixLookup {
+    pub(crate) fn same_contract(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.index, &other.index) && self.keys == other.keys
+    }
+
+    pub(crate) fn confirms_miss<'a>(
+        &self,
+        tokens: &'a [u32],
+        cache: &mut RequestHashCache<'a>,
+    ) -> bool {
+        let group = PageQuery {
+            group: 0,
+            stop_at_gap: true,
+        };
+        let (keys, evidence) = cache.prepared_pages(tokens, &self.keys, None, &self.index);
+        if let Some(page) = evidence.get(&group) {
+            return page.confirms_empty(&self.index);
+        }
+        let Some(page) = self.index.collect_prefix(group, keys) else {
+            return true;
+        };
+        evidence.insert(group, page);
+        false
+    }
+}
+
+impl SourceBinding {
+    fn plain_attention_match(&self) -> bool {
+        self.groups.len() == 1
+            && self.groups[0].kind == crate::kv_index::GroupRule::FullAttention
+            && !self.partial_hash_hits
+            && self.replay_tokens == 0
+            && self.tail_drop_group.is_none()
+    }
+}
+
 impl crate::policies::TieredMatchProvider for SourceBinding {
+    fn shared_prefix_lookup(&self, rank: u32) -> Option<SharedPrefixLookup> {
+        (rank == self.target.dp_rank
+            && self.plain_attention_match()
+            && self.groups[0].group_idx == 0
+            && self.groups[0].block_size as usize == self.keys.block_size())
+        .then(|| SharedPrefixLookup {
+            index: self.index.clone(),
+            keys: self.keys.clone(),
+        })
+    }
+
     fn target_scoped(&self) -> bool {
         true
     }
@@ -46,12 +99,7 @@ impl crate::policies::TieredMatchProvider for SourceBinding {
         if block_size == 0 || dp_rank != self.target.dp_rank || prompt_cap < block_size as usize {
             return Vec::new();
         }
-        if self.groups.len() == 1
-            && self.groups[0].kind == crate::kv_index::GroupRule::FullAttention
-            && !self.partial_hash_hits
-            && self.replay_tokens == 0
-            && self.tail_drop_group.is_none()
-        {
+        if self.plain_attention_match() {
             let Some((mut claims, version, generation)) =
                 self.page_snapshot(lora_name, tokens, cache.stop_at_gap, cache)
             else {
@@ -185,6 +233,31 @@ impl<'a> RequestHashCache<'a> {
         domain_index: &Arc<KvBlockIndexer>,
         groups: impl Iterator<Item = impl Into<PageQuery>>,
     ) -> (&[SequenceHash], &GroupPages) {
+        let single_target = self.single_target;
+        let (keys, evidence) = self.prepared_pages(tokens, generator, adapter, domain_index);
+        let mut missing = groups
+            .map(Into::into)
+            .filter(|group| !evidence.contains_key(group))
+            .peekable();
+        if missing.peek().is_some() && !single_target && domain_index.has_multiple_sources() {
+            let added =
+                domain_index.collect_hash_groups(missing, adapter.map(|(name, _)| name), keys);
+            if evidence.is_empty() {
+                *evidence = added;
+            } else {
+                evidence.extend(added);
+            }
+        }
+        (keys, evidence)
+    }
+
+    fn prepared_pages(
+        &mut self,
+        tokens: &'a [u32],
+        generator: &BlockKeyGenerator,
+        adapter: Option<(&str, &str)>,
+        domain_index: &Arc<KvBlockIndexer>,
+    ) -> (&[SequenceHash], &mut GroupPages) {
         let slot = self.prompt_slot(tokens);
         let (tokens, chains) = &mut self.prepared[slot];
         let index = chains.iter().position(|chain| {
@@ -219,24 +292,7 @@ impl<'a> RequestHashCache<'a> {
                 .push((domain_index.clone(), GroupPages::default()));
             chain.domains.len() - 1
         });
-        let evidence = &mut chain.domains[domain].1;
-        let mut missing = groups
-            .map(Into::into)
-            .filter(|group| !evidence.contains_key(group))
-            .peekable();
-        if missing.peek().is_some() && !self.single_target && domain_index.has_multiple_sources() {
-            let added = domain_index.collect_hash_groups(
-                missing,
-                adapter.map(|(name, _)| name),
-                &chain.keys,
-            );
-            if evidence.is_empty() {
-                *evidence = added;
-            } else {
-                evidence.extend(added);
-            }
-        }
-        (&chain.keys, evidence)
+        (&chain.keys, &mut chain.domains[domain].1)
     }
 }
 

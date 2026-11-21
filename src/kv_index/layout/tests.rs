@@ -269,6 +269,21 @@ fn group_evidence_combines_partial_checkpoint_and_tier() {
 }
 
 #[test]
+fn partial_restore_does_not_charge_a_later_block_endpoint() {
+    use StorageTier::{Device, HostPinned};
+
+    let dense = CacheGroup {
+        group_idx: 0,
+        block_size: 16,
+        kind: GroupRule::FullAttention,
+    };
+    assert_eq!(
+        credit_from_groups(&[dense], &[vec![Some(Device), Some(HostPinned)]], 8, 8, 0),
+        (8, Some(Device))
+    );
+}
+
+#[test]
 fn replay_prices_groups_at_the_restore_boundary() {
     use StorageTier::{Device, HostPinned};
 

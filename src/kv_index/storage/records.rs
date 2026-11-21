@@ -38,7 +38,7 @@ impl Residency {
             }
             self.device_copies = 0;
         }
-        let removed = self.contains(tier);
+        let removed = self.tiers.contains(tier);
         self.tiers.0 &= !TierBits::bit(tier);
         removed
     }
@@ -47,10 +47,6 @@ impl Residency {
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn set_device_copies_for_test(&mut self, copies: u32) {
         self.device_copies = copies;
-    }
-
-    pub(super) fn contains(self, tier: StorageTier) -> bool {
-        self.tiers.contains(tier)
     }
 }
 
@@ -63,7 +59,7 @@ mod tests {
     fn residency_counts_only_incremental_gpu_copies_and_keeps_other_tiers() {
         let mut record = Residency::default();
         assert!(!record.observe(StorageTier::Device, false));
-        assert!(!record.contains(StorageTier::Device));
+        assert!(!record.tiers.contains(StorageTier::Device));
         for _ in 0..2 {
             assert!(record.observe(StorageTier::Device, true));
         }
@@ -72,10 +68,10 @@ mod tests {
         assert!(!record.withdraw(StorageTier::HostPinned, true));
         assert_eq!(record.device_copies, 2);
         assert!(!record.withdraw(StorageTier::Device, true));
-        assert!(record.contains(StorageTier::Device));
+        assert!(record.tiers.contains(StorageTier::Device));
         assert!(record.withdraw(StorageTier::Device, true));
-        assert!(!record.contains(StorageTier::Device));
-        assert!(record.contains(StorageTier::HostPinned));
+        assert!(!record.tiers.contains(StorageTier::Device));
+        assert!(record.tiers.contains(StorageTier::HostPinned));
         assert_eq!(record.device_copies, 0);
         record.withdraw(StorageTier::Device, false);
         record.withdraw(StorageTier::HostPinned, false);

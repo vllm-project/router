@@ -16,7 +16,8 @@ use sha2::{Digest as _, Sha256};
 use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::kv_index::{
-    CacheKey, PromptKey, RequestHashCache, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo,
+    CacheKey, PromptKey, RequestHashCache, RoutableTarget, SharedPrefixLookup, StorageTier,
+    TierMatch, WorkerKvInfo,
 };
 use crate::request_identity::StableIdentity;
 
@@ -51,6 +52,11 @@ pub trait TieredMatchProvider: Send + Sync {
     /// Group restore evidence belongs to one target; dense lookups cover all targets.
     fn target_scoped(&self) -> bool {
         false
+    }
+
+    #[doc(hidden)]
+    fn shared_prefix_lookup(&self, _rank: u32) -> Option<SharedPrefixLookup> {
+        None
     }
 
     fn nixl_decode_credit(&self, _rank: u32, _prompt_len: usize, reused: u64) -> u64 {
@@ -105,6 +111,14 @@ impl<'a> WorkerPrompts<'a> {
             Self::Single(tokens) => *tokens,
             Self::Batch(prompts) => prompts[i].as_slice(),
         })
+    }
+
+    fn single(&self) -> Option<&'a [u32]> {
+        match self {
+            Self::Single(tokens) => Some(tokens),
+            Self::Batch([tokens]) => Some(tokens),
+            Self::Batch(_) => None,
+        }
     }
 
     fn input_tokens(&self) -> Option<usize> {
@@ -994,6 +1008,7 @@ struct TargetBinding {
     generation: u64,
     cache_key: Option<CacheKey>,
     matches: Arc<dyn TieredMatchProvider>,
+    shared_prefix: Option<SharedPrefixLookup>,
     block_size: u32,
 }
 
@@ -1040,6 +1055,7 @@ impl std::hash::Hash for ProviderIdentity {
 /// Reuse prompt hashes across P/D and scored matches within one policy stage.
 #[derive(Default)]
 pub struct PromptHashes<'a> {
+    // Each stage scores a single adapter identity for the entire request.
     matches: HashMap<(MatchScope, PromptKey<'a>), Vec<TierMatch>, foldhash::fast::RandomState>,
     hashes: RequestHashCache<'a>,
 }
@@ -1174,6 +1190,7 @@ impl KvAwarePolicy {
                 generation: self.next_generation.fetch_add(1, Ordering::AcqRel),
                 cache_key: None,
                 matches: self.matches.clone(),
+                shared_prefix: None,
                 block_size: self.params.block_size,
             }),
         );
@@ -1186,6 +1203,7 @@ impl KvAwarePolicy {
         cache_key: CacheKey,
         matches: Arc<dyn TieredMatchProvider>,
     ) {
+        let shared_prefix = matches.shared_prefix_lookup(target.dp_rank);
         let _guard = self.selection_lock.lock();
         let block_size = cache_key.block_size;
         self.targets.insert(
@@ -1195,6 +1213,7 @@ impl KvAwarePolicy {
                 generation: self.next_generation.fetch_add(1, Ordering::AcqRel),
                 cache_key: Some(cache_key),
                 matches,
+                shared_prefix,
                 block_size,
             }),
         );
@@ -1256,6 +1275,7 @@ impl KvAwarePolicy {
                     generation: 0,
                     cache_key: None,
                     matches: self.matches.clone(),
+                    shared_prefix: None,
                     block_size: self.params.block_size,
                 })
             })
@@ -1663,6 +1683,56 @@ impl KvAwarePolicy {
             .filter(|(index, ids)| !ids.is_empty() && input.allows_credit(**index, workers.len()))
             .nth(1)
             .is_none();
+        // A negative page observation covers every eligible rank with the same
+        // domain and hash contract at this cutoff. Hits still require rank trust.
+        let shared_miss = if self.prefix_scoring
+            && has_tokens
+            && !query_cache.hashes.single_target
+            && lora_name.is_none()
+            && credit_fallback.is_none()
+        {
+            prompts
+                .first()
+                .and_then(WorkerPrompts::single)
+                .filter(|&tokens| {
+                    let Some(shared) = bindings
+                        .first()
+                        .and_then(|binding| binding.shared_prefix.as_ref())
+                    else {
+                        return false;
+                    };
+                    shared.confirms_miss(tokens, &mut query_cache.hashes)
+                        && bindings.iter().zip(&prompts).all(|(binding, prompts)| {
+                            binding
+                                .shared_prefix
+                                .as_ref()
+                                .is_some_and(|other| shared.same_contract(other))
+                                && prompts
+                                    .single()
+                                    .is_some_and(|ids| std::ptr::eq(tokens, ids) || tokens == ids)
+                        })
+                })
+        } else {
+            None
+        };
+        if let Some(tokens) = shared_miss {
+            let size = bindings.len();
+            let count = input.eligibility.map_or(size, |_| {
+                healthy
+                    .iter()
+                    .filter(|&&i| input.allows_credit(i, workers.len()))
+                    .count()
+            });
+            lookups.record_count("miss", count as u64);
+            return Some(SelectionPlan {
+                healthy,
+                bindings,
+                grouped: vec![Vec::new(); size],
+                input_tokens: vec![tokens.len(); size],
+                prefill_tokens: vec![None; size],
+                has_tokens,
+            });
+        }
         let mut unique = query_cache.hashes.single_target.then_some(true);
         let mut grouped = Vec::with_capacity(bindings.len());
         let mut input_tokens = Vec::with_capacity(bindings.len());
@@ -2410,6 +2480,103 @@ mod tests {
             instance_id: Arc::from(name),
             dp_rank: rank,
         }
+    }
+
+    #[test]
+    fn shared_first_page_miss_skips_rank_matching_only_for_one_contract() {
+        struct Counted(SourceBinding, AtomicUsize);
+
+        impl TieredMatchProvider for Counted {
+            fn target_scoped(&self) -> bool {
+                true
+            }
+
+            fn shared_prefix_lookup(&self, rank: u32) -> Option<SharedPrefixLookup> {
+                self.0.shared_prefix_lookup(rank)
+            }
+
+            fn matches_with_cache<'a>(
+                &self,
+                tokens: &'a [u32],
+                block_size: u32,
+                lora: Option<&str>,
+                rank: u32,
+                cache: &mut RequestHashCache<'a>,
+            ) -> Vec<TierMatch> {
+                self.1.fetch_add(1, Ordering::Relaxed);
+                self.0
+                    .matches_with_cache(tokens, block_size, lora, rank, cache)
+            }
+        }
+
+        let policy = KvAwarePolicy::default();
+        let domain = Arc::new(crate::kv_index::KvBlockIndexer::new());
+        let workers: Vec<Arc<dyn Worker>> = ["http://a:8000", "http://b:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new(url.into(), WorkerType::Regular)) as Arc<dyn Worker>
+            })
+            .collect();
+        let register = |worker: &dyn Worker, domain: &Arc<crate::kv_index::KvBlockIndexer>| {
+            let target = target(worker.url(), 0);
+            let source = full_binding(target.clone(), 16).with_shared_index(domain.clone());
+            source.begin_empty(0);
+            let provider = Arc::new(Counted(source, AtomicUsize::new(0)));
+            policy.register_target_with_cache_identity(
+                worker.url(),
+                target,
+                CacheKey {
+                    model: "model".into(),
+                    block_size: 16,
+                },
+                provider.clone(),
+            );
+            provider
+        };
+        let first = register(workers[0].as_ref(), &domain);
+        let second = register(workers[1].as_ref(), &domain);
+        let tokens = [42; 33];
+        let inputs: WorkerTokenInputs = workers
+            .iter()
+            .map(|worker| (worker.base_url().into(), Arc::from([tokens.to_vec()])))
+            .collect();
+        let plan = |inputs: &WorkerTokenInputs| {
+            policy
+                .prepare_selection(
+                    &workers,
+                    QualifiedKvInput {
+                        tokens: KvRequestTokens::PerWorker(inputs),
+                        eligibility: None,
+                    },
+                    None,
+                    None,
+                )
+                .unwrap()
+        };
+        assert!(plan(&inputs).grouped.iter().all(Vec::is_empty));
+        assert_eq!(first.1.load(Ordering::Relaxed), 0);
+        assert_eq!(second.1.load(Ordering::Relaxed), 0);
+
+        warm_full(&second.0, 0, &tokens[..32]);
+        assert!(!plan(&inputs).grouped[1].is_empty());
+
+        let mut different = inputs.clone();
+        different.insert(
+            workers[0].base_url().into(),
+            Arc::from([vec![7; tokens.len()]]),
+        );
+        assert!(!plan(&different).grouped[1].is_empty());
+
+        // A separate index can have the same policy key and still hold
+        // different pages. A miss on the first index must not mask this hit.
+        let other_domain = Arc::new(crate::kv_index::KvBlockIndexer::new());
+        let unlisted =
+            full_binding(target("unlisted", 0), 16).with_shared_index(other_domain.clone());
+        unlisted.begin_empty(0);
+        register(workers[0].as_ref(), &other_domain);
+        let plan = plan(&inputs);
+        assert!(plan.grouped[0].is_empty());
+        assert!(!plan.grouped[1].is_empty());
     }
 
     #[test]

@@ -241,6 +241,10 @@ pub(super) struct LayoutWorkerProvider {
 }
 
 impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
+    fn shared_prefix_lookup(&self, rank: u32) -> Option<crate::kv_index::SharedPrefixLookup> {
+        self.indexes.get(&rank)?.shared_prefix_lookup(rank)
+    }
+
     fn target_scoped(&self) -> bool {
         true
     }

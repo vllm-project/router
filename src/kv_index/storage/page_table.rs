@@ -213,6 +213,7 @@ pub(super) struct OwnerPages {
     owner: Arc<PageOwner>,
     base: Pages,
     named: Namespaces,
+    page_count: usize,
     // Count non-device tier claims, including named pages and mixed-tier pages.
     non_device_tiers: usize,
 }
@@ -373,6 +374,41 @@ impl<'a> PageTiers<'a> {
     }
 }
 
+impl KvBlockIndexer {
+    /// A plain prefix with no first-page holders can finish from one observation.
+    pub(crate) fn collect_prefix(
+        &self,
+        group: PageQuery,
+        keys: &[SequenceHash],
+    ) -> Option<PageEvidence> {
+        debug_assert!(group.stop_at_gap);
+        let (&first, rest) = keys.split_first()?;
+        let committed = self.committed.load(Ordering::Acquire);
+        let row = self
+            .hash_pages
+            .rows
+            .peek_with(&PageKey::new(group.group, first), |page, ()| page.clone());
+        if row.is_none() && self.confirms_miss_at(committed) {
+            return None;
+        }
+
+        // Keep the head row pinned across the lifecycle gate. Source validation
+        // still uses the cutoff taken before looking up the head.
+        let _domain = self.domain.read();
+        let head = row
+            .map(|page| PageTable::row_claims(&page.0.row.read(), None))
+            .unwrap_or_default();
+        let (prefix_len, prefix, holders) =
+            self.hash_pages.collect_rest(group, None, rest, self, head);
+        Some(PageEvidence {
+            scan: Arc::new(super::PageScan::new(committed)),
+            prefix_len,
+            prefix,
+            holders,
+        })
+    }
+}
+
 impl PageEvidence {
     /// A scan stays coherent through one transaction if it cannot touch a requested page.
     pub(super) fn validate_source(
@@ -403,15 +439,24 @@ impl PageEvidence {
                 }
                 changes.clone()
             };
-            let tags = self
-                .scan
-                .request_tags
-                .get_or_init(|| keys.iter().map(page_tag).collect());
-            if changes.as_slice().iter().any(|tag| tags.contains(tag)) {
+            let overlaps = if let [key] = keys {
+                changes.as_slice().contains(&page_tag(key))
+            } else {
+                let tags = self
+                    .scan
+                    .request_tags
+                    .get_or_init(|| keys.iter().map(page_tag).collect());
+                changes.as_slice().iter().any(|tag| tags.contains(tag))
+            };
+            if overlaps {
                 return None;
             }
         }
         Some(SourceVersion { source, generation })
+    }
+
+    pub(crate) fn confirms_empty(&self, index: &KvBlockIndexer) -> bool {
+        self.prefix.is_empty() && self.holders.is_empty() && self.scan.confirms_miss(index)
     }
 
     pub(crate) fn unchanged_groups<'a>(
@@ -422,11 +467,26 @@ impl PageEvidence {
         mut groups: impl Iterator<Item = Option<&'a Self>>,
     ) -> Option<PageMatch<'a>> {
         let first = groups.next()??;
+        if first.prefix.is_empty() && first.holders.is_empty() {
+            if first.scan.confirms_miss(index) {
+                return Some(PageMatch::Miss);
+            }
+            // An empty run of length one ends at the first page. Later pages
+            // cannot change a prefix miss, but can affect a full scan.
+            let keys = if first.prefix_len == 1 {
+                &keys[..1]
+            } else {
+                keys
+            };
+            return first
+                .validate_source(index, target, keys)
+                .map(|_| PageMatch::Miss);
+        }
         let head = first.runs_for_owner(owner);
         let missing = head.prefix_len == 0 && head.tail.is_empty();
         // A required group has no pages for this owner. A confirmed domain
         // scan establishes this for every non-holder without another source lookup.
-        if missing && first.scan.confirms_unchanged(index) {
+        if missing && first.scan.confirms_miss(index) {
             return Some(PageMatch::Miss);
         }
         let version = first.validate_source(index, target, keys)?;
@@ -475,7 +535,7 @@ fn observe(
 ) -> Result<(), PageWriteError> {
     if let Some(holder) = holders.get_mut(owner.id) {
         let fact = &mut holder.residency;
-        let new_non_device = tier != StorageTier::Device && !fact.contains(tier);
+        let new_non_device = tier != StorageTier::Device && !fact.tiers.contains(tier);
         if !fact.observe(tier, incremental) {
             return Err(PageWriteError::Capacity);
         }
@@ -554,8 +614,8 @@ impl PageTable {
             return Ok(());
         }
         // The source gate keeps memberships stable until the whole store is applied.
-        let check_capacity = |keys: Option<&Pages>| {
-            let remaining = max_entries.saturating_sub(keys.map_or(0, Pages::len));
+        let check_capacity = |count: usize, keys: Option<&Pages>| {
+            let remaining = max_entries.saturating_sub(count);
             if hashes.len() > remaining {
                 let mut new = HashSet::<_, Fast>::default();
                 for hash in hashes {
@@ -571,11 +631,11 @@ impl PageTable {
         };
         let pages = match active.entry_ref(owner) {
             EntryRef::Occupied(entry) => {
-                check_capacity(entry.get().pages(namespace))?;
+                check_capacity(entry.get().page_count, entry.get().pages(namespace))?;
                 entry.into_mut()
             }
             EntryRef::Vacant(entry) => {
-                check_capacity(None)?;
+                check_capacity(0, None)?;
                 entry.insert_with_key(
                     Arc::new(owner.clone()),
                     OwnerPages {
@@ -591,6 +651,7 @@ impl PageTable {
                         }),
                         base: Pages::default(),
                         named: Namespaces::default(),
+                        page_count: 0,
                         non_device_tiers: 0,
                     },
                 )
@@ -607,7 +668,11 @@ impl PageTable {
             }
         };
         if hashes.len() > keys.len() {
-            keys.reserve(hashes.len().min(max_entries.saturating_sub(keys.len())));
+            keys.reserve(
+                hashes
+                    .len()
+                    .min(max_entries.saturating_sub(pages.page_count)),
+            );
         }
         let mut observe_page = |page: &PageRef| {
             let mut row = page.0.row.write();
@@ -635,6 +700,7 @@ impl PageTable {
                     });
                     observe_page(entry.key())?;
                     member.insert_with_key(entry.key().clone(), ());
+                    pages.page_count += 1;
                 }
             }
         }
@@ -672,6 +738,7 @@ impl PageTable {
                     ) {
                         continue;
                     }
+                    pages.page_count -= 1;
                     if let Some(name) = &scope.namespace {
                         if let EntryRef::Occupied(mut entry) = pages.named.entry_ref(name) {
                             entry.get_mut().remove(&page);
@@ -724,7 +791,24 @@ impl PageTable {
         }
     }
 
-    /// Compress the initial shared run and pass the first different row on to the tail.
+    fn claims_at(&self, group: u32, namespace: Option<&str>, key: SequenceHash) -> Vec<Claim> {
+        self.read_row(&PageKey::new(group, key), |row| {
+            Self::row_claims(row, namespace)
+        })
+        .unwrap_or_default()
+    }
+
+    fn row_claims(row: &PageRow, namespace: Option<&str>) -> Vec<Claim> {
+        row.holders(namespace)
+            .map(|holders| {
+                holders
+                    .values()
+                    .map(|holder| (holder.owner.clone(), holder.residency.tiers))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(super) fn collect_split(
         &self,
         query: PageQuery,
@@ -735,19 +819,20 @@ impl PageTable {
         let Some((&first, rest)) = keys.split_first() else {
             return Default::default();
         };
+        let first = self.claims_at(query.group, namespace, first);
+        self.collect_rest(query, namespace, rest, index, first)
+    }
+
+    /// Compress the initial shared run and pass the first different row on to the tail.
+    fn collect_rest(
+        &self,
+        query: PageQuery,
+        namespace: Option<&str>,
+        rest: &[SequenceHash],
+        index: &KvBlockIndexer,
+        mut run: Vec<Claim>,
+    ) -> (usize, PrefixClaims, OwnerClaims) {
         let group = query.group;
-        let claims = |holders: &Holders| -> Vec<Claim> {
-            holders
-                .values()
-                .map(|holder| (holder.owner.clone(), holder.residency.tiers))
-                .collect()
-        };
-        let mut run = self
-            .read_row(&PageKey::new(group, first), |row| {
-                row.holders(namespace).map(claims)
-            })
-            .flatten()
-            .unwrap_or_default();
         if rest.is_empty() || (query.stop_at_gap && run.is_empty()) {
             return (1, Self::prefix_claims(run), OwnerClaims::default());
         }
@@ -812,7 +897,11 @@ impl PageTable {
                 return (offset + 1, Self::prefix_claims(run), tail);
             }
         }
-        (keys.len(), Self::prefix_claims(run), OwnerClaims::default())
+        (
+            rest.len() + 1,
+            Self::prefix_claims(run),
+            OwnerClaims::default(),
+        )
     }
 
     fn prefix_claims(claims: Vec<Claim>) -> PrefixClaims {
@@ -1236,6 +1325,30 @@ mod tests {
     }
 
     #[test]
+    fn base_and_adapter_pages_share_one_source_budget() {
+        let index = KvBlockIndexer::new();
+        let holder = owner("worker");
+        let base = [[1; 32]];
+        let a = [[2; 32]];
+        let b = [[3; 32]];
+        index.with_source_batch(&holder.target(), |tx| {
+            tx.store_hash_pages(&holder, 0, StorageTier::Device, None, &base, true, 2)
+                .unwrap();
+            tx.store_hash_pages(&holder, 0, StorageTier::Device, Some("a"), &a, true, 2)
+                .unwrap();
+            assert_eq!(
+                tx.store_hash_pages(&holder, 0, StorageTier::Device, Some("b"), &b, true, 2),
+                Err(PageWriteError::Capacity)
+            );
+            tx.remove_hash_pages(&holder, 0, StorageTier::Device, &a, true)
+                .unwrap();
+            tx.store_hash_pages(&holder, 0, StorageTier::Device, Some("b"), &b, true, 2)
+                .unwrap();
+        });
+        assert_eq!(index.hash_pages.rows.len(), 2);
+    }
+
+    #[test]
     fn replicas_tiers_capacity_and_retirement_keep_one_shared_fact() {
         let index = KvBlockIndexer::new();
         let a = owner("a");
@@ -1300,14 +1413,15 @@ mod tests {
                         Some(name),
                         &[hash],
                         true,
-                        1,
+                        3,
                     )
                     .unwrap();
                 }
             });
         }
-        put(&index, &a, 0);
         index.with_source_batch(&a.target(), |tx| {
+            tx.store_hash_pages(&a, 0, StorageTier::Device, None, &[hash], true, 3)
+                .unwrap();
             tx.remove_hash_pages(&a, 0, StorageTier::Device, &[hash], true)
                 .unwrap();
         });

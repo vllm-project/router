@@ -273,7 +273,7 @@ pub(in crate::kv_index) fn credit_from_pages(
                 continue;
             }
         }
-        for position in (floor..blocks.max(1)).rev() {
+        for position in (floor..blocks).rev() {
             let index = stride * (position + 1) - 1;
             let Some(tier) = claims[group_pos].get(index).map(|bits| bits.best()) else {
                 break;

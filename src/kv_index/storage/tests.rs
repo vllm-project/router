@@ -12,14 +12,16 @@ impl KvBlockIndexer {
         let _domain = self.domain.read();
         let source = self.source_lock(target);
         let mut data = source.access.write();
-        let _revision = SourceWrite::new(&source.revision, &self.committed);
+        let write = SourceWrite::new(&source.revision, self);
         *source.planned.write() = None;
-        f(&mut IndexBatch {
+        let mut batch = IndexBatch {
             index: self,
             target,
             active_pages: &mut data.active_pages,
             source: &source,
-        })
+            write,
+        };
+        f(&mut batch)
     }
 
     pub(crate) fn suspend_source(&self, source: &SourceId, dp_rank: u32) {
@@ -41,8 +43,8 @@ impl KvBlockIndexer {
         let _domain = self.domain.read();
         let source_lock = self.source_lock(&target);
         let mut data = source_lock.access.write();
-        let _revision = SourceWrite::new(&source_lock.revision, &self.committed);
-        self.invalidate_source_unlocked(source, dp_rank, &mut data.active_pages);
+        let mut write = SourceWrite::new(&source_lock.revision, self);
+        self.invalidate_source_unlocked(source, dp_rank, &mut data.active_pages, &mut write);
     }
 
     pub(crate) fn resume_source(&self, source: &SourceId, dp_rank: u32) {
@@ -405,7 +407,7 @@ fn shared_miss_tracks_only_requested_rank_publication() {
     store(&index, &first, 0, retained, StorageTier::Device);
     store(&index, &other, 0, retained, StorageTier::Device);
     let miss = index.collect_hash_pages(0, &[requested]);
-    assert!(miss.scan.confirms_unchanged(&index));
+    assert!(miss.scan.confirms_miss(&index));
     let verified_miss = |evidence: &PageEvidence, owner: &ResidencyOwner| {
         PageEvidence::unchanged_groups(
             &index,
@@ -420,7 +422,7 @@ fn shared_miss_tracks_only_requested_rank_publication() {
 
     // An unrelated rank's commit does not force this rank's proof to be refreshed.
     store(&index, &other, 0, requested, StorageTier::HostPinned);
-    assert!(!miss.scan.confirms_unchanged(&index));
+    assert!(!miss.scan.confirms_miss(&index));
     assert_eq!(verified_miss(&miss, &first), Some(true));
     assert_eq!(verified_miss(&miss, &other), None);
     let sparse = index.collect_hash_pages(0, &[requested]);
@@ -458,16 +460,39 @@ fn shared_miss_tracks_only_requested_rank_publication() {
 }
 
 #[test]
+fn shared_miss_can_cross_an_uncommitted_store() {
+    let index = KvBlockIndexer::new();
+    let holder = worker("worker", 0);
+    let key = [1; 32];
+    let observed = index.collect_hash_pages(0, &[key]);
+    index.with_source_batch(&holder.target(), |tx| {
+        tx.store_hash_pages(&holder, 0, StorageTier::Device, None, &[key], true, 8)
+            .unwrap();
+        // The page was absent at the published cutoff. Its store cannot hide
+        // a prior hit, and the old miss expires when this batch commits.
+        assert!(observed.scan.confirms_miss(&index));
+    });
+    assert!(!observed.scan.confirms_miss(&index));
+    assert!(visible_tiers(&index, &holder, 0, key).contains(StorageTier::Device));
+}
+
+#[test]
 fn shared_miss_does_not_accept_an_uncommitted_removal() {
     let index = KvBlockIndexer::new();
     let holder = worker("worker", 0);
     let key = [1; 32];
+    let group = PageQuery {
+        group: 0,
+        stop_at_gap: true,
+    };
     store(&index, &holder, 0, key, StorageTier::Device);
     let observed = index.with_source_batch(&holder.target(), |tx| {
         tx.remove_hash_pages(&holder, 0, StorageTier::Device, &[key], true)
             .unwrap();
-        let observed = index.collect_hash_pages(0, &[key]);
-        assert!(!observed.scan.confirms_unchanged(&index));
+        let observed = index
+            .collect_prefix(group, &[key])
+            .expect("an unpublished removal must leave evidence for exact fallback");
+        assert!(!observed.confirms_empty(&index));
         assert!(PageEvidence::unchanged_groups(
             &index,
             &holder.target(),
@@ -480,8 +505,51 @@ fn shared_miss_does_not_accept_an_uncommitted_removal() {
             .unwrap();
         observed
     });
-    assert!(!observed.scan.confirms_unchanged(&index));
+    assert!(!observed.scan.confirms_miss(&index));
     assert!(visible_tiers(&index, &holder, 0, key).contains(StorageTier::Device));
+    assert!(index.collect_prefix(group, &[key]).is_some());
+    assert!(index.collect_prefix(group, &[[2; 32]]).is_none());
+}
+
+#[test]
+fn shared_first_page_miss_ignores_changes_only_beyond_the_prefix() {
+    let index = KvBlockIndexer::new();
+    let owner = worker("worker", 0);
+    let target = owner.target();
+    let control = Arc::new(StreamControl::default());
+    let keys = [[1; 32], [2; 32]];
+    let prefix = PageQuery {
+        group: 0,
+        stop_at_gap: true,
+    };
+    let complete = PageQuery::from(0);
+    store(&index, &owner, 0, [3; 32], StorageTier::Device);
+    let evidence = index.collect_hash_groups([prefix, complete].into_iter(), None, &keys);
+    let matched = |query| {
+        PageEvidence::unchanged_groups(
+            &index,
+            &target,
+            &owner,
+            &keys,
+            std::iter::once(evidence.get(&query)),
+        )
+    };
+
+    // Even within a planned transaction, only the prefix scan can ignore a
+    // residency change to the second page while the first one is absent.
+    let plan = PageChanges::from_batches(std::iter::once(Some(&keys[1..])), 1);
+    index.with_page_mutation_batch(&target, &owner, &control, plan, |_, tx| {
+        tx.remove_hash_pages(&owner, 0, StorageTier::Device, &keys[1..], true)
+            .unwrap();
+        tx.store_hash_pages(&owner, 0, StorageTier::Device, None, &keys[1..], true, 8)
+            .unwrap();
+        assert!(matches!(matched(prefix), Some(PageMatch::Miss)));
+        assert!(matched(complete).is_none());
+    });
+
+    store(&index, &owner, 0, keys[0], StorageTier::Device);
+    assert!(matched(prefix).is_none());
+    assert!(visible_tiers(&index, &owner, 0, keys[0]).contains(StorageTier::Device));
 }
 
 #[test]

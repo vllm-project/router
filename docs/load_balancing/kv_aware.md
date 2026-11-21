@@ -24,7 +24,7 @@ For gRPC, use one interface for the whole worker pool. P/D uses static worker UR
 | Prefix caching | `--enable-prefix-caching --prefix-caching-hash-algo sha256_cbor` |
 | Event hashes | `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` publishes the full 32-byte hashes. |
 | Event reporting | Keep incremental reporting and enable KV events through `--kv-events-config`. Router needs reachable live and replay endpoints. |
-| Publisher identity | Generate a fresh topic on each worker start. |
+| Publisher identity | Generate a fresh topic on each worker start. Each DP rank needs its own live endpoint/topic pair and replay endpoint. |
 | HTTP text prompts | Start the worker with `--enable-scale-out` to expose rendering endpoints. |
 
 ### Explicit layouts
@@ -207,7 +207,7 @@ VLLM_USE_RUST_FRONTEND=1 vllm serve "$MODEL" --host 127.0.0.1 \
   --enable-scale-out "${KV_ARGS[@]}" "${MODEL_ARGS[@]}" --kv-transfer-config "$TRANSFER"
 ```
 
-Set `MODEL` in the Router terminal to the local tokenizer directory. Save the model's [gRPC P/D layout](#ascend-a2) as `layout.json`.
+Use the same [tokenizer setup as colocated gRPC](#grpc-workers). Save the model's [gRPC P/D layout](#ascend-a2) as `layout.json`.
 
 ```bash
 VLLM_ROUTER_TOKENIZER="$MODEL" vllm-router --port 19000 --vllm-pd-disaggregation \
@@ -246,6 +246,8 @@ Use the same URL scheme and address as the Router command. Leave Program schedul
 </details>
 
 ## Check cache reuse
+
+The Router estimates placement from the KV events it has applied. The worker reports actual reuse. Requests with an unrecognized adapter, cache salt or extension still route, with no cache credit.
 
 In an idle worker pool, send the same token-ID prompt twice. Set `SERVED_MODEL` to the worker's served name and `PROMPT_TOKENS` to the length in its recipe.
 
@@ -388,31 +390,22 @@ For Ascend layouts, set `"hash_seed":"0"`. Set `partial_hash_hits` to `false` un
 
 ## CLI options
 
-These defaults are for `vllm-router`. See the [CLI reference](../cli_reference.md) for other Router options.
+Set the policy to `kv_aware` in the worker pool you want to score. The [CLI reference](../cli_reference.md) lists shared routing, worker and metrics arguments.
 
 | Option | Type | Default | Use |
 | --- | --- | --- | --- |
-| `--policy` | Policy name | `cache_aware` | Set `kv_aware` for colocated routing. Provides the default policy for P/D stages. |
-| `--worker-urls` | URL list | Empty | Worker endpoints for colocated routing. |
-| `--vllm-pd-disaggregation` | Flag | `false` | Use separate Prefill and Decode pools. |
-| `--prefill` | URL plus optional port, repeatable | Empty | Add a Prefill URL and, for Mooncake bootstrap, its port. |
-| `--decode` | URL, repeatable | Empty | Add a Decode URL. |
-| `--prefill-policy` | Policy name | Inherit `--policy` | Set `kv_aware` to score Prefill reuse. |
-| `--decode-policy` | Policy name | Inherit `--policy` | Select the Decode policy, such as `round_robin` or `kv_aware`. |
-| `--kv-connector` | `nixl`, `mooncake`, `moriio` | `nixl` | Select the P/D handoff protocol. |
 | `--kv-hybrid-layout` | File path | Unset | Read the layout and P/D compatibility pairs keyed by worker URL. |
 | `--kv-event-source` | `URL=ENDPOINT[,ENDPOINT...]`, repeatable | Empty | Static live event addresses. |
 | `--kv-event-replay-source` | `URL=ENDPOINT[,ENDPOINT...]`, repeatable | Empty | Static replay addresses. |
-| `--kv-event-block-size` | `u32` | `16` | Hash unit in tokens for static event sources. |
+| `--kv-event-block-size` | `u32` | `16` | Hash unit in tokens for static event sources. Match the layout's `hash_block_size` when supplying both. |
 | `--kv-event-model` | String | Unset | Served model ID for static event sources. |
 | `--pd-kv-events` | `URL=ENDPOINT[,ENDPOINT...]`, repeatable | Empty | Static P/D live endpoints in DP-rank order for 16-token blocks. |
 | `--kv-event-strict-recovery` | Flag | `false` | Require complete recovery or a worker KV clear before scoring reuse. |
 | `--router-temperature` | `f64` | `0.0` | KV-aware selection temperature for colocated and Prefill placement. Zero selects the lowest cost. |
 | `--kv-penalty-host` | `f64` | `0.8` | Reuse credit for host-resident KV. |
-| `--kv-penalty-external` | `f64` | `0.6` | Reuse credit for KV in an external tier. |
+| `--kv-penalty-external` | `f64` | `0.6` | Reuse credit when a placement provider reports an external tier. |
 | `--kv-penalty-disk` | `f64` | `0.3` | Reuse credit for disk-resident KV. |
 | `--kv-aware-session-affinity-ttl-secs` | `u64`, seconds | Unset | Enable idle session affinity for 1–31,536,000 seconds. In P/D, applies to Decode. |
-| `--prometheus-port` | `u16` | `29000` | Port for Router metrics. |
 | `VLLM_ROUTER_TOKENIZER` | Path, environment variable | Unset | Local model directory for gRPC text and chat rendering. |
 
 ### Static event endpoints

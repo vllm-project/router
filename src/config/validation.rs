@@ -701,9 +701,7 @@ impl ConfigValidator {
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
         if let Some(program) = &config.program_scheduling {
             let pd_mode = matches!(config.mode, RoutingMode::VllmPrefillDecode { .. });
-            if (!matches!(config.mode, RoutingMode::Regular { .. }) && !pd_mode)
-                || (pd_mode && config.connection_mode != ConnectionMode::Http)
-            {
+            if !matches!(config.mode, RoutingMode::Regular { .. }) && !pd_mode {
                 return Err(ConfigError::IncompatibleConfig {
                     reason: "Program scheduling requires regular HTTP mode or vLLM PD HTTP mode"
                         .to_string(),
@@ -996,6 +994,11 @@ impl ConfigValidator {
                         )));
                     }
                     if let Some(layout) = &sources.hybrid {
+                        if !layout.matches_hash_block_size(None, sources.block_size) {
+                            return Err(invalid(
+                                "block_size must match the layout hash_block_size",
+                            ));
+                        }
                         if sources.endpoints.is_empty() {
                             if sources.replay_endpoints.is_some() || layout.ranks.is_empty() {
                                 return Err(invalid("discovered publishers require a rank layout and no static replay endpoints"));

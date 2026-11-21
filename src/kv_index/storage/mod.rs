@@ -92,6 +92,8 @@ pub struct KvBlockIndexer {
     committed: AtomicU64,
     /// Ordinary access shares the barrier; retirement excludes it.
     domain: RwLock<()>,
+    /// Batches that can hide a previously committed page hold a shared guard until publish.
+    removals: RwLock<()>,
 }
 
 impl KvBlockIndexer {
@@ -101,6 +103,7 @@ impl KvBlockIndexer {
             source_locks: RwLock::new(HashMap::default()),
             committed: AtomicU64::new(0),
             domain: RwLock::new(()),
+            removals: RwLock::new(()),
         }
     }
 
@@ -155,8 +158,8 @@ impl KvBlockIndexer {
         };
         let gate = self.source_lock(&target);
         let mut data = gate.access.write();
-        let _revision = SourceWrite::new(&gate.revision, &self.committed);
-        self.invalidate_source_unlocked(source, dp_rank, &mut data.active_pages);
+        let mut write = SourceWrite::new(&gate.revision, self);
+        self.invalidate_source_unlocked(source, dp_rank, &mut data.active_pages, &mut write);
         drop(data);
         self.source_locks.write().remove(&target);
     }
@@ -166,7 +169,9 @@ impl KvBlockIndexer {
         source: &SourceId,
         dp_rank: u32,
         active_pages: &mut ActivePages,
+        write: &mut SourceWrite<'_>,
     ) {
+        write.mark_removal();
         self.suspend_source_unlocked(source, dp_rank);
         let owners: Vec<_> = active_pages.keys().cloned().collect();
         for owner in owners {
@@ -240,7 +245,7 @@ impl KvBlockIndexer {
             self.existing_source(target)?
         };
         let mut data = source.access.write();
-        let _revision = SourceWrite::new(&source.revision, &self.committed);
+        let write = SourceWrite::new(&source.revision, self);
         let revision = source.revision.load(Ordering::Relaxed);
         *source.planned.write() = planned.map(|changes| (revision, changes));
         let SourceData {
@@ -263,6 +268,7 @@ impl KvBlockIndexer {
             target,
             active_pages,
             source: &source,
+            write,
         };
         let result = f(state, &mut tx);
         if state.lease_id == 0 && state.next_seq.is_none() && !state.visible() {
@@ -303,6 +309,13 @@ impl KvBlockIndexer {
         self.source_locks.read().len() > 1
     }
 
+    fn confirms_miss_at(&self, committed: u64) -> bool {
+        // An unpublished removal could hide a page. Completed mutations advance the cutoff.
+        self.removals
+            .try_write()
+            .is_some_and(|_removals| self.committed.load(Ordering::Acquire) == committed)
+    }
+
     pub(crate) fn collect_hash_groups(
         &self,
         groups: impl Iterator<Item = impl Into<PageQuery>>,
@@ -310,11 +323,7 @@ impl KvBlockIndexer {
         keys: &[SequenceHash],
     ) -> GroupPages {
         let _domain = self.domain.read();
-        let scan = Arc::new(PageScan {
-            committed: self.committed.load(Ordering::Acquire),
-            request_tags: OnceLock::new(),
-            confirmed: OnceLock::new(),
-        });
+        let scan = Arc::new(PageScan::new(self.committed.load(Ordering::Acquire)));
         groups
             .map(|query| {
                 let query = query.into();
@@ -354,15 +363,18 @@ struct PageScan {
 }
 
 impl PageScan {
-    fn confirms_unchanged(&self, index: &KvBlockIndexer) -> bool {
-        let confirmed = self.confirmed.get_or_init(|| {
-            // Writers publish before releasing the domain barrier. Taking it
-            // exclusively without waiting accounts for any writes during the scan.
-            let Some(_domain) = index.domain.try_write() else {
-                return false;
-            };
-            index.committed.load(Ordering::Acquire) == self.committed
-        });
+    fn new(committed: u64) -> Self {
+        Self {
+            committed,
+            request_tags: OnceLock::new(),
+            confirmed: OnceLock::new(),
+        }
+    }
+
+    fn confirms_miss(&self, index: &KvBlockIndexer) -> bool {
+        let confirmed = self
+            .confirmed
+            .get_or_init(|| index.confirms_miss_at(self.committed));
         *confirmed && index.committed.load(Ordering::Acquire) == self.committed
     }
 }

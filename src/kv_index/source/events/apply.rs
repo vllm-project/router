@@ -243,6 +243,14 @@ impl SourceBinding {
         let Some(tier) = StorageTier::from_medium(store.medium.as_deref()) else {
             return Ok(None);
         };
+        let namespace = store.lora_name.as_deref();
+        // Undeclared adapters have no claims in this source.
+        if namespace.is_some_and(|name| self.adapter_path(name).is_none())
+            || (self.requires_root_proof && store.lora_id.is_some())
+            || store.ownership.is_some()
+        {
+            return Ok(None);
+        }
         if self.requires_root_proof
             && (store.group_idx != Some(0)
                 || store.kv_cache_spec_kind.as_deref() != Some("full_attention")
@@ -251,14 +259,6 @@ impl SourceBinding {
                 || store.block_size as usize != self.keys.block_size())
         {
             return Err(SourceError::InvalidBatch);
-        }
-        let namespace = store.lora_name.as_deref();
-        // Undeclared adapters have no claims in this source.
-        if namespace.is_some_and(|name| self.adapter_path(name).is_none())
-            || (self.requires_root_proof && store.lora_id.is_some())
-            || store.ownership.is_some()
-        {
-            return Ok(None);
         }
         let group = self
             .groups

@@ -4,7 +4,7 @@ pub mod request_hash;
 mod routing_provider;
 pub(crate) use routing_provider::PromptKey;
 #[doc(hidden)]
-pub use routing_provider::RequestHashCache;
+pub use routing_provider::{RequestHashCache, SharedPrefixLookup};
 pub(crate) mod source;
 
 pub use source::discovery;

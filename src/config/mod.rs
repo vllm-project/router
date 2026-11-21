@@ -153,6 +153,14 @@ impl StaticKvEventSources {
                 ),
             });
         }
+        if let Some(layout) = &self.hybrid {
+            let rank = crate::kv_index::source::discovery::split_worker_rank(worker).1;
+            if !layout.matches_hash_block_size(rank, self.block_size) {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!("static KV source for '{worker}' block_size must match the layout hash_block_size"),
+                });
+            }
+        }
         if self
             .replay_endpoints
             .as_ref()
@@ -328,6 +336,14 @@ mod static_kv_event_source_tests {
         let mut source = source;
         source.hybrid = Some(layout);
         source.validate("http://worker:8000").unwrap();
+
+        let mut mismatched = source.clone();
+        mismatched.block_size = 16;
+        assert!(mismatched.validate("http://worker:8000").is_err());
+        let layout = mismatched.hybrid.as_mut().unwrap();
+        layout.ranks.clear();
+        assert!(!layout.is_plain_full_attention());
+        assert!(mismatched.validate("http://worker:8000").is_err());
 
         // Without a layout the endpoint list is still mandatory.
         let mut generic = source.clone();

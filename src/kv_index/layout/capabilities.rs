@@ -154,9 +154,24 @@ pub(crate) struct VerifiedLayout {
 
 impl CacheCapabilities {
     pub(crate) fn is_plain_full_attention(&self) -> bool {
-        self.ranks
-            .iter()
-            .all(RankCapability::has_plain_full_attention_shape)
+        !self.ranks.is_empty()
+            && self
+                .ranks
+                .iter()
+                .all(RankCapability::has_plain_full_attention_shape)
+    }
+
+    pub(crate) fn matches_hash_block_size(&self, rank: Option<u32>, size: u32) -> bool {
+        if let Some(rank) = rank {
+            return self
+                .rank_capability(rank)
+                .is_some_and(|rank| rank.hash_block_size == Some(size));
+        }
+        !self.ranks.is_empty()
+            && self
+                .ranks
+                .iter()
+                .all(|rank| rank.hash_block_size == Some(size))
     }
 
     /// The capability declared for one DP rank. Ranks are independent

@@ -11,6 +11,7 @@ pub(crate) struct IndexBatch<'a> {
     pub(super) target: &'a RoutableTarget,
     pub(super) active_pages: &'a mut ActivePages,
     pub(super) source: &'a SourceLock,
+    pub(super) write: SourceWrite<'a>,
 }
 
 /// A consistent view under one source read lock.
@@ -44,6 +45,7 @@ impl IndexBatch<'_> {
     /// Remove only this precise owner, including its incarnation.
     pub(crate) fn clear_owner_exact(&mut self, owner: &ResidencyOwner) {
         self.check_target(&owner.target());
+        self.write.mark_removal();
         *self.source.planned.write() = None;
         self.index.hash_pages.clear_owner(self.active_pages, owner);
     }
@@ -144,10 +146,11 @@ impl IndexSnapshot<'_> {
 /// Mark the entire source batch, including failures and clears, as one mutation.
 pub(super) struct SourceWrite<'a> {
     revision: &'a AtomicU64,
-    committed: &'a AtomicU64,
+    index: &'a KvBlockIndexer,
+    removal: Option<parking_lot::RwLockReadGuard<'a, ()>>,
 }
 impl<'a> SourceWrite<'a> {
-    pub(super) fn new(revision: &'a AtomicU64, committed: &'a AtomicU64) -> Self {
+    pub(super) fn new(revision: &'a AtomicU64, index: &'a KvBlockIndexer) -> Self {
         let previous = revision.fetch_or(1, Ordering::AcqRel);
         assert!(
             previous.is_multiple_of(2),
@@ -155,14 +158,21 @@ impl<'a> SourceWrite<'a> {
         );
         Self {
             revision,
-            committed,
+            index,
+            removal: None,
+        }
+    }
+
+    pub(super) fn mark_removal(&mut self) {
+        if self.removal.is_none() {
+            self.removal = Some(self.index.removals.read());
         }
     }
 }
 impl Drop for SourceWrite<'_> {
     fn drop(&mut self) {
         // Pages must already be updated when this commit becomes part of a scan's cutoff.
-        let previous = self.committed.fetch_add(2, Ordering::AcqRel);
+        let previous = self.index.committed.fetch_add(2, Ordering::AcqRel);
         assert!(previous < u64::MAX - 1, "index commit sequence exhausted");
         self.revision.store(previous + 2, Ordering::Release);
     }
@@ -201,6 +211,7 @@ impl IndexBatch<'_> {
         incremental: bool,
     ) -> Result<(), PageWriteError> {
         self.check_target(&owner.target());
+        self.write.mark_removal();
         self.index
             .hash_pages
             .remove(self.active_pages, owner, group, tier, hashes, incremental)
