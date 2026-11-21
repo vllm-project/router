@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use pyo3::prelude::*;
 pub mod backend;
 pub mod config;
@@ -54,6 +56,7 @@ struct Router {
     kv_event_replay_source: Vec<String>,
     kv_event_block_size: u32,
     kv_event_model: Option<String>,
+    kv_event_strict_recovery: bool,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
     cache_threshold: f32,
@@ -231,6 +234,7 @@ impl Router {
             epd: None,
             mode,
             pd_kv_event_sources: config::parse_pd_kv_events(&self.pd_kv_events)?,
+            kv_event_strict_recovery: self.kv_event_strict_recovery,
             policy,
             host: self.host.clone(),
             port: self.port,
@@ -395,6 +399,7 @@ impl Router {
         kv_event_model = None,
         pd_decode_commit_wait_ms = 0,
         pd_held_kv_mode = String::from("unknown"),
+        kv_event_strict_recovery = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -474,6 +479,7 @@ impl Router {
         kv_event_model: Option<String>,
         pd_decode_commit_wait_ms: u64,
         pd_held_kv_mode: String,
+        kv_event_strict_recovery: bool,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -505,6 +511,7 @@ impl Router {
             kv_event_replay_source,
             kv_event_block_size,
             kv_event_model,
+            kv_event_strict_recovery,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
             cache_threshold,

@@ -38,7 +38,23 @@ pub struct ProgramDiagnostic {
     pub home_target: Option<String>,
     pub last_target: Option<String>,
     pub placement: Option<String>,
-    pub estimated_context_tokens: usize,
+    /// Input-token demand currently reserved in the rank ledger.
+    pub context_tokens: usize,
+    /// Deprecated compatibility alias for `context_tokens`.
+    ///
+    /// Kept in the serialized snapshot so existing diagnostics consumers keep
+    /// working after the field was renamed; new code should use
+    /// `context_tokens`. Despite the legacy name this may carry an exact
+    /// prepared count, not only an estimate.
+    #[serde(rename = "estimated_context_tokens")]
+    pub legacy_estimated_context_tokens: usize,
+    /// Provenance of `context_tokens`.
+    pub context_token_source: &'static str,
+    /// Pending prepared fact: a shadow counterfactual or exact-mode probation
+    /// witness. The serialized name is kept for compatibility.
+    pub shadow_context_tokens: Option<usize>,
+    /// Fingerprint of the prepared count behind `context_tokens`, if any.
+    pub context_token_fingerprint: Option<String>,
     pub shared_prefix_tokens: usize,
     pub shared_prefix_freshness_remaining_seconds: Option<f64>,
     pub logical_tokens: usize,
@@ -147,6 +163,22 @@ pub struct ProgramSchedulerDiagnostic {
     pub prediction_mode: PredictionMode,
     pub return_time_profile_keys: usize,
     pub output_length_profile_keys: usize,
+    /// Input-token fact mode currently active.
+    pub token_count_mode: &'static str,
+    /// Matching settlements required before a fingerprint is applied exactly.
+    pub token_count_verification_settlements: usize,
+    pub token_count_model_pools: Vec<String>,
+    pub exact_text_endpoints: Vec<String>,
+    /// Fingerprints currently in the bounded revoked map.
+    pub revoked_token_fingerprints: usize,
+    /// Fingerprints that completed their probation window.
+    pub verified_token_fingerprints: usize,
+    /// Model pools whose exact facts are saturated off.
+    pub saturated_model_pools: Vec<String>,
+    /// Pools disabled after repeated successful settlements without usage.
+    pub usage_unavailable_model_pools: Vec<String>,
+    /// Whether usage-observation tracking reached its bounded pool limit.
+    pub usage_tracking_saturated: bool,
     pub ranks: Vec<RankDiagnostic>,
 }
 
@@ -274,13 +306,21 @@ impl ProgramScheduler {
                     home_target: decision.home_target.clone(),
                     last_target: decision.last_target.clone(),
                     placement: runtime.placement.map(str::to_string),
-                    estimated_context_tokens: decision.estimated_context_tokens,
+                    context_tokens: decision.context.tokens(),
+                    legacy_estimated_context_tokens: decision.context.tokens(),
+                    context_token_source: decision.context.source().as_str(),
+                    shadow_context_tokens: decision.context.shadow_tokens(),
+                    context_token_fingerprint: decision
+                        .context
+                        .fingerprint()
+                        .map(|fingerprint| fingerprint.as_hex()),
                     shared_prefix_tokens: decision.shared_prefix_tokens,
                     shared_prefix_freshness_remaining_seconds: decision
                         .shared_prefix_fresh_until
                         .map(|deadline| deadline.saturating_duration_since(now).as_secs_f64()),
                     logical_tokens: decision
-                        .estimated_context_tokens
+                        .context
+                        .tokens()
                         .saturating_add(self.config.progress_ttl.decode_buffer_tokens),
                     private_tokens: decision
                         .private_tokens(self.config.progress_ttl.decode_buffer_tokens)
@@ -547,12 +587,35 @@ impl ProgramScheduler {
             prediction_mode: self.config.prediction_profile.mode,
             return_time_profile_keys: state.prediction_profiles.return_key_count(),
             output_length_profile_keys: state.prediction_profiles.output_key_count(),
+            token_count_mode: self.config.token_count_mode.as_str(),
+            token_count_verification_settlements: self.config.token_count_verification_settlements,
+            token_count_model_pools: self.config.token_count_model_pools.clone(),
+            exact_text_endpoints: self.config.exact_text_endpoints.clone(),
+            revoked_token_fingerprints: state.revoked_token_fingerprints.len(),
+            verified_token_fingerprints: state
+                .verified_token_fingerprints
+                .values()
+                .filter(|(count, _)| *count >= self.config.token_count_verification_settlements)
+                .count(),
+            saturated_model_pools: state
+                .token_fingerprint_saturated_pools
+                .iter()
+                .cloned()
+                .collect(),
+            usage_unavailable_model_pools: state
+                .token_usage_misses
+                .iter()
+                .filter(|(_, misses)| **misses >= super::scheduler_tokens::MAX_TOKEN_USAGE_MISSES)
+                .map(|(pool, _)| pool.clone())
+                .collect(),
+            usage_tracking_saturated: state.token_usage_tracking_saturated,
             ranks,
         }
     }
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::program_scheduling::{
@@ -578,7 +641,12 @@ mod tests {
         .unwrap()
         .unwrap();
         let _dispatch = scheduler
-            .acquire(identity, 123, std::slice::from_ref(&target), None)
+            .acquire(
+                identity,
+                crate::program_scheduling::ContextTokens::estimated(123),
+                std::slice::from_ref(&target),
+                None,
+            )
             .await
             .unwrap();
 
@@ -586,7 +654,22 @@ mod tests {
         assert_eq!(snapshot.ranks.len(), 1);
         assert_eq!(snapshot.ranks[0].target_id, "rank-0");
         assert_eq!(snapshot.ranks[0].router_active_reasoning_programs, 1);
-        assert_eq!(snapshot.ranks[0].programs[0].estimated_context_tokens, 123);
+        assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 123);
+        assert_eq!(
+            snapshot.ranks[0].programs[0].legacy_estimated_context_tokens,
+            123
+        );
+        // The serialized snapshot keeps the legacy key for compatibility.
+        let serialized = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(serialized["ranks"][0]["programs"][0]["context_tokens"], 123);
+        assert_eq!(
+            serialized["ranks"][0]["programs"][0]["estimated_context_tokens"],
+            123
+        );
+        assert_eq!(
+            snapshot.ranks[0].programs[0].context_token_source,
+            "estimated"
+        );
         assert!(snapshot.ranks[0].programs[0].expected_resume);
         assert!(!snapshot.ranks[0].observation_fresh);
         assert_eq!(

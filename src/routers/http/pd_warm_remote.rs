@@ -1578,6 +1578,7 @@ impl PdResponseContext {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::program_scheduling::ProgramRequestHints;
@@ -1589,7 +1590,7 @@ mod tests {
             epoch,
             Instant::now(),
             Instant::now(),
-            3,
+            crate::program_scheduling::ContextTokens::estimated(3),
             false,
             None,
             ProgramRequestHints::default(),
