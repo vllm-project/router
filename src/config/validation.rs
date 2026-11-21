@@ -71,7 +71,6 @@ impl ConfigValidator {
         }
         if config.binding_strategy == ProgramBindingStrategy::ReasoningTokenBalance
             && config.token_capacity_per_dp_rank.is_none()
-            && !config.dynamic_token_capacity
         {
             return Err(ConfigError::ValidationFailed {
                 reason: "reasoning_token_balance requires token_capacity_per_dp_rank".to_string(),
@@ -1152,6 +1151,43 @@ mod tests {
         config.token_capacity_per_dp_rank = Some(1200);
         config.binding_strategy = ProgramBindingStrategy::ConsistentHash;
         assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+    }
+
+    #[test]
+    fn reasoning_token_balance_requires_static_capacity_even_in_dynamic_mode() {
+        for dynamic in [false, true] {
+            let mut config = RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec!["http://worker:8000".to_string()],
+                },
+                PolicyConfig::Random,
+            );
+            config.program_scheduling = Some(ProgramSchedulingConfig {
+                binding_strategy: ProgramBindingStrategy::ReasoningTokenBalance,
+                dynamic_token_capacity: dynamic,
+                token_capacity_per_dp_rank: None,
+                ..ProgramSchedulingConfig::default()
+            });
+            let error = ConfigValidator::validate(&config).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("reasoning_token_balance requires token_capacity_per_dp_rank"),
+                "{error}"
+            );
+
+            let program = config.program_scheduling.as_mut().unwrap();
+            program.dynamic_token_capacity = false;
+            program.token_capacity_per_dp_rank = Some(100_000);
+            ConfigValidator::validate(&config).unwrap();
+
+            let program = config.program_scheduling.as_mut().unwrap();
+            program.binding_strategy = ProgramBindingStrategy::CacheAware;
+            program.resume_order = ProgramResumeOrder::DpAdmissionTAO;
+            program.dynamic_token_capacity = true;
+            program.token_capacity_per_dp_rank = None;
+            ConfigValidator::validate(&config).unwrap();
+        }
     }
 
     #[test]
