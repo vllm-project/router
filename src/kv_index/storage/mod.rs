@@ -90,7 +90,7 @@ pub struct KvBlockIndexer {
     source_locks: RwLock<HashMap<RoutableTarget, Arc<SourceLock>, Fast>>,
     // A scan samples this once before reading any page. Only completed writes advance it.
     committed: AtomicU64,
-    /// Ordinary access shares the barrier; retirement excludes it.
+    /// Source mutations share the barrier; retirement excludes them.
     domain: RwLock<()>,
     /// Batches that can hide a previously committed page hold a shared guard until publish.
     removals: RwLock<()>,
@@ -325,7 +325,7 @@ impl KvBlockIndexer {
         namespace: Option<&str>,
         keys: &[SequenceHash],
     ) -> GroupPages {
-        let _domain = self.domain.read();
+        // Each source validates this scan against its transaction revision.
         let scan = Arc::new(PageScan::new(self.committed.load(Ordering::Acquire)));
         groups
             .map(|query| {

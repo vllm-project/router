@@ -392,9 +392,8 @@ impl KvBlockIndexer {
             return None;
         }
 
-        // Keep the head row pinned across the lifecycle gate. Source validation
-        // still uses the cutoff taken before looking up the head.
-        let _domain = self.domain.read();
+        // The row handle stays valid through retirement. Each source validates
+        // its evidence against the cutoff taken before looking up the head.
         let head = row
             .map(|page| PageTable::row_claims(&page.0.row.read(), None))
             .unwrap_or_default();
@@ -419,6 +418,9 @@ impl PageEvidence {
     ) -> Option<SourceVersion> {
         let source = index.existing_source(target)?;
         let generation = source.generation.load(Ordering::Acquire);
+        if !generation.is_multiple_of(2) {
+            return Some(SourceVersion { source, generation });
+        }
         let now = source.revision.load(Ordering::Acquire);
         if now > self.scan.committed || !now.is_multiple_of(2) {
             let changes = {
@@ -490,7 +492,9 @@ impl PageEvidence {
             return Some(PageMatch::Miss);
         }
         let version = first.validate_source(index, target, keys)?;
-        if missing {
+        // A hidden rank cannot earn credit. Skip the exact fallback while
+        // retirement is still removing its entries.
+        if missing || !version.generation.is_multiple_of(2) {
             return Some(PageMatch::Miss);
         }
         let mut runs = smallvec::SmallVec::with_capacity(groups.size_hint().0 + 1);
@@ -1185,6 +1189,89 @@ mod tests {
                 .read_row(&hash, |row| (owns(row, &old), owns(row, &new))),
             Some((false, true))
         );
+    }
+
+    #[test]
+    fn shared_queries_keep_survivor_hits_while_retirement_clears_pages() {
+        let index = KvBlockIndexer::new();
+        let retiring = owner("retiring");
+        let survivor = owner("survivor");
+        let target = retiring.target();
+        let gate = index.source_lock(&target);
+        let keys = [[7; 32]];
+        let cold = [8; 32];
+        for owner in [&retiring, &survivor] {
+            index.with_source_batch(&owner.target(), |tx| {
+                for group in 0..2 {
+                    tx.store_hash_pages(owner, group, StorageTier::Device, None, &keys, true, 8)
+                        .unwrap();
+                }
+            });
+        }
+        index.with_source_batch(&target, |tx| {
+            tx.store_hash_pages(&retiring, 0, StorageTier::Device, None, &[cold], true, 8)
+                .unwrap();
+        });
+        let page = index
+            .hash_pages
+            .rows
+            .peek_with(&PageKey::new(0, cold), |page, ()| page.clone())
+            .unwrap();
+
+        std::thread::scope(|scope| {
+            // Hold an unrelated page open so a real retirement cannot complete.
+            let blocked = page.0.row.read();
+            let index = &index;
+            let target = &target;
+            scope.spawn(move || index.retire_source(&target.instance_id, target.dp_rank));
+            let timeout = std::time::Duration::from_secs(5);
+            let started = std::time::Instant::now();
+            while gate.generation.load(Ordering::Acquire).is_multiple_of(2) {
+                assert!(
+                    started.elapsed() < timeout,
+                    "source did not enter retirement"
+                );
+                std::thread::yield_now();
+            }
+
+            let (done, completed) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let prefix = index
+                    .collect_prefix(
+                        PageQuery {
+                            group: 0,
+                            stop_at_gap: true,
+                        },
+                        &keys,
+                    )
+                    .unwrap();
+                let groups = index.collect_hash_groups(0u32..2, None, &keys);
+                for evidence in [vec![&prefix], groups.values().collect()] {
+                    for (owner, visible) in [(&retiring, false), (&survivor, true)] {
+                        let matched = PageEvidence::unchanged_groups(
+                            index,
+                            &owner.target(),
+                            owner,
+                            &keys,
+                            evidence.iter().copied().map(Some),
+                        );
+                        if visible {
+                            let Some(PageMatch::Hit(pages, version)) = matched else {
+                                panic!("survivor lost shared pages")
+                            };
+                            assert!(pages.iter().all(|group| group.get(0).is_some()));
+                            assert!(index.source_version_is_current(&version));
+                        } else {
+                            assert!(matches!(matched, Some(PageMatch::Miss)));
+                        }
+                    }
+                }
+                done.send(()).unwrap();
+            });
+            let result = completed.recv_timeout(timeout);
+            drop(blocked);
+            result.expect("shared queries must finish while a different rank retires");
+        });
     }
 
     #[test]
