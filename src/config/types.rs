@@ -128,6 +128,10 @@ fn default_intra_node_data_parallel_size() -> usize {
     1
 }
 
+pub(crate) fn default_dp_state_budget() -> Option<usize> {
+    Some(50_000)
+}
+
 fn default_dp_capacity_quantum() -> usize {
     512
 }
@@ -418,7 +422,7 @@ pub struct ProgramSchedulingConfig {
     pub dynamic_token_capacity: bool,
     #[serde(default = "default_dp_capacity_quantum")]
     pub dp_capacity_quantum: usize,
-    #[serde(default)]
+    #[serde(default = "default_dp_state_budget")]
     pub dp_state_budget: Option<usize>,
     #[serde(default)]
     pub resume_solver_strategy: ResumeSolverStrategy,
@@ -642,7 +646,7 @@ impl Default for ProgramSchedulingConfig {
             token_capacity_per_dp_rank: None,
             dynamic_token_capacity: false,
             dp_capacity_quantum: 512,
-            dp_state_budget: None,
+            dp_state_budget: default_dp_state_budget(),
             resume_solver_strategy: ResumeSolverStrategy::Dp,
             token_count_mode: TokenCountMode::default(),
             token_count_model_pools: Vec::new(),
@@ -703,7 +707,7 @@ struct ProgramSchedulingConfigInput {
     dynamic_token_capacity: bool,
     #[serde(default = "default_dp_capacity_quantum")]
     dp_capacity_quantum: usize,
-    #[serde(default)]
+    #[serde(default = "default_dp_state_budget")]
     dp_state_budget: Option<usize>,
     #[serde(default)]
     resume_solver_strategy: ResumeSolverStrategy,

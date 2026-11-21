@@ -110,7 +110,7 @@ impl Default for ProgramSchedulerConfig {
             resume_order: ProgramResumeOrder::default(),
             dynamic_token_capacity: false,
             dp_capacity_quantum: 512,
-            dp_state_budget: None,
+            dp_state_budget: crate::config::types::default_dp_state_budget(),
             resume_solver_strategy: crate::config::ResumeSolverStrategy::Dp,
             cross_rank_headroom_ratio: 1.2,
             binding_strategy: ProgramBindingStrategy::ConsistentHash,
@@ -271,7 +271,7 @@ pub(crate) struct ProgramDecisionState {
     /// Input-token demand currently reserved in the rank ledger and its provenance.
     pub(crate) context: ContextTokens,
     pub(crate) output_token_reservation: Option<usize>,
-    pub(crate) tree_dp_reserved_tokens: Option<usize>,
+    pub(crate) tao_reserved_tokens: Option<usize>,
     pub(crate) context_shrink_observations: u8,
     pub(crate) completed_requests: usize,
     pub(crate) segment_served_rounds: usize,
@@ -332,7 +332,7 @@ impl ProgramDecisionState {
             home_target,
             context,
             output_token_reservation: None,
-            tree_dp_reserved_tokens: None,
+            tao_reserved_tokens: None,
             context_shrink_observations: 0,
             completed_requests: 0,
             segment_served_rounds: 0,
@@ -473,7 +473,7 @@ pub(crate) struct RouterCapacityAccounting {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CapacityAccountingSource {
     BackendHeadroomEstimate,
-    BackendCacheConfigTreeDp,
+    BackendCacheConfigTao,
     BackendHeadroomUnavailable,
     BackendObservation,
     RouterLedgerMissingObservation,
@@ -485,7 +485,7 @@ impl CapacityAccountingSource {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::BackendHeadroomEstimate => "backend_headroom_estimate",
-            Self::BackendCacheConfigTreeDp => "backend_usage_plus_reservations_tree_dp",
+            Self::BackendCacheConfigTao => "backend_usage_plus_reservations_tao",
             Self::BackendHeadroomUnavailable => "backend_headroom_unavailable",
             Self::BackendObservation => "backend_observation",
             Self::RouterLedgerMissingObservation => "router_ledger_missing_observation",

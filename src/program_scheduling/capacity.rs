@@ -52,8 +52,8 @@ impl ProgramScheduler {
         target: &str,
         now: Instant,
     ) -> Option<usize> {
-        if self.kv_dp_mode() {
-            return self.tree_dp_capacity(state, target, now);
+        if self.uses_tao_admission() {
+            return self.tao_token_capacity(state, target, now);
         }
         if !self.config.dynamic_token_capacity {
             return self.config.progress_ttl.token_capacity;
@@ -120,7 +120,7 @@ impl ProgramScheduler {
         program: &super::ProgramRef,
         now: Instant,
     ) {
-        if self.kv_dp_mode() {
+        if self.uses_tao_admission() {
             return;
         }
         if !self.config.dynamic_token_capacity || self.config.binding_only {
@@ -188,8 +188,7 @@ mod tests {
             dynamic_token_capacity: true,
             dp_capacity_quantum: 1, // Small exact-token test fixtures.
             resume_order: order,
-            // These fixtures test legacy physical-headroom accounting.
-            // Tree-backed direct DP has its own tests in tree_dp_admission.
+            // Native MRU/FCFS use the same observed-headroom accounting.
             binding_strategy: ProgramBindingStrategy::ConsistentHash,
             ..Default::default()
         };
@@ -311,8 +310,8 @@ mod tests {
     }
 
     #[test]
-    fn native_and_tao_modes_wait_for_backend_then_obey_changing_headroom() {
-        for order in [ProgramResumeOrder::Mru, ProgramResumeOrder::DpAdmissionTAO] {
+    fn native_resume_orders_wait_for_backend_then_obey_changing_headroom() {
+        for order in [ProgramResumeOrder::Mru, ProgramResumeOrder::Fcfs] {
             let s = scheduler(order);
             let a = enqueue(&s, "a", 300);
             let b = enqueue(&s, "b", 300);
@@ -351,7 +350,7 @@ mod tests {
 
     #[test]
     fn fresh_low_usage_does_not_readmit_reserved_backend_queue_capacity() {
-        for order in [ProgramResumeOrder::Mru, ProgramResumeOrder::DpAdmissionTAO] {
+        for order in [ProgramResumeOrder::Mru, ProgramResumeOrder::Fcfs] {
             let s = scheduler(order);
             let a = enqueue(&s, "a", 600);
             observe(&s, 0.0);
@@ -382,7 +381,7 @@ mod tests {
 
     #[test]
     fn idle_acting_context_does_not_consume_live_reasoning_reservation_twice() {
-        for order in [ProgramResumeOrder::Mru, ProgramResumeOrder::DpAdmissionTAO] {
+        for order in [ProgramResumeOrder::Mru, ProgramResumeOrder::Fcfs] {
             let s = scheduler(order);
             let a = enqueue(&s, "acting", 600);
             observe(&s, 0.0);
@@ -438,7 +437,7 @@ mod tests {
     #[test]
     fn retained_active_turn_cannot_bypass_invalid_or_stale_usage() {
         for invalid in [true, false] {
-            let s = scheduler(ProgramResumeOrder::DpAdmissionTAO);
+            let s = scheduler(ProgramResumeOrder::Fcfs);
             let a = enqueue(&s, "a", 600);
             observe(&s, 0.0);
             s.schedule_waiting(&mut s.state.lock(), Instant::now());
@@ -463,7 +462,7 @@ mod tests {
 
     #[test]
     fn epoch_preserves_new_charges_and_does_not_credit_logical_releases() {
-        let s = scheduler(ProgramResumeOrder::DpAdmissionTAO);
+        let s = scheduler(ProgramResumeOrder::Fcfs);
         observe(&s, 0.0);
         {
             let mut state = s.state.lock();
@@ -526,7 +525,7 @@ mod tests {
 
     #[test]
     fn overdraw_keeps_pressure_instead_of_inflating_capacity_to_current_usage() {
-        let s = scheduler(ProgramResumeOrder::DpAdmissionTAO);
+        let s = scheduler(ProgramResumeOrder::Fcfs);
         let _p = enqueue(&s, "active", 600);
         observe(&s, 0.0);
         let mut state = s.state.lock();
@@ -546,7 +545,7 @@ mod tests {
 
     #[test]
     fn independent_ranks_do_not_share_a_budget_or_static_override() {
-        let s = scheduler(ProgramResumeOrder::DpAdmissionTAO);
+        let s = scheduler(ProgramResumeOrder::Fcfs);
         let mut targets = targets();
         targets.push(ProgramTarget {
             id: "other".into(),
@@ -568,7 +567,7 @@ mod tests {
 
     #[test]
     fn stale_target_epoch_and_out_of_order_samples_cannot_restore_budget() {
-        let s = scheduler(ProgramResumeOrder::DpAdmissionTAO);
+        let s = scheduler(ProgramResumeOrder::Fcfs);
         let old = raw("rank", 0.0);
         observe(&s, 1.0);
         s.apply_observations(s.begin_observation(&targets()), [old]);

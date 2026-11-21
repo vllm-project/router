@@ -22,14 +22,13 @@ mod return_time;
 mod runtime;
 mod scheduler;
 mod scheduler_admission;
-mod scheduler_dp_admission;
 mod scheduler_fairness;
 mod scheduler_global;
 mod scheduler_lifecycle;
 mod scheduler_state;
 mod scheduler_tokens;
+mod tao_admission;
 mod token_facts;
-mod tree_dp_admission;
 
 pub use binding::{
     ProgramBindingCandidate, ProgramBindingPolicy, ProgramBindingStrategy, ProgramBindings,

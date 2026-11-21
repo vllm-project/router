@@ -56,11 +56,12 @@ impl ConfigValidator {
     fn validate_program_scheduling(config: &ProgramSchedulingConfig) -> ConfigResult<()> {
         if matches!(config.resume_order, ProgramResumeOrder::DpAdmissionTAO)
             && (config.binding_strategy != ProgramBindingStrategy::CacheAware
-                || (config.token_capacity_per_dp_rank.is_none() && !config.dynamic_token_capacity))
+                || !config.dynamic_token_capacity
+                || !config.global_queue)
         {
             return Err(ConfigError::ValidationFailed {
                 reason:
-                    "dp_admission_tao requires cache_aware binding and static or dynamic token capacity"
+                    "dp_admission_tao requires cache_aware binding, dynamic_token_capacity=true and global_queue=true"
                         .to_string(),
             });
         }
@@ -1099,7 +1100,14 @@ mod tests {
     fn solver_configuration_defaults_and_validation() {
         let mut cfg: ProgramSchedulingConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.dp_capacity_quantum, 512);
-        assert_eq!(cfg.dp_state_budget, None);
+        assert_eq!(cfg.dp_state_budget, Some(50_000));
+        assert_eq!(
+            cfg.dp_state_budget,
+            ProgramSchedulingConfig::default().dp_state_budget
+        );
+        let unlimited: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"dp_state_budget":null}"#).unwrap();
+        assert_eq!(unlimited.dp_state_budget, None);
         assert_eq!(
             cfg.resume_solver_strategy,
             crate::config::ResumeSolverStrategy::Dp
@@ -1134,23 +1142,37 @@ mod tests {
     }
 
     #[test]
-    fn direct_dp_admission_is_a_separate_validated_configuration() {
-        let mut config: ProgramSchedulingConfig = serde_json::from_str(
-            r#"{"resume_order":"dp_admission_tao","binding_strategy":"cache_aware","token_capacity_per_dp_rank":1200}"#,
-        ).unwrap();
-        assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
-        assert_eq!(
-            serde_json::to_value(&config).unwrap()["resume_order"],
-            "dp_admission_tao"
-        );
-        config.binding_only = true;
-        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
-        config.binding_only = false;
-        config.token_capacity_per_dp_rank = None;
-        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
-        config.token_capacity_per_dp_rank = Some(1200);
-        config.binding_strategy = ProgramBindingStrategy::ConsistentHash;
-        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+    fn tao_requires_global_dynamic_cache_aware_admission() {
+        let valid: ProgramSchedulingConfig = serde_json::from_str(include_str!(
+            "../../examples/configs/program_dynamic_dp_admission.json"
+        ))
+        .unwrap();
+        ConfigValidator::validate_program_scheduling(&valid).unwrap();
+        for invalid in [
+            ProgramSchedulingConfig {
+                global_queue: false,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                dynamic_token_capacity: false,
+                token_capacity_per_dp_rank: Some(1200),
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                token_capacity_per_dp_rank: Some(1200),
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                binding_only: true,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                binding_strategy: ProgramBindingStrategy::ConsistentHash,
+                ..valid
+            },
+        ] {
+            assert!(ConfigValidator::validate_program_scheduling(&invalid).is_err());
+        }
     }
 
     #[test]
@@ -1184,30 +1206,11 @@ mod tests {
             let program = config.program_scheduling.as_mut().unwrap();
             program.binding_strategy = ProgramBindingStrategy::CacheAware;
             program.resume_order = ProgramResumeOrder::DpAdmissionTAO;
+            program.global_queue = true;
             program.dynamic_token_capacity = true;
             program.token_capacity_per_dp_rank = None;
             ConfigValidator::validate(&config).unwrap();
         }
-    }
-
-    #[test]
-    fn dynamic_capacity_replaces_static_requirement_but_not_binding_constraints() {
-        let mut config: ProgramSchedulingConfig = serde_json::from_value(serde_json::json!({
-            "resume_order": "dp_admission_tao",
-            "binding_strategy": "cache_aware", "dynamic_token_capacity": true
-        }))
-        .unwrap();
-        assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
-        assert!(
-            serde_json::to_value(&config).unwrap()["dynamic_token_capacity"]
-                .as_bool()
-                .unwrap()
-        );
-        config.token_capacity_per_dp_rank = Some(1000);
-        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
-        config.token_capacity_per_dp_rank = None;
-        config.binding_strategy = ProgramBindingStrategy::ConsistentHash;
-        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
     }
 
     #[test]
@@ -1831,24 +1834,18 @@ mod tests {
     #[test]
     fn tao_admission_and_dynamic_capacity_do_not_change_pd_scheduling() {
         use crate::program_scheduling::ProgramResumeOrder;
-        for (order, dynamic) in [
-            (ProgramResumeOrder::DpAdmissionTAO, false),
-            (ProgramResumeOrder::DpAdmissionTAO, true),
-            (ProgramResumeOrder::Mru, true),
-        ] {
+        for order in [ProgramResumeOrder::DpAdmissionTAO, ProgramResumeOrder::Mru] {
             let mut config = pd_config_with_static_kv_sources();
             config.program_scheduling = Some(ProgramSchedulingConfig {
-                token_capacity_per_dp_rank: Some(100000),
+                token_capacity_per_dp_rank: None,
+                global_queue: true,
+                dynamic_token_capacity: true,
                 enable_batch_gain_admission: false,
                 ..ProgramSchedulingConfig::default()
             });
             let program = config.program_scheduling.as_mut().unwrap();
             program.binding_strategy = ProgramBindingStrategy::CacheAware;
             program.resume_order = order;
-            program.dynamic_token_capacity = dynamic;
-            if dynamic {
-                program.token_capacity_per_dp_rank = None;
-            }
             let error = ConfigValidator::validate(&config).unwrap_err();
             assert!(
                 error.to_string().contains("only in regular mode"),

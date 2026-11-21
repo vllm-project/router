@@ -789,7 +789,7 @@ impl ProgramScheduler {
         if self.config.dynamic_token_capacity {
             return if observation.is_some_and(|o| {
                 self.observation_is_fresh(o, now)
-                    && if self.kv_dp_mode() {
+                    && if self.uses_tao_admission() {
                         o.backend.backend_token_capacity.is_some_and(|c| c > 0)
                             && o.backend.backend_available_tokens.is_some_and(|free| {
                                 free.is_finite()
@@ -800,8 +800,8 @@ impl ProgramScheduler {
                         o.backend.backend_available_tokens.is_some()
                     }
             }) {
-                if self.kv_dp_mode() {
-                    CapacityAccountingSource::BackendCacheConfigTreeDp
+                if self.uses_tao_admission() {
+                    CapacityAccountingSource::BackendCacheConfigTao
                 } else {
                     CapacityAccountingSource::BackendHeadroomEstimate
                 }
@@ -850,7 +850,7 @@ impl ProgramScheduler {
             if matches!(
                 source,
                 CapacityAccountingSource::BackendObservation
-                    | CapacityAccountingSource::BackendCacheConfigTreeDp
+                    | CapacityAccountingSource::BackendCacheConfigTao
                     | CapacityAccountingSource::BackendHeadroomEstimate
             ) {
                 if let Some(previous) = previous {
@@ -883,8 +883,8 @@ impl ProgramScheduler {
         target_id: &str,
         now: Instant,
     ) -> f64 {
-        if self.kv_dp_mode() {
-            return self.tree_dp_accounted_used(state, target_id) as f64;
+        if self.uses_tao_admission() {
+            return self.tao_accounted_tokens(state, target_id) as f64;
         }
         if self.config.dynamic_token_capacity {
             return self.ledger_usage(state, target_id);

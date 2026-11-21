@@ -14,7 +14,7 @@ use std::time::Instant;
 /// One live Program generation and the facts used by scheduling decisions.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProgramDiagnostic {
-    pub tree_dp_reserved_tokens: Option<usize>,
+    pub tao_reserved_tokens: Option<usize>,
     pub program: String,
     pub generation: u64,
     pub state: &'static str,
@@ -278,7 +278,7 @@ impl ProgramScheduler {
                 .entry(target_id)
                 .or_default()
                 .push(ProgramDiagnostic {
-                    tree_dp_reserved_tokens: decision.tree_dp_reserved_tokens,
+                    tao_reserved_tokens: decision.tao_reserved_tokens,
                     program: runtime.reference.redacted_id(),
                     generation: runtime.reference.generation(),
                     state: match runtime.state {
@@ -534,10 +534,10 @@ impl ProgramScheduler {
                 dp_rank: target.dp_rank,
                 configured_token_capacity: capacity,
                 effective_token_capacity: self.target_capacity(&state, target_id, now),
-                token_capacity_source: if self.kv_dp_mode()
+                token_capacity_source: if self.uses_tao_admission()
                     && self.capacity_ready(&state, target_id, now)
                 {
-                    "vllm_usage_plus_reservations_tree_dp"
+                    "vllm_usage_plus_reservations_tao"
                 } else if !self.config.dynamic_token_capacity {
                     "configured"
                 } else if self.capacity_ready(&state, target_id, now) {
@@ -556,8 +556,8 @@ impl ProgramScheduler {
                     .dynamic_token_capacity
                     .then(|| self.dynamic_headroom(&state, target_id, now))
                     .flatten(),
-                router_reasoning_reserved_tokens: if self.kv_dp_mode() {
-                    self.tree_dp_used(&state, target_id) as f64
+                router_reasoning_reserved_tokens: if self.uses_tao_admission() {
+                    self.tao_reserved_tokens(&state, target_id) as f64
                 } else {
                     self.reasoning_reservations(&state, target_id)
                 },

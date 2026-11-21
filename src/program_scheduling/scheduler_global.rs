@@ -106,30 +106,11 @@ impl ProgramScheduler {
         program: &ProgramRef,
         now: Instant,
     ) -> Option<(String, RankAdmissionPlan)> {
-        self.cross_rank_admissions(state, program, now)
-            .into_iter()
-            .next()
-    }
-
-    fn cross_rank_admissions(
-        &self,
-        state: &ProgramSchedulerState,
-        program: &ProgramRef,
-        now: Instant,
-    ) -> Vec<(String, RankAdmissionPlan)> {
-        let Some(decision) = state.decisions.get(program) else {
-            return Vec::new();
-        };
-        if decision.last_pause_reason.is_none() {
-            return Vec::new();
-        }
-        let Some(source_target) = decision.last_target.as_deref() else {
-            return Vec::new();
-        };
-        let Some(targets) = state.model_targets.get(program.model_pool()) else {
-            return Vec::new();
-        };
-        let mut candidates = targets
+        let decision = state.decisions.get(program)?;
+        decision.last_pause_reason?;
+        let source_target = decision.last_target.as_deref()?;
+        let targets = state.model_targets.get(program.model_pool())?;
+        let candidates = targets
             .iter()
             .filter(|target| target.as_str() != source_target)
             .filter(|target| !self.destination_has_local_waiter(state, program, target))
@@ -141,37 +122,38 @@ impl ProgramScheduler {
                     .map(|plan| (target.clone(), plan))
             })
             .collect::<Vec<_>>();
-        candidates.sort_by(|(left_id, left), (right_id, right)| {
-            let waiting = |target_id: &str| {
-                state
-                    .observations
-                    .get(target_id)
-                    .filter(|observation| self.observation_is_fresh(observation, now))
-                    .and_then(|observation| observation.backend.waiting_requests)
-                    .unwrap_or(0)
-            };
-            let pressure = |target_id: &str, plan: &RankAdmissionPlan| {
-                plan.capacity_tokens.map_or_else(
-                    || {
-                        (self.active_program_count(state, target_id) + 1) as f64
-                            / self.config.max_active_programs_per_target.max(1) as f64
-                    },
-                    |capacity| {
-                        (plan.used_tokens + plan.required_tokens + plan.reserve_tokens)
-                            / capacity.max(1) as f64
-                    },
-                )
-            };
-            waiting(left_id)
-                .cmp(&waiting(right_id))
-                .then_with(|| pressure(left_id, left).total_cmp(&pressure(right_id, right)))
-                .then_with(|| {
-                    self.active_program_count(state, left_id)
-                        .cmp(&self.active_program_count(state, right_id))
-                })
-                .then_with(|| left_id.cmp(right_id))
-        });
         candidates
+            .into_iter()
+            .min_by(|(left_id, left), (right_id, right)| {
+                let waiting = |target_id: &str| {
+                    state
+                        .observations
+                        .get(target_id)
+                        .filter(|observation| self.observation_is_fresh(observation, now))
+                        .and_then(|observation| observation.backend.waiting_requests)
+                        .unwrap_or(0)
+                };
+                let pressure = |target_id: &str, plan: &RankAdmissionPlan| {
+                    plan.capacity_tokens.map_or_else(
+                        || {
+                            (self.active_program_count(state, target_id) + 1) as f64
+                                / self.config.max_active_programs_per_target.max(1) as f64
+                        },
+                        |capacity| {
+                            (plan.used_tokens + plan.required_tokens + plan.reserve_tokens)
+                                / capacity.max(1) as f64
+                        },
+                    )
+                };
+                waiting(left_id)
+                    .cmp(&waiting(right_id))
+                    .then_with(|| pressure(left_id, left).total_cmp(&pressure(right_id, right)))
+                    .then_with(|| {
+                        self.active_program_count(state, left_id)
+                            .cmp(&self.active_program_count(state, right_id))
+                    })
+                    .then_with(|| left_id.cmp(right_id))
+            })
     }
 
     fn destination_has_local_waiter(

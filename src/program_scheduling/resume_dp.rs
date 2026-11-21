@@ -157,34 +157,6 @@ fn select(
     capacities: &[(usize, usize)],
     max_states: usize,
 ) -> Result<Vec<usize>, ()> {
-    // Native local-before-cross-rank scheduling normally gives one eligible
-    // target per Program. Those knapsacks are independent: avoid constructing
-    // their Cartesian product when serving several aggregated replicas.
-    if capacities.len() > 1 && programs.iter().all(|options| options.len() == 1) {
-        let mut selected = Vec::new();
-        for (target, capacity) in capacities.iter().enumerate() {
-            let local: Vec<_> = programs
-                .iter()
-                .filter(|options| options[0].target == target)
-                .map(|options| {
-                    let mut option = options[0].clone();
-                    option.target = 0;
-                    vec![option]
-                })
-                .collect();
-            selected.extend(select_bounded(&local, &[*capacity], max_states)?);
-        }
-        selected.sort_unstable();
-        return Ok(selected);
-    }
-    select_bounded(programs, capacities, max_states)
-}
-
-fn select_bounded(
-    programs: &[Vec<OptionValue>],
-    capacities: &[(usize, usize)],
-    max_states: usize,
-) -> Result<Vec<usize>, ()> {
     let mut frontier = BTreeMap::from([(
         vec![(0usize, 0usize); capacities.len()],
         Selection::default(),
@@ -250,16 +222,20 @@ mod tests {
     fn agentx_sized_128_candidates_two_replicas_make_progress() {
         let programs: Vec<_> = (0..128)
             .map(|i| {
-                vec![option(
-                    i,
-                    i % 2,
-                    200_000 + (i * 7919) % 180_000,
-                    (i * 1709) as u128,
-                )]
+                (0..2)
+                    .map(|target| {
+                        option(
+                            i * 2 + target,
+                            target,
+                            200_000 + ((i + target) * 7919) % 180_000,
+                            ((i + target) * 1709) as u128,
+                        )
+                    })
+                    .collect()
             })
             .collect();
         let caps = [(1_132_746, 128), (1_132_746, 128)];
-        for budget in [None, Some(16), Some(16_384)] {
+        for budget in [Some(16), Some(50_000)] {
             let cfg = crate::program_scheduling::ProgramSchedulerConfig {
                 dp_state_budget: budget,
                 ..Default::default()
@@ -279,10 +255,10 @@ mod tests {
     }
 
     #[test]
-    fn quantum_is_conservative_and_default_is_unbounded() {
+    fn quantum_is_conservative_and_default_frontier_is_bounded() {
         let cfg = crate::program_scheduling::ProgramSchedulerConfig::default();
         assert_eq!(cfg.dp_capacity_quantum, 512);
-        assert_eq!(cfg.dp_state_budget, None);
+        assert_eq!(cfg.dp_state_budget, Some(50_000));
         let programs = vec![vec![option(0, 0, 513, 4)], vec![option(1, 0, 512, 3)]];
         assert_eq!(solve(&programs, &[(1023, 2)], &cfg), vec![1]);
         assert_eq!(solve(&programs, &[(1024, 2)], &cfg), vec![0]);
@@ -453,7 +429,7 @@ mod tests {
         assert_eq!(select(&programs, &[(10, 1)], usize::MAX), Ok(vec![0]));
         let programs = vec![vec![option(0, 0, 5, 1)], vec![option(1, 0, 6, 1)]];
         assert_eq!(select(&programs, &[(6, 1)], usize::MAX), Ok(vec![1]));
-        assert_eq!(select_bounded(&programs, &[(6, 1)], 1), Err(()));
+        assert_eq!(select(&programs, &[(6, 1)], 1), Err(()));
     }
 
     #[test]

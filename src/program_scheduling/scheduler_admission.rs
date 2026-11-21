@@ -401,7 +401,7 @@ impl ProgramScheduler {
         {
             return None;
         }
-        if (self.config.pd_mode || self.kv_dp_mode())
+        if (self.config.pd_mode || self.uses_tao_admission())
             && state.runtime.view(handle.program())?.in_flight_requests > 0
         {
             return None;
@@ -499,9 +499,9 @@ impl ProgramScheduler {
             return;
         }
         let after = state.runtime.view(handle.program());
-        if self.kv_dp_mode() && after.as_ref().is_some_and(|v| v.in_flight_requests == 0) {
+        if self.uses_tao_admission() && after.as_ref().is_some_and(|v| v.in_flight_requests == 0) {
             if let Some(d) = state.decisions.get_mut(handle.program()) {
-                d.tree_dp_reserved_tokens = None;
+                d.tao_reserved_tokens = None;
             }
         }
         if self.config.pd_mode
@@ -620,26 +620,9 @@ impl ProgramScheduler {
         changed
     }
 
-    pub(crate) fn resume_target_allowed(
-        &self,
-        state: &ProgramSchedulerState,
-        program: &ProgramRef,
-        target: &str,
-    ) -> bool {
-        self.config.global_queue
-            || state
-                .decisions
-                .get(program)
-                .and_then(|d| d.last_target.as_deref())
-                == Some(target)
-    }
-
     pub(crate) fn schedule_waiting(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {
-        if self.kv_dp_mode() {
-            return self.schedule_tree_dp(state, now);
-        }
-        if self.config.resume_order == ProgramResumeOrder::DpAdmissionTAO {
-            return self.schedule_dp_admission(state, now);
+        if self.uses_tao_admission() {
+            return self.schedule_tao_admission(state, now);
         }
         if self.config.global_queue {
             self.schedule_global_waiting(state, now)
@@ -789,7 +772,7 @@ impl ProgramScheduler {
     ) -> Option<RankAdmissionPlan> {
         let runtime = state.runtime.view(program)?;
         let decision = state.decisions.get(program)?;
-        if !self.resume_target_allowed(state, program, target_id) {
+        if !self.config.global_queue && decision.last_target.as_deref() != Some(target_id) {
             return None;
         }
         if runtime.state != ProgramState::Paused

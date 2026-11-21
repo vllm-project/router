@@ -34,7 +34,7 @@ The default is a strict per-request opt-in contract, not a claim that existing a
 }
 ```
 
-`global_queue: true` is the recommended deployment mode. MRU/FCFS first try the previous Rank before considering cross-Rank placement under their capacity/headroom gates; TAO jointly selects eligible Program/Rank assignments within its budgets. Set it to `false` for strict Rank-local scheduling with any resume strategy.
+`global_queue: true` is the recommended deployment mode. MRU/FCFS first try the previous Rank before considering cross-Rank placement under their capacity/headroom gates; TAO jointly selects eligible Program/Rank assignments within its budgets. MRU/FCFS also support strict Rank-local scheduling with `global_queue: false`. TAO requires `true`.
 
 To adapt Program scheduling to a different model or hardware configuration, operators generally only need to recalibrate `prefill_cost_model` and `decode_throughput_model`. The [AgentInfer backend calibration README](https://github.com/openJiuwen-ai/agent-infer/blob/main/tools/calibration/README.md) describes how to measure these coefficients for the target deployment.
 
@@ -95,9 +95,9 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 |---|---:|---|
 | `program_scheduling_enable_key` | `vllm_xargs.agentic_context` | Selects which identity inputs opt a request into Program scheduling. The default accepts only canonical `vllm_xargs.agentic_context`; `auto` additionally accepts the documented `agent_hint` and framework Header schemas. |
 | `binding_only` | `false` | Preserves Program identity and initial Program-to-Rank binding but bypasses RequestPool admission, Progress-TTL pause, and resume scheduling. This isolates the effect of Program affinity. |
-| `global_queue` | `false` | When `false`, a paused Program can resume only on its bound Rank. When `true`, MRU/FCFS prefer local resumes before cross-Rank placement, while TAO jointly selects eligible Program/Rank assignments. |
-| `resume_order` | `mru` | `mru` and `fcfs` retain native ordering; `dp_admission_tao` lets DP decide admission directly. TAO requires `cache_aware` binding plus either explicit token capacity or `dynamic_token_capacity: true`. See the DP sections below. |
-| `cross_rank_headroom_ratio` | `1.2` | Controls cross-Rank migration conservatism. A destination must have at least the source Rank's free capacity plus this multiple of the Program's complete estimated context. It has no effect when `global_queue` is `false`. |
+| `global_queue` | `false` | When `false`, MRU/FCFS can resume a paused Program only on its bound Rank. TAO requires `true`. When `true`, MRU/FCFS prefer local resumes before cross-Rank placement, while TAO jointly selects eligible Program/Rank assignments. |
+| `resume_order` | `mru` | `mru` and `fcfs` retain native ordering; `dp_admission_tao` lets DP decide admission directly. TAO requires `cache_aware` binding with both `global_queue: true` and `dynamic_token_capacity: true`. See [TAO admission](#tao-admission). |
+| `cross_rank_headroom_ratio` | `1.2` | Controls MRU/FCFS cross-Rank migration conservatism. A destination must have at least the source Rank's free capacity plus this multiple of the Program's complete estimated context. It has no effect when `global_queue` is `false`. |
 | `binding_strategy` | `consistent_hash` | Selects the initial home Rank for each new Program generation. Supported values are `consistent_hash`, `program_round_robin`, `least_program_count`, `reasoning_token_balance`, and `cache_aware`; it does not replace admission or resume decisions. |
 | `hash_virtual_nodes` | `160` | Sets the number of virtual nodes used by `consistent_hash` initial binding. It has no effect on the other binding strategies. |
 | `dynamic_token_capacity` | `false` | Opt into live per-rank engine block-headroom estimates. Omit static token capacity; missing or stale metrics defer new admissions. See Dynamic backend capacity below. |
@@ -286,59 +286,27 @@ For `agent_hint`, `session_id` becomes both Program ID and session ID, `task_id`
 
 ## Resume ordering and capacity
 
-### Direct DP admission (aggregated HTTP only)
+### TAO admission
 
-Merge this into the existing Program scheduling configuration, retaining its
-configured `token_capacity_per_dp_rank`:
+For aggregated HTTP serving, select `resume_order: "dp_admission_tao"` with
+`binding_strategy: "cache_aware"`, `dynamic_token_capacity: true` and
+`global_queue: true`. Omit `token_capacity_per_dp_rank` and leave `binding_only`
+disabled. See [the example configuration](../../examples/configs/program_dynamic_dp_admission.json).
 
-```json
-{"binding_strategy": "cache_aware", "resume_order": "dp_admission_tao"}
-```
-
-The old native-prefiltered `resume_order: "dp"` mode has been removed.
-`resume_solver_strategy: "dp"` still selects the DP solver inside TAO admission.
-
-- **Candidates:** all live paused Programs with waiting requests. Native
-  growth-reserve, batch-gain, low-watermark and backend-waiting-count tests do
-  not filter candidates or veto DP's selected set.
-- **Budget:** configured token capacity minus existing active occupancy, and
-  the remaining Program-count slots. Costs use the same private-token ledger
-  as committed admissions, including its existing immediate output allowance;
-  no new reserve or shared-prefix estimator is added.
-- **Decision:** within each force/priority/yield tier, DP maximizes the sum of
-  `(estimated_cached_tokens, context_tokens)` using the existing prefix tree.
-  It selects an admission set under the joint token/count constraints, then
-  commits that set under the scheduler lock without a second native admission
-  pass. Non-selected requests stay queued. When the entire set fits, admitting
-  all candidates is already optimal and no DP frontier is constructed.
-- **Placement:** `global_queue: false` restricts each Program to its bound Rank;
-  `global_queue: true` allows DP to choose across eligible Ranks in the model
-  pool. Active requests, pause/TTL and capacity repair are unchanged.
-- **Deadlines:** overdue force-resume deadlines raise priority, but never permit
-  overselling. Oversized requests continue waiting until capacity/placement
-  changes or the existing queue timeout expires.
-- **Solver limit:** `dp_state_budget` is unlimited by default. If an explicit
-  budget is exhausted, recompute from the full candidate set using BFD on raw
-  costs and emit `resume_solver_fallback`. Ordinary decisions emit
-  `dp_admission_decision` at DEBUG level.
-
-For example, with 1,200 tokens free and costs of 900, 600 and 600, the DP can
-admit the two smaller requests when their combined cache value is higher.
-It can do so even if native future-growth reserve would reject all three.
-`binding_only: true` is incompatible with this mode.
-
-### Dynamic tree-DP admission
-
-This path replaces the fixed-binding direct-DP budget described above
-when `dynamic_token_capacity=true`, `binding_strategy="cache_aware"`,
-and `resume_order="dp_admission_tao"` (`kv_dp_mode` internally).
+For each paused Program with a waiting model request, TAO estimates how many
+input tokens match the prefix on each eligible backend in the same model pool.
+Placing that request consumes its input length minus its estimated match on that
+backend. The DP maximizes total estimated cached tokens, breaking ties by total
+input tokens, subject to each backend's budget and one placement per Program.
+An active Program returning within its TTL keeps its placement if its next
+request fits. TAO uses KV headroom for admission and bypasses the native
+per-target active-Program count and growth-reserve gates.
 
 Overdue waiting requests are considered in earliest-deadline order. Each uses
 its best-value currently feasible backend without exceeding its token budget;
 an unplaceable overdue request does not block other work. The configured solver
 then selects ordinary admissions from the remaining budget. Deadline expiry is
 a scheduling priority, not a guarantee that an oversized request can be served.
-The fixed-binding TAO path applies the same deadline ordering on its bound targets.
 
 The backend's cache configuration still supplies total reference capacity C.
 The existing metrics converter supplies sampled free reference tokens F, with
@@ -356,25 +324,17 @@ guarantee. Tree prediction errors and unreserved decode growth remain. A valid
 zero-free sample still permits a zero-estimated-cost full prefix hit, as before;
 unknown capacity does not. No arbitrary safety factor is introduced.
 
-This path respects the same queue scope as other resume strategies:
-`global_queue=false` restricts each Program to its bound Rank, while
-`global_queue=true` enables joint placement across eligible backends in the
-model pool. It uses token budgets and candidate-count slots, not the configured
-per-target active-Program count guard.
-
 For this path, `/scheduling/diagnostics` reports:
 
-- `token_capacity_source`: `vllm_usage_plus_reservations_tree_dp`.
+- `token_capacity_source`: `vllm_usage_plus_reservations_tao`.
 - `effective_token_capacity`: total backend reference capacity C (unchanged).
 - `backend_available_tokens_at_observation`: F.
 - `router_reasoning_reserved_tokens`: sum(R), router reservations only.
 - `router_estimated_used_tokens`: C - F + sum(R), conservative combined charge.
 - `dynamic_admission_headroom_tokens`: max(0, F - sum(R)).
 
-The `tree_dp_admission` INFO event also records backend unavailable tokens,
+The `tao_admission` INFO event also records backend unavailable tokens,
 aggregate router reservations and the remaining budget after selection.
-TTL settings, shared-prefix observation updates, tree values/costs, quantum,
-solver/BFD and the MRU path are unchanged. Existing launch arguments work.
 
 ### Native ordering
 
@@ -494,18 +454,14 @@ reserved. The Rust conversion is:
 ```
 reference_free_tokens = floor((1 - usage) * reference_token_capacity
                               * (num_gpu_blocks - 1) / num_gpu_blocks)
-remaining_budget = max(0, reference_free_tokens - positive_charges_since_scrape)
-effective_capacity = max(0, floor(current_router_active_private_tokens
-                                  + reference_free_tokens - positive_charges_since_scrape))
 ```
 
-DP therefore gets a changing per-rank budget, rather than a user-supplied total.
-An overdraw remains visible as capacity pressure to the existing pause policy.
-Native MRU/FCFS retain their admission watermarks/reserves; TAO admission
-uses the full available budget without those native admission filters. Each successful positive occupancy adjustment immediately
-consumes the sampled budget. Logical pause/finish does **not** replenish that
-budget until a new backend scrape. A scrape begun before an admission preserves
-its intervening charge, using the existing observation-epoch fence.
+TAO subtracts outstanding request reservations from the sampled free tokens, as
+described under [TAO admission](#tao-admission). Dynamic MRU/FCFS instead track
+positive occupancy charges since the scrape and also limit headroom by active
+reasoning reservations. A logical release does not refund a charge made since
+the last scrape. A scrape begun before an admission preserves the intervening
+charge through the observation epoch.
 
 This is a **reference-token headroom estimate**, not an exact hybrid-KV token
 capacity or an OOM-prevention guarantee. The block pool responds to compression,
@@ -514,11 +470,8 @@ SWA block release, and linear-attention state allocation. However,
 reference/max-length request layout, not a universal bytes-per-token constant.
 Two sets of requests with the same total logical tokens can require different
 numbers of blocks. Prefix hits, block rounding, in-flight decode and stats
-publication latency also matter. The unchanged DP private-token cost model does
-not become a candidate-specific block allocator merely by changing its budget.
-An exact admission oracle would require querying engine allocation costs for
-specific candidate requests (or using block-cost DP); that is outside this
-capacity-only change. No new metric or backend patch is fabricated.
+publication latency also matter. The router estimates incremental KV use for a request from its predicted prefix match.
+The engine's actual allocation also depends on request layout and block reuse.
 
 ### Failure behavior and diagnostics
 
@@ -532,7 +485,7 @@ Existing queue timeout behavior remains in effect. Poll freshness measures
 HTTP observation time, not engine-side stats production time; a responding
 API that republishes stale engine stats cannot be detected by these metrics.
 
-Inspect `/scheduling/diagnostics` per rank:
+For dynamic MRU/FCFS, inspect `/scheduling/diagnostics` per rank. TAO reports its own budget fields [above](#tao-admission).
 
 - `token_capacity_source`: `vllm_block_headroom_estimate` or `backend_unavailable`.
 - `backend_reference_token_capacity`: the backend's reference conversion scale.
@@ -555,20 +508,16 @@ Engine references:
 ## Solver configuration
 
 `dp_capacity_quantum` defaults to 512: ceil option token costs and floor per-target
-capacities. Values remain unscaled. Full-set raw all-fit paths remain valid.
-`dp_state_budget` is null/unlimited by default, or a positive frontier state cap.
+capacities. Values remain unscaled.
+`dp_state_budget` defaults to 50,000 frontier states. Supply a positive integer to override it or explicit JSON `null` for an unlimited frontier.
 Exhaustion recomputes from the full candidate set with best-fit decreasing on raw
-token costs, respecting allowed target options and slots; it no longer defers
-solely for state budget. The cap applies to each solver invocation.
+token costs and eligible targets. The cap applies to each solver invocation.
 `resume_solver_strategy` is `dp` (default) or objective-ranked `greedy`. Use with
 `resume_order=dp_admission_tao`. `greedy` is a solver
 choice, not a replacement for the lifecycle scheduling policy.
 Diagnostics expose all three fields.
 `program_resume` supplements `program_admit` for activations with a recorded
 pause reason, with `pause_elapsed_seconds`; first admission is not a resume.
-
-Correction (2026-11-08): resume_solver_strategy=greedy now selects feasible session/backend pairs by the complete caller-supplied lexicographic objective, not BFD. BFD is reserved for bounded-DP state-budget exhaustion.
-
 
 ## Workflow prediction shadow profiles
 

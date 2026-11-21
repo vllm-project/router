@@ -191,13 +191,13 @@ impl ProgramScheduler {
             return;
         }
         let runtime_after = state.runtime.view(dispatch.program());
-        if self.kv_dp_mode()
+        if self.uses_tao_admission()
             && runtime_after
                 .as_ref()
                 .is_some_and(|v| v.in_flight_requests == 0)
         {
             if let Some(d) = state.decisions.get_mut(dispatch.program()) {
-                d.tree_dp_reserved_tokens = None;
+                d.tao_reserved_tokens = None;
             }
         }
         let next_output_reservation = state
@@ -741,7 +741,7 @@ impl ProgramScheduler {
     }
 
     fn repair_capacity(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {
-        if self.kv_dp_mode() {
+        if self.uses_tao_admission() {
             return false;
         }
         let target_ids = state.targets.keys().cloned().collect::<Vec<_>>();

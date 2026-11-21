@@ -78,7 +78,22 @@ pub struct ProgramBindings {
 }
 
 impl ProgramBindings {
-    pub(crate) fn prefix_match_rate(&self, model_pool: &str, text: &str, target_id: &str) -> f64 {
+    pub(crate) fn estimated_cached_tokens(
+        &self,
+        pool: &str,
+        text: &str,
+        target: &str,
+        total: usize,
+    ) -> usize {
+        let ratio = self.prefix_match_rate(pool, text, target);
+        if ratio.is_finite() {
+            ((total as f64 * ratio.clamp(0.0, 1.0)).floor() as usize).min(total)
+        } else {
+            0
+        }
+    }
+
+    fn prefix_match_rate(&self, model_pool: &str, text: &str, target_id: &str) -> f64 {
         self.policy.prefix_match_rate(model_pool, text, target_id)
     }
 
