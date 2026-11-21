@@ -20,7 +20,9 @@ import sys
 import threading
 import time
 from contextlib import asynccontextmanager
+from hashlib import sha256
 from typing import Optional
+from uuid import uuid4
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -33,27 +35,118 @@ _failures_seen = 0
 _requests_seen = 0
 
 
-def chain_hashes(tokens, block_size, medium="device", lora_name=None, parent=None):
-    """Opaque per-block engine hashes for one stored prefix.
+KV_HASH_SEED = "vllm-none-hash"
 
-    The router re-hashes ``token_ids`` itself, so these only have to be stable
-    and unique per (prefix, medium, LoRA namespace).
-    """
-    import hashlib
-    import struct
 
+def kv_store(
+    tokens, block_size, *, medium="GPU", parent=None, adapter=None, ownership=None
+):
+    """Build a vLLM incremental store with full-width, group-0 hashes."""
+    import cbor2
+
+    assert tokens and len(tokens) % block_size == 0
+    name, path = adapter or (None, None)
+    extra_keys = (("lora", name, path),) if adapter else None
     hashes = []
-    previous = parent or b""
+    previous = (
+        parent if parent is not None else sha256(cbor2.dumps(KV_HASH_SEED)).digest()
+    )
     for offset in range(0, len(tokens), block_size):
-        chunk = tokens[offset : offset + block_size]
-        previous = hashlib.sha256(
-            previous
-            + medium.encode()
-            + (lora_name or "").encode()
-            + b"".join(struct.pack("<I", token) for token in chunk)
+        previous = sha256(
+            cbor2.dumps((previous, tokens[offset : offset + block_size], extra_keys))
         ).digest()
         hashes.append(previous)
-    return hashes
+    event = dict(
+        type="BlockStored",
+        block_hashes=hashes,
+        parent_block_hash=parent,
+        token_ids=list(tokens),
+        block_size=block_size,
+        lora_id=None,
+        lora_name=name,
+        medium=medium,
+        group_idx=0,
+        kv_cache_spec_kind="full_attention",
+    )
+    if ownership is not None:
+        event["ownership"] = ownership
+    return event
+
+
+class KvEventPublisher:
+    """An XPUB live stream and a vLLM-compatible ROUTER replay endpoint."""
+
+    def __init__(self):
+        import zmq
+
+        self.context = zmq.Context()
+        self.publisher = self.context.socket(zmq.XPUB)
+        self.replay = self.context.socket(zmq.ROUTER)
+        for socket in (self.publisher, self.replay):
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.bind_to_random_port("tcp://127.0.0.1")
+        self.endpoint = self.publisher.last_endpoint.decode()
+        self.replay_endpoint = self.replay.last_endpoint.decode()
+        self.topic = f"kv/{uuid4().hex}".encode()
+        self.sequence = 0
+        self.subscribed = False
+        self.history = {}
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._replay, daemon=True)
+        self.thread.start()
+
+    def source(self):
+        return dict(
+            endpoint=self.endpoint,
+            replay_endpoint=self.replay_endpoint,
+            topic=self.topic.decode(),
+            encoding="msgpack",
+            schema_version=1,
+        )
+
+    def wait_subscribed(self, timeout=10):
+        if not self.subscribed:
+            assert self.publisher.poll(int(timeout * 1000)), (
+                "KV subscriber did not attach"
+            )
+            assert self.publisher.recv() == b"\x01" + self.topic
+            self.subscribed = True
+
+    def publish(self, events, sequence=None, *, live=True):
+        import msgpack
+
+        with self.lock:
+            if sequence == 0:
+                self.history.clear()
+            if sequence is not None:
+                self.sequence = sequence
+            seq = self.sequence.to_bytes(8, "big")
+            payload = msgpack.packb([time.time(), events, 0], use_bin_type=True)
+            self.history[self.sequence] = (seq, payload)
+            self.sequence += 1
+        if live:
+            self.publisher.send_multipart([self.topic, seq, payload])
+
+    def _replay(self):
+        while not self.stop.is_set():
+            if not self.replay.poll(50):
+                continue
+            sender, envelope, start = self.replay.recv_multipart()
+            assert envelope == b"" and len(start) == 8
+            start = int.from_bytes(start, "big")
+            with self.lock:
+                frames = [frame for seq, frame in self.history.items() if seq >= start]
+            for seq, payload in frames:
+                self.replay.send_multipart([sender, b"", self.topic, seq, payload])
+            self.replay.send_multipart([sender, b"", b"", b"\xff" * 8, b""])
+
+    def close(self):
+        self.stop.set()
+        self.thread.join()
+        self.publisher.close()
+        self.replay.close()
+        self.context.term()
 
 
 def mock_tokenize(text):
@@ -74,13 +167,18 @@ class GrpcKvWorker:
     """
 
     def __init__(
-        self, bindings, worker_id, block_size=2, model="test-model", events_enabled=True
+        self,
+        bindings,
+        worker_id,
+        block_size=2,
+        model="test-model",
+        events_enabled=True,
+        adapters=None,
     ):
         from collections import deque
         from concurrent.futures import ThreadPoolExecutor
 
         import grpc
-        import zmq
         from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
         self.control, control_grpc, self.inference, inference_grpc = bindings
@@ -88,17 +186,13 @@ class GrpcKvWorker:
         self.block_size = block_size
         self.model = model
         self.events_enabled = events_enabled
+        self.adapters = adapters or {}
         self.failures_remaining = 0
         self.captured = []
         self.condition = threading.Condition()
         self.gates = deque()
         self.all_gates = []
-        self.sequence = 0
-        self.context = zmq.Context()
-        self.publisher = self.context.socket(zmq.XPUB)
-        self.publisher.setsockopt(zmq.LINGER, 0)
-        port = self.publisher.bind_to_random_port("tcp://127.0.0.1")
-        self.endpoint = f"tcp://127.0.0.1:{port}"
+        self.events = KvEventPublisher() if events_enabled else None
         self.executor = ThreadPoolExecutor(max_workers=8)
         self.server = grpc.server(self.executor)
         control_service = control_grpc.ControlServicer()
@@ -128,20 +222,55 @@ class GrpcKvWorker:
         )
 
     def GetKvEventSources(self, request, context):
-        if not self.events_enabled:
+        if self.events is None:
             return self.control.GetKvEventSourcesResponse()
-        return self.control.GetKvEventSourcesResponse(
+        source = self.events.source()
+        response = self.control.GetKvEventSourcesResponse(
             sources=[
                 self.control.KvEventSource(
-                    transport="zmq",
-                    endpoint=self.endpoint,
-                    topic="kv",
-                    data_parallel_rank=0,
-                    encoding="msgpack",
-                    schema_version=1,
+                    transport="zmq", data_parallel_rank=0, **source
                 )
             ]
         )
+        # Adapter metadata supplements the default group-0 discovery contract.
+        if self.adapters:
+            response.kv_routing_capabilities = json.dumps(
+                {
+                    "schema_version": 1,
+                    "adapters": [
+                        {"name": name, "path": path}
+                        for name, path in self.adapters.items()
+                    ],
+                    "ranks": [
+                        {
+                            "rank": 0,
+                            "declared_groups": 1,
+                            "model": self.model,
+                            "weight_version": "test",
+                            "publisher_topic": source["topic"],
+                            "instance_topic": True,
+                            "hash_algorithm": "sha256_cbor",
+                            "hash_seed": KV_HASH_SEED,
+                            "full_hashes": True,
+                            "hash_block_size": self.block_size,
+                            "hash_lookahead_tokens": 0,
+                            "speculative_tokens": 0,
+                            "prefix_caching": True,
+                            "groups": [
+                                {
+                                    "group_idx": 0,
+                                    "kind": "full_attention",
+                                    "spec_type": "FullAttentionSpec",
+                                    "block_size": self.block_size,
+                                    "prefix_cacheable": True,
+                                    "prefix_replay_tokens": 0,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ).encode()
+        return response
 
     def Abort(self, request, context):
         return self.control.AbortResponse()
@@ -241,49 +370,22 @@ class GrpcKvWorker:
 
     def wait_subscribed(self, timeout=10):
         """XPUB handshake prevents losing the initial event (not an apply ack)."""
-        assert self.publisher.poll(int(timeout * 1000)), "KV subscriber did not attach"
-        assert self.publisher.recv() == b"\x01kv"
+        self.events.wait_subscribed(timeout)
 
-    def store(
-        self, tokens, medium="device", parent=None, lora_name=None, ownership=None
-    ):
-        """Build engine events from actual token_ids captured over gRPC.
-
-        Sequence hashes are opaque engine identifiers. Include the medium/LoRA
-        namespace so unrelated chains never accidentally reuse an anchor.
-        """
-        assert len(tokens) % self.block_size == 0
-        return dict(
-            type="BlockStored",
-            block_hashes=chain_hashes(
-                tokens,
-                self.block_size,
-                medium=medium,
-                lora_name=lora_name,
-                parent=parent,
-            ),
-            parent_block_hash=parent,
-            token_ids=list(tokens),
-            block_size=self.block_size,
-            lora_id=None,
-            lora_name=lora_name,
+    def store(self, tokens, medium="GPU", parent=None, lora_name=None, ownership=None):
+        """Build engine events from actual token IDs captured over gRPC."""
+        adapter = (lora_name, self.adapters[lora_name]) if lora_name else None
+        return kv_store(
+            tokens,
+            self.block_size,
             medium=medium,
+            parent=parent,
+            adapter=adapter,
             ownership=ownership,
         )
 
-    def publish(self, events, sequence=None):
-        import msgpack
-
-        if sequence is not None:
-            self.sequence = sequence
-        self.publisher.send_multipart(
-            [
-                b"kv",
-                self.sequence.to_bytes(8, "big"),
-                msgpack.packb([time.time(), events, 0], use_bin_type=True),
-            ]
-        )
-        self.sequence += 1
+    def publish(self, events, sequence=None, *, live=True):
+        self.events.publish(events, sequence, live=live)
 
     def close(self):
         for gate in self.all_gates:
@@ -291,8 +393,8 @@ class GrpcKvWorker:
             gate.finish.set()
         self.server.stop(0).wait(timeout=5)
         self.executor.shutdown(wait=True)
-        self.publisher.close()
-        self.context.term()
+        if self.events is not None:
+            self.events.close()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -328,37 +430,20 @@ def _extract_worker_id(args: argparse.Namespace) -> str:
 
 
 def create_app(args: argparse.Namespace) -> FastAPI:
-    app = FastAPI()
+    kv_events = KvEventPublisher() if args.kv_block_size > 0 else None
+
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            if kv_events is not None:
+                kv_events.close()
+
+    app = FastAPI(lifespan=lifespan)
     worker_id = _extract_worker_id(args)
     start_ts = time.time()
     crashed = {"done": False}
-
-    kv_events = {
-        "socket": None,
-        "endpoint": None,
-        "sequence": 0,
-        "subscribed": False,
-        "published": 0,
-        # Topic the router subscribed with; frames are published under it.
-        "topic": b"kv",
-    }
-    if args.kv_block_size > 0:
-        import zmq
-
-        context = zmq.Context()
-        socket = context.socket(zmq.XPUB)
-        socket.setsockopt(zmq.LINGER, 0)
-        port = socket.bind_to_random_port("tcp://127.0.0.1")
-        kv_events.update(
-            socket=socket, context=context, endpoint=f"tcp://127.0.0.1:{port}"
-        )
-
-    def _drain_subscription(timeout_ms: int = 10_000) -> bytes:
-        """Wait for the XPUB subscription frame, off the server's event loop."""
-        socket = kv_events["socket"]
-        if socket is None or not socket.poll(timeout_ms):
-            return b""
-        return socket.recv()
 
     async def maybe_delay():
         if args.latency_ms > 0:
@@ -448,22 +533,19 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         if args.kv_block_size > 0:
             payload["kv_block_size"] = args.kv_block_size
             payload["model_id"] = args.kv_model
+            payload["instance_id"] = worker_id
         return JSONResponse(payload)
 
     @app.get("/kv_event_sources")
     async def kv_event_sources():
-        if kv_events["socket"] is None:
+        if kv_events is None:
             return JSONResponse({}, status_code=404)
         return JSONResponse(
             {
                 "0": {
                     "publisher": "zmq",
-                    "endpoint": kv_events["endpoint"],
-                    # Same wire contract as Control.GetKvEventSources: without an
-                    # explicit topic the router subscribes to "" and drops the
-                    # "kv"-prefixed frames this worker publishes.
-                    "topic": kv_events["topic"].decode("utf-8", "replace"),
                     "enable_kv_cache_events": True,
+                    **kv_events.source(),
                 }
             }
         )
@@ -476,76 +558,34 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
     @app.post("/kv_wait_subscribed")
     async def kv_wait_subscribed():
-        """Block until the router's KV subscriber attaches (XPUB handshake).
-
-        The subscription frame carries the topic the router subscribed with
-        (``\\x01<topic>``). XPUB filters outbound frames by that prefix, so the
-        topic is recorded here and used for every published batch: a hardcoded
-        ``kv`` prefix is silently dropped when the subscriber asked for another
-        topic (or for the empty one).
-        """
-        if kv_events["socket"] is None:
+        """Wait for the Router's XPUB handshake off the event loop."""
+        if kv_events is None:
             raise HTTPException(status_code=400, detail="KV events are disabled")
-        if not kv_events["subscribed"]:
-            # The poll blocks, so it runs off the event loop: holding it here
-            # would stall /health and /tokenize for up to the timeout.
-            frame = await asyncio.to_thread(_drain_subscription)
-            if not frame:
-                raise HTTPException(status_code=504, detail="KV subscriber absent")
-            if frame[:1] == b"\x01":
-                kv_events["topic"] = frame[1:]
-            kv_events["subscribed"] = True
-        return JSONResponse(
-            {"subscribed": True, "topic": kv_events["topic"].decode("utf-8", "replace")}
-        )
+        try:
+            await asyncio.to_thread(kv_events.wait_subscribed)
+        except AssertionError as error:
+            raise HTTPException(status_code=504, detail=str(error)) from error
+        return JSONResponse({"subscribed": True, "topic": kv_events.topic.decode()})
 
     @app.get("/kv_status")
     async def kv_status():
         """How many batches this worker published and whether a peer is attached."""
         return JSONResponse(
             {
-                "subscribed": bool(kv_events["subscribed"]),
-                "published": int(kv_events["published"]),
-                "topic": kv_events["topic"].decode("utf-8", "replace"),
+                "subscribed": bool(kv_events and kv_events.subscribed),
+                "published": kv_events.sequence if kv_events else 0,
+                "topic": kv_events.topic.decode() if kv_events else "",
             }
         )
 
     @app.post("/kv_store")
-    async def kv_store(request: Request):
+    async def publish_kv_store(request: Request):
         """Publish a BlockStored batch for tokens this worker has cached."""
-        if kv_events["socket"] is None:
+        if kv_events is None:
             raise HTTPException(status_code=400, detail="KV events are disabled")
-        import msgpack
-
         body = await request.json()
         tokens = [int(token) for token in body["token_ids"]]
-        event = dict(
-            type="BlockStored",
-            block_hashes=chain_hashes(tokens, args.kv_block_size),
-            parent_block_hash=None,
-            token_ids=tokens,
-            block_size=args.kv_block_size,
-            lora_id=None,
-            lora_name=None,
-            medium="device",
-        )
-        payload = [
-            kv_events["topic"],
-            kv_events["sequence"].to_bytes(8, "big"),
-            msgpack.packb([time.time(), [event], 0], use_bin_type=True),
-        ]
-        # PUB drops frames with no subscriber. The subscribe acknowledgement is
-        # awaited by /kv_wait_subscribed; here the drain is non-blocking so a
-        # late subscriber can never hold the event loop.
-        if not kv_events["subscribed"] and kv_events["socket"].poll(0):
-            frame = kv_events["socket"].recv()
-            if frame[:1] == b"\x01":
-                kv_events["topic"] = frame[1:]
-                payload[0] = kv_events["topic"]
-            kv_events["subscribed"] = True
-        kv_events["sequence"] += 1
-        kv_events["socket"].send_multipart(payload)
-        kv_events["published"] += 1
+        kv_events.publish([kv_store(tokens, args.kv_block_size)])
         return JSONResponse({"published": 1})
 
     @app.get("/get_load")

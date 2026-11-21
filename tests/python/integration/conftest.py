@@ -114,7 +114,7 @@ def mock_workers():
 
 @pytest.fixture(scope="session")
 def kv_st_runtime(tmp_path_factory):
-    """Generate Python wire bindings from the exact crate used by the binary.
+    """Generate Python wire bindings from the crate locked by the binary.
 
     Requires `cargo build --bin vllm-router` and `pip install -e '.[dev]'`.
     Missing prerequisites fail explicitly, including in CI; no silent skips or
@@ -171,14 +171,26 @@ def kv_st_runtime(tmp_path_factory):
         "Build the router first: cargo build --bin vllm-router"
     )
     output = tmp_path_factory.mktemp("kv-proto")
+    # Mirror the additive response in src/backend/control.rs. The locked
+    # vllm-proto crate does not yet declare its native layout payload.
+    control = (proto_dir / "control.proto").read_text()
+    stock_response = "repeated KvEventSource sources = 1;"
+    assert control.count(stock_response) == 1
+    (output / "control.proto").write_text(
+        control.replace(
+            stock_response,
+            stock_response + " optional bytes kv_routing_capabilities = 2;",
+        )
+    )
     result = protoc.main(
         [
             "grpc_tools.protoc",
+            f"-I{output}",
             f"-I{proto_dir}",
             f"-I{Path(grpc_tools.__file__).parent / '_proto'}",
             f"--python_out={output}",
             f"--grpc_python_out={output}",
-            str(proto_dir / "control.proto"),
+            str(output / "control.proto"),
             str(proto_dir / "inference.proto"),
         ]
     )
