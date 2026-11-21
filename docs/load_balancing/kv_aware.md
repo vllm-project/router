@@ -140,11 +140,11 @@ Use the [HTTP](#http-workers) or [gRPC](#grpc-workers) worker command with the c
 
 | Model | Available recipes |
 | --- | --- |
-| [Qwen3.5-4B](#qwen35-4b) | Base, [Ascend MTP](#qwen35-4b-with-mtp-on-ascend) |
-| [Qwen3.6-27B](#qwen36-27b) | Base |
+| [Qwen3.5-4B](#qwen35-4b) | Base, [Ascend modes](#qwen35-4b-with-mtp-on-ascend) |
+| [Qwen3.6-27B](#qwen36-27b) | Base, [Ascend modes](#qwen36-27b-w8a8-on-ascend) |
 | [Qwen3.8-27B](#qwen38-27b) | Base, [MTP](#qwen38-27b-with-mtp), [DSpark](#qwen38-27b-with-dspark), [Ascend variants](#ascend-models) |
-| [Qwen4Exp FP8 QSA](#qwen4exp-fp8-qsa) | Base |
-| [DeepSeek V4 Flash](#deepseek-v4-flash) | [Base](#deepseek-v4-flash), [DSpark](#deepseek-v4-flash-with-dspark) |
+| [Qwen4Exp](#qwen4exp-fp8-qsa) | GPU FP8, [Ascend W4A8](#qwen4exp-w4a8-on-ascend) |
+| [DeepSeek V4 Flash](#deepseek-v4-flash) | Base, [GPU DSpark](#deepseek-v4-flash-with-dspark), [Ascend 0731 W8A8](#deepseek-v4-flash-0731-w8a8-on-ascend) |
 | [DeepSeek V4 Pro](#deepseek-v4-pro) | Base |
 | [DeepSeek V4.1 Flash](#deepseek-v41-flash) | Bounded replay |
 
@@ -649,19 +649,53 @@ Use the V4.1 Flash 1017 checkpoint. Bounded replay rebuilds the last 128 tokens 
 
 ### Ascend models
 
-These recipes use an Ascend build with the zero-lookahead cache lookup rule. Set `PYTHONHASHSEED=0` for these files and apply the Ascend checkpoint's launch options. Confirm group order and block size on the running worker. For Ascend Mooncake P/D, these layouts describe the Prefill worker. Use a separately verified layout for cache-aware Decode.
+Use the [vLLM Ascend 0.32.0rc1 image](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.32.0rc1) with its bundled vLLM 0.32.0 on Atlas 800I A2 (Ascend 910B, 64 GiB per NPU). The layouts below are from HTTP deployments. Use the same checkpoint and engine settings, then check the running worker's cache groups before reusing a layout.
+
+#### Start an A2 worker
+
+In the Ascend container, use the following worker command. The example starts Qwen3.5-4B with MTP on one NPU. For another model, replace the model path, served name, and option assignments in this command with the settings from its recipe below. For colocated serving, run the Router on the same host with the corresponding `layout.json`.
+
+```bash
+MODEL=/models/Qwen3.5-4B
+SERVED_MODEL=qwen35-a2
+MAX_LEN=10240 BATCH_TOKENS=4096 MEM_FRACTION=0.80
+export ASCEND_RT_VISIBLE_DEVICES=0
+export PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0
+KV_TOPIC=$(python3 -c 'from uuid import uuid4; print(uuid4().hex)')
+EVENTS=$(printf '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","topic":"%s"}' "$KV_TOPIC")
+MODEL_OPTIONS=(--speculative-config '{"method":"mtp","num_speculative_tokens":3}')
+
+vllm serve "$MODEL" --host 127.0.0.1 --port 8000 --served-model-name "$SERVED_MODEL" \
+  --max-model-len "$MAX_LEN" --max-num-batched-tokens "$BATCH_TOKENS" --max-num-seqs 4 \
+  --gpu-memory-utilization "$MEM_FRACTION" --enforce-eager --skip-mm-profiling \
+  --enable-scale-out --enable-prefix-caching --enable-prompt-tokens-details \
+  --prefix-caching-hash-algo sha256_cbor --kv-events-config "$EVENTS" "${MODEL_OPTIONS[@]}"
+```
+
+```bash
+vllm-router --host 127.0.0.1 --port 19000 --prometheus-port 29000 \
+  --policy kv_aware --worker-urls http://127.0.0.1:8000 --kv-hybrid-layout layout.json
+```
+
+The layouts use `hash_seed: "0"` to match the worker. Keep `sha256_cbor`, full-width hashes, and incremental reporting enabled. The examples rely on HTTP event discovery. For fixed endpoints without discovery, include the live and replay addresses in the layout and put the worker's served model and the generated topic in its rank record. Choose distinct HTTP, live and replay ports for each worker on the same host.
+
+Select one method in `--speculative-config` per worker. To turn speculation off, omit the option and use the layout for that mode. The measured A2 recipes below publish zero hash lookahead. Set `speculative_tokens` to the configured draft length and `hash_lookahead_tokens` to the number of lookahead tokens actually used by the hash. Use an empty `tail_drop_groups` array only when the engine's cache lookup skips the last-unit drop.
+
+| Checkpoint | Colocated modes below | NPU count | Prompt tokens for a reuse check |
+| --- | --- | ---: | ---: |
+| Qwen3.5-4B | [Off or MTP](#qwen35-4b-with-mtp-on-ascend), [DSpark](#qwen35-4b-with-dspark-on-ascend) | 1 | 1,927 |
+| Qwen3.6-27B W8A8 | [Off, MTP or DSpark](#qwen36-27b-w8a8-on-ascend) | 1 | 2,695 |
+| Qwen3.8-27B W8A8 | [Off or MTP](#qwen38-27b-with-mtp-on-ascend) | 1 | 2,695 |
+| Qwen3.8-27B BF16 | [DSpark](#qwen38-27b-with-dspark-on-ascend) | 2 | 2,695 |
+| Qwen3.8-Flash-Next W4A8 (Qwen4Exp) | [Off or MTP](#qwen4exp-w4a8-on-ascend) | 2 | 4,999 |
+| DeepSeek V4 Flash 0731 W8A8 | [Off or DSpark](#deepseek-v4-flash-0731-w8a8-on-ascend) | 8 | 16,401 |
 
 #### Qwen3.5-4B with MTP on Ascend
 
-Use the 640-token cache layout on vLLM 0.32 with the matching Ascend build.
-
-```bash
---max-model-len 4096 \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
-```
+Use the worker command above. The four cache groups are the same with speculation off. To serve without speculation, set `MODEL_OPTIONS=()` and `"speculative_tokens": 0` in the layout.
 
 <details>
-<summary>Ascend Qwen3.5 MTP layout.json</summary>
+<summary>A2 Qwen3.5-4B MTP layout.json</summary>
 
 ```json
 {
@@ -673,13 +707,14 @@ Use the 640-token cache layout on vLLM 0.32 with the matching Ascend build.
         "weight_version": "default",
         "instance_topic": true,
         "hash_algorithm": "sha256_cbor",
-        "hash_seed": "0",
         "full_hashes": true,
+        "hash_seed": "0",
         "hash_block_size": 640,
         "hash_lookahead_tokens": 0,
         "speculative_tokens": 3,
-        "prefix_caching": true,
         "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
         "declared_groups": 4,
         "groups": [
           {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 640, "prefix_cacheable": true, "prefix_replay_tokens": 0},
@@ -695,17 +730,17 @@ Use the 640-token cache layout on vLLM 0.32 with the matching Ascend build.
 
 </details>
 
-#### Qwen3.8-27B with MTP on Ascend
+#### Qwen3.5-4B with DSpark on Ascend
 
-Use the W8A8 checkpoint with `--quantization ascend` and the 896-token cache layout on vLLM 0.32 with the matching Ascend build.
+Use the same target checkpoint and a compatible Ascend DSpark draft for Qwen3.5-4B at `/models/Qwen3.5-4B-DSpark`. The draft adds cache groups. Use the eight-group layout for this mode.
 
 ```bash
---max-model-len 4096 \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+MAX_LEN=4096
+MODEL_OPTIONS=(--speculative-config '{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.5-4B-DSpark"}')
 ```
 
 <details>
-<summary>Ascend Qwen3.8 MTP layout.json</summary>
+<summary>A2 Qwen3.5-4B DSpark layout.json</summary>
 
 ```json
 {
@@ -717,13 +752,110 @@ Use the W8A8 checkpoint with `--quantization ascend` and the 896-token cache lay
         "weight_version": "default",
         "instance_topic": true,
         "hash_algorithm": "sha256_cbor",
-        "hash_seed": "0",
         "full_hashes": true,
+        "hash_seed": "0",
+        "hash_block_size": 640,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 8,
+        "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
+        "declared_groups": 8,
+        "groups": [
+          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 640, "prefix_cacheable": true, "prefix_replay_tokens": 0},
+          {"group_idx": 1, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 640, "prefix_cacheable": true, "prefix_replay_tokens": 0},
+          {"group_idx": 2, "kind": "sliding_window", "spec_type": "SlidingWindowSpec", "block_size": 640, "prefix_cacheable": true, "prefix_replay_tokens": 0, "sliding_window": 2048},
+          {"group_idx": 3, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 640, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 640},
+          {"group_idx": 4, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 640, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 640},
+          {"group_idx": 5, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 640, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 640},
+          {"group_idx": 6, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 640, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 640},
+          {"group_idx": 7, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 640, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 640}
+        ]
+      }
+    ]
+  }
+}
+```
+
+</details>
+
+#### Qwen3.6-27B W8A8 on Ascend
+
+Use [Eco-Tech/Qwen3.6-27B-w8a8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.6-27B-w8a8) and `--quantization ascend`. The measured runs used the same four cache groups in all three modes. Set `MODEL_OPTIONS` and `speculative_tokens` together.
+
+| Mode | Worker options | `MAX_LEN` | `speculative_tokens` |
+| --- | --- | ---: | ---: |
+| Off | `--quantization ascend` | 10240 | 0 |
+| MTP | `--quantization ascend --speculative-config '{"method":"mtp","num_speculative_tokens":3}'` | 10240 | 3 |
+| DSpark | `--quantization ascend --speculative-config '{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.6-27B-DSpark"}'` | 4096 | 8 |
+
+<details>
+<summary>A2 Qwen3.6-27B W8A8 MTP layout.json</summary>
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "full_hashes": true,
+        "hash_seed": "0",
         "hash_block_size": 896,
         "hash_lookahead_tokens": 0,
         "speculative_tokens": 3,
-        "prefix_caching": true,
         "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
+        "declared_groups": 4,
+        "groups": [
+          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0},
+          {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896},
+          {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896},
+          {"group_idx": 3, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896}
+        ]
+      }
+    ]
+  }
+}
+```
+
+</details>
+
+#### Qwen3.8-27B with MTP on Ascend
+
+Use the W8A8 checkpoint on one NPU with the defaults in the worker command.
+
+```bash
+MODEL_OPTIONS=(--quantization ascend --speculative-config '{"method":"mtp","num_speculative_tokens":3}')
+```
+
+For speculation off, keep `--quantization ascend` and set `"speculative_tokens": 0` in the layout.
+
+<details>
+<summary>A2 Qwen3.8-27B W8A8 MTP layout.json</summary>
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "full_hashes": true,
+        "hash_seed": "0",
+        "hash_block_size": 896,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 3,
+        "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
         "declared_groups": 4,
         "groups": [
           {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0},
@@ -741,15 +873,17 @@ Use the W8A8 checkpoint with `--quantization ascend` and the 896-token cache lay
 
 #### Qwen3.8-27B with DSpark on Ascend
 
-Use the BF16 checkpoint, the Qwen3.8 DSpark draft, and the 896-token cache layout on vLLM 0.34 with the matching Ascend build. The example uses TP2.
+Use the BF16 target with a matching Qwen3.8-27B DSpark draft. In the worker command, set `MODEL` to the BF16 checkpoint and expose two NPUs. This configuration was exercised with the same 0.32.0rc1 image.
 
 ```bash
---max-model-len 4096 --tensor-parallel-size 2 \
-  --speculative-config '{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.8-27B-speculator.dspark"}'
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+MAX_LEN=4096
+MODEL_OPTIONS=(--tensor-parallel-size 2 \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.8-27B-speculator.dspark"}')
 ```
 
 <details>
-<summary>Ascend Qwen3.8 DSpark layout.json</summary>
+<summary>A2 Qwen3.8-27B BF16 DSpark layout.json</summary>
 
 ```json
 {
@@ -761,13 +895,14 @@ Use the BF16 checkpoint, the Qwen3.8 DSpark draft, and the 896-token cache layou
         "weight_version": "default",
         "instance_topic": true,
         "hash_algorithm": "sha256_cbor",
-        "hash_seed": "0",
         "full_hashes": true,
+        "hash_seed": "0",
         "hash_block_size": 896,
         "hash_lookahead_tokens": 0,
         "speculative_tokens": 8,
-        "prefix_caching": true,
         "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
         "declared_groups": 15,
         "groups": [
           {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0},
@@ -794,7 +929,117 @@ Use the BF16 checkpoint, the Qwen3.8 DSpark draft, and the 896-token cache layou
 
 </details>
 
-For zero-lookahead speculation, `tail_drop_groups` lists the cache groups that actually drop their last reusable unit. An empty array means the worker skips that drop. Use the lookup rule for each role. The predictor's draft length and the number of tokens hashed past a block are separate fields.
+#### Qwen4Exp W4A8 on Ascend
+
+Use [Eco-Tech/Qwen3.8-Flash-Next-w4a8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.8-Flash-Next-w4a8) with the V2 model runner. Give the Ascend container 128 GiB of shared memory. The colocated test used TP2 and host offload for Engram.
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1 VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ASCEND_PLE_BACKEND=torch
+MEM_FRACTION=0.93
+MODEL_OPTIONS=(--quantization ascend --tensor-parallel-size 2 --trust-remote-code \
+  --enable-expert-parallel --mamba-cache-mode align \
+  --engram-config '{"cpu_offload":true,"dp_shared_memory":false}' \
+  --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3}')
+```
+
+With MTP off, omit `--speculative-config`, set `speculative_tokens` to 0, set group 0's size to 4, remove group 6, and set `declared_groups` to 6. A2 validation covers the native MTP draft. See the [Ascend model support matrix](https://github.com/vllm-project/vllm-ascend/blob/main/docs/source/user_guide/support_matrix/supported_models.md) for available speculative modes.
+
+<details>
+<summary>A2 Qwen4Exp W4A8 colocated MTP layout.json</summary>
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "full_hashes": true,
+        "hash_seed": "0",
+        "hash_block_size": 1664,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 3,
+        "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
+        "declared_groups": 7,
+        "groups": [
+          {"group_idx": 0, "spec_type": "CircularBufferSpec", "block_size": 8, "tokens_per_state": "1", "prefix_cacheable": false, "prefix_replay_tokens": 0, "kind": "scratch"},
+          {"group_idx": 1, "spec_type": "FullAttentionSpec", "block_size": 1664, "tokens_per_state": "1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "full_attention"},
+          {"group_idx": 2, "spec_type": "MambaSpec", "block_size": 1664, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"},
+          {"group_idx": 3, "spec_type": "MambaSpec", "block_size": 1664, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"},
+          {"group_idx": 4, "spec_type": "MambaSpec", "block_size": 1664, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"},
+          {"group_idx": 5, "spec_type": "MambaSpec", "block_size": 1664, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"},
+          {"group_idx": 6, "spec_type": "MambaSpec", "block_size": 1664, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+</details>
+
+#### DeepSeek V4 Flash 0731 W8A8 on Ascend
+
+Use the full W8A8 checkpoint in the [Ascend deployment guide](https://github.com/vllm-project/vllm-ascend/blob/main/docs/source/tutorials/models/DeepSeek-V4-Flash.md#31-model-weight). The colocated configuration uses one 8-NPU node. Initialize the container's Ascend toolkit and set `HCCL_IF_IP`, `HCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`, and `TP_SOCKET_IFNAME` for the node's communication interface.
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export HCCL_OP_EXPANSION_MODE=AIV OMP_NUM_THREADS=8 VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+export VLLM_PREFIX_CACHE_RETENTION_INTERVAL=16384
+MAX_LEN=65536 BATCH_TOKENS=8192 MEM_FRACTION=0.90
+MODEL_OPTIONS=(--quantization ascend --tensor-parallel-size 8 --enable-expert-parallel \
+  --tokenizer-mode deepseek_v4 --block-size 128 --attention_config.indexer_kv_dtype int8 \
+  --no-disable-hybrid-kv-cache-manager --prefix-cache-retention-interval 16384 \
+  --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":16}' \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":7,"enforce_eager":true}')
+```
+
+The measured layout applies with DSpark off by omitting `--speculative-config` and setting `"speculative_tokens": 0`. In both modes, a repeated 16,401-token prompt reused 16,384 tokens. Classic MTP uses the separate W8A8 MTP checkpoint and needs its own measured layout.
+
+<details>
+<summary>A2 DeepSeek V4 Flash 0731 W8A8 DSpark layout.json</summary>
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "full_hashes": true,
+        "hash_seed": "0",
+        "hash_block_size": 8,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 7,
+        "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
+        "declared_groups": 6,
+        "groups": [
+          {"group_idx": 0, "spec_type": "MLAAttentionSpec", "block_size": 512, "tokens_per_state": "4", "cache_role": "sparse", "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "mla_attention"},
+          {"group_idx": 1, "spec_type": "MLAAttentionSpec", "block_size": 16384, "tokens_per_state": "128", "cache_role": "sparse", "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "mla_attention"},
+          {"group_idx": 2, "spec_type": "SlidingWindowMLASpec", "block_size": 128, "tokens_per_state": "1", "sliding_window": 128, "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "sliding_window_mla"},
+          {"group_idx": 3, "spec_type": "SlidingWindowMLASpec", "block_size": 128, "tokens_per_state": "1", "sliding_window": 128, "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "sliding_window_mla"},
+          {"group_idx": 4, "spec_type": "SlidingWindowMLASpec", "block_size": 8, "tokens_per_state": "1", "sliding_window": 8, "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "sliding_window_mla"},
+          {"group_idx": 5, "spec_type": "SlidingWindowMLASpec", "block_size": 32, "tokens_per_state": "1", "sliding_window": 128, "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "sliding_window_mla"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+</details>
+
+The [Ascend V4.1 Flash guide](https://github.com/vllm-project/vllm-ascend/blob/main/docs/source/tutorials/models/DeepSeek-V4.1-Flash.md#55-multi-node-colocated-deployment) uses two A2 nodes for the full-weight colocated DSpark example. Use that model's own runtime layout. The Flash 0731 layout above applies to V4 Flash.
 
 ## P/D routing
 
@@ -819,16 +1064,32 @@ With HTTP workers, use explicit prompt token IDs to get Decode cache credit. Wit
 
 #### Ascend Mooncake
 
-For HTTP P/D, replace the NIXL worker settings with these Mooncake options. Use different `kv_port` values on one host and set both stages' DP and TP sizes to match the deployment. The Qwen3.8 Ascend DSpark example uses `tp_size: 2` on both stages.
+On A2, the vLLM Ascend Mooncake connector transfers KV from Prefill to Decode. The Router's `kv_aware` policy scores reuse for Prefill selection, and `--kv-connector mooncake` selects the P/D handoff. Run the two workers on separate NPUs. Each worker used DP1. Configure MTP or DSpark through the worker's `--speculative-config`. The results below verify each connector and speculation mode together.
+
+| Checkpoint | Ascend connector | Tested speculation modes | TP per worker |
+| --- | --- | --- | ---: |
+| Qwen3-4B (full attention) | `MooncakeConnectorV1` | Off | 1 |
+| Qwen3.5-4B and Qwen3.6-27B W8A8 | `MooncakeConnectorV1` | Off, MTP, DSpark | 1 |
+| Qwen3.8-27B W8A8 | `MooncakeConnectorV1` | Off, MTP | 1 |
+| Qwen3.8-27B BF16 | `MooncakeConnectorV1` | DSpark | 2 |
+| Qwen3.8-Flash-Next W4A8 | `MooncakeConnectorV2` | Off, MTP | 2 |
+
+Add the matching transfer option to each worker command. The example uses V1 with TP1. Give each worker its own `engine_id` and `kv_port`. Set both `tp_size` values to match the selected worker configuration.
 
 ```bash
 # Prefill
---kv-transfer-config '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_producer","kv_buffer_device":"npu","kv_port":38352,"kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":1},"decode":{"dp_size":1,"tp_size":1}}}'
+--kv-transfer-config '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_producer","kv_buffer_device":"npu","engine_id":"prefill-a2","kv_port":38352,"kv_load_failure_policy":"fail","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":1},"decode":{"dp_size":1,"tp_size":1}}}'
 # Decode
---kv-transfer-config '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_consumer","kv_buffer_device":"npu","kv_port":38353,"kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":1},"decode":{"dp_size":1,"tp_size":1}}}'
+--kv-transfer-config '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_consumer","kv_buffer_device":"npu","engine_id":"decode-a2","kv_port":38353,"kv_load_failure_policy":"fail","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":1},"decode":{"dp_size":1,"tp_size":1}}}'
 ```
 
-Use `--kv-connector mooncake` in the Router command. For the Ascend recipes above, use `--decode-policy round_robin` and include only the Prefill layout. The optional bootstrap port can be omitted when Prefill returns the transfer parameters.
+For W4A8 Qwen4Exp with V2, add `--mamba-ssm-cache-dtype bfloat16` on both workers. In the Prefill layout, the measured `hash_block_size` and the full attention and Mamba group sizes are 896. The scratch group keeps its mode-specific size from the [colocated recipe](#qwen4exp-w4a8-on-ascend).
+
+Add `compatible_decode_urls` to each Prefill entry as shown in [P/D layout](#pd-layout). Use `--prefill-policy kv_aware --decode-policy round_robin --kv-connector mooncake` in the Router and supply the Prefill layout. The optional bootstrap port can be omitted when Prefill returns the transfer parameters.
+
+For DeepSeek V4, follow the Ascend P/D recipe for your checkpoint and engine version. The A2 1P1D test used `MooncakeHybridConnector` with the four-layer V4 Flash mini4 checkpoint and speculation off. The full W8A8 DSpark checkpoint was verified in colocated mode.
+
+Verify Decode reads using per-request Mooncake completion logs. With `MooncakeHybridConnector`, some Qwen3.5 and Qwen3.8 requests failed during Mamba block pairing before Decode could read the KV, even when the API returned HTTP 200. Use the tested connectors in the table for those Qwen configurations.
 
 ### P/D layout
 
@@ -913,7 +1174,7 @@ Pass the file once by appending `--kv-hybrid-layout layout.json` to the Router c
 
 ## Check cache reuse
 
-In an idle pool, send the same prompt twice. The first request fills the cache. The second should increase the Router's KV-aware hit counter. Set `SERVED_MODEL` to the worker's served name. For the hybrid recipes above, start with `PROMPT_TOKENS=2001`.
+In an idle pool, send the same prompt twice. The first request fills the cache. The second should increase the Router's KV-aware hit counter. Set `SERVED_MODEL` to the worker's served name. For the GPU hybrid recipes above, start with `PROMPT_TOKENS=2001`. For Ascend, use the prompt length in the [A2 recipe table](#start-an-a2-worker).
 
 ```bash
 SERVED_MODEL=qwen3 PROMPT_TOKENS=129
@@ -936,6 +1197,8 @@ Repeat the last request if events are still arriving. To confirm actual reuse, c
 ```bash
 curl -fsS http://127.0.0.1:8000/metrics | grep '^vllm:prefix_cache_hits_total'
 ```
+
+For Ascend HTTP, `--enable-prompt-tokens-details` exposes the worker's cached-token count. To display it in the check above, replace `>/dev/null` with `| jq '.usage.prompt_tokens_details.cached_tokens'`. Once events have arrived, the repeated prompt should report positive cached tokens and increase the Router hit counter. For P/D, check the Prefill response for local reuse and the Decode connector log for remote reads. With MTP or DSpark enabled, verify that `vllm:spec_decode_num_draft_tokens_total` increases on the worker generating tokens.
 
 To confirm NIXL transfer, send a fresh prompt and compare `vllm:nixl_bytes_transferred_sum` on Decode's metrics port before and after the request.
 
