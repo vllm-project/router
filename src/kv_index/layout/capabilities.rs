@@ -1,5 +1,5 @@
 //! Verified engine declarations, independent of worker discovery and storage.
-use super::{common_block_alignment, AlignedTailDrop, CacheGroup, GroupRule};
+use super::{common_block_alignment, AlignedTailDrop, CacheGroup, DenseLookup, GroupRule};
 use crate::kv_index::request_hash::{BlockKeyGenerator, SequenceHash};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -56,6 +56,10 @@ pub struct RankCapability {
     /// membership and may differ from this list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail_drop_groups: Option<Vec<u32>>,
+    /// Ordered runtime lookup batches for fine-grained speculation with
+    /// multiple dense groups. Groups in one batch must match the same hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dense_lookup_groups: Option<Vec<Vec<u32>>>,
     pub prefix_caching: bool,
     pub groups: Vec<GroupCapability>,
 }
@@ -82,6 +86,7 @@ impl RankCapability {
             && self.speculative_tokens == 0
             && !self.partial_hash_hits
             && self.tail_drop_groups.as_ref().is_none_or(Vec::is_empty)
+            && self.dense_lookup_groups.is_none()
             && matches!(
                 self.groups.as_slice(),
                 [group] if self.hash_block_size == Some(group.block_size)
@@ -142,6 +147,7 @@ pub(crate) struct VerifiedLayout {
     pub(crate) hash_lookahead_tokens: u32,
     pub(crate) tail_drop_group: Option<u32>,
     pub(in crate::kv_index) aligned_tail_drop: Option<AlignedTailDrop>,
+    pub(in crate::kv_index) dense_lookups: Vec<DenseLookup>,
     pub(crate) root: SequenceHash,
     pub(crate) replay_tokens: u32,
     pub(crate) adapters: Vec<(String, String)>,
@@ -378,7 +384,20 @@ impl CacheCapabilities {
                 })
             })
             .collect();
-        let (tail_drop_group, aligned_tail_drop) = if tail_groups.is_empty() {
+        let dense_lookups = if let Some(lookups) = &rank.dense_lookup_groups {
+            verify_dense_lookups(
+                &groups,
+                lookups,
+                &tail_groups,
+                rank.partial_hash_hits,
+                replay_tokens,
+            )?
+        } else {
+            Vec::new()
+        };
+        let (tail_drop_group, aligned_tail_drop) = if tail_groups.is_empty()
+            || !dense_lookups.is_empty()
+        {
             (None, None)
         } else {
             let unsupported = "unsupported tail-drop layout. Set tail_drop_groups to the effective groups and use [] when the worker skips the drop";
@@ -429,12 +448,75 @@ impl CacheCapabilities {
             hash_lookahead_tokens: rank.hash_lookahead_tokens,
             tail_drop_group,
             aligned_tail_drop,
+            dense_lookups,
             root,
             replay_tokens,
             adapters: validate_adapters(&self.adapters)?,
             partial_hash_hits: rank.partial_hash_hits,
         })
     }
+}
+
+fn verify_dense_lookups(
+    groups: &[CacheGroup],
+    lookups: &[Vec<u32>],
+    tail_groups: &[u32],
+    partial_hash_hits: bool,
+    replay_tokens: u32,
+) -> Result<Vec<DenseLookup>, &'static str> {
+    let error =
+        "dense_lookup_groups must report every full-attention group once, in engine lookup order";
+    let tail: HashSet<_> = tail_groups.iter().copied().collect();
+    if !partial_hash_hits
+        || replay_tokens != 0
+        || tail.is_empty()
+        || tail.len() != tail_groups.len()
+        || groups
+            .iter()
+            .any(|group| !matches!(group.kind, GroupRule::FullAttention | GroupRule::Checkpoint))
+        || tail.iter().any(|id| {
+            !groups
+                .iter()
+                .any(|group| group.group_idx == *id && group.kind == GroupRule::FullAttention)
+        })
+    {
+        return Err(error);
+    }
+    let mut seen = HashSet::new();
+    let mut verified = Vec::new();
+    for ids in lookups {
+        let drop_tail = tail.contains(ids.first().ok_or(error)?);
+        let mut positions = Vec::new();
+        for id in ids {
+            let position = groups
+                .iter()
+                .position(|group| group.group_idx == *id && group.kind == GroupRule::FullAttention)
+                .ok_or(error)?;
+            if !seen.insert(*id)
+                || tail.contains(id) != drop_tail
+                || positions.first().is_some_and(|&first: &usize| {
+                    groups[first].block_size != groups[position].block_size
+                })
+            {
+                return Err(error);
+            }
+            positions.push(position);
+        }
+        verified.push(DenseLookup {
+            positions,
+            drop_tail,
+        });
+    }
+    if seen.len() < 2
+        || seen.len()
+            != groups
+                .iter()
+                .filter(|group| group.kind == GroupRule::FullAttention)
+                .count()
+    {
+        return Err(error);
+    }
+    Ok(verified)
 }
 
 fn parse_hash(value: &str) -> Option<[u8; 32]> {

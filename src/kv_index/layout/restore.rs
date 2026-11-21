@@ -1,5 +1,7 @@
 //! Compute the common restore boundary from cache-group evidence.
 
+use smallvec::SmallVec;
+
 use super::{align_down, GroupEvidence, GroupRule};
 
 pub(in crate::kv_index) struct AlignedTailDrop {
@@ -7,10 +9,15 @@ pub(in crate::kv_index) struct AlignedTailDrop {
     pub alignment: u32,
 }
 
+pub(in crate::kv_index) struct DenseLookup {
+    pub positions: Vec<usize>,
+    pub drop_tail: bool,
+}
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(super) fn common_reusable_tokens(groups: &[GroupEvidence], max_reusable_tokens: u64) -> u64 {
-    restore_boundary(groups, max_reusable_tokens, None, 0, false).0
+    restore_boundary(groups, max_reusable_tokens, None, 0, false, &[]).0
 }
 
 /// Find the common restore boundary for a layout verified at source binding.
@@ -21,9 +28,10 @@ pub(super) fn restore_boundary(
     tail_drop_group: Option<u32>,
     fine_unit: u64,
     proof_within_cap: bool,
-) -> (u64, Option<(usize, u64)>) {
+    dense_lookups: &[DenseLookup],
+) -> (u64, SmallVec<[(usize, u64); 1]>) {
     if groups.is_empty() || max_reusable_tokens == 0 {
-        return (0, None);
+        return (0, SmallVec::new());
     }
     // Every cacheable group must supply its own pages. An empty sliding
     // store can mean masked or null pages; it does not make the group optional.
@@ -31,7 +39,7 @@ pub(super) fn restore_boundary(
         .iter()
         .any(|group| group.segments.is_empty() && group.partial_ends.is_empty())
     {
-        return (0, None);
+        return (0, SmallVec::new());
     }
 
     // Reproduce the engine's coordinator: every group reports the longest
@@ -42,52 +50,84 @@ pub(super) fn restore_boundary(
         .iter()
         .map(|group| BoundaryCursor::new(group, false))
         .collect();
-    let tail = match tail_drop_group {
-        None => None,
-        Some(group_idx) => {
-            let Some(index) = groups.iter().position(|evidence| {
-                evidence.group.group_idx == group_idx && evidence.group.kind.is_dense_attention()
-            }) else {
-                return (0, None);
-            };
-            let drop_unit = if fine_unit == 0 {
-                for cursor in &mut cursors {
-                    cursor.partial_end = 0;
-                }
-                cursors[index].size
-            } else {
-                fine_unit
-            };
-            // Starting in vLLM 0.32, the hybrid coordinator can use one
-            // extra proof unit from the request's hash chain.
-            let lookup_cap = if proof_within_cap || groups.len() == 1 {
-                max_reusable_tokens
-            } else {
-                max_reusable_tokens.saturating_add(drop_unit)
-            };
-            let proof = cursors[index].predecessor(lookup_cap);
-            // vLLM's FullAttentionManager drops one unit even below the cap.
-            // https://github.com/vllm-project/vllm/blob/v0.33.0/vllm/v1/core/single_type_kv_cache_manager.py#L825-L835
-            Some((index, proof, proof.saturating_sub(drop_unit)))
-        }
-    };
     let mut boundary = max_reusable_tokens;
+    if !dense_lookups.is_empty() {
+        let cap = if proof_within_cap {
+            max_reusable_tokens
+        } else {
+            max_reusable_tokens.saturating_add(fine_unit)
+        };
+        // vLLM looks up dense batches in order, requiring matching endpoints
+        // within a batch. Subsequent checkpoint checks can only shorten hits.
+        for lookup in dense_lookups {
+            let drop = if lookup.drop_tail { fine_unit } else { 0 };
+            let mut proof = cap.min(boundary.saturating_add(drop));
+            loop {
+                let next = lookup.positions.iter().fold(proof, |end, &position| {
+                    end.min(cursors[position].predecessor(proof))
+                });
+                if next == proof {
+                    break;
+                }
+                proof = next;
+            }
+            let retained = proof.saturating_sub(drop);
+            for &position in &lookup.positions {
+                cursors[position].dense_proof = Some((proof, retained));
+            }
+            boundary = boundary.min(retained);
+        }
+    } else if let Some(group_idx) = tail_drop_group {
+        let Some(index) = groups.iter().position(|evidence| {
+            evidence.group.group_idx == group_idx && evidence.group.kind.is_dense_attention()
+        }) else {
+            return (0, SmallVec::new());
+        };
+        let drop_unit = if fine_unit == 0 {
+            for cursor in &mut cursors {
+                cursor.partial_end = 0;
+            }
+            cursors[index].size
+        } else {
+            fine_unit
+        };
+        // Starting in vLLM 0.32, the hybrid coordinator can use one
+        // extra proof unit from the request's hash chain.
+        let lookup_cap = if proof_within_cap || groups.len() == 1 {
+            max_reusable_tokens
+        } else {
+            max_reusable_tokens.saturating_add(drop_unit)
+        };
+        let proof = cursors[index].predecessor(lookup_cap);
+        // vLLM's FullAttentionManager drops one unit even below the cap.
+        // https://github.com/vllm-project/vllm/blob/v0.33.0/vllm/v1/core/single_type_kv_cache_manager.py#L825-L835
+        cursors[index].dense_proof = Some((proof, proof.saturating_sub(drop_unit)));
+    }
     loop {
         let mut next = boundary;
-        for (index, cursor) in cursors.iter_mut().enumerate() {
-            let group_hit = match tail {
+        for cursor in &mut cursors {
+            let group_hit = match cursor.dense_proof {
                 // The engine retains the dense prefix after the first lookup.
                 // Later checkpoint limits can shorten it without another drop.
-                Some((group, _, retained)) if group == index => retained,
-                _ => cursor.predecessor(boundary),
+                Some((_, retained)) => retained,
+                None => cursor.predecessor(boundary),
             };
             next = next.min(group_hit);
         }
         if next == 0 {
-            return (0, None);
+            return (0, SmallVec::new());
         }
         if next == boundary {
-            return (boundary, tail.map(|(group, proof, _)| (group, proof)));
+            return (
+                boundary,
+                cursors
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, cursor)| {
+                        cursor.dense_proof.map(|(proof, _)| (position, proof))
+                    })
+                    .collect(),
+            );
         }
         boundary = next;
     }
@@ -140,6 +180,7 @@ struct BoundaryCursor {
     range_end: usize,
     partials: Vec<u64>,
     partial_end: usize,
+    dense_proof: Option<(u64, u64)>,
 }
 
 impl BoundaryCursor {
@@ -218,6 +259,7 @@ impl BoundaryCursor {
             ranges,
             partial_end: partials.len(),
             partials,
+            dense_proof: None,
         }
     }
 

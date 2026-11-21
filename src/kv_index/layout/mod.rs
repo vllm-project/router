@@ -12,7 +12,7 @@ pub(super) use evidence::full_attention_matches;
 pub(super) use evidence::{credit_from_pages, TailDrop};
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 use restore::common_reusable_tokens;
-pub(super) use restore::AlignedTailDrop;
+pub(super) use restore::{AlignedTailDrop, DenseLookup};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheGroup {

@@ -71,6 +71,54 @@ fn page_view(group: &[TierBits]) -> crate::kv_index::storage::PageTiers<'_> {
 }
 
 #[test]
+fn fine_grained_tail_drop_follows_dense_lookup_batches() {
+    use StorageTier::{Device, HostPinned};
+
+    let groups = [0, 1].map(|group_idx| CacheGroup {
+        group_idx,
+        block_size: 64,
+        kind: GroupRule::FullAttention,
+    });
+    let mut claims = [[TierBits::default(); 8]; 2];
+    for group in &mut claims {
+        group[3] = TierBits(TierBits::bit(Device));
+    }
+    claims[0][6] = TierBits(TierBits::bit(Device));
+    claims[1][5] = TierBits(TierBits::bit(HostPinned));
+    let views = claims.each_ref().map(|pages| page_view(pages));
+    let dense = |positions| DenseLookup {
+        positions,
+        drop_tail: true,
+    };
+    let credit = |dense_lookups: &[DenseLookup]| {
+        credit_from_pages(
+            &groups,
+            &views,
+            16,
+            127,
+            0,
+            TailDrop {
+                fine_grained: true,
+                dense_lookups,
+                proof_within_cap: true,
+                ..Default::default()
+            },
+        )
+    };
+    // The installed vLLM 0.30 coordinator matches 48, 80 and 48 tokens
+    // for these three plans with the same underlying cache pages.
+    assert_eq!(credit(&[dense(vec![0, 1])]), (48, Some(Device)));
+    assert_eq!(
+        credit(&[dense(vec![0]), dense(vec![1])]),
+        (80, Some(HostPinned))
+    );
+    assert_eq!(
+        credit(&[dense(vec![1]), dense(vec![0])]),
+        (48, Some(Device))
+    );
+}
+
+#[test]
 fn full_attention_rounding_preserves_gaps_between_same_tier_pages() {
     use StorageTier::{Device, HostPinned};
 
@@ -689,6 +737,32 @@ mod declarations {
     }
 
     #[test]
+    fn fine_grained_speculation_requires_a_complete_dense_lookup_order() {
+        let mut value = qwen_layout();
+        let rank = &mut value["ranks"][0];
+        let mut second_dense = rank["groups"][3].clone();
+        second_dense["group_idx"] = serde_json::json!(4);
+        rank["groups"].as_array_mut().unwrap().push(second_dense);
+        rank["declared_groups"] = serde_json::json!(5);
+        rank["hash_block_size"] = serde_json::json!(16);
+        rank["partial_hash_hits"] = serde_json::json!(true);
+        rank["speculative_tokens"] = serde_json::json!(8);
+        rank["tail_drop_groups"] = serde_json::json!([3, 4]);
+        assert!(bind_layout(&value, "epoch-1").is_err());
+        for (lookups, accepted) in [
+            (serde_json::json!([[3, 4]]), true),
+            (serde_json::json!([[4], [3]]), true),
+            (serde_json::json!([[3], [3]]), false),
+            (serde_json::json!([[3]]), false),
+            (serde_json::json!([[0, 3, 4]]), false),
+            (serde_json::json!([[], [3, 4]]), false),
+        ] {
+            value["ranks"][0]["dense_lookup_groups"] = lookups;
+            assert_eq!(bind_layout(&value, "epoch-1").is_ok(), accepted);
+        }
+    }
+
+    #[test]
     fn qwen_layout_restores_prefix_and_respects_pd_prefill_boundary() {
         use crate::config::KvConnector;
 
@@ -920,7 +994,7 @@ mod declarations {
             })
             .collect();
         assert_eq!(
-            super::super::restore::restore_boundary(&evidence, 641, Some(4), 0, false).0,
+            super::super::restore::restore_boundary(&evidence, 641, Some(4), 0, false, &[]).0,
             320
         );
 

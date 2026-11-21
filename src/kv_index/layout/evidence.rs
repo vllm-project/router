@@ -3,7 +3,7 @@
 use super::{
     align_down,
     restore::{aligned_tail_boundary, restore_boundary},
-    AlignedTailDrop, CacheGroup, GroupEvidence, GroupRule,
+    AlignedTailDrop, CacheGroup, DenseLookup, GroupEvidence, GroupRule,
 };
 use crate::kv_index::{
     storage::PageTiers,
@@ -168,6 +168,7 @@ pub(in crate::kv_index) struct TailDrop<'a> {
     pub fine_grained: bool,
     pub aligned: Option<&'a AlignedTailDrop>,
     pub proof_within_cap: bool,
+    pub dense_lookups: &'a [DenseLookup],
 }
 
 /// Return the credited tokens and slowest required tier for a source snapshot.
@@ -197,7 +198,7 @@ pub(in crate::kv_index) fn credit_from_pages(
                 tail,
                 tail_drop.proof_within_cap,
             ),
-            None,
+            Default::default(),
         )
     } else {
         restore_boundary(
@@ -206,6 +207,7 @@ pub(in crate::kv_index) fn credit_from_pages(
             tail_drop.group,
             fine_unit,
             tail_drop.proof_within_cap,
+            tail_drop.dense_lookups,
         )
     };
     let credited = boundary.saturating_sub(u64::from(replay_tokens));
@@ -236,15 +238,15 @@ pub(in crate::kv_index) fn credit_from_pages(
             }
         };
         let floor = blocks.saturating_sub(required);
-        let partial_end = match tail_proof {
+        let partial_end = match tail_proof
+            .iter()
+            .find(|(position, _)| *position == group_pos)
+        {
             // The dense block already matched by the coordinator may have been
             // published at a later hash boundary. Price the retained physical
             // page rather than a nonexistent hash exactly at `boundary`.
-            Some((position, proof))
-                if position == group_pos
-                    && !boundary.is_multiple_of(u64::from(group.block_size)) =>
-            {
-                Some(proof.min((blocks as u64 + 1) * u64::from(group.block_size)))
+            Some((_, proof)) if !boundary.is_multiple_of(u64::from(group.block_size)) => {
+                Some((*proof).min((blocks as u64 + 1) * u64::from(group.block_size)))
             }
             _ => partials.contains(&boundary).then_some(boundary),
         };

@@ -35,7 +35,8 @@ use crate::kv_hash::BlockKeyGenerator;
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 use crate::kv_index::layout::valid_groups;
 use crate::kv_index::layout::{
-    align_down, common_block_alignment, AlignedTailDrop, CacheGroup, GroupRule, TailDrop,
+    align_down, common_block_alignment, AlignedTailDrop, CacheGroup, DenseLookup, GroupRule,
+    TailDrop,
 };
 use crate::kv_index::storage::source_transaction::{StreamControl, StreamPhase, StreamState};
 use crate::kv_index::storage::{
@@ -58,6 +59,7 @@ pub struct SourceBinding {
     pub(in crate::kv_index) replay_tokens: u32,
     pub(in crate::kv_index) tail_drop_group: Option<u32>,
     aligned_tail_drop: Option<AlignedTailDrop>,
+    dense_lookups: Vec<DenseLookup>,
     tail_proof_within_cap: bool,
     prefill_truncates_prompt: bool,
     nixl_decode_alignment: Option<u32>,
@@ -120,6 +122,7 @@ impl SourceBinding {
             replay_tokens: 0,
             tail_drop_group: None,
             aligned_tail_drop: None,
+            dense_lookups: Vec::new(),
             tail_proof_within_cap: false,
             prefill_truncates_prompt: false,
             nixl_decode_alignment: None,
@@ -242,6 +245,9 @@ impl SourceBinding {
     ) -> Result<Self, &'static str> {
         if self.aligned_tail_drop.is_some() && version.is_none_or(|version| version < (0, 30)) {
             return Err("block-aligned tail proofs require a known vLLM version of 0.30 or later");
+        }
+        if !self.dense_lookups.is_empty() && version.is_none_or(|version| version < (0, 30)) {
+            return Err("ordered dense lookups require a known vLLM version of 0.30 or later");
         }
         self.tail_proof_within_cap = version.is_none_or(|version| version < (0, 32));
         Ok(self)
@@ -423,6 +429,7 @@ impl CacheCapabilities {
             .with_adapters(layout.adapters)
             .with_partial_hash_hits(layout.partial_hash_hits);
         binding.aligned_tail_drop = layout.aligned_tail_drop;
+        binding.dense_lookups = layout.dense_lookups;
         if let Some(rank) = self.rank_capability(source.dp_rank) {
             binding.strict_event_block_size = rank.has_plain_full_attention_shape();
             if layout.partial_hash_hits
@@ -574,6 +581,7 @@ impl SourceBinding {
                 fine_grained: self.partial_hash_hits,
                 aligned: self.aligned_tail_drop.as_ref(),
                 proof_within_cap: self.tail_proof_within_cap,
+                dense_lookups: &self.dense_lookups,
             },
         );
         if tier.is_none() || u32::try_from(credited / self.keys.block_size() as u64).is_err() {

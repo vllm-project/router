@@ -1091,6 +1091,7 @@ fn synthesize_plain_full_layout(
                 hash_lookahead_tokens: 0,
                 speculative_tokens: 0,
                 tail_drop_groups: None,
+                dense_lookup_groups: None,
                 prefix_caching: true,
                 groups: vec![GroupCapability {
                     group_idx: 0,
