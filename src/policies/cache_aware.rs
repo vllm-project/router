@@ -730,7 +730,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
     fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
         // Group workers by model
-        info!(
+        debug!(
             "Initializing workers for cache-aware policy: {}",
             workers
                 .iter()
