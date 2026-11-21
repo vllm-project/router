@@ -103,9 +103,7 @@ impl ProgramScheduler {
                             .iter()
                             .enumerate()
                             .filter(|(_, target)| {
-                                // This mode changes admission, not routing. Preserve
-                                // the existing cache-aware binding in either queue mode.
-                                decision.last_target.as_ref() == Some(*target)
+                                self.resume_target_allowed(state, program, target)
                             })
                             .map(|(target_index, target)| {
                                 let affinity =
@@ -473,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_dp_preserves_bindings_in_both_queue_modes() {
+    fn direct_dp_cross_backend_placement_requires_global_queue() {
         for global in [false, true] {
             let scheduler = scheduler(global, ProgramResumeOrder::DpAdmissionTAO);
             let targets: Vec<_> = (0..2)
@@ -498,6 +496,13 @@ mod tests {
             let observation = state.observations.get_mut("rank-0").unwrap();
             observation.backend.observed_at = Some(now);
             observation.accounting.estimated_active_program_tokens = Some(1200.0);
+            if global {
+                assert!(scheduler.schedule_waiting(&mut state, now));
+                for handle in [&a, &b] {
+                    assert_eq!(state.runtime.placement(handle.program()), Some("rank-1"));
+                }
+                continue;
+            }
             assert!(!scheduler.schedule_waiting(&mut state, now));
             for handle in [&a, &b] {
                 assert_eq!(state.runtime.placement(handle.program()), None);

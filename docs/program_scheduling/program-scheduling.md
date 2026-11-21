@@ -34,7 +34,7 @@ The default is a strict per-request opt-in contract, not a claim that existing a
 }
 ```
 
-`global_queue: true` is the recommended deployment mode. The Router first tries to resume a paused Program on its previous Rank and considers cross-Rank placement only when the configured capacity and headroom checks allow it. Set it to `false` only when strict Rank-local scheduling is required.
+`global_queue: true` is the recommended deployment mode. MRU/FCFS first try the previous Rank before considering cross-Rank placement under their capacity/headroom gates; TAO jointly selects eligible Program/Rank assignments within its budgets. Set it to `false` for strict Rank-local scheduling with any resume strategy.
 
 To adapt Program scheduling to a different model or hardware configuration, operators generally only need to recalibrate `prefill_cost_model` and `decode_throughput_model`. The [AgentInfer backend calibration README](https://github.com/openJiuwen-ai/agent-infer/blob/main/tools/calibration/README.md) describes how to measure these coefficients for the target deployment.
 
@@ -95,7 +95,7 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 |---|---:|---|
 | `program_scheduling_enable_key` | `vllm_xargs.agentic_context` | Selects which identity inputs opt a request into Program scheduling. The default accepts only canonical `vllm_xargs.agentic_context`; `auto` additionally accepts the documented `agent_hint` and framework Header schemas. |
 | `binding_only` | `false` | Preserves Program identity and initial Program-to-Rank binding but bypasses RequestPool admission, Progress-TTL pause, and resume scheduling. This isolates the effect of Program affinity. |
-| `global_queue` | `false` | When `false`, a paused Program can resume only on its bound Rank. When `true`, resume first tries the previous Rank and may then select another Rank that passes the cross-Rank capacity gates. |
+| `global_queue` | `false` | When `false`, a paused Program can resume only on its bound Rank. When `true`, MRU/FCFS prefer local resumes before cross-Rank placement, while TAO jointly selects eligible Program/Rank assignments. |
 | `resume_order` | `mru` | `mru` and `fcfs` retain native ordering; `dp_admission_tao` lets DP decide admission directly. TAO requires `cache_aware` binding plus either explicit token capacity or `dynamic_token_capacity: true`. See the DP sections below. |
 | `cross_rank_headroom_ratio` | `1.2` | Controls cross-Rank migration conservatism. A destination must have at least the source Rank's free capacity plus this multiple of the Program's complete estimated context. It has no effect when `global_queue` is `false`. |
 | `binding_strategy` | `consistent_hash` | Selects the initial home Rank for each new Program generation. Supported values are `consistent_hash`, `program_round_robin`, `least_program_count`, `reasoning_token_balance`, and `cache_aware`; it does not replace admission or resume decisions. |
@@ -311,9 +311,9 @@ The old native-prefiltered `resume_order: "dp"` mode has been removed.
   commits that set under the scheduler lock without a second native admission
   pass. Non-selected requests stay queued. When the entire set fits, admitting
   all candidates is already optimal and no DP frontier is constructed.
-- **Placement:** retain existing cache-aware bindings in both local and global
-  queue configurations. This mode does not introduce cross-rank placement
-  optimization. Active requests, pause/TTL and capacity repair are unchanged.
+- **Placement:** `global_queue: false` restricts each Program to its bound Rank;
+  `global_queue: true` allows DP to choose across eligible Ranks in the model
+  pool. Active requests, pause/TTL and capacity repair are unchanged.
 - **Deadlines:** overdue force-resume deadlines raise priority, but never permit
   overselling. Oversized requests continue waiting until capacity/placement
   changes or the existing queue timeout expires.
@@ -356,10 +356,11 @@ guarantee. Tree prediction errors and unreserved decode growth remain. A valid
 zero-free sample still permits a zero-estimated-cost full prefix hit, as before;
 unknown capacity does not. No arbitrary safety factor is introduced.
 
-Unlike fixed-binding direct DP, this path considers every eligible backend
-in the model pool even with `global_queue=false`. It uses token budgets and
-candidate-count slots, not the configured per-target active-Program count guard.
-These are the historical tree-admission semantics.
+This path respects the same queue scope as other resume strategies:
+`global_queue=false` restricts each Program to its bound Rank, while
+`global_queue=true` enables joint placement across eligible backends in the
+model pool. It uses token budgets and candidate-count slots, not the configured
+per-target active-Program count guard.
 
 For this path, `/scheduling/diagnostics` reports:
 
@@ -462,6 +463,12 @@ Progress-TTL currently protects KV indirectly by controlling request admission. 
 ## Dynamic backend capacity (opt-in, aggregated HTTP)
 
 Set `dynamic_token_capacity: true` and **omit** `token_capacity_per_dp_rank`.
+
+Token capacity distinguishes an unrestricted target (static mode without a token
+limit), a known token limit, and unavailable dynamic capacity. Unknown dynamic
+capacity blocks admission and is represented as fully pressured for initial
+binding; Cache-aware excludes unknown targets when a target with known capacity
+exists, even if that known target currently requires queueing.
 No Python launcher, fixed H200 budget, or new backend metric is required.
 The Rust metrics provider reads each worker's `/metrics` every
 `metrics_interval_seconds` (default 1 second). It selects the matching

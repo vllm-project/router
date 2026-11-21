@@ -620,6 +620,20 @@ impl ProgramScheduler {
         changed
     }
 
+    pub(crate) fn resume_target_allowed(
+        &self,
+        state: &ProgramSchedulerState,
+        program: &ProgramRef,
+        target: &str,
+    ) -> bool {
+        self.config.global_queue
+            || state
+                .decisions
+                .get(program)
+                .and_then(|d| d.last_target.as_deref())
+                == Some(target)
+    }
+
     pub(crate) fn schedule_waiting(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {
         if self.kv_dp_mode() {
             return self.schedule_tree_dp(state, now);
@@ -775,7 +789,7 @@ impl ProgramScheduler {
     ) -> Option<RankAdmissionPlan> {
         let runtime = state.runtime.view(program)?;
         let decision = state.decisions.get(program)?;
-        if !self.config.global_queue && decision.last_target.as_deref() != Some(target_id) {
+        if !self.resume_target_allowed(state, program, target_id) {
             return None;
         }
         if runtime.state != ProgramState::Paused

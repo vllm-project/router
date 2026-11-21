@@ -173,6 +173,7 @@ impl ProgramScheduler {
                     targets
                         .iter()
                         .enumerate()
+                        .filter(|(_, t)| self.resume_target_allowed(state, p, t))
                         .map(|(target_index, t)| {
                             let ratio = state.bindings.prefix_match_rate(&pool, text, t);
                             let cached = if ratio.is_finite() {
@@ -268,6 +269,7 @@ mod tests {
     fn setup(capacities: &[usize]) -> ProgramScheduler {
         let mut cfg = ProgramSchedulerConfig {
             dynamic_token_capacity: true,
+            global_queue: true,
             resume_order: ProgramResumeOrder::DpAdmissionTAO,
             binding_strategy: ProgramBindingStrategy::CacheAware,
             dp_capacity_quantum: 1,
@@ -489,23 +491,24 @@ mod tests {
         );
     }
     #[test]
-    fn dp_can_choose_backend_other_than_cache_aware_initial_binding() {
-        let s = setup(&[5, 100]);
-        let h = enqueue(&s, "p", 100, "abcdefghij");
-        seed(&s, &h, "abcdefgh", "t0");
-        s.state
-            .lock()
-            .decisions
-            .get_mut(h.program())
-            .unwrap()
-            .last_target = Some("t0".into());
-        let mut st = s.state.lock();
-        assert!(s.schedule_waiting(&mut st, Instant::now()));
-        assert_eq!(
-            st.runtime.view(h.program()).unwrap().placement.as_deref(),
-            Some("t1")
-        );
-        assert_eq!(st.decisions[h.program()].tree_dp_reserved_tokens, Some(100));
+    fn dp_cross_backend_placement_requires_global_queue() {
+        for global in [false, true] {
+            let mut s = setup(&[5, 100]);
+            s.config.global_queue = global;
+            let h = enqueue(&s, "p", 100, "abcdefghij");
+            seed(&s, &h, "abcdefgh", "t0");
+            let mut st = s.state.lock();
+            st.decisions.get_mut(h.program()).unwrap().last_target = Some("t0".into());
+            assert_eq!(s.schedule_waiting(&mut st, Instant::now()), global);
+            assert_eq!(
+                st.runtime.view(h.program()).unwrap().placement.as_deref(),
+                global.then_some("t1")
+            );
+            assert_eq!(
+                st.decisions[h.program()].tree_dp_reserved_tokens,
+                global.then_some(100)
+            );
+        }
     }
     #[test]
     fn dp_prefers_tree_hit_value_over_larger_total_and_ignores_count_gate() {

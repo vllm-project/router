@@ -3,6 +3,7 @@
 //! Rank-local and global decision algorithms live in sibling modules. This
 //! file owns atomic state access, target discovery, and observation rebasing.
 
+use super::capacity::TargetTokenCapacity;
 use super::scheduler_state::{
     CapacityAccountingSource, PrefillPressure, ProgramDecisionState, ProgramSchedulerState,
     RankObservationState,
@@ -635,40 +636,54 @@ impl ProgramScheduler {
         let required_tokens = estimated_context_tokens
             .saturating_add(self.config.progress_ttl.decode_buffer_tokens)
             as f64;
-        state
+        let candidates: Vec<_> = state
             .model_targets
             .get(identity.model_pool())
             .into_iter()
             .flatten()
             .map(|target_id| {
-                let capacity = self.target_capacity(state, target_id, now);
+                let capacity_state = self.target_capacity_state(state, target_id, now);
+                let capacity = capacity_state.limit();
                 let summary = &summaries[target_id.as_str()];
                 let target_usage = self
                     .observed_target_usage(state, target_id, now)
                     .unwrap_or(summary.router_usage);
-                let immediately_admissible = self.capacity_ready(state, target_id, now)
+                let immediately_admissible = capacity_state != TargetTokenCapacity::Unknown
                     && summary.active_programs.saturating_add(1)
                         <= self.config.max_active_programs_per_target
                     && capacity.is_none_or(|capacity| {
                         target_usage + required_tokens
                             <= capacity as f64 * self.config.progress_ttl.low_watermark_ratio
                     });
-                ProgramBindingCandidate {
+                let candidate = ProgramBindingCandidate {
                     target_id: target_id.clone(),
                     accounted_programs: summary.accounted_programs,
                     accounted_tokens: summary.accounted_tokens,
                     capacity_tokens: capacity,
-                    kv_pressure: capacity.map_or(0.0, |capacity| {
-                        if capacity == 0 {
-                            1.0
-                        } else {
-                            ((target_usage + summary.pending_new_program_tokens) / capacity as f64)
+                    kv_pressure: match capacity_state {
+                        TargetTokenCapacity::Unrestricted => 0.0,
+                        TargetTokenCapacity::Unknown | TargetTokenCapacity::Limited(0) => 1.0,
+                        TargetTokenCapacity::Limited(tokens) => {
+                            ((target_usage + summary.pending_new_program_tokens) / tokens as f64)
                                 .clamp(0.0, 1.0)
                         }
-                    }),
+                    },
                     immediately_admissible,
-                }
+                };
+                (candidate, capacity_state)
             })
+            .collect();
+        // Unknown dynamic headroom is not an empty backend. Even when no
+        // candidate fits immediately, prefer a known target for queue binding.
+        let prefer_known = self.config.binding_strategy
+            == super::ProgramBindingStrategy::CacheAware
+            && candidates
+                .iter()
+                .any(|(_, capacity)| *capacity != TargetTokenCapacity::Unknown);
+        candidates
+            .into_iter()
+            .filter(|(_, capacity)| !prefer_known || *capacity != TargetTokenCapacity::Unknown)
+            .map(|(candidate, _)| candidate)
             .collect()
     }
 

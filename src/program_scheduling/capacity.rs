@@ -4,7 +4,37 @@ use super::scheduler_state::ProgramSchedulerState;
 use super::{ProgramScheduler, ProgramState, ProgramStatus};
 use std::time::Instant;
 
+/// Whether a target has a token limit, rather than whether it can admit now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetTokenCapacity {
+    Unrestricted,
+    Unknown,
+    Limited(usize),
+}
+
+impl TargetTokenCapacity {
+    pub(crate) fn limit(self) -> Option<usize> {
+        match self {
+            Self::Limited(tokens) => Some(tokens),
+            Self::Unrestricted | Self::Unknown => None,
+        }
+    }
+}
+
 impl ProgramScheduler {
+    pub(crate) fn target_capacity_state(
+        &self,
+        state: &ProgramSchedulerState,
+        target: &str,
+        now: Instant,
+    ) -> TargetTokenCapacity {
+        match self.target_capacity(state, target, now) {
+            Some(tokens) => TargetTokenCapacity::Limited(tokens),
+            None if self.config.dynamic_token_capacity => TargetTokenCapacity::Unknown,
+            None => TargetTokenCapacity::Unrestricted,
+        }
+    }
+
     pub(crate) fn dynamic_headroom(
         &self,
         state: &ProgramSchedulerState,
@@ -60,7 +90,7 @@ impl ProgramScheduler {
         target: &str,
         now: Instant,
     ) -> bool {
-        !self.config.dynamic_token_capacity || self.dynamic_headroom(state, target, now).is_some()
+        self.target_capacity_state(state, target, now) != TargetTokenCapacity::Unknown
     }
 
     pub(crate) fn reasoning_reservations(
@@ -211,6 +241,73 @@ mod tests {
             .or_default()
             .push_back(handle.program().clone());
         handle
+    }
+
+    #[test]
+    fn cache_binding_distinguishes_unknown_dynamic_capacity_from_unrestricted() {
+        for order in [ProgramResumeOrder::Mru, ProgramResumeOrder::Fcfs] {
+            for stale in [false, true] {
+                let mut s = scheduler(order);
+                s.config.binding_strategy = super::super::ProgramBindingStrategy::CacheAware;
+                let mut ts = targets();
+                ts.push(ProgramTarget {
+                    id: "unknown".into(),
+                    base_url: "http://unknown".into(),
+                    dp_rank: None,
+                });
+                s.sync_targets("m", &ts);
+                let identity = ProgramIdentity::from_request(
+                    None,
+                    Some(&json!({"vllm_xargs":{"agentic_context":{"program_id":"new"}}})),
+                    Some("m"),
+                )
+                .unwrap()
+                .unwrap();
+                {
+                    let mut st = s.state.lock();
+                    st.runtime
+                        .retain_request(&identity, 100, Some("new"), Instant::now());
+                    let candidates = s.binding_candidates(&st, &identity, Instant::now());
+                    assert_eq!(candidates.len(), 2);
+                    assert!(candidates
+                        .iter()
+                        .all(|c| c.kv_pressure == 1.0 && !c.immediately_admissible));
+                }
+                if stale {
+                    let mut o = raw("unknown", 0.0);
+                    o.base_url = "http://unknown".into();
+                    o.observed_at = Instant::now() - Duration::from_secs(4);
+                    s.apply_observations(s.begin_observation(&ts), [o]);
+                }
+                s.apply_observations(s.begin_observation(&ts), [raw("rank", 1.0)]);
+                {
+                    let mut st = s.state.lock();
+                    let candidates = s.binding_candidates(&st, &identity, Instant::now());
+                    assert_eq!(candidates.len(), 1);
+                    assert_eq!(candidates[0].target_id, "rank");
+                    assert!(!candidates[0].immediately_admissible);
+                    let mut bindings = super::super::ProgramBindings::new(
+                        super::super::ProgramBindingStrategy::CacheAware,
+                        160,
+                    );
+                    assert_eq!(
+                        bindings
+                            .bind(&identity, &candidates, Some("new"))
+                            .as_deref(),
+                        Some("rank")
+                    );
+                    st.observations.clear();
+                }
+                s.config.dynamic_token_capacity = false;
+                s.config.progress_ttl.token_capacity = None;
+                let st = s.state.lock();
+                let candidates = s.binding_candidates(&st, &identity, Instant::now());
+                assert_eq!(candidates.len(), 2);
+                assert!(candidates
+                    .iter()
+                    .all(|c| c.kv_pressure == 0.0 && c.immediately_admissible));
+            }
+        }
     }
 
     #[test]
