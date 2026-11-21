@@ -2,7 +2,7 @@
 
 If requests often start with the same prompt, such as a shared system message, `kv_aware` prefers a worker that can reuse that prefix and also considers worker load. vLLM publishes cache events so the Router can track which workers have the prefix. When cache information is unavailable, the Router routes by load.
 
-Clients send OpenAI HTTP requests to the Router with either HTTP or gRPC workers.
+Clients use the Router's OpenAI HTTP API with either HTTP or gRPC workers. Choose [colocated serving](#colocated-prefill-and-decode) or [P/D disaggregation](#pd-routing), then [check cache reuse](#check-cache-reuse).
 
 ## Requirements for KV-aware prefix reuse
 
@@ -20,7 +20,7 @@ These settings apply to all workers scored by `kv_aware`, including workers with
 | --- | --- |
 | [Ordinary single-group full attention](#colocated-prefill-and-decode), HTTP or gRPC | Omit `--kv-hybrid-layout` when the worker uses the default hash root and exposes its model, block size, and event sources. [Stock HTTP vLLM 0.30.0](#static-event-endpoints) uses static configuration. |
 | Hybrid or sliding-window attention, speculative decoding, or custom hash seed | Use a worker-reported layout when available. Otherwise pass an [explicit layout](#explicit-layouts) with `--kv-hybrid-layout`. |
-| [P/D disaggregation](#pd-routing), HTTP or gRPC | Use the same `--kv-hybrid-layout` file for both stages that need an [explicit layout](#pd-layout). |
+| [P/D disaggregation](#pd-routing), HTTP or gRPC | Pass one [P/D layout file](#pd-layout) when needed. Include the compatible Decode URLs for each hybrid Prefill and the layout of each scored worker that cannot report it. |
 
 ## Colocated prefill and decode
 
@@ -46,7 +46,7 @@ On vLLM 0.30.0, use a fixed replay endpoint such as `tcp://*:5558` for one rank.
 
 ### 2. Start the worker and Router
 
-Choose one transport. **Run these commands with no layout JSON** for one full-attention group with no sliding window or speculative decoding. Leave `PYTHONHASHSEED` unset to use the default hash root. The Router checks that root and the reported block size against a first-block event. The `16` below is the example block size. The same rule applies to ordinary full-attention workers in P/D.
+Choose HTTP or gRPC. These commands start an ordinary full-attention worker with the default hash root and 16-token blocks. For a hybrid model, apply its [worker and layout settings](#hybrid-attention-models) to the commands below.
 
 #### HTTP workers
 
@@ -124,11 +124,181 @@ This setup is for stock HTTP vLLM 0.30.0, which has no event discovery endpoint.
 
 </details>
 
+## P/D routing
+
+P/D disaggregation runs prompt processing on Prefill workers and token generation on Decode workers. Use the same checkpoint, engine version, connector, and worker transport on both stages. Enable KV events on each stage scored by `kv_aware`.
+
+### GPU with NIXL
+
+1. Use the [HTTP](#http-workers) or [gRPC](#grpc-workers) worker setup on separate GPUs. Keep Prefill on HTTP port `8000` or gRPC port `50051`. Set Decode's HTTP port to `8001` and its gRPC port, if used, to `50052`.
+2. Set `VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1` on both workers. Set `VLLM_NIXL_SIDE_CHANNEL_PORT=5600` on Prefill and `5601` on Decode. For separate hosts, use reachable addresses.
+3. Add `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'` to Prefill and the same option with `"kv_role":"kv_consumer"` to Decode. Give each process distinct event ports and a fresh topic. For gRPC, pass the engine options after `--` and set `VLLM_ROUTER_TOKENIZER` for the Router.
+4. Use the [P/D layout](#pd-layout) for hybrid workers. For ordinary full attention, follow the [layout rules above](#when-to-pass-a-layout).
+
+```bash
+PREFILL=http://127.0.0.1:8000
+DECODE=http://127.0.0.1:8001
+# For gRPC, use grpc://127.0.0.1:50051 and grpc://127.0.0.1:50052.
+vllm-router --port 19000 --vllm-pd-disaggregation --prefill "$PREFILL" --decode "$DECODE" \
+  --prefill-policy kv_aware --decode-policy kv_aware --kv-connector nixl
+```
+
+With HTTP workers, use explicit prompt token IDs to get Decode cache credit. With gRPC workers, the Router can also use tokens from its own tokenizer. For a Prefill-only setup, set `--decode-policy round_robin` and omit Decode's event settings and layout entry.
+
+### Ascend Mooncake
+
+Start Prefill and Decode on separate NPUs using the [A2 worker setup](#start-an-a2-worker). Use HTTP port `8000` for Prefill and `8001` for Decode. The table lists 1P1D configurations in which Decode read remote KV. Each engine used DP1. Select MTP or DSpark with the worker's `--speculative-config`. For ordinary full attention, use the [HTTP worker setup](#http-workers) with `PYTHONHASHSEED` unset.
+
+| Checkpoint | Ascend connector | Tested speculation modes | TP per worker |
+| --- | --- | --- | ---: |
+| Qwen3-4B (full attention) | `MooncakeConnectorV1` | Off | 1 |
+| Qwen3.5-4B and Qwen3.6-27B W8A8 | `MooncakeConnectorV1` | Off, MTP, DSpark | 1 |
+| Qwen3.8-27B W8A8 | `MooncakeConnectorV1` | Off, MTP | 1 |
+| Qwen3.8-27B BF16 | `MooncakeConnectorV1` | DSpark | 2 |
+| Qwen3.8-Flash-Next W4A8 | `MooncakeConnectorV2` | Off, MTP | 2 |
+
+Add the transfer option to each worker command. The example uses V1 with TP1. Set the connector name and both `tp_size` values from the table, and give each worker its own `engine_id` and `kv_port`.
+
+```bash
+# Prefill
+--kv-transfer-config '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_producer","kv_buffer_device":"npu","engine_id":"prefill-a2","kv_port":38352,"kv_load_failure_policy":"fail","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":1},"decode":{"dp_size":1,"tp_size":1}}}'
+# Decode
+--kv-transfer-config '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_consumer","kv_buffer_device":"npu","engine_id":"decode-a2","kv_port":38353,"kv_load_failure_policy":"fail","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":1},"decode":{"dp_size":1,"tp_size":1}}}'
+```
+
+For W4A8 Qwen4Exp with V2, add `--mamba-ssm-cache-dtype bfloat16` on both workers. In the Prefill layout, the measured `hash_block_size` and the full attention and Mamba group sizes are 896. The scratch group keeps its mode-specific size from the [colocated recipe](#qwen4exp-w4a8-on-ascend).
+
+Start the Router with `kv_aware` on Prefill. In the [hybrid P/D layout](#pd-layout), add `compatible_decode_urls` to the Prefill entry. For ordinary full attention, follow the [layout rules above](#when-to-pass-a-layout). The bootstrap port is optional when Prefill returns its transfer parameters.
+
+```bash
+vllm-router --port 19000 --vllm-pd-disaggregation \
+  --prefill http://127.0.0.1:8000 --decode http://127.0.0.1:8001 \
+  --prefill-policy kv_aware --decode-policy round_robin --kv-connector mooncake \
+  --kv-hybrid-layout layout.json
+```
+
+For DeepSeek on A2, the [V4 Flash 0731 W8A8 DSpark](https://docs.vllm.ai/projects/ascend/en/main/tutorials/models/DeepSeek-V4-Flash.html#52-pd-separation-deployment) and [V4.1 Flash W4A8](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/DeepSeek-V4.1-Flash.html#52-1p1d-pd-disaggregated-deployment) P/D examples both use `MooncakeHybridConnector`. The [full V4 Flash recipe below](#deepseek-v4-flash-0731-w8a8-on-ascend) covers colocated serving. P/D was verified on the four-layer V4 Flash mini4 checkpoint with speculation off.
+
+Use V1 for the Qwen3.5 and Qwen3.8 configurations above. With `MooncakeHybridConnector`, some requests returned HTTP 200 despite Mamba block-pairing failures on Decode.
+
+### P/D layout
+
+For each hybrid Prefill, declare the Decode URLs compatible with its connector and layout. Use worker base URLs with the transport used by Router. If the worker reports its layout, the entry needs only the compatible Decode URLs.
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "compatible_decode_urls": ["http://127.0.0.1:8001"]
+  }
+}
+```
+
+Include a complete model entry for each scored worker that does not report its layout. The example configures both stages. Use `grpc://` URL keys and matching pairing values for gRPC. Use each stage's effective speculation and cache rules. Leave Program scheduling disabled for hybrid P/D layouts.
+
+<details>
+<summary>Complete P/D layout.json · Qwen3.5-4B with NIXL</summary>
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
+    ],
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "hash_seed": "vllm-none-hash",
+        "full_hashes": true,
+        "hash_block_size": 16,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 0,
+        "prefix_caching": true,
+        "partial_hash_hits": true,
+        "declared_groups": 4,
+        "groups": [
+          {"group_idx": 0, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
+          {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
+          {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
+          {"group_idx": 3, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0}
+        ]
+      }
+    ]
+  },
+  "http://127.0.0.1:8001": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "hash_seed": "vllm-none-hash",
+        "full_hashes": true,
+        "hash_block_size": 16,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 0,
+        "prefix_caching": true,
+        "partial_hash_hits": true,
+        "declared_groups": 4,
+        "groups": [
+          {"group_idx": 0, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
+          {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
+          {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
+          {"group_idx": 3, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0}
+        ]
+      }
+    ]
+  }
+}
+```
+
+</details>
+
+If event discovery is unavailable, include `endpoints` and `replay_endpoints` in rank order, and include `model` and `publisher_topic` for each rank.
+
+Pass the file once by appending `--kv-hybrid-layout layout.json` to the Router command.
+
+## Check cache reuse
+
+In an idle pool, send the same prompt twice. The first request fills the cache. The second should increase the Router's KV-aware hit counter. Set `SERVED_MODEL` to the worker's served name. For the GPU hybrid recipes, start with `PROMPT_TOKENS=2001`. For Ascend, use the prompt length in the [A2 recipe table](#start-an-a2-worker).
+
+```bash
+SERVED_MODEL=qwen3 PROMPT_TOKENS=129
+payload=$(jq -nc --arg model "$SERVED_MODEL" --argjson n "$PROMPT_TOKENS" \
+  '{model:$model,prompt:[range(1000;1000+$n)],max_tokens:1,temperature:0}')
+request() {
+  curl -fsS http://127.0.0.1:19000/v1/completions \
+    -H 'Content-Type: application/json' --data-binary "$payload" >/dev/null
+}
+hits() {
+  curl -fsS http://127.0.0.1:29000/metrics |
+    awk '$1 == "vllm_router_kv_placement_lookups_total{result=\"hit\"}" {hits += $2} END {print hits+0}'
+}
+request && sleep 1 && before=$(hits) && request && after=$(hits) &&
+  printf 'Router KV-aware hits: %s → %s\n' "$before" "$after"
+```
+
+Repeat the last request if events are still arriving. To confirm actual reuse, compare the worker's `prefix_cache_hits_total` before and after the repeat. For P/D, check Prefill.
+
+```bash
+curl -fsS http://127.0.0.1:8000/metrics | grep '^vllm:prefix_cache_hits_total'
+```
+
+On Ascend HTTP, `--enable-prompt-tokens-details` adds `usage.prompt_tokens_details.cached_tokens` to the worker response. For P/D, inspect the Prefill response to check local reuse.
+
+To verify P/D transfer, send a prompt whose KV is absent on Decode. Check Decode's per-request Mooncake completion log or an increase in `vllm:nixl_bytes_transferred_sum` for NIXL. With MTP or DSpark, check that `vllm:spec_decode_num_draft_tokens_total` increases on the worker generating tokens.
+
+Both worker transports accept `/v1/chat/completions` through the Router. On gRPC, `/v1/completions` accepts one flat token-ID array as shown above.
+
 ## Explicit layouts
 
 Use a layout file for hybrid attention, sliding-window attention, speculative decoding, or a custom hash seed when the worker cannot report its complete layout. Choose a recipe below and pass it with `--kv-hybrid-layout layout.json`. Use the worker URL as the JSON key, such as `grpc://127.0.0.1:50051` for the gRPC example. Include one entry per worker URL and one rank record per DP rank.
 
-The Router discovers the served model, publisher topic, and live and replay addresses. For [static event sources](#static-event-endpoints), also declare `model` and `publisher_topic` per rank. Use the group IDs, block sizes, and reuse rules of the running worker. A different checkpoint, engine version, or speculation mode can change the layout.
+With event discovery, the Router reads the served model, publisher topic, and live and replay addresses. For [static event sources](#static-event-endpoints), include `model` and `publisher_topic` per rank. Use the group IDs, block sizes, and reuse rules of the running worker. A different checkpoint, engine version, or speculation mode can change the layout.
 
 For a hybrid worker with static events, set `--kv-event-block-size` to the recipe's `hash_block_size`.
 
@@ -677,7 +847,7 @@ vllm-router --host 127.0.0.1 --port 19000 --prometheus-port 29000 \
   --policy kv_aware --worker-urls http://127.0.0.1:8000 --kv-hybrid-layout layout.json
 ```
 
-The layouts use `hash_seed: "0"` to match the worker. Keep `sha256_cbor`, full-width hashes, and incremental reporting enabled. The examples rely on HTTP event discovery. For fixed endpoints without discovery, include the live and replay addresses in the layout and put the worker's served model and the generated topic in its rank record. Choose distinct HTTP, live and replay ports for each worker on the same host.
+The layouts use `hash_seed: "0"` to match the worker and rely on HTTP event discovery. For static endpoints, follow the [static event setup](#static-event-endpoints). Use distinct HTTP, live, and replay ports for workers on the same host.
 
 Select one method in `--speculative-config` per worker. To turn speculation off, omit the option and use the layout for that mode. The measured A2 recipes below publish zero hash lookahead. Set `speculative_tokens` to the configured draft length and `hash_lookahead_tokens` to the number of lookahead tokens actually used by the hash. Use an empty `tail_drop_groups` array only when the engine's cache lookup skips the last-unit drop.
 
@@ -1039,170 +1209,7 @@ The measured layout applies with DSpark off by omitting `--speculative-config` a
 
 </details>
 
-The [Ascend V4.1 Flash guide](https://github.com/vllm-project/vllm-ascend/blob/main/docs/source/tutorials/models/DeepSeek-V4.1-Flash.md#55-multi-node-colocated-deployment) uses two A2 nodes for the full-weight colocated DSpark example. Use that model's own runtime layout. The Flash 0731 layout above applies to V4 Flash.
-
-## P/D routing
-
-P/D disaggregation puts prompt processing on Prefill workers and token generation on Decode workers. The example below uses NIXL and enables `kv_aware` on both stages.
-
-1. Start two workers on different GPUs with the same checkpoint, vLLM version, connector and transport. Keep Prefill on HTTP port `8000` or gRPC port `50051`. Move Decode to HTTP port `8001` and, for a gRPC worker, gRPC port `50052`.
-2. Set `VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1` on both workers. Set `VLLM_NIXL_SIDE_CHANNEL_PORT=5600` on Prefill and `5601` on Decode. For separate hosts, use reachable addresses.
-3. Add `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'` to Prefill and the same option with `"kv_role":"kv_consumer"` to Decode. Enable prefix caching, `sha256_cbor`, and live and replay events on both stages. Give each process a distinct event port and topic. For gRPC, pass the engine options after `--`.
-4. For hybrid models, pass the [P/D layout](#pd-layout). Ordinary single-group workers with event discovery can omit it.
-
-Follow the transport setup for each scored worker and the Router ([HTTP](#http-workers) or [gRPC](#grpc-workers)).
-
-```bash
-PREFILL=http://127.0.0.1:8000
-DECODE=http://127.0.0.1:8001
-# For gRPC, use grpc://127.0.0.1:50051 and grpc://127.0.0.1:50052.
-vllm-router --port 19000 --vllm-pd-disaggregation --prefill "$PREFILL" --decode "$DECODE" \
-  --prefill-policy kv_aware --decode-policy kv_aware --kv-connector nixl
-```
-
-With HTTP workers, use explicit prompt token IDs to get Decode cache credit. With gRPC workers, the Router can also use tokens from its own tokenizer. For a Prefill-only setup, set `--decode-policy round_robin` and omit Decode's event settings and layout entry.
-
-#### Ascend Mooncake
-
-On A2, the vLLM Ascend Mooncake connector transfers KV from Prefill to Decode. The Router's `kv_aware` policy scores reuse for Prefill selection, and `--kv-connector mooncake` selects the P/D handoff. Run the two workers on separate NPUs. Each worker used DP1. Configure MTP or DSpark through the worker's `--speculative-config`. The results below verify each connector and speculation mode together.
-
-| Checkpoint | Ascend connector | Tested speculation modes | TP per worker |
-| --- | --- | --- | ---: |
-| Qwen3-4B (full attention) | `MooncakeConnectorV1` | Off | 1 |
-| Qwen3.5-4B and Qwen3.6-27B W8A8 | `MooncakeConnectorV1` | Off, MTP, DSpark | 1 |
-| Qwen3.8-27B W8A8 | `MooncakeConnectorV1` | Off, MTP | 1 |
-| Qwen3.8-27B BF16 | `MooncakeConnectorV1` | DSpark | 2 |
-| Qwen3.8-Flash-Next W4A8 | `MooncakeConnectorV2` | Off, MTP | 2 |
-
-Add the matching transfer option to each worker command. The example uses V1 with TP1. Give each worker its own `engine_id` and `kv_port`. Set both `tp_size` values to match the selected worker configuration.
-
-```bash
-# Prefill
---kv-transfer-config '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_producer","kv_buffer_device":"npu","engine_id":"prefill-a2","kv_port":38352,"kv_load_failure_policy":"fail","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":1},"decode":{"dp_size":1,"tp_size":1}}}'
-# Decode
---kv-transfer-config '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_consumer","kv_buffer_device":"npu","engine_id":"decode-a2","kv_port":38353,"kv_load_failure_policy":"fail","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":1},"decode":{"dp_size":1,"tp_size":1}}}'
-```
-
-For W4A8 Qwen4Exp with V2, add `--mamba-ssm-cache-dtype bfloat16` on both workers. In the Prefill layout, the measured `hash_block_size` and the full attention and Mamba group sizes are 896. The scratch group keeps its mode-specific size from the [colocated recipe](#qwen4exp-w4a8-on-ascend).
-
-Add `compatible_decode_urls` to each Prefill entry as shown in [P/D layout](#pd-layout). Use `--prefill-policy kv_aware --decode-policy round_robin --kv-connector mooncake` in the Router and supply the Prefill layout. The optional bootstrap port can be omitted when Prefill returns the transfer parameters.
-
-For DeepSeek V4, follow the Ascend P/D recipe for your checkpoint and engine version. The A2 1P1D test used `MooncakeHybridConnector` with the four-layer V4 Flash mini4 checkpoint and speculation off. The full W8A8 DSpark checkpoint was verified in colocated mode.
-
-Verify Decode reads using per-request Mooncake completion logs. With `MooncakeHybridConnector`, some Qwen3.5 and Qwen3.8 requests failed during Mamba block pairing before Decode could read the KV, even when the API returned HTTP 200. Use the tested connectors in the table for those Qwen configurations.
-
-### P/D layout
-
-For each hybrid Prefill, declare the Decode URLs compatible with its connector and layout. Use worker base URLs with the transport used by Router. If the worker reports its layout, the entry needs only the compatible Decode URLs.
-
-```json
-{
-  "http://127.0.0.1:8000": {
-    "compatible_decode_urls": ["http://127.0.0.1:8001"]
-  }
-}
-```
-
-Include a complete model entry for each scored worker that does not report its layout. The example configures both stages. Use `grpc://` URL keys and matching pairing values for gRPC. Use each stage's effective speculation and cache rules. Leave Program scheduling disabled for hybrid P/D layouts.
-
-<details>
-<summary>Complete P/D layout.json · Qwen3.5-4B with NIXL</summary>
-
-```json
-{
-  "http://127.0.0.1:8000": {
-    "schema_version": 1,
-    "compatible_decode_urls": [
-      "http://127.0.0.1:8001"
-    ],
-    "ranks": [
-      {
-        "rank": 0,
-        "weight_version": "default",
-        "instance_topic": true,
-        "hash_algorithm": "sha256_cbor",
-        "hash_seed": "vllm-none-hash",
-        "full_hashes": true,
-        "hash_block_size": 16,
-        "hash_lookahead_tokens": 0,
-        "speculative_tokens": 0,
-        "prefix_caching": true,
-        "partial_hash_hits": true,
-        "declared_groups": 4,
-        "groups": [
-          {"group_idx": 0, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
-          {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
-          {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
-          {"group_idx": 3, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0}
-        ]
-      }
-    ]
-  },
-  "http://127.0.0.1:8001": {
-    "schema_version": 1,
-    "ranks": [
-      {
-        "rank": 0,
-        "weight_version": "default",
-        "instance_topic": true,
-        "hash_algorithm": "sha256_cbor",
-        "hash_seed": "vllm-none-hash",
-        "full_hashes": true,
-        "hash_block_size": 16,
-        "hash_lookahead_tokens": 0,
-        "speculative_tokens": 0,
-        "prefix_caching": true,
-        "partial_hash_hits": true,
-        "declared_groups": 4,
-        "groups": [
-          {"group_idx": 0, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
-          {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
-          {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
-          {"group_idx": 3, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0}
-        ]
-      }
-    ]
-  }
-}
-```
-
-</details>
-
-If event discovery is unavailable, include `endpoints` and `replay_endpoints` in rank order, and include `model` and `publisher_topic` for each rank.
-
-Pass the file once by appending `--kv-hybrid-layout layout.json` to the Router command.
-
-## Check cache reuse
-
-In an idle pool, send the same prompt twice. The first request fills the cache. The second should increase the Router's KV-aware hit counter. Set `SERVED_MODEL` to the worker's served name. For the GPU hybrid recipes above, start with `PROMPT_TOKENS=2001`. For Ascend, use the prompt length in the [A2 recipe table](#start-an-a2-worker).
-
-```bash
-SERVED_MODEL=qwen3 PROMPT_TOKENS=129
-payload=$(jq -nc --arg model "$SERVED_MODEL" --argjson n "$PROMPT_TOKENS" \
-  '{model:$model,prompt:[range(1000;1000+$n)],max_tokens:1,temperature:0}')
-request() {
-  curl -fsS http://127.0.0.1:19000/v1/completions \
-    -H 'Content-Type: application/json' --data-binary "$payload" >/dev/null
-}
-hits() {
-  curl -fsS http://127.0.0.1:29000/metrics |
-    awk '$1 == "vllm_router_kv_placement_lookups_total{result=\"hit\"}" {hits += $2} END {print hits+0}'
-}
-request && sleep 1 && before=$(hits) && request && after=$(hits) &&
-  printf 'Router KV-aware hits: %s → %s\n' "$before" "$after"
-```
-
-Repeat the last request if events are still arriving. To confirm actual reuse, compare the worker's `prefix_cache_hits_total` before and after the repeat. For P/D, check Prefill.
-
-```bash
-curl -fsS http://127.0.0.1:8000/metrics | grep '^vllm:prefix_cache_hits_total'
-```
-
-For Ascend HTTP, `--enable-prompt-tokens-details` exposes the worker's cached-token count. To display it in the check above, replace `>/dev/null` with `| jq '.usage.prompt_tokens_details.cached_tokens'`. Once events have arrived, the repeated prompt should report positive cached tokens and increase the Router hit counter. For P/D, check the Prefill response for local reuse and the Decode connector log for remote reads. With MTP or DSpark enabled, verify that `vllm:spec_decode_num_draft_tokens_total` increases on the worker generating tokens.
-
-To confirm NIXL transfer, send a fresh prompt and compare `vllm:nixl_bytes_transferred_sum` on Decode's metrics port before and after the request.
-
-Both worker transports accept `/v1/chat/completions` through the Router. On gRPC, `/v1/completions` accepts one flat token-ID array as shown above.
+For V4.1 Flash, use the model's own runtime layout and the [Ascend V4.1 Flash deployment guide](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/DeepSeek-V4.1-Flash.html#55-multi-node-colocated-deployment). Its colocated DSpark example uses two A2 nodes.
 
 ## Versions
 
