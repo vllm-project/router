@@ -39,7 +39,9 @@ pub enum GroupRule {
 }
 
 impl GroupRule {
-    fn is_dense_attention(self) -> bool {
+    // vLLM registers MLAAttentionSpec with FullAttentionManager too. Either
+    // kind can drop a lookup unit when the engine reports that group.
+    fn uses_full_attention_lookup(self) -> bool {
         matches!(
             self,
             Self::FullAttention | Self::CompressedFullAttention { .. }

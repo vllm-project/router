@@ -17,26 +17,17 @@ fn target(name: &str, rank: u32) -> RoutableTarget {
 
 #[test]
 fn aligned_tail_requires_dense_and_window_guard_pages() {
-    let evidence = |group_idx, block_size, kind, segments| GroupEvidence {
-        group: CacheGroup {
-            group_idx,
-            block_size,
-            kind,
-        },
-        segments,
-        partial_ends: Vec::new(),
-    };
     let mut groups = [
-        evidence(0, 560, GroupRule::Checkpoint, vec![(3, 4), (7, 8)]),
-        evidence(5, 560, GroupRule::FullAttention, vec![(0, 10)]),
-        evidence(6, 560, GroupRule::FullAttention, vec![(0, 10)]),
-        evidence(
+        group(0, 560, GroupRule::Checkpoint, &[(3, 4), (7, 8)]),
+        group(5, 560, GroupRule::FullAttention, &[(0, 10)]),
+        group(6, 560, GroupRule::FullAttention, &[(0, 10)]),
+        group(
             7,
             64,
             GroupRule::SlidingWindow {
                 window_tokens: 2048,
             },
-            vec![(3, 80)],
+            &[(3, 80)],
         ),
     ];
     let tail = AlignedTailDrop {
@@ -387,6 +378,64 @@ fn group(id: u32, block_size: u32, kind: GroupRule, segments: &[(u32, u32)]) -> 
 }
 
 #[test]
+fn invalid_page_units_and_overflow_do_not_produce_credit() {
+    use crate::kv_index::storage::PageTiers;
+
+    let target = target("worker", 0);
+    let dense = group(0, 16, GroupRule::FullAttention, &[]).group;
+    let invalid_group = CacheGroup {
+        block_size: 0,
+        ..dense
+    };
+    let pages = |prefix_len, tail| PageTiers {
+        prefix_len,
+        prefix: TierBits(TierBits::bit(StorageTier::Device)),
+        tail,
+    };
+    for (group, hash_unit, score_unit) in [(dense, 0, 16), (dense, 16, 0), (invalid_group, 16, 16)]
+    {
+        assert!(full_attention_matches(
+            &target,
+            &group,
+            pages(1, Default::default()),
+            hash_unit,
+            score_unit,
+            16,
+        )
+        .is_empty());
+    }
+    for (group, hash_unit, len) in [
+        (dense, 0, 1),
+        (invalid_group, 16, 1),
+        (dense, 16, u32::MAX as usize),
+    ] {
+        assert_eq!(
+            credit_from_pages(
+                &[group],
+                &[pages(len, vec![TierBits::default()].into())],
+                hash_unit,
+                16,
+                0,
+                TailDrop::default(),
+            ),
+            (0, None)
+        );
+    }
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(
+        credit_from_pages(
+            &[dense],
+            &[pages(u32::MAX as usize + 1, Default::default())],
+            16,
+            16,
+            0,
+            TailDrop::default(),
+        ),
+        (0, None)
+    );
+}
+
+#[test]
 fn restore_rules_respect_the_cap_and_page_gaps() {
     let dense = [(0, 4)];
     let cases = [
@@ -691,7 +740,7 @@ mod declarations {
         });
         let mut value = serde_json::json!({"schema_version": 1, "ranks": [{
             "rank": 0, "model": "v41", "weight_version": "default",
-            "weight_identity": "model-sha256", "publisher_topic": "epoch-1",
+            "publisher_topic": "epoch-1",
             "instance_topic": true, "hash_algorithm": "sha256_cbor",
             "full_hashes": true,
             "root_hash": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
@@ -723,7 +772,7 @@ mod declarations {
             })
         };
         serde_json::json!({"schema_version": 1, "ranks": [{
-            "rank": 0, "model": "qwen", "weight_version": "default", "weight_identity": "model-sha256",
+            "rank": 0, "model": "qwen", "weight_version": "default",
             "publisher_topic": "epoch-1", "instance_topic": true,
             "hash_algorithm": "sha256_cbor", "full_hashes": true,
             "root_hash": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
@@ -886,7 +935,7 @@ mod declarations {
         };
         let mut value = serde_json::json!({"schema_version": 1, "ranks": [{
             "rank": 0, "model": "deepseek-v4", "weight_version": "default",
-            "weight_identity": null, "publisher_topic": "ds4", "instance_topic": true,
+            "publisher_topic": "ds4", "instance_topic": true,
             "hash_algorithm": "sha256_cbor", "root_hash":
                 "9bd96a485ad84efdafb72ee48a1d7a69bcead0f8f0433173941b276b9581eef0",
             "full_hashes": true, "hash_block_size": 4, "hash_lookahead_tokens": 0,
@@ -962,7 +1011,6 @@ mod declarations {
         // compressed MLA group whose states cover four tokens each.
         let mut value = serde_json::json!({"schema_version": 1, "ranks": [{
             "rank": 0, "model": "qwen4", "weight_version": "default",
-            "weight_identity": "qwen4-sha256",
             "publisher_topic": "kv-events", "instance_topic": true,
             "hash_algorithm": "sha256_cbor", "full_hashes": true,
             "root_hash": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",

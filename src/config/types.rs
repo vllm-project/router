@@ -14,7 +14,6 @@ pub struct RouterConfig {
     /// Optional encoder orchestration for E+PD or E/P/D routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epd: Option<EpdConfig>,
-    /// Routing mode configuration
     pub mode: RoutingMode,
     /// Statically configured KV event sources, keyed by prefill base URL.
     /// Workers listed here skip HTTP control-plane discovery and probing.
@@ -23,34 +22,24 @@ pub struct RouterConfig {
     /// Opt in to hiding KV placement until a complete authoritative recovery.
     #[serde(default)]
     pub kv_event_strict_recovery: bool,
-    /// Worker connection mode
     #[serde(default)]
     pub connection_mode: ConnectionMode,
-    /// Policy configuration
     pub policy: PolicyConfig,
-    /// Server host address
     pub host: String,
-    /// Server port
     pub port: u16,
-    /// Maximum payload size in bytes
     pub max_payload_size: usize,
-    /// Request timeout in seconds
     pub request_timeout_secs: u64,
-    /// Worker startup timeout in seconds
     pub worker_startup_timeout_secs: u64,
     /// Worker health check interval in seconds
     pub worker_startup_check_interval_secs: u64,
     /// Intra-node data parallel size (number of DP replicas per worker URL). When > 1, the router will create multiple worker instances per URL, one for each DP rank.
     #[serde(default = "default_intra_node_data_parallel_size")]
     pub intra_node_data_parallel_size: usize,
-    /// The api key used for the authorization with the worker
     pub api_key: Option<String>,
     /// API key validation URLs (if set, incoming requests must validate against them)
     #[serde(default)]
     pub api_key_validation_urls: Vec<String>,
-    /// Service discovery configuration (optional)
     pub discovery: Option<DiscoveryConfig>,
-    /// Metrics configuration (optional)
     pub metrics: Option<MetricsConfig>,
     /// Log directory (None = stdout only)
     pub log_dir: Option<String>,
@@ -66,11 +55,8 @@ pub struct RouterConfig {
     pub queue_timeout_secs: u64,
     /// Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
     pub rate_limit_tokens_per_second: Option<usize>,
-    /// CORS allowed origins
     pub cors_allowed_origins: Vec<String>,
-    /// Retry configuration
     pub retry: RetryConfig,
-    /// Circuit breaker configuration
     pub circuit_breaker: CircuitBreakerConfig,
     /// Disable retries (overrides retry.max_retries to 1 when true)
     #[serde(default)]
@@ -83,7 +69,6 @@ pub struct RouterConfig {
     /// `None` disables affinity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_aware_session_affinity_ttl_secs: Option<u64>,
-    /// Health check configuration
     pub health_check: HealthCheckConfig,
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
     #[serde(default)]
@@ -1486,25 +1471,6 @@ impl RouterConfig {
         ConfigValidator::validate(self)
     }
 
-    /// Get the routing mode type as a string
-    pub fn mode_type(&self) -> &'static str {
-        match self.mode {
-            RoutingMode::Regular { .. } => "regular",
-            RoutingMode::VllmPrefillDecode { .. } => "vllm_prefill_decode",
-            RoutingMode::OpenAI { .. } => "openai",
-        }
-    }
-
-    /// Check if service discovery is enabled
-    pub fn has_service_discovery(&self) -> bool {
-        self.discovery.as_ref().is_some_and(|d| d.enabled)
-    }
-
-    /// Check if metrics are enabled
-    pub fn has_metrics(&self) -> bool {
-        self.metrics.is_some()
-    }
-
     /// Compute the effective retry config considering disable flag
     pub fn effective_retry_config(&self) -> RetryConfig {
         let mut cfg = self.retry.clone();
@@ -1521,11 +1487,6 @@ impl RouterConfig {
             cfg.failure_threshold = u32::MAX;
         }
         cfg
-    }
-
-    /// Check if running in IGW (Inference Gateway) mode
-    pub fn is_igw_mode(&self) -> bool {
-        self.enable_igw
     }
 }
 
@@ -2039,50 +2000,6 @@ mod tests {
         assert!(json.contains("\"load_check_interval_secs\":60"));
     }
 
-    #[test]
-    fn test_cache_aware_parameters() {
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.75,
-            balance_abs_threshold: 20,
-            balance_rel_threshold: 2.0,
-            eviction_interval_secs: 600,
-            max_tree_size: 5000,
-        };
-
-        match cache_aware {
-            PolicyConfig::CacheAware {
-                cache_threshold,
-                balance_abs_threshold,
-                balance_rel_threshold,
-                eviction_interval_secs,
-                max_tree_size,
-            } => {
-                assert!((cache_threshold - 0.75).abs() < 0.0001);
-                assert_eq!(balance_abs_threshold, 20);
-                assert!((balance_rel_threshold - 2.0).abs() < 0.0001);
-                assert_eq!(eviction_interval_secs, 600);
-                assert_eq!(max_tree_size, 5000);
-            }
-            _ => panic!("Expected CacheAware"),
-        }
-    }
-
-    #[test]
-    fn test_power_of_two_parameters() {
-        let power_of_two = PolicyConfig::PowerOfTwo {
-            load_check_interval_secs: 120,
-        };
-
-        match power_of_two {
-            PolicyConfig::PowerOfTwo {
-                load_check_interval_secs,
-            } => {
-                assert_eq!(load_check_interval_secs, 120);
-            }
-            _ => panic!("Expected PowerOfTwo"),
-        }
-    }
-
     // ============= DiscoveryConfig Tests =============
 
     #[test]
@@ -2159,134 +2076,6 @@ mod tests {
 
         assert_eq!(config.port, 9090);
         assert_eq!(config.host, "0.0.0.0");
-    }
-
-    // ============= RouterConfig Utility Methods Tests =============
-
-    #[test]
-    fn test_mode_type() {
-        let config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec![],
-            },
-            ..Default::default()
-        };
-        assert_eq!(config.mode_type(), "regular");
-
-        let config = RouterConfig {
-            mode: RoutingMode::VllmPrefillDecode {
-                prefill_urls: vec![],
-                decode_urls: vec![],
-                prefill_policy: None,
-                decode_policy: None,
-                discovery_address: None,
-            },
-            ..Default::default()
-        };
-        assert_eq!(config.mode_type(), "vllm_prefill_decode");
-    }
-
-    #[test]
-    fn test_has_service_discovery() {
-        let config = RouterConfig::default();
-        assert!(!config.has_service_discovery());
-
-        let config = RouterConfig {
-            discovery: Some(DiscoveryConfig {
-                enabled: false,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(!config.has_service_discovery());
-
-        let config = RouterConfig {
-            discovery: Some(DiscoveryConfig {
-                enabled: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(config.has_service_discovery());
-    }
-
-    #[test]
-    fn test_has_metrics() {
-        let config = RouterConfig::default();
-        assert!(!config.has_metrics());
-
-        let config = RouterConfig {
-            metrics: Some(MetricsConfig::default()),
-            ..Default::default()
-        };
-        assert!(config.has_metrics());
-    }
-
-    // ============= Edge Cases =============
-
-    #[test]
-    fn test_large_worker_lists() {
-        let large_urls: Vec<String> = (0..1000).map(|i| format!("http://worker{}", i)).collect();
-
-        let mode = RoutingMode::Regular {
-            worker_urls: large_urls.clone(),
-        };
-
-        assert_eq!(mode.worker_count(), 1000);
-
-        // Test serialization with large list
-        let config = RouterConfig {
-            mode,
-            ..Default::default()
-        };
-
-        let json = serde_json::to_string(&config).unwrap();
-        let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
-
-        match deserialized.mode {
-            RoutingMode::Regular { worker_urls } => {
-                assert_eq!(worker_urls.len(), 1000);
-            }
-            _ => panic!("Expected Regular mode"),
-        }
-    }
-
-    #[test]
-    fn test_unicode_in_config() {
-        let config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec!["http://работник1".to_string(), "http://工作者2".to_string()],
-            },
-            log_dir: Some("/日志/目录".to_string()),
-            ..Default::default()
-        };
-
-        let json = serde_json::to_string(&config).unwrap();
-        let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
-
-        match deserialized.mode {
-            RoutingMode::Regular { worker_urls } => {
-                assert_eq!(worker_urls[0], "http://работник1");
-                assert_eq!(worker_urls[1], "http://工作者2");
-            }
-            _ => panic!("Expected Regular mode"),
-        }
-
-        assert_eq!(deserialized.log_dir, Some("/日志/目录".to_string()));
-    }
-
-    #[test]
-    fn test_empty_string_fields() {
-        let config = RouterConfig {
-            host: "".to_string(),
-            log_dir: Some("".to_string()),
-            log_level: Some("".to_string()),
-            ..Default::default()
-        };
-
-        assert_eq!(config.host, "");
-        assert_eq!(config.log_dir, Some("".to_string()));
-        assert_eq!(config.log_level, Some("".to_string()));
     }
 
     // ============= Policy Fallback Tests =============

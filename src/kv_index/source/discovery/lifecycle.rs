@@ -497,7 +497,7 @@ impl InstalledWorkers {
     }
 
     /// Decrement an identity's ref-count; on last release drop its indexer.
-    fn release_identity(&self, key: &CacheKey) {
+    pub(super) fn release_identity(&self, key: &CacheKey) {
         let mut refs = self.identity_refs.lock();
         if let Some(c) = refs.get_mut(key) {
             *c = c.saturating_sub(1);

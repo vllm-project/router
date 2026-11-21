@@ -79,7 +79,8 @@ pub(super) fn restore_boundary(
         }
     } else if let Some(group_idx) = tail_drop_group {
         let Some(index) = groups.iter().position(|evidence| {
-            evidence.group.group_idx == group_idx && evidence.group.kind.is_dense_attention()
+            evidence.group.group_idx == group_idx
+                && evidence.group.kind.uses_full_attention_lookup()
         }) else {
             return (0, SmallVec::new());
         };

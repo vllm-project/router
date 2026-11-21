@@ -1887,15 +1887,6 @@ impl KvAwarePolicy {
             },
         )
     }
-
-    pub fn decision_for(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        token_ids: Option<&[u32]>,
-    ) -> Option<CostDecision> {
-        self.select_worker_pure(workers, token_ids, None, None)
-            .map(|(_, decision)| decision)
-    }
 }
 
 impl Default for KvAwarePolicy {

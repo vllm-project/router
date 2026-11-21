@@ -78,7 +78,7 @@ fn decode_event(event: Value) -> Result<KVEvent, String> {
         "kv_cache_spec_sliding_window",
         "locality",
         "ownership",
-        "session_id",
+        "session_id", // Accepted for older publishers. Residency does not use it.
         "lookahead_token_ids",
     ];
     let pairs = event.as_map().ok_or("KV event must be a tagged map")?;
@@ -161,10 +161,9 @@ fn decode_event(event: Value) -> Result<KVEvent, String> {
                     }
                 }
             }
-            Some(
-                "medium" | "lora_name" | "kv_cache_spec_kind" | "locality" | "ownership"
-                | "session_id",
-            ) if !matches!(value, Value::String(_) | Value::Nil) => {
+            Some("medium" | "lora_name" | "kv_cache_spec_kind" | "locality" | "ownership")
+                if !matches!(value, Value::String(_) | Value::Nil) =>
+            {
                 return Err(format!("KV event field {key} must be a string or nil"));
             }
             _ => {}
@@ -268,7 +267,7 @@ mod tests {
             ("medium", "CPU".into()),
             ("ownership", "TRANSFERRED".into()),
             ("locality", "REMOTE".into()),
-            ("session_id", "session".into()),
+            ("session_id", 42.into()),
             ("lora_id", 9.into()),
             ("lora_name", "adapter".into()),
             ("extra_keys", Value::Array(vec!["salt".into()])),
@@ -573,7 +572,6 @@ mod tests {
                     "kv_cache_spec_kind",
                     "locality",
                     "ownership",
-                    "session_id",
                 ][..],
             ),
             (removed, &["medium", "locality", "ownership"][..]),

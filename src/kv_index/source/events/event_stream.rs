@@ -352,7 +352,9 @@ impl Drop for EventSubscriberHandle {
 }
 
 /// Attach to one publisher incarnation using its replay stream.
-pub fn spawn_zmq(
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn spawn_zmq(
     source: EventSource,
     stream: Arc<EventStream>,
     ctx: Arc<zmq::Context>,

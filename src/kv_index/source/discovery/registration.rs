@@ -87,10 +87,15 @@ impl KvIndexSupervisor {
                         worker_url
                     ),
                     SourcesProbe::Failed => warn!(
-                        "kv_index {}: {} probe failed: {} ? will retry",
+                        "kv_index {}: {} probe failed: {}; will retry",
                         worker_url,
                         event_source_label(worker_url),
                         unavailable.detail
+                    ),
+                    SourcesProbe::StaticMismatch => warn!(
+                        worker_url,
+                        reason = unavailable.detail,
+                        "configured KV event sources rejected"
                     ),
                 }
                 return Ok(WorkerKvInfo {
@@ -234,7 +239,7 @@ impl KvIndexSupervisor {
         }) {
             return Err("KV worker origins must be independent".into());
         }
-        let mut replay_endpoints = Vec::new();
+        let mut seen_replays = HashSet::new();
         let mut live_endpoints = HashSet::new();
         for source in &event_sources {
             // Topic-specific continuity requires one publisher stream per rank.
@@ -243,14 +248,13 @@ impl KvIndexSupervisor {
             }
             if let Some(endpoint) = &source.replay_endpoint {
                 // This replay protocol sends only start_seq, not a source key.
-                if replay_endpoints.contains(endpoint)
+                if !seen_replays.insert(endpoint)
                     || workers.iter().any(|(url, worker)| {
                         url != worker_url && worker.replay_endpoints.contains(endpoint)
                     })
                 {
                     return Err("KV replay endpoints must be independent".into());
                 }
-                replay_endpoints.push(endpoint.clone());
             }
             for (url, worker) in workers.iter().filter(|(url, _)| url.as_str() != worker_url) {
                 if worker
@@ -271,34 +275,28 @@ impl KvIndexSupervisor {
         // Publish the new registration while holding the source-owner lock.
         let active = Arc::new(AtomicBool::new(true));
         let lifecycle = Arc::new(WorkerLifecycle::new(active.clone(), true, descriptor));
-        let live_sources: Vec<_> = event_sources
-            .iter()
-            .map(|source| LiveSource {
-                publisher: source.pub_endpoint.clone(),
-                topic: source.topic.clone(),
-                rank: source.dp_rank,
-                lease: crate::kv_index::source::binding::SourceLease {
-                    strict_rank: Arc::new(Mutex::new(true)),
-                    active: active.clone(),
-                },
-            })
-            .collect();
         if let Some(previous) = workers.remove(worker_url) {
             self.installed.retire_worker(previous);
         }
         let indexer = self.installed.acquire_identity(&key);
         let mut ranks = Vec::with_capacity(event_sources.len());
         let mut handles = Vec::with_capacity(event_sources.len());
+        let mut live_sources = Vec::with_capacity(event_sources.len());
+        let mut replay_endpoints = Vec::new();
         let mut targets = Vec::new();
         let mut indexes = HashMap::default();
-        for (ev, live) in event_sources.into_iter().zip(&live_sources) {
+        for ev in event_sources {
             let rank = ev.dp_rank;
+            let lease = crate::kv_index::source::binding::SourceLease {
+                strict_rank: Arc::new(Mutex::new(true)),
+                active: active.clone(),
+            };
             let index = Arc::new(
                 bindings
                     .remove(&rank)
                     .expect("admitted rank has a source binding")
                     .with_shared_index(indexer.clone())
-                    .with_source_binding(live.lease.clone()),
+                    .with_source_binding(lease.clone()),
             );
             let stream = Arc::new(
                 EventStream::new(index.clone()).with_strict_recovery(self.strict_recovery),
@@ -315,6 +313,13 @@ impl KvIndexSupervisor {
                     continue;
                 }
             };
+            live_sources.push(LiveSource {
+                publisher: ev.pub_endpoint.clone(),
+                topic: ev.topic.clone(),
+                rank,
+                lease,
+            });
+            replay_endpoints.extend(ev.replay_endpoint.clone());
             targets.push((ev, index.clone()));
             indexes.insert(rank, index);
             handles.push(Arc::new(handle));
@@ -323,6 +328,10 @@ impl KvIndexSupervisor {
                 worker_url, rank, instance_id
             );
             ranks.push(rank);
+        }
+        if ranks.is_empty() {
+            self.installed.release_identity(&key);
+            return Err("no KV event subscribers started".into());
         }
 
         let provider = Arc::new(LayoutWorkerProvider {
@@ -361,7 +370,7 @@ impl KvIndexSupervisor {
         };
         {
             let mut state = lifecycle.state.lock();
-            state.info = (!info.ranks.is_empty()).then(|| info.clone());
+            state.info = Some(info.clone());
             state.base_models = discovery.base_models.unwrap_or_default();
         }
         self.lifecycles

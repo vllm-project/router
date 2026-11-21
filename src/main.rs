@@ -456,7 +456,7 @@ struct CliArgs {
     #[arg(long, default_value_t = false)]
     profile: bool,
 
-    /// KV connector type for PD disaggregation (nixl or mooncake)
+    /// KV connector for P/D disaggregation
     #[arg(long, value_enum, default_value_t = KvConnector::Nixl)]
     kv_connector: KvConnector,
 }

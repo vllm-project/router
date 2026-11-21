@@ -789,6 +789,14 @@ async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
         static_hybrid_sources_match(&client, &worker, None, &discovery, None).await,
         StaticHybridMatch::Differs
     );
+    let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(client.clone());
+    let supervisor =
+        supervisor.with_static_sources(HashMap::from([(worker.clone(), config.clone())]));
+    let rejected = supervisor.discover(&worker).await;
+    let unavailable = rejected.sources.as_ref().unwrap_err();
+    assert_eq!(unavailable.probe, SourcesProbe::StaticMismatch);
+    assert!(!unavailable.probe.retryable());
+    assert!(super::probe::worker_descriptor(&rejected).is_ok());
     let installed = HashMap::from([(
         0,
         BoundSource {

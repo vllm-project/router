@@ -139,6 +139,8 @@ pub(crate) enum SourcesProbe {
     Unsupported,
     /// Transport or server failure; the next discovery pass retries.
     Failed,
+    /// The declared source disagrees with the worker or is malformed.
+    StaticMismatch,
 }
 
 impl SourcesProbe {
@@ -343,10 +345,13 @@ impl KvIndexSupervisor {
         }
         per_rank.sort_by_key(|(rank, _, _)| *rank);
         if let Some(duplicate) = per_rank.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-            return Some(failed_hybrid_discovery(format!(
-                "duplicate static KV event sources for DP rank {} of {worker_url}",
-                duplicate[0].0
-            )));
+            return Some(failed_hybrid_discovery(
+                SourcesProbe::StaticMismatch,
+                format!(
+                    "duplicate static KV event sources for DP rank {} of {worker_url}",
+                    duplicate[0].0
+                ),
+            ));
         }
         let mut per_rank = per_rank.into_iter();
         let mut merged = if let Some(source) = exact {
@@ -364,9 +369,10 @@ impl KvIndexSupervisor {
             // Overlay publishers by DP rank, keeping each replay address
             // attached to its live publisher, even across sparse rank IDs.
             let (Ok(sources), Ok(new_sources)) = (&mut merged.sources, overlay.sources) else {
-                return Some(failed_hybrid_discovery(format!(
-                    "invalid static KV event sources for {worker_url}"
-                )));
+                return Some(failed_hybrid_discovery(
+                    SourcesProbe::StaticMismatch,
+                    format!("invalid static KV event sources for {worker_url}"),
+                ));
             };
             sources.extend(new_sources);
             if merged
@@ -442,12 +448,18 @@ impl KvIndexSupervisor {
             Some(discovery) if layout_only(&discovery) => {
                 self.discover_declared_layout(worker_url, discovery).await
             }
-            Some(discovery) => {
+            Some(mut discovery) => {
                 if discovery.sources.is_err() {
                     return discovery;
                 }
-                if let Err(reason) = self.verify_static_source(worker_url, &discovery).await {
-                    return failed_hybrid_discovery(reason.into());
+                if let Err((probe, reason)) =
+                    self.verify_static_source(worker_url, &discovery).await
+                {
+                    discovery.sources = Err(SourcesUnavailable {
+                        probe,
+                        detail: reason.into(),
+                    });
+                    return discovery;
                 }
                 info!(worker_url, "using configured static KV event sources");
                 discovery
@@ -592,13 +604,21 @@ impl KvIndexSupervisor {
             return discovery;
         };
         if sources.is_empty() {
-            return failed_hybrid_discovery("worker reports no KV event sources".into());
+            return failed_hybrid_discovery(
+                SourcesProbe::Failed,
+                "worker reports no KV event sources".into(),
+            );
         }
         if let Some(reason) = layout_topic_mismatch(discovery.hybrid.as_ref(), &sources) {
-            return failed_hybrid_discovery(reason);
+            discovery.sources = Err(SourcesUnavailable {
+                probe: SourcesProbe::StaticMismatch,
+                detail: reason,
+            });
+            return discovery;
         }
         let Some(model) = model else {
             return failed_hybrid_discovery(
+                SourcesProbe::Failed,
                 "worker reports no served base model for KV layout".into(),
             );
         };
@@ -627,7 +647,7 @@ impl KvIndexSupervisor {
         &self,
         worker_url: &str,
         discovery: &WorkerDiscovery,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), (SourcesProbe, &'static str)> {
         if discovery.hybrid.is_none() {
             return Ok(());
         }
@@ -640,14 +660,17 @@ impl KvIndexSupervisor {
         )
         .await
         {
-            StaticHybridMatch::Differs => {
-                Err("configured hybrid event sources do not match worker")
-            }
-            StaticHybridMatch::Unavailable(SourcesProbe::Failed) => Err(
+            StaticHybridMatch::Differs
+            | StaticHybridMatch::Unavailable(SourcesProbe::StaticMismatch) => Err((
+                SourcesProbe::StaticMismatch,
+                "configured hybrid event sources do not match worker",
+            )),
+            StaticHybridMatch::Unavailable(SourcesProbe::Failed) => Err((
+                SourcesProbe::Failed,
                 "cannot confirm configured hybrid event sources while the control probe is failing",
-            ),
+            )),
             StaticHybridMatch::Unavailable(SourcesProbe::Unsupported) => {
-                log_static_layout_trusted(worker_url, SourcesProbe::Unsupported);
+                debug!(worker_url, "engine does not expose KV event sources; trusting the configured hybrid layout");
                 Ok(())
             }
             StaticHybridMatch::Matches => Ok(()),
@@ -711,35 +734,17 @@ fn merge_hybrid_layout(
     }
 }
 
-fn failed_hybrid_discovery(error: String) -> WorkerDiscovery {
+fn failed_hybrid_discovery(probe: SourcesProbe, error: String) -> WorkerDiscovery {
     WorkerDiscovery {
         server_info: Err(error.clone()),
         sources: Err(SourcesUnavailable {
-            probe: SourcesProbe::Failed,
+            probe,
             detail: error.clone(),
         }),
         model_id: Err(error),
         base_models: None,
         hybrid: None,
         assumed_plain_full: false,
-    }
-}
-
-/// A declared static layout outranks a missing control endpoint: it is the
-/// operator's contract, not a fallback. Say which reason we trusted.
-fn log_static_layout_trusted(worker_url: &str, probe: SourcesProbe) {
-    match probe {
-        // Stock vLLM serves no HTTP route, so this is the expected answer.
-        SourcesProbe::Unsupported => debug!(
-            worker_url,
-            "engine does not expose /kv_event_sources (added in vLLM 0.31.0); \
-             trusting the configured hybrid layout"
-        ),
-        SourcesProbe::Failed => warn!(
-            worker_url,
-            "engine did not answer the KV event source probe; \
-             trusting the configured hybrid layout"
-        ),
     }
 }
 
@@ -831,7 +836,7 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         return WorkerDiscovery {
             server_info: Ok(server_info),
             sources: Err(SourcesUnavailable {
-                probe: SourcesProbe::Failed,
+                probe: SourcesProbe::StaticMismatch,
                 detail: format!(
                     "invalid static publisher and replay endpoint counts for '{worker_url}'"
                 ),
@@ -1079,7 +1084,6 @@ fn synthesize_plain_full_layout(
                 declared_groups: Some(1),
                 model: model.to_owned(),
                 weight_version: "default".into(),
-                weight_identity: None,
                 publisher_topic: Some(source.topic.clone()),
                 instance_topic: true,
                 hash_algorithm: "sha256_cbor".into(),
@@ -1244,7 +1248,7 @@ mod rank_merge_tests {
         let rank = |rank: u32, model: &str| {
             serde_json::json!({
                 "rank": rank, "model": model, "weight_version": "default",
-                "weight_identity": null, "publisher_topic": format!("topic-{rank}"),
+                "publisher_topic": format!("topic-{rank}"),
                 "instance_topic": true, "hash_algorithm": "sha256_cbor",
                 "root_hash": "9bd96a485ad84efdafb72ee48a1d7a69bcead0f8f0433173941b276b9581eef0",
                 "full_hashes": true, "hash_block_size": 16, "hash_lookahead_tokens": 0,

@@ -8,8 +8,8 @@ use std::time::Duration;
 use super::lifecycle::{SourceAction, WorkerLifecycle, WorkerRegistration, CONTROL_TIMEOUT};
 use super::probe::{fetch_kv_event_sources, fetch_native_sources};
 use super::{
-    events_enabled, layout_topic_mismatch, resolve_endpoint, split_worker_rank, worker_host,
-    KvEventSourceEntry, KvIndexSupervisor, SourcesProbe, WorkerDiscovery,
+    events_enabled, resolve_endpoint, split_worker_rank, worker_host, KvEventSourceEntry,
+    KvIndexSupervisor, SourcesProbe, WorkerDiscovery,
 };
 use crate::kv_index::CacheCapabilities;
 
@@ -364,54 +364,20 @@ pub(super) async fn static_hybrid_sources_match(
     let Ok(expected) = &discovery.sources else {
         return StaticHybridMatch::Differs;
     };
-    // A layout-only binding declares no endpoints, so check the answer
-    // against the layout and the sources it was bound to; a new topic or no
-    // sources means the engine restarted.
-    if expected.is_empty() {
-        if observed.is_empty() {
-            return StaticHybridMatch::Differs;
-        }
-        if layout_topic_mismatch(discovery.hybrid.as_ref(), &observed).is_some() {
-            return StaticHybridMatch::Differs;
-        }
-        let missing_rank = discovery.hybrid.as_ref().is_some_and(|layout| {
-            layout.ranks.iter().any(|rank| {
-                rank.publisher_topic
-                    .as_deref()
-                    .is_some_and(|topic| !topic.is_empty())
-                    && !observed.contains_key(&rank.rank.to_string())
+    // Layout-only sources are verified against their bound publishers above.
+    // A rank-pinned declaration only compares the rank it supplies.
+    let matches = !expected.is_empty()
+        && expected.iter().all(|(rank, expected)| {
+            observed.get(rank).is_some_and(|actual| {
+                source_matches(
+                    &host,
+                    actual,
+                    &expected.endpoint,
+                    expected.replay_endpoint.as_deref(),
+                    &expected.topic,
+                )
             })
         });
-        return if missing_rank {
-            StaticHybridMatch::Differs
-        } else {
-            StaticHybridMatch::Matches
-        };
-    }
-    // A rank-pinned source declares one rank out of the engine's full set, so
-    // only the declared ranks have to match.
-    let matches = expected.iter().all(|(rank, expected)| {
-        let Some(actual) = observed.get(rank) else {
-            return false;
-        };
-        let endpoints_match = |actual: &str, expected: &str| {
-            resolve_endpoint(actual, &host)
-                .ok()
-                .zip(resolve_endpoint(expected, &host).ok())
-                .is_some_and(|(actual, expected)| actual == expected)
-        };
-        events_enabled(actual)
-            && actual.topic == expected.topic
-            && endpoints_match(&actual.endpoint, &expected.endpoint)
-            && match (
-                actual.replay_endpoint.as_deref(),
-                expected.replay_endpoint.as_deref(),
-            ) {
-                (None, None) => true,
-                (Some(actual), Some(expected)) => endpoints_match(actual, expected),
-                _ => false,
-            }
-    });
     if matches {
         StaticHybridMatch::Matches
     } else {
@@ -441,22 +407,34 @@ pub(super) fn bound_source_moved(
     installed: &BoundSource,
     actual: &KvEventSourceEntry,
 ) -> bool {
+    !source_matches(
+        host,
+        actual,
+        &installed.endpoint,
+        installed.replay_endpoint.as_deref(),
+        &installed.topic,
+    )
+}
+
+fn source_matches(
+    host: &str,
+    actual: &KvEventSourceEntry,
+    endpoint: &str,
+    replay_endpoint: Option<&str>,
+    topic: &str,
+) -> bool {
     let same_endpoint = |left: &str, right: &str| {
         resolve_endpoint(left, host)
             .ok()
             .zip(resolve_endpoint(right, host).ok())
             .is_some_and(|(left, right)| left == right)
     };
-    let same_optional_endpoint = |left: Option<&str>, right: Option<&str>| match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) => same_endpoint(left, right),
-        _ => false,
-    };
-    !events_enabled(actual)
-        || actual.topic != installed.topic
-        || !same_endpoint(&actual.endpoint, &installed.endpoint)
-        || !same_optional_endpoint(
-            actual.replay_endpoint.as_deref(),
-            installed.replay_endpoint.as_deref(),
-        )
+    events_enabled(actual)
+        && actual.topic == topic
+        && same_endpoint(&actual.endpoint, endpoint)
+        && match (actual.replay_endpoint.as_deref(), replay_endpoint) {
+            (None, None) => true,
+            (Some(left), Some(right)) => same_endpoint(left, right),
+            _ => false,
+        }
 }

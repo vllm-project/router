@@ -130,14 +130,15 @@ impl SourceBinding {
                     }
                 }
                 KVEvent::BlockRemoved(remove) => {
-                    if self.requires_root_proof && remove.group_idx != Some(0) {
-                        return Err(SourceError::InvalidBatch);
-                    }
                     if remove.ownership.is_some() {
                         continue;
                     }
-                    let tier = StorageTier::from_medium(remove.medium.as_deref())
-                        .ok_or(SourceError::InvalidBatch)?;
+                    let Some(tier) = StorageTier::from_medium(remove.medium.as_deref()) else {
+                        continue;
+                    };
+                    if self.requires_root_proof && remove.group_idx != Some(0) {
+                        return Err(SourceError::InvalidBatch);
+                    }
                     if remove.locality.as_deref().is_some_and(|s| s != "LOCAL")
                         || !self
                             .groups
@@ -231,6 +232,9 @@ impl SourceBinding {
         &self,
         store: &'a BlockStored,
     ) -> Result<Option<PreparedEvent<'a>>, SourceError> {
+        let Some(tier) = StorageTier::from_medium(store.medium.as_deref()) else {
+            return Ok(None);
+        };
         if self.requires_root_proof
             && (store.group_idx != Some(0)
                 || store.kv_cache_spec_kind.as_deref() != Some("full_attention")
@@ -248,9 +252,6 @@ impl SourceBinding {
         {
             return Ok(None);
         }
-        let Some(tier) = StorageTier::from_medium(store.medium.as_deref()) else {
-            return Ok(None);
-        };
         let group = self
             .groups
             .iter()

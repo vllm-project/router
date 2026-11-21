@@ -81,9 +81,6 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 hf-hub = { version = "0.4.3", features = ["tokio"] }
 
-deadpool = { version = "0.12", features = ["managed", "rt_tokio_1"] }
-backoff = { version = "0.4", features = ["tokio"] }
-strum = { version = "0.26", features = ["derive"] }
 zmq = "0.10.0"
 lru = { version = "0.18", default-features = false }
 rmp-serde = "1.3"

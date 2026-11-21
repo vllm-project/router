@@ -34,7 +34,6 @@ pub struct RankCapability {
     #[serde(default)]
     pub model: String,
     pub weight_version: String,
-    pub weight_identity: Option<String>,
     pub publisher_topic: Option<String>,
     pub instance_topic: bool,
     pub hash_algorithm: String,
@@ -407,7 +406,7 @@ impl CacheCapabilities {
             let single_dense = tail_groups.as_slice().first().and_then(|id| {
                 let group = groups.iter().find(|group| group.group_idx == *id)?;
                 (tail_groups.len() == 1
-                    && group.kind.is_dense_attention()
+                    && group.kind.uses_full_attention_lookup()
                     && groups.iter().all(|other| {
                         (other.group_idx == *id || other.kind == GroupRule::Checkpoint)
                             && (rank.partial_hash_hits || other.block_size == group.block_size)

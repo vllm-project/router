@@ -95,6 +95,10 @@ pub fn init_metrics() {
         "vllm_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
     );
+    describe_counter!(
+        "vllm_router_prefix_routing_decisions_total",
+        "Prefix routing decisions by policy, stage and outcome"
+    );
     describe_counter!("vllm_router_cache_hits_total", "Total cache hits");
     describe_counter!("vllm_router_cache_misses_total", "Total cache misses");
     describe_gauge!(
@@ -265,6 +269,70 @@ pub fn init_metrics() {
         "vllm_router_agent_aware_token_prepare_failures_total",
         "Prepared exact facts skipped because Router-side text preparation failed"
     );
+    describe_gauge!(
+        "vllm_router_workflow_prediction_profile_keys",
+        "Loaded profile keys per workflow predictor"
+    );
+    for (name, help) in [
+        (
+            "vllm_router_workflow_return_probability",
+            "Predicted probability of a workflow return by the prediction horizon",
+        ),
+        (
+            "vllm_router_workflow_predicted_ttl_seconds",
+            "Predicted workflow return TTL in seconds",
+        ),
+        (
+            "vllm_router_workflow_return_prediction_support",
+            "Profile sample count supporting a workflow return prediction",
+        ),
+        (
+            "vllm_router_workflow_return_actual_seconds",
+            "Observed workflow return interval in seconds",
+        ),
+        (
+            "vllm_router_workflow_return_brier_score",
+            "Squared error of a workflow return prediction",
+        ),
+        (
+            "vllm_router_workflow_return_nll",
+            "Negative log loss of a workflow return prediction",
+        ),
+        (
+            "vllm_router_workflow_predicted_output_tokens",
+            "Predicted workflow output length in tokens",
+        ),
+        (
+            "vllm_router_workflow_output_prediction_support",
+            "Profile sample count supporting a workflow output prediction",
+        ),
+        (
+            "vllm_router_workflow_output_actual_tokens",
+            "Observed workflow output length in tokens",
+        ),
+        (
+            "vllm_router_workflow_output_reservation_error_tokens",
+            "Absolute output reservation error in tokens by quantile and direction",
+        ),
+    ] {
+        describe_histogram!(name, help);
+    }
+    for (name, help) in [
+        (
+            "vllm_router_workflow_return_prediction_total",
+            "Workflow return predictions by source and backoff level",
+        ),
+        (
+            "vllm_router_workflow_output_prediction_total",
+            "Workflow output predictions by source and backoff level",
+        ),
+        (
+            "vllm_router_workflow_output_coverage_total",
+            "Workflow output observations by predicted quantile and coverage",
+        ),
+    ] {
+        describe_counter!(name, help);
+    }
 
     // PD-specific metrics
     describe_counter!(
@@ -298,6 +366,34 @@ pub fn init_metrics() {
     describe_histogram!(
         "vllm_router_pd_request_duration_seconds",
         "PD request duration by route"
+    );
+    for (name, help) in [
+        (
+            "vllm_router_pd_prefill_decisions_total",
+            "Prefill routing decisions by fallback reason",
+        ),
+        (
+            "vllm_router_pd_credited_prefix_tokens_total",
+            "Prefix tokens credited by Prefill routing",
+        ),
+        (
+            "vllm_router_pd_affinity_decisions_total",
+            "P/D affinity decisions by stage and outcome",
+        ),
+        (
+            "vllm_router_pd_decode_commit_total",
+            "Decode commitment outcomes after Prefill",
+        ),
+        (
+            "vllm_router_pd_body_over_limit_total",
+            "P/D stage responses that exceeded the Router buffer limit",
+        ),
+    ] {
+        describe_counter!(name, help);
+    }
+    describe_histogram!(
+        "vllm_router_pd_new_prefill_tokens",
+        "Uncached prompt tokens estimated at Prefill admission"
     );
 
     // Service discovery metrics
@@ -500,9 +596,6 @@ pub fn start_prometheus(config: PrometheusConfig) -> Result<(), Box<dyn std::err
     })?;
     let socket_addr = SocketAddr::new(ip_addr, config.port);
 
-    // Initialize metric descriptions
-    init_metrics();
-
     let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
     let duration_bucket = [
         0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
@@ -516,6 +609,7 @@ pub fn start_prometheus(config: PrometheusConfig) -> Result<(), Box<dyn std::err
     builder
         .set_buckets_for_metric(duration_matcher, &duration_bucket)?
         .install()?;
+    init_metrics();
     Ok(())
 }
 
@@ -547,6 +641,11 @@ fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuild
     ];
     const RATIO_BUCKETS: &[f64] = &[0.25, 0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 3.0, 4.0];
     const REQUEST_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
+    const PROBABILITY_BUCKETS: &[f64] =
+        &[0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0];
+    const LOSS_BUCKETS: &[f64] = &[
+        0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0,
+    ];
 
     let exact = |name: &str| Matcher::Full(name.to_string());
     let set = |builder: PrometheusBuilder, name: &str, buckets: &[f64]| {
@@ -578,6 +677,10 @@ fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuild
         "vllm_router_agent_aware_admission_used_tokens",
         "vllm_router_agent_aware_admission_required_tokens",
         "vllm_router_agent_aware_admission_growth_reserve_tokens",
+        "vllm_router_pd_new_prefill_tokens",
+        "vllm_router_workflow_predicted_output_tokens",
+        "vllm_router_workflow_output_actual_tokens",
+        "vllm_router_workflow_output_reservation_error_tokens",
     ] {
         builder = set(builder, name, TOKEN_BUCKETS);
     }
@@ -591,9 +694,24 @@ fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuild
     for name in [
         "vllm_router_agent_aware_admission_backend_running_requests",
         "vllm_router_agent_aware_admission_backend_waiting_requests",
+        "vllm_router_workflow_return_prediction_support",
+        "vllm_router_workflow_output_prediction_support",
     ] {
         builder = set(builder, name, REQUEST_BUCKETS);
     }
+    for name in [
+        "vllm_router_workflow_return_probability",
+        "vllm_router_workflow_return_brier_score",
+    ] {
+        builder = set(builder, name, PROBABILITY_BUCKETS);
+    }
+    for name in [
+        "vllm_router_workflow_predicted_ttl_seconds",
+        "vllm_router_workflow_return_actual_seconds",
+    ] {
+        builder = set(builder, name, INTERVAL_SECONDS);
+    }
+    builder = set(builder, "vllm_router_workflow_return_nll", LOSS_BUCKETS);
     set(
         builder,
         "vllm_router_agent_aware_admission_capacity_observation_age_seconds",
@@ -1546,6 +1664,31 @@ impl TokenizerMetrics {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publishes_routing_and_workflow_metric_descriptions_and_buckets() {
+        let recorder = set_program_scheduling_buckets(PrometheusBuilder::new()).build_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            init_metrics();
+            RouterMetrics::record_prefix_routing_decision("kv_aware", "regular", "hit");
+            RouterMetrics::record_pd_kv_decision(Some(256), Some(16), None);
+            RouterMetrics::record_workflow_return_prediction("worker", "profile", 0.5, 1.0, 8, 0);
+        });
+        let rendered = recorder.handle().render();
+        for name in [
+            "vllm_router_prefix_routing_decisions_total",
+            "vllm_router_pd_credited_prefix_tokens_total",
+            "vllm_router_workflow_return_probability",
+        ] {
+            assert!(rendered.contains(&format!("# HELP {name} ")), "{rendered}");
+        }
+        for name in [
+            "vllm_router_pd_new_prefill_tokens",
+            "vllm_router_workflow_return_probability",
+        ] {
+            assert!(rendered.contains(&format!("{name}_bucket")), "{rendered}");
+        }
+    }
 
     #[test]
     fn rejects_invalid_prometheus_bind_address() {

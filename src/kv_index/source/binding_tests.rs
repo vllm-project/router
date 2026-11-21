@@ -51,6 +51,35 @@ fn inferred_full_waits_for_root_evidence_after_a_replay_restart() {
 }
 
 #[test]
+fn unknown_medium_does_not_revoke_known_residency() {
+    use crate::kv_index::source::test_support::{full_binding, full_store};
+
+    let index = full_binding(target(), 16).require_root_proof();
+    index.begin_empty(0);
+    let tokens: Vec<_> = (0..33).collect();
+    let known = full_store(&tokens[..32], 16, None);
+    let mut unknown = known.clone();
+    unknown.medium = Some("UNSUPPORTED".into());
+    let remove = BlockRemoved {
+        group_idx: Some(0),
+        block_hashes: unknown.block_hashes.clone(),
+        medium: unknown.medium.clone(),
+        locality: None,
+        ownership: None,
+    };
+    let batch = event_batch(
+        1.0,
+        vec![
+            KVEvent::BlockStored(known),
+            KVEvent::BlockStored(unknown),
+            KVEvent::BlockRemoved(remove),
+        ],
+    );
+    assert_eq!(index.apply_batch(0, &batch), Ok(()));
+    assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 32);
+}
+
+#[test]
 fn inferred_full_revokes_credit_on_an_incompatible_root_or_event_shape() {
     use crate::kv_index::source::test_support::{full_binding, full_store};
 

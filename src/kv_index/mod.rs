@@ -34,7 +34,7 @@ pub use source::binding::SourceBinding;
 pub(crate) use source::endpoints::canonical_endpoint;
 pub use source::events::decode::decode_batch;
 pub use source::events::event_stream::{
-    spawn_zmq, EventStream, EventSubscriberHandle, StreamError, StreamLease,
+    EventStream, EventSubscriberHandle, StreamError, StreamLease,
 };
 pub use source::SourceError;
 pub use storage::KvBlockIndexer;
