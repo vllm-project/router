@@ -130,7 +130,7 @@ impl ProgramScheduler {
                         .observations
                         .get(target_id)
                         .filter(|observation| self.observation_is_fresh(observation, now))
-                        .and_then(|observation| observation.waiting_requests)
+                        .and_then(|observation| observation.backend.waiting_requests)
                         .unwrap_or(0)
                 };
                 let pressure = |target_id: &str, plan: &RankAdmissionPlan| {
@@ -222,7 +222,7 @@ impl ProgramScheduler {
         let backend_waiting = source
             .and_then(|target| state.observations.get(target))
             .filter(|observation| self.observation_is_fresh(observation, now))
-            .and_then(|observation| observation.waiting_requests)
+            .and_then(|observation| observation.backend.waiting_requests)
             .is_some_and(|waiting| waiting >= threshold);
         backend_waiting || self.higher_priority_source_waiters(state, program, now) >= 1
     }
@@ -261,7 +261,10 @@ impl ProgramScheduler {
         destination: &str,
         now: Instant,
     ) -> bool {
-        let Some(capacity) = self.config.progress_ttl.token_capacity else {
+        if !self.capacity_ready(state, destination, now) {
+            return false;
+        }
+        let Some(capacity) = self.target_capacity(state, destination, now) else {
             return true;
         };
         let decision = &state.decisions[program];
@@ -270,7 +273,9 @@ impl ProgramScheduler {
         };
         let limit = capacity as f64 * self.config.progress_ttl.low_watermark_ratio;
         let destination_headroom = (limit - self.target_usage(state, destination, now)).max(0.0);
-        let source_headroom = (limit - self.target_usage(state, source, now)).max(0.0);
+        let source_limit = self.target_capacity(state, source, now).unwrap_or(0) as f64
+            * self.config.progress_ttl.low_watermark_ratio;
+        let source_headroom = (source_limit - self.target_usage(state, source, now)).max(0.0);
         destination_headroom
             >= source_headroom
                 + self.config.cross_rank_headroom_ratio * decision.context.tokens() as f64

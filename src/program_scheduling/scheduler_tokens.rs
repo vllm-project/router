@@ -1420,7 +1420,12 @@ mod revocation_tests {
                 assert!(scheduler
                     .rank_admission_plan(&state, &reference, "rank-0", now)
                     .is_none());
-                assert_eq!(state.observations["rank-0"].active_program_token_delta, 0.0);
+                assert_eq!(
+                    state.observations["rank-0"]
+                        .accounting
+                        .active_program_token_delta,
+                    0.0
+                );
                 if saturate {
                     assert!(state.token_fingerprint_saturated_pools.contains("model"));
                     assert_eq!(

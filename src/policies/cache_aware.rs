@@ -150,6 +150,20 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// Read target-specific text-prefix affinity without changing the tree.
+    pub fn prefix_match_rate(&self, model_id: &str, request_text: &str, target_id: &str) -> f64 {
+        let input_chars = request_text.chars().count();
+        if input_chars == 0 {
+            return 0.0;
+        }
+        self.trees
+            .get(normalize_model_key(model_id))
+            .map_or(0.0, |tree| {
+                tree.prefix_match_tenant_char_count(request_text, target_id) as f64
+                    / input_chars as f64
+            })
+    }
+
     /// Select by the product of text-prefix affinity and current KV headroom.
     pub fn evaluate_initial_placement(
         &self,

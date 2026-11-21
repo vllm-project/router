@@ -364,6 +364,10 @@ impl ProgramRuntime {
         self.request_pool.is_empty()
     }
 
+    pub(crate) fn front_routing_text(&self, program_ref: &ProgramRef) -> Option<&str> {
+        self.request_pool.front_routing_text(program_ref)
+    }
+
     /// Request-scoped hints associated with the Program's front waiter.
     pub(crate) fn front_request_hints(
         &self,

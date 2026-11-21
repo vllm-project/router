@@ -191,6 +191,15 @@ impl ProgramScheduler {
             return;
         }
         let runtime_after = state.runtime.view(dispatch.program());
+        if self.uses_tao_admission()
+            && runtime_after
+                .as_ref()
+                .is_some_and(|v| v.in_flight_requests == 0)
+        {
+            if let Some(d) = state.decisions.get_mut(dispatch.program()) {
+                d.tao_reserved_tokens = None;
+            }
+        }
         let next_output_reservation = state
             .runtime
             .front_request_hints(dispatch.program())
@@ -703,7 +712,7 @@ impl ProgramScheduler {
         if !factors.request_window_complete(self.config.progress_ttl.stats_window_size) {
             return self.config.shared_prefix_freshness_warmup;
         }
-        let Some(capacity) = self.config.progress_ttl.token_capacity else {
+        let Some(capacity) = self.target_capacity(state, target_id, Instant::now()) else {
             return self.config.shared_prefix_freshness_warmup;
         };
         let active_reasoning = state
@@ -732,12 +741,15 @@ impl ProgramScheduler {
     }
 
     fn repair_capacity(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {
-        let Some(capacity) = self.config.progress_ttl.token_capacity else {
+        if self.uses_tao_admission() {
             return false;
-        };
+        }
         let target_ids = state.targets.keys().cloned().collect::<Vec<_>>();
         let mut changed = false;
         for target_id in target_ids {
+            let Some(capacity) = self.target_capacity(state, &target_id, now) else {
+                continue;
+            };
             let high = capacity as f64 * self.config.progress_ttl.high_watermark_ratio;
             let low = capacity as f64 * self.config.progress_ttl.low_watermark_ratio;
             let average_completion = state
@@ -1318,12 +1330,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            scheduler.state.lock().observations["rank-0"].active_program_token_delta,
+            scheduler.state.lock().observations["rank-0"]
+                .accounting
+                .active_program_token_delta,
             200.0
         );
         scheduler.complete(&dispatch, true, true, Some(100), Some(0.1));
         let state = scheduler.state.lock();
-        assert_eq!(state.observations["rank-0"].active_program_token_delta, 0.0);
+        assert_eq!(
+            state.observations["rank-0"]
+                .accounting
+                .active_program_token_delta,
+            0.0
+        );
         assert!(!state.decisions.contains_key(dispatch.program()));
     }
 }

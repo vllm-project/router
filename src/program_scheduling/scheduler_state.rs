@@ -26,6 +26,9 @@ pub enum ProgramResumeOrder {
     /// Prefer the Program that most recently completed a request.
     #[default]
     Mru,
+    /// Let DP decide admission directly from waiting Programs and capacity.
+    #[serde(rename = "dp_admission_tao")]
+    DpAdmissionTAO,
 }
 
 /// Complete opt-in Program scheduler configuration.
@@ -50,6 +53,10 @@ pub struct ProgramSchedulerConfig {
     pub global_queue: bool,
     /// Ordinary resume order after force-resume, priority, and one-shot yield.
     pub resume_order: ProgramResumeOrder,
+    pub dynamic_token_capacity: bool,
+    pub dp_capacity_quantum: usize,
+    pub dp_state_budget: Option<usize>,
+    pub resume_solver_strategy: crate::config::ResumeSolverStrategy,
     /// Required destination-over-source headroom in complete Program contexts.
     pub cross_rank_headroom_ratio: f64,
     /// Initial Program generation binding policy.
@@ -101,6 +108,10 @@ impl Default for ProgramSchedulerConfig {
             binding_only: false,
             global_queue: false,
             resume_order: ProgramResumeOrder::default(),
+            dynamic_token_capacity: false,
+            dp_capacity_quantum: 512,
+            dp_state_budget: crate::config::types::default_dp_state_budget(),
+            resume_solver_strategy: crate::config::ResumeSolverStrategy::Dp,
             cross_rank_headroom_ratio: 1.2,
             binding_strategy: ProgramBindingStrategy::ConsistentHash,
             hash_virtual_nodes: 160,
@@ -178,6 +189,10 @@ impl ProgramSchedulerConfig {
             binding_only: config.binding_only,
             global_queue: config.global_queue,
             resume_order: config.resume_order,
+            dynamic_token_capacity: config.dynamic_token_capacity,
+            dp_capacity_quantum: config.dp_capacity_quantum,
+            dp_state_budget: config.dp_state_budget,
+            resume_solver_strategy: config.resume_solver_strategy,
             cross_rank_headroom_ratio: config.cross_rank_headroom_ratio,
             binding_strategy: config.binding_strategy,
             hash_virtual_nodes: config.hash_virtual_nodes,
@@ -256,6 +271,7 @@ pub(crate) struct ProgramDecisionState {
     /// Input-token demand currently reserved in the rank ledger and its provenance.
     pub(crate) context: ContextTokens,
     pub(crate) output_token_reservation: Option<usize>,
+    pub(crate) tao_reserved_tokens: Option<usize>,
     pub(crate) context_shrink_observations: u8,
     pub(crate) completed_requests: usize,
     pub(crate) segment_served_rounds: usize,
@@ -316,6 +332,7 @@ impl ProgramDecisionState {
             home_target,
             context,
             output_token_reservation: None,
+            tao_reserved_tokens: None,
             context_shrink_observations: 0,
             completed_requests: 0,
             segment_served_rounds: 0,
@@ -421,23 +438,43 @@ impl ProgramDecisionState {
     }
 }
 
-/// Most recent raw backend observation plus Router epoch accounting.
+/// Most recent backend facts paired with Router accounting for that epoch.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RankObservationState {
+    pub(crate) backend: BackendCapacityObservation,
+    pub(crate) accounting: RouterCapacityAccounting,
+    pub(crate) reported_capacity_source: Option<CapacityAccountingSource>,
+}
+
+/// Backend-reported facts and reference-token conversions, without Router debits.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BackendCapacityObservation {
+    pub(crate) backend_token_capacity: Option<usize>,
+    pub(crate) backend_available_tokens: Option<f64>,
+    pub(crate) backend_usable_token_capacity: Option<usize>,
     pub(crate) kv_cache_usage: Option<f64>,
     pub(crate) running_requests: Option<usize>,
     pub(crate) waiting_requests: Option<usize>,
+    pub(crate) observed_at: Option<Instant>,
+}
+
+/// Router estimates and changes since the backend observation epoch began.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RouterCapacityAccounting {
+    // Monotonic charges between scrapes: logical pauses do not free physical KV.
+    pub(crate) admitted_token_debits: f64,
     pub(crate) router_active_reasoning_programs: usize,
     pub(crate) router_active_reasoning_requests: usize,
     pub(crate) estimated_active_reasoning_tokens: Option<f64>,
     pub(crate) estimated_active_program_tokens: Option<f64>,
-    pub(crate) observed_at: Option<Instant>,
     pub(crate) active_program_token_delta: f64,
-    pub(crate) reported_capacity_source: Option<CapacityAccountingSource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CapacityAccountingSource {
+    BackendHeadroomEstimate,
+    BackendCacheConfigTao,
+    BackendHeadroomUnavailable,
     BackendObservation,
     RouterLedgerMissingObservation,
     RouterLedgerStaleObservation,
@@ -447,6 +484,9 @@ pub(crate) enum CapacityAccountingSource {
 impl CapacityAccountingSource {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::BackendHeadroomEstimate => "backend_headroom_estimate",
+            Self::BackendCacheConfigTao => "backend_usage_plus_reservations_tao",
+            Self::BackendHeadroomUnavailable => "backend_headroom_unavailable",
             Self::BackendObservation => "backend_observation",
             Self::RouterLedgerMissingObservation => "router_ledger_missing_observation",
             Self::RouterLedgerStaleObservation => "router_ledger_stale_observation",

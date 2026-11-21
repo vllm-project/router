@@ -13,10 +13,23 @@ pub(crate) mod prometheus_text {
 
     /// Split one sample line into its series and its value.
     ///
-    /// Returns `None` for a line without a trailing value field.
+    /// Ignore an optional timestamp and whitespace inside quoted labels.
     pub(crate) fn split_series_value(line: &str) -> Option<(&str, &str)> {
-        let split = line.rfind(char::is_whitespace)?;
-        Some((line[..split].trim(), line[split..].trim()))
+        let line = line.trim();
+        let mut quoted = false;
+        let mut escaped = false;
+        for (index, character) in line.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' && quoted {
+                escaped = true;
+            } else if character == '"' {
+                quoted = !quoted;
+            } else if character.is_whitespace() && !quoted {
+                return Some((&line[..index], line[index..].split_whitespace().next()?));
+            }
+        }
+        None
     }
 
     /// Split `name{k="v",...}` into the metric name and its labels.
@@ -86,6 +99,17 @@ pub(crate) mod prometheus_text {
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     mod tests {
+        #[test]
+        fn samples_keep_values_separate_from_labels_and_optional_timestamps() {
+            for sample in ["metric 0.25", "metric 0.25 123", "  metric 0.25  "] {
+                assert_eq!(split_series_value(sample), Some(("metric", "0.25")));
+            }
+            let series = r#"metric{model="a b",label="escaped\" quote"}"#;
+            let sample = format!("{series} 0.5 123");
+            assert_eq!(split_series_value(&sample), Some((series, "0.5")));
+            assert_eq!(split_series_value(series), None);
+        }
+
         use super::*;
 
         #[test]

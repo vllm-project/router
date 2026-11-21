@@ -34,7 +34,7 @@ The default is a strict per-request opt-in contract, not a claim that existing a
 }
 ```
 
-`global_queue: true` is the recommended deployment mode. The Router first tries to resume a paused Program on its previous Rank and considers cross-Rank placement only when the configured capacity and headroom checks allow it. Set it to `false` only when strict Rank-local scheduling is required.
+`global_queue: true` is the recommended deployment mode. MRU/FCFS first try the previous Rank before considering cross-Rank placement under their capacity/headroom gates; TAO jointly selects eligible Program/Rank assignments within its budgets. MRU/FCFS also support strict Rank-local scheduling with `global_queue: false`. TAO requires `true`.
 
 To adapt Program scheduling to a different model or hardware configuration, operators generally only need to recalibrate `prefill_cost_model` and `decode_throughput_model`. The [AgentInfer backend calibration README](https://github.com/openJiuwen-ai/agent-infer/blob/main/tools/calibration/README.md) describes how to measure these coefficients for the target deployment.
 
@@ -95,11 +95,12 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 |---|---:|---|
 | `program_scheduling_enable_key` | `vllm_xargs.agentic_context` | Selects which identity inputs opt a request into Program scheduling. The default accepts only canonical `vllm_xargs.agentic_context`; `auto` additionally accepts the documented `agent_hint` and framework Header schemas. |
 | `binding_only` | `false` | Preserves Program identity and initial Program-to-Rank binding but bypasses RequestPool admission, Progress-TTL pause, and resume scheduling. This isolates the effect of Program affinity. |
-| `global_queue` | `false` | When `false`, a paused Program can resume only on its bound Rank. When `true`, resume first tries the previous Rank and may then select another Rank that passes the cross-Rank capacity gates. |
-| `resume_order` | `mru` | Orders ordinary Rank-local resume candidates within the same force-resume, request-priority, and segment-yield tier. Supported values are `mru` and `fcfs`; cross-Rank resume is always FCFS. |
-| `cross_rank_headroom_ratio` | `1.2` | Controls cross-Rank migration conservatism. A destination must have at least the source Rank's free capacity plus this multiple of the Program's complete estimated context. It has no effect when `global_queue` is `false`. |
+| `global_queue` | `false` | When `false`, MRU/FCFS can resume a paused Program only on its bound Rank. TAO requires `true`. When `true`, MRU/FCFS prefer local resumes before cross-Rank placement, while TAO jointly selects eligible Program/Rank assignments. |
+| `resume_order` | `mru` | `mru` and `fcfs` retain native ordering; `dp_admission_tao` lets DP decide admission directly. TAO requires `cache_aware` binding with both `global_queue: true` and `dynamic_token_capacity: true`. See [TAO admission](#tao-admission). |
+| `cross_rank_headroom_ratio` | `1.2` | Controls MRU/FCFS cross-Rank migration conservatism. A destination must have at least the source Rank's free capacity plus this multiple of the Program's complete estimated context. It has no effect when `global_queue` is `false`. |
 | `binding_strategy` | `consistent_hash` | Selects the initial home Rank for each new Program generation. Supported values are `consistent_hash`, `program_round_robin`, `least_program_count`, `reasoning_token_balance`, and `cache_aware`; it does not replace admission or resume decisions. |
 | `hash_virtual_nodes` | `160` | Sets the number of virtual nodes used by `consistent_hash` initial binding. It has no effect on the other binding strategies. |
+| `dynamic_token_capacity` | `false` | Opt into live per-rank engine block-headroom estimates. Omit static token capacity; missing or stale metrics defer new admissions. See Dynamic backend capacity below. |
 | `token_capacity_per_dp_rank` | `null` | Supplies the logical KV-token capacity of each concrete DP Rank. A value enables token-based admission, growth reserve, capacity repair, and cross-Rank headroom checks; `null` falls back to the Program-count guard. `reasoning_token_balance` requires this value. The deprecated input alias `token_capacity_per_target` is accepted but is never emitted when the configuration is serialized. |
 | `token_count_mode` | `exact` | Apply available prepared counts after matching Engine settlements, otherwise estimate. `estimated` is a supported compatibility override, not deprecated. `shadow` is an advanced diagnostic that keeps estimated decisions and records prepared counterfactuals even after verification. See [Input-token facts](#input-token-facts). |
 | `token_count_model_pools` | `[]` | Model pools allowed to apply prepared exact counts. Empty allows every pool; entries may be plain model names (`model-a`) or internal pool keys (`program:model:model-a`, `program:all`, `program:fallback:unlabeled`). Unknown-looking entries are not validated against live pools, so check `vllm_router_agent_aware_context_token_fallbacks_total{reason="pool_not_allowed"}` after enabling. |
@@ -285,6 +286,58 @@ For `agent_hint`, `session_id` becomes both Program ID and session ID, `task_id`
 
 ## Resume ordering and capacity
 
+### TAO admission
+
+For aggregated HTTP serving, select `resume_order: "dp_admission_tao"` with
+`binding_strategy: "cache_aware"`, `dynamic_token_capacity: true` and
+`global_queue: true`. Omit `token_capacity_per_dp_rank` and leave `binding_only`
+disabled. See [the example configuration](../../examples/configs/program_dynamic_dp_admission.json).
+
+For each paused Program with a waiting model request, TAO estimates how many
+input tokens match the prefix on each eligible backend in the same model pool.
+Placing that request consumes its input length minus its estimated match on that
+backend. The DP maximizes total estimated cached tokens, breaking ties by total
+input tokens, subject to each backend's budget and one placement per Program.
+An active Program returning within its TTL keeps its placement if its next
+request fits. TAO uses KV headroom for admission and bypasses the native
+per-target active-Program count and growth-reserve gates.
+
+Overdue waiting requests are considered in earliest-deadline order. Each uses
+its best-value currently feasible backend without exceeding its token budget;
+an unplaceable overdue request does not block other work. The configured solver
+then selects ordinary admissions from the remaining budget. Deadline expiry is
+a scheduling priority, not a guarantee that an oversized request can be served.
+
+The backend's cache configuration still supplies total reference capacity C.
+The existing metrics converter supplies sampled free reference tokens F, with
+the null-block correction. The router additionally retains each admitted but
+unfinished request's frozen tree cost R (input tokens minus predicted prefix
+hits). The budget is `max(0, F - sum(R))`, equivalently
+`max(0, C - ((C - F) + sum(R)))`. Backend waiters keep their reservation across
+scrapes; completion/cancellation releases the reservation, not observed occupancy.
+Missing/invalid/stale required metrics block new admissions. Unexpired returning
+placements use the same budget and keep their placement when the next turn fits.
+
+This deliberately double-counts some KV already reflected in F. It is a
+conservative experiment, not an exact per-request block allocator or an OOM
+guarantee. Tree prediction errors and unreserved decode growth remain. A valid
+zero-free sample still permits a zero-estimated-cost full prefix hit, as before;
+unknown capacity does not. No arbitrary safety factor is introduced.
+
+For this path, `/scheduling/diagnostics` reports:
+
+- `token_capacity_source`: `vllm_usage_plus_reservations_tao`.
+- `effective_token_capacity`: total backend reference capacity C (unchanged).
+- `backend_available_tokens_at_observation`: F.
+- `router_reasoning_reserved_tokens`: sum(R), router reservations only.
+- `router_estimated_used_tokens`: C - F + sum(R), conservative combined charge.
+- `dynamic_admission_headroom_tokens`: max(0, F - sum(R)).
+
+The `tao_admission` INFO event also records backend unavailable tokens,
+aggregate router reservations and the remaining budget after selection.
+
+### Native ordering
+
 Resume first selects expired force-resume deadlines, then larger request priorities. Within each equal force/priority cohort, a Program paused because it reached `max_segment_rounds` ranks behind other candidates. Rank-local ordering defaults to MRU and can be changed to FCFS, while cross-Rank candidates always use FCFS. Successful resume clears the one-shot yield marker. Priority and yield ordering only change selection order and never grant a new capacity bypass; established force-resume admission behavior remains unchanged.
 
 The first implementation contains no automatic privileged Program, relationship handoff, privileged TTL, or privileged capacity demotion. Programs that consume a complete continuous segment yield once to other waiters, while force resume bounds starvation.
@@ -366,6 +419,105 @@ Report absolute and relative results for job completion time, request throughput
 ## Engine KV-control boundary
 
 Progress-TTL currently protects KV indirectly by controlling request admission. Physical eviction, offload, and prefetch are not executed by this feature. A future Router-to-engine KV hint must receive explicit `accepted`, `rejected`, or `unsupported` feedback and an eventual `applied`, `failed`, or `expired` result. Router residency accounting must not change until the engine reports `applied`.
+
+## Dynamic backend capacity (opt-in, aggregated HTTP)
+
+Set `dynamic_token_capacity: true` and **omit** `token_capacity_per_dp_rank`.
+
+Token capacity distinguishes an unrestricted target (static mode without a token
+limit), a known token limit, and unavailable dynamic capacity. Unknown dynamic
+capacity blocks admission and is represented as fully pressured for initial
+binding; Cache-aware excludes unknown targets when a target with known capacity
+exists, even if that known target currently requires queueing.
+No Python launcher, fixed H200 budget, or new backend metric is required.
+The Rust metrics provider reads each worker's `/metrics` every
+`metrics_interval_seconds` (default 1 second). It selects the matching
+`engine` label for each internal DP rank; it does not multiply by TP size or
+sum ranks. Multiple models/duplicate series for the same rank are rejected as
+ambiguous. An unlabelled metric is rank 0 only, never broadcast across DP ranks.
+
+See `examples/configs/program_dynamic_dp_admission.json`.
+
+### What is measured, and what is estimated
+
+The required standard vLLM metrics are:
+
+- `vllm:kv_cache_usage_perc{engine="..."}`: actual used fraction of the engine's
+  shared block pool, not CUDA allocated-memory utilization.
+- `vllm:cache_config_info{engine="...",kv_cache_size_tokens="...",num_gpu_blocks="..."} 1`:
+  group-aware reference token capacity and physical pool size.
+
+vLLM's `KVCacheManager.usage` calls `BlockPool.get_usage()`. For the inspected
+engine this is `1 - free_blocks / (num_gpu_blocks - 1)`, with one null block
+reserved. The Rust conversion is:
+
+```
+reference_free_tokens = floor((1 - usage) * reference_token_capacity
+                              * (num_gpu_blocks - 1) / num_gpu_blocks)
+```
+
+TAO subtracts outstanding request reservations from the sampled free tokens, as
+described under [TAO admission](#tao-admission). Dynamic MRU/FCFS instead track
+positive occupancy charges since the scrape and also limit headroom by active
+reasoning reservations. A logical release does not refund a charge made since
+the last scrape. A scrape begun before an admission preserves the intervening
+charge through the observation epoch.
+
+This is a **reference-token headroom estimate**, not an exact hybrid-KV token
+capacity or an OOM-prevention guarantee. The block pool responds to compression,
+SWA block release, and linear-attention state allocation. However,
+`kv_cache_size_tokens` is an equivalent capacity computed for the backend's
+reference/max-length request layout, not a universal bytes-per-token constant.
+Two sets of requests with the same total logical tokens can require different
+numbers of blocks. Prefix hits, block rounding, in-flight decode and stats
+publication latency also matter. The router estimates incremental KV use for a request from its predicted prefix match.
+The engine's actual allocation also depends on request layout and block reuse.
+
+### Failure behavior and diagnostics
+
+Before the first valid sample, or if required metrics are missing/invalid,
+new Program admissions wait. Samples older than the existing freshness rule
+(`3 * metrics_interval_seconds`) also block new admissions. Already active
+inference is not cancelled. Missing data does not trigger a zero-capacity
+mass pause, and there is no silent static-capacity or Program-count fallback.
+A force-resume deadline cannot bypass unknown or exhausted dynamic headroom.
+Existing queue timeout behavior remains in effect. Poll freshness measures
+HTTP observation time, not engine-side stats production time; a responding
+API that republishes stale engine stats cannot be detected by these metrics.
+
+For dynamic MRU/FCFS, inspect `/scheduling/diagnostics` per rank. TAO reports its own budget fields [above](#tao-admission).
+
+- `token_capacity_source`: `vllm_block_headroom_estimate` or `backend_unavailable`.
+- `backend_reference_token_capacity`: the backend's reference conversion scale.
+- `backend_available_tokens_at_observation`: uncharged sampled equivalent headroom.
+- `dynamic_admission_headroom_tokens`: remaining headroom after local charges.
+- `effective_token_capacity`: current logical occupancy plus remaining headroom.
+- `observation_age_seconds` and `observation_fresh`: scrape freshness.
+
+Zero headroom is valid; absent headroom is unknown. Both stop positive-cost
+admission. The default remains the previous static/count-only path. Supplying
+both dynamic mode and static token capacity is a configuration error, as is
+combining dynamic mode with `binding_only`.
+
+Engine references:
+- https://docs.vllm.ai/en/v0.32.0/api/vllm/v1/core/block_pool/
+- https://docs.vllm.ai/en/v0.32.0/api/vllm/v1/core/kv_cache_utils/
+- https://docs.vllm.ai/en/v0.32.0/api/vllm/v1/core/kv_cache_manager/
+
+
+## Solver configuration
+
+`dp_capacity_quantum` defaults to 512: ceil option token costs and floor per-target
+capacities. Values remain unscaled.
+`dp_state_budget` defaults to 50,000 frontier states. Supply a positive integer to override it or explicit JSON `null` for an unlimited frontier.
+Exhaustion recomputes from the full candidate set with best-fit decreasing on raw
+token costs and eligible targets. The cap applies to each solver invocation.
+`resume_solver_strategy` is `dp` (default) or objective-ranked `greedy`. Use with
+`resume_order=dp_admission_tao`. `greedy` is a solver
+choice, not a replacement for the lifecycle scheduling policy.
+Diagnostics expose all three fields.
+`program_resume` supplements `program_admit` for activations with a recorded
+pause reason, with `pause_elapsed_seconds`; first admission is not a resume.
 
 ## Workflow prediction shadow profiles
 
