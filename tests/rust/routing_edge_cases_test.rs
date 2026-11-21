@@ -157,6 +157,7 @@ async fn body_at_the_payload_limit_is_routed_and_one_byte_more_is_rejected() {
             worker_urls: vec![worker.url().to_string()],
         },
         max_payload_size: LIMIT,
+        preparation_timeout_secs: 1,
         worker_startup_timeout_secs: 5,
         worker_startup_check_interval_secs: 1,
         ..Default::default()

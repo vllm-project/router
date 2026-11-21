@@ -7,6 +7,7 @@ use crate::policies::WorkerTokenInputs;
 use http::HeaderMap;
 use reqwest::Client;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::debug;
@@ -498,6 +499,24 @@ async fn http_input_json(
         .json()
         .await
         .map_err(|_| "invalid_preparation_response")
+}
+
+/// Per-call budget for pre-dispatch token preparation (/render, then the
+/// /tokenize fallback). Set once at startup from
+/// `RouterConfig::preparation_timeout_secs`. The 1s default starves large
+/// prompts: a several-hundred-K-token body renders in more than a second,
+/// the client times out, and the request becomes an "unknown prefill" that
+/// latches pool-wide cost comparison into occupancy fallback for its whole
+/// multi-minute flight. Stacks serving big contexts raise this to cover
+/// their largest body.
+static PREPARATION_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn set_preparation_timeout_secs(secs: u64) {
+    PREPARATION_TIMEOUT_SECS.store(secs.max(1), Ordering::Relaxed);
+}
+
+pub(crate) fn preparation_timeout() -> Duration {
+    Duration::from_secs(PREPARATION_TIMEOUT_SECS.load(Ordering::Relaxed))
 }
 
 pub(crate) fn http_tokenize_fallback(
@@ -1177,6 +1196,20 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    #[test]
+    fn preparation_timeout_clamps_to_one_second_floor() {
+        use super::{preparation_timeout, set_preparation_timeout_secs};
+        use std::time::Duration;
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        set_preparation_timeout_secs(0);
+        assert_eq!(preparation_timeout(), Duration::from_secs(1));
+        set_preparation_timeout_secs(5);
+        assert_eq!(preparation_timeout(), Duration::from_secs(5));
+        // restore the upstream default for any test that reads the budget
+        set_preparation_timeout_secs(1);
+    }
+
     #[test]
     fn router_tokens_refuse_adapter_cache_identities() {
         use super::router_token_inputs;

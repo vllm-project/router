@@ -432,7 +432,7 @@ impl PdKvState {
                     route,
                     headers,
                     self.api_key.as_deref(),
-                    Duration::from_secs(1),
+                    crate::backend::preprocess::preparation_timeout(),
                 )
                 .await
             }

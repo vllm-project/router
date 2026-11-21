@@ -204,6 +204,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 0.0)]
     router_temperature: f64,
 
+    /// Per-call budget (seconds) for pre-dispatch token preparation (/render, then the /tokenize fallback). Default 1 preserves upstream behavior; large-prompt stacks raise it to cover their largest body (a ~400K-token prompt renders in ~1s on our serving stack).
+    #[arg(long = "preparation-timeout-secs", default_value_t = 1)]
+    preparation_timeout_secs: u64,
+
     /// Enable kv_aware session affinity and set its idle TTL in seconds.
     /// P/D uses decode-only soft affinity based on pending plus active requests.
     /// Omit to disable session affinity while keeping KV-aware routing enabled.
@@ -659,6 +663,7 @@ impl CliArgs {
             host: self.host.clone(),
             port: self.port,
             max_payload_size: self.max_payload_size,
+            preparation_timeout_secs: self.preparation_timeout_secs,
             request_timeout_secs: self.request_timeout_secs,
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: self.worker_startup_check_interval,
