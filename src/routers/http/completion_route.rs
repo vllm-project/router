@@ -63,6 +63,15 @@ pub(super) fn prepare_completion_route(
                 "add_special_tokens" => value.is_boolean(),
                 "priority" => value.is_i64() || value.is_u64(),
                 "truncate_prompt_tokens" => true,
+                "vllm_xargs" => {
+                    value.is_null()
+                        || value.as_object().is_some_and(|args| {
+                            args.iter().all(|(key, value)| {
+                                key == "kv_cache_report_mode"
+                                    && value.as_str() == Some("incremental")
+                            })
+                        })
+                }
                 _ => false,
             });
     CompletionRoute {
@@ -77,4 +86,33 @@ pub(super) fn placement_eligibility(
     workers: &[Arc<dyn Worker>],
 ) -> Option<Vec<bool>> {
     (!completion.worker_credit).then(|| vec![false; workers.len()])
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn incremental_report_retains_prefix_credit() {
+        for (args, credit) in [
+            (json!({"kv_cache_report_mode": "incremental"}), true),
+            (json!({"kv_cache_report_mode": "full"}), false),
+            (
+                json!({"kv_cache_report_mode": "incremental", "unknown": true}),
+                false,
+            ),
+        ] {
+            let request = serde_json::from_value(json!({
+                "prompt": [1, 2, 3],
+                "vllm_xargs": args,
+            }))
+            .unwrap();
+            assert_eq!(
+                prepare_completion_route(&request, None).worker_credit,
+                credit
+            );
+        }
+    }
 }

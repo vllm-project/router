@@ -8,25 +8,19 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
-use crate::kv_index::admit::{validate_full_attention_batch, FullAttentionBatchRejection};
+use crate::kv_hash::{BlockKeyGenerator, SequenceHash};
+use crate::kv_index::admit::{
+    validate_full_attention_batch, FullAttentionBatchRejection, FullAttentionRejectionReason,
+};
 use crate::kv_index::binding::SourceLease;
 use crate::kv_index::indexer::KvBlockIndexer;
+use crate::kv_index::storage::PageChanges;
 use crate::kv_index::types::{
-    ClearScope, RecoveryBoundary, ResidencyOwner, SourceId, SourceRecoveryReason, StorageTier,
+    RecoveryBoundary, ResidencyOwner, SourceId, SourceRecoveryReason, StorageTier,
 };
 use crate::kv_index::wire::{ExternalBlockHash, KVEvent, KVEventBatch};
-use crate::kv_index::{decode_batch, IngestionSignal};
+use crate::kv_index::{decode_batch, ordinary_block_keys, IngestionSignal};
 use crate::metrics::RouterMetrics;
-
-/// sha256 of each block's token-id bytes, seeded by `lora_name`.
-/// The seed is re-applied per block (no parent chaining here) so identical
-/// tokens under different adapters land on different nodes.
-// ponytail: cache_salt/MM isolation deferred — needs raw msgpack capture of
-// per-block extra_keys tuples (custom newtype or rmpv); add when cost model
-// scores cross-salt collisions. Until then lora_name alone distinguishes adapters.
-pub fn local_hashes(token_ids: &[u32], block_size: u32, lora_name: Option<&str>) -> Vec<[u8; 32]> {
-    crate::kv_index::local_block_hashes(token_ids, block_size, lora_name)
-}
 
 /// The signed sentinel ending a replay stream: `seq = -1`.
 const END_SEQ: i64 = -1;
@@ -408,6 +402,12 @@ fn spawn_inner(
                         if let (Some(true), ReplayOutcome::Complete(high)) = (current, result) {
                             last_seq = high;
                             retries.reset();
+                            debug!(
+                                source = %source_id,
+                                rank = dp_rank,
+                                seq = high,
+                                "kv_index replay sequence advanced"
+                            );
                             emit(
                                 &signals,
                                 IngestionSignal::ReplayApplied {
@@ -721,14 +721,6 @@ fn decode(payload: &[u8]) -> Option<KVEventBatch> {
     }
 }
 
-fn owner_for(source_id: &SourceId, dp_rank: u32, incarnation: u64) -> ResidencyOwner {
-    ResidencyOwner::Worker {
-        source: source_id.clone(),
-        dp_rank,
-        incarnation,
-    }
-}
-
 /// Build the owner an event's blocks belong to. A non-empty `ownership` field
 /// tags the block as a shared-pool copy (`CacheOwner`); otherwise the worker's
 /// own residency (`Worker`).
@@ -760,11 +752,10 @@ fn event_tier(owner: &ResidencyOwner, medium: Option<&str>) -> StorageTier {
     }
 }
 
-fn hash_str(h: &ExternalBlockHash) -> Arc<str> {
-    // Discriminator: Int(16) and Bytes([0x16]) both render "16" without it.
-    match h {
-        ExternalBlockHash::Int(i) => Arc::from(format!("i:{i}")),
-        ExternalBlockHash::Bytes(b) => Arc::from(format!("b:{}", hex(b))),
+fn wire_hash(hash: &ExternalBlockHash) -> Option<SequenceHash> {
+    match hash {
+        ExternalBlockHash::Bytes(bytes) => bytes.as_slice().try_into().ok(),
+        ExternalBlockHash::Int(_) => None,
     }
 }
 
@@ -790,43 +781,114 @@ fn apply_batch(
     batch: &KVEventBatch,
     expected_block_size: Option<u32>,
 ) -> Result<(), FullAttentionBatchRejection> {
-    // Preflight the whole batch before any Store, Remove, or Clear mutation.
-    if let Some(expected) = expected_block_size {
+    use FullAttentionRejectionReason::{Capacity, HashContract, Layout};
+    let expected = expected_block_size.or_else(|| {
+        batch.events.iter().find_map(|event| match event {
+            KVEvent::BlockStored(store) => Some(store.block_size),
+            _ => None,
+        })
+    });
+    if let Some(expected) = expected {
         validate_full_attention_batch(batch, expected)?;
     }
-    // Batch rank if the 3-element array carries it; else the discovery rank.
+
+    enum Change {
+        Store(ResidencyOwner, StorageTier, Vec<SequenceHash>),
+        Remove(ResidencyOwner, StorageTier, Vec<SequenceHash>),
+        ClearWorker,
+    }
+
     let rank = batch.data_parallel_rank.unwrap_or(dp_rank);
-    for ev in &batch.events {
-        match ev {
-            KVEvent::BlockStored(s) => {
-                let group = s.group_idx.unwrap_or(0);
-                let owner = event_owner(source_id, rank, incarnation, s.ownership.as_deref());
-                let tier = event_tier(&owner, s.medium.as_deref());
-                let locals: Vec<Arc<str>> =
-                    local_hashes(&s.token_ids, s.block_size, s.lora_name.as_deref())
-                        .iter()
-                        .map(|b| Arc::from(hex(b)))
-                        .collect();
-                // vLLM emits one BlockStored per contiguous chain (block[i]'s parent
-                // is block[i-1]); zipping seqs with local hashes yields one edge.
-                let seqs: Vec<Arc<str>> = s.block_hashes.iter().map(hash_str).collect();
-                let blocks: Vec<(Arc<str>, Arc<str>)> = seqs.into_iter().zip(locals).collect();
-                let parent_seq = s.parent_block_hash.as_ref().map(hash_str);
-                indexer.store(group, owner, tier, parent_seq, &blocks);
+    let changes = batch
+        .events
+        .iter()
+        .enumerate()
+        .map(|(event_index, event)| {
+            let reject = |reason| FullAttentionBatchRejection {
+                event_index,
+                reason,
+            };
+            let (group, medium, ownership, hashes) = match event {
+                KVEvent::BlockStored(store) => {
+                    let generator = if let Some(parent) = &store.parent_block_hash {
+                        let parent = wire_hash(parent).ok_or_else(|| reject(HashContract))?;
+                        BlockKeyGenerator::from_root_hash(store.block_size as usize, parent)
+                    } else {
+                        ordinary_block_keys(store.block_size).ok_or_else(|| reject(HashContract))?
+                    };
+                    let first_hash = store.block_hashes.first().and_then(wire_hash);
+                    if first_hash.is_none()
+                        || first_hash
+                            != generator.first_block(&store.token_ids, store.lora_name.as_deref())
+                    {
+                        return Err(reject(HashContract));
+                    }
+                    (
+                        store.group_idx,
+                        &store.medium,
+                        &store.ownership,
+                        &store.block_hashes,
+                    )
+                }
+                KVEvent::BlockRemoved(remove) => (
+                    remove.group_idx,
+                    &remove.medium,
+                    &remove.ownership,
+                    &remove.block_hashes,
+                ),
+                KVEvent::AllBlocksCleared(_) => return Ok(Change::ClearWorker),
+            };
+            if group.is_some_and(|group| group != 0) {
+                return Err(reject(Layout));
             }
-            KVEvent::BlockRemoved(r) => {
-                let group = r.group_idx.unwrap_or(0);
-                let owner = event_owner(source_id, rank, incarnation, r.ownership.as_deref());
-                let tier = event_tier(&owner, r.medium.as_deref());
-                let hashes: Vec<Arc<str>> = r.block_hashes.iter().map(hash_str).collect();
-                indexer.remove(group, &owner, tier, &hashes);
-            }
-            KVEvent::AllBlocksCleared(_) => {
-                indexer.clear(&owner_for(source_id, rank, incarnation), ClearScope::Worker);
+            let owner = event_owner(source_id, rank, incarnation, ownership.as_deref());
+            let tier = event_tier(&owner, medium.as_deref());
+            let hashes = hashes
+                .iter()
+                .map(wire_hash)
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| reject(HashContract))?;
+            Ok(match event {
+                KVEvent::BlockStored(_) => Change::Store(owner, tier, hashes),
+                _ => Change::Remove(owner, tier, hashes),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let touched = PageChanges::from_batches(
+        changes.iter().map(|event| match event {
+            Change::Store(_, _, hashes) | Change::Remove(_, _, hashes) => Some(hashes.as_slice()),
+            Change::ClearWorker => None,
+        }),
+        usize::MAX,
+    );
+    indexer.write_batch(source_id, rank, touched, |write| {
+        for (event_index, change) in changes.into_iter().enumerate() {
+            match change {
+                Change::Store(owner, tier, hashes) => write
+                    .store_hash_pages(
+                        &owner,
+                        0,
+                        tier,
+                        None,
+                        &hashes,
+                        tier == StorageTier::Device,
+                        usize::MAX,
+                    )
+                    .map_err(|_| FullAttentionBatchRejection {
+                        event_index,
+                        reason: Capacity,
+                    })?,
+                Change::Remove(owner, tier, hashes) => {
+                    write.remove_hash_pages(&owner, 0, tier, &hashes, tier == StorageTier::Device)
+                }
+                Change::ClearWorker => {
+                    write.clear_pages(|owner| matches!(owner, ResidencyOwner::Worker { .. }))
+                }
             }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Backfill `(last_seq, ∞)` from the replay ROUTER via a DEALER socket.
@@ -974,15 +1036,6 @@ async fn replay(
     None
 }
 
-fn hex(b: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(b.len() * 2);
-    for byte in b {
-        write!(s, "{:02x}", byte).unwrap();
-    }
-    s
-}
-
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -996,15 +1049,25 @@ mod tests {
     use crate::kv_index::types::Locality;
     use crate::kv_index::wire::{AllBlocksCleared, BlockRemoved, BlockStored};
 
+    fn wire_hashes_for(tokens: &[u32], block_size: u32) -> Vec<ExternalBlockHash> {
+        crate::kv_index::ordinary_block_hashes(tokens, block_size)
+            .into_iter()
+            .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
+            .collect()
+    }
+
     fn stored(
-        block_hashes: Vec<ExternalBlockHash>,
+        block_count: usize,
         token_ids: Vec<u32>,
         medium: Option<&str>,
         ownership: Option<&str>,
     ) -> BlockStored {
         BlockStored {
             extra_keys: None,
-            block_hashes,
+            block_hashes: wire_hashes_for(&token_ids, 4)
+                .into_iter()
+                .take(block_count)
+                .collect(),
             parent_block_hash: None,
             token_ids,
             block_size: 4,
@@ -1052,12 +1115,16 @@ mod tests {
         ] {
             for full_attention_only in [false, true] {
                 let index = KvBlockIndexer::new();
-                let mut event = stored(
-                    vec![ExternalBlockHash::Int(10)],
-                    vec![1, 2, 3, 4],
-                    Some("GPU"),
-                    None,
-                );
+                let mut event = stored(1, vec![1, 2, 3, 4], Some("GPU"), None);
+                let keys = ordinary_block_keys(4).unwrap();
+                let hashes = match name {
+                    Some(name) => keys.generate_block_keys_for_adapter_name(&event.token_ids, name),
+                    None => keys.generate_block_keys(&event.token_ids),
+                };
+                event.block_hashes = hashes
+                    .iter()
+                    .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
+                    .collect();
                 event.lora_name = name.map(str::to_owned);
                 event.lora_id = lora_id;
                 event.extra_keys = extra.clone();
@@ -1076,20 +1143,14 @@ mod tests {
                         full_attention_only.then_some(4),
                     )
                     .is_ok(),
-                    !full_attention_only || expected > 0
+                    expected > 0
                 );
                 let query = MatchQuery {
                     group_idx: 0,
-                    local_hashes: local_hashes(&[1, 2, 3, 4], 4, name)
-                        .iter()
-                        .map(|hash| Arc::from(hex(hash)))
-                        .collect(),
+                    hashes,
                     tiers_of_interest: vec![StorageTier::Device],
                 };
-                assert_eq!(
-                    index.find_matches(&query).len(),
-                    if full_attention_only { expected } else { 1 }
-                );
+                assert_eq!(index.find_matches(&query).len(), expected);
             }
         }
     }
@@ -1101,31 +1162,18 @@ mod tests {
             ts: 1.0,
             events: vec![
                 // ownership set → CacheOwner → External (not GPU/Device).
-                KVEvent::BlockStored(stored(
-                    vec![ExternalBlockHash::Int(10)],
-                    vec![1, 2, 3, 4],
-                    Some("GPU"),
-                    Some("mooncake"),
-                )),
+                KVEvent::BlockStored(stored(1, vec![1, 2, 3, 4], Some("GPU"), Some("mooncake"))),
                 // ownership None, medium CPU → Worker → HostPinned.
-                KVEvent::BlockStored(stored(
-                    vec![ExternalBlockHash::Int(20)],
-                    vec![5, 6, 7, 8],
-                    Some("CPU"),
-                    None,
-                )),
+                KVEvent::BlockStored(stored(1, vec![5, 6, 7, 8], Some("CPU"), None)),
             ],
             data_parallel_rank: Some(1),
         };
         apply_batch(&idx, &SourceId::from("w0"), 0, 0, &batch, None).unwrap();
 
-        let pool_locals: Vec<Arc<str>> = local_hashes(&[1, 2, 3, 4], 4, None)
-            .iter()
-            .map(|b| Arc::from(hex(b)))
-            .collect();
+        let pool_locals = crate::kv_index::ordinary_block_hashes(&[1, 2, 3, 4], 4);
         let pool_res = idx.find_matches(&MatchQuery {
             group_idx: 0,
-            local_hashes: pool_locals,
+            hashes: pool_locals,
             tiers_of_interest: vec![StorageTier::External],
         });
         assert_eq!(pool_res.len(), 1);
@@ -1134,13 +1182,10 @@ mod tests {
         assert_eq!(&*pool_res[0].target.instance_id, "w0");
         assert_eq!(pool_res[0].target.dp_rank, 1);
 
-        let wkr_locals: Vec<Arc<str>> = local_hashes(&[5, 6, 7, 8], 4, None)
-            .iter()
-            .map(|b| Arc::from(hex(b)))
-            .collect();
+        let wkr_locals = crate::kv_index::ordinary_block_hashes(&[5, 6, 7, 8], 4);
         let wkr_res = idx.find_matches(&MatchQuery {
             group_idx: 0,
-            local_hashes: wkr_locals,
+            hashes: wkr_locals,
             tiers_of_interest: vec![StorageTier::HostPinned],
         });
         assert_eq!(wkr_res.len(), 1);
@@ -1151,14 +1196,9 @@ mod tests {
     }
 
     #[test]
-    fn full_attention_and_generic_subscribers_preserve_residency_boundaries() {
+    fn full_attention_subscribers_preserve_residency_boundaries() {
         let source = SourceId::from("dense");
-        let valid = stored(
-            vec![ExternalBlockHash::Int(1)],
-            vec![1, 2, 3, 4],
-            Some("GPU"),
-            None,
-        );
+        let valid = stored(1, vec![1, 2, 3, 4], Some("GPU"), None);
         let generic = KvBlockIndexer::new();
         let mut remote = valid.clone();
         remote.locality = Some("REMOTE".into());
@@ -1167,8 +1207,8 @@ mod tests {
             events: vec![KVEvent::BlockStored(remote)],
             data_parallel_rank: Some(0),
         };
-        assert!(apply_batch(&generic, &source, 0, 0, &batch, None).is_ok());
-        assert_eq!(hits(&generic, &[1, 2, 3, 4]).len(), 1);
+        assert!(apply_batch(&generic, &source, 0, 0, &batch, None).is_err());
+        assert!(hits(&generic, &[1, 2, 3, 4]).is_empty());
         for (medium, ownership, locality, tier) in [
             ("GPU", None, "LOCAL", StorageTier::Device),
             ("CPU", None, "LOCAL", StorageTier::HostPinned),
@@ -1187,7 +1227,7 @@ mod tests {
             assert!(apply_batch(&index, &source, 0, 0, &batch, Some(4)).is_ok());
             let matches = index.find_matches(&MatchQuery {
                 group_idx: 0,
-                local_hashes: crate::kv_index::local_block_hash_strings(&[1, 2, 3, 4], 4, None),
+                hashes: crate::kv_index::ordinary_block_hashes(&[1, 2, 3, 4], 4),
                 tiers_of_interest: vec![tier],
             });
             assert_eq!(matches.len(), 1);
@@ -1205,54 +1245,6 @@ mod tests {
     #[test]
     fn read_seq_short_input_is_sentinel() {
         assert_eq!(read_seq(&[0u8, 1]), -1);
-    }
-
-    #[test]
-    fn hex_encodes_bytes() {
-        assert_eq!(hex(&[0u8, 255]), "00ff");
-    }
-
-    #[test]
-    fn hash_str_int_and_bytes() {
-        assert_eq!(&*hash_str(&ExternalBlockHash::Int(7)), "i:7");
-        assert_eq!(
-            &*hash_str(&ExternalBlockHash::Bytes(vec![0xab, 0xcd])),
-            "b:abcd"
-        );
-    }
-
-    #[test]
-    fn local_hashes_chunks_by_block_size() {
-        let ids = vec![1u32, 2, 3, 4, 5, 6, 7, 8];
-        let hashes = local_hashes(&ids, 2, None);
-        assert_eq!(hashes.len(), 4);
-        assert_eq!(hashes[0].len(), 32);
-    }
-
-    #[test]
-    fn local_hashes_trailing_partial_block_included() {
-        let ids = vec![1u32, 2, 3, 4, 5];
-        let hashes = local_hashes(&ids, 2, None);
-        assert_eq!(hashes.len(), 3);
-    }
-
-    #[test]
-    fn local_hashes_block_size_zero_yields_empty() {
-        assert!(local_hashes(&[1u32, 2, 3], 0, None).is_empty());
-    }
-
-    #[test]
-    fn local_hashes_determinism() {
-        let ids = vec![10u32, 20, 30, 40];
-        assert_eq!(local_hashes(&ids, 2, None), local_hashes(&ids, 2, None));
-    }
-
-    #[test]
-    fn local_hashes_seed_distinguishes_lora() {
-        let ids = vec![1u32, 2, 3, 4];
-        let base = local_hashes(&ids, 2, None);
-        let lora = local_hashes(&ids, 2, Some("adapter-a"));
-        assert_ne!(base, lora);
     }
 
     #[tokio::test]
@@ -1313,10 +1305,10 @@ mod tests {
             ctx.clone(),
         );
 
-        let local: Arc<str> = Arc::from(hex(&local_hashes(&[1, 2, 3, 4], 4, None)[0]));
-        let dev = |hashes: &[Arc<str>]| MatchQuery {
+        let local = crate::kv_index::ordinary_block_hashes(&[1, 2, 3, 4], 4)[0];
+        let dev = |hashes: &[SequenceHash]| MatchQuery {
             group_idx: 0,
-            local_hashes: hashes.to_vec(),
+            hashes: hashes.to_vec(),
             tiers_of_interest: vec![StorageTier::Device],
         };
 
@@ -1329,7 +1321,7 @@ mod tests {
             1.0,
             &[KVEvent::BlockStored(BlockStored {
                 extra_keys: None,
-                block_hashes: vec![ExternalBlockHash::Int(100)],
+                block_hashes: wire_hashes_for(&[1, 2, 3, 4], 4),
                 parent_block_hash: None,
                 token_ids: vec![1, 2, 3, 4],
                 block_size: 4,
@@ -1360,7 +1352,7 @@ mod tests {
             1,
             2.0,
             &[KVEvent::BlockRemoved(BlockRemoved {
-                block_hashes: vec![ExternalBlockHash::Int(100)],
+                block_hashes: wire_hashes_for(&[1, 2, 3, 4], 4),
                 medium: Some("GPU".into()),
                 group_idx: Some(0),
                 locality: None,
@@ -1419,14 +1411,9 @@ mod tests {
             0,
             1.0,
             &[
+                KVEvent::BlockStored(stored(1, host_tokens.to_vec(), Some("CPU"), None)),
                 KVEvent::BlockStored(stored(
-                    vec![ExternalBlockHash::Int(100)],
-                    host_tokens.to_vec(),
-                    Some("CPU"),
-                    None,
-                )),
-                KVEvent::BlockStored(stored(
-                    vec![ExternalBlockHash::Int(101)],
+                    1,
                     external_tokens.to_vec(),
                     Some("GPU"),
                     Some("external-pool"),
@@ -1441,7 +1428,7 @@ mod tests {
         ] {
             let hits = indexer.find_matches(&MatchQuery {
                 group_idx: 0,
-                local_hashes: crate::kv_index::local_block_hash_strings(&tokens, 4, None),
+                hashes: crate::kv_index::ordinary_block_hashes(&tokens, 4),
                 tiers_of_interest: vec![tier],
             });
             assert_eq!(hits.len(), 1);
@@ -1587,17 +1574,12 @@ mod tests {
         }
     }
 
-    fn store_event(seq_hash: u64, tokens: &[u32]) -> KVEvent {
-        KVEvent::BlockStored(stored(
-            vec![ExternalBlockHash::Int(seq_hash)],
-            tokens.to_vec(),
-            Some("GPU"),
-            None,
-        ))
+    fn store_event(tokens: &[u32]) -> KVEvent {
+        KVEvent::BlockStored(stored(1, tokens.to_vec(), Some("GPU"), None))
     }
 
-    fn session_store_event(seq_hash: u64, tokens: &[u32], session: &str) -> KVEvent {
-        let KVEvent::BlockStored(mut event) = store_event(seq_hash, tokens) else {
+    fn session_store_event(tokens: &[u32], session: &str) -> KVEvent {
+        let KVEvent::BlockStored(mut event) = store_event(tokens) else {
             unreachable!()
         };
         event.session_id = Some(session.into());
@@ -1607,10 +1589,7 @@ mod tests {
     fn hits(index: &KvBlockIndexer, tokens: &[u32]) -> Vec<crate::kv_index::TierMatch> {
         index.find_matches(&MatchQuery {
             group_idx: 0,
-            local_hashes: local_hashes(tokens, 4, None)
-                .iter()
-                .map(|hash| Arc::from(hex(hash)))
-                .collect(),
+            hashes: crate::kv_index::ordinary_block_hashes(tokens, 4),
             tiers_of_interest: vec![StorageTier::Device],
         })
     }
@@ -1652,7 +1631,7 @@ mod tests {
             b"kv",
             0,
             0.0,
-            &[store_event(100, &old)],
+            &[store_event(&old)],
             Some(0),
         )
         .await;
@@ -1663,7 +1642,7 @@ mod tests {
             b"kv",
             1,
             1.0,
-            &[store_event(101, &current)],
+            &[store_event(&current)],
             Some(0),
         )
         .await;
@@ -1688,7 +1667,7 @@ mod tests {
             b"kv",
             2,
             2.0,
-            &[store_event(102, &fresh)],
+            &[store_event(&fresh)],
             Some(0),
         )
         .await;
@@ -1704,7 +1683,7 @@ mod tests {
             3.0,
             &[
                 KVEvent::AllBlocksCleared(AllBlocksCleared {}),
-                store_event(102, &fresh),
+                store_event(&fresh),
             ],
             Some(0),
         )
@@ -1741,7 +1720,7 @@ mod tests {
             b"kv",
             0,
             0.0,
-            &[store_event(100, &old)],
+            &[store_event(&old)],
             Some(0),
         )
         .await;
@@ -1756,7 +1735,7 @@ mod tests {
             b"kv",
             1,
             1.0,
-            &[store_event(200, &foreign)],
+            &[store_event(&foreign)],
             Some(1),
         )
         .await;
@@ -1774,7 +1753,7 @@ mod tests {
             b"kv",
             2,
             2.0,
-            &[store_event(101, &fresh)],
+            &[store_event(&fresh)],
             Some(0),
         )
         .await;
@@ -1793,7 +1772,7 @@ mod tests {
             b"kv",
             5,
             5.0,
-            &[store_event(102, &fresh)],
+            &[store_event(&fresh)],
             Some(0),
         )
         .await;
@@ -1807,7 +1786,7 @@ mod tests {
             6.0,
             &[
                 KVEvent::AllBlocksCleared(AllBlocksCleared {}),
-                store_event(102, &fresh),
+                store_event(&fresh),
             ],
             Some(0),
         )
@@ -1840,29 +1819,28 @@ mod tests {
                 b"kv",
                 0,
                 0.0,
-                &[store_event(100, &old)],
+                &[store_event(&old)],
                 Some(0),
             )
             .await;
             assert_eq!(hits(&f.indexer, &old).len(), 1);
-            let live = [store_event(102, &fresh)];
+            let live = [store_event(&fresh)];
             let replies = [
                 (
                     1,
                     b"kv".as_slice(),
-                    batch_payload(&[store_event(101, &recovered)], 0),
+                    batch_payload(&[store_event(&recovered)], 0),
                 ),
                 (
                     2,
                     b"kv".as_slice(),
-                    rmp_serde::to_vec_named(&(2.0, [store_event(200, &foreign)], foreign_rank))
-                        .unwrap(),
+                    rmp_serde::to_vec_named(&(2.0, [store_event(&foreign)], foreign_rank)).unwrap(),
                 ),
                 (3, b"kv".as_slice(), batch_payload(&live, 0)),
             ];
             let query = MatchQuery {
                 group_idx: 0,
-                local_hashes: crate::kv_index::local_block_hash_strings(&old, 4, None),
+                hashes: crate::kv_index::ordinary_block_hashes(&old, 4),
                 tiers_of_interest: vec![StorageTier::Device],
             };
             let suspended_queries = [query];
@@ -1920,7 +1898,7 @@ mod tests {
             b"kv",
             0,
             0.0,
-            &[store_event(100, &old)],
+            &[store_event(&old)],
             Some(0),
         )
         .await;
@@ -1944,7 +1922,7 @@ mod tests {
             &[(
                 1,
                 b"kv".as_slice(),
-                batch_payload(&[store_event(101, &partial)], 0),
+                batch_payload(&[store_event(&partial)], 0),
             )],
         );
         loop {
@@ -2001,7 +1979,7 @@ mod tests {
             b"kv",
             0,
             0.0,
-            &[store_event(200, &replacement)],
+            &[store_event(&replacement)],
             Some(0),
         )
         .await;
@@ -2033,7 +2011,7 @@ mod tests {
             b"kv",
             0,
             0.0,
-            &[store_event(100, &tokens)],
+            &[store_event(&tokens)],
             Some(0),
         )
         .await;
@@ -2045,7 +2023,7 @@ mod tests {
                 0,
                 &KVEventBatch {
                     ts: 0.0,
-                    events: vec![store_event(100, &tokens)],
+                    events: vec![store_event(&tokens)],
                     data_parallel_rank: Some(rank),
                 },
                 None,
@@ -2065,7 +2043,7 @@ mod tests {
             b"kv",
             3,
             3.0,
-            &[store_event(101, &tokens)],
+            &[store_event(&tokens)],
             Some(0),
         )
         .await;
@@ -2078,7 +2056,7 @@ mod tests {
             4.0,
             &[
                 KVEvent::AllBlocksCleared(AllBlocksCleared {}),
-                store_event(101, &tokens),
+                store_event(&tokens),
             ],
             Some(0),
         )
@@ -2098,7 +2076,7 @@ mod tests {
             0.0,
             &[
                 KVEvent::AllBlocksCleared(AllBlocksCleared {}),
-                store_event(100, &tokens),
+                store_event(&tokens),
             ],
             Some(0),
         )
@@ -2132,7 +2110,7 @@ mod tests {
             1.0,
             &[
                 KVEvent::AllBlocksCleared(AllBlocksCleared {}),
-                store_event(100, &tokens),
+                store_event(&tokens),
             ],
             Some(0),
         )
@@ -2146,7 +2124,7 @@ mod tests {
         publish_until_advanced(&f.publisher, &mut f.signals, b"kv", 0, 0.0, &[], Some(0)).await;
         let unrelated = [1, 2, 3, 4];
         let expected = [5, 6, 7, 8];
-        let payload = batch_payload(&[store_event(100, &unrelated)], 0);
+        let payload = batch_payload(&[store_event(&unrelated)], 0);
         f.publisher
             .send_multipart([b"kv-other".as_slice(), &1i64.to_be_bytes(), &payload], 0)
             .unwrap();
@@ -2156,7 +2134,7 @@ mod tests {
             b"kv",
             1,
             1.0,
-            &[session_store_event(101, &expected, "session-live")],
+            &[session_store_event(&expected, "session-live")],
             Some(0),
         )
         .await;
@@ -2172,12 +2150,12 @@ mod tests {
         let mut f = fixture(false);
         publish_until_advanced(&f.publisher, &mut f.signals, b"kv", 0, 0.0, &[], Some(0)).await;
         let tokens = [1, 2, 3, 4];
-        let mut event = serde_json::to_value(store_event(100, &tokens)).unwrap();
+        let mut event = serde_json::to_value(store_event(&tokens)).unwrap();
         event["future_namespace"] = serde_json::json!("not-plain");
         let payload = rmp_serde::to_vec(&(
             1.0,
             [
-                serde_json::to_value(store_event(101, &[5, 6, 7, 8])).unwrap(),
+                serde_json::to_value(store_event(&[5, 6, 7, 8])).unwrap(),
                 event,
             ],
             0u32,
@@ -2212,7 +2190,7 @@ mod tests {
             1.0,
             &[
                 KVEvent::AllBlocksCleared(AllBlocksCleared {}),
-                store_event(100, &tokens),
+                store_event(&tokens),
             ],
             Some(0),
         )
@@ -2236,7 +2214,7 @@ mod tests {
         ] {
             let events: Vec<_> = blocks
                 .into_iter()
-                .map(|(hash, tokens)| session_store_event(hash, &tokens, session))
+                .map(|(_, tokens)| session_store_event(&tokens, session))
                 .collect();
             let batch = KVEventBatch {
                 ts: seq as f64,
@@ -2263,23 +2241,18 @@ mod tests {
             let source = SourceId::from("dense");
             let initial = KVEventBatch {
                 ts: 0.0,
-                events: vec![store_event(100, &[1, 2, 3, 4])],
+                events: vec![store_event(&[1, 2, 3, 4])],
                 data_parallel_rank: Some(0),
             };
             assert!(apply_batch(&index, &source, 0, 0, &initial, Some(4)).is_ok());
-            let mut bad = stored(
-                vec![ExternalBlockHash::Int(102)],
-                (20..28).collect(),
-                Some("GPU"),
-                None,
-            );
+            let mut bad = stored(1, (20..28).collect(), Some("GPU"), None);
             bad.block_size = actual;
             let batch = KVEventBatch {
                 ts: 1.0,
                 events: vec![
-                    store_event(101, &[5, 6, 7, 8]),
+                    store_event(&[5, 6, 7, 8]),
                     KVEvent::BlockRemoved(BlockRemoved {
-                        block_hashes: vec![ExternalBlockHash::Int(100)],
+                        block_hashes: wire_hashes_for(&[1, 2, 3, 4], 4),
                         medium: Some("GPU".into()),
                         group_idx: Some(0),
                         locality: None,
@@ -2312,19 +2285,15 @@ mod tests {
 
     #[tokio::test]
     async fn full_attention_replay_block_size_mismatch_clears_partial_recovery() {
-        let event = |hash, tokens: &[u32], size| {
-            let mut value = stored(
-                vec![ExternalBlockHash::Int(hash)],
-                tokens.to_vec(),
-                Some("GPU"),
-                None,
-            );
+        let event = |_id, tokens: &[u32], size| {
+            let mut value = stored(1, tokens.to_vec(), Some("GPU"), None);
             value.block_size = size;
+            value.block_hashes = wire_hashes_for(tokens, size);
             KVEvent::BlockStored(value)
         };
         let query = |tokens: &[u32], block_size| MatchQuery {
             group_idx: 0,
-            local_hashes: crate::kv_index::local_block_hash_strings(tokens, block_size, None),
+            hashes: crate::kv_index::ordinary_block_hashes(tokens, block_size),
             tiers_of_interest: vec![StorageTier::Device],
         };
         let cases = [(16, 8), (8, 16)].map(|(expected, actual)| {
@@ -2475,13 +2444,13 @@ mod tests {
             b"kv",
             0,
             0.0,
-            &[store_event(100, &old), store_event(101, &keep)],
+            &[store_event(&old), store_event(&keep)],
             Some(0),
         )
         .await;
         let query = |tokens: &[u32]| MatchQuery {
             group_idx: 0,
-            local_hashes: crate::kv_index::local_block_hash_strings(tokens, 4, None),
+            hashes: crate::kv_index::ordinary_block_hashes(tokens, 4),
             tiers_of_interest: vec![StorageTier::Device],
         };
         for tokens in [&old, &keep] {
@@ -2490,10 +2459,10 @@ mod tests {
             assert_eq!(matches[0].target.instance_id.as_ref(), "w0");
             assert_eq!(matches[0].target.dp_rank, 0);
         }
-        let first = batch_payload(&[session_store_event(200, &partial, "session-replay")], 0);
+        let first = batch_payload(&[session_store_event(&partial, "session-replay")], 0);
         let eviction = batch_payload(
             &[KVEvent::BlockRemoved(BlockRemoved {
-                block_hashes: vec![ExternalBlockHash::Int(100)],
+                block_hashes: wire_hashes_for(&[1, 2, 3, 4], 4),
                 medium: Some("GPU".into()),
                 group_idx: Some(0),
                 locality: None,
@@ -2501,7 +2470,7 @@ mod tests {
             })],
             0,
         );
-        let third = batch_payload(&[store_event(400, &fresh)], 0);
+        let third = batch_payload(&[store_event(&fresh)], 0);
         let eof = (-1, b"".as_slice(), vec![]);
         let topic = b"kv".as_slice();
         let replies = match case {
@@ -2518,7 +2487,7 @@ mod tests {
             ],
             _ => panic!("unknown replay case"),
         };
-        let live_events = [store_event(400, &fresh)];
+        let live_events = [store_event(&fresh)];
         let suspended_queries = [query(&old), query(&keep)];
         let (advances, ()) = tokio::join!(
             publish_until_advanced(
@@ -2612,8 +2581,7 @@ mod tests {
         ];
         let payloads: Vec<_> = tokens
             .iter()
-            .enumerate()
-            .map(|(seq, token_ids)| batch_payload(&[store_event(100 + seq as u64, token_ids)], 0))
+            .map(|token_ids| batch_payload(&[store_event(token_ids)], 0))
             .collect();
 
         publish_until_advanced(
@@ -2622,7 +2590,7 @@ mod tests {
             b"kv",
             0,
             0.0,
-            &[store_event(100, &tokens[0])],
+            &[store_event(&tokens[0])],
             Some(0),
         )
         .await;
@@ -2639,7 +2607,7 @@ mod tests {
                 ],
             );
         };
-        let seq_two_events = [store_event(102, &tokens[2])];
+        let seq_two_events = [store_event(&tokens[2])];
         tokio::join!(
             publish_until_advanced(
                 &fixture.publisher,
@@ -2671,7 +2639,7 @@ mod tests {
                 .collect();
             send_replay_replies(fixture.replay_server.as_ref().unwrap(), &request, &replies);
         };
-        let seq_four_events = [store_event(104, &tokens[4])];
+        let seq_four_events = [store_event(&tokens[4])];
         tokio::join!(
             publish_until_advanced(
                 &fixture.publisher,
@@ -2709,12 +2677,11 @@ mod tests {
         ];
         let payloads: Vec<_> = tokens
             .iter()
-            .enumerate()
-            .map(|(seq, token_ids)| batch_payload(&[store_event(100 + seq as u64, token_ids)], 0))
+            .map(|token_ids| batch_payload(&[store_event(token_ids)], 0))
             .collect();
 
         for (seq, token_ids) in tokens.iter().take(2).enumerate() {
-            let events = [store_event(100 + seq as u64, token_ids)];
+            let events = [store_event(token_ids)];
             publish_until_advanced(
                 &fixture.publisher,
                 &mut fixture.signals,
@@ -2740,7 +2707,7 @@ mod tests {
                 .collect();
             send_replay_replies(fixture.replay_server.as_ref().unwrap(), &request, &replies);
         };
-        let seq_three_events = [store_event(103, &tokens[3])];
+        let seq_three_events = [store_event(&tokens[3])];
         tokio::join!(
             publish_until_advanced(
                 &fixture.publisher,
@@ -2791,7 +2758,7 @@ mod tests {
             b"kv",
             0,
             0.0,
-            &[store_event(100, &[1, 2, 3, 4])],
+            &[store_event(&[1, 2, 3, 4])],
             Some(0),
         )
         .await;
@@ -2800,7 +2767,7 @@ mod tests {
                 [
                     b"kv".as_slice(),
                     &4i64.to_be_bytes(),
-                    &batch_payload(&[store_event(104, &live)], 0),
+                    &batch_payload(&[store_event(&live)], 0),
                 ],
                 0,
             )
@@ -2837,7 +2804,7 @@ mod tests {
                 (
                     2,
                     b"kv".as_slice(),
-                    batch_payload(&[store_event(102, &stale)], 0),
+                    batch_payload(&[store_event(&stale)], 0),
                 ),
                 (3, b"kv".as_slice(), vec![0xc1]),
             ],
@@ -2872,7 +2839,7 @@ mod tests {
             b"kv",
             0,
             0.0,
-            &[store_event(100, &tokens[0])],
+            &[store_event(&tokens[0])],
             Some(0),
         )
         .await;
@@ -2887,12 +2854,12 @@ mod tests {
                     (
                         1,
                         b"kv".as_slice(),
-                        batch_payload(&[store_event(101, &tokens[1])], 0),
+                        batch_payload(&[store_event(&tokens[1])], 0),
                     ),
                     (
                         2,
                         b"kv".as_slice(),
-                        batch_payload(&[store_event(102, &tokens[2])], 0),
+                        batch_payload(&[store_event(&tokens[2])], 0),
                     ),
                 ],
             );
@@ -2909,7 +2876,7 @@ mod tests {
             }
             commit_barrier.wait().await;
         };
-        let seq_two_events = [store_event(102, &tokens[2])];
+        let seq_two_events = [store_event(&tokens[2])];
         tokio::join!(
             publish_until_advanced(
                 &fixture.publisher,
@@ -2968,7 +2935,7 @@ mod tests {
             b"kv",
             0,
             0.0,
-            &[store_event(100, &[1, 2, 3, 4])],
+            &[store_event(&[1, 2, 3, 4])],
             Some(0),
         )
         .await;
@@ -2991,7 +2958,7 @@ mod tests {
             // More than the combined PUB/SUB HWM arrives before replay replies.
             for seq in 2i64..=42 {
                 let events = if seq == 42 {
-                    vec![store_event(200, &final_tokens)]
+                    vec![store_event(&final_tokens)]
                 } else {
                     vec![]
                 };
@@ -3112,7 +3079,7 @@ mod tests {
                 b"kv",
                 0,
                 0.0,
-                &[store_event(100, &old)],
+                &[store_event(&old)],
                 Some(0),
             )
             .await;
@@ -3134,7 +3101,7 @@ mod tests {
                 &[(
                     1,
                     b"kv".as_slice(),
-                    batch_payload(&[store_event(101, &partial)], 0),
+                    batch_payload(&[store_event(&partial)], 0),
                 )],
             );
             wait_for_advance(&mut f.signals, 1).await;
@@ -3234,7 +3201,7 @@ mod tests {
             b"kv",
             0,
             0.0,
-            &[store_event(100, &old)],
+            &[store_event(&old)],
             Some(0),
         )
         .await;
@@ -3256,7 +3223,7 @@ mod tests {
             &[(
                 1,
                 b"kv".as_slice(),
-                batch_payload(&[store_event(101, &partial)], 0),
+                batch_payload(&[store_event(&partial)], 0),
             )],
         );
         wait_for_advance(&mut f.signals, 1).await;
@@ -3301,7 +3268,7 @@ mod tests {
                 (
                     next,
                     b"kv".as_slice(),
-                    batch_payload(&[store_event(102, &fresh)], 0),
+                    batch_payload(&[store_event(&fresh)], 0),
                 ),
             ],
         );
@@ -3338,13 +3305,8 @@ mod tests {
         let local = [9, 10, 11, 12];
         let initial = [13, 14, 15, 16];
         let hidden = [17, 18, 19, 20];
-        let pool_store = |hash, tokens: &[u32]| {
-            KVEvent::BlockStored(stored(
-                vec![ExternalBlockHash::Int(hash)],
-                tokens.to_vec(),
-                Some("GPU"),
-                Some("pool"),
-            ))
+        let pool_store = |_id, tokens: &[u32]| {
+            KVEvent::BlockStored(stored(1, tokens.to_vec(), Some("GPU"), Some("pool")))
         };
         let source = SourceId::from("w0");
         for (strict, gap, expected) in [
@@ -3374,7 +3336,7 @@ mod tests {
                 b"kv",
                 0,
                 0.0,
-                &[pool_store(100, &old), store_event(103, &initial)],
+                &[pool_store(100, &old), store_event(&initial)],
                 Some(0),
             )
             .await;
@@ -3384,7 +3346,7 @@ mod tests {
             );
             assert_eq!(hits(&f.indexer, &initial).len(), 1);
             if gap {
-                let gap_events = [store_event(104, &hidden)];
+                let gap_events = [store_event(&hidden)];
                 tokio::join!(
                     publish_until_advanced(
                         &f.publisher,
@@ -3426,7 +3388,7 @@ mod tests {
                 0.0,
                 &[
                     KVEvent::AllBlocksCleared(AllBlocksCleared {}),
-                    store_event(101, &local),
+                    store_event(&local),
                 ],
                 Some(0),
             )
@@ -3455,7 +3417,7 @@ mod tests {
                 f.indexer
                     .find_matches(&MatchQuery {
                         group_idx: 0,
-                        local_hashes: crate::kv_index::local_block_hash_strings(tokens, 4, None),
+                        hashes: crate::kv_index::ordinary_block_hashes(tokens, 4),
                         tiers_of_interest: vec![StorageTier::External],
                     })
                     .len()
@@ -3552,13 +3514,8 @@ mod tests {
     #[tokio::test]
     async fn publisher_restart_restores_only_worker_credit_live_or_replayed() {
         let source = SourceId::from("w0");
-        let pool_store = |id, tokens: &[u32]| {
-            KVEvent::BlockStored(stored(
-                vec![ExternalBlockHash::Int(id)],
-                tokens.to_vec(),
-                Some("GPU"),
-                Some("pool"),
-            ))
+        let pool_store = |_id, tokens: &[u32]| {
+            KVEvent::BlockStored(stored(1, tokens.to_vec(), Some("GPU"), Some("pool")))
         };
         for use_replay in [false, true] {
             let mut f = fixture_with_block_size(use_replay, Some(4));
@@ -3568,12 +3525,12 @@ mod tests {
             let new_local = [9, 10, 11, 12];
             let pool_query = |tokens: &[u32]| MatchQuery {
                 group_idx: 0,
-                local_hashes: crate::kv_index::local_block_hash_strings(tokens, 4, None),
+                hashes: crate::kv_index::ordinary_block_hashes(tokens, 4),
                 tiers_of_interest: vec![StorageTier::External],
             };
             for seq in 0..=2 {
                 let events = if seq == 0 {
-                    vec![pool_store(100, &old_pool), store_event(99, &old_local)]
+                    vec![pool_store(100, &old_pool), store_event(&old_local)]
                 } else {
                     vec![]
                 };
@@ -3593,7 +3550,7 @@ mod tests {
             f.indexer
                 .resume_boundary(&source, 0, RecoveryBoundary::Initial, false);
             assert_eq!(f.indexer.find_matches(&pool_query(&old_pool)).len(), 1);
-            let initial = [pool_store(101, &new_pool), store_event(200, &new_local)];
+            let initial = [pool_store(101, &new_pool), store_event(&new_local)];
             let reason = if let Some(server) = &f.replay_server {
                 tokio::join!(
                     publish_until_advanced(
@@ -3661,7 +3618,7 @@ mod tests {
         for strict in [false, true] {
             for replay_available in [false, true] {
                 let mut f = fixture_with_recovery(replay_available, Some(4), None, strict);
-                let events = [store_event(120, &[1, 2, 3, 4])];
+                let events = [store_event(&[1, 2, 3, 4])];
                 tokio::join!(
                     publish_until_advanced(
                         &f.publisher,
@@ -3731,7 +3688,7 @@ mod tests {
                         b"kv",
                         23,
                         0.0,
-                        &[store_event(150, &[5, 6, 7, 8])],
+                        &[store_event(&[5, 6, 7, 8])],
                         Some(0),
                     )
                     .await;
@@ -3754,16 +3711,11 @@ mod tests {
             b"kv",
             0,
             0.0,
-            &[store_event(100, &[1, 2, 3, 4])],
+            &[store_event(&[1, 2, 3, 4])],
             Some(0),
         )
         .await;
-        let mut invalid = stored(
-            vec![ExternalBlockHash::Int(200)],
-            vec![1, 2, 3, 4, 5, 6, 7, 8],
-            Some("GPU"),
-            None,
-        );
+        let mut invalid = stored(1, vec![1, 2, 3, 4, 5, 6, 7, 8], Some("GPU"), None);
         invalid.block_size = 8;
         let payload = batch_payload(&[KVEvent::BlockStored(invalid)], 0);
         let server = f.replay_server.as_ref().unwrap();
@@ -3849,7 +3801,7 @@ mod tests {
                 &[(
                     0,
                     b"kv".as_slice(),
-                    batch_payload(&[store_event(100, &[1, 2, 3, 4])], 0),
+                    batch_payload(&[store_event(&[1, 2, 3, 4])], 0),
                 )],
             );
         };

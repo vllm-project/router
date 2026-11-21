@@ -1,0 +1,341 @@
+//! Shared hash-page storage and source transactions, for full and mixed attention.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::RwLock;
+
+use crate::kv_hash::SequenceHash;
+mod page_table;
+mod records;
+pub(crate) mod source_transaction;
+
+use self::page_table::{ActivePages, PageTable};
+pub(crate) use self::page_table::{PageEvidence, PageMatch, PageTiers};
+use self::source_transaction::SourceWrite;
+pub(crate) use self::source_transaction::{IndexBatch, IndexSnapshot};
+use crate::kv_index::types::{ResidencyOwner, RoutableTarget, SourceId, StorageTier, TierBits};
+
+type Fast = foldhash::fast::RandomState;
+pub(crate) type GroupPages = HashMap<PageQuery, PageEvidence, Fast>;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PageQuery {
+    pub(crate) group: u32,
+    pub(crate) stop_at_gap: bool,
+}
+
+impl From<u32> for PageQuery {
+    fn from(group: u32) -> Self {
+        Self {
+            group,
+            stop_at_gap: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageWriteError {
+    Capacity,
+    ConflictingHash,
+}
+
+/// Serializes one worker/rank across its cache groups.
+struct SourceLock {
+    target: RoutableTarget,
+    access: RwLock<SourceData>,
+    // Even generations are visible. Odd generations are suspended or retired.
+    generation: AtomicU64,
+    revision: AtomicU64,
+    planned: RwLock<Option<(u64, PageChanges)>>,
+}
+
+#[derive(Default)]
+struct SourceData {
+    active_pages: ActivePages,
+}
+
+/// Identity and trust generation of one source at snapshot time.
+pub(crate) struct SourceVersion {
+    source: Arc<SourceLock>,
+    generation: u64,
+}
+
+impl SourceLock {
+    fn new(target: RoutableTarget, committed: u64) -> Self {
+        Self {
+            target,
+            access: RwLock::new(SourceData::default()),
+            generation: AtomicU64::new(0),
+            revision: AtomicU64::new(committed),
+            planned: RwLock::default(),
+        }
+    }
+
+    fn committed_at(&self, scan: &PageScan) -> bool {
+        let revision = self.revision.load(Ordering::Acquire);
+        revision.is_multiple_of(2) && revision <= scan.committed
+    }
+}
+
+/// One shared fact index per cache identity, sharded by cache group.
+pub struct KvBlockIndexer {
+    hash_pages: PageTable,
+    /// Gates may be removed only by `retire_source` under the global barrier.
+    // Membership changes only on source attachment/retirement. A compact map
+    // avoids scanning CPU-count-sized sets of empty shards on every query.
+    source_locks: RwLock<HashMap<RoutableTarget, Arc<SourceLock>, Fast>>,
+    // A scan samples this once before reading any page. Only completed writes advance it.
+    committed: AtomicU64,
+    /// Ordinary access shares the barrier; retirement excludes it.
+    domain: RwLock<()>,
+}
+
+impl KvBlockIndexer {
+    pub fn new() -> Self {
+        KvBlockIndexer {
+            hash_pages: PageTable::default(),
+            source_locks: RwLock::new(HashMap::default()),
+            committed: AtomicU64::new(0),
+            domain: RwLock::new(()),
+        }
+    }
+
+    fn existing_source(&self, target: &RoutableTarget) -> Option<Arc<SourceLock>> {
+        self.source_locks.read().get(target).cloned()
+    }
+
+    fn source_lock(&self, target: &RoutableTarget) -> Arc<SourceLock> {
+        if let Some(source) = self.existing_source(target) {
+            return source;
+        }
+        self.source_locks
+            .write()
+            .entry(target.clone())
+            .or_insert_with(|| {
+                // A replacement must not validate observations taken before the old source retired.
+                Arc::new(SourceLock::new(
+                    target.clone(),
+                    self.committed.load(Ordering::Acquire),
+                ))
+            })
+            .clone()
+    }
+
+    /// Check a snapshot after dropping its locks. Ordinary store/remove is a
+    /// valid snapshot transition; suspension, resume, or retirement invalidates
+    /// the result. This does not reserve engine blocks.
+    pub(crate) fn source_version_is_current(&self, version: &SourceVersion) -> bool {
+        version.generation.is_multiple_of(2)
+            && version.source.generation.load(Ordering::Acquire) == version.generation
+    }
+
+    /// Hide a source while contiguous replay repairs its observations.
+    fn suspend_source_unlocked(&self, source: &SourceId, dp_rank: u32) {
+        let target = RoutableTarget {
+            instance_id: source.clone(),
+            dp_rank,
+        };
+        self.source_lock(&target)
+            .generation
+            .fetch_or(1, Ordering::AcqRel);
+    }
+
+    /// Permanently retire a fenced source. The global barrier drains all
+    /// transactions before removing its gate; in-flight owned snapshots retain
+    /// the old gate and observe its incremented generation.
+    pub(crate) fn retire_source(&self, source: &SourceId, dp_rank: u32) {
+        let _domain = self.domain.write();
+        let target = RoutableTarget {
+            instance_id: source.clone(),
+            dp_rank,
+        };
+        let gate = self.source_lock(&target);
+        let mut data = gate.access.write();
+        let _revision = SourceWrite::new(&gate.revision, &self.committed);
+        self.invalidate_source_unlocked(source, dp_rank, &mut data.active_pages);
+        drop(data);
+        self.source_locks.write().remove(&target);
+    }
+
+    fn invalidate_source_unlocked(
+        &self,
+        source: &SourceId,
+        dp_rank: u32,
+        active_pages: &mut ActivePages,
+    ) {
+        self.suspend_source_unlocked(source, dp_rank);
+        let owners: Vec<_> = active_pages.keys().cloned().collect();
+        for owner in owners {
+            self.hash_pages.clear_owner(active_pages, &owner);
+        }
+    }
+
+    /// Enable fresh observations after successful replay.
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn resume_source_unlocked(&self, source: &SourceId, dp_rank: u32) {
+        let target = RoutableTarget {
+            instance_id: source.clone(),
+            dp_rank,
+        };
+        let gate = self.source_lock(&target);
+        let generation = gate.generation.load(Ordering::Relaxed);
+        if !generation.is_multiple_of(2) {
+            gate.generation
+                .store(generation.wrapping_add(1), Ordering::Release);
+        }
+    }
+
+    /// Read all groups from one attached source without creating a source gate.
+    pub(crate) fn with_source_snapshot<R>(
+        &self,
+        target: &RoutableTarget,
+        f: impl FnOnce(&IndexSnapshot<'_>) -> R,
+    ) -> Option<R> {
+        // Pin this gate across replacement. Retirement clears its pages and
+        // advances its generation while holding its write lock.
+        let source = self.existing_source(target)?;
+        let data = source.access.read();
+        Some(f(&IndexSnapshot {
+            index: self,
+            source: &source,
+            source_data: &data,
+        }))
+    }
+
+    pub(crate) fn collect_hash_groups(
+        &self,
+        groups: impl Iterator<Item = impl Into<PageQuery>>,
+        namespace: Option<&str>,
+        keys: &[SequenceHash],
+    ) -> GroupPages {
+        let _domain = self.domain.read();
+        let scan = Arc::new(PageScan {
+            committed: self.committed.load(Ordering::Acquire),
+            request_tags: OnceLock::new(),
+            confirmed: OnceLock::new(),
+        });
+        groups
+            .map(|query| {
+                let query = query.into();
+                let (prefix_len, head, holders) =
+                    self.hash_pages.collect_split(query, namespace, keys, self);
+                (
+                    query,
+                    PageEvidence {
+                        scan: Arc::clone(&scan),
+                        prefix_len,
+                        prefix: head,
+                        holders,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    pub(super) fn with_source_pages<R>(
+        &self,
+        target: &RoutableTarget,
+        changes: Option<PageChanges>,
+        apply: impl FnOnce(&mut IndexBatch<'_>) -> R,
+    ) -> R {
+        let _domain = self.domain.read();
+        let source = self.source_lock(target);
+        let mut data = source.access.write();
+        let _write = SourceWrite::new(&source.revision, &self.committed);
+        let revision = source.revision.load(Ordering::Relaxed);
+        *source.planned.write() = changes.map(|changes| (revision, changes));
+        let mut batch = IndexBatch {
+            index: self,
+            target,
+            active_pages: &mut data.active_pages,
+            source: &source,
+        };
+        apply(&mut batch)
+    }
+
+    pub(super) fn targets(&self) -> Vec<RoutableTarget> {
+        self.source_locks.read().keys().cloned().collect()
+    }
+
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn collect_hash_pages(&self, group: u32, keys: &[SequenceHash]) -> PageEvidence {
+        self.collect_hash_groups(std::iter::once(group), None, keys)
+            .remove(&PageQuery::from(group))
+            .unwrap()
+    }
+}
+
+/// A tag collision only requires an exact source snapshot. Page equality still uses the full hash.
+fn page_tag(key: &SequenceHash) -> u32 {
+    u32::from_le_bytes(key[..4].try_into().unwrap())
+}
+
+struct PageScan {
+    committed: u64,
+    request_tags: OnceLock<HashSet<u32, Fast>>,
+    confirmed: OnceLock<bool>,
+}
+
+impl PageScan {
+    fn confirms_unchanged(&self, index: &KvBlockIndexer) -> bool {
+        let confirmed = self.confirmed.get_or_init(|| {
+            // Writers publish before releasing the domain barrier. Taking it
+            // exclusively without waiting accounts for any writes during the scan.
+            let Some(_domain) = index.domain.try_write() else {
+                return false;
+            };
+            index.committed.load(Ordering::Acquire) == self.committed
+        });
+        *confirmed && index.committed.load(Ordering::Acquire) == self.committed
+    }
+}
+
+/// At most one event batch is retained per source. Readers copy only a tag or an Arc
+/// before releasing the publication lock, regardless of batch and prompt length.
+#[derive(Clone)]
+pub(crate) enum PageChanges {
+    Inline(Option<u32>),
+    Batch(Arc<[u32]>),
+}
+
+impl PageChanges {
+    pub(crate) fn from_batches<'a>(
+        batches: impl Iterator<Item = Option<&'a [SequenceHash]>>,
+        max_entries: usize,
+    ) -> Option<Self> {
+        let mut tags = smallvec::SmallVec::<[u32; 1]>::new();
+        for batch in batches {
+            let hashes = batch?;
+            if hashes.len() > max_entries - tags.len() {
+                return None;
+            }
+            tags.extend(hashes.iter().map(page_tag));
+        }
+        Some(if tags.len() <= 1 {
+            Self::Inline(tags.pop())
+        } else {
+            Self::Batch(tags.into_vec().into())
+        })
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Inline(tag) => tag.as_slice(),
+            Self::Batch(tags) => tags,
+        }
+    }
+}
+
+impl Default for KvBlockIndexer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod tests;

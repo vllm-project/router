@@ -89,12 +89,8 @@ async fn grpc_prefix_selection_uses_the_ids_actually_dispatched() {
                 index.clone(),
             );
         }
-        let hashes = KvAwarePolicy::local_hashes(&expected[..(expected.len() - 1) / 2 * 2], 2);
-        let blocks: Vec<_> = hashes
-            .into_iter()
-            .enumerate()
-            .map(|(i, hash)| (Arc::from(format!("block-{i}")), hash))
-            .collect();
+        let hashes = KvAwarePolicy::block_hashes(&expected[..(expected.len() - 1) / 2 * 2], 2);
+        let blocks = hashes;
         index.store(
             0,
             ResidencyOwner::Worker {
@@ -103,7 +99,6 @@ async fn grpc_prefix_selection_uses_the_ids_actually_dispatched() {
                 incarnation: 0,
             },
             StorageTier::Device,
-            None,
             &blocks,
         );
         let before = warm.captured().len();

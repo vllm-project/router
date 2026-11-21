@@ -4,12 +4,11 @@ mod admit;
 mod binding;
 mod decode;
 
-use std::sync::Arc;
-
-use sha2::{Digest, Sha256};
 pub mod discovery;
 mod endpoints;
 pub mod indexer;
+pub mod request_hash;
+mod storage;
 pub mod subscriber;
 pub mod types;
 pub mod wire;
@@ -22,7 +21,6 @@ pub use discovery::{
 pub(crate) use endpoints::canonical_endpoint;
 pub use endpoints::{parse_endpoint_mapping, resolve_endpoints};
 pub use indexer::{KvBlockIndexer, MatchQuery, TierMatch};
-pub use subscriber::local_hashes;
 pub(crate) use types::SourceRecoveryReason;
 pub use types::{
     CacheOwnerId, ClearScope, HashMode, Locality, ResidencyOwner, RoutableTarget, SourceId,
@@ -35,47 +33,55 @@ pub use wire::{AllBlocksCleared, BlockRemoved, BlockStored, KVEvent, KVEventBatc
 // Compatibility export; the consumer owns the port and the index implements it.
 pub use crate::policies::TieredMatchProvider;
 
-/// SHA256 of each token block, seeded independently with the LoRA identity.
-pub(crate) fn local_block_hashes(
-    token_ids: &[u32],
-    block_size: u32,
-    lora_name: Option<&str>,
-) -> Vec<[u8; 32]> {
-    let block_size = block_size as usize;
+pub(crate) const DEFAULT_HASH_SEED: &str = "vllm-none-hash";
+
+pub(crate) fn ordinary_block_keys(block_size: u32) -> Option<request_hash::BlockKeyGenerator> {
+    use std::sync::OnceLock;
+    static ROOT: OnceLock<request_hash::SequenceHash> = OnceLock::new();
     if block_size == 0 {
-        return Vec::new();
+        return None;
     }
-    token_ids
-        .chunks(block_size)
-        .map(|chunk| {
-            let mut hasher = Sha256::new();
-            if let Some(name) = lora_name.filter(|name| !name.is_empty()) {
-                hasher.update(name.as_bytes());
-            }
-            for &token_id in chunk {
-                hasher.update(token_id.to_le_bytes());
-            }
-            hasher.finalize().into()
-        })
-        .collect()
+    let root = ROOT.get_or_init(|| {
+        request_hash::BlockKeyGenerator::from_seed(1, DEFAULT_HASH_SEED).root_hash()
+    });
+    Some(request_hash::BlockKeyGenerator::from_root_hash(
+        block_size as usize,
+        *root,
+    ))
 }
 
-pub(crate) fn local_block_hash_strings(
-    token_ids: &[u32],
+pub(crate) fn ordinary_block_hashes(
+    tokens: &[u32],
     block_size: u32,
-    lora_name: Option<&str>,
-) -> Vec<Arc<str>> {
-    local_block_hashes(token_ids, block_size, lora_name)
+) -> Vec<crate::kv_hash::SequenceHash> {
+    ordinary_block_keys(block_size).map_or_else(Vec::new, |keys| keys.generate_block_keys(tokens))
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub(crate) fn test_store_event(
+    tokens: &[u32],
+    block_size: u32,
+    medium: &str,
+    owner: Option<&str>,
+) -> rmpv::Value {
+    use rmpv::Value;
+    let hashes = ordinary_block_hashes(tokens, block_size)
         .into_iter()
-        .map(|digest| {
-            let mut value = String::with_capacity(digest.len() * 2);
-            for byte in digest {
-                use std::fmt::Write;
-                let _ = write!(value, "{byte:02x}");
-            }
-            Arc::from(value)
-        })
-        .collect()
+        .map(|hash| Value::Binary(hash.to_vec()))
+        .collect();
+    let tokens = tokens.iter().copied().map(Value::from).collect();
+    Value::Map(vec![
+        ("type".into(), "BlockStored".into()),
+        ("block_hashes".into(), Value::Array(hashes)),
+        ("parent_block_hash".into(), Value::Nil),
+        ("token_ids".into(), Value::Array(tokens)),
+        ("block_size".into(), block_size.into()),
+        ("medium".into(), medium.into()),
+        ("lora_name".into(), Value::Nil),
+        ("lora_id".into(), Value::Nil),
+        ("ownership".into(), owner.map_or(Value::Nil, Value::from)),
+    ])
 }
 
 /// Out-of-band loss fence: advisory queue overflow can never leave warm state trusted.

@@ -3639,6 +3639,10 @@ impl RouterTrait for VllmPDRouter {
         }
     }
 
+    fn monitors_kv_events(&self) -> bool {
+        self.pd_router.kv_state.is_some()
+    }
+
     fn router_type(&self) -> &'static str {
         "vllm_pd"
     }

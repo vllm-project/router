@@ -14,6 +14,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
+use crate::kv_hash::SequenceHash;
 use crate::kv_index::{CacheKey, MatchQuery, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo};
 use crate::request_identity::StableIdentity;
 
@@ -88,7 +89,7 @@ pub struct DecodeWorkEstimate {
 /// path.
 #[derive(Default)]
 pub struct PromptHashes {
-    map: HashMap<(u32, u64), Arc<[Arc<str>]>>,
+    map: HashMap<(u32, u64), Arc<[SequenceHash]>>,
 }
 
 impl PromptHashes {
@@ -98,11 +99,11 @@ impl PromptHashes {
 
     /// Hashes `tokens` for `block_size`, memoized so one backend's rendering is
     /// never reused for a different prompt content.
-    pub fn hashes_for(&mut self, block_size: u32, tokens: &[u32]) -> &Arc<[Arc<str>]> {
+    pub fn hashes_for(&mut self, block_size: u32, tokens: &[u32]) -> &Arc<[SequenceHash]> {
         let key = (block_size, prompt_fingerprint(tokens));
         self.map
             .entry(key)
-            .or_insert_with(|| Arc::from(KvAwarePolicy::local_hashes(tokens, block_size)))
+            .or_insert_with(|| Arc::from(KvAwarePolicy::block_hashes(tokens, block_size)))
     }
 }
 
@@ -1155,8 +1156,8 @@ impl KvAwarePolicy {
             })
     }
 
-    pub fn local_hashes(token_ids: &[u32], block_size: u32) -> Vec<Arc<str>> {
-        Self::local_hashes_with_lora(token_ids, block_size, None)
+    pub fn block_hashes(token_ids: &[u32], block_size: u32) -> Vec<SequenceHash> {
+        crate::kv_index::ordinary_block_hashes(token_ids, block_size)
     }
 
     fn tiers_of_interest() -> Vec<StorageTier> {
@@ -1168,25 +1169,28 @@ impl KvAwarePolicy {
         ]
     }
 
-    fn local_hashes_with_lora(
+    fn block_hashes_with_lora(
         token_ids: &[u32],
         block_size: u32,
         lora_name: Option<&str>,
-    ) -> Vec<Arc<str>> {
-        crate::kv_index::local_block_hash_strings(token_ids, block_size, lora_name)
+    ) -> Vec<SequenceHash> {
+        if let Some(name) = lora_name {
+            return crate::kv_index::ordinary_block_keys(block_size)
+                .map_or_else(Vec::new, |keys| {
+                    keys.generate_block_keys_for_adapter_name(token_ids, name)
+                });
+        }
+        Self::block_hashes(token_ids, block_size)
     }
 
     /// The index query alone, for callers that already hold the hashes.
-    fn placement_matches_with(
-        binding: &TargetBinding,
-        local_hashes: &[Arc<str>],
-    ) -> Vec<TierMatch> {
-        if local_hashes.is_empty() {
+    fn placement_matches_with(binding: &TargetBinding, hashes: &[SequenceHash]) -> Vec<TierMatch> {
+        if hashes.is_empty() {
             Vec::new()
         } else {
             let hits = binding.matches.find_tiered_matches(&MatchQuery {
                 group_idx: 0,
-                local_hashes: local_hashes.to_vec(),
+                hashes: hashes.to_vec(),
                 tiers_of_interest: Self::tiers_of_interest(),
             });
             crate::metrics::RouterMetrics::record_kv_placement_lookup(
@@ -1553,14 +1557,14 @@ impl KvAwarePolicy {
                                 crate::metrics::RouterMetrics::record_kv_placement_lookup(reason);
                                 return Vec::new();
                             }
-                            let local_hashes =
-                                Self::local_hashes_with_lora(ids, binding.block_size, lora_name);
-                            if local_hashes.is_empty() {
+                            let hashes =
+                                Self::block_hashes_with_lora(ids, binding.block_size, lora_name);
+                            if hashes.is_empty() {
                                 return Vec::new();
                             }
                             let hits = binding.matches.find_tiered_matches(&MatchQuery {
                                 group_idx: 0,
-                                local_hashes,
+                                hashes,
                                 tiers_of_interest: Self::tiers_of_interest(),
                             });
                             crate::metrics::RouterMetrics::record_kv_placement_lookup(
@@ -2293,8 +2297,7 @@ mod tests {
         impl TieredMatchProvider for Matches {
             fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
                 self.queries.fetch_add(1, Ordering::Relaxed);
-                self.blocks
-                    .store(query.local_hashes.len(), Ordering::Relaxed);
+                self.blocks.store(query.hashes.len(), Ordering::Relaxed);
                 self.hits.clone()
             }
         }
@@ -2360,7 +2363,7 @@ mod tests {
             assert!(mask[receipt.worker_index], "{case}: ineligible worker");
             assert_eq!(receipt.new_prefill_tokens, 1, "{case}");
             assert_eq!(provider.queries.load(Ordering::Relaxed), 1, "{case}");
-            assert_eq!(provider.blocks.load(Ordering::Relaxed), 3, "{case}");
+            assert_eq!(provider.blocks.load(Ordering::Relaxed), 2, "{case}");
             release_receipt(&workers, &receipt);
 
             if count == 1 {
@@ -2697,11 +2700,7 @@ mod tests {
             })
             .collect();
         let ids: Vec<u32> = (0..32).collect();
-        let blocks: Vec<_> = KvAwarePolicy::local_hashes(&ids, 16)
-            .into_iter()
-            .enumerate()
-            .map(|(i, local)| (Arc::from(format!("seq-{i}")), local))
-            .collect();
+        let blocks = KvAwarePolicy::block_hashes(&ids, 16);
         for worker in &workers {
             let t = policy.target_for_worker(worker.as_ref());
             index.store(
@@ -2712,7 +2711,6 @@ mod tests {
                     incarnation: 0,
                 },
                 StorageTier::Device,
-                None,
                 &blocks,
             );
         }
@@ -2820,7 +2818,7 @@ mod tests {
         policy.register_target("http://warm", warm.clone());
         policy.register_target("http://cold", target("http://cold", 0));
         let ids = [1_u32, 2, 3, 4, 5, 6];
-        let hashes = KvAwarePolicy::local_hashes(&ids, 2);
+        let hashes = KvAwarePolicy::block_hashes(&ids, 2);
         index.store(
             0,
             crate::kv_index::ResidencyOwner::Worker {
@@ -2829,11 +2827,7 @@ mod tests {
                 incarnation: 0,
             },
             StorageTier::Device,
-            None,
-            &[
-                (Arc::from("seq-1"), hashes[0].clone()),
-                (Arc::from("seq-2"), hashes[1].clone()),
-            ],
+            &hashes[..2],
         );
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(BasicWorker::new("http://warm".into(), WorkerType::Regular)),
@@ -2942,12 +2936,8 @@ mod tests {
         policy.register_target(workers[1].url(), target("cold", 0));
         let prompts: Arc<[Vec<u32>]> =
             Arc::from(vec![vec![1, 2, 3, 4, 5, 6], vec![11, 12, 13, 14, 15, 16]]);
-        for (p, ids) in prompts.iter().enumerate() {
-            let blocks: Vec<_> = KvAwarePolicy::local_hashes(&ids[..4], 2)
-                .into_iter()
-                .enumerate()
-                .map(|(i, hash)| (Arc::from(format!("{p}-{i}")), hash))
-                .collect();
+        for ids in prompts.iter() {
+            let blocks = KvAwarePolicy::block_hashes(&ids[..4], 2);
             index.store(
                 0,
                 crate::kv_index::ResidencyOwner::Worker {
@@ -2956,7 +2946,6 @@ mod tests {
                     incarnation: 0,
                 },
                 StorageTier::Device,
-                None,
                 &blocks,
             );
         }
@@ -3006,8 +2995,8 @@ mod tests {
         policy.register_target("http://base", base.clone());
         policy.register_target("http://lora", lora.clone());
         let ids = [1_u32, 2, 3, 4];
-        let base_hashes = KvAwarePolicy::local_hashes(&ids, 2);
-        let lora_hashes = KvAwarePolicy::local_hashes_with_lora(&ids, 2, Some("adapter"));
+        let base_hashes = KvAwarePolicy::block_hashes(&ids, 2);
+        let lora_hashes = KvAwarePolicy::block_hashes_with_lora(&ids, 2, Some("adapter"));
         for (target, hashes) in [(&base, base_hashes), (&lora, lora_hashes)] {
             index.store(
                 0,
@@ -3017,11 +3006,7 @@ mod tests {
                     incarnation: 0,
                 },
                 StorageTier::Device,
-                None,
-                &[
-                    (Arc::from("seq-1"), hashes[0].clone()),
-                    (Arc::from("seq-2"), hashes[1].clone()),
-                ],
+                &hashes[..2],
             );
         }
         let workers: Vec<Arc<dyn Worker>> = vec![
@@ -3064,7 +3049,7 @@ mod tests {
         policy.register_target("http://cached", cached.clone());
         policy.register_target("http://uncached", uncached);
         let ids = [1_u32, 2, 3, 4];
-        let hashes = KvAwarePolicy::local_hashes(&ids, 2);
+        let hashes = KvAwarePolicy::block_hashes(&ids, 2);
         index.store(
             0,
             crate::kv_index::ResidencyOwner::Worker {
@@ -3073,11 +3058,7 @@ mod tests {
                 incarnation: 0,
             },
             StorageTier::Device,
-            None,
-            &[
-                (Arc::from("seq-1"), hashes[0].clone()),
-                (Arc::from("seq-2"), hashes[1].clone()),
-            ],
+            &hashes[..2],
         );
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(BasicWorker::new(
@@ -3153,7 +3134,7 @@ mod tests {
         );
 
         let ids = [1_u32, 2, 3, 4];
-        let hashes = KvAwarePolicy::local_hashes(&ids, 2);
+        let hashes = KvAwarePolicy::block_hashes(&ids, 2);
         first_index.store(
             0,
             crate::kv_index::ResidencyOwner::Worker {
@@ -3162,11 +3143,7 @@ mod tests {
                 incarnation: 0,
             },
             StorageTier::Device,
-            None,
-            &[
-                (Arc::from("seq-1"), hashes[0].clone()),
-                (Arc::from("seq-2"), hashes[1].clone()),
-            ],
+            &hashes[..2],
         );
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(BasicWorker::new("http://first".into(), WorkerType::Regular)),
@@ -3202,7 +3179,7 @@ mod tests {
         policy.register_target("http://w1", first.clone());
         policy.register_target("http://w2", second);
         let ids = [1_u32, 2, 3, 4];
-        let locals = KvAwarePolicy::local_hashes(&ids, 2);
+        let locals = KvAwarePolicy::block_hashes(&ids, 2);
         index.store(
             0,
             crate::kv_index::ResidencyOwner::Worker {
@@ -3211,11 +3188,7 @@ mod tests {
                 incarnation: 0,
             },
             StorageTier::Device,
-            None,
-            &[
-                (Arc::from("seq-1"), locals[0].clone()),
-                (Arc::from("seq-2"), locals[1].clone()),
-            ],
+            &locals[..2],
         );
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(BasicWorker::new("http://w1".into(), WorkerType::Regular)),
@@ -4129,7 +4102,7 @@ mod tests {
         );
         impl TieredMatchProvider for QueryBlocks {
             fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
-                self.0.store(query.local_hashes.len(), Ordering::Relaxed);
+                self.0.store(query.hashes.len(), Ordering::Relaxed);
                 self.2.fetch_add(1, Ordering::Relaxed);
                 if let Some(mutate) = self.1.lock().as_mut() {
                     mutate();
@@ -4161,7 +4134,8 @@ mod tests {
             ops.select_worker_with_receipt(&workers, Some(&[1, 2, 3, 4, 5]), None, None, None, &[])
         };
         release_receipt(&workers, &select().unwrap());
-        assert_eq!(matches.0.load(Ordering::Relaxed), 3);
+        // The fifth token does not complete a cache-addressable block.
+        assert_eq!(matches.0.load(Ordering::Relaxed), 2);
 
         // Mutate the live candidate after its snapshot, during a KV query.
         for mutation in 0..3 {

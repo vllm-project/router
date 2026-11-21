@@ -212,13 +212,34 @@ impl RouterManager {
         let policy_hint = labels.get("policy").map(|s| s.as_str());
         let policy = self.policy_registry.on_worker_added(&model_id, policy_hint);
         if worker_arc.worker_type() == WorkerType::Regular {
-            if let Some(kv) = kv_aware_ops(policy.as_ref()) {
-                kv.register_worker(worker_arc.as_ref(), None, None);
-            }
-            let default = self.policy_registry.get_default_policy();
-            if !Arc::ptr_eq(&policy, &default) {
-                if let Some(kv) = kv_aware_ops(default.as_ref()) {
+            let regular = self
+                .routers
+                .get(&RouterId::new("http-regular".into()))
+                .map(|router| router.clone());
+            if let Some(router) = regular.as_deref().and_then(|router| {
+                router
+                    .as_any()
+                    .downcast_ref::<crate::routers::router::Router>()
+            }) {
+                let info = router.discover_kv_worker(worker_arc.base_url()).await;
+                if self
+                    .worker_registry
+                    .get_by_url(worker_arc.url())
+                    .is_some_and(|current| Arc::ptr_eq(&current, &worker_arc))
+                {
+                    router.register_kv_target(worker_arc.as_ref(), info.as_ref());
+                } else {
+                    router.retire_unused_kv_source(worker_arc.base_url());
+                }
+            } else {
+                if let Some(kv) = kv_aware_ops(policy.as_ref()) {
                     kv.register_worker(worker_arc.as_ref(), None, None);
+                }
+                let default = self.policy_registry.get_default_policy();
+                if !Arc::ptr_eq(&policy, &default) {
+                    if let Some(kv) = kv_aware_ops(default.as_ref()) {
+                        kv.register_worker(worker_arc.as_ref(), None, None);
+                    }
                 }
             }
         }
@@ -259,6 +280,17 @@ impl RouterManager {
     ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
         if let Some(worker) = self.worker_registry.remove_by_url(url) {
             if worker.worker_type() == WorkerType::Regular {
+                let regular = self
+                    .routers
+                    .get(&RouterId::new("http-regular".into()))
+                    .map(|router| router.clone());
+                if let Some(router) = regular.as_deref().and_then(|router| {
+                    router
+                        .as_any()
+                        .downcast_ref::<crate::routers::router::Router>()
+                }) {
+                    router.retire_unused_kv_source(worker.base_url());
+                }
                 let policy = self
                     .policy_registry
                     .get_policy_or_default(worker.model_id());
@@ -837,6 +869,12 @@ impl RouterTrait for RouterManager {
     }
 
     /// Get router type name
+    fn monitors_kv_events(&self) -> bool {
+        self.routers
+            .iter()
+            .any(|router| router.monitors_kv_events())
+    }
+
     fn router_type(&self) -> &'static str {
         "manager"
     }

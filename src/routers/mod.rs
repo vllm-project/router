@@ -172,6 +172,10 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     async fn get_worker_loads(&self) -> Response;
 
     /// Get router type name
+    fn monitors_kv_events(&self) -> bool {
+        false
+    }
+
     fn router_type(&self) -> &'static str;
 
     /// Check if this is a PD router

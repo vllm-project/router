@@ -2716,13 +2716,8 @@ mod admission_tests {
         };
         let policy = KvAwarePolicy::new(params);
         let index = Arc::new(KvBlockIndexer::new());
-        let hashes = KvAwarePolicy::local_hashes(tokens, 16);
-        let blocks: Vec<_> = hashes
-            .into_iter()
-            .enumerate()
-            .take(stored_blocks)
-            .map(|(i, hash)| (Arc::<str>::from(format!("block-{i}")), hash))
-            .collect();
+        let hashes = KvAwarePolicy::block_hashes(tokens, 16);
+        let blocks = &hashes[..stored_blocks.min(hashes.len())];
         index.store(
             0,
             ResidencyOwner::Worker {
@@ -2731,8 +2726,7 @@ mod admission_tests {
                 incarnation: 0,
             },
             StorageTier::Device,
-            None,
-            &blocks,
+            blocks,
         );
         for worker in p {
             policy.register_target_with_cache_identity(

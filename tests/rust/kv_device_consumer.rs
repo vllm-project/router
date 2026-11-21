@@ -3,38 +3,23 @@
 //! Synthetic event consumer using the shared index and read contract.
 use std::sync::Arc;
 use vllm_router_rs::{
-    kv_hash::BlockKeyGenerator,
+    kv_hash::{BlockKeyGenerator, SequenceHash},
     kv_index::{
-        decode_batch, local_hashes, validate_device_batch,
+        decode_batch, validate_device_batch,
         wire::{ExternalBlockHash, KVEvent, KVEventBatch},
         ClearScope, KvBlockIndexer, MatchQuery, ResidencyOwner, StorageTier, TieredMatchProvider,
     },
 };
 
-fn opaque(hash: &ExternalBlockHash) -> Arc<str> {
+fn event_key(hash: &ExternalBlockHash) -> SequenceHash {
     let ExternalBlockHash::Bytes(bytes) = hash else {
-        panic!("admitted bytes required")
+        panic!("expected a full-width hash")
     };
-    Arc::from(format!(
-        "b:{}",
-        bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    ))
+    bytes.as_slice().try_into().unwrap()
 }
 
-fn local_keys(tokens: &[u32]) -> Vec<Arc<str>> {
-    local_hashes(tokens, 2, None)
-        .iter()
-        .map(|hash| {
-            Arc::from(
-                hash.iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>(),
-            )
-        })
-        .collect()
+fn keys(tokens: &[u32]) -> Vec<SequenceHash> {
+    BlockKeyGenerator::new(2, 0).generate_block_keys(tokens)
 }
 
 fn apply(index: &KvBlockIndexer, owner: &ResidencyOwner, batch: &KVEventBatch) {
@@ -48,21 +33,18 @@ fn apply(index: &KvBlockIndexer, owner: &ResidencyOwner, batch: &KVEventBatch) {
     for event in &batch.events {
         match event {
             KVEvent::BlockStored(event) => {
-                let locals = local_keys(&event.token_ids);
-                let blocks: Vec<_> = event.block_hashes.iter().map(opaque).zip(locals).collect();
                 index.store(
                     0,
                     owner.clone(),
                     StorageTier::Device,
-                    event.parent_block_hash.as_ref().map(opaque),
-                    &blocks,
+                    &event.block_hashes.iter().map(event_key).collect::<Vec<_>>(),
                 );
             }
             KVEvent::BlockRemoved(event) => index.remove(
                 0,
                 &owner,
                 StorageTier::Device,
-                &event.block_hashes.iter().map(opaque).collect::<Vec<_>>(),
+                &event.block_hashes.iter().map(event_key).collect::<Vec<_>>(),
             ),
             KVEvent::AllBlocksCleared(_) => index.clear(&owner, ClearScope::Worker),
         }
@@ -75,8 +57,8 @@ fn stored_event() -> rmpv::Value {
         (
             "block_hashes".into(),
             rmpv::Value::Array(vec![
-                rmpv::Value::Binary(vec![1; 32]),
-                rmpv::Value::Binary(vec![2; 32]),
+                rmpv::Value::Binary(keys(&[1, 2, 3, 4])[0].to_vec()),
+                rmpv::Value::Binary(keys(&[1, 2, 3, 4])[1].to_vec()),
             ]),
         ),
         ("parent_block_hash".into(), rmpv::Value::Nil),
@@ -96,7 +78,7 @@ fn removed_event() -> rmpv::Value {
         ("type".into(), "BlockRemoved".into()),
         (
             "block_hashes".into(),
-            rmpv::Value::Array(vec![rmpv::Value::Binary(vec![2; 32])]),
+            rmpv::Value::Array(vec![rmpv::Value::Binary(keys(&[1, 2, 3, 4])[1].to_vec())]),
         ),
         ("medium".into(), "GPU".into()),
     ])
@@ -155,7 +137,7 @@ fn same_source_rank_remove_and_clear_are_isolated() {
         let mut hits: Vec<_> = index
             .find_matches(&MatchQuery {
                 group_idx: 0,
-                local_hashes: local_keys(&[1, 2, 3, 4]),
+                hashes: keys(&[1, 2, 3, 4]),
                 tiers_of_interest: vec![StorageTier::Device],
             })
             .into_iter()
@@ -232,7 +214,7 @@ fn absent_rank_uses_configured_source_and_explicit_zero_overrides_it() {
         apply(&index, &configured, &batch);
         let query = MatchQuery {
             group_idx: 0,
-            local_hashes: local_keys(&[1, 2, 3, 4]),
+            hashes: keys(&[1, 2, 3, 4]),
             tiers_of_interest: vec![StorageTier::Device],
         };
         let hits = index.find_matches(&query);
@@ -343,7 +325,7 @@ fn decode_admit_store_query_remove_and_clear_use_the_common_contract() {
     let index = KvBlockIndexer::new();
     let query = MatchQuery {
         group_idx: 0,
-        local_hashes: local_keys(&tokens),
+        hashes: keys(&tokens),
         tiers_of_interest: vec![StorageTier::Device],
     };
     let provider: &dyn TieredMatchProvider = &index;
@@ -353,12 +335,7 @@ fn decode_admit_store_query_remove_and_clear_use_the_common_contract() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].segments, vec![(0, 2)]); // Observation blocks, never reusable tokens.
     assert_eq!(hits[0].target.instance_id.as_ref(), "publisher-A");
-    // A routing integration must bind this source to its actual target.
-    let local = local_keys(&tokens);
-    assert_ne!(
-        local[0],
-        opaque(&ExternalBlockHash::Bytes(sequences[0].to_vec()))
-    );
+    assert_eq!(query.hashes, sequences);
     apply(&index, &owner, &batch); // Idempotent announcement.
     assert_eq!(
         provider.find_tiered_matches(&query)[0].segments,

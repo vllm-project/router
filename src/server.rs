@@ -116,6 +116,23 @@ pub struct AppState {
     pub router_manager: Option<Arc<RouterManager>>,
 }
 
+fn reject_full_cache_report(
+    router: &dyn RouterTrait,
+    xargs: Option<&serde_json::Value>,
+) -> Option<Response> {
+    let requests_full = xargs
+        .and_then(|args| args.get("kv_cache_report_mode"))
+        .and_then(serde_json::Value::as_str)
+        == Some("full");
+    (requests_full && router.monitors_kv_events()).then(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "KV-aware routing requires incremental KV event reports",
+        )
+            .into_response()
+    })
+}
+
 // Fallback handler for unmatched routes
 async fn sink_handler() -> Response {
     StatusCode::NOT_FOUND.into_response()
@@ -155,6 +172,12 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
     };
 
     // Route through transparent proxy
+    if let Some(response) =
+        reject_full_cache_report(state.router.as_ref(), body_json.get("vllm_xargs"))
+    {
+        return response;
+    }
+
     state
         .router
         .route_transparent(Some(&headers), &path, &method, body_json)
@@ -251,6 +274,12 @@ async fn inference_generate(
         return response;
     }
 
+    if let Some(response) =
+        reject_full_cache_report(state.router.as_ref(), body.other.get("vllm_xargs"))
+    {
+        return response;
+    }
+
     state
         .router
         .route_inference_generate(Some(&headers), &body, None)
@@ -266,6 +295,12 @@ async fn v1_chat_completions(
         return response;
     }
 
+    if let Some(response) =
+        reject_full_cache_report(state.router.as_ref(), body.other.get("vllm_xargs"))
+    {
+        return response;
+    }
+
     state.router.route_chat(Some(&headers), &body, None).await
 }
 
@@ -277,6 +312,11 @@ async fn epd_chat_completions(
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
+    if let Some(response) = reject_full_cache_report(state.router.as_ref(), body.get("vllm_xargs"))
+    {
+        return response;
+    }
+
     state
         .router
         .route_transparent(
@@ -294,6 +334,12 @@ async fn v1_completions(
     JsonWithRaw { value: body, raw }: JsonWithRaw<CompletionRequest>,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    if let Some(response) =
+        reject_full_cache_report(state.router.as_ref(), body.other.get("vllm_xargs"))
+    {
         return response;
     }
 
