@@ -1,122 +1,243 @@
 # KV-aware routing
 
-If requests often start with the same prompt, such as a shared system message, `kv_aware` prefers a worker that can reuse that prefix and also considers worker load. vLLM publishes cache events so the Router can track which workers have the prefix. When cache information is unavailable, the Router routes by load.
+The `kv_aware` policy prefers workers that can reuse a request's prefix and accounts for worker load. Clients use the Router's OpenAI HTTP API with either HTTP or gRPC workers.
 
-Clients use the Router's OpenAI HTTP API with either HTTP or gRPC workers. Choose [colocated serving](#colocated-prefill-and-decode) or [P/D disaggregation](#pd-routing), then [check cache reuse](#check-cache-reuse).
+## Versions
 
-## Requirements for KV-aware prefix reuse
+Pair `vllm-rs` with the same vLLM release as its Python engine. Use the Rust `vllm-router` binary for the examples below.
 
-These settings apply to all workers scored by `kv_aware`, including workers with a layout file.
+| vLLM | HTTP event sources | gRPC event sources | Layout and hashing | vLLM Ascend pairing |
+| --- | --- | --- | --- | --- |
+| 0.30.0 | [Static addresses and layout](#static-event-endpoints) | `Control.GetKvEventSources` | Zero hash lookahead | [0.30.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.30.0) |
+| 0.31.0–0.32.0 | `/kv_event_sources` | `Control.GetKvEventSources` | Zero hash lookahead. Supports V4.1 bounded replay with the corresponding model layout. | [0.31.0rc1](https://pypi.org/project/vllm-ascend/0.31.0rc1/) or [0.32.0rc1](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.32.0rc1), respectively |
+| 0.33.0 | `/kv_event_sources` | `Control.GetKvEventSources` | Supports nonzero hash lookahead carried by `BlockStored.lookahead_token_ids`. | Build against vLLM 0.33.0 |
+| 0.34.0 | `/kv_event_sources` | `Control.GetKvEventSources` | Uses 64-token blocks when the backend has no preferred size. Use the worker's actual sizes in a layout. | Build against vLLM 0.34.0 |
 
-| Requirement | Worker setting |
+For gRPC, use one interface for the whole worker pool. P/D uses static worker URLs. Router renders chat locally using `vllm-chat` pinned to vLLM 0.30.0. See the [gRPC API compatibility table](../backend/grpc.md#api-compatibility) for request features and tokenizer settings.
+
+## Before deployment
+
+### Worker requirements
+
+| Setting | Value |
 | --- | --- |
-| Prefix caching and matching block hashes | Set `--enable-prefix-caching --prefix-caching-hash-algo sha256_cbor`. |
-| Complete hashes in events | Set `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0`. |
-| Incremental events | Keep incremental reporting and enable KV events. Give each publisher a fresh topic on restart. Live and replay addresses must be reachable from the Router. |
+| Prefix caching | `--enable-prefix-caching --prefix-caching-hash-algo sha256_cbor` |
+| Event hashes | `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` publishes the full 32-byte hashes. |
+| Event reporting | Keep incremental reporting and enable KV events through `--kv-events-config`. Router needs reachable live and replay endpoints. |
+| Publisher identity | Generate a fresh topic on each worker start. |
+| HTTP text prompts | Start the worker with `--enable-scale-out` to expose rendering endpoints. |
 
-## When to pass a layout
+### Explicit layouts
 
-| Deployment | Layout JSON to pass to the Router |
+| Worker configuration | What to pass to Router |
 | --- | --- |
-| [Ordinary single-group full attention](#colocated-prefill-and-decode), HTTP or gRPC | Omit `--kv-hybrid-layout` when the worker uses the default hash root and exposes its model, block size, and event sources. [Stock HTTP vLLM 0.30.0](#static-event-endpoints) uses static configuration. |
-| Hybrid or sliding-window attention, speculative decoding, or custom hash seed | Use a worker-reported layout when available. Otherwise pass an [explicit layout](#explicit-layouts) with `--kv-hybrid-layout`. |
-| [P/D disaggregation](#pd-routing), HTTP or gRPC | Pass one [P/D layout file](#pd-layout) when needed. Include the compatible Decode URLs for each hybrid Prefill and the layout of each scored worker that cannot report it. |
+| Ordinary single-group full attention with event discovery, default hash root, no sliding window or speculative decoding | Omit `--kv-hybrid-layout`. Leave `PYTHONHASHSEED` unset. Router confirms the model, block size and hash root before granting reuse credit. |
+| Hybrid attention, sliding-window attention, MTP, DSpark or a custom hash seed | Use the worker's complete layout metadata when available. Otherwise save the matching [model layout](#hybrid-attention-models) as `layout.json` and pass `--kv-hybrid-layout layout.json`. |
+| Stock HTTP vLLM 0.30.0 | Use the [static event setup](#static-event-endpoints). |
+| Hybrid P/D | Supply a [P/D layout file](#pd-layout) with compatible Decode addresses. Include layout details only for scored workers that cannot report them. |
+
+Use the worker URL as the JSON key and one rank entry per DP rank. Use the group order, sizes and effective hash settings of the deployed worker. For fixed event addresses, include the actual served model and publisher topic per rank. For a custom seed, set the same `hash_seed` in the layout and `PYTHONHASHSEED` on the worker. To score LoRA reuse, add `"adapters": [{"name": "my-adapter", "path": "/models/my-adapter"}]` beside `ranks` using the path passed to `--lora-modules`.
+
+### Set the event ports
+
+Run in each worker terminal before launching vLLM. The [P/D port table](#pd-routing) gives separate values for each stage.
+
+```bash
+export VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0
+LIVE_PORT=${LIVE_PORT:-5557}
+REPLAY_PORT=${REPLAY_PORT:-5558}
+KV_TOPIC=$(python3 -c 'from uuid import uuid4; print(uuid4().hex)')
+EVENTS=$(printf '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:%s","replay_endpoint":"tcp://*:%s","topic":"%s"}' \
+  "$LIVE_PORT" "$REPLAY_PORT" "$KV_TOPIC")
+KV_ARGS=(--enable-prefix-caching --prefix-caching-hash-algo sha256_cbor --kv-events-config "$EVENTS")
+```
+
+Use distinct ports for workers on the same host. vLLM adds the DP rank to each fixed event port. Reserve separate ranges for live and replay when using multiple ranks. With event discovery on vLLM 0.31–0.34, set `REPLAY_PORT=0` to let vLLM allocate the replay port.
 
 ## Colocated prefill and decode
 
-Each worker handles the entire request. The walkthrough uses one Qwen3-4B-Instruct-2507 worker, vLLM 0.33.0, and the Rust `vllm-router` binary. Check [version compatibility](#versions) for other releases.
+Set the event ports and copy one model's environment and `MODEL_ARGS`. Start with [Qwen3-4B on GPU](#qwen3-4b-on-gpu) for full attention or choose a [hybrid recipe](#hybrid-attention-models). Use the [A2 Qwen3.8 W8A8 MTP recipe](#qwen38-27b-with-mtp-on-ascend) for the Ascend gRPC command.
 
-### 1. Prepare the worker settings
+In the Router terminal, set `LAYOUT_ARGS=()` for automatic full-attention layout discovery. For an explicit layout, use `LAYOUT_ARGS=(--kv-hybrid-layout layout.json)`.
 
-Run this before each worker start. Set the live port and let vLLM allocate a replay port. The command generates a fresh publisher topic.
-
-```bash
-MODEL=/models/Qwen3-4B-Instruct-2507
-SERVED_MODEL=qwen3
-export VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0
-unset PYTHONHASHSEED
-KV_TOPIC=$(python3 -c 'from uuid import uuid4; print(uuid4().hex)')
-KV_LIVE_PORT=5557
-EVENTS=$(printf '{"enable_kv_cache_events":true,"endpoint":"tcp://*:%s","replay_endpoint":"tcp://*:0","topic":"%s"}' "$KV_LIVE_PORT" "$KV_TOPIC")
-```
-
-For multiple worker processes on one host, set a distinct `KV_LIVE_PORT` per process. Set a fixed `replay_endpoint` if the network requires a reserved port. vLLM adds the DP rank to each fixed event port, so reserve non-overlapping ranges for live and replay. These ports are separate from HTTP and gRPC.
-
-On vLLM 0.30.0, use a fixed replay endpoint such as `tcp://*:5558` for one rank.
-
-### 2. Start the worker and Router
-
-Choose HTTP or gRPC. These commands start an ordinary full-attention worker with the default hash root and 16-token blocks. For a hybrid model, apply its [worker and layout settings](#hybrid-attention-models) to the commands below.
-
-#### HTTP workers
-
-`--enable-scale-out` exposes the worker's rendering endpoints for text and chat requests. Requests that already contain token IDs can use KV-aware routing without this flag.
+### HTTP workers
 
 ```bash
 vllm serve "$MODEL" --host 127.0.0.1 --port 8000 --served-model-name "$SERVED_MODEL" \
-  --enable-scale-out --enable-prefix-caching --prefix-caching-hash-algo sha256_cbor --block-size 16 \
-  --kv-events-config "$EVENTS"
+  --enable-scale-out "${KV_ARGS[@]}" "${MODEL_ARGS[@]}"
 ```
 
 ```bash
 vllm-router --host 127.0.0.1 --port 19000 --policy kv_aware \
-  --worker-urls http://127.0.0.1:8000
+  --worker-urls http://127.0.0.1:8000 "${LAYOUT_ARGS[@]}"
 ```
 
-#### gRPC workers
+### gRPC workers
 
-Use [`vllm-rs` from the same vLLM version](../backend/grpc.md#starting-a-vllm-grpc-worker). Activate that vLLM Python environment before starting the worker.
+| Platform | Worker launcher | Engine options |
+| --- | --- | --- |
+| GPU | `vllm-rs serve` | Pass model and KV engine flags after `--`. |
+| Ascend A2 with vLLM 0.32.0 | `VLLM_USE_RUST_FRONTEND=1 vllm serve` | Use `--grpc-port` for vLLM's Rust inference and control services. |
 
 ```bash
-"${VLLM_RS:-vllm-rs}" serve "$MODEL" --host 127.0.0.1 --port 8000 --grpc-port 50051 --served-model-name "$SERVED_MODEL" -- \
-  --enable-prefix-caching --prefix-caching-hash-algo sha256_cbor \
-  --block-size 16 --kv-events-config "$EVENTS"
+# GPU
+vllm-rs serve "$MODEL" --host 127.0.0.1 --port 8000 --grpc-port 50051 \
+  --served-model-name "$SERVED_MODEL" -- "${KV_ARGS[@]}" "${MODEL_ARGS[@]}"
 ```
 
-In the Router terminal, set `MODEL` to a local copy of the worker's model directory with its tokenizer files.
+```bash
+# Ascend A2
+VLLM_USE_RUST_FRONTEND=1 vllm serve "$MODEL" --host 127.0.0.1 \
+  --port 8000 --grpc-port 50051 --served-model-name "$SERVED_MODEL" \
+  --enable-scale-out "${KV_ARGS[@]}" "${MODEL_ARGS[@]}"
+```
+
+Set `MODEL` in the Router terminal to the local model directory with tokenizer files.
 
 ```bash
 VLLM_ROUTER_TOKENIZER="$MODEL" vllm-router --host 127.0.0.1 --port 19000 \
-  --policy kv_aware --worker-urls grpc://127.0.0.1:50051
+  --policy kv_aware --worker-urls grpc://127.0.0.1:50051 "${LAYOUT_ARGS[@]}"
 ```
 
-#### Static event endpoints
+## P/D routing
 
-This setup is for stock HTTP vLLM 0.30.0, which has no event discovery endpoint. Set the worker's replay port to `5558`. Save the example below as `layout.json` and replace the topic with the worker's `KV_TOPIC` value.
+### Choose a connector
+
+Choose the worker connector from the model and platform. Use the same model checkpoint, engine version and connector on both stages.
+
+| Platform | Models and modes | Worker interface | Worker connector | Router `--kv-connector` |
+| --- | --- | --- | --- | --- |
+| GPU | Qwen3-4B, Qwen3.5-4B, DeepSeek V4 Flash 0731 with DSpark | HTTP | `NixlConnector` | `nixl` |
+| GPU | Qwen3.8-27B MTP with zero hash lookahead, or DSpark | HTTP | `MooncakeConnector` | `mooncake` |
+| Ascend A2 | Qwen3-4B, Qwen3.5-4B, Qwen3.6-27B W8A8, Qwen3.8-27B BF16 with DSpark | HTTP | `MooncakeConnectorV1` | `mooncake` |
+| Ascend A2 | Qwen3.8-27B W8A8 | HTTP; gRPC with MTP | `MooncakeConnectorV1` | `mooncake` |
+| Ascend A2 | Qwen4Exp W4A8 with MTP or off | HTTP | `MooncakeConnectorV2` | `mooncake` |
+
+Use `CONNECTOR=nixl` or `CONNECTOR=mooncake` in the Router terminal. HTTP and gRPC describe the Router-to-worker interface. The connector transfers KV between Prefill and Decode.
+
+### Set worker ports and connector parameters
+
+Start Prefill and Decode in separate terminals. After loading the same recipe in each terminal, assign disjoint devices with `CUDA_VISIBLE_DEVICES` or `ASCEND_RT_VISIBLE_DEVICES`. The examples bind to localhost. For separate hosts, use reachable bind and advertised addresses.
+
+| Setting | Prefill | Decode |
+| --- | --- | --- |
+| Worker HTTP port | `8000` | `8001` |
+| Worker gRPC port, if used | `50051` | `50052` |
+| `LIVE_PORT` and `REPLAY_PORT` | `5557` / `5558` | `5559` / `5560` |
+| Connector role | `kv_producer` | `kv_consumer` |
+| NIXL side-channel port | `5600` | `5601` |
+| Ascend Mooncake `kv_port` | `38352` | `38353` |
+
+Copy the settings for each stage into its terminal, then run the [event setup](#set-the-event-ports) to build `KV_ARGS`. For Ascend, set `TP` from the model recipe and choose `MOONCAKE_CONNECTOR` from the connector table.
 
 ```bash
---kv-event-source http://127.0.0.1:8000=tcp://127.0.0.1:5557 \
---kv-event-replay-source http://127.0.0.1:8000=tcp://127.0.0.1:5558 \
---kv-event-model "$SERVED_MODEL" --kv-event-block-size 16 \
---kv-hybrid-layout layout.json
+# Prefill terminal
+HTTP_PORT=8000 GRPC_PORT=50051 LIVE_PORT=5557 REPLAY_PORT=5558
+KV_ROLE=kv_producer NIXL_PORT=5600 KV_PORT=38352 ENGINE_ID=prefill-a2
 ```
 
+```bash
+# Decode terminal
+HTTP_PORT=8001 GRPC_PORT=50052 LIVE_PORT=5559 REPLAY_PORT=5560
+KV_ROLE=kv_consumer NIXL_PORT=5601 KV_PORT=38353 ENGINE_ID=decode-a2
+```
+
+Set `TRANSFER` in each terminal using the connector below.
+
 <details>
-<summary>Complete layout.json for stock HTTP vLLM 0.30.0</summary>
+<summary>GPU NIXL</summary>
+
+Set `NIXL_PORT` to the side-channel port for this worker. For Qwen3.5, export `VLLM_SSM_CONV_STATE_LAYOUT=DS` on both stages.
+
+```bash
+export VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1
+export VLLM_NIXL_SIDE_CHANNEL_PORT="$NIXL_PORT"
+TRANSFER=$(printf '{"kv_connector":"NixlConnector","kv_role":"%s"}' "$KV_ROLE")
+```
+
+</details>
+
+<details>
+<summary>GPU Mooncake</summary>
+
+Install the [Mooncake Transfer Engine for your CUDA version](https://docs.vllm.ai/en/latest/features/mooncake_connector_usage/#installation). Use the same bootstrap port in the Prefill and Router commands.
+
+```bash
+export VLLM_MOONCAKE_BOOTSTRAP_PORT=8998
+TRANSFER=$(printf '{"kv_connector":"MooncakeConnector","kv_role":"%s"}' "$KV_ROLE")
+```
+
+</details>
+
+<details>
+<summary>Ascend Mooncake</summary>
+
+Set `MOONCAKE_CONNECTOR` to the worker connector from the table. Set `KV_PORT` from the port table and assign different `ENGINE_ID` values, such as `prefill-a2` and `decode-a2`. Set `TP` to the recipe's tensor parallel size for each stage. The following config uses DP1 and the same TP on both stages.
+
+```bash
+TRANSFER=$(printf '{"kv_connector":"%s","kv_role":"%s","kv_buffer_device":"npu","engine_id":"%s","kv_port":%s,"kv_load_failure_policy":"fail","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":%s},"decode":{"dp_size":1,"tp_size":%s}}}' \
+  "$MOONCAKE_CONNECTOR" "$KV_ROLE" "$ENGINE_ID" "$KV_PORT" "$TP" "$TP")
+```
+
+</details>
+
+### HTTP P/D
+
+Run on Prefill first, then Decode, with the port, role and event settings for each stage. Set `LAYOUT_ARGS=(--kv-hybrid-layout layout.json)` when using a [P/D layout](#pd-layout), or `LAYOUT_ARGS=()` for ordinary full-attention discovery. Set `PREFILL_BOOTSTRAP=()` for NIXL and Ascend Mooncake, or `PREFILL_BOOTSTRAP=(8998)` for GPU Mooncake.
+
+```bash
+vllm serve "$MODEL" --host 127.0.0.1 --port "$HTTP_PORT" --served-model-name "$SERVED_MODEL" \
+  --enable-scale-out "${KV_ARGS[@]}" "${MODEL_ARGS[@]}" --kv-transfer-config "$TRANSFER"
+```
+
+```bash
+vllm-router --port 19000 --vllm-pd-disaggregation \
+  --prefill http://127.0.0.1:8000 "${PREFILL_BOOTSTRAP[@]}" --decode http://127.0.0.1:8001 \
+  --prefill-policy kv_aware --decode-policy round_robin --kv-connector "$CONNECTOR" \
+  "${LAYOUT_ARGS[@]}"
+```
+
+### gRPC P/D
+
+For Ascend A2, use [Qwen3.8 W8A8 MTP](#qwen38-27b-with-mtp-on-ascend). Set `MOONCAKE_CONNECTOR=MooncakeConnectorV1` on both workers before building `TRANSFER`. Run the worker command on Prefill first and then Decode with the stage settings above.
+
+```bash
+VLLM_USE_RUST_FRONTEND=1 vllm serve "$MODEL" --host 127.0.0.1 \
+  --port "$HTTP_PORT" --grpc-port "$GRPC_PORT" --served-model-name "$SERVED_MODEL" \
+  --enable-scale-out "${KV_ARGS[@]}" "${MODEL_ARGS[@]}" --kv-transfer-config "$TRANSFER"
+```
+
+Set `MODEL` in the Router terminal to the local tokenizer directory. Save the model's [gRPC P/D layout](#qwen38-27b-with-mtp-on-ascend) as `layout.json`.
+
+```bash
+VLLM_ROUTER_TOKENIZER="$MODEL" vllm-router --port 19000 --vllm-pd-disaggregation \
+  --prefill grpc://127.0.0.1:50051 --decode grpc://127.0.0.1:50052 \
+  --prefill-policy kv_aware --decode-policy round_robin --kv-connector mooncake \
+  --kv-hybrid-layout layout.json
+```
+
+To score Decode reuse as well, set `--decode-policy kv_aware`, enable Decode's events and include its layout when required. For HTTP Decode scoring, supply explicit prompt token IDs. Each gRPC stage uses the token IDs produced by Router. Use one worker interface throughout the P/D pool.
+
+### P/D layout
+
+Save the model recipe as `layout.json` and pass it to Router with `--kv-hybrid-layout`. Use the Qwen3.5-4B GPU recipe below for a two-stage NIXL example.
+
+| Entry | Required contents |
+| --- | --- |
+| Hybrid Prefill | `compatible_decode_urls` plus the Prefill layout when the worker does not report it |
+| Decode scored by `kv_aware` | The Decode layout when the worker does not report it |
+| Decode using `round_robin` | List its URL under the Prefill's `compatible_decode_urls` |
+
+Use the same URL scheme and address as the Router command. Leave Program scheduling disabled for hybrid P/D layouts.
+
+<details>
+<summary>Pairing-only layout.json when the workers report their layouts</summary>
 
 ```json
 {
   "http://127.0.0.1:8000": {
-    "schema_version": 1,
-    "ranks": [
-      {
-        "rank": 0,
-        "model": "qwen3",
-        "publisher_topic": "replace-with-KV_TOPIC",
-        "weight_version": "default",
-        "instance_topic": true,
-        "hash_algorithm": "sha256_cbor",
-        "hash_seed": "vllm-none-hash",
-        "full_hashes": true,
-        "hash_block_size": 16,
-        "hash_lookahead_tokens": 0,
-        "speculative_tokens": 0,
-        "prefix_caching": true,
-        "declared_groups": 1,
-        "groups": [
-          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 16, "prefix_cacheable": true, "prefix_replay_tokens": 0}
-        ]
-      }
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
     ]
   }
 }
@@ -124,79 +245,64 @@ This setup is for stock HTTP vLLM 0.30.0, which has no event discovery endpoint.
 
 </details>
 
-## P/D routing
+## Check cache reuse
 
-P/D disaggregation runs prompt processing on Prefill workers and token generation on Decode workers. Use the same checkpoint, engine version, connector, and worker transport on both stages. Enable KV events on each stage scored by `kv_aware`.
-
-### GPU with NIXL
-
-1. Use the [HTTP](#http-workers) or [gRPC](#grpc-workers) worker setup on separate GPUs. Keep Prefill on HTTP port `8000` or gRPC port `50051`. Set Decode's HTTP port to `8001` and its gRPC port, if used, to `50052`.
-2. Set `VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1` on both workers. Set `VLLM_NIXL_SIDE_CHANNEL_PORT=5600` on Prefill and `5601` on Decode. For separate hosts, use reachable addresses.
-3. Add `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'` to Prefill and the same option with `"kv_role":"kv_consumer"` to Decode. Give each process distinct event ports and a fresh topic. For gRPC, pass the engine options after `--` and set `VLLM_ROUTER_TOKENIZER` for the Router.
-4. Use the [P/D layout](#pd-layout) for hybrid workers. For ordinary full attention, follow the [layout rules above](#when-to-pass-a-layout).
+In an idle worker pool, send the same token-ID prompt twice. Set `SERVED_MODEL` to the worker's served name and `PROMPT_TOKENS` to the length in its recipe.
 
 ```bash
-PREFILL=http://127.0.0.1:8000
-DECODE=http://127.0.0.1:8001
-# For gRPC, use grpc://127.0.0.1:50051 and grpc://127.0.0.1:50052.
-vllm-router --port 19000 --vllm-pd-disaggregation --prefill "$PREFILL" --decode "$DECODE" \
-  --prefill-policy kv_aware --decode-policy kv_aware --kv-connector nixl
+SERVED_MODEL=qwen3
+PROMPT_TOKENS=129
+payload=$(jq -nc --arg model "$SERVED_MODEL" --argjson n "$PROMPT_TOKENS" \
+  '{model:$model,prompt:[range(1000;1000+$n)],max_tokens:1,temperature:0}')
+for delay in 0 1; do
+  sleep "$delay"
+  curl -fsS http://127.0.0.1:19000/v1/completions \
+    -H 'Content-Type: application/json' --data-binary "$payload"
+  printf '\n'
+done
 ```
 
-With HTTP workers, use explicit prompt token IDs to get Decode cache credit. With gRPC workers, the Router can also use tokens from its own tokenizer. For a Prefill-only setup, set `--decode-policy round_robin` and omit Decode's event settings and layout entry.
+| Check | Where to look | Success signal |
+| --- | --- | --- |
+| Router placement | Router `/metrics` on port `29000`. Look for `vllm_router_kv_placement_lookups_total{result="hit"}`. | Increases on the repeat after events arrive. |
+| Worker local reuse | Worker `/metrics`. Look for `vllm:prefix_cache_hits_total`. With `--enable-prompt-tokens-details` on HTTP, inspect `usage.prompt_tokens_details.cached_tokens`. | Increases on the repeat. For P/D, inspect Prefill. |
+| P/D transfer | Send a fresh prompt. Read Decode's Mooncake completion log or compare its `vllm:nixl_bytes_transferred_sum` counter. | Requests that need remote KV complete a read. |
+| MTP or DSpark | On the worker generating tokens, inspect `vllm:spec_decode_num_draft_tokens_total` or the speculative-decoding log. | Drafted tokens increase during generation. |
 
-### Ascend Mooncake
+## Model recipes
 
-Start Prefill and Decode on separate NPUs using the [A2 worker setup](#start-an-a2-worker). Use HTTP port `8000` for Prefill and `8001` for Decode. The table lists 1P1D configurations in which Decode read remote KV. Each engine used DP1. Select MTP or DSpark with the worker's `--speculative-config`. For ordinary full attention, use the [HTTP worker setup](#http-workers) with `PYTHONHASHSEED` unset.
+Copy the shell block for the selected model before starting each worker. Set `MODEL` to the local checkpoint path. Copy the matching JSON when the routing path needs a layout. The examples use one rank. To use a gRPC worker, use its `grpc://` address as the JSON key.
 
-| Checkpoint | Ascend connector | Tested speculation modes | TP per worker |
-| --- | --- | --- | ---: |
-| Qwen3-4B (full attention) | `MooncakeConnectorV1` | Off | 1 |
-| Qwen3.5-4B and Qwen3.6-27B W8A8 | `MooncakeConnectorV1` | Off, MTP, DSpark | 1 |
-| Qwen3.8-27B W8A8 | `MooncakeConnectorV1` | Off, MTP | 1 |
-| Qwen3.8-27B BF16 | `MooncakeConnectorV1` | DSpark | 2 |
-| Qwen3.8-Flash-Next W4A8 | `MooncakeConnectorV2` | Off, MTP | 2 |
+### GPU full attention
 
-Add the transfer option to each worker command. The example uses V1 with TP1. Set the connector name and both `tp_size` values from the table, and give each worker its own `engine_id` and `kv_port`.
+#### Qwen3-4B on GPU
+
+Use Qwen3-4B-Instruct-2507 with the default hash root. Automatic discovery uses one 16-token full-attention group.
 
 ```bash
-# Prefill
---kv-transfer-config '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_producer","kv_buffer_device":"npu","engine_id":"prefill-a2","kv_port":38352,"kv_load_failure_policy":"fail","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":1},"decode":{"dp_size":1,"tp_size":1}}}'
-# Decode
---kv-transfer-config '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_consumer","kv_buffer_device":"npu","engine_id":"decode-a2","kv_port":38353,"kv_load_failure_policy":"fail","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":1},"decode":{"dp_size":1,"tp_size":1}}}'
+MODEL=/models/Qwen3-4B-Instruct-2507
+SERVED_MODEL=qwen3
+PROMPT_TOKENS=129
+unset PYTHONHASHSEED
+MODEL_ARGS=(--block-size 16)
 ```
 
-For W4A8 Qwen4Exp with V2, add `--mamba-ssm-cache-dtype bfloat16` on both workers. In the Prefill layout, the measured `hash_block_size` and the full attention and Mamba group sizes are 896. The scratch group keeps its mode-specific size from the [colocated recipe](#qwen4exp-w4a8-on-ascend).
+### Hybrid attention models
 
-Start the Router with `kv_aware` on Prefill. In the [hybrid P/D layout](#pd-layout), add `compatible_decode_urls` to the Prefill entry. For ordinary full attention, follow the [layout rules above](#when-to-pass-a-layout). The bootstrap port is optional when Prefill returns its transfer parameters.
+The GPU recipes use vLLM 0.33.0. The layout and limits apply to the named checkpoint and mode.
 
-```bash
-vllm-router --port 19000 --vllm-pd-disaggregation \
-  --prefill http://127.0.0.1:8000 --decode http://127.0.0.1:8001 \
-  --prefill-policy kv_aware --decode-policy round_robin --kv-connector mooncake \
-  --kv-hybrid-layout layout.json
-```
-
-For DeepSeek on A2, the [V4 Flash 0731 W8A8 DSpark](https://docs.vllm.ai/projects/ascend/en/main/tutorials/models/DeepSeek-V4-Flash.html#52-pd-separation-deployment) and [V4.1 Flash W4A8](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/DeepSeek-V4.1-Flash.html#52-1p1d-pd-disaggregated-deployment) P/D examples both use `MooncakeHybridConnector`. The [full V4 Flash recipe below](#deepseek-v4-flash-0731-w8a8-on-ascend) covers colocated serving. P/D was verified on the four-layer V4 Flash mini4 checkpoint with speculation off.
-
-Use V1 for the Qwen3.5 and Qwen3.8 configurations above. With `MooncakeHybridConnector`, some requests returned HTTP 200 despite Mamba block-pairing failures on Decode.
-
-### P/D layout
-
-For each hybrid Prefill, declare the Decode URLs compatible with its connector and layout. Use worker base URLs with the transport used by Router. If the worker reports its layout, the entry needs only the compatible Decode URLs.
-
-```json
-{
-  "http://127.0.0.1:8000": {
-    "compatible_decode_urls": ["http://127.0.0.1:8001"]
-  }
-}
-```
-
-Include a complete model entry for each scored worker that does not report its layout. The example configures both stages. Use `grpc://` URL keys and matching pairing values for gRPC. Use each stage's effective speculation and cache rules. Leave Program scheduling disabled for hybrid P/D layouts.
+#### Qwen3.5-4B
 
 <details>
-<summary>Complete P/D layout.json · Qwen3.5-4B with NIXL</summary>
+<summary>Worker settings and layout.json for colocated or HTTP P/D</summary>
+
+```bash
+MODEL=/models/Qwen3.5-4B
+SERVED_MODEL=qwen35
+PROMPT_TOKENS=2001
+unset PYTHONHASHSEED
+MODEL_ARGS=(--max-model-len 4096 --prefix-match-unit 16)
+```
 
 ```json
 {
@@ -258,117 +364,70 @@ Include a complete model entry for each scored worker that does not report its l
 
 </details>
 
-If event discovery is unavailable, include `endpoints` and `replay_endpoints` in rank order, and include `model` and `publisher_topic` for each rank.
+#### Qwen3.6-27B
 
-Pass the file once by appending `--kv-hybrid-layout layout.json` to the Router command.
-
-## Check cache reuse
-
-In an idle pool, send the same prompt twice. The first request fills the cache. The second should increase the Router's KV-aware hit counter. Set `SERVED_MODEL` to the worker's served name. For the GPU hybrid recipes, start with `PROMPT_TOKENS=2001`. For Ascend, use the prompt length in the [A2 recipe table](#start-an-a2-worker).
+<details>
+<summary>Worker settings and layout.json</summary>
 
 ```bash
-SERVED_MODEL=qwen3 PROMPT_TOKENS=129
-payload=$(jq -nc --arg model "$SERVED_MODEL" --argjson n "$PROMPT_TOKENS" \
-  '{model:$model,prompt:[range(1000;1000+$n)],max_tokens:1,temperature:0}')
-request() {
-  curl -fsS http://127.0.0.1:19000/v1/completions \
-    -H 'Content-Type: application/json' --data-binary "$payload" >/dev/null
-}
-hits() {
-  curl -fsS http://127.0.0.1:29000/metrics |
-    awk '$1 == "vllm_router_kv_placement_lookups_total{result=\"hit\"}" {hits += $2} END {print hits+0}'
-}
-request && sleep 1 && before=$(hits) && request && after=$(hits) &&
-  printf 'Router KV-aware hits: %s → %s\n' "$before" "$after"
+MODEL=/models/Qwen3.6-27B
+SERVED_MODEL=qwen36
+PROMPT_TOKENS=2001
+unset PYTHONHASHSEED
+MODEL_ARGS=(--max-model-len 4096 --prefix-match-unit 16)
 ```
 
-Repeat the last request if events are still arriving. To confirm actual reuse, compare the worker's `prefix_cache_hits_total` before and after the repeat. For P/D, check Prefill.
-
-```bash
-curl -fsS http://127.0.0.1:8000/metrics | grep '^vllm:prefix_cache_hits_total'
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "hash_seed": "vllm-none-hash",
+        "full_hashes": true,
+        "hash_block_size": 16,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 0,
+        "prefix_caching": true,
+        "partial_hash_hits": true,
+        "declared_groups": 4,
+        "groups": [
+          {"group_idx": 0, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 832, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
+          {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 832, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
+          {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 832, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
+          {"group_idx": 3, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 832, "prefix_cacheable": true, "prefix_replay_tokens": 0}
+        ]
+      }
+    ]
+  }
+}
 ```
 
-On Ascend HTTP, `--enable-prompt-tokens-details` adds `usage.prompt_tokens_details.cached_tokens` to the worker response. For P/D, inspect the Prefill response to check local reuse.
+</details>
 
-To verify P/D transfer, send a prompt whose KV is absent on Decode. Check Decode's per-request Mooncake completion log or an increase in `vllm:nixl_bytes_transferred_sum` for NIXL. With MTP or DSpark, check that `vllm:spec_decode_num_draft_tokens_total` increases on the worker generating tokens.
+#### Qwen3.8-27B
 
-Both worker transports accept `/v1/chat/completions` through the Router. On gRPC, `/v1/completions` accepts one flat token-ID array as shown above.
-
-## Explicit layouts
-
-Use a layout file for hybrid attention, sliding-window attention, speculative decoding, or a custom hash seed when the worker cannot report its complete layout. Choose a recipe below and pass it with `--kv-hybrid-layout layout.json`. Use the worker URL as the JSON key, such as `grpc://127.0.0.1:50051` for the gRPC example. Include one entry per worker URL and one rank record per DP rank.
-
-With event discovery, the Router reads the served model, publisher topic, and live and replay addresses. For [static event sources](#static-event-endpoints), include `model` and `publisher_topic` per rank. Use the group IDs, block sizes, and reuse rules of the running worker. A different checkpoint, engine version, or speculation mode can change the layout.
-
-For a hybrid worker with static events, set `--kv-event-block-size` to the recipe's `hash_block_size`.
-
-The GPU examples use the default `sha256_cbor` root with `PYTHONHASHSEED` unset. If workers use a fixed seed, set `hash_seed` to that string. For LoRA, add `"adapters": [{"name": "my-adapter", "path": "/models/my-adapter"}]` beside `ranks`, with the exact path passed to `--lora-modules`.
-
-## Hybrid attention models
-
-Use the [HTTP](#http-workers) or [gRPC](#grpc-workers) worker command with the chosen checkpoint and served model name. Remove `--block-size 16` and add the engine options shown for the recipe. For gRPC, put these options after `--`. The GPU recipes use vLLM 0.33.0 and a context length of 4,096 tokens.
-
-| Model | Available recipes |
+| Mode | Setup |
 | --- | --- |
-| [Qwen3.5-4B](#qwen35-4b) | Base, [Ascend modes](#qwen35-4b-with-mtp-on-ascend) |
-| [Qwen3.6-27B](#qwen36-27b) | Base, [Ascend modes](#qwen36-27b-w8a8-on-ascend) |
-| [Qwen3.8-27B](#qwen38-27b) | Base, [MTP](#qwen38-27b-with-mtp), [DSpark](#qwen38-27b-with-dspark), [Ascend variants](#ascend-models) |
-| [Qwen4Exp](#qwen4exp-fp8-qsa) | GPU FP8, [Ascend W4A8](#qwen4exp-w4a8-on-ascend) |
-| [DeepSeek V4 Flash](#deepseek-v4-flash) | Base, [GPU DSpark](#deepseek-v4-flash-with-dspark), [Ascend 0731 W8A8](#deepseek-v4-flash-0731-w8a8-on-ascend) |
-| [DeepSeek V4 Pro](#deepseek-v4-pro) | Base |
-| [DeepSeek V4.1 Flash](#deepseek-v41-flash) | Bounded replay |
-
-### Qwen3.5-4B
-
-```bash
---max-model-len 4096 --prefix-match-unit 16
-```
+| Off | Use the base model profile below. |
+| MTP, one token of hash lookahead | Use the colocated MTP profile. |
+| MTP, zero hash lookahead | Use the zero-lookahead profile for colocated serving or Mooncake P/D. |
+| DSpark | Use the matching draft checkpoint for colocated serving or Mooncake P/D. |
 
 <details>
-<summary>Qwen3.5-4B layout.json</summary>
-
-```json
-{
-  "http://127.0.0.1:8000": {
-    "schema_version": 1,
-    "ranks": [
-      {
-        "rank": 0,
-        "weight_version": "default",
-        "instance_topic": true,
-        "hash_algorithm": "sha256_cbor",
-        "hash_seed": "vllm-none-hash",
-        "full_hashes": true,
-        "hash_block_size": 16,
-        "hash_lookahead_tokens": 0,
-        "speculative_tokens": 0,
-        "prefix_caching": true,
-        "partial_hash_hits": true,
-        "declared_groups": 4,
-        "groups": [
-          {"group_idx": 0, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
-          {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
-          {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
-          {"group_idx": 3, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0}
-        ]
-      }
-    ]
-  }
-}
-```
-
-</details>
-
-For NIXL P/D, set `VLLM_SSM_CONV_STATE_LAYOUT=DS` on both stages.
-
-### Qwen3.6-27B
+<summary>Off</summary>
 
 ```bash
---max-model-len 4096 --prefix-match-unit 16
+MODEL=/models/Qwen3.8-27B
+SERVED_MODEL=qwen38
+PROMPT_TOKENS=2001
+unset PYTHONHASHSEED
+MODEL_ARGS=(--max-model-len 4096 --prefix-match-unit 16)
 ```
-
-<details>
-<summary>Qwen3.6-27B layout.json</summary>
 
 ```json
 {
@@ -402,62 +461,20 @@ For NIXL P/D, set `VLLM_SSM_CONV_STATE_LAYOUT=DS` on both stages.
 
 </details>
 
-### Qwen3.8-27B
+##### Qwen3.8-27B with MTP
 
-**Without speculative decoding**
-
-```bash
---max-model-len 4096 --prefix-match-unit 16
-```
+Use the profile for the worker's effective hash lookahead.
 
 <details>
-<summary>Qwen3.8-27B layout.json</summary>
-
-```json
-{
-  "http://127.0.0.1:8000": {
-    "schema_version": 1,
-    "ranks": [
-      {
-        "rank": 0,
-        "weight_version": "default",
-        "instance_topic": true,
-        "hash_algorithm": "sha256_cbor",
-        "hash_seed": "vllm-none-hash",
-        "full_hashes": true,
-        "hash_block_size": 16,
-        "hash_lookahead_tokens": 0,
-        "speculative_tokens": 0,
-        "prefix_caching": true,
-        "partial_hash_hits": true,
-        "declared_groups": 4,
-        "groups": [
-          {"group_idx": 0, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 832, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
-          {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 832, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
-          {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 832, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 64},
-          {"group_idx": 3, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 832, "prefix_cacheable": true, "prefix_replay_tokens": 0}
-        ]
-      }
-    ]
-  }
-}
-```
-
-</details>
-
-#### Qwen3.8-27B with MTP
-
-Pick the variant that matches the running worker. A P/D connector can disable lookahead hashes, so check Prefill and Decode separately. For Ascend, use its [MTP recipe](#qwen38-27b-with-mtp-on-ascend).
-
-**One token of hash lookahead**
+<summary>MTP with one token of hash lookahead</summary>
 
 ```bash
---max-model-len 4096 --prefix-match-unit 16 \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+MODEL=/models/Qwen3.8-27B
+SERVED_MODEL=qwen38
+PROMPT_TOKENS=2001
+unset PYTHONHASHSEED
+MODEL_ARGS=(--max-model-len 4096 --prefix-match-unit 16 --speculative-config '{"method":"mtp","num_speculative_tokens":3}')
 ```
-
-<details>
-<summary>Qwen3.8 MTP layout.json · one token of hash lookahead</summary>
 
 ```json
 {
@@ -491,15 +508,16 @@ Pick the variant that matches the running worker. A P/D connector can disable lo
 
 </details>
 
-**Zero hash lookahead with a group 3 tail drop**
+<details>
+<summary>MTP with zero hash lookahead</summary>
 
 ```bash
---max-model-len 4096 --prefix-match-unit 16 \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":3,"disable_lookahead_block_hashes":true}'
+MODEL=/models/Qwen3.8-27B
+SERVED_MODEL=qwen38
+PROMPT_TOKENS=2001
+unset PYTHONHASHSEED
+MODEL_ARGS=(--max-model-len 4096 --prefix-match-unit 16 --speculative-config '{"method":"mtp","num_speculative_tokens":3,"disable_lookahead_block_hashes":true}')
 ```
-
-<details>
-<summary>Qwen3.8 MTP layout.json · zero hash lookahead, group 3 tail drop</summary>
 
 ```json
 {
@@ -529,6 +547,9 @@ Pick the variant that matches the running worker. A P/D connector can disable lo
           3
         ]
       }
+    ],
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
     ]
   }
 }
@@ -536,17 +557,20 @@ Pick the variant that matches the running worker. A P/D connector can disable lo
 
 </details>
 
-#### Qwen3.8-27B with DSpark
+##### Qwen3.8-27B with DSpark
 
-Download the [Qwen3.8 DSpark draft checkpoint](https://huggingface.co/RedHatAI/Qwen3.8-27B-speculator.dspark) to `/models/Qwen3.8-27B-speculator.dspark` or set the actual path in the launch option.
-
-```bash
---max-model-len 4096 --prefix-match-unit 16 \
-  --speculative-config '{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.8-27B-speculator.dspark"}'
-```
+Place the [DSpark draft checkpoint](https://huggingface.co/RedHatAI/Qwen3.8-27B-speculator.dspark) at `/models/Qwen3.8-27B-speculator.dspark`.
 
 <details>
-<summary>Qwen3.8 DSpark layout.json</summary>
+<summary>Worker settings and layout.json</summary>
+
+```bash
+MODEL=/models/Qwen3.8-27B
+SERVED_MODEL=qwen38
+PROMPT_TOKENS=2001
+unset PYTHONHASHSEED
+MODEL_ARGS=(--max-model-len 4096 --prefix-match-unit 16 --speculative-config '{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.8-27B-speculator.dspark"}')
+```
 
 ```json
 {
@@ -585,6 +609,9 @@ Download the [Qwen3.8 DSpark draft checkpoint](https://huggingface.co/RedHatAI/Q
           {"group_idx": 14, "kind": "sliding_window", "spec_type": "SlidingWindowSpec", "block_size": 832, "prefix_cacheable": true, "prefix_replay_tokens": 0, "sliding_window": 2048}
         ]
       }
+    ],
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
     ]
   }
 }
@@ -592,16 +619,20 @@ Download the [Qwen3.8 DSpark draft checkpoint](https://huggingface.co/RedHatAI/Q
 
 </details>
 
-### Qwen4Exp FP8 QSA
+#### Qwen4Exp FP8 QSA
 
-Use the `Qwen3.8-Flash-Next-FP8` checkpoint with architecture `Qwen4ExpForConditionalGeneration`. Use a prompt longer than 1,600 tokens to check reuse.
-
-```bash
---max-model-len 4096
-```
+Use the Qwen3.8-Flash-Next-FP8 checkpoint with architecture Qwen4ExpForConditionalGeneration.
 
 <details>
-<summary>Qwen4Exp FP8 QSA layout.json</summary>
+<summary>Worker settings and layout.json</summary>
+
+```bash
+MODEL=/models/Qwen3.8-Flash-Next-FP8
+SERVED_MODEL=qwen4exp
+PROMPT_TOKENS=1701
+unset PYTHONHASHSEED
+MODEL_ARGS=(--max-model-len 4096)
+```
 
 ```json
 {
@@ -637,16 +668,18 @@ Use the `Qwen3.8-Flash-Next-FP8` checkpoint with architecture `Qwen4ExpForCondit
 
 </details>
 
-### DeepSeek V4 Flash
-
-Use the V4 Flash 0731 checkpoint.
-
-```bash
---max-model-len 4096
-```
+#### DeepSeek V4 Flash
 
 <details>
-<summary>DeepSeek V4 Flash layout.json</summary>
+<summary>Worker settings and layout.json</summary>
+
+```bash
+MODEL=/models/DeepSeek-V4-Flash-0731
+SERVED_MODEL=v4-flash
+PROMPT_TOKENS=1057
+unset PYTHONHASHSEED
+MODEL_ARGS=(--max-model-len 4096)
+```
 
 ```json
 {
@@ -681,17 +714,20 @@ Use the V4 Flash 0731 checkpoint.
 
 </details>
 
-#### DeepSeek V4 Flash with DSpark
+##### DeepSeek V4 Flash with DSpark
 
-Use the 0731 checkpoint with DSpark support. For P/D, use NIXL.
-
-```bash
---max-model-len 4096 \
-  --speculative-config '{"method":"dspark","num_speculative_tokens":4}'
-```
+Use the 0731 checkpoint with its DSpark draft. For P/D, select NIXL.
 
 <details>
-<summary>DeepSeek V4 Flash DSpark layout.json</summary>
+<summary>Worker settings and layout.json</summary>
+
+```bash
+MODEL=/models/DeepSeek-V4-Flash-0731
+SERVED_MODEL=v4-flash
+PROMPT_TOKENS=2001
+unset PYTHONHASHSEED
+MODEL_ARGS=(--max-model-len 4096 --speculative-config '{"method":"dspark","num_speculative_tokens":4}')
+```
 
 ```json
 {
@@ -720,6 +756,9 @@ Use the 0731 checkpoint with DSpark support. For P/D, use NIXL.
         ],
         "tail_drop_groups": []
       }
+    ],
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
     ]
   }
 }
@@ -727,16 +766,18 @@ Use the 0731 checkpoint with DSpark support. For P/D, use NIXL.
 
 </details>
 
-### DeepSeek V4 Pro
-
-The example uses four GPUs. Set tensor parallelism to fit your deployment and confirm the group layout if you change it.
-
-```bash
---max-model-len 4096 --tensor-parallel-size 4
-```
+#### DeepSeek V4 Pro
 
 <details>
-<summary>DeepSeek V4 Pro layout.json</summary>
+<summary>Worker settings and layout.json</summary>
+
+```bash
+MODEL=/models/DeepSeek-V4-Pro
+SERVED_MODEL=v4-pro
+PROMPT_TOKENS=2001
+unset PYTHONHASHSEED
+MODEL_ARGS=(--max-model-len 4096 --tensor-parallel-size 4)
+```
 
 ```json
 {
@@ -771,16 +812,20 @@ The example uses four GPUs. Set tensor parallelism to fit your deployment and co
 
 </details>
 
-### DeepSeek V4.1 Flash
+#### DeepSeek V4.1 Flash
 
-Use the V4.1 Flash 1017 checkpoint. Bounded replay rebuilds the last 128 tokens for groups 0–4 after a cache hit.
-
-```bash
---max-model-len 4096 --tensor-parallel-size 2 --swa-bounded-replay
-```
+Use the 1017 checkpoint with bounded replay.
 
 <details>
-<summary>DeepSeek V4.1 Flash layout.json</summary>
+<summary>Worker settings and layout.json</summary>
+
+```bash
+MODEL=/models/DeepSeek-V4.1-Flash
+SERVED_MODEL=v41-flash
+PROMPT_TOKENS=1057
+unset PYTHONHASHSEED
+MODEL_ARGS=(--max-model-len 4096 --tensor-parallel-size 2 --swa-bounded-replay)
+```
 
 ```json
 {
@@ -819,53 +864,129 @@ Use the V4.1 Flash 1017 checkpoint. Bounded replay rebuilds the last 128 tokens 
 
 ### Ascend models
 
-Use the [vLLM Ascend 0.32.0rc1 image](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.32.0rc1) with its bundled vLLM 0.32.0 on Atlas 800I A2 (Ascend 910B, 64 GiB per NPU). The layouts below are from HTTP deployments. Use the same checkpoint and engine settings, then check the running worker's cache groups before reusing a layout.
+Use the [vLLM Ascend 0.32.0rc1 A2 image](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.32.0rc1) on Atlas 800I A2. Initialize the Ascend toolkit before launching workers.
 
-#### Start an A2 worker
+| Checkpoint | Modes | NPUs per worker | Deployment |
+| --- | --- | ---: | --- |
+| [Qwen3-4B](#qwen3-4b-on-ascend) | Off | 1 | HTTP colocated or Mooncake V1 P/D |
+| [Qwen3.5-4B](#qwen35-4b-with-mtp-on-ascend) | Off, MTP, [DSpark](#qwen35-4b-with-dspark-on-ascend) | 1 | HTTP colocated or Mooncake V1 P/D |
+| [Qwen3.6-27B W8A8](#qwen36-27b-w8a8-on-ascend) | Off, MTP, DSpark | 1 | HTTP colocated or Mooncake V1 P/D |
+| [Qwen3.8-27B W8A8](#qwen38-27b-with-mtp-on-ascend) | Off, MTP | 1 | HTTP colocated or Mooncake V1 P/D. Use the MTP profile for gRPC. |
+| [Qwen3.8-27B BF16](#qwen38-27b-with-dspark-on-ascend) | DSpark | 2 | HTTP colocated or Mooncake V1 P/D |
+| [Qwen4Exp W4A8](#qwen4exp-w4a8-on-ascend) | Off, MTP | 2 | HTTP colocated or Mooncake V2 P/D |
+| [DeepSeek V4 Flash 0731 W8A8](#deepseek-v4-flash-0731-w8a8-on-ascend) | Off, DSpark | 8 | HTTP colocated |
 
-In the Ascend container, use the following worker command. The example starts Qwen3.5-4B with MTP on one NPU. For another model, replace the model path, served name, and option assignments in this command with the settings from its recipe below. For colocated serving, run the Router on the same host with the corresponding `layout.json`.
+#### Qwen3-4B on Ascend
+
+<details>
+<summary>Worker settings and layout.json</summary>
+
+```bash
+MODEL=/models/Qwen3-4B
+SERVED_MODEL=qwen3-a2
+PROMPT_TOKENS=391
+TP=1
+export PYTHONHASHSEED=0
+export ASCEND_RT_VISIBLE_DEVICES=0
+MODEL_ARGS=(--max-model-len 10240 --max-num-batched-tokens 4096 --max-num-seqs 4
+  --gpu-memory-utilization 0.80 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details
+  --block-size 16)
+```
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "hash_seed": "0",
+        "full_hashes": true,
+        "hash_block_size": 128,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 0,
+        "prefix_caching": true,
+        "declared_groups": 1,
+        "groups": [
+          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 128, "prefix_cacheable": true, "prefix_replay_tokens": 0}
+        ]
+      }
+    ]
+  }
+}
+```
+
+</details>
+
+#### Qwen3.5-4B with MTP on Ascend
+
+<details>
+<summary>Off</summary>
 
 ```bash
 MODEL=/models/Qwen3.5-4B
 SERVED_MODEL=qwen35-a2
-MAX_LEN=10240 BATCH_TOKENS=4096 MEM_FRACTION=0.80
+PROMPT_TOKENS=1927
+TP=1
+export PYTHONHASHSEED=0
 export ASCEND_RT_VISIBLE_DEVICES=0
-export PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0
-KV_TOPIC=$(python3 -c 'from uuid import uuid4; print(uuid4().hex)')
-EVENTS=$(printf '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","topic":"%s"}' "$KV_TOPIC")
-MODEL_OPTIONS=(--speculative-config '{"method":"mtp","num_speculative_tokens":3}')
-
-vllm serve "$MODEL" --host 127.0.0.1 --port 8000 --served-model-name "$SERVED_MODEL" \
-  --max-model-len "$MAX_LEN" --max-num-batched-tokens "$BATCH_TOKENS" --max-num-seqs 4 \
-  --gpu-memory-utilization "$MEM_FRACTION" --enforce-eager --skip-mm-profiling \
-  --enable-scale-out --enable-prefix-caching --enable-prompt-tokens-details \
-  --prefix-caching-hash-algo sha256_cbor --kv-events-config "$EVENTS" "${MODEL_OPTIONS[@]}"
+MODEL_ARGS=(--max-model-len 10240 --max-num-batched-tokens 4096 --max-num-seqs 4
+  --gpu-memory-utilization 0.80 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details)
 ```
 
-```bash
-vllm-router --host 127.0.0.1 --port 19000 --prometheus-port 29000 \
-  --policy kv_aware --worker-urls http://127.0.0.1:8000 --kv-hybrid-layout layout.json
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "full_hashes": true,
+        "hash_seed": "0",
+        "hash_block_size": 640,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 0,
+        "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
+        "declared_groups": 4,
+        "groups": [
+          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 640, "prefix_cacheable": true, "prefix_replay_tokens": 0},
+          {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 640, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 640},
+          {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 640, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 640},
+          {"group_idx": 3, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 640, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 640}
+        ]
+      }
+    ],
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
+    ]
+  }
+}
 ```
 
-The layouts use `hash_seed: "0"` to match the worker and rely on HTTP event discovery. For static endpoints, follow the [static event setup](#static-event-endpoints). Use distinct HTTP, live, and replay ports for workers on the same host.
-
-Select one method in `--speculative-config` per worker. To turn speculation off, omit the option and use the layout for that mode. The measured A2 recipes below publish zero hash lookahead. Set `speculative_tokens` to the configured draft length and `hash_lookahead_tokens` to the number of lookahead tokens actually used by the hash. Use an empty `tail_drop_groups` array only when the engine's cache lookup skips the last-unit drop.
-
-| Checkpoint | Colocated modes below | NPU count | Prompt tokens for a reuse check |
-| --- | --- | ---: | ---: |
-| Qwen3.5-4B | [Off or MTP](#qwen35-4b-with-mtp-on-ascend), [DSpark](#qwen35-4b-with-dspark-on-ascend) | 1 | 1,927 |
-| Qwen3.6-27B W8A8 | [Off, MTP or DSpark](#qwen36-27b-w8a8-on-ascend) | 1 | 2,695 |
-| Qwen3.8-27B W8A8 | [Off or MTP](#qwen38-27b-with-mtp-on-ascend) | 1 | 2,695 |
-| Qwen3.8-27B BF16 | [DSpark](#qwen38-27b-with-dspark-on-ascend) | 2 | 2,695 |
-| Qwen3.8-Flash-Next W4A8 (Qwen4Exp) | [Off or MTP](#qwen4exp-w4a8-on-ascend) | 2 | 4,999 |
-| DeepSeek V4 Flash 0731 W8A8 | [Off or DSpark](#deepseek-v4-flash-0731-w8a8-on-ascend) | 8 | 16,401 |
-
-#### Qwen3.5-4B with MTP on Ascend
-
-Use the worker command above. The four cache groups are the same with speculation off. To serve without speculation, set `MODEL_OPTIONS=()` and `"speculative_tokens": 0` in the layout.
+</details>
 
 <details>
-<summary>A2 Qwen3.5-4B MTP layout.json</summary>
+<summary>MTP</summary>
+
+```bash
+MODEL=/models/Qwen3.5-4B
+SERVED_MODEL=qwen35-a2
+PROMPT_TOKENS=1927
+TP=1
+export PYTHONHASHSEED=0
+export ASCEND_RT_VISIBLE_DEVICES=0
+MODEL_ARGS=(--max-model-len 10240 --max-num-batched-tokens 4096 --max-num-seqs 4
+  --gpu-memory-utilization 0.80 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}')
+```
 
 ```json
 {
@@ -893,6 +1014,9 @@ Use the worker command above. The four cache groups are the same with speculatio
           {"group_idx": 3, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 640, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 640}
         ]
       }
+    ],
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
     ]
   }
 }
@@ -902,15 +1026,22 @@ Use the worker command above. The four cache groups are the same with speculatio
 
 #### Qwen3.5-4B with DSpark on Ascend
 
-Use the same target checkpoint and a compatible Ascend DSpark draft for Qwen3.5-4B at `/models/Qwen3.5-4B-DSpark`. The draft adds cache groups. Use the eight-group layout for this mode.
-
-```bash
-MAX_LEN=4096
-MODEL_OPTIONS=(--speculative-config '{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.5-4B-DSpark"}')
-```
+Place a compatible Ascend DSpark draft for Qwen3.5-4B at `/models/Qwen3.5-4B-DSpark`.
 
 <details>
-<summary>A2 Qwen3.5-4B DSpark layout.json</summary>
+<summary>DSpark</summary>
+
+```bash
+MODEL=/models/Qwen3.5-4B
+SERVED_MODEL=qwen35-a2
+PROMPT_TOKENS=1927
+TP=1
+export PYTHONHASHSEED=0
+export ASCEND_RT_VISIBLE_DEVICES=0
+MODEL_ARGS=(--max-model-len 4096 --max-num-batched-tokens 4096 --max-num-seqs 4
+  --gpu-memory-utilization 0.80 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details
+  --tensor-parallel-size 1 --speculative-config '{"method": "dspark", "num_speculative_tokens": 8, "model": "/models/Qwen3.5-4B-DSpark"}')
+```
 
 ```json
 {
@@ -942,6 +1073,9 @@ MODEL_OPTIONS=(--speculative-config '{"method":"dspark","num_speculative_tokens"
           {"group_idx": 7, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 640, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 640}
         ]
       }
+    ],
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
     ]
   }
 }
@@ -951,16 +1085,73 @@ MODEL_OPTIONS=(--speculative-config '{"method":"dspark","num_speculative_tokens"
 
 #### Qwen3.6-27B W8A8 on Ascend
 
-Use [Eco-Tech/Qwen3.6-27B-w8a8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.6-27B-w8a8) and `--quantization ascend`. The measured runs used the same four cache groups in all three modes. Set `MODEL_OPTIONS` and `speculative_tokens` together.
-
-| Mode | Worker options | `MAX_LEN` | `speculative_tokens` |
-| --- | --- | ---: | ---: |
-| Off | `--quantization ascend` | 10240 | 0 |
-| MTP | `--quantization ascend --speculative-config '{"method":"mtp","num_speculative_tokens":3}'` | 10240 | 3 |
-| DSpark | `--quantization ascend --speculative-config '{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.6-27B-DSpark"}'` | 4096 | 8 |
+Use [Eco-Tech/Qwen3.6-27B-w8a8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.6-27B-w8a8). Mount its Ascend DSpark draft at `/models/Qwen3.6-27B-DSpark` for DSpark.
 
 <details>
-<summary>A2 Qwen3.6-27B W8A8 MTP layout.json</summary>
+<summary>Off</summary>
+
+```bash
+MODEL=/models/Qwen3.6-27B-w8a8
+SERVED_MODEL=qwen36-a2
+PROMPT_TOKENS=2695
+TP=1
+export PYTHONHASHSEED=0
+export ASCEND_RT_VISIBLE_DEVICES=0
+MODEL_ARGS=(--max-model-len 10240 --max-num-batched-tokens 4096 --max-num-seqs 4
+  --gpu-memory-utilization 0.80 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details
+  --quantization ascend)
+```
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "full_hashes": true,
+        "hash_seed": "0",
+        "hash_block_size": 896,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 0,
+        "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
+        "declared_groups": 4,
+        "groups": [
+          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0},
+          {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896},
+          {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896},
+          {"group_idx": 3, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896}
+        ]
+      }
+    ],
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
+    ]
+  }
+}
+```
+
+</details>
+
+<details>
+<summary>MTP</summary>
+
+```bash
+MODEL=/models/Qwen3.6-27B-w8a8
+SERVED_MODEL=qwen36-a2
+PROMPT_TOKENS=2695
+TP=1
+export PYTHONHASHSEED=0
+export ASCEND_RT_VISIBLE_DEVICES=0
+MODEL_ARGS=(--max-model-len 10240 --max-num-batched-tokens 4096 --max-num-seqs 4
+  --gpu-memory-utilization 0.80 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details
+  --quantization ascend --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}')
+```
 
 ```json
 {
@@ -988,6 +1179,60 @@ Use [Eco-Tech/Qwen3.6-27B-w8a8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.
           {"group_idx": 3, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896}
         ]
       }
+    ],
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
+    ]
+  }
+}
+```
+
+</details>
+
+<details>
+<summary>DSpark</summary>
+
+```bash
+MODEL=/models/Qwen3.6-27B-w8a8
+SERVED_MODEL=qwen36-a2
+PROMPT_TOKENS=2695
+TP=1
+export PYTHONHASHSEED=0
+export ASCEND_RT_VISIBLE_DEVICES=0
+MODEL_ARGS=(--max-model-len 4096 --max-num-batched-tokens 4096 --max-num-seqs 4
+  --gpu-memory-utilization 0.80 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details
+  --quantization ascend --tensor-parallel-size 1 --speculative-config '{"method": "dspark", "num_speculative_tokens": 8, "model": "/models/Qwen3.6-27B-DSpark"}')
+```
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "full_hashes": true,
+        "hash_seed": "0",
+        "hash_block_size": 896,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 8,
+        "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
+        "declared_groups": 4,
+        "groups": [
+          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0},
+          {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896},
+          {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896},
+          {"group_idx": 3, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896}
+        ]
+      }
+    ],
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
     ]
   }
 }
@@ -997,20 +1242,114 @@ Use [Eco-Tech/Qwen3.6-27B-w8a8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.
 
 #### Qwen3.8-27B with MTP on Ascend
 
-Use the W8A8 checkpoint on one NPU with the defaults in the worker command.
+<details>
+<summary>Off (HTTP)</summary>
 
 ```bash
-MODEL_OPTIONS=(--quantization ascend --speculative-config '{"method":"mtp","num_speculative_tokens":3}')
+MODEL=/models/Qwen3.8-27B-W8A8
+SERVED_MODEL=qwen38-a2
+PROMPT_TOKENS=2695
+TP=1
+export PYTHONHASHSEED=0
+export ASCEND_RT_VISIBLE_DEVICES=0
+MODEL_ARGS=(--max-model-len 10240 --max-num-batched-tokens 4096 --max-num-seqs 4
+  --gpu-memory-utilization 0.80 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details
+  --quantization ascend)
 ```
-
-For speculation off, keep `--quantization ascend` and set `"speculative_tokens": 0` in the layout.
-
-<details>
-<summary>A2 Qwen3.8-27B W8A8 MTP layout.json</summary>
 
 ```json
 {
   "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "full_hashes": true,
+        "hash_seed": "0",
+        "hash_block_size": 896,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 0,
+        "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
+        "declared_groups": 4,
+        "groups": [
+          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0},
+          {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896},
+          {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896},
+          {"group_idx": 3, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896}
+        ]
+      }
+    ],
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
+    ]
+  }
+}
+```
+
+</details>
+
+<details>
+<summary>MTP worker settings and HTTP layout.json</summary>
+
+```bash
+MODEL=/models/Qwen3.8-27B-W8A8
+SERVED_MODEL=qwen38-a2
+PROMPT_TOKENS=2695
+TP=1
+export PYTHONHASHSEED=0
+export ASCEND_RT_VISIBLE_DEVICES=0
+MODEL_ARGS=(--max-model-len 10240 --max-num-batched-tokens 4096 --max-num-seqs 4
+  --gpu-memory-utilization 0.80 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details
+  --quantization ascend --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}')
+```
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "full_hashes": true,
+        "hash_seed": "0",
+        "hash_block_size": 896,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 3,
+        "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
+        "declared_groups": 4,
+        "groups": [
+          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0},
+          {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896},
+          {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896},
+          {"group_idx": 3, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896}
+        ]
+      }
+    ],
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
+    ]
+  }
+}
+```
+
+</details>
+
+<details>
+<summary>MTP gRPC colocated layout.json</summary>
+
+```json
+{
+  "grpc://127.0.0.1:50051": {
     "schema_version": 1,
     "ranks": [
       {
@@ -1041,19 +1380,63 @@ For speculation off, keep `--quantization ascend` and set `"speculative_tokens":
 
 </details>
 
-#### Qwen3.8-27B with DSpark on Ascend
+<details>
+<summary>MTP gRPC P/D layout.json</summary>
 
-Use the BF16 target with a matching Qwen3.8-27B DSpark draft. In the worker command, set `MODEL` to the BF16 checkpoint and expose two NPUs. This configuration was exercised with the same 0.32.0rc1 image.
-
-```bash
-export ASCEND_RT_VISIBLE_DEVICES=0,1
-MAX_LEN=4096
-MODEL_OPTIONS=(--tensor-parallel-size 2 \
-  --speculative-config '{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.8-27B-speculator.dspark"}')
+```json
+{
+  "grpc://127.0.0.1:50051": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "full_hashes": true,
+        "hash_seed": "0",
+        "hash_block_size": 896,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 3,
+        "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
+        "declared_groups": 4,
+        "groups": [
+          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0},
+          {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896},
+          {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896},
+          {"group_idx": 3, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896}
+        ]
+      }
+    ],
+    "compatible_decode_urls": [
+      "grpc://127.0.0.1:50052"
+    ]
+  }
+}
 ```
 
+</details>
+
+#### Qwen3.8-27B with DSpark on Ascend
+
+Use the BF16 target and place its compatible DSpark draft at `/models/Qwen3.8-27B-speculator.dspark`.
+
 <details>
-<summary>A2 Qwen3.8-27B BF16 DSpark layout.json</summary>
+<summary>DSpark</summary>
+
+```bash
+MODEL=/models/Qwen3.8-27B
+SERVED_MODEL=qwen38-a2
+PROMPT_TOKENS=2695
+TP=2
+export PYTHONHASHSEED=0
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+MODEL_ARGS=(--max-model-len 4096 --max-num-batched-tokens 4096 --max-num-seqs 4
+  --gpu-memory-utilization 0.80 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details
+  --tensor-parallel-size 2 --speculative-config '{"method": "dspark", "num_speculative_tokens": 8, "model": "/models/Qwen3.8-27B-speculator.dspark"}')
+```
 
 ```json
 {
@@ -1092,6 +1475,9 @@ MODEL_OPTIONS=(--tensor-parallel-size 2 \
           {"group_idx": 14, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 896, "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "prefill_checkpoint_alignment": 896}
         ]
       }
+    ],
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
     ]
   }
 }
@@ -1101,21 +1487,77 @@ MODEL_OPTIONS=(--tensor-parallel-size 2 \
 
 #### Qwen4Exp W4A8 on Ascend
 
-Use [Eco-Tech/Qwen3.8-Flash-Next-w4a8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.8-Flash-Next-w4a8) with the V2 model runner. Give the Ascend container 128 GiB of shared memory. The colocated test used TP2 and host offload for Engram.
-
-```bash
-export ASCEND_RT_VISIBLE_DEVICES=0,1 VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ASCEND_PLE_BACKEND=torch
-MEM_FRACTION=0.93
-MODEL_OPTIONS=(--quantization ascend --tensor-parallel-size 2 --trust-remote-code \
-  --enable-expert-parallel --mamba-cache-mode align \
-  --engram-config '{"cpu_offload":true,"dp_shared_memory":false}' \
-  --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3}')
-```
-
-With MTP off, omit `--speculative-config`, set `speculative_tokens` to 0, set group 0's size to 4, remove group 6, and set `declared_groups` to 6. A2 validation covers the native MTP draft. See the [Ascend model support matrix](https://github.com/vllm-project/vllm-ascend/blob/main/docs/source/user_guide/support_matrix/supported_models.md) for available speculative modes.
+Use [Eco-Tech/Qwen3.8-Flash-Next-w4a8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.8-Flash-Next-w4a8) with 128 GiB of container shared memory and host offload for Engram.
 
 <details>
-<summary>A2 Qwen4Exp W4A8 colocated MTP layout.json</summary>
+<summary>Colocated, off</summary>
+
+```bash
+MODEL=/models/Qwen3.8-Flash-Next-w4a8
+SERVED_MODEL=qwen4exp-a2
+PROMPT_TOKENS=4999
+TP=2
+export PYTHONHASHSEED=0
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+export VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ASCEND_PLE_BACKEND=torch
+MODEL_ARGS=(--max-model-len 10240 --max-num-batched-tokens 4096 --max-num-seqs 4
+  --gpu-memory-utilization 0.93 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details
+  --quantization ascend --tensor-parallel-size 2 --trust-remote-code --enable-expert-parallel
+  --mamba-cache-mode align --engram-config '{"cpu_offload": true, "dp_shared_memory": false}')
+```
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "full_hashes": true,
+        "hash_seed": "0",
+        "hash_block_size": 1664,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 0,
+        "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
+        "declared_groups": 6,
+        "groups": [
+          {"group_idx": 0, "spec_type": "CircularBufferSpec", "block_size": 4, "tokens_per_state": "1", "prefix_cacheable": false, "prefix_replay_tokens": 0, "kind": "scratch"},
+          {"group_idx": 1, "spec_type": "FullAttentionSpec", "block_size": 1664, "tokens_per_state": "1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "full_attention"},
+          {"group_idx": 2, "spec_type": "MambaSpec", "block_size": 1664, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"},
+          {"group_idx": 3, "spec_type": "MambaSpec", "block_size": 1664, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"},
+          {"group_idx": 4, "spec_type": "MambaSpec", "block_size": 1664, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"},
+          {"group_idx": 5, "spec_type": "MambaSpec", "block_size": 1664, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+</details>
+
+<details>
+<summary>Colocated, MTP</summary>
+
+```bash
+MODEL=/models/Qwen3.8-Flash-Next-w4a8
+SERVED_MODEL=qwen4exp-a2
+PROMPT_TOKENS=4999
+TP=2
+export PYTHONHASHSEED=0
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+export VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ASCEND_PLE_BACKEND=torch
+MODEL_ARGS=(--max-model-len 10240 --max-num-batched-tokens 4096 --max-num-seqs 4
+  --gpu-memory-utilization 0.93 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details
+  --quantization ascend --tensor-parallel-size 2 --trust-remote-code --enable-expert-parallel
+  --mamba-cache-mode align --engram-config '{"cpu_offload": true, "dp_shared_memory": false}'
+  --speculative-config '{"method": "qwen3_5_mtp", "num_speculative_tokens": 3}')
+```
 
 ```json
 {
@@ -1153,26 +1595,197 @@ With MTP off, omit `--speculative-config`, set `speculative_tokens` to 0, set gr
 
 </details>
 
-#### DeepSeek V4 Flash 0731 W8A8 on Ascend
-
-Use the full W8A8 checkpoint in the [Ascend deployment guide](https://github.com/vllm-project/vllm-ascend/blob/main/docs/source/tutorials/models/DeepSeek-V4-Flash.md#31-model-weight). The colocated configuration uses one 8-NPU node. Initialize the container's Ascend toolkit and set `HCCL_IF_IP`, `HCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`, and `TP_SOCKET_IFNAME` for the node's communication interface.
+<details>
+<summary>P/D, off with Mooncake V2</summary>
 
 ```bash
+MODEL=/models/Qwen3.8-Flash-Next-w4a8
+SERVED_MODEL=qwen4exp-a2
+PROMPT_TOKENS=2695
+TP=2
+export PYTHONHASHSEED=0
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+export VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ASCEND_PLE_BACKEND=torch
+MODEL_ARGS=(--max-model-len 10240 --max-num-batched-tokens 4096 --max-num-seqs 4
+  --gpu-memory-utilization 0.93 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details
+  --quantization ascend --tensor-parallel-size 2 --trust-remote-code --enable-expert-parallel
+  --mamba-cache-mode align --engram-config '{"cpu_offload": true, "dp_shared_memory": false}'
+  --mamba-ssm-cache-dtype bfloat16)
+```
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "full_hashes": true,
+        "hash_seed": "0",
+        "hash_block_size": 896,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 0,
+        "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
+        "declared_groups": 6,
+        "groups": [
+          {"group_idx": 0, "spec_type": "CircularBufferSpec", "block_size": 4, "tokens_per_state": "1", "prefix_cacheable": false, "prefix_replay_tokens": 0, "kind": "scratch"},
+          {"group_idx": 1, "spec_type": "FullAttentionSpec", "block_size": 896, "tokens_per_state": "1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "full_attention"},
+          {"group_idx": 2, "spec_type": "MambaSpec", "block_size": 896, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"},
+          {"group_idx": 3, "spec_type": "MambaSpec", "block_size": 896, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"},
+          {"group_idx": 4, "spec_type": "MambaSpec", "block_size": 896, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"},
+          {"group_idx": 5, "spec_type": "MambaSpec", "block_size": 896, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"}
+        ]
+      }
+    ],
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
+    ]
+  }
+}
+```
+
+</details>
+
+<details>
+<summary>P/D, MTP with Mooncake V2</summary>
+
+```bash
+MODEL=/models/Qwen3.8-Flash-Next-w4a8
+SERVED_MODEL=qwen4exp-a2
+PROMPT_TOKENS=2695
+TP=2
+export PYTHONHASHSEED=0
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+export VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ASCEND_PLE_BACKEND=torch
+MODEL_ARGS=(--max-model-len 10240 --max-num-batched-tokens 4096 --max-num-seqs 4
+  --gpu-memory-utilization 0.93 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details
+  --quantization ascend --tensor-parallel-size 2 --trust-remote-code --enable-expert-parallel
+  --mamba-cache-mode align --engram-config '{"cpu_offload": true, "dp_shared_memory": false}'
+  --speculative-config '{"method": "qwen3_5_mtp", "num_speculative_tokens": 3}'
+  --mamba-ssm-cache-dtype bfloat16)
+```
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "full_hashes": true,
+        "hash_seed": "0",
+        "hash_block_size": 896,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 3,
+        "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
+        "declared_groups": 7,
+        "groups": [
+          {"group_idx": 0, "spec_type": "CircularBufferSpec", "block_size": 8, "tokens_per_state": "1", "prefix_cacheable": false, "prefix_replay_tokens": 0, "kind": "scratch"},
+          {"group_idx": 1, "spec_type": "FullAttentionSpec", "block_size": 896, "tokens_per_state": "1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "full_attention"},
+          {"group_idx": 2, "spec_type": "MambaSpec", "block_size": 896, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"},
+          {"group_idx": 3, "spec_type": "MambaSpec", "block_size": 896, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"},
+          {"group_idx": 4, "spec_type": "MambaSpec", "block_size": 896, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"},
+          {"group_idx": 5, "spec_type": "MambaSpec", "block_size": 896, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"},
+          {"group_idx": 6, "spec_type": "MambaSpec", "block_size": 896, "tokens_per_state": "-1", "prefix_cacheable": true, "prefix_replay_tokens": 0, "mamba_cache_mode": "align", "kind": "mamba"}
+        ]
+      }
+    ],
+    "compatible_decode_urls": [
+      "http://127.0.0.1:8001"
+    ]
+  }
+}
+```
+
+</details>
+
+#### DeepSeek V4 Flash 0731 W8A8 on Ascend
+
+Set HCCL_IF_IP, HCCL_SOCKET_IFNAME, GLOO_SOCKET_IFNAME and TP_SOCKET_IFNAME for the node's communication interface.
+
+<details>
+<summary>Off</summary>
+
+```bash
+MODEL=/models/DeepSeek-V4-Flash-0731-w8a8
+SERVED_MODEL=v4-flash-a2
+PROMPT_TOKENS=16401
+TP=8
+export PYTHONHASHSEED=0
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export HCCL_OP_EXPANSION_MODE=AIV OMP_NUM_THREADS=8 VLLM_ASCEND_ENABLE_FLASHCOMM1=1
 export VLLM_PREFIX_CACHE_RETENTION_INTERVAL=16384
-MAX_LEN=65536 BATCH_TOKENS=8192 MEM_FRACTION=0.90
-MODEL_OPTIONS=(--quantization ascend --tensor-parallel-size 8 --enable-expert-parallel \
-  --tokenizer-mode deepseek_v4 --block-size 128 --attention_config.indexer_kv_dtype int8 \
-  --no-disable-hybrid-kv-cache-manager --prefix-cache-retention-interval 16384 \
-  --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":16}' \
-  --speculative-config '{"method":"dspark","num_speculative_tokens":7,"enforce_eager":true}')
+MODEL_ARGS=(--max-model-len 65536 --max-num-batched-tokens 8192 --max-num-seqs 4
+  --gpu-memory-utilization 0.90 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details
+  --quantization ascend --tensor-parallel-size 8 --enable-expert-parallel --tokenizer-mode deepseek_v4
+  --block-size 128 --attention_config.indexer_kv_dtype int8 --no-disable-hybrid-kv-cache-manager
+  --prefix-cache-retention-interval 16384 --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 16}')
 ```
 
-The measured layout applies with DSpark off by omitting `--speculative-config` and setting `"speculative_tokens": 0`. In both modes, a repeated 16,401-token prompt reused 16,384 tokens. Classic MTP uses the separate W8A8 MTP checkpoint and needs its own measured layout.
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "full_hashes": true,
+        "hash_seed": "0",
+        "hash_block_size": 8,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 0,
+        "tail_drop_groups": [],
+        "partial_hash_hits": false,
+        "prefix_caching": true,
+        "declared_groups": 6,
+        "groups": [
+          {"group_idx": 0, "spec_type": "MLAAttentionSpec", "block_size": 512, "tokens_per_state": "4", "cache_role": "sparse", "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "mla_attention"},
+          {"group_idx": 1, "spec_type": "MLAAttentionSpec", "block_size": 16384, "tokens_per_state": "128", "cache_role": "sparse", "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "mla_attention"},
+          {"group_idx": 2, "spec_type": "SlidingWindowMLASpec", "block_size": 128, "tokens_per_state": "1", "sliding_window": 128, "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "sliding_window_mla"},
+          {"group_idx": 3, "spec_type": "SlidingWindowMLASpec", "block_size": 128, "tokens_per_state": "1", "sliding_window": 128, "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "sliding_window_mla"},
+          {"group_idx": 4, "spec_type": "SlidingWindowMLASpec", "block_size": 8, "tokens_per_state": "1", "sliding_window": 8, "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "sliding_window_mla"},
+          {"group_idx": 5, "spec_type": "SlidingWindowMLASpec", "block_size": 32, "tokens_per_state": "1", "sliding_window": 128, "prefix_cacheable": true, "prefix_replay_tokens": 0, "kind": "sliding_window_mla"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+</details>
 
 <details>
-<summary>A2 DeepSeek V4 Flash 0731 W8A8 DSpark layout.json</summary>
+<summary>DSpark</summary>
+
+```bash
+MODEL=/models/DeepSeek-V4-Flash-0731-w8a8
+SERVED_MODEL=v4-flash-a2
+PROMPT_TOKENS=16401
+TP=8
+export PYTHONHASHSEED=0
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export HCCL_OP_EXPANSION_MODE=AIV OMP_NUM_THREADS=8 VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+export VLLM_PREFIX_CACHE_RETENTION_INTERVAL=16384
+MODEL_ARGS=(--max-model-len 65536 --max-num-batched-tokens 8192 --max-num-seqs 4
+  --gpu-memory-utilization 0.90 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details
+  --quantization ascend --tensor-parallel-size 8 --enable-expert-parallel --tokenizer-mode deepseek_v4
+  --block-size 128 --attention_config.indexer_kv_dtype int8 --no-disable-hybrid-kv-cache-manager
+  --prefix-cache-retention-interval 16384 --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 16}'
+  --speculative-config '{"method": "dspark", "num_speculative_tokens": 7, "enforce_eager": true}')
+```
 
 ```json
 {
@@ -1209,30 +1822,81 @@ The measured layout applies with DSpark off by omitting `--speculative-config` a
 
 </details>
 
-For V4.1 Flash, use the model's own runtime layout and the [Ascend V4.1 Flash deployment guide](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/DeepSeek-V4.1-Flash.html#55-multi-node-colocated-deployment). Its colocated DSpark example uses two A2 nodes.
-
-## Versions
-
-Pair the gRPC worker's `vllm-rs` and Python engine from the same release. The table covers worker KV event discovery and layout support.
-
-| vLLM release | HTTP event discovery | Layout support | vLLM Ascend pairing |
-| --- | --- | --- | --- |
-| [0.30.0](https://github.com/vllm-project/vllm/tree/v0.30.0) | Pass a layout and [static addresses](#static-event-endpoints). | Zero hash lookahead. | [0.30.0 stable](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.30.0). |
-| [0.31.0](https://github.com/vllm-project/vllm/tree/v0.31.0)–[0.32.0](https://github.com/vllm-project/vllm/tree/v0.32.0) | `/kv_event_sources` | Zero hash lookahead and V4.1 bounded replay. | [0.31.0rc1 wheel](https://pypi.org/project/vllm-ascend/0.31.0rc1/) or [0.32.0rc1](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.32.0rc1). See [Ascend models](#ascend-models) for MTP and DSpark. |
-| [0.33.0](https://github.com/vllm-project/vllm/tree/v0.33.0) | `/kv_event_sources` | Adds nonzero hash lookahead via `BlockStored.lookahead_token_ids`. The GPU recipes use this release. | Use an Ascend build compatible with vLLM 0.33. |
-| [0.34.0](https://github.com/vllm-project/vllm/tree/v0.34.0) | `/kv_event_sources` | Defaults to 64-token blocks when the backend has no preferred size. Use the actual block size in an explicit layout. | Use an Ascend build compatible with vLLM 0.34. |
-
-All listed gRPC worker releases discover live and replay addresses through `GetKvEventSources`. For chat routed to gRPC workers, the Router renders locally using `vllm-chat` pinned to vLLM 0.30.0. Model-specific rendering and output features follow the [Router's gRPC API compatibility](../backend/grpc.md#api-compatibility).
-
 ## CLI options
 
-See [worker and KV event options](../cli_reference.md#workers-and-backend), [routing policy options](../cli_reference.md#routing-policies), and [P/D disaggregation options](../cli_reference.md#prefilldecode-disaggregation) for value types and defaults.
+These defaults are for `vllm-router`. See the [CLI reference](../cli_reference.md) for other Router options.
+
+| Option | Type | Default | Use |
+| --- | --- | --- | --- |
+| `--policy` | Policy name | `cache_aware` | Set `kv_aware` for colocated routing. Provides the default policy for P/D stages. |
+| `--worker-urls` | URL list | Empty | Worker endpoints for colocated routing. |
+| `--vllm-pd-disaggregation` | Flag | `false` | Use separate Prefill and Decode pools. |
+| `--prefill` | URL plus optional port, repeatable | Empty | Add a Prefill URL and, for Mooncake bootstrap, its port. |
+| `--decode` | URL, repeatable | Empty | Add a Decode URL. |
+| `--prefill-policy` | Policy name | Inherit `--policy` | Set `kv_aware` to score Prefill reuse. |
+| `--decode-policy` | Policy name | Inherit `--policy` | Select the Decode policy, such as `round_robin` or `kv_aware`. |
+| `--kv-connector` | `nixl`, `mooncake`, `moriio` | `nixl` | Select the P/D handoff protocol. |
+| `--kv-hybrid-layout` | File path | Unset | Read the layout and P/D compatibility pairs keyed by worker URL. |
+| `--kv-event-source` | `URL=ENDPOINT[,ENDPOINT...]`, repeatable | Empty | Static live event addresses. |
+| `--kv-event-replay-source` | `URL=ENDPOINT[,ENDPOINT...]`, repeatable | Empty | Static replay addresses. |
+| `--kv-event-block-size` | `u32` | `16` | Hash unit in tokens for static event sources. |
+| `--kv-event-model` | String | Unset | Served model ID for static event sources. |
+| `--pd-kv-events` | `URL=ENDPOINT[,ENDPOINT...]`, repeatable | Empty | Static P/D live endpoints in DP-rank order for 16-token blocks. |
+| `--pd-hybrid-config` | File path | Unset | Read a legacy P/D layout. New deployments use `--kv-hybrid-layout`. |
+| `--kv-event-strict-recovery` | Flag | `false` | Require complete recovery or a worker KV clear before scoring reuse. |
+| `--router-temperature` | `f64` | `0.0` | KV-aware selection temperature for colocated and Prefill placement. Zero selects the lowest cost. |
+| `--kv-penalty-host` | `f64` | `0.8` | Reuse credit for host-resident KV. |
+| `--kv-penalty-external` | `f64` | `0.6` | Reuse credit for KV in an external tier. |
+| `--kv-penalty-disk` | `f64` | `0.3` | Reuse credit for disk-resident KV. |
+| `--kv-aware-session-affinity-ttl-secs` | `u64`, seconds | Unset | Enable idle session affinity for 1–31,536,000 seconds. In P/D, applies to Decode. |
+| `--prometheus-port` | `u16` | `29000` | Port for Router metrics. |
+| `VLLM_ROUTER_TOKENIZER` | Path, environment variable | Unset | Local model directory for gRPC text and chat rendering. |
+
+### Static event endpoints
+
+For stock HTTP vLLM 0.30.0, use fixed live and replay ports. Save this [Qwen3-4B](#qwen3-4b-on-gpu) example as `layout.json` and replace `replace-with-KV_TOPIC` with the topic from the worker terminal.
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "schema_version": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "model": "qwen3",
+        "publisher_topic": "replace-with-KV_TOPIC",
+        "weight_version": "default",
+        "instance_topic": true,
+        "hash_algorithm": "sha256_cbor",
+        "hash_seed": "vllm-none-hash",
+        "full_hashes": true,
+        "hash_block_size": 16,
+        "hash_lookahead_tokens": 0,
+        "speculative_tokens": 0,
+        "prefix_caching": true,
+        "declared_groups": 1,
+        "groups": [
+          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 16, "prefix_cacheable": true, "prefix_replay_tokens": 0}
+        ]
+      }
+    ]
+  }
+}
+```
+
+```bash
+vllm-router --port 19000 --policy kv_aware --worker-urls http://127.0.0.1:8000 \
+  --kv-event-source http://127.0.0.1:8000=tcp://127.0.0.1:5557 \
+  --kv-event-replay-source http://127.0.0.1:8000=tcp://127.0.0.1:5558 \
+  --kv-event-model qwen3 --kv-event-block-size 16 --kv-hybrid-layout layout.json
+```
 
 ## Troubleshooting
 
-- If the engine reports hits and the Router does not, check the layout's model and topic, the hash flags, and whether both event ports are reachable from the Router.
-- If a worker-reported layout is rejected, run the Router with `--log-level debug` and look for `worker-reported KV layout rejected` to see the reason.
-- If replay history is incomplete, an inferred full-attention layout resumes cache credit after the Router verifies a first-block Store against the default hash root.
-- For `unsupported tail-drop layout`, check the worker's [MTP recipe](#qwen38-27b-with-mtp).
-- If vLLM reports `Address already in use`, check the live and replay port ranges before starting it again. Inspect the actual event addresses in `/kv_event_sources` for HTTP or `Control.GetKvEventSources` for gRPC.
-- When a worker restarts, rerun the worker settings for a fresh topic. Update the layout only if it explicitly pins the topic or other layout fields changed. On a Router-only restart, replay recovers the events still in the worker's history.
+| Symptom | Check |
+| --- | --- |
+| Worker reports reuse and Router stays at zero | Check the served model, hash settings, publisher topic and reachability of both event ports. Inspect `/kv_event_sources` or `Control.GetKvEventSources`. |
+| Router rejects the layout | Use `--log-level debug` and inspect `worker-reported KV layout rejected`. Match the JSON to the actual model, rank, groups and speculation settings. |
+| Worker reports `Address already in use` | Check HTTP, gRPC, event and connector ports. Reserve separate ranges for DP ranks. |
+| Worker restarted | Generate a new publisher topic. Update a static layout that pins the topic. A Router restart uses the available replay history. |
+| Decode has no remote read | Check whether the prompt was already cached on Decode, the connector and role settings, and Decode's transfer log. |
