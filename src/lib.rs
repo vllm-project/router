@@ -229,13 +229,13 @@ impl Router {
 
         Ok(config::RouterConfig {
             epd: None,
+            connection_mode: mode.connection_mode(),
             mode,
             pd_kv_event_sources: config::parse_pd_kv_events(&self.pd_kv_events)?,
             kv_event_strict_recovery: self.kv_event_strict_recovery,
             policy,
             host: self.host.clone(),
             port: self.port,
-            connection_mode: config::ConnectionMode::Http,
             max_payload_size: self.max_payload_size,
             request_timeout_secs: self.request_timeout_secs,
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,

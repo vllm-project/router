@@ -478,7 +478,7 @@ impl InstalledWorkers {
             handle.shutdown();
         }
         for live in &subs.live_sources {
-            let _guard = live.lease.strict_rank.lock();
+            let _guard = live.lease.gate.lock();
             subs.indexer.retire_source(&subs.source_id, live.rank);
         }
         self.release_identity(&subs.key);

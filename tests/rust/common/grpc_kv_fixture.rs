@@ -1,12 +1,15 @@
 //! Single-rank vLLM event publisher with a deterministic startup replay.
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 use vllm_router_rs::kv_index::request_hash::BlockKeyGenerator;
 use vllm_router_rs::kv_index::wire::ExternalBlockHash;
 use vllm_router_rs::kv_index::{AllBlocksCleared, BlockStored, CacheCapabilities, KVEvent};
 
 pub const TOPIC: &str = "grpc-kv-start";
+const XPUB_SUBSCRIBE: u8 = 1;
+const REPLAY_END: i64 = -1;
 
 pub struct KvPublisher {
     live: zmq::Socket,
@@ -40,7 +43,7 @@ impl KvPublisher {
             "ranks": [{
                 "rank": 0, "model": model, "weight_version": "default",
                 "publisher_topic": TOPIC, "instance_topic": true,
-                "hash_algorithm": "sha256_cbor", "hash_seed": self.seed.to_string(), "full_hashes": true,
+                "hash_algorithm": "sha256_cbor", "root_hash": self.root_hash_hex(), "full_hashes": true,
                 "hash_block_size": block_size, "declared_groups": 1,
                 "hash_lookahead_tokens": 0, "speculative_tokens": 0, "prefix_caching": true,
                 "groups": [{
@@ -50,6 +53,19 @@ impl KvPublisher {
             }]
         }))
         .unwrap()
+    }
+
+    fn root_hash_hex(&self) -> String {
+        use std::fmt::Write;
+        let seed = self.seed.to_string();
+        // The decimal representation of a u64 uses the CBOR short string form.
+        let mut encoded = vec![0x60 | seed.len() as u8];
+        encoded.extend_from_slice(seed.as_bytes());
+        let mut hex = String::with_capacity(64);
+        for byte in Sha256::digest(encoded) {
+            write!(hex, "{byte:02x}").unwrap();
+        }
+        hex
     }
 
     pub async fn restore(&self, tokens: &[u32], block_size: u32) {
@@ -80,19 +96,33 @@ impl KvPublisher {
         };
         let payload = batch(&[event]);
         let subscription = frames(&self.live).await;
-        assert_eq!(subscription[0], [b"\x01", TOPIC.as_bytes()].concat());
-        let request = frames(&self.replay).await;
-        assert_eq!(request[2], 0_u64.to_be_bytes());
-        self.reply(&request[0], TOPIC.as_bytes(), 0, &payload);
-        self.reply(&request[0], b"", -1, b"");
+        let [subscription] = subscription.as_slice() else {
+            panic!("expected an XPUB subscription");
+        };
+        assert_eq!(
+            subscription.split_first(),
+            Some((&XPUB_SUBSCRIBE, TOPIC.as_bytes()))
+        );
+        let peer = self.replay_peer(0).await;
+        self.reply(&peer, TOPIC.as_bytes(), 0, &payload);
+        self.reply(&peer, b"", REPLAY_END, b"");
 
         // Requesting sequence 1 proves that the Router published sequence 0.
-        let request = frames(&self.replay).await;
-        assert_eq!(request[2], 1_u64.to_be_bytes());
-        self.reply(&request[0], b"", -1, b"");
+        let peer = self.replay_peer(1).await;
+        self.reply(&peer, b"", REPLAY_END, b"");
         self.live
             .send_multipart([TOPIC.as_bytes(), &1_u64.to_be_bytes(), &batch(&[])], 0)
             .unwrap();
+    }
+
+    async fn replay_peer(&self, expected_seq: u64) -> Vec<u8> {
+        let request = frames(&self.replay).await;
+        let [peer, delimiter, sequence]: [Vec<u8>; 3] = request
+            .try_into()
+            .expect("expected identity, delimiter and sequence");
+        assert!(delimiter.is_empty());
+        assert_eq!(sequence, expected_seq.to_be_bytes());
+        peer
     }
 
     fn reply(&self, identity: &[u8], topic: &[u8], seq: i64, payload: &[u8]) {

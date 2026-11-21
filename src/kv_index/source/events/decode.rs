@@ -33,10 +33,7 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
     if !(2..=3).contains(&batch.len()) {
         return Err("KV batch requires timestamp, events, and optional rank".into());
     }
-    let _timestamp = batch[0]
-        .as_f64()
-        .filter(|ts| ts.is_finite() && *ts >= 0.0)
-        .ok_or("invalid KV event timestamp")?;
+    // Ordering comes from the sequence frame. The first slot is publisher time.
     let data_parallel_rank = match batch.get(2) {
         None | Some(Value::Nil) => None,
         Some(rank) => Some(
@@ -55,8 +52,6 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
         .map(decode_event)
         .collect::<Result<_, _>>()?;
     Ok(KVEventBatch {
-        #[cfg(test)]
-        ts: _timestamp,
         events,
         data_parallel_rank,
     })
@@ -275,7 +270,6 @@ mod tests {
             change(&mut event, key, value);
         }
         let batch = decode_batch(&encode(vec![event], Value::from(3))).unwrap();
-        assert_eq!(batch.ts, 1.25);
         assert_eq!(batch.data_parallel_rank, Some(3));
         let KVEvent::BlockStored(event) = &batch.events[0] else {
             panic!("stored expected")

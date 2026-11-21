@@ -780,22 +780,16 @@ impl ConfigValidator {
                     .is_some_and(|discovery| discovery.enabled)
                 {
                     for worker in static_kv_event_sources.keys() {
-                        // A DP-aware worker is configured as `base@rank`, while
-                        // one event-source entry covers every rank of that
-                        // base URL. Accept either the exact URL, the base of a
-                        // rank-pinned key, or a rank-pinned entry of this base.
+                        use crate::kv_index::source::discovery::split_worker_rank;
+                        let (base, pinned) = split_worker_rank(worker);
                         let exact = worker_urls.iter().any(|url| url == worker);
-                        let covers_ranks = worker_urls.iter().any(|url| {
-                            url.strip_prefix(worker.as_str())
-                                .is_some_and(|suffix| suffix.starts_with('@'))
-                        });
-                        let rank_pinned_under_base = !exact
+                        let covers_ranks = pinned.is_none()
                             && worker_urls.iter().any(|url| {
-                                !url.contains('@')
-                                    && worker
-                                        .strip_prefix(url.as_str())
-                                        .is_some_and(|suffix| suffix.starts_with('@'))
+                                let (url_base, rank) = split_worker_rank(url);
+                                rank.is_some() && url_base == worker
                             });
+                        let rank_pinned_under_base =
+                            pinned.is_some() && !exact && worker_urls.iter().any(|url| url == base);
                         if rank_pinned_under_base {
                             // The KV index resolves static sources by exact
                             // worker URL, so a rank-pinned declaration under a
@@ -888,12 +882,9 @@ impl ConfigValidator {
         if config.intra_node_data_parallel_size == 1 {
             if let RoutingMode::Regular { worker_urls } = &config.mode {
                 if let Some(url) = worker_urls.iter().find(|url| {
-                    // gRPC worker URLs use the same suffix for a pinned rank.
-                    let is_http = url.starts_with("http://") || url.starts_with("https://");
-                    is_http
-                        && url.rsplit_once('@').is_some_and(|(base, rank)| {
-                            !base.is_empty() && !rank.is_empty() && rank.parse::<u32>().is_ok()
-                        })
+                    crate::kv_index::source::discovery::split_worker_rank(url)
+                        .1
+                        .is_some()
                 }) {
                     return Err(ConfigError::ValidationFailed {
                         reason: format!(
@@ -1185,23 +1176,25 @@ mod tests {
 
     #[test]
     fn rank_pinned_worker_url_requires_data_parallel_size() {
-        let mut config = RouterConfig::new(
-            RoutingMode::Regular {
-                worker_urls: vec!["http://worker:8000@1".to_string()],
-            },
-            PolicyConfig::Random,
-        );
-        let error = ConfigValidator::validate(&config).unwrap_err();
-        assert!(
-            error.to_string().contains("pins a data-parallel rank"),
-            "{error}"
-        );
+        for scheme in ["http", "grpc"] {
+            let mut config = RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec![format!("{scheme}://worker:8000@1")],
+                },
+                PolicyConfig::Random,
+            );
+            let error = ConfigValidator::validate(&config).unwrap_err();
+            assert!(
+                error.to_string().contains("pins a data-parallel rank"),
+                "{error}"
+            );
 
-        config.intra_node_data_parallel_size = 2;
-        config.mode = RoutingMode::Regular {
-            worker_urls: vec!["http://worker:8000".to_string()],
-        };
-        assert!(ConfigValidator::validate(&config).is_ok());
+            config.intra_node_data_parallel_size = 2;
+            config.mode = RoutingMode::Regular {
+                worker_urls: vec![format!("{scheme}://worker:8000")],
+            };
+            assert!(ConfigValidator::validate(&config).is_ok());
+        }
     }
 
     #[test]
@@ -1382,12 +1375,13 @@ mod tests {
             RoutingMode::Regular {
                 worker_urls: vec![
                     "grpc://worker:50051".to_string(),
-                    "grpc://worker:50052@0".to_string(),
+                    "grpc://worker:50052".to_string(),
                 ],
             },
             PolicyConfig::Random,
         );
 
+        assert_eq!(config.connection_mode, ConnectionMode::Grpc);
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 

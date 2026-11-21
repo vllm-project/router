@@ -1071,6 +1071,26 @@ pub enum RoutingMode {
 }
 
 impl RoutingMode {
+    pub fn connection_mode(&self) -> ConnectionMode {
+        let worker_url = match self {
+            Self::Regular { worker_urls } => worker_urls.first(),
+            Self::VllmPrefillDecode {
+                prefill_urls,
+                decode_urls,
+                ..
+            } => prefill_urls
+                .first()
+                .map(|(url, _)| url)
+                .or_else(|| decode_urls.first()),
+            Self::OpenAI { .. } => None,
+        };
+        if worker_url.is_some_and(|url| crate::backend::is_grpc_url(url)) {
+            ConnectionMode::Grpc
+        } else {
+            ConnectionMode::Http
+        }
+    }
+
     pub fn is_pd_mode(&self) -> bool {
         matches!(self, RoutingMode::VllmPrefillDecode { .. })
     }
@@ -1460,6 +1480,7 @@ impl RouterConfig {
     /// Create a new configuration with mode and policy
     pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
         Self {
+            connection_mode: mode.connection_mode(),
             mode,
             policy,
             ..Default::default()

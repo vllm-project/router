@@ -161,7 +161,7 @@ def kv_scenario(kv_workers, kv_st_runtime, kv_tokenizer, router_manager):
             },
         )
         for worker in workers:
-            if worker.block_size and worker.model and worker.events_enabled:
+            if worker.block_size and worker.model and worker.events is not None:
                 worker.wait_subscribed()
         scenario = KvScenario(workers, router.url)
         scenarios.append(scenario)
@@ -210,11 +210,12 @@ def test_kv_aware_cache_events_change_routing(kv_scenario, invalidation):
         a.publish([remove], live=False)
         events = []
     elif invalidation == "malformed":
-        a.publish([{"type": "UnknownEvent"}])
-        # Observe the invalidation before sending a fresh valid batch, so a
-        # subsequent restart cannot mask a broken malformed decoder.
+        bad_seq = a.publish([{"type": "UnknownEvent"}], replay=False)
+        # An incomplete replay keeps the invalid source hidden. Supply the
+        # valid batch only after the route reflects that invalidation.
         st.wait_stable(b)
-        events, sequence = [], 0
+        a.publish([remove], sequence=bad_seq, live=False)
+        events = []
     else:
         events, sequence = [], 0
     st.publish_applied(a, events, sequence=sequence)

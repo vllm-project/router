@@ -827,7 +827,7 @@ async fn hybrid_discovery_binds_only_ranks_for_the_worker_model() {
             serde_json::json!([
                 {"group_idx":0,"kind":"mamba","spec_type":"MambaSpec","block_size":block_size,
                  "sliding_window":null,"prefix_cacheable":true,"prefix_replay_tokens":0,
-                 "mamba_cache_mode":"align","prefill_checkpoint_alignment":block_size},
+                 "mamba_cache_mode":"align"},
                 {"group_idx":1,"kind":"full_attention","spec_type":"FullAttentionSpec","block_size":block_size,
                  "sliding_window":null,"prefix_cacheable":true,"prefix_replay_tokens":0}
             ]),
@@ -892,7 +892,6 @@ async fn exercise_static_hybrid(pd: bool) {
             "group_idx":idx, "kind":kind, "spec_type":spec, "block_size":528,
             "sliding_window":null, "prefix_cacheable":true,
             "prefix_replay_tokens":0, "mamba_cache_mode":mode,
-            "prefill_checkpoint_alignment": if kind == "mamba" { Some(528) } else { None }
         })
     };
     let mut capability = capability(
@@ -2178,7 +2177,7 @@ fn renewed_grants_do_not_price_pages_seen_only_after_expiry() {
                     ownership: None,
                 });
                 source
-                    .apply_batch(seq + 1, &event_batch(1.0, vec![removed]))
+                    .apply_batch(seq + 1, &event_batch(vec![removed]))
                     .unwrap();
                 assert_eq!(source.control.generation(), source_generation);
                 assert_eq!(

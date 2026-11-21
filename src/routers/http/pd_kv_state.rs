@@ -41,7 +41,7 @@ pub(super) struct PdKvState {
     targets: Mutex<HashMap<String, TargetRegistration>>,
     hybrid_pairs: Option<HashMap<String, HashSet<String>>>,
     allow_hybrid_layouts: bool,
-    nixl_pull: bool,
+    nixl_decode_replay: bool,
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
     credit_gate: Mutex<()>,
 }
@@ -70,7 +70,7 @@ impl PdKvState {
         let mut state = Self::new_with_statics(client, sources);
         state.api_key = api_key;
         state.allow_hybrid_layouts = allow_hybrid_layouts;
-        state.nixl_pull = connector == KvConnector::Nixl;
+        state.nixl_decode_replay = connector == KvConnector::Nixl;
         state.supervisor.set_api_key(state.api_key.clone());
         state.supervisor.set_strict_recovery(strict_recovery);
         state.supervisor.set_pd_connector(connector);
@@ -129,26 +129,29 @@ impl PdKvState {
             targets: Mutex::new(HashMap::new()),
             hybrid_pairs: (!pairs.is_empty()).then_some(pairs),
             allow_hybrid_layouts: true,
-            nixl_pull: false,
+            nixl_decode_replay: false,
             #[cfg(all(test, feature = "cpu", feature = "ready"))]
             credit_gate: Mutex::new(()),
         }
     }
 
-    /// Restrict declared hybrid sources; full-attention sources keep their pool.
+    /// Match declared hybrid sources only with their compatible Decode workers.
+    /// Other Prefill workers can use Decode workers outside the hybrid pairs.
     pub(super) fn compatible_hybrid_pairs(
         &self,
         prefill: &[Arc<dyn Worker>],
         decode: &[Arc<dyn Worker>],
     ) -> Option<HashSet<(PdEndpoint, PdEndpoint)>> {
         let configured = self.hybrid_pairs.as_ref()?;
+        let hybrid_decodes: HashSet<_> =
+            configured.values().flatten().map(String::as_str).collect();
         let mut allowed = HashSet::new();
         for p in prefill {
             for d in decode {
-                if configured
-                    .get(p.base_url())
-                    .is_none_or(|decodes| decodes.contains(d.base_url()))
-                {
+                if configured.get(p.base_url()).map_or_else(
+                    || !hybrid_decodes.contains(d.base_url()),
+                    |decodes| decodes.contains(d.base_url()),
+                ) {
                     allowed.insert((
                         PdEndpoint::for_worker(p.as_ref()),
                         PdEndpoint::for_worker(d.as_ref()),
@@ -547,7 +550,7 @@ impl PdKvState {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unpriced");
             return None;
         }
-        let work = kv.estimate_decode_work_with_transfer(&inputs, hashes, self.nixl_pull);
+        let work = kv.estimate_decode_work_with_transfer(&inputs, hashes, self.nixl_decode_replay);
         let mut context = HashMap::with_capacity(work.len());
         for ((worker, _, _), estimate) in inputs.iter().zip(work) {
             context.insert(worker.url().to_owned(), estimate.additional_tokens?);
@@ -714,10 +717,6 @@ mod kv_input_tests {
             HashSet::from([
                 (
                     PdEndpoint::for_worker(p[0].as_ref()),
-                    PdEndpoint::for_worker(d[0].as_ref())
-                ),
-                (
-                    PdEndpoint::for_worker(p[1].as_ref()),
                     PdEndpoint::for_worker(d[0].as_ref())
                 ),
                 (

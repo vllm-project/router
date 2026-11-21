@@ -67,10 +67,7 @@ impl PreparedEvent<'_> {
                 tier,
                 incremental,
                 hashes,
-            } => {
-                tx.remove_hash_pages(owner, group, tier, &hashes, incremental);
-                Ok(())
-            }
+            } => tx.remove_hash_pages(owner, group, tier, &hashes, incremental),
             Self::Clear => {
                 tx.clear_owner_exact(owner);
                 Ok(())
@@ -125,11 +122,11 @@ impl SourceBinding {
                 if store.kv_cache_spec_kind.is_none()
                     && store.medium.as_deref().is_some_and(|medium| medium.eq_ignore_ascii_case("CPU")))
         });
-        if events.clone().any(publishes_int_hash) {
-            return Err(SourceError::IntBlockHashes);
-        }
         let mut prepared = Vec::with_capacity(batch.events.len());
         for event in events {
+            if publishes_int_hash(event) {
+                return Err(SourceError::IntBlockHashes);
+            }
             match event {
                 KVEvent::BlockStored(store) => {
                     if let Some(event) = self.prepare_store(store)? {
@@ -220,8 +217,12 @@ impl SourceBinding {
                 );
             }
             let clear = matches!(event, PreparedEvent::Clear);
-            if event.apply(tx, &self.owner, self.max_entries).is_err() {
-                return Self::fail(state, tx, &self.owner, SourceError::Capacity);
+            if let Err(error) = event.apply(tx, &self.owner, self.max_entries) {
+                let error = match error {
+                    PageWriteError::Capacity => SourceError::Capacity,
+                    PageWriteError::InvalidResidencyMode => SourceError::InvalidBatch,
+                };
+                return Self::fail(state, tx, &self.owner, error);
             }
             if clear {
                 state.bump_generation();

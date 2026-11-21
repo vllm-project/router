@@ -74,7 +74,15 @@ fn store(
 ) {
     index.with_source_batch(&owner.target(), |batch| {
         batch
-            .store_hash_pages(owner, group, tier, None, &[key], false, usize::MAX)
+            .store_hash_pages(
+                owner,
+                group,
+                tier,
+                None,
+                &[key],
+                tier == StorageTier::Device,
+                usize::MAX,
+            )
             .unwrap();
     });
 }
@@ -219,7 +227,7 @@ fn source_batch_publishes_all_groups_atomically() {
                         StorageTier::Device,
                         None,
                         &[key],
-                        false,
+                        true,
                         8,
                     )
                     .unwrap();
@@ -348,7 +356,7 @@ fn page_evidence_can_cross_only_one_known_disjoint_batch() {
 
     let before = collect();
     index.with_page_mutation_batch(&target, &owner, &control, plan(&unrelated), |_, tx| {
-        tx.store_hash_pages(&owner, 1, StorageTier::Device, None, &[unrelated], false, 8)
+        tx.store_hash_pages(&owner, 1, StorageTier::Device, None, &[unrelated], true, 8)
             .unwrap();
         assert!(can_reuse(&before));
     });
@@ -356,19 +364,21 @@ fn page_evidence_can_cross_only_one_known_disjoint_batch() {
 
     let before_eviction = collect();
     index.with_page_mutation_batch(&target, &owner, &control, plan(&requested[0]), |_, tx| {
-        tx.remove_hash_pages(&owner, 1, StorageTier::Device, &requested, false);
+        tx.remove_hash_pages(&owner, 1, StorageTier::Device, &requested, true)
+            .unwrap();
         assert!(!can_reuse(&before_eviction));
     });
     assert!(!can_reuse(&before_eviction));
     index.with_page_mutation_batch(&target, &owner, &control, plan(&unrelated), |_, tx| {
-        tx.remove_hash_pages(&owner, 1, StorageTier::Device, &[unrelated], false);
+        tx.remove_hash_pages(&owner, 1, StorageTier::Device, &[unrelated], true)
+            .unwrap();
     });
     assert!(!can_reuse(&before_eviction));
     assert_eq!(exact(&before_eviction), [true, false]);
 
     let before_collision = collect();
     index.with_page_mutation_batch(&target, &owner, &control, plan(&collision), |_, tx| {
-        tx.store_hash_pages(&owner, 1, StorageTier::Device, None, &[collision], false, 8)
+        tx.store_hash_pages(&owner, 1, StorageTier::Device, None, &[collision], true, 8)
             .unwrap();
     });
     assert!(!can_reuse(&before_collision));
@@ -435,7 +445,7 @@ fn shared_miss_tracks_only_requested_rank_publication() {
     index.with_source_batch(&target, |tx| {
         // The confirmed miss remains valid at the published cutoff until commit.
         assert!(matches!(hybrid_match(), Some(PageMatch::Miss)));
-        tx.store_hash_pages(&first, 0, StorageTier::Device, None, &[requested], false, 8)
+        tx.store_hash_pages(&first, 0, StorageTier::Device, None, &[requested], true, 8)
             .unwrap();
     });
     assert!(hybrid_match().is_none());
@@ -454,7 +464,8 @@ fn shared_miss_does_not_accept_an_uncommitted_removal() {
     let key = [1; 32];
     store(&index, &holder, 0, key, StorageTier::Device);
     let observed = index.with_source_batch(&holder.target(), |tx| {
-        tx.remove_hash_pages(&holder, 0, StorageTier::Device, &[key], false);
+        tx.remove_hash_pages(&holder, 0, StorageTier::Device, &[key], true)
+            .unwrap();
         let observed = index.collect_hash_pages(0, &[key]);
         assert!(!observed.scan.confirms_unchanged(&index));
         assert!(PageEvidence::unchanged_groups(
@@ -465,7 +476,7 @@ fn shared_miss_does_not_accept_an_uncommitted_removal() {
             std::iter::once(Some(&observed)),
         )
         .is_none());
-        tx.store_hash_pages(&holder, 0, StorageTier::Device, None, &[key], false, 8)
+        tx.store_hash_pages(&holder, 0, StorageTier::Device, None, &[key], true, 8)
             .unwrap();
         observed
     });

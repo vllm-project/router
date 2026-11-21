@@ -52,14 +52,11 @@ pub(crate) fn full_store(
 }
 
 pub(crate) fn warm_full(binding: &SourceBinding, seq: u64, tokens: &[u32]) {
-    let mut batch = event_batch(
-        1.0,
-        vec![KVEvent::BlockStored(full_store(
-            tokens,
-            binding.keys.block_size() as u32,
-            None,
-        ))],
-    );
+    let mut batch = event_batch(vec![KVEvent::BlockStored(full_store(
+        tokens,
+        binding.keys.block_size() as u32,
+        None,
+    ))]);
     batch.data_parallel_rank = Some(binding.target.dp_rank);
     binding.apply_batch(seq, &batch).unwrap();
 }
@@ -87,9 +84,8 @@ pub(crate) fn stored_block(
     }
 }
 
-pub(crate) fn event_batch(ts: f64, events: Vec<KVEvent>) -> KVEventBatch {
+pub(crate) fn event_batch(events: Vec<KVEvent>) -> KVEventBatch {
     KVEventBatch {
-        ts,
         events,
         data_parallel_rank: Some(0),
     }

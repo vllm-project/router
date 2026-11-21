@@ -3,8 +3,8 @@
 use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
+    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
+    HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
     ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, StaticKvEventSources,
     TraceConfig,
 };
@@ -186,10 +186,6 @@ struct CliArgs {
         value_name = "URL=ENDPOINT[,ENDPOINT...]"
     )]
     pd_kv_events: Vec<String>,
-    /// Legacy P/D layout configuration.
-    #[arg(long, hide = true, conflicts_with = "kv_hybrid_layout")]
-    pd_hybrid_config: Option<std::path::PathBuf>,
-
     /// Specific policy for prefill nodes in PD mode. kv_aware uses the prefill load profile.
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
     prefill_policy: Option<String>,
@@ -600,17 +596,6 @@ impl CliArgs {
         };
 
         let mut pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
-        if let Some(path) = &self.pd_hybrid_config {
-            let configured: HashMap<String, PdKvEventSources> =
-                read_json_config(path, "PD hybrid config")?;
-            for (worker, source) in configured {
-                if pd_kv_event_sources.insert(worker.clone(), source).is_some() {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: format!("duplicate PD KV event source for '{worker}'"),
-                    });
-                }
-            }
-        }
         if let Some(path) = &self.kv_hybrid_layout {
             let layouts: HashMap<String, WorkerKvLayout> =
                 read_json_config(path, "KV cache layout")?;
@@ -641,7 +626,13 @@ impl CliArgs {
                         }
                         Some(layout)
                     };
-                let rank = layout.as_ref().and_then(|layout| layout.ranks.first());
+                let rank = layout.as_ref().and_then(|layout| {
+                    if let Some(rank) = vllm_router_rs::backend::parse_dp_rank(&worker) {
+                        layout.rank_capability(rank)
+                    } else {
+                        layout.ranks.iter().min_by_key(|rank| rank.rank)
+                    }
+                });
                 let block_size = rank.and_then(|rank| rank.hash_block_size).unwrap_or(16);
                 let model = rank
                     .map(|rank| rank.model.clone())
@@ -721,7 +712,7 @@ impl CliArgs {
             host: self.prometheus_host.clone(),
         });
 
-        let connection_mode = ConnectionMode::Http;
+        let connection_mode = mode.connection_mode();
 
         let api_key_validation_urls = if !self.api_key_validation_urls.is_empty() {
             self.api_key_validation_urls.clone()

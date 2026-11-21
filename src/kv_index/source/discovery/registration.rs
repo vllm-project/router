@@ -288,7 +288,7 @@ impl KvIndexSupervisor {
         for ev in event_sources {
             let rank = ev.dp_rank;
             let lease = crate::kv_index::source::binding::SourceLease {
-                strict_rank: Arc::new(Mutex::new(true)),
+                gate: Arc::new(Mutex::new(())),
                 active: active.clone(),
             };
             let index = Arc::new(

@@ -200,6 +200,9 @@ impl PdLoadSample {
             && self.unknown_prefill_requests == 0
             && self.pending_decode_requests == 0
             && self.active_decode_requests == 0
+            && self.pending_decode_tokens == 0
+            && self.active_decode_tokens == 0
+            && self.unknown_decode_requests == 0
     }
 }
 
@@ -537,11 +540,11 @@ impl AttemptInner {
         let mut loads = self.loads.lock();
         let key = (Stage::Prefill, self.prefill.clone());
         if let Some(load) = loads.get_mut(&key) {
-            load.prefill_requests -= 1;
+            load.prefill_requests = load.prefill_requests.saturating_sub(1);
             if let Some(tokens) = self.prefill_tokens {
-                load.active_prefill_tokens -= tokens;
+                load.active_prefill_tokens = load.active_prefill_tokens.saturating_sub(tokens);
             } else {
-                load.unknown_prefill_requests -= 1;
+                load.unknown_prefill_requests = load.unknown_prefill_requests.saturating_sub(1);
             }
             load.publish(Stage::Prefill, &self.prefill);
             if load.idle() {

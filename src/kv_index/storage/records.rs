@@ -13,10 +13,10 @@ pub(super) struct Residency {
 
 impl Residency {
     pub(super) fn observe(&mut self, tier: StorageTier, incremental: bool) -> bool {
+        if incremental != (tier == StorageTier::Device) {
+            return false;
+        }
         if incremental {
-            if tier != StorageTier::Device {
-                return false;
-            }
             let Some(next) = self.device_copies.checked_add(1) else {
                 return false;
             };
@@ -28,21 +28,25 @@ impl Residency {
 
     /// Return true when the last observation in this tier was removed.
     pub(super) fn withdraw(&mut self, tier: StorageTier, incremental: bool) -> bool {
+        if incremental != (tier == StorageTier::Device) {
+            return false;
+        }
         if incremental {
-            if tier != StorageTier::Device {
-                return false;
-            }
             if self.device_copies > 1 {
                 self.device_copies -= 1;
                 return false;
             }
-        }
-        if tier == StorageTier::Device {
             self.device_copies = 0;
         }
         let removed = self.contains(tier);
         self.tiers.0 &= !TierBits::bit(tier);
         removed
+    }
+
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(super) fn set_device_copies_for_test(&mut self, copies: u32) {
+        self.device_copies = copies;
     }
 
     pub(super) fn contains(self, tier: StorageTier) -> bool {
@@ -58,6 +62,8 @@ mod tests {
     #[test]
     fn residency_counts_only_incremental_gpu_copies_and_keeps_other_tiers() {
         let mut record = Residency::default();
+        assert!(!record.observe(StorageTier::Device, false));
+        assert!(!record.contains(StorageTier::Device));
         for _ in 0..2 {
             assert!(record.observe(StorageTier::Device, true));
         }
@@ -86,8 +92,9 @@ mod tests {
         assert!(!record.observe(StorageTier::Device, true));
         assert_eq!(record, before);
         assert!(record.observe(StorageTier::HostPinned, false));
-        record.withdraw(StorageTier::Device, false);
-        record.withdraw(StorageTier::HostPinned, false);
-        assert_eq!(record, Residency::default());
+        assert!(!record.withdraw(StorageTier::Device, false));
+        assert_eq!(record.device_copies, u32::MAX);
+        assert!(record.withdraw(StorageTier::HostPinned, false));
+        assert_eq!(record, before);
     }
 }

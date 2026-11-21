@@ -139,6 +139,8 @@ impl GroupEvidence {
             };
         // The shared run may end inside a physical block. Align the first
         // tail endpoint to the group's stride in the original hash chain.
+        // That endpoint addresses the complete physical block. Interior
+        // hashes prove partial reuse only when the layout admits partial hits.
         let offset = stride - 1 - pages.prefix_len % stride;
         let mut end = prefix_blocks;
         for &bits in pages.tail.iter().skip(offset).step_by(stride) {

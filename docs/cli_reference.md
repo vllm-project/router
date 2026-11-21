@@ -14,7 +14,7 @@ Both install an executable named `vllm-router`. Check which executable is on
 your `PATH` before copying flags between installations. Their options are
 similar, but they are not interchangeable. In particular:
 
-- Both CLIs support `kv_aware` in regular and P/D routing. The [hybrid layout options](load_balancing/kv_aware.md#hybrid-attention-models) require the Rust binary.
+- Both CLIs support `kv_aware` in regular and P/D routing. The [hybrid layout options](load_balancing/kv_aware.md#layout-template) require the Rust binary.
 - Rust also exposes `rendezvous_hash`, backend selection, tracing, API-key validation URLs, history storage and profiling.
 - Python exposes `--mini-lb`, queue settings and the token bucket refill rate.
   The Rust CLI fixes queue size at `100`, queue timeout at `60` seconds, and
@@ -52,7 +52,7 @@ width. `f32` and `f64` are floating-point values. Python's `integer` and
 | `--version` | `flag` | `n/a` | — | — | Print the Rust binary version and exit; `-V` is also accepted. |
 | `--max-payload-size` | `usize` | `536870912` | `integer` | `536870912` | Maximum request body size in bytes; the default is 512 MiB. |
 | `--request-timeout-secs` | `u64` | `1800` | `integer` | `1800` | Request timeout in seconds. |
-| `--pool-idle-timeout-secs` | `u64` | `2` | — | — | Idle lifetime for pooled backend HTTP connections in seconds; 0 disables reuse. |
+| `--pool-idle-timeout-secs` | `u64` | `2` | — | — | Maximum time to keep a backend HTTP connection idle in the pool. Use `0` to stop retaining idle connections. |
 | `--max-concurrent-requests` | `usize` | `32768` | `integer` | `32768` | Token bucket capacity for request admission; does not enforce a hard limit on in-flight requests. |
 | `--queue-size` | — | — | `integer` | `100` | Pending request queue capacity; `0` disables queuing and returns 429 when full. |
 | `--queue-timeout-secs` | — | — | `integer` | `60` | Maximum time in seconds spent waiting in the request queue. |
@@ -135,7 +135,6 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--vllm-discovery-address` | `string` | `unset` | `string` | `unset` | ZMQ registration address for vLLM workers, e.g. `0.0.0.0:30001`. |
 | `--kv-connector` | `nixl, mooncake, moriio` | `nixl` | `nixl, mooncake, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. |
 | `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static KV publishers for a KV-aware prefill or decode stage. Use URL=ENDPOINT[,ENDPOINT...] in DP-rank order. Block size is 16. |
-| `--pd-hybrid-config` | `std::path::PathBuf` | `unset` | — | — | Legacy P/D layout format. Use [`--kv-hybrid-layout`](load_balancing/kv_aware.md#pd-layout) for new deployments. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
 discovery. For static configuration, provide both prefill and decode workers:

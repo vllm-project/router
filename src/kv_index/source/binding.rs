@@ -6,13 +6,12 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 
-/// All ranks of a worker share `active`; owners of one canonical publisher and
-/// exact topic share `strict_rank`. Neither identifies a remote engine lifetime.
-/// Lock order is supervisor workers -> strict rank -> indexer. Keep the final
-/// rank decision and index mutation together, never holding this lock over await.
+/// All ranks of a worker share its active flag. The gate serializes an individual
+/// rank's event application with retirement.
+/// Lock order is supervisor workers -> source gate -> indexer.
 #[derive(Clone)]
 pub(in crate::kv_index) struct SourceLease {
-    pub(in crate::kv_index) strict_rank: Arc<Mutex<bool>>,
+    pub(in crate::kv_index) gate: Arc<Mutex<()>>,
     pub(in crate::kv_index) active: Arc<AtomicBool>,
 }
 
@@ -21,12 +20,9 @@ impl SourceLease {
         self.active.load(Ordering::Acquire)
     }
 
-    pub(in crate::kv_index) fn with_active<T>(
-        &self,
-        operation: impl FnOnce(bool) -> T,
-    ) -> Option<T> {
-        let strict = self.strict_rank.lock();
-        self.is_active().then(|| operation(*strict))
+    pub(in crate::kv_index) fn with_active<T>(&self, operation: impl FnOnce() -> T) -> Option<T> {
+        let _guard = self.gate.lock();
+        self.is_active().then(operation)
     }
 }
 
@@ -171,7 +167,7 @@ impl SourceBinding {
         operation: impl FnOnce() -> R,
     ) -> Option<R> {
         match &self.binding {
-            Some(binding) => binding.with_active(|_| operation()),
+            Some(binding) => binding.with_active(operation),
             None => Some(operation()),
         }
     }

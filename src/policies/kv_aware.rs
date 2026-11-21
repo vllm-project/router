@@ -914,6 +914,8 @@ impl Scorer for MultiplicativeScorer {
         for (candidate, cost) in candidates.iter().zip(costs.iter_mut()) {
             let components = cost_components(candidate, params);
             let projected_batchsize = components.batchsize.saturating_add(1);
+            // Token work and request count model separate costs: prefilling
+            // the tokens and competing with other requests in the projected batch.
             let contribution = components.ptoken as f64 * projected_batchsize as f64;
             if !contribution.is_finite() {
                 return Err(SelectionError::NonFiniteCost);
@@ -2146,6 +2148,9 @@ impl KvAwareOps for KvAwarePolicy {
     }
 
     fn pick_decode(&self, loads: &[usize], additional: &[u64]) -> Option<usize> {
+        if loads.len() != additional.len() {
+            return None;
+        }
         let min_load = *loads.iter().min()?;
         let tied: Vec<usize> = loads
             .iter()
@@ -2156,13 +2161,10 @@ impl KvAwareOps for KvAwarePolicy {
         // A continuation reaches the same projected load on the engine that
         // holds its prefix with a smaller `additional`; rotating that tie sent
         // the request to an engine without the prefix and lost the reuse.
-        let min_additional = tied
-            .iter()
-            .map(|&index| additional.get(index).copied().unwrap_or(0))
-            .min()?;
+        let min_additional = tied.iter().map(|&index| additional[index]).min()?;
         let tied: Vec<usize> = tied
             .into_iter()
-            .filter(|&index| additional.get(index).copied().unwrap_or(0) == min_additional)
+            .filter(|&index| additional[index] == min_additional)
             .collect();
         let cursor = self.decode_tie_cursor.fetch_add(1, Ordering::Relaxed) as usize;
         Some(tied[cursor % tied.len()])
@@ -2441,9 +2443,7 @@ mod tests {
                 warm_full(&source, seq, &prompts[0][..64]);
             } else {
                 let clear = KVEvent::AllBlocksCleared(crate::kv_index::AllBlocksCleared {});
-                source
-                    .apply_batch(seq, &event_batch(1.0, vec![clear]))
-                    .unwrap();
+                source.apply_batch(seq, &event_batch(vec![clear])).unwrap();
             }
             assert_eq!(
                 decode.estimate_decode_work(&inputs, &mut cache)[0].additional_tokens,
@@ -3400,10 +3400,11 @@ mod tests {
         binding
             .apply_batch(
                 0,
-                &event_batch(
-                    1.0,
-                    vec![KVEvent::BlockStored(full_store(&ids, 2, Some(adapter)))],
-                ),
+                &event_batch(vec![KVEvent::BlockStored(full_store(
+                    &ids,
+                    2,
+                    Some(adapter),
+                ))]),
             )
             .unwrap();
         let workers: Vec<Arc<dyn Worker>> = vec![

@@ -113,7 +113,7 @@ class KvEventPublisher:
             assert self.publisher.recv() == b"\x01" + self.topic
             self.subscribed = True
 
-    def publish(self, events, sequence=None, *, live=True):
+    def publish(self, events, sequence=None, *, live=True, replay=True):
         import msgpack
 
         with self.lock:
@@ -121,12 +121,15 @@ class KvEventPublisher:
                 self.history.clear()
             if sequence is not None:
                 self.sequence = sequence
-            seq = self.sequence.to_bytes(8, "big")
+            published = self.sequence
+            seq = published.to_bytes(8, "big")
             payload = msgpack.packb([time.time(), events, 0], use_bin_type=True)
-            self.history[self.sequence] = (seq, payload)
+            if replay:
+                self.history[published] = (seq, payload)
             self.sequence += 1
         if live:
             self.publisher.send_multipart([self.topic, seq, payload])
+        return published
 
     def _replay(self):
         while not self.stop.is_set():
@@ -156,6 +159,25 @@ def mock_tokenize(text):
         body = word[1:]
         tokens.append(int(body) + 1 if word.startswith("t") and body.isdigit() else 0)
     return tokens
+
+
+def _native_layout_field(layout: bytes) -> bytes:
+    """Encode the additive field in the Router's Control RPC response."""
+    from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+
+    descriptor = descriptor_pb2.FileDescriptorProto(name="test_native_kv_layout.proto")
+    message = descriptor.message_type.add(name="NativeKvLayout")
+    message.field.add(
+        name="kv_routing_capabilities",
+        number=2,
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+        type=descriptor_pb2.FieldDescriptorProto.TYPE_BYTES,
+    )
+    pool = descriptor_pool.DescriptorPool()
+    field_message = message_factory.GetMessageClass(
+        pool.Add(descriptor).message_types_by_name["NativeKvLayout"]
+    )
+    return field_message(kv_routing_capabilities=layout).SerializeToString()
 
 
 class GrpcKvWorker:
@@ -233,7 +255,7 @@ class GrpcKvWorker:
         )
         # Adapter metadata supplements the default group-0 discovery contract.
         if self.adapters:
-            response.kv_routing_capabilities = json.dumps(
+            capabilities = json.dumps(
                 {
                     "schema_version": 1,
                     "adapters": [
@@ -269,6 +291,7 @@ class GrpcKvWorker:
                     ],
                 }
             ).encode()
+            response.MergeFromString(_native_layout_field(capabilities))
         return response
 
     def Abort(self, request, context):
@@ -383,8 +406,8 @@ class GrpcKvWorker:
             ownership=ownership,
         )
 
-    def publish(self, events, sequence=None, *, live=True):
-        self.events.publish(events, sequence, live=live)
+    def publish(self, events, sequence=None, *, live=True, replay=True):
+        return self.events.publish(events, sequence, live=live, replay=replay)
 
     def close(self):
         for gate in self.all_gates:

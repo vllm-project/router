@@ -3,10 +3,9 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::kv_index::source::test_support::{event_batch, full_store, gpu_remove};
 use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::types::TierBits;
-use crate::kv_index::{KVEvent, RoutableTarget, SourceBinding, StorageTier};
+use crate::kv_index::{RoutableTarget, StorageTier};
 
 fn target(name: &str, rank: u32) -> RoutableTarget {
     RoutableTarget {
@@ -667,50 +666,6 @@ fn a_sliding_run_below_the_boundary_keeps_the_credit() {
     assert_eq!(common_reusable_tokens(&groups, 143), 96);
 }
 
-#[test]
-fn group_index_removal_reduces_the_common_restore_point() {
-    let tokens: Vec<_> = (0..64).collect();
-    let full = full_store(&tokens, 16, None);
-    let mut checkpoint = full.clone();
-    checkpoint.group_idx = Some(1);
-    checkpoint.kv_cache_spec_kind = Some("mamba".into());
-    let removed = checkpoint.block_hashes[2].clone();
-    let index = SourceBinding::new(
-        target("w", 0),
-        vec![
-            CacheGroup {
-                group_idx: 0,
-                block_size: 16,
-                kind: GroupRule::FullAttention,
-            },
-            CacheGroup {
-                group_idx: 1,
-                block_size: 16,
-                kind: GroupRule::Checkpoint,
-            },
-        ],
-        16,
-        0,
-        8,
-    )
-    .unwrap();
-    index.begin_empty(0);
-    let stored = event_batch(
-        1.0,
-        vec![KVEvent::BlockStored(full), KVEvent::BlockStored(checkpoint)],
-    );
-    index.apply_batch(0, &stored).unwrap();
-    assert_eq!(index.reusable_tokens(&tokens, 63), 48);
-
-    index
-        .apply_batch(
-            1,
-            &event_batch(1.0, vec![gpu_remove(Some(1), vec![removed])]),
-        )
-        .unwrap();
-    assert_eq!(index.reusable_tokens(&tokens, 63), 32);
-}
-
 mod declarations {
     use super::*;
     use crate::kv_index::SourceBinding;
@@ -736,7 +691,6 @@ mod declarations {
             "group_idx": 5, "kind": "full_attention", "spec_type": "FullAttentionSpec",
             "block_size": 128, "sliding_window": null, "prefix_cacheable": true,
             "prefix_replay_tokens": 0, "mamba_cache_mode": null,
-            "prefill_checkpoint_alignment": null,
         });
         let mut value = serde_json::json!({"schema_version": 1, "ranks": [{
             "rank": 0, "model": "v41", "weight_version": "default",
@@ -768,7 +722,6 @@ mod declarations {
                 "group_idx": idx, "kind": kind, "spec_type": spec, "block_size": 528,
                 "sliding_window": null, "prefix_cacheable": true,
                 "prefix_replay_tokens": 0, "mamba_cache_mode": mode,
-                "prefill_checkpoint_alignment": if kind == "mamba" { Some(528) } else { None },
             })
         };
         serde_json::json!({"schema_version": 1, "ranks": [{
@@ -844,9 +797,6 @@ mod declarations {
         rank["partial_hash_hits"] = true.into();
         for group in rank["groups"].as_array_mut().unwrap() {
             group["block_size"] = 576.into();
-            if group["kind"] == "mamba" {
-                group["prefill_checkpoint_alignment"] = 64.into();
-            }
         }
         let index = bind_layout(&value, "epoch-1").unwrap();
         assert_eq!(index.nixl_decode_credit(1801, 1792), 1728);
@@ -857,17 +807,12 @@ mod declarations {
     #[test]
     fn layout_rejects_inconsistent_groups_publisher_and_hash_contract() {
         let mut value = qwen_layout();
-        value["ranks"][0]["groups"][0]["prefill_checkpoint_alignment"] = serde_json::Value::Null;
-        assert!(bind_layout(&value, "epoch-1").is_ok());
         // Reject malformed group sizes and identities during source admission.
         for (field, invalid) in [("block_size", 0), ("group_idx", 0)] {
             let mut invalid_layout = value.clone();
             invalid_layout["ranks"][0]["groups"][1][field] = serde_json::json!(invalid);
             assert!(bind_layout(&invalid_layout, "epoch-1").is_err());
         }
-        value["ranks"][0]["groups"][0]["prefill_checkpoint_alignment"] = serde_json::json!(7);
-        assert!(bind_layout(&value, "epoch-1").is_err());
-        value["ranks"][0]["groups"][0]["prefill_checkpoint_alignment"] = serde_json::json!(528);
         for (field, invalid) in [
             ("publisher_topic", serde_json::json!("other")),
             ("declared_groups", serde_json::json!(3)),
@@ -930,7 +875,6 @@ mod declarations {
                 "group_idx": idx, "kind": kind, "spec_type": spec, "block_size": block,
                 "sliding_window": window, "prefix_cacheable": true,
                 "prefix_replay_tokens": 0, "mamba_cache_mode": null,
-                "prefill_checkpoint_alignment": null,
             })
         };
         let mut value = serde_json::json!({"schema_version": 1, "ranks": [{
@@ -989,7 +933,7 @@ mod declarations {
                 "group_idx": idx, "kind": kind, "spec_type": spec, "block_size": 320,
                 "sliding_window": null, "prefix_cacheable": true,
                 "prefix_replay_tokens": 0, "mamba_cache_mode": null,
-                "prefill_checkpoint_alignment": null, "tokens_per_state": "1",
+                "tokens_per_state": "1",
                 "cache_role": null,
             });
             value
@@ -1003,7 +947,7 @@ mod declarations {
                 0,
                 "mamba",
                 "MambaSpec",
-                serde_json::json!({"mamba_cache_mode": "align", "prefill_checkpoint_alignment": 320, "tokens_per_state": "-1", "block_size": 320}),
+                serde_json::json!({"mamba_cache_mode": "align", "tokens_per_state": "-1", "block_size": 320}),
             )
         };
         // Captured from a Qwen4Exp (QSA) vLLM 0.33.0 probe: three GDN groups,
@@ -1018,8 +962,8 @@ mod declarations {
             "speculative_tokens": 0, "prefix_caching": true,
             "groups": [
                 mamba(),
-                group(1, "mamba", "MambaSpec", serde_json::json!({"mamba_cache_mode": "align", "prefill_checkpoint_alignment": 320, "tokens_per_state": "-1"})),
-                group(2, "mamba", "MambaSpec", serde_json::json!({"mamba_cache_mode": "align", "prefill_checkpoint_alignment": 320, "tokens_per_state": "-1"})),
+                group(1, "mamba", "MambaSpec", serde_json::json!({"mamba_cache_mode": "align", "tokens_per_state": "-1"})),
+                group(2, "mamba", "MambaSpec", serde_json::json!({"mamba_cache_mode": "align", "tokens_per_state": "-1"})),
                 group(3, "unknown", "CircularBufferSpec", serde_json::json!({"prefix_cacheable": false, "block_size": 4})),
                 group(4, "mla_attention", "MLAAttentionSpec", serde_json::json!({"tokens_per_state": "4", "cache_role": "sparse"}))
             ]

@@ -199,11 +199,11 @@ impl IndexBatch<'_> {
         tier: StorageTier,
         hashes: &[SequenceHash],
         incremental: bool,
-    ) {
+    ) -> Result<(), PageWriteError> {
         self.check_target(&owner.target());
         self.index
             .hash_pages
-            .remove(self.active_pages, owner, group, tier, hashes, incremental);
+            .remove(self.active_pages, owner, group, tier, hashes, incremental)
     }
 }
 

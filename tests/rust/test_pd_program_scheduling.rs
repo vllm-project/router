@@ -108,6 +108,28 @@ async fn generate(
     Json(value).into_response()
 }
 
+async fn wait_for_program(router: &VllmPDRouter, predicate: impl Fn(&Value) -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let body = router.get_worker_loads().await.into_body();
+            let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            if value["program_scheduling"]["scheduler"]["ranks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|rank| rank["programs"].as_array().into_iter().flatten())
+                .any(&predicate)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("program did not reach the expected scheduling state");
+}
+
 async fn wait_calls(mock: &Mock, count: usize) {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while mock.calls.lock().unwrap().len() < count {
@@ -148,7 +170,10 @@ async fn check_prefill_slot(push: bool) {
             .route_completion(None, &req, Some("test"))
             .await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_for_program(&router, |program| {
+        program["root_program_id"] == "other-task" && program["in_flight_requests"] == 1
+    })
+    .await;
     assert_eq!(
         p.calls.lock().unwrap().len(),
         1,
@@ -417,26 +442,18 @@ async fn dropping_decode_body_unblocks_only_the_waiting_turn() {
     let p = mock(true).await;
     let d = mock(false).await;
     let router = Arc::new(router(&p, &d, true).await);
+    let mut streaming = request(true);
+    streaming.stream = true;
     let first = router
-        .route_completion(None, &request(true), Some("test"))
+        .route_completion(None, &streaming, Some("test"))
         .await;
     assert!(first.status().is_success());
-    let second_router = router.clone();
-    let mut second = tokio::spawn(async move {
-        second_router
-            .route_completion(None, &request(true), Some("test"))
-            .await
-    });
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(20), &mut second)
-            .await
-            .is_err()
-    );
+    let mut second = Box::pin(router.route_completion(None, &streaming, Some("test")));
+    assert!(futures_util::poll!(&mut second).is_pending());
     assert_eq!(p.calls.lock().unwrap().len(), 1);
     drop(first);
-    let second = tokio::time::timeout(std::time::Duration::from_secs(2), second)
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), second)
         .await
-        .unwrap()
         .unwrap();
     assert!(second.status().is_success());
     axum::body::to_bytes(second.into_body(), usize::MAX)

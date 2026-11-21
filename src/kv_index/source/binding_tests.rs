@@ -51,8 +51,8 @@ fn inferred_full_waits_for_root_evidence_after_a_replay_restart() {
     let root = full_store(&tokens[..32], 16, None);
     let mut suffix = root.clone();
     suffix.parent_block_hash = Some(ExternalBlockHash::Bytes(vec![7; 32]));
-    let suffix = event_batch(1.0, vec![KVEvent::BlockStored(suffix)]);
-    let root = event_batch(2.0, vec![KVEvent::BlockStored(root)]);
+    let suffix = event_batch(vec![KVEvent::BlockStored(suffix)]);
+    let root = event_batch(vec![KVEvent::BlockStored(root)]);
 
     index.begin_replay(0);
     index.finish_replay(0).unwrap();
@@ -88,14 +88,11 @@ fn unknown_medium_does_not_revoke_known_residency() {
         locality: None,
         ownership: None,
     };
-    let batch = event_batch(
-        1.0,
-        vec![
-            KVEvent::BlockStored(known),
-            KVEvent::BlockStored(unknown),
-            KVEvent::BlockRemoved(remove),
-        ],
-    );
+    let batch = event_batch(vec![
+        KVEvent::BlockStored(known),
+        KVEvent::BlockStored(unknown),
+        KVEvent::BlockRemoved(remove),
+    ]);
     assert_eq!(index.apply_batch(0, &batch), Ok(()));
     assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 32);
 }
@@ -117,10 +114,7 @@ fn inferred_full_revokes_credit_on_an_incompatible_root_or_event_shape() {
         let index = full_binding(target(), 16).require_root_proof();
         index.begin_empty(0);
         index
-            .apply_batch(
-                0,
-                &event_batch(1.0, vec![KVEvent::BlockStored(first.clone())]),
-            )
+            .apply_batch(0, &event_batch(vec![KVEvent::BlockStored(first.clone())]))
             .unwrap();
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 32);
 
@@ -140,7 +134,7 @@ fn inferred_full_revokes_credit_on_an_incompatible_root_or_event_shape() {
             _ => unreachable!(),
         }
         assert_eq!(
-            index.apply_batch(1, &event_batch(2.0, vec![KVEvent::BlockStored(wrong)])),
+            index.apply_batch(1, &event_batch(vec![KVEvent::BlockStored(wrong)])),
             Err(expected),
             "{case}"
         );
@@ -192,27 +186,21 @@ fn full_and_checkpoint_layouts_share_hash_pages_but_preserve_tier_scoring() {
     host.medium = Some("CPU".into());
     full.apply_batch(
         0,
-        &event_batch(
-            1.0,
-            vec![
-                KVEvent::BlockStored(gpu.clone()),
-                KVEvent::BlockStored(host.clone()),
-            ],
-        ),
+        &event_batch(vec![
+            KVEvent::BlockStored(gpu.clone()),
+            KVEvent::BlockStored(host.clone()),
+        ]),
     )
     .unwrap();
     let checkpoint = gpu_store(1, "mamba", 16, &tokens[48..64], &hashes[3..]);
     hybrid
         .apply_batch(
             0,
-            &event_batch(
-                1.0,
-                vec![
-                    KVEvent::BlockStored(gpu),
-                    KVEvent::BlockStored(host),
-                    KVEvent::BlockStored(checkpoint),
-                ],
-            ),
+            &event_batch(vec![
+                KVEvent::BlockStored(gpu),
+                KVEvent::BlockStored(host),
+                KVEvent::BlockStored(checkpoint),
+            ]),
         )
         .unwrap();
     for (score_unit, middle, end) in [(16, 2, 4), (32, 1, 2)] {
@@ -245,13 +233,10 @@ fn full_and_checkpoint_layouts_share_hash_pages_but_preserve_tier_scoring() {
             .len(),
         2
     );
-    let evict_first = event_batch(
-        1.0,
-        vec![gpu_remove(
-            Some(0),
-            vec![ExternalBlockHash::Bytes(hashes[0].to_vec())],
-        )],
-    );
+    let evict_first = event_batch(vec![gpu_remove(
+        Some(0),
+        vec![ExternalBlockHash::Bytes(hashes[0].to_vec())],
+    )]);
     full.apply_batch(1, &evict_first).unwrap();
     cache.single_target = true;
     let hits = full.matches_with_cache(&tokens, 16, None, 0, &mut cache);
@@ -323,29 +308,26 @@ fn partial_stores_restore_the_joint_boundary_and_survive_tier_removal() {
     partial.medium = Some("CPU".into());
     let mut device_copy = partial.clone();
     device_copy.medium = Some("GPU".into());
-    let batch = event_batch(
-        1.0,
-        vec![
-            KVEvent::BlockStored(gpu_store(
-                0,
-                "full_attention",
-                576,
-                &tokens[..576],
-                &hashes[35..36],
-            )),
-            KVEvent::BlockStored(gpu_store(
-                0,
-                "full_attention",
-                16,
-                &tokens[1120..1136],
-                &hashes[70..71],
-            )),
-            KVEvent::BlockStored(previous),
-            KVEvent::BlockStored(partial),
-            KVEvent::BlockStored(device_copy.clone()),
-            KVEvent::BlockStored(device_copy),
-        ],
-    );
+    let batch = event_batch(vec![
+        KVEvent::BlockStored(gpu_store(
+            0,
+            "full_attention",
+            576,
+            &tokens[..576],
+            &hashes[35..36],
+        )),
+        KVEvent::BlockStored(gpu_store(
+            0,
+            "full_attention",
+            16,
+            &tokens[1120..1136],
+            &hashes[70..71],
+        )),
+        KVEvent::BlockStored(previous),
+        KVEvent::BlockStored(partial),
+        KVEvent::BlockStored(device_copy.clone()),
+        KVEvent::BlockStored(device_copy),
+    ]);
     let default_index = SourceBinding::new(target(), groups.clone(), 16, 0, 8).unwrap();
     default_index.begin_empty(0);
     assert_eq!(default_index.apply_batch(0, &batch), Ok(()));
@@ -360,13 +342,10 @@ fn partial_stores_restore_the_joint_boundary_and_survive_tier_removal() {
     assert_eq!(index.reusable_tokens(&tokens, 1120), 576);
     let matches = index.matches(&tokens, 16, None, 0);
     assert_eq!(matches[0].tier, StorageTier::Device);
-    let removal = event_batch(
-        1.0,
-        vec![gpu_remove(
-            Some(1),
-            vec![ExternalBlockHash::Bytes(hashes[70].to_vec())],
-        )],
-    );
+    let removal = event_batch(vec![gpu_remove(
+        Some(1),
+        vec![ExternalBlockHash::Bytes(hashes[70].to_vec())],
+    )]);
     assert_eq!(index.apply_batch(1, &removal), Ok(()));
     let matches = index.matches(&tokens, 16, None, 0);
     assert_eq!(matches[0].tier, StorageTier::Device);
@@ -387,25 +366,22 @@ fn single_full_attention_group_credits_only_published_partial_pages() {
         block_size: 32,
         kind: GroupRule::FullAttention,
     };
-    let batch = event_batch(
-        1.0,
-        vec![
-            KVEvent::BlockStored(gpu_store(
-                0,
-                "full_attention",
-                32,
-                &tokens[..32],
-                &hashes[1..2],
-            )),
-            KVEvent::BlockStored(gpu_store(
-                0,
-                "full_attention",
-                16,
-                &tokens[32..48],
-                &hashes[2..3],
-            )),
-        ],
-    );
+    let batch = event_batch(vec![
+        KVEvent::BlockStored(gpu_store(
+            0,
+            "full_attention",
+            32,
+            &tokens[..32],
+            &hashes[1..2],
+        )),
+        KVEvent::BlockStored(gpu_store(
+            0,
+            "full_attention",
+            16,
+            &tokens[32..48],
+            &hashes[2..3],
+        )),
+    ]);
     for (partial, end) in [(false, 2), (true, 3)] {
         let index = SourceBinding::new(target(), vec![group], 16, 0, 8)
             .unwrap()
@@ -420,13 +396,10 @@ fn single_full_attention_group_credits_only_published_partial_pages() {
             index
                 .apply_batch(
                     1,
-                    &event_batch(
-                        1.0,
-                        vec![gpu_remove(
-                            Some(0),
-                            vec![ExternalBlockHash::Bytes(hashes[1].to_vec())],
-                        )],
-                    ),
+                    &event_batch(vec![gpu_remove(
+                        Some(0),
+                        vec![ExternalBlockHash::Bytes(hashes[1].to_vec())],
+                    )]),
                 )
                 .unwrap();
             assert!(index.matches(&tokens, 16, None, 0).is_empty());
@@ -500,7 +473,7 @@ fn qwen_batch() -> KVEventBatch {
             ))
         })
         .collect();
-    event_batch(1.0, events)
+    event_batch(events)
 }
 
 #[test]
@@ -522,7 +495,7 @@ fn incremental_second_copy_survives_first_remove() {
     if let KVEvent::BlockRemoved(event) = &mut removal {
         event.medium = Some("ASCEND".into());
     }
-    let removal = event_batch(1.0, vec![removal]);
+    let removal = event_batch(vec![removal]);
     assert_eq!(index.apply_batch(1, &removal), Ok(()));
     assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 528);
     assert_eq!(index.apply_batch(2, &removal), Ok(()));
@@ -530,7 +503,7 @@ fn incremental_second_copy_survives_first_remove() {
 
     // A cache clear resets both residency and copy counts before new Stores.
     assert_eq!(index.apply_batch(3, &batch), Ok(()));
-    let clear = event_batch(1.0, vec![KVEvent::AllBlocksCleared(Default::default())]);
+    let clear = event_batch(vec![KVEvent::AllBlocksCleared(Default::default())]);
     assert_eq!(index.apply_batch(4, &clear), Ok(()));
     assert_eq!(index.apply_batch(5, &qwen_batch()), Ok(()));
     assert_eq!(index.apply_batch(6, &removal), Ok(()));
@@ -550,7 +523,7 @@ fn incremental_second_copy_survives_first_remove() {
 /// `qwen_batch()` encoded as the engine publishes it.
 pub(crate) fn qwen35_payload() -> Vec<u8> {
     let batch = qwen_batch();
-    event_payload(batch.ts, &batch.events, batch.data_parallel_rank)
+    event_payload(1.0, &batch.events, batch.data_parallel_rank)
 }
 
 pub(crate) fn qwen_index(target: RoutableTarget, limit: usize) -> SourceBinding {
@@ -597,13 +570,10 @@ fn incremental_copy_counts_are_isolated_by_worker() {
     )));
     first.apply_batch(0, &two_copies).unwrap();
     second.apply_batch(0, &qwen_batch()).unwrap();
-    let removal = event_batch(
-        1.0,
-        vec![gpu_remove(
-            Some(3),
-            vec![ExternalBlockHash::Bytes(hash.to_vec())],
-        )],
-    );
+    let removal = event_batch(vec![gpu_remove(
+        Some(3),
+        vec![ExternalBlockHash::Bytes(hash.to_vec())],
+    )]);
     first.apply_batch(1, &removal).unwrap();
     assert_eq!(first.reusable_tokens(&tokens, usize::MAX), 528);
     second.apply_batch(1, &removal).unwrap();
@@ -736,7 +706,7 @@ fn retired_source_cannot_reactivate_a_shared_domain() {
         .with_shared_index(shared.clone())
         .with_source_binding(SourceLease {
             active: active.clone(),
-            strict_rank: Arc::new(parking_lot::Mutex::new(false)),
+            gate: Arc::new(parking_lot::Mutex::new(())),
         });
     old.begin_replay(0);
     old.apply_batch(0, &qwen_batch()).unwrap();
@@ -772,7 +742,7 @@ fn old_hybrid_cleanup_preserves_a_new_full_attention_owner() {
     let tokens = prompt();
     let mut store = full_store(&tokens[..528], 528, None);
     store.group_idx = Some(3);
-    next.apply_batch(0, &event_batch(1.0, vec![KVEvent::BlockStored(store)]))
+    next.apply_batch(0, &event_batch(vec![KVEvent::BlockStored(store)]))
         .unwrap();
     assert_eq!(old.reusable_tokens(&tokens, usize::MAX), 528);
     assert_eq!(next.reusable_tokens(&tokens, usize::MAX), 528);
@@ -806,7 +776,7 @@ fn decoded_qwen_layout_requires_all_groups_and_tracks_removal() {
     let KVEvent::BlockStored(store) = &batch.events[2] else {
         panic!("expected store")
     };
-    let removed = event_batch(2.0, vec![gpu_remove(Some(2), store.block_hashes.clone())]);
+    let removed = event_batch(vec![gpu_remove(Some(2), store.block_hashes.clone())]);
     assert_eq!(index.apply_batch(1, &removed), Ok(()));
     assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
 }
@@ -879,13 +849,10 @@ fn a_foreign_owner_is_skipped_without_revoking_the_view() {
     removal.locality = Some("LOCAL".into());
     removal.ownership = None;
     removal.block_hashes = store.block_hashes.clone();
-    let local_removal = event_batch(
-        2.0,
-        vec![
-            KVEvent::BlockRemoved(foreign_removal),
-            KVEvent::BlockRemoved(removal),
-        ],
-    );
+    let local_removal = event_batch(vec![
+        KVEvent::BlockRemoved(foreign_removal),
+        KVEvent::BlockRemoved(removal),
+    ]);
     assert_eq!(index.apply_batch(2, &local_removal), Ok(()));
     assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
 }
@@ -945,7 +912,7 @@ fn adapter_batch(name: &str, path: &str) -> KVEventBatch {
             KVEvent::BlockStored(store)
         })
         .collect();
-    event_batch(1.0, events)
+    event_batch(events)
 }
 
 /// An adapter's pages live under their own chain: they are indexed under
@@ -989,7 +956,6 @@ fn adapter_pages_are_indexed_under_their_own_chain() {
     .to_vec();
     let base_hash = BlockKeyGenerator::new(528, 0).generate_block_keys(&prompt())[0].to_vec();
     let removed = event_batch(
-        2.0,
         groups()
             .iter()
             .map(|group| {
@@ -1056,7 +1022,6 @@ fn hybrid_first_page_accepts_either_adapter_hash_endpoint() {
         .apply_batch(
             0,
             &event_batch(
-                1.0,
                 stores(0, 32, "GPU")
                     .into_iter()
                     .chain(stores(32, 48, "GPU"))
@@ -1072,12 +1037,10 @@ fn hybrid_first_page_accepts_either_adapter_hash_endpoint() {
         assert!(index.matches(&tokens, 16, other, 0).is_empty());
     }
     let evict = gpu_remove(Some(0), vec![ExternalBlockHash::Bytes(hashes[1].to_vec())]);
-    index
-        .apply_batch(1, &event_batch(2.0, vec![evict]))
-        .unwrap();
+    index.apply_batch(1, &event_batch(vec![evict])).unwrap();
     assert!(index.matches(&tokens, 16, Some("a"), 0).is_empty());
     index
-        .apply_batch(2, &event_batch(3.0, stores(0, 16, "CPU").to_vec()))
+        .apply_batch(2, &event_batch(stores(0, 16, "CPU").to_vec()))
         .unwrap();
     let hits = index.matches(&tokens, 16, Some("a"), 0);
     assert_eq!(hits[0].segments, [(0, 1)]);
@@ -1170,7 +1133,7 @@ fn replay_stays_hidden_until_the_verified_watermark() {
     let KVEvent::BlockStored(store) = &batch.events[2] else {
         panic!("expected store")
     };
-    let eviction = event_batch(2.0, vec![gpu_remove(Some(2), store.block_hashes.clone())]);
+    let eviction = event_batch(vec![gpu_remove(Some(2), store.block_hashes.clone())]);
     index.begin_replay(0);
     assert_eq!(index.apply_batch(0, &batch), Ok(()));
     assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
@@ -1337,15 +1300,91 @@ fn adapter_capacity_failure_invalidates_source_before_copy_counts_grow() {
 }
 
 #[test]
+fn group_index_removal_reduces_the_common_restore_point() {
+    let tokens: Vec<_> = (0..64).collect();
+    let full = crate::kv_index::source::test_support::full_store(&tokens, 16, None);
+    let mut checkpoint = full.clone();
+    checkpoint.group_idx = Some(1);
+    checkpoint.kv_cache_spec_kind = Some("mamba".into());
+    let removed = checkpoint.block_hashes[2].clone();
+    let index = SourceBinding::new(
+        target(),
+        vec![
+            CacheGroup {
+                group_idx: 0,
+                block_size: 16,
+                kind: GroupRule::FullAttention,
+            },
+            CacheGroup {
+                group_idx: 1,
+                block_size: 16,
+                kind: GroupRule::Checkpoint,
+            },
+        ],
+        16,
+        0,
+        8,
+    )
+    .unwrap();
+    index.begin_empty(0);
+    let stored = event_batch(vec![
+        KVEvent::BlockStored(full),
+        KVEvent::BlockStored(checkpoint),
+    ]);
+    index.apply_batch(0, &stored).unwrap();
+    assert_eq!(index.reusable_tokens(&tokens, 63), 48);
+
+    index
+        .apply_batch(1, &event_batch(vec![gpu_remove(Some(1), vec![removed])]))
+        .unwrap();
+    assert_eq!(index.reusable_tokens(&tokens, 63), 32);
+}
+
+#[test]
+fn speculative_wire_events_require_complete_blocks_and_matching_lookahead() {
+    use crate::kv_index::source::test_support::{full_binding, full_store};
+
+    let prompt: Vec<u32> = (0..34).collect();
+    let mut binding = full_binding(target(), 16);
+    binding.keys = binding.keys.with_lookahead(1);
+
+    let mut store = full_store(&prompt[..32], 16, None);
+    store.block_hashes = binding
+        .keys
+        .generate_block_keys(&prompt)
+        .into_iter()
+        .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
+        .collect();
+    store.lookahead_token_ids = Some(vec![vec![16], vec![32]]);
+    let payload = |store| event_payload(1.0, &[KVEvent::BlockStored(store)], Some(0));
+    for remove_lookahead in [false, true] {
+        binding.begin_empty(0);
+        binding.apply_payload(0, &payload(store.clone())).unwrap();
+        assert_eq!(binding.reusable_tokens(&prompt, 34), 32);
+        let mut invalid = store.clone();
+        if remove_lookahead {
+            invalid.lookahead_token_ids = None;
+        } else {
+            invalid.token_ids.truncate(16);
+        }
+        assert_eq!(
+            binding.apply_payload(1, &payload(invalid)),
+            Err(SourceError::InvalidBatch)
+        );
+        assert_eq!(binding.reusable_tokens(&prompt, 34), 0);
+    }
+}
+
+#[test]
 fn clear_drops_every_group_before_new_events_are_applied() {
     let index = fresh_index(8);
     let batch = qwen_batch();
     assert_eq!(index.apply_batch(0, &batch), Ok(()));
     assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
-    let cleared = event_batch(2.0, vec![KVEvent::AllBlocksCleared(Default::default())]);
+    let cleared = event_batch(vec![KVEvent::AllBlocksCleared(Default::default())]);
     assert_eq!(index.apply_batch(1, &cleared), Ok(()));
     assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
-    let partial = event_batch(3.0, vec![batch.events[0].clone()]);
+    let partial = event_batch(vec![batch.events[0].clone()]);
     assert_eq!(index.apply_batch(2, &partial), Ok(()));
     assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
 }
@@ -1388,13 +1427,10 @@ fn sparse_checkpoint_does_not_require_its_parent_to_be_resident() {
     ];
     let mut checkpoint = gpu_store(1, "mamba", 8, &tokens[8..16], &hashes[3..4]);
     checkpoint.parent_block_hash = Some(ExternalBlockHash::Bytes(hashes[1].to_vec()));
-    let batch = event_batch(
-        1.0,
-        vec![
-            KVEvent::BlockStored(gpu_store(0, "full_attention", 4, &tokens[..16], &hashes)),
-            KVEvent::BlockStored(checkpoint),
-        ],
-    );
+    let batch = event_batch(vec![
+        KVEvent::BlockStored(gpu_store(0, "full_attention", 4, &tokens[..16], &hashes)),
+        KVEvent::BlockStored(checkpoint),
+    ]);
     let index = SourceBinding::new(target(), layout, 4, 0, 8).unwrap();
     index.begin_empty(0);
     assert_eq!(index.apply_batch(0, &batch), Ok(()));
@@ -1408,13 +1444,10 @@ fn concurrent_queries_never_see_a_partially_applied_batch() {
     let KVEvent::BlockStored(store) = &initial.events[2] else {
         panic!("expected store")
     };
-    let replacement = event_batch(
-        2.0,
-        vec![
-            gpu_remove(Some(2), store.block_hashes.clone()),
-            KVEvent::BlockStored(store.clone()),
-        ],
-    );
+    let replacement = event_batch(vec![
+        gpu_remove(Some(2), store.block_hashes.clone()),
+        KVEvent::BlockStored(store.clone()),
+    ]);
     assert_eq!(index.apply_batch(0, &initial), Ok(()));
     let start = std::sync::Barrier::new(2);
     std::thread::scope(|scope| {
@@ -1459,7 +1492,7 @@ fn qwen4_batch(kind_override: Option<&str>) -> KVEventBatch {
             ))
         })
         .collect();
-    event_batch(1.0, events)
+    event_batch(events)
 }
 
 #[test]
@@ -1520,7 +1553,7 @@ fn checkpoint_event_may_cover_the_whole_cached_chunk() {
                 ))
             })
             .collect();
-        event_batch(1.0, events)
+        event_batch(events)
     };
     let index = SourceBinding::new(target(), qwen4_groups(), 320, 0, 16).unwrap();
     index.begin_empty(0);
@@ -1570,27 +1603,21 @@ fn qwen35_checkpoint_groups_may_omit_hashes_on_a_reused_chunk() {
     };
     let index = SourceBinding::new(target(), groups, 576, 0, 64).unwrap();
     index.begin_empty(0);
-    let first = event_batch(
-        1.0,
-        vec![
-            store(0, &keys[2..3], 1728),
-            store(1, &keys[2..3], 1728),
-            store(2, &keys[2..3], 1728),
-            store(3, &keys[..3], 1728),
-        ],
-    );
+    let first = event_batch(vec![
+        store(0, &keys[2..3], 1728),
+        store(1, &keys[2..3], 1728),
+        store(2, &keys[2..3], 1728),
+        store(3, &keys[..3], 1728),
+    ]);
     assert_eq!(index.apply_batch(0, &first), Ok(()));
     assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 1728);
     // Re-run of the same prompt: checkpoints publish nothing new.
-    let rerun = event_batch(
-        2.0,
-        vec![
-            store(0, &[], 576),
-            store(1, &[], 576),
-            store(2, &[], 576),
-            store(3, &keys[..1], 576),
-        ],
-    );
+    let rerun = event_batch(vec![
+        store(0, &[], 576),
+        store(1, &[], 576),
+        store(2, &[], 576),
+        store(3, &keys[..1], 576),
+    ]);
     assert_eq!(index.apply_batch(1, &rerun), Ok(()));
     assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 1728);
 }
@@ -1629,13 +1656,10 @@ fn sliding_group_restores_only_verified_windows() {
             &keys[pages],
         );
         sliding.kv_cache_spec_sliding_window = Some(window);
-        let batch = event_batch(
-            1.0,
-            vec![
-                KVEvent::BlockStored(dense.clone()),
-                KVEvent::BlockStored(sliding),
-            ],
-        );
+        let batch = event_batch(vec![
+            KVEvent::BlockStored(dense.clone()),
+            KVEvent::BlockStored(sliding),
+        ]);
         assert_eq!(index.apply_batch(0, &batch), result);
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), hit);
     }
@@ -1741,11 +1765,11 @@ fn tail_window_events_credit_the_engine_boundary() {
         256,
         1024,
     ));
-    assert_eq!(index.apply_batch(0, &event_batch(1.0, initial)), Ok(()));
+    assert_eq!(index.apply_batch(0, &event_batch(initial)), Ok(()));
     assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 0);
 
     // Reuse stops at the boundary for which all four sliding tails are present.
-    let tail = event_batch(2.0, sliding_stores(true).collect());
+    let tail = event_batch(sliding_stores(true).collect());
     assert_eq!(index.apply_batch(1, &tail), Ok(()));
     assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 768);
 }
@@ -1813,7 +1837,7 @@ fn sliding_tier_prices_only_pages_needed_by_engine() {
             }
             stores.push(KVEvent::BlockStored(store));
         }
-        let batch = event_batch(1.0, stores);
+        let batch = event_batch(stores);
         assert_eq!(index.apply_batch(0, &batch), Ok(()));
         for (pages, expected_tier) in (1..=3).zip(expected_tiers) {
             let matches = index.matches(&tokens[..pages * 16 + 1], 16, None, 0);
@@ -1847,7 +1871,7 @@ fn sliding_claims_only_the_published_page_boundaries() {
     let tail = &tail[tail.len() - 3..];
     let mut store = gpu_store(0, "sliding_window_mla", 64, &tokens[..1024], tail);
     store.kv_cache_spec_sliding_window = Some(128);
-    let batch = event_batch(1.0, vec![KVEvent::BlockStored(store)]);
+    let batch = event_batch(vec![KVEvent::BlockStored(store)]);
     // Three published pages are three claims, not sixteen chain steps.
     for (capacity, result, hit) in [(3, Ok(()), 960), (2, Err(SourceError::Capacity), 0)] {
         let index = SourceBinding::new(target(), vec![group], 4, 0, capacity).unwrap();
@@ -1871,16 +1895,13 @@ fn bounded_replay_credits_one_window_below_the_engine() {
             tokens_per_state: 1,
         },
     }];
-    let batch = event_batch(
-        1.0,
-        vec![KVEvent::BlockStored(gpu_store(
-            5,
-            "mla_attention",
-            128,
-            &tokens,
-            &keys,
-        ))],
-    );
+    let batch = event_batch(vec![KVEvent::BlockStored(gpu_store(
+        5,
+        "mla_attention",
+        128,
+        &tokens,
+        &keys,
+    ))]);
     // The restorable boundary is 896. A larger replay window must saturate
     // at zero credit without rejecting an otherwise valid declaration.
     for (replay_tokens, credit) in [(128, 768), (u32::MAX, 0)] {

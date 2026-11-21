@@ -132,13 +132,7 @@ async fn grpc_discovers_native_full_attention_without_layout_json() {
     let mut capability = serde_json::to_value(publisher.layout("mock-model", 2)).unwrap();
     capability["adapters"] = json!([]);
     let rank = capability["ranks"][0].as_object_mut().unwrap();
-    rank.remove("hash_seed");
     rank.insert("transfer".into(), serde_json::Value::Null);
-    // SHA-256 of the canonical CBOR encoding of the engine seed "42".
-    rank.insert(
-        "root_hash".into(),
-        json!("9fa6eb003f14425eb9c8e6baacfbcaab26257357b829c7bfa74ffcc4f31c1780"),
-    );
     let warm = MockVllmRsServer::spawn_with_kv_event_sources(
         2,
         KvEventSourcesResponse {

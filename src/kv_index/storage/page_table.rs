@@ -15,12 +15,20 @@ use super::{
 use crate::kv_index::request_hash::SequenceHash;
 use crate::kv_index::types::{ResidencyOwner, RoutableTarget, StorageTier, TierBits};
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct PageKey {
     group: u32,
     fingerprint: u32,
     digest: SequenceHash,
 }
+
+impl PartialEq for PageKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.group == other.group && self.digest == other.digest
+    }
+}
+
+impl Eq for PageKey {}
 
 impl PageKey {
     fn new(group: u32, digest: SequenceHash) -> Self {
@@ -344,11 +352,12 @@ pub(crate) enum PageMatch<'a> {
 
 impl<'a> PageTiers<'a> {
     pub(crate) fn get(&self, index: usize) -> Option<TierBits> {
-        if index < self.prefix_len {
-            Some(self.prefix)
+        let tiers = if index < self.prefix_len {
+            self.prefix
         } else {
-            self.tail.get(index - self.prefix_len).copied()
-        }
+            *self.tail.get(index - self.prefix_len)?
+        };
+        (tiers.0 != 0).then_some(tiers)
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -538,8 +547,8 @@ impl PageTable {
         incremental: bool,
         max_entries: usize,
     ) -> Result<(), PageWriteError> {
-        if incremental && tier != StorageTier::Device {
-            return Err(PageWriteError::ConflictingHash);
+        if incremental != (tier == StorageTier::Device) {
+            return Err(PageWriteError::InvalidResidencyMode);
         }
         if hashes.is_empty() {
             return Ok(());
@@ -640,12 +649,12 @@ impl PageTable {
         tier: StorageTier,
         hashes: &[SequenceHash],
         incremental: bool,
-    ) {
-        if incremental && tier != StorageTier::Device {
-            return;
+    ) -> Result<(), PageWriteError> {
+        if incremental != (tier == StorageTier::Device) {
+            return Err(PageWriteError::InvalidResidencyMode);
         }
         let Some(pages) = active.get_mut(owner) else {
-            return;
+            return Ok(());
         };
         let id = pages.owner.id;
         for &hash in hashes {
@@ -680,6 +689,7 @@ impl PageTable {
         if pages.base.is_empty() && pages.named.is_empty() {
             active.remove(owner);
         }
+        Ok(())
     }
 
     pub(super) fn clear_owner(&self, active: &mut ActivePages, owner: &ResidencyOwner) {
@@ -979,6 +989,53 @@ mod tests {
     }
 
     #[test]
+    fn invalid_device_mode_and_holder_overflow_preserve_existing_pages() {
+        let index = KvBlockIndexer::new();
+        let owner = owner("worker");
+        let key = [7; 32];
+        index.with_source_batch(&owner.target(), |tx| {
+            assert_eq!(
+                tx.store_hash_pages(&owner, 0, StorageTier::Device, None, &[key], false, 1),
+                Err(PageWriteError::InvalidResidencyMode)
+            );
+        });
+        assert!(index.hash_pages.rows.is_empty());
+
+        put(&index, &owner, 0);
+        let entry = index
+            .hash_pages
+            .rows
+            .get_sync(&PageKey::new(0, key))
+            .unwrap();
+        {
+            let mut row = entry.key().0.row.write();
+            let holders = row.holders_mut(None);
+            let id = holders.values().next().unwrap().owner.id;
+            holders
+                .get_mut(id)
+                .unwrap()
+                .residency
+                .set_device_copies_for_test(u32::MAX);
+        }
+        drop(entry);
+        index.with_source_batch(&owner.target(), |tx| {
+            assert_eq!(
+                tx.store_hash_pages(&owner, 0, StorageTier::Device, None, &[key], true, 1),
+                Err(PageWriteError::Capacity)
+            );
+            assert_eq!(
+                tx.remove_hash_pages(&owner, 0, StorageTier::Device, &[key], false),
+                Err(PageWriteError::InvalidResidencyMode)
+            );
+            tx.remove_hash_pages(&owner, 0, StorageTier::Device, &[key], true)
+                .unwrap();
+        });
+        assert!(
+            index.collect_hash_pages(0, &[key]).for_owner(&owner)[0].contains(StorageTier::Device)
+        );
+    }
+
+    #[test]
     fn concurrent_owner_registration_keeps_all_shared_page_claims() {
         let index = KvBlockIndexer::new();
         let threads = 8;
@@ -1022,7 +1079,8 @@ mod tests {
             .peek_with(&hash, |page, ()| page.clone())
             .unwrap();
         index.with_source_batch(&old.target(), |tx| {
-            tx.remove_hash_pages(&old, 0, StorageTier::Device, &[digest], true);
+            tx.remove_hash_pages(&old, 0, StorageTier::Device, &[digest], true)
+                .unwrap();
         });
         put(&index, &new, 0);
         let owns = |row: &PageRow, owner: &ResidencyOwner| {
@@ -1104,7 +1162,8 @@ mod tests {
                         .unwrap();
                     tx.store_hash_pages(&a, 0, StorageTier::HostPinned, ns, &[hash], false, 1)
                         .unwrap();
-                    tx.remove_hash_pages(&a, 0, StorageTier::Device, &[hash], true);
+                    tx.remove_hash_pages(&a, 0, StorageTier::Device, &[hash], true)
+                        .unwrap();
                 });
                 let g = index.collect_hash_groups(0u32..1, ns, &[hash, extra]);
                 let e = g[&0.into()].for_owner(&a);
@@ -1117,11 +1176,13 @@ mod tests {
                     .unwrap());
                 index.with_source_batch(&a.target(), |tx| {
                     tx.remove_hash_pages(&a, 0, StorageTier::HostPinned, &[hash], false)
+                        .unwrap()
                 });
             }
         });
         index.with_source_batch(&a.target(), |tx| {
             tx.remove_hash_pages(&a, 0, StorageTier::Device, &[hash], true)
+                .unwrap()
         });
         assert!(index.hash_pages.rows.is_empty());
     }
@@ -1147,7 +1208,8 @@ mod tests {
                 ),
                 Err(PageWriteError::Capacity)
             );
-            tx.remove_hash_pages(&worker, 0, StorageTier::Device, &[existing], true);
+            tx.remove_hash_pages(&worker, 0, StorageTier::Device, &[existing], true)
+                .unwrap();
         });
         assert!(index.hash_pages.rows.is_empty());
 
@@ -1162,11 +1224,13 @@ mod tests {
                 1,
             )
             .unwrap();
-            tx.remove_hash_pages(&worker, 0, StorageTier::Device, &[admitted], true);
+            tx.remove_hash_pages(&worker, 0, StorageTier::Device, &[admitted], true)
+                .unwrap();
         });
         assert!(!index.hash_pages.rows.is_empty());
         index.with_source_batch(&worker.target(), |tx| {
-            tx.remove_hash_pages(&worker, 0, StorageTier::Device, &[admitted], true);
+            tx.remove_hash_pages(&worker, 0, StorageTier::Device, &[admitted], true)
+                .unwrap();
         });
         assert!(index.hash_pages.rows.is_empty());
     }
@@ -1180,7 +1244,9 @@ mod tests {
         put(&index, &a, 0);
         put(&index, &b, 0);
         index.with_source_batch(&a.target(), |tx| {
-            tx.remove_hash_pages(&a, 0, StorageTier::Device, &[[7; 32]], true);
+            tx.remove_hash_pages(&a, 0, StorageTier::Device, &[[7; 32]], true)
+                .unwrap();
+
             assert_eq!(
                 tx.store_hash_pages(&a, 1, StorageTier::Device, None, &[[8; 32]], true, 1),
                 Err(PageWriteError::Capacity)
@@ -1200,6 +1266,7 @@ mod tests {
         assert!(holds(&a));
         index.with_source_batch(&a.target(), |tx| {
             tx.remove_hash_pages(&a, 0, StorageTier::Device, &[[7; 32]], true)
+                .unwrap();
         });
         assert!(!holds(&a));
         assert!(holds(&b));
@@ -1241,7 +1308,8 @@ mod tests {
         }
         put(&index, &a, 0);
         index.with_source_batch(&a.target(), |tx| {
-            tx.remove_hash_pages(&a, 0, StorageTier::Device, &[hash], true);
+            tx.remove_hash_pages(&a, 0, StorageTier::Device, &[hash], true)
+                .unwrap();
         });
         let has = |owner, namespace| {
             index
@@ -1257,7 +1325,8 @@ mod tests {
         assert!(!has(&a, Some("adapter-b")));
         assert!(has(&b, Some("adapter-b")));
         index.with_source_batch(&a.target(), |tx| {
-            tx.remove_hash_pages(&a, 0, StorageTier::Device, &[hash], true);
+            tx.remove_hash_pages(&a, 0, StorageTier::Device, &[hash], true)
+                .unwrap();
             tx.store_hash_pages(
                 &a,
                 0,
@@ -1355,7 +1424,8 @@ mod tests {
         };
         let remove = |group, tier| {
             index.with_source_batch(&owner.target(), |tx| {
-                tx.remove_hash_pages(&owner, group, tier, &keys, tier == StorageTier::Device);
+                tx.remove_hash_pages(&owner, group, tier, &keys, tier == StorageTier::Device)
+                    .unwrap();
             });
         };
 
@@ -1396,8 +1466,16 @@ mod tests {
         ] {
             let hashes: Vec<_> = positions.iter().map(|&position| keys[position]).collect();
             index.with_source_batch(&owner.target(), |tx| {
-                tx.store_hash_pages(owner, 0, tier, None, &hashes, false, 6)
-                    .unwrap();
+                tx.store_hash_pages(
+                    owner,
+                    0,
+                    tier,
+                    None,
+                    &hashes,
+                    tier == StorageTier::Device,
+                    6,
+                )
+                .unwrap();
             });
         }
         // Pages 0 and 1 are identical. Page 2 changes the tier, page 3
@@ -1433,8 +1511,16 @@ mod tests {
         ] {
             let hashes: Vec<_> = positions.iter().map(|&i| keys[i]).collect();
             index.with_source_batch(&owner.target(), |tx| {
-                tx.store_hash_pages(owner, 0, tier, namespace, &hashes, false, 7)
-                    .unwrap();
+                tx.store_hash_pages(
+                    owner,
+                    0,
+                    tier,
+                    namespace,
+                    &hashes,
+                    tier == StorageTier::Device,
+                    7,
+                )
+                .unwrap();
             });
         }
         let groups = index.collect_hash_groups(0u32..1, named, &keys);
@@ -1463,8 +1549,16 @@ mod tests {
             (&b, 0, StorageTier::HostPinned, vec![[2; 32]]),
         ] {
             index.with_source_batch(&owner.target(), |tx| {
-                tx.store_hash_pages(owner, group, tier, None, &hashes, false, 4)
-                    .unwrap();
+                tx.store_hash_pages(
+                    owner,
+                    group,
+                    tier,
+                    None,
+                    &hashes,
+                    tier == StorageTier::Device,
+                    4,
+                )
+                .unwrap();
             });
         }
         let keys = [[1; 32], [2; 32], [3; 32], [4; 32]];
@@ -1499,8 +1593,16 @@ mod tests {
                 (StorageTier::HostPinned, &keys[1..2]),
                 (StorageTier::HostPinned, &keys[3..]),
             ] {
-                tx.store_hash_pages(&holder, 0, tier, None, hashes, false, 8)
-                    .unwrap();
+                tx.store_hash_pages(
+                    &holder,
+                    0,
+                    tier,
+                    None,
+                    hashes,
+                    tier == StorageTier::Device,
+                    8,
+                )
+                .unwrap();
             }
         });
         let groups = index.collect_hash_groups([prefix, complete].into_iter(), None, &keys);
@@ -1544,7 +1646,8 @@ mod tests {
                             .unwrap();
                         assert!(pages[0][0].contains(StorageTier::Device));
                         index.with_source_batch(&owner.target(), |tx| {
-                            tx.remove_hash_pages(&owner, 0, StorageTier::Device, &[[7; 32]], true);
+                            tx.remove_hash_pages(&owner, 0, StorageTier::Device, &[[7; 32]], true)
+                                .unwrap();
                         });
                     }
                 });

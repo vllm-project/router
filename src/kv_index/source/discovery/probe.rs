@@ -123,8 +123,8 @@ pub(super) fn grpc_kv_event_source_entries(
                     topic: source.topic,
                     hwm: i32::try_from(source.hwm).ok(),
                     publisher: Some(source.transport),
-                    encoding: Some(source.encoding),
-                    schema_version: Some(source.schema_version),
+                    encoding: (!source.encoding.is_empty()).then_some(source.encoding),
+                    schema_version: (source.schema_version != 0).then_some(source.schema_version),
                     // The Control RPC has no per-source enable flag; it only
                     // returns sources when KV events are enabled.
                     enable_kv_cache_events: Some(true),
@@ -611,5 +611,13 @@ mod tests {
         assert!(entries.contains_key("3"));
         assert_eq!(entries["3"].publisher.as_deref(), Some("zmq"));
         assert_eq!(entries["3"].enable_kv_cache_events, Some(true));
+
+        let mut legacy_source = source(Some(0));
+        legacy_source.encoding.clear();
+        legacy_source.schema_version = 0;
+        let entries = grpc_kv_event_source_entries("grpc://worker:8000", vec![legacy_source]);
+        assert_eq!(entries["0"].encoding, None);
+        assert_eq!(entries["0"].schema_version, None);
+        assert!(super::super::events_enabled(&entries["0"]));
     }
 }

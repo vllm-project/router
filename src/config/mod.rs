@@ -144,9 +144,8 @@ impl StaticKvEventSources {
                     .to_string(),
             });
         }
-        // A declared hybrid layout may leave the publishers to the engine: the
-        // layout still fixes the block size and the model identity, so an empty
-        // endpoint list is legal and discovery fills it in.
+        // With a layout, discovery can supply the endpoints and outer model
+        // identity. Registration checks the observed model against each rank.
         if self.block_size == 0 || (self.endpoints.is_empty() && self.hybrid.is_none()) {
             return Err(ConfigError::ValidationFailed {
                 reason: format!(

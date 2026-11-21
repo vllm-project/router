@@ -493,7 +493,7 @@ mod tests {
             8,
         )
         .with_source_binding(SourceLease {
-            strict_rank: Arc::new(parking_lot::Mutex::new(true)),
+            gate: Arc::new(parking_lot::Mutex::new(())),
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         assert_eq!(

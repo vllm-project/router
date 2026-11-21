@@ -115,6 +115,14 @@ pub(crate) fn http_cache_read_fallback(body: &serde_json::Value) -> Option<&'sta
     cache_read_fallback(fields, false, false)
 }
 
+fn completion_lora_is_null(request: &CompletionRequest) -> bool {
+    // Flattened fields serialize last, including duplicates in borrowed API requests.
+    request.other.get("lora_path").map_or_else(
+        || matches!(request.lora_path, None | Some(LoRAPath::Single(None))),
+        serde_json::Value::is_null,
+    )
+}
+
 /// Completion's worker-render contract admits only modeled extension fields.
 pub(crate) fn completion_cache_read_fallback(request: &CompletionRequest) -> Option<&'static str> {
     if let Some(reason) =
@@ -122,7 +130,7 @@ pub(crate) fn completion_cache_read_fallback(request: &CompletionRequest) -> Opt
     {
         return Some(reason);
     }
-    if request.lora_path.is_some()
+    if !completion_lora_is_null(request)
         || request
             .other
             .iter()
@@ -134,6 +142,7 @@ pub(crate) fn completion_cache_read_fallback(request: &CompletionRequest) -> Opt
                 // Its cache-read gate depends on prompt logprobs and explicit skips.
                 "return_token_ids" => value.is_boolean() || value.is_null(),
                 "session_id" => value.is_string() || value.is_null(),
+                "lora_path" => value.is_null(),
                 "vllm_xargs" => {
                     value.is_null()
                         || value.as_object().is_some_and(|args| {
@@ -149,6 +158,30 @@ pub(crate) fn completion_cache_read_fallback(request: &CompletionRequest) -> Opt
         return Some("unsupported_cache_identity");
     }
     None
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[test]
+fn completion_credit_accepts_null_lora_path() {
+    let mut request: CompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "model",
+        "prompt": [1, 2],
+        "lora_path": null
+    }))
+    .unwrap();
+    request.lora_path = Some(LoRAPath::Single(None));
+    assert_eq!(completion_cache_read_fallback(&request), None);
+    request
+        .other
+        .insert("lora_path".into(), serde_json::Value::Null);
+    assert_eq!(completion_cache_read_fallback(&request), None);
+    request.other.remove("lora_path");
+    request.lora_path = Some(LoRAPath::Single(Some("adapter".into())));
+    assert_eq!(
+        completion_cache_read_fallback(&request),
+        Some("unsupported_cache_identity")
+    );
 }
 
 fn cache_read_fallback(
@@ -533,16 +566,11 @@ pub(crate) fn prepare_completion_direct_inputs(
     workers: &[Arc<dyn Worker>],
 ) -> Option<WorkerTokenInputs> {
     http_cache_identity(&request.other).ok()?;
-    // Flattened fields serialize last, including duplicates in borrowed API requests.
-    let lora_is_null = request.other.get("lora_path").map_or_else(
-        || matches!(request.lora_path, None | Some(LoRAPath::Single(None))),
-        serde_json::Value::is_null,
-    );
     let suffix_is_null = request
         .other
         .get("suffix")
         .map_or(request.suffix.is_none(), serde_json::Value::is_null);
-    if !lora_is_null
+    if !completion_lora_is_null(request)
         || !suffix_is_null
         || request
             .other

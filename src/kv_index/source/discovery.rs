@@ -1106,7 +1106,6 @@ fn synthesize_plain_full_layout(
                     prefix_cacheable: true,
                     prefix_replay_tokens: 0,
                     mamba_cache_mode: None,
-                    prefill_checkpoint_alignment: None,
                     tokens_per_state: None,
                     cache_role: None,
                 }],

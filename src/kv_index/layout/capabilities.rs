@@ -73,7 +73,6 @@ pub struct GroupCapability {
     pub prefix_cacheable: bool,
     pub prefix_replay_tokens: u32,
     pub mamba_cache_mode: Option<String>,
-    pub prefill_checkpoint_alignment: Option<u32>,
     pub tokens_per_state: Option<String>,
     pub cache_role: Option<String>,
 }
@@ -322,12 +321,7 @@ impl CacheCapabilities {
                         window_tokens: u64::from(window),
                     }
                 }
-                ("mamba", "MambaSpec")
-                    if group.mamba_cache_mode.as_deref() == Some("align")
-                        && group.prefill_checkpoint_alignment.is_none_or(|alignment| {
-                            alignment > 0 && group.block_size.is_multiple_of(alignment)
-                        }) =>
-                {
+                ("mamba", "MambaSpec") if group.mamba_cache_mode.as_deref() == Some("align") => {
                     GroupRule::Checkpoint
                 }
                 _ => return Err("unsupported group kind"),

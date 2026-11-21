@@ -39,7 +39,7 @@ impl From<u32> for PageQuery {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PageWriteError {
     Capacity,
-    ConflictingHash,
+    InvalidResidencyMode,
 }
 
 /// Serializes one worker/rank across its cache groups.
@@ -382,7 +382,10 @@ impl PageChanges {
     ) -> Option<Self> {
         let mut tags = smallvec::SmallVec::<[u32; 1]>::new();
         for batch in batches {
-            let hashes = batch?;
+            let Some(hashes) = batch else {
+                // A clear can affect any page, so readers must validate under the source lock.
+                return None;
+            };
             if hashes.len() > max_entries - tags.len() {
                 return None;
             }

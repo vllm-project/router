@@ -59,6 +59,7 @@ pub struct MockVllmRs {
     pub finish_kv_transfer_params: Option<serde_json::Value>,
     /// Wait before sending any output, as a long prefill would.
     pub reply_delay: Duration,
+    pub reply_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// Streams the client cancelled before their first output.
     pub cancelled: Arc<AtomicUsize>,
     /// Streams to fail with a gRPC error after their prompt info, i.e.
@@ -128,6 +129,7 @@ impl Default for MockVllmRs {
             failures_remaining: Arc::new(AtomicUsize::new(0)),
             finish_kv_transfer_params: None,
             reply_delay: Duration::ZERO,
+            reply_gate: None,
             cancelled: Arc::new(AtomicUsize::new(0)),
             stream_failures_remaining: Arc::new(AtomicUsize::new(0)),
             aborted_finishes_remaining: Arc::new(AtomicUsize::new(0)),
@@ -343,6 +345,7 @@ impl Inference for MockVllmRs {
             .as_ref()
             .map(|params| json_to_proto_struct(params).expect("JSON object"));
         let reply_delay = self.reply_delay;
+        let reply_gate = self.reply_gate.clone();
         let cancelled = self.cancelled.clone();
         let fail_stream = self
             .stream_failures_remaining
@@ -359,7 +362,13 @@ impl Inference for MockVllmRs {
         };
         tokio::spawn(async move {
             tokio::select! {
-                _ = tokio::time::sleep(reply_delay) => {}
+                _ = async {
+                    if let Some(gate) = reply_gate {
+                        gate.acquire().await.expect("test reply gate closed").forget();
+                    } else {
+                        tokio::time::sleep(reply_delay).await;
+                    }
+                } => {}
                 _ = tx.closed() => {
                     cancelled.fetch_add(1, Ordering::Relaxed);
                     return;

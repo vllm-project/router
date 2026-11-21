@@ -114,8 +114,6 @@ pub struct AllBlocksCleared {}
 /// decoded by `decode_batch`. The sequence is in its own ZMQ frame.
 #[derive(Debug, Clone)]
 pub struct KVEventBatch {
-    #[cfg(test)]
-    pub ts: f64,
     pub events: Vec<KVEvent>,
     pub data_parallel_rank: Option<u32>,
 }
