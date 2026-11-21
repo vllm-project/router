@@ -91,12 +91,14 @@ impl PdProgramRuntime {
         let kv_interval = scheduler.metrics_interval().max(Duration::from_secs(1));
         let kv_warm_remote = warm_remote.clone();
         let kv_observer = if kv_config.kv_events {
+            let strict_recovery = ctx.router_config.kv_event_strict_recovery;
             Some(
                 tokio::spawn(async move {
-                    let (supervisor, mut signals) = KvIndexSupervisor::new(
+                    let (mut supervisor, mut signals) = KvIndexSupervisor::new(
                         kv_client,
                         HashMode::parse_config(&kv_config.kv_hash_mode),
                     );
+                    supervisor.set_strict_recovery(strict_recovery);
                     let mut previous = BTreeSet::new();
                     let mut subscribed = BTreeSet::new();
                     let mut loss_epoch = crate::kv_index::signal_loss_epoch();
@@ -108,18 +110,15 @@ impl PdProgramRuntime {
                             use crate::kv_index::IngestionSignal;
                             if let Some(warm_remote) = &kv_warm_remote {
                                 let invalidation = match signal {
-                                    IngestionSignal::Invalidated {
-                                        source, dp_rank, ..
-                                    } => Some((source, Some(dp_rank as usize))),
                                     IngestionSignal::Gap { source, .. }
                                     | IngestionSignal::IncarnationReset { source, .. } => {
-                                        Some((source, None))
+                                        Some(source)
                                     }
                                     _ => None,
                                 };
-                                if let Some((source, rank)) = invalidation {
+                                if let Some(source) = invalidation {
                                     for url in supervisor.worker_urls_for_source(&source) {
-                                        warm_remote.invalidate_target(&url, rank);
+                                        warm_remote.invalidate_target(&url, None);
                                     }
                                 }
                             }
@@ -294,7 +293,12 @@ impl PdProgramRuntime {
         reserve_output_budget(&mut identity, request, path, default_output);
         let dispatch = self
             .scheduler
-            .acquire(identity, tokens, targets, None)
+            .acquire(
+                identity,
+                crate::program_scheduling::ContextTokens::estimated(tokens),
+                targets,
+                None,
+            )
             .await?;
         Ok(Some(ProgramCompletion::new(
             self.scheduler.clone(),
@@ -836,6 +840,7 @@ impl Stream for PdTrackedBody {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::program_scheduling::ProgramSchedulerConfig;
@@ -1116,7 +1121,7 @@ mod tests {
         assert_eq!(bytes.as_ref(), input.as_bytes());
         let program = &scheduler.diagnostics().ranks[0].programs[0];
         assert_eq!(program.in_flight_requests, 0);
-        assert_eq!(program.estimated_context_tokens, 120);
+        assert_eq!(program.context_tokens, 120);
         assert_eq!(program.state, "active");
     }
 

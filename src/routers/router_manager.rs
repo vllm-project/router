@@ -942,6 +942,7 @@ impl std::fmt::Debug for RouterManager {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

@@ -180,7 +180,7 @@ def test_pd_cache_aware_prefix_overrides_load(router_manager, mock_workers, tmp_
         decode_args=["--hold-after", "1", "--release-file", str(release)],
     )
     cached_prompt = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    busy_prompt = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109]
+    busy_prompt = cached_prompt + [100, 101, 102, 103, 104, 105, 106, 107, 108, 109]
     other_prompt = [200, 201, 202, 203, 204, 205, 206, 207, 208, 209]
 
     cached = completion(pd.router.url, cached_prompt, timeout=10)

@@ -4,6 +4,7 @@
 //! across both regular and prefill-decode (PD) routing modes.
 
 use crate::core::{Worker, WorkerLoadGuard, WorkerType};
+use rand::Rng;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -29,10 +30,11 @@ pub use factory::PolicyFactory;
 pub(crate) use kv_aware::kv_aware_policy;
 pub use kv_aware::{
     cost_components, kv_aware_ops, AffinityKey, AffinityRecord, CandidateView, CostComponents,
-    CostDecision, CostParams, InMemorySlotManager, KvAffinityTable, KvAwareOps, KvAwarePolicy,
-    KvRequestSlot, KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample,
-    MultiplicativeScorer, Picker, PrefillWorkEstimate, Scorer, SelectionError, SlotManager,
-    StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits, WorkerTokenInputs,
+    CostDecision, CostParams, DecodeWorkEstimate, InMemorySlotManager, KvAffinityTable, KvAwareOps,
+    KvAwarePolicy, KvRequestSlot, KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample,
+    MultiplicativeScorer, Picker, PrefillWorkEstimate, PromptHashes, Scorer, SelectionError,
+    SlotManager, StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits,
+    WorkerTokenInputs,
 };
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
@@ -316,7 +318,21 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
     }
 }
 
+/// Picks uniformly among tied candidates.
+///
+/// Equal scores carry no ranking evidence. Keeping the first candidate would
+/// encode slice order as a preference: with an idle pool every cold request of
+/// the same length has one cost, and all of them would land on the same worker.
+pub(crate) fn pick_tied(candidates: &[usize]) -> Option<usize> {
+    match candidates {
+        [] => None,
+        [only] => Some(*only),
+        _ => Some(candidates[rand::rng().random_range(0..candidates.len())]),
+    }
+}
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};

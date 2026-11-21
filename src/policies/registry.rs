@@ -141,6 +141,20 @@ impl PolicyRegistry {
                 kv.unregister_worker(removed.url());
             }
         }
+        self.clear_cache_aware_state(removed);
+    }
+
+    /// Finish policy cleanup when the HTTP P/D router has already unregistered
+    /// the worker from its KV policy and index state.
+    pub(crate) fn notify_consumer_removed_after_kv_cleanup(&self, removed: &dyn Worker) {
+        if !removed.worker_type().is_consumer() {
+            return;
+        }
+        self.clear_cache_aware_state(removed);
+        self.on_worker_removed(removed.model_id());
+    }
+
+    fn clear_cache_aware_state(&self, removed: &dyn Worker) {
         let model_id = removed.model_id();
         let mut policies = Vec::new();
         if let Some(policy) = self.get_policy(model_id) {
@@ -435,6 +449,7 @@ impl std::fmt::Debug for PolicyRegistry {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

@@ -12,7 +12,27 @@ pip install pre-commit && pre-commit install
 
 ## Pipeline Files
 
-`pipeline.yml` builds the release binary and wheel, pushes the NVIDIA CI image, then uploads L1, L2, and L3.
+`pipeline.yml` runs a lightweight CPU bootstrap, following
+[vllm-omni's diff-aware bootstrap](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py).
+When every changed path is under `docs/`, ends in `.md`, or is
+`mkdocs.yml`, it succeeds without uploading build or test jobs. This includes
+documentation additions and deletions. Mixed code/documentation changes run CI.
+For PRs (including `merge-test`), the bootstrap fetches the target branch and
+compares its merge base with `HEAD`. Merge queues compare against Buildkite's
+recorded queue base commit. Default-branch pushes always run full CI because
+the bootstrap has no verified pre-push SHA to compare the complete push range.
+It does not fall back to `HEAD^1`, which could miss earlier code changes in a
+multi-commit push. Skipping post-merge pushes requires a verified push range
+from the webhook before it can be enabled safely.
+Renames include both the old and new paths. Empty or unresolved diffs run CI.
+Scheduled builds and `NIGHTLY=1` always run CI.
+PR labels `ready`, `merge-test`, and `nightly-test` do not override docs-only
+skipping; they select test levels only when the full pipeline is uploaded.
+GitHub Actions quality/security checks and release publishing
+remain enabled. Unlike Omni, pytest skip-mark changes do not qualify.
+
+Otherwise the bootstrap uploads `bootstrap-upload-steps.yml`, which builds the release
+binary and wheel, pushes the NVIDIA CI image, then uploads L1, L2, and L3.
 Those uploads depend on the build step, not on each other. Jobs in each uploaded file depend on that upload step. The L1 and L3 NVIDIA P/D jobs, and the L3 gRPC perf job, also wait for `image-build`. `NIGHTLY=1` on this test pipeline selects tests. `NIGHTLY=1`
 on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 
@@ -23,7 +43,10 @@ on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 | `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), router_policy TraceLab c16 on 4× L4 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA |
 | `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
 
-A pull request labeled `ready` uploads `test-ready.yml`, including forks.
+A pull request labeled `ready` uploads `test-ready.yml`, including forks,
+unless the bootstrap skips it as documentation-only. The same exception applies
+to `merge-test` and merge-queue L2 uploads. Default-branch push L2 uploads
+remain enabled.
 `test-merge.yml` has no per-job `if`. In `test-ready.yml` and `test-nightly.yml`, a job whose gate is narrower than the upload keeps its own `if`.
 
 GPU machine presets are in [`ci_mirror_hardwares.yml`](ci_mirror_hardwares.yml).
@@ -42,6 +65,68 @@ shell. A build-level `HF_TOKEN` would override a pod env entry of the same name.
 | `mi300_rdma` | `router_rocm_mi300_2` coordinator, no Docker plugin |
 
 CPU steps keep `medium_cpu_queue_premerge` inline. Their command lives in the Docker plugin, so they do not use a preset. Dependency sets live in `ci_apt_packages.conf` and `scripts/install_packages.sh`. `rust` and `nvidia_pd` install apt packages. `router-bin` downloads the release binary and checks it. `lm-eval` installs the ROCm accuracy harness. A sourced `python` call downloads the binary and installs `.[dev]` into `/tmp/venv`. `python-wheel` uses that apt set and venv for `python -m build`.
+
+### Rust coverage artifacts
+
+The Rust unit and integration jobs in `test-nightly.yml`
+run through [`scripts/rust_coverage.sh`](scripts/rust_coverage.sh), using
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov/tree/v0.6.21)
+0.6.21 and pinned `nightly-2026-04-15` with its `llvm-tools-preview` component. Each job
+runs its existing `cpu,ready` test targets once with coverage instrumentation.
+Instrumentation is limited to the host target so nested WASM component builds
+do not inherit unsupported coverage flags.
+This adds tool installation and instrumented compilation time to those jobs.
+`test-ready.yml` runs ordinary Rust tests without coverage instrumentation.
+The nightly Rust jobs keep their existing scheduling condition, so a PR
+also labeled `ready` skips them and does not produce Rust coverage artifacts.
+
+Each job uploads one machine-readable LCOV file from the mounted checkout:
+
+| Artifact | Unit job | Integration job |
+| --- | --- | --- |
+| LCOV data | `target/coverage/rust-unit/lcov.info` | `target/coverage/rust-integration/lcov.info` |
+
+Reports exclude `tests/` and `benches/` files as well as inline test modules
+and test-only helpers marked with `#[cfg_attr(coverage_nightly, coverage(off))]`.
+The nightly toolchain enables this unstable attribute; ordinary stable builds
+do not enable it. Add the same marker to new test modules and test-only helpers.
+The existing `check-mark` pre-commit hook checks each test-only module,
+function and impl declaration under `src/` for this marker, including
+file-based `mod tests;` declarations.
+These are separate coverage
+measurements for each test group; their percentages must not be added or
+averaged to obtain total coverage. Python tests, doctests, ignored tests, and
+nightly-only branch coverage are outside this measurement. No minimum
+coverage threshold is enforced.
+Each run cleans workspace coverage artifacts so reports cannot include stale
+binaries from another toolchain or test group; dependency builds remain cached.
+
+Tests retain a failing job status when they fail. Report generation is
+attempted after test failures, but compilation failures or missing profiles
+may prevent reports from being generated. Report generation failures also
+fail the job.
+The previous report is removed before tool installation. A new report is
+written to a temporary file and renamed to `lcov.info` only after generation
+succeeds, so failed runs cannot publish stale or partially written reports.
+The completed report is set to mode `0644` before publication so the host
+Buildkite agent can read it even when the container runs as root.
+
+To reproduce with the same Rust image and dependency set as CI, run from the
+repository root (requires Docker and network access):
+
+```bash
+docker run --rm -v "$PWD:/workdir" -w /workdir rust:1.95.0-bookworm \
+  bash -euc 'bash .buildkite/scripts/install_packages.sh rust; bash .buildkite/scripts/rust_coverage.sh unit'
+docker run --rm -v "$PWD:/workdir" -w /workdir rust:1.95.0-bookworm \
+  bash -euc 'bash .buildkite/scripts/install_packages.sh rust; bash .buildkite/scripts/rust_coverage.sh integration'
+```
+
+On a Linux development host with Rust, rustup, and the `rust` apt dependency
+set already installed, use `bash .buildkite/scripts/rust_coverage.sh unit`
+or `bash .buildkite/scripts/rust_coverage.sh integration`. The script installs
+the pinned nightly toolchain, precompiled coverage tool from GitHub releases,
+and LLVM component, so it also
+needs network access.
 
 ### `release-pipeline.yml`
 Release pipeline for tagged versions, nightly Docker images, and versioned
@@ -175,7 +260,7 @@ bash ./run_accuracy_test.sh
 ## Additional Pipeline Steps
 
 ### Build
-The `build` group in `pipeline.yml` creates release artifacts:
+The `build` group in `bootstrap-upload-steps.yml` creates release artifacts:
 - Rust binary (`target/release/vllm-router`)
 - Python wheels and source distribution
 
