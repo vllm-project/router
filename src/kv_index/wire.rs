@@ -117,8 +117,13 @@ pub struct AllBlocksCleared {}
 #[derive(Debug, Clone)]
 pub struct KVEventBatch {
     pub ts: f64,
+    /// Every event the publisher sent, including any the consumer will not apply.
     pub events: Vec<KVEvent>,
     pub data_parallel_rank: Option<u32>,
+    /// Index of the first event to apply. Non-zero only when an oversized batch could be
+    /// trimmed, which requires every discarded event to be a store: applying a batch whose
+    /// removals or clears were dropped would leave freed blocks in the index.
+    pub keep_from: usize,
 }
 
 impl<'de> Deserialize<'de> for KVEventBatch {
@@ -141,6 +146,7 @@ impl<'de> Deserialize<'de> for KVEventBatch {
                     .ok_or_else(|| de::Error::custom("missing events"))?;
                 let data_parallel_rank: Option<u32> = seq.next_element()?;
                 Ok(KVEventBatch {
+                    keep_from: 0,
                     ts,
                     events,
                     data_parallel_rank,

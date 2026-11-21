@@ -796,7 +796,7 @@ fn apply_batch(
     }
     // Batch rank if the 3-element array carries it; else the discovery rank.
     let rank = batch.data_parallel_rank.unwrap_or(dp_rank);
-    for ev in &batch.events {
+    for ev in &batch.events[batch.keep_from..] {
         match ev {
             KVEvent::BlockStored(s) => {
                 let group = s.group_idx.unwrap_or(0);
@@ -1069,6 +1069,7 @@ mod tests {
                         0,
                         0,
                         &KVEventBatch {
+                            keep_from: 0,
                             ts: 1.0,
                             events: vec![KVEvent::BlockStored(event)],
                             data_parallel_rank: Some(0),
@@ -1098,6 +1099,7 @@ mod tests {
     fn apply_batch_routes_ownership_to_tier_and_rank_from_batch() {
         let idx = Arc::new(KvBlockIndexer::new());
         let batch = KVEventBatch {
+            keep_from: 0,
             ts: 1.0,
             events: vec![
                 // ownership set → CacheOwner → External (not GPU/Device).
@@ -1163,6 +1165,7 @@ mod tests {
         let mut remote = valid.clone();
         remote.locality = Some("REMOTE".into());
         let batch = KVEventBatch {
+            keep_from: 0,
             ts: 0.0,
             events: vec![KVEvent::BlockStored(remote)],
             data_parallel_rank: Some(0),
@@ -1180,6 +1183,7 @@ mod tests {
             event.ownership = ownership.map(str::to_owned);
             event.locality = Some(locality.into());
             let batch = KVEventBatch {
+                keep_from: 0,
                 ts: 0.0,
                 events: vec![KVEvent::BlockStored(event)],
                 data_parallel_rank: Some(3),
@@ -2044,6 +2048,7 @@ mod tests {
                 rank,
                 0,
                 &KVEventBatch {
+                    keep_from: 0,
                     ts: 0.0,
                     events: vec![store_event(100, &tokens)],
                     data_parallel_rank: Some(rank),
@@ -2239,6 +2244,7 @@ mod tests {
                 .map(|(hash, tokens)| session_store_event(hash, &tokens, session))
                 .collect();
             let batch = KVEventBatch {
+                keep_from: 0,
                 ts: seq as f64,
                 events,
                 data_parallel_rank: Some(0),
@@ -2262,6 +2268,7 @@ mod tests {
             let index = KvBlockIndexer::new();
             let source = SourceId::from("dense");
             let initial = KVEventBatch {
+                keep_from: 0,
                 ts: 0.0,
                 events: vec![store_event(100, &[1, 2, 3, 4])],
                 data_parallel_rank: Some(0),
@@ -2275,6 +2282,7 @@ mod tests {
             );
             bad.block_size = actual;
             let batch = KVEventBatch {
+                keep_from: 0,
                 ts: 1.0,
                 events: vec![
                     store_event(101, &[5, 6, 7, 8]),
