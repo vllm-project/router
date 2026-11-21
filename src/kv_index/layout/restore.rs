@@ -10,7 +10,7 @@ pub(in crate::kv_index) struct AlignedTailDrop {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(super) fn common_reusable_tokens(groups: &[GroupEvidence], max_reusable_tokens: u64) -> u64 {
-    restore_boundary(groups, max_reusable_tokens, None, 0).0
+    restore_boundary(groups, max_reusable_tokens, None, 0, false).0
 }
 
 /// Find the common restore boundary for a layout verified at source binding.
@@ -20,6 +20,7 @@ pub(super) fn restore_boundary(
     max_reusable_tokens: u64,
     tail_drop_group: Option<u32>,
     fine_unit: u64,
+    proof_within_cap: bool,
 ) -> (u64, Option<(usize, u64)>) {
     if groups.is_empty() || max_reusable_tokens == 0 {
         return (0, None);
@@ -57,10 +58,9 @@ pub(super) fn restore_boundary(
             } else {
                 fine_unit
             };
-            // The hybrid coordinator can look one unit past the cap to prove
-            // a dense hit, then drops that unit. The single-group coordinator
-            // looks up to the cap before dropping its last block.
-            let lookup_cap = if groups.len() == 1 {
+            // Starting in vLLM 0.32, the hybrid coordinator can use one
+            // extra proof unit from the request's hash chain.
+            let lookup_cap = if proof_within_cap || groups.len() == 1 {
                 max_reusable_tokens
             } else {
                 max_reusable_tokens.saturating_add(drop_unit)

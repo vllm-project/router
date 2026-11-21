@@ -296,7 +296,7 @@ fn mtp_tail_proof_restores_the_mamba_checkpoint_and_prices_the_dense_page() {
     ] {
         claims[group][end / 16 - 1] = TierBits(TierBits::bit(tier));
     }
-    let credit = |claims: &[Vec<TierBits>], cap| {
+    let credit = |claims: &[Vec<TierBits>], cap, proof_within_cap| {
         let views: Vec<_> = claims.iter().map(|pages| page_view(pages)).collect();
         credit_from_pages(
             &groups,
@@ -307,18 +307,23 @@ fn mtp_tail_proof_restores_the_mamba_checkpoint_and_prices_the_dense_page() {
             TailDrop {
                 group: Some(3),
                 fine_grained: true,
+                proof_within_cap,
                 ..Default::default()
             },
         )
     };
-    assert_eq!(credit(&claims, 1792), (1776, Some(HostPinned)));
-    assert_eq!(credit(&claims, 1776), (1776, Some(HostPinned)));
-    assert_eq!(credit(&claims, 1775), (832, Some(Device)));
+    assert_eq!(credit(&claims, 1792, false), (1776, Some(HostPinned)));
+    assert_eq!(credit(&claims, 1776, false), (1776, Some(HostPinned)));
+    assert_eq!(credit(&claims, 1775, false), (832, Some(Device)));
+    // In vLLM 0.30 and 0.31 the final partial page cannot prove a hit
+    // when its hash boundary exceeds the Prefill lookup limit.
+    assert_eq!(credit(&claims, 1791, true), (832, Some(Device)));
+    assert_eq!(credit(&claims, 1791, false), (1776, Some(HostPinned)));
     claims[0][1792 / 16 - 1] = TierBits(TierBits::bit(Device));
     // Both groups reach 1792, below the cap, so the dense proof still loses one unit.
-    assert_eq!(credit(&claims, 1808), (1776, Some(HostPinned)));
+    assert_eq!(credit(&claims, 1808, false), (1776, Some(HostPinned)));
     claims[1][1792 / 16 - 1] = TierBits::default();
-    assert_eq!(credit(&claims, 1792), (832, Some(Device)));
+    assert_eq!(credit(&claims, 1792, false), (832, Some(Device)));
 }
 
 fn group(id: u32, block_size: u32, kind: GroupRule, segments: &[(u32, u32)]) -> GroupEvidence {
@@ -915,7 +920,7 @@ mod declarations {
             })
             .collect();
         assert_eq!(
-            super::super::restore::restore_boundary(&evidence, 641, Some(4), 0).0,
+            super::super::restore::restore_boundary(&evidence, 641, Some(4), 0, false).0,
             320
         );
 

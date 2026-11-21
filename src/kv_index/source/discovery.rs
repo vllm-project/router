@@ -496,15 +496,13 @@ impl KvIndexSupervisor {
                     .iter()
                     .any(|group| group.prefix_replay_tokens > 0)
             });
-        let aligned_tails = layout.ranks.iter().any(|rank| {
-            !rank.partial_hash_hits
-                && rank
-                    .tail_drop_groups
-                    .as_ref()
-                    .is_some_and(|groups| !groups.is_empty())
+        let has_tail_drop = layout.ranks.iter().any(|rank| {
+            rank.tail_drop_groups
+                .as_ref()
+                .is_some_and(|groups| !groups.is_empty())
         });
         let (base, _) = split_worker_rank(worker_url);
-        if bounded_nixl || aligned_tails {
+        if bounded_nixl || has_tail_drop {
             if let Some(info) = discovery
                 .server_info
                 .as_mut()

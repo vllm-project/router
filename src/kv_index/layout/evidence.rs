@@ -166,7 +166,8 @@ impl GroupEvidence {
 pub(in crate::kv_index) struct TailDrop<'a> {
     pub group: Option<u32>,
     pub fine_grained: bool,
-    pub aligned: Option<(&'a AlignedTailDrop, bool)>,
+    pub aligned: Option<&'a AlignedTailDrop>,
+    pub proof_within_cap: bool,
 }
 
 /// Return the credited tokens and slowest required tier for a source snapshot.
@@ -188,13 +189,24 @@ pub(in crate::kv_index) fn credit_from_pages(
     } else {
         0
     };
-    let (boundary, tail_proof) = if let Some((tail, proof_within_cap)) = tail_drop.aligned {
+    let (boundary, tail_proof) = if let Some(tail) = tail_drop.aligned {
         (
-            aligned_tail_boundary(&evidence, max_reusable_tokens, tail, proof_within_cap),
+            aligned_tail_boundary(
+                &evidence,
+                max_reusable_tokens,
+                tail,
+                tail_drop.proof_within_cap,
+            ),
             None,
         )
     } else {
-        restore_boundary(&evidence, max_reusable_tokens, tail_drop.group, fine_unit)
+        restore_boundary(
+            &evidence,
+            max_reusable_tokens,
+            tail_drop.group,
+            fine_unit,
+            tail_drop.proof_within_cap,
+        )
     };
     let credited = boundary.saturating_sub(u64::from(replay_tokens));
     let credited = align_down(credited, hash_block_size as u32);

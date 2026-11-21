@@ -120,7 +120,7 @@ impl SourceBinding {
             replay_tokens: 0,
             tail_drop_group: None,
             aligned_tail_drop: None,
-            tail_proof_within_cap: true,
+            tail_proof_within_cap: false,
             prefill_truncates_prompt: false,
             nixl_decode_alignment: None,
             adapters: Vec::new(),
@@ -240,12 +240,10 @@ impl SourceBinding {
         mut self,
         version: Option<(u32, u32)>,
     ) -> Result<Self, &'static str> {
-        if self.aligned_tail_drop.is_some() {
-            let version = version
-                .filter(|&version| version >= (0, 30))
-                .ok_or("block-aligned tail proofs require a known vLLM version of 0.30 or later")?;
-            self.tail_proof_within_cap = version < (0, 32);
+        if self.aligned_tail_drop.is_some() && version.is_none_or(|version| version < (0, 30)) {
+            return Err("block-aligned tail proofs require a known vLLM version of 0.30 or later");
         }
+        self.tail_proof_within_cap = version.is_none_or(|version| version < (0, 32));
         Ok(self)
     }
 
@@ -574,10 +572,8 @@ impl SourceBinding {
             TailDrop {
                 group: self.tail_drop_group,
                 fine_grained: self.partial_hash_hits,
-                aligned: self
-                    .aligned_tail_drop
-                    .as_ref()
-                    .map(|tail| (tail, self.tail_proof_within_cap)),
+                aligned: self.aligned_tail_drop.as_ref(),
+                proof_within_cap: self.tail_proof_within_cap,
             },
         );
         if tier.is_none() || u32::try_from(credited / self.keys.block_size() as u64).is_err() {
