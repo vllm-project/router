@@ -1812,7 +1812,10 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
         let (worker, server) = spawn_metrics_only_worker(router).await;
         let (supervisor, _signals) =
             KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-        let info = supervisor.on_worker_added(&worker).await.unwrap();
+        let (info, models) = supervisor
+            .on_worker_added_with_models(&worker)
+            .await
+            .unwrap();
         assert_eq!(info.block_size, Some(16));
         assert_eq!(info.cache_key.is_some(), with_replay);
         assert_eq!(
@@ -1829,14 +1832,11 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
             &worker,
             None,
             None,
-            supervisor.discovered_base_models(&worker),
+            models,
         )
         .await;
         assert_eq!(labels["served_model_aliases"], "mock-alias,mock-model");
-        assert_eq!(
-            model_requests.load(Ordering::Relaxed),
-            if with_replay { 1 } else { 2 }
-        );
+        assert_eq!(model_requests.load(Ordering::Relaxed), 1);
         supervisor.shutdown();
         server.abort();
     }

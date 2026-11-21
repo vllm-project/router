@@ -495,9 +495,9 @@ impl Router {
             drop(signals);
             let supervisor = Arc::new(supervisor);
             for worker_url in &kv_discovery_urls {
-                match supervisor.on_worker_added(worker_url).await {
-                    Ok(info) => {
-                        kv_worker_info.insert(worker_url.clone(), info);
+                match supervisor.on_worker_added_with_models(worker_url).await {
+                    Ok(discovery) => {
+                        kv_worker_info.insert(worker_url.clone(), discovery);
                     }
                     Err(error) => warn!(
                         worker_url,
@@ -515,10 +515,10 @@ impl Router {
             // KV-aware placement distinguishes base aliases from adapter names.
             // Other policies retain the original unlabeled worker behavior.
             let labels = if kv_aware_ops(default_policy.as_ref()).is_some() {
-                let base_models = kv_index_supervisor
-                    .as_ref()
+                let base_models = kv_worker_info
+                    .get(&base_url)
                     .filter(|_| dp_rank.is_none())
-                    .and_then(|supervisor| supervisor.discovered_base_models(&base_url));
+                    .and_then(|(_, models)| models.clone());
                 crate::routers::served_model_labels(
                     &ctx.client,
                     &base_url,
@@ -560,7 +560,9 @@ impl Router {
                 });
                 kv_aware.register_worker(
                     worker_arc.as_ref(),
-                    kv_worker_info.get(worker_arc.base_url()),
+                    kv_worker_info
+                        .get(worker_arc.base_url())
+                        .map(|(info, _)| info),
                     provider,
                 );
             }
@@ -816,11 +818,14 @@ impl Router {
     pub(crate) async fn discover_kv_worker(
         &self,
         worker_url: &str,
-    ) -> Option<crate::kv_index::WorkerKvInfo> {
+    ) -> Option<(
+        crate::kv_index::WorkerKvInfo,
+        Option<std::collections::HashSet<String>>,
+    )> {
         let supervisor = self.kv_index_supervisor.as_ref()?;
         let policy = self.policy_registry.get_default_policy();
         kv_aware_ops(policy.as_ref())?;
-        match supervisor.on_worker_added(worker_url).await {
+        match supervisor.on_worker_added_with_models(worker_url).await {
             Ok(info) => Some(info),
             Err(error) => {
                 warn!(
@@ -2873,7 +2878,10 @@ impl Router {
                                 continue;
                             }
                             if !kv_discovery_attempted {
-                                kv_info = self.discover_kv_worker(worker_url).await;
+                                kv_info = self
+                                    .discover_kv_worker(worker_url)
+                                    .await
+                                    .map(|(info, _)| info);
                                 kv_discovery_attempted = true;
                             }
                             info!("Added worker: {}", dp_url);
@@ -2939,14 +2947,11 @@ impl Router {
                         // from a base-model alias.
                         let policy = self.policy_registry.get_default_policy();
                         let labels = if kv_aware_ops(policy.as_ref()).is_some() {
-                            let (base_url, dp_rank) = dp_utils::parse_worker_url(worker_url);
-                            let base_models = self
-                                .kv_index_supervisor
+                            let (_, dp_rank) = dp_utils::parse_worker_url(worker_url);
+                            let base_models = kv_info
                                 .as_ref()
                                 .filter(|_| dp_rank.is_none())
-                                .and_then(|supervisor| {
-                                    supervisor.discovered_base_models(&base_url)
-                                });
+                                .and_then(|(_, models)| models.clone());
                             crate::routers::served_model_labels(
                                 &self.client,
                                 worker_url,
@@ -2967,7 +2972,10 @@ impl Router {
 
                         let worker_arc = Arc::new(new_worker);
                         self.worker_registry.register(worker_arc.clone());
-                        self.register_kv_target(worker_arc.as_ref(), kv_info.as_ref());
+                        self.register_kv_target(
+                            worker_arc.as_ref(),
+                            kv_info.as_ref().map(|(info, _)| info),
+                        );
 
                         // Notify PolicyRegistry about the new worker
                         let model_id = worker_arc.model_id();

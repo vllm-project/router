@@ -396,8 +396,20 @@ impl KvIndexSupervisor {
     /// Query both endpoints for `worker_url`, spawn one subscriber per rank into
     /// this worker's identity's indexer. A missing source route is a soft skip.
     pub async fn on_worker_added(&self, worker_url: &str) -> Result<WorkerKvInfo, String> {
+        self.on_worker_added_with_models(worker_url)
+            .await
+            .map(|(info, _)| info)
+    }
+
+    pub(crate) async fn on_worker_added_with_models(
+        &self,
+        worker_url: &str,
+    ) -> Result<(WorkerKvInfo, Option<HashSet<String>>), String> {
         if let Some(observers) = &self.observers {
-            return self.observe_worker(worker_url, observers).await;
+            return self
+                .observe_worker(worker_url, observers)
+                .await
+                .map(|info| (info, None));
         }
         // Discovery awaits without the owner lock. A failed/stale re-add must
         // leave the prior registration and its observed placement intact.
@@ -408,7 +420,10 @@ impl KvIndexSupervisor {
             (owner, lifecycle)
         };
         let discovery = self.discover(worker_url).await;
-        self.install_observed_worker(worker_url, discovery, observed, Some(lifecycle))
+        let models = discovery.base_models.clone();
+        let info =
+            self.install_observed_worker(worker_url, discovery, observed, Some(lifecycle))?;
+        Ok((info, models))
     }
 
     /// Prepare metadata once; P/D refresh fingerprints and installs this same snapshot.

@@ -392,8 +392,7 @@ pub(super) async fn query_worker_metadata_and_models(
     query_metrics_metadata(client, worker_url, api_key)
         .await
         .and_then(|(info, models)| {
-            validate_worker_metadata(worker_url, "metrics", Ok(info))
-                .map(|info| (info, Some(models)))
+            validate_worker_metadata(worker_url, "metrics", Ok(info)).map(|info| (info, models))
         })
         .map_err(|error| format!("{control_error}; {error}"))
 }
@@ -488,7 +487,7 @@ async fn query_metrics_metadata(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-) -> Result<(ServerInfo, HashSet<String>), String> {
+) -> Result<(ServerInfo, Option<HashSet<String>>), String> {
     let text = query_worker_text(client, worker_url, "metrics", true, api_key).await?;
     let engines = metrics_meta::parse_cache_config_info(&text);
     if engines.is_empty() {
@@ -514,10 +513,7 @@ async fn query_metrics_metadata(
         kv_block_size: hash_unit,
         ..Default::default()
     };
-    Ok((
-        info,
-        models.as_ref().map(base_model_names).unwrap_or_default(),
-    ))
+    Ok((info, models.as_ref().map(base_model_names)))
 }
 
 pub(super) async fn query_model_list(
