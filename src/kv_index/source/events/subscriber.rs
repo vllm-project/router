@@ -651,7 +651,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             replay_socket = None;
                             allow_overlap = false;
                             replayed.clear();
-                            debug!(source = %source_id, rank = dp_rank, seq, "kv_index live sequence advanced");
+                            debug!(source = %source_id, rank = dp_rank, seq, wall_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64, "kv_index live sequence advanced");
                             // A sustained publisher starves EAGAIN; yield so this task
                             // can't monopolize the runtime worker.
                             tokio::task::yield_now().await;

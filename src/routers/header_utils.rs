@@ -60,6 +60,17 @@ pub fn sanitize_request_headers(headers: &HeaderMap) -> HeaderMap {
             forwarded.append(name.clone(), value.clone());
         }
     }
+    // Add generated IDs only while forwarding. Policies must see the original
+    // client headers so a generated ID cannot change hash-based routing.
+    if !headers.contains_key("x-request-id")
+        && !connection_fields
+            .iter()
+            .any(|field| field.eq_ignore_ascii_case("x-request-id"))
+    {
+        if let Some(id) = crate::middleware::current_request_id() {
+            forwarded.insert("x-request-id", id);
+        }
+    }
     forwarded
 }
 
