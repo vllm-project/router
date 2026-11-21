@@ -151,6 +151,9 @@ impl KvBlockIndexer {
     /// transactions before removing its gate; in-flight owned snapshots retain
     /// the old gate and observe its incremented generation.
     pub(crate) fn retire_source(&self, source: &SourceId, dp_rank: u32) {
+        // Share an epoch across the page removals. Enter it before locking the
+        // domain so reclamation of earlier batches cannot hold up lookups.
+        let _epoch = scc::Guard::new();
         let _domain = self.domain.write();
         let target = RoutableTarget {
             instance_id: source.clone(),
