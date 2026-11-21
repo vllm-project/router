@@ -1,6 +1,6 @@
 use crate::config::EpdConfig;
 use axum::http::{HeaderMap, StatusCode};
-use futures_util::future::join_all;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -221,7 +221,19 @@ impl EncoderStage {
                 groups.push((encoder, vec![index]));
             }
         }
-        let replies = join_all(groups.iter().map(|(encoder, indices)| {
+        // A failed encoder must not leave the other calls running. Dropping
+        // those futures aborts their HTTP requests. `EcTransferGuard` still
+        // cancels transfers that were already published when this returns.
+        //
+        // `try_join_all` does not do this for every fan-out. futures-util 0.3
+        // fail-fasts only while the iterator's upper bound is 30 or less. Past
+        // that it collects through `FuturesOrdered`, which holds a later error
+        // until every earlier group finishes. Audio and video are one group
+        // each, so 31 items take that path. Completion order returns the first
+        // error and drops the rest. Replies are written back by group index so
+        // a successful fan-out stays in the order the zip below expects.
+        let mut inflight = FuturesUnordered::new();
+        for (group_index, (encoder, indices)) in groups.iter().enumerate() {
             let encoder_url = &self.config.encoder_urls[*encoder];
             let mut request = client
                 .post(format!(
@@ -240,16 +252,29 @@ impl EncoderStage {
             } else if let Some(auth) = headers.and_then(|h| h.get("authorization")) {
                 request = request.header("authorization", auth);
             }
-            encode_group(
-                request,
-                &items,
-                indices,
-                &body,
-                consumer_addr.map(String::as_str),
-            )
-        }))
-        .await;
-        let replies: Vec<Value> = replies.into_iter().collect::<Result<_, _>>()?;
+            let items = &items;
+            let body = &body;
+            let consumer_addr = consumer_addr.map(String::as_str);
+            inflight.push(async move {
+                encode_group(request, items, indices, body, consumer_addr)
+                    .await
+                    .map(|reply| (group_index, reply))
+            });
+        }
+        let mut replies = vec![None; groups.len()];
+        while let Some(item) = inflight.next().await {
+            let (group_index, reply) = item?;
+            // A 2xx body can already be unusable. Reject duplicate or invalid
+            // item indices before the other groups finish, so a blocked
+            // sibling is dropped instead of holding the request open.
+            reject_unusable_item_indices(&groups[group_index].1, &reply)?;
+            replies[group_index] = Some(reply);
+        }
+        drop(inflight);
+        let replies = replies.into_iter().collect::<Option<Vec<_>>>().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Encoder fan-out lost a completed group".into(),
+        ))?;
         let mut handles = Map::new();
         // Sort transfers by content position, including caller-supplied embeds.
         let mut transfers = Vec::new();
@@ -506,6 +531,35 @@ async fn encode_group(
     })
 }
 
+fn reject_unusable_item_indices(indices: &[usize], reply: &Value) -> Result<(), EpdError> {
+    if indices.len() <= 1 {
+        return Ok(());
+    }
+    let Some(params) = reply.get("ec_transfer_params").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let mut seen = HashSet::new();
+    for reported in params.values() {
+        let Some(item_indices) = reported.get("item_indices").and_then(Value::as_array) else {
+            continue;
+        };
+        for local in item_indices {
+            let local = local
+                .as_u64()
+                .map(|v| v as usize)
+                .filter(|&v| v < indices.len())
+                .ok_or_else(|| (StatusCode::BAD_GATEWAY, "Invalid encoder item index".into()))?;
+            if !seen.insert(local) {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "Duplicate encoder item index".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn flatten_metadata(metadata: &Map<String, Value>) -> Result<Map<String, Value>, EpdError> {
     metadata
         .iter()
@@ -539,7 +593,9 @@ fn flatten_metadata(metadata: &Map<String, Value>) -> Result<Map<String, Value>,
 mod tests {
     use super::*;
     use axum::{extract::State, routing::post, Json, Router};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[derive(Clone)]
     struct MockEncoder {
@@ -857,6 +913,189 @@ mod tests {
             .unwrap();
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_encoder_cancels_a_blocked_sibling() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let slow = Router::new()
+            .route("/v1/chat/completions", post(slow_encode))
+            .with_state(cancelled.clone());
+        let fail = Router::new().route("/v1/chat/completions", post(fail_encode));
+        let slow_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fail_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_url = format!("http://{}", slow_listener.local_addr().unwrap());
+        let fail_url = format!("http://{}", fail_listener.local_addr().unwrap());
+        let slow_server =
+            tokio::spawn(async move { axum::serve(slow_listener, slow).await.unwrap() });
+        let fail_server =
+            tokio::spawn(async move { axum::serve(fail_listener, fail).await.unwrap() });
+        let stage = EncoderStage::new(EpdConfig {
+            encoder_urls: vec![fail_url, slow_url],
+            consumer_zmq_addrs: Default::default(),
+        });
+        let input = json!({
+            "model": "test",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "http://example.test/a.png"}},
+                    {"type": "image_url", "image_url": {"url": "http://example.test/b.png"}},
+                ],
+            }],
+        });
+        let started = Instant::now();
+        let error = stage
+            .prepare(&Client::new(), input, "pd", None, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let became_cancelled = tokio::time::timeout(Duration::from_secs(2), async {
+            while !cancelled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(became_cancelled.is_ok());
+        slow_server.abort();
+        fail_server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_encoder_cancels_a_blocked_sibling_past_join_all_limit() {
+        // 31 singleton groups cross futures-util's try_join_all threshold of 30.
+        // Group 0 blocks on the first encoder. Group 1 returns 503. The stage
+        // must return without waiting out the blocked call.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let slow = Router::new()
+            .route("/v1/chat/completions", post(slow_encode))
+            .with_state(cancelled.clone());
+        let fail = Router::new().route("/v1/chat/completions", post(fail_encode));
+        let slow_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fail_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_url = format!("http://{}", slow_listener.local_addr().unwrap());
+        let fail_url = format!("http://{}", fail_listener.local_addr().unwrap());
+        let slow_server =
+            tokio::spawn(async move { axum::serve(slow_listener, slow).await.unwrap() });
+        let fail_server =
+            tokio::spawn(async move { axum::serve(fail_listener, fail).await.unwrap() });
+        let stage = EncoderStage::new(EpdConfig {
+            encoder_urls: vec![slow_url, fail_url],
+            consumer_zmq_addrs: Default::default(),
+        });
+        let content: Vec<_> = (0..31)
+            .map(|index| {
+                json!({
+                    "type": "audio_url",
+                    "audio_url": {"url": format!("http://example.test/{index}.wav")},
+                })
+            })
+            .collect();
+        let input = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": content}],
+        });
+        let started = Instant::now();
+        let error = stage
+            .prepare(&Client::new(), input, "pd", None, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let became_cancelled = tokio::time::timeout(Duration::from_secs(2), async {
+            while !cancelled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(became_cancelled.is_ok());
+        slow_server.abort();
+        fail_server.abort();
+    }
+
+    #[tokio::test]
+    async fn duplicate_item_index_cancels_a_blocked_sibling() {
+        // Three images on two encoders: the first batches two items and
+        // returns 200 with a repeated item index. That reply is already a
+        // 502, so the blocked sibling must be cancelled rather than awaited.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let slow = Router::new()
+            .route("/v1/chat/completions", post(slow_encode))
+            .with_state(cancelled.clone());
+        let duplicate = Router::new().route("/v1/chat/completions", post(duplicate_index_encode));
+        let slow_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let duplicate_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_url = format!("http://{}", slow_listener.local_addr().unwrap());
+        let duplicate_url = format!("http://{}", duplicate_listener.local_addr().unwrap());
+        let slow_server =
+            tokio::spawn(async move { axum::serve(slow_listener, slow).await.unwrap() });
+        let duplicate_server =
+            tokio::spawn(async move { axum::serve(duplicate_listener, duplicate).await.unwrap() });
+        let stage = EncoderStage::new(EpdConfig {
+            encoder_urls: vec![duplicate_url, slow_url],
+            consumer_zmq_addrs: Default::default(),
+        });
+        let input = json!({
+            "model": "test",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "http://example.test/a.png"}},
+                    {"type": "image_url", "image_url": {"url": "http://example.test/b.png"}},
+                    {"type": "image_url", "image_url": {"url": "http://example.test/c.png"}},
+                ],
+            }],
+        });
+        let started = Instant::now();
+        let error = stage
+            .prepare(&Client::new(), input, "pd", None, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.1, "Duplicate encoder item index");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let became_cancelled = tokio::time::timeout(Duration::from_secs(2), async {
+            while !cancelled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(became_cancelled.is_ok());
+        slow_server.abort();
+        duplicate_server.abort();
+    }
+
+    async fn slow_encode(State(cancelled): State<Arc<AtomicBool>>) -> StatusCode {
+        struct Mark(Arc<AtomicBool>);
+        impl Drop for Mark {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _mark = Mark(cancelled);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        StatusCode::OK
+    }
+
+    async fn fail_encode() -> StatusCode {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+
+    async fn duplicate_index_encode() -> Json<Value> {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Json(json!({
+            "ec_transfer_params": {
+                "engine-dup": {
+                    "metadata": {"image_grid_thw": [[1, 2, 3]]},
+                    "item_indices": [0, 0],
+                }
+            }
+        }))
     }
 
     #[tokio::test]
