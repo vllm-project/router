@@ -107,6 +107,75 @@ use crate::kv_index::wire::KVEvent;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+#[tokio::test]
+async fn registration_probe_reuses_aliases_until_the_worker_changes() {
+    use axum::{routing::get, Json, Router};
+    use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
+
+    let instance = Arc::new(AtomicUsize::new(1));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/get_server_info",
+            get({
+                let instance = instance.clone();
+                move || {
+                    let id = instance.load(Ordering::Relaxed).to_string();
+                    async move {
+                        Json(json!({"model_id": "model", "instance_id": id, "kv_block_size": 16}))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/models",
+            get({
+                let requests = requests.clone();
+                move || {
+                    let count = requests.fetch_add(1, Ordering::Relaxed) + 1;
+                    async move { Json(json!({"data": [{"id": format!("alias-{count}")}]})) }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let worker = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
+    let lifecycle = supervisor.lifecycle_for_worker(&worker);
+    let first = supervisor
+        .probe_registration(&worker, false, &lifecycle)
+        .await
+        .unwrap();
+    {
+        let mut state = lifecycle.state.lock();
+        state.info = Some(WorkerKvInfo::default());
+        state.descriptor = Some(first.descriptor);
+        state.base_models = first.worker.base_models.unwrap();
+    }
+    let repeated = supervisor
+        .probe_registration(&worker, false, &lifecycle)
+        .await
+        .unwrap();
+    assert_eq!(
+        repeated.worker.base_models.unwrap(),
+        HashSet::from(["alias-1".into()])
+    );
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+
+    instance.store(2, Ordering::Relaxed);
+    let replaced = supervisor
+        .probe_registration(&worker, false, &lifecycle)
+        .await
+        .unwrap();
+    assert_eq!(
+        replaced.worker.base_models.unwrap(),
+        HashSet::from(["alias-2".into()])
+    );
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
 fn capability(
     model: &str,
     topic: &str,

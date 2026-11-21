@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
+use super::lifecycle::WorkerLifecycle;
 use super::{
     discovered_block_size, metrics_meta, CacheCapabilities, KvEventSourceEntry,
     KvEventSourcesResponse, KvIndexSupervisor, SourcesProbe, SourcesUnavailable, WorkerDiscovery,
@@ -56,6 +57,7 @@ impl KvIndexSupervisor {
         &self,
         base: &str,
         plain_only: bool,
+        lifecycle: &WorkerLifecycle,
     ) -> Result<RegistrationProbe, String> {
         let mut worker = self.discover(base).await;
         if plain_only
@@ -72,13 +74,27 @@ impl KvIndexSupervisor {
         }
         let descriptor = worker_descriptor(&worker)?;
         if worker.base_models.is_none() {
-            worker.base_models = Some(
-                query_model_list(&self.client, base, self.api_key.as_deref())
+            let cached = {
+                let state = lifecycle.state.lock();
+                (state.info.is_some()
+                    && state.descriptor.as_ref() == Some(&descriptor)
+                    && (descriptor
+                        .server_info
+                        .instance_id
+                        .as_ref()
+                        .is_some_and(|id| !id.is_empty())
+                        || descriptor.hybrid.is_some())
+                    && !state.base_models.is_empty())
+                .then(|| state.base_models.clone())
+            };
+            worker.base_models = Some(match cached {
+                Some(models) => models,
+                None => query_model_list(&self.client, base, self.api_key.as_deref())
                     .await
                     .as_ref()
                     .map(base_model_names)
                     .unwrap_or_default(),
-            );
+            });
         }
         Ok(RegistrationProbe { descriptor, worker })
     }

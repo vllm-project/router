@@ -197,7 +197,7 @@ impl KvIndexSupervisor {
             |(base, lifecycle, owner)| async move {
                 let probe = tokio::time::timeout(
                     CONTROL_TIMEOUT,
-                    self.probe_registration(&base, plain_only.contains(&base)),
+                    self.probe_registration(&base, plain_only.contains(&base), &lifecycle),
                 )
                 .await
                 .ok()
