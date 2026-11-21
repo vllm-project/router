@@ -6,7 +6,7 @@ use crate::{
     core::{ConnectionMode, Worker, WorkerType},
     metrics::RouterMetrics,
 };
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, RwLock,
@@ -95,6 +95,33 @@ impl WorkerRegistry {
         } else {
             (WorkerId::new(), true)
         };
+        self.store_worker(&worker, &worker_id, is_new);
+        self.url_to_id
+            .insert(worker.url().to_string(), worker_id.clone());
+        self.index_worker(&worker, &worker_id);
+        worker_id
+    }
+
+    /// Install a lifecycle-owned target before any registry index can expose
+    /// it; hold the URL entry until all indexes are current. No registry access
+    /// is allowed in the callback.
+    pub(crate) fn register_if_absent_before_publish(
+        &self,
+        worker: Arc<dyn Worker>,
+        before_publish: impl FnOnce(&dyn Worker, &WorkerId),
+    ) -> bool {
+        let Entry::Vacant(entry) = self.url_to_id.entry(worker.url().to_owned()) else {
+            return false;
+        };
+        let worker_id = WorkerId::new();
+        before_publish(worker.as_ref(), &worker_id);
+        self.store_worker(&worker, &worker_id, true);
+        let _entry = entry.insert(worker_id.clone());
+        self.index_worker(&worker, &worker_id);
+        true
+    }
+
+    fn store_worker(&self, worker: &Arc<dyn Worker>, worker_id: &WorkerId, is_new: bool) {
         if is_new {
             self.registration_order
                 .write()
@@ -104,11 +131,9 @@ impl WorkerRegistry {
 
         // Store worker
         self.workers.insert(worker_id.clone(), worker.clone());
+    }
 
-        // Update URL mapping
-        self.url_to_id
-            .insert(worker.url().to_string(), worker_id.clone());
-
+    fn index_worker(&self, worker: &Arc<dyn Worker>, worker_id: &WorkerId) {
         // Update model index (both ID-based and optimized)
         let model_id = worker.model_id().to_string();
         self.model_workers
@@ -140,51 +165,64 @@ impl WorkerRegistry {
         RouterMetrics::set_worker_health(worker.url(), worker.is_healthy());
 
         self.notify_worker_state_change();
-
-        worker_id
     }
 
     /// Remove a worker by ID
     pub fn remove(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
-        if let Some((_, worker)) = self.workers.remove(worker_id) {
-            // Remove from URL mapping
-            self.url_to_id.remove(worker.url());
+        let (_, worker) = self.workers.remove(worker_id)?;
+        self.url_to_id.remove(worker.url());
+        self.unindex_worker(&worker, worker_id);
+        Some(worker)
+    }
 
-            // Remove from model index (both ID-based and optimized)
-            if let Some(mut model_workers) = self.model_workers.get_mut(worker.model_id()) {
-                model_workers.retain(|id| id != worker_id);
-            }
-
-            // Remove from optimized model index
-            if let Some(model_index_entry) = self.model_index.get(worker.model_id()) {
-                let worker_url = worker.url();
-                model_index_entry
-                    .write()
-                    .expect("RwLock for model_index is poisoned")
-                    .retain(|w| w.url() != worker_url);
-            }
-
-            // Remove from type index
-            if let Some(mut type_workers) = self.type_workers.get_mut(&worker.worker_type()) {
-                type_workers.retain(|id| id != worker_id);
-            }
-            self.registration_order
-                .write()
-                .expect("RwLock for registration_order is poisoned")
-                .retain(|id| id != worker_id);
-
-            // Remove from connection mode index
-            if let Some(mut conn_workers) =
-                self.connection_workers.get_mut(&worker.connection_mode())
-            {
-                conn_workers.retain(|id| id != worker_id);
-            }
-
-            self.notify_worker_state_change();
-            Some(worker)
-        } else {
-            None
+    fn unindex_worker(&self, worker: &Arc<dyn Worker>, worker_id: &WorkerId) {
+        // Remove from model index (both ID-based and optimized)
+        if let Some(mut model_workers) = self.model_workers.get_mut(worker.model_id()) {
+            model_workers.retain(|id| id != worker_id);
         }
+
+        // Remove from optimized model index
+        if let Some(model_index_entry) = self.model_index.get(worker.model_id()) {
+            let worker_url = worker.url();
+            model_index_entry
+                .write()
+                .expect("RwLock for model_index is poisoned")
+                .retain(|w| w.url() != worker_url);
+        }
+
+        // Remove from type index
+        if let Some(mut type_workers) = self.type_workers.get_mut(&worker.worker_type()) {
+            type_workers.retain(|id| id != worker_id);
+        }
+        self.registration_order
+            .write()
+            .expect("RwLock for registration_order is poisoned")
+            .retain(|id| id != worker_id);
+
+        // Remove from connection mode index
+        if let Some(mut conn_workers) = self.connection_workers.get_mut(&worker.connection_mode()) {
+            conn_workers.retain(|id| id != worker_id);
+        }
+
+        self.notify_worker_state_change();
+    }
+
+    /// Keep the URL unavailable for readmission until its registry indexes and
+    /// lifecycle-owned target have retired. The callback may not access this
+    /// registry.
+    pub(crate) fn remove_by_url_with_cleanup(
+        &self,
+        url: &str,
+        cleanup: impl FnOnce(&dyn Worker),
+    ) -> Option<Arc<dyn Worker>> {
+        let Entry::Occupied(entry) = self.url_to_id.entry(url.to_owned()) else {
+            return None;
+        };
+        let (_, worker) = self.workers.remove(entry.get())?;
+        self.unindex_worker(&worker, entry.get());
+        cleanup(worker.as_ref());
+        entry.remove();
+        Some(worker)
     }
 
     /// Remove a worker by URL
@@ -204,6 +242,20 @@ impl WorkerRegistry {
     /// Get a worker by URL
     pub fn get_by_url(&self, url: &str) -> Option<Arc<dyn Worker>> {
         self.url_to_id.get(url).and_then(|id| self.get(&id))
+    }
+
+    /// Fence a short registration update against removal/replacement of this
+    /// exact routing Worker. The callback must not access the registry or await.
+    pub(crate) fn with_current<T>(
+        &self,
+        worker: &Arc<dyn Worker>,
+        operation: impl FnOnce(&WorkerId) -> T,
+    ) -> Option<T> {
+        // remove_by_url removes the URL mapping before it removes the ID.
+        // Pin both entries until the callback completes.
+        let id = self.url_to_id.get(worker.url())?;
+        let current = self.workers.get(id.value())?;
+        Arc::ptr_eq(current.value(), worker).then(|| operation(id.value()))
     }
 
     /// Get all workers for a model
@@ -523,6 +575,82 @@ mod tests {
         // Remove worker
         registry.remove(&worker_id);
         assert!(registry.get(&worker_id).is_none());
+    }
+
+    #[test]
+    fn registration_update_rejects_removed_or_replaced_worker_arc() {
+        let registry = WorkerRegistry::new();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://worker:8080".to_owned(),
+            WorkerType::Regular,
+        ));
+        let mut initial_id = None;
+        assert!(
+            registry.register_if_absent_before_publish(worker.clone(), |_, id| {
+                initial_id = Some(id.clone());
+            })
+        );
+        assert_eq!(registry.with_current(&worker, Clone::clone), initial_id);
+        assert!(
+            !registry.register_if_absent_before_publish(worker.clone(), |_, _| {
+                panic!("duplicate worker must not overwrite its binding");
+            })
+        );
+        let (retiring, entered) = std::sync::mpsc::channel();
+        let (resume, released) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let registry = &registry;
+            let url = worker.url();
+            let removal = scope.spawn(move || {
+                registry
+                    .remove_by_url_with_cleanup(url, |_| {
+                        retiring.send(()).unwrap();
+                        released
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                    })
+                    .unwrap()
+            });
+            entered
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let locked = matches!(
+                registry.url_to_id.try_get(url),
+                dashmap::try_result::TryResult::Locked
+            );
+            let unindexed = registry.get_all().is_empty()
+                && registry.get_by_model_fast(worker.model_id()).is_empty();
+            resume.send(()).unwrap();
+            assert!(Arc::ptr_eq(&removal.join().unwrap(), &worker));
+            assert!(locked, "admission and late probes must wait for retirement");
+            assert!(
+                unindexed,
+                "removed worker remains visible in a routing index"
+            );
+        });
+        assert_eq!(
+            registry.with_current(&worker, |_| -> () { panic!("removed worker") }),
+            None
+        );
+        let replacement: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            worker.url().to_owned(),
+            WorkerType::Regular,
+        ));
+        let mut replacement_id = None;
+        assert!(
+            registry.register_if_absent_before_publish(replacement.clone(), |_, id| {
+                replacement_id = Some(id.clone());
+            })
+        );
+        assert_eq!(
+            registry.with_current(&worker, |_| -> () { panic!("stale worker") }),
+            None
+        );
+        assert_ne!(initial_id, replacement_id);
+        assert_eq!(
+            registry.with_current(&replacement, Clone::clone),
+            replacement_id
+        );
     }
 
     #[test]

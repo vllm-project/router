@@ -37,6 +37,7 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
         mode: RoutingMode::Regular { worker_urls },
         pd_kv_event_sources: Default::default(),
         kv_event_strict_recovery: false,
+        kv_snapshot_sources: Default::default(),
         policy: PolicyConfig::RoundRobin,
         host: "127.0.0.1".to_string(),
         port: 3002,

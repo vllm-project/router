@@ -23,6 +23,9 @@ pub struct RouterConfig {
     /// Opt in to hiding KV placement until a complete authoritative recovery.
     #[serde(default)]
     pub kv_event_strict_recovery: bool,
+    /// Explicit trust/enrollment for source-local snapshot control. No automatic discovery opt-in.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub kv_snapshot_sources: HashMap<String, KvSnapshotSource>,
     /// Worker connection mode
     #[serde(default)]
     pub connection_mode: ConnectionMode,
@@ -1198,6 +1201,22 @@ pub struct StaticKvEventSources {
     pub model: String,
 }
 
+/// Explicit publisher enrollment. Endpoint trust is never inferred from metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvSnapshotSource {
+    pub rank: u32,
+    pub block_size: u32,
+    pub publisher_snapshot: PublisherSnapshotSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublisherSnapshotSource {
+    pub endpoint: String,
+    pub snapshot_endpoint: String,
+    #[serde(default)]
+    pub topic: String,
+}
+
 impl PolicyConfig {
     pub fn name(&self) -> &'static str {
         match self {
@@ -1414,6 +1433,7 @@ impl Default for RouterConfig {
             },
             pd_kv_event_sources: HashMap::new(),
             kv_event_strict_recovery: false,
+            kv_snapshot_sources: Default::default(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3001,
@@ -2288,6 +2308,7 @@ mod tests {
             },
             pd_kv_event_sources: Default::default(),
             kv_event_strict_recovery: false,
+            kv_snapshot_sources: Default::default(),
             policy: PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 30,
             },
@@ -2355,6 +2376,7 @@ mod tests {
             },
             pd_kv_event_sources: Default::default(),
             kv_event_strict_recovery: false,
+            kv_snapshot_sources: Default::default(),
             policy: PolicyConfig::CacheAware {
                 cache_threshold: 0.9,
                 balance_abs_threshold: 5,
@@ -2423,6 +2445,7 @@ mod tests {
             },
             pd_kv_event_sources: Default::default(),
             kv_event_strict_recovery: false,
+            kv_snapshot_sources: Default::default(),
             policy: PolicyConfig::RoundRobin,
             host: "::1".to_string(), // IPv6
             port: 8888,

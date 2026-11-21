@@ -225,6 +225,9 @@ struct CliArgs {
     /// Monitor vllm_router_kv_source_recovery_state and vllm_router_kv_source_recovery_transitions_total.
     #[arg(long, default_value_t = false)]
     kv_event_strict_recovery: bool,
+    /// Bounded JSON map of HTTP workers to experimental loopback publisher snapshots.
+    #[arg(long)]
+    kv_snapshot_sources_file: Option<String>,
     /// Transfer credit for host-resident KV blocks.
     #[arg(long, default_value_t = 0.8)]
     kv_penalty_host: f64,
@@ -482,6 +485,32 @@ impl CliArgs {
         vllm_router_rs::config::parse_pd_kv_events(specs)
     }
 
+    fn load_snapshot_sources(
+        &self,
+    ) -> ConfigResult<HashMap<String, vllm_router_rs::config::types::KvSnapshotSource>> {
+        use std::io::Read;
+        let Some(path) = &self.kv_snapshot_sources_file else {
+            return Ok(HashMap::new());
+        };
+        let invalid = || ConfigError::ValidationFailed {
+            reason: "invalid --kv-snapshot-sources-file (bounded JSON enrollment map required)"
+                .into(),
+        };
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|f| f.take(65537).read_to_end(&mut bytes))
+            .map_err(|_| invalid())?;
+        if bytes.len() > 65536 {
+            return Err(invalid());
+        }
+        let sources: HashMap<String, vllm_router_rs::config::types::KvSnapshotSource> =
+            serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if sources.len() > 256 {
+            return Err(invalid());
+        }
+        Ok(sources)
+    }
+
     /// Convert CLI arguments to RouterConfig
     fn to_router_config(
         &self,
@@ -627,6 +656,7 @@ impl CliArgs {
         )?;
 
         let pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
+        let kv_snapshot_sources = self.load_snapshot_sources()?;
 
         // Build RouterConfig
         Ok(RouterConfig {
@@ -641,6 +671,7 @@ impl CliArgs {
             mode,
             pd_kv_event_sources,
             kv_event_strict_recovery: self.kv_event_strict_recovery,
+            kv_snapshot_sources,
             policy,
             connection_mode,
             host: self.host.clone(),
@@ -862,6 +893,57 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_sources_file_reaches_native_config_and_is_bounded() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(br#"{"http://127.0.0.1:8000":{"rank":3,"block_size":16,"publisher_snapshot":{"endpoint":"tcp://127.0.0.1:5557","snapshot_endpoint":"tcp://127.0.0.1:5558"}}}"#).unwrap();
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--worker-urls",
+            "http://127.0.0.1:8000",
+            "--policy",
+            "kv_aware",
+            "--kv-event-strict-recovery",
+            "--kv-snapshot-sources-file",
+            file.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        let config = args.to_router_config(Vec::new()).unwrap();
+        let enrolled = &config.kv_snapshot_sources["http://127.0.0.1:8000"];
+        assert_eq!(enrolled.rank, 3);
+        assert_eq!(enrolled.block_size, 16);
+        assert_eq!(enrolled.publisher_snapshot.endpoint, "tcp://127.0.0.1:5557");
+        assert!(config.validate().is_ok());
+        let igw_args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--enable-igw",
+            "--policy",
+            "kv_aware",
+            "--kv-event-strict-recovery",
+            "--kv-snapshot-sources-file",
+            file.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        let mut igw_config = igw_args.to_router_config(Vec::new()).unwrap();
+        assert!(igw_config.enable_igw);
+        assert!(matches!(
+            &igw_config.mode,
+            RoutingMode::Regular { worker_urls } if worker_urls.is_empty()
+        ));
+        assert!(igw_config.validate().is_err());
+        igw_config.kv_snapshot_sources.clear();
+        assert!(igw_config.validate().is_ok());
+        let mut unsupported = config.clone();
+        unsupported.intra_node_data_parallel_size = 2;
+        assert!(unsupported.validate().is_err());
+        unsupported = config;
+        unsupported.kv_event_strict_recovery = false;
+        assert!(unsupported.validate().is_err());
+        file.as_file_mut().set_len(65537).unwrap();
+        assert!(args.load_snapshot_sources().is_err());
+    }
 
     #[test]
     fn parses_pd_kv_aware_with_affinity_ttl() {

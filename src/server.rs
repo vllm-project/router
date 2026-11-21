@@ -66,6 +66,8 @@ impl AppContext {
         rate_limit_tokens_per_second: Option<usize>,
         api_key_validation_urls: Vec<String>,
     ) -> Result<Self, String> {
+        crate::config::ConfigValidator::validate_snapshot_scope(&router_config)
+            .map_err(|error| error.to_string())?;
         if let crate::config::PolicyConfig::KvAware {
             static_kv_event_sources,
             ..
