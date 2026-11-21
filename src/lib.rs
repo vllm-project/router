@@ -45,6 +45,7 @@ struct Router {
     host: String,
     port: u16,
     worker_urls: Vec<String>,
+    extra_generate_paths: Vec<String>,
     policy: PolicyType,
     router_temperature: f64,
     kv_penalty_host: f64,
@@ -387,6 +388,7 @@ impl Router {
         kv_event_block_size = 16,
         kv_event_model = None,
         kv_event_strict_recovery = false,
+        extra_generate_paths = vec![],
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -465,6 +467,7 @@ impl Router {
         kv_event_block_size: u32,
         kv_event_model: Option<String>,
         kv_event_strict_recovery: bool,
+        extra_generate_paths: Vec<String>,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -485,6 +488,7 @@ impl Router {
             host,
             port,
             worker_urls,
+            extra_generate_paths,
             policy,
             router_temperature,
             kv_penalty_host,
@@ -612,6 +616,7 @@ impl Router {
                 port: self.port,
                 router_config,
                 max_payload_size: self.max_payload_size,
+                extra_generate_paths: self.extra_generate_paths.clone(),
                 wasm_middleware: self.wasm_middleware.clone(),
                 wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
                 wasm_middleware_routes: self.wasm_middleware_routes.clone(),

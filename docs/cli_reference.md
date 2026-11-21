@@ -73,6 +73,7 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
 | `--worker-urls` | `string [0..] (repeatable)` | `[]` | `string [0..]` | `[]` | Worker URLs for regular routing, e.g. `http://worker:8000`; Rust also supports `grpc://` inference workers. |
+| `--extra-generate-paths` | `string [0..] (repeatable)` | `[]` | `string [0..]` | `[]` | Additional HTTP paths that use the inference-generate schema; workers must expose the same paths. Built-in routes and reserved route prefixes are rejected. |
 | `--worker-startup-timeout-secs` | `u64` | `600` | `integer` | `600` | Time in seconds to wait for workers to become ready. |
 | `--worker-startup-check-interval` | `u64` | `30` | `integer` | `30` | Seconds between worker startup checks; also controls regular-router `power_of_two` load polling. |
 | `--intra-node-data-parallel-size` | `usize` | `1` | `integer` | `1` | DP replicas per worker URL; values greater than 1 enable DP-aware routing. |
