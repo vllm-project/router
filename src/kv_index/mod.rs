@@ -38,11 +38,8 @@ pub use source::events::event_stream::{
 };
 pub use source::SourceError;
 pub use storage::KvBlockIndexer;
-pub use types::{CacheOwnerId, ResidencyOwner, RoutableTarget, SourceId, StorageTier, TierMatch};
+pub use types::{ResidencyOwner, RoutableTarget, SourceId, StorageTier, TierMatch};
 pub use wire::{AllBlocksCleared, BlockRemoved, BlockStored, KVEvent, KVEventBatch};
-
-// Compatibility export; the consumer owns the port and the index implements it.
-pub use crate::policies::TieredMatchProvider;
 
 // Out-of-band loss fence: advisory queue overflow can never leave warm state trusted.
 static SIGNAL_LOSS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

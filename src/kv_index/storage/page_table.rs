@@ -12,7 +12,7 @@ use parking_lot::RwLock;
 use super::{
     page_tag, records::Residency, Fast, KvBlockIndexer, PageQuery, PageWriteError, SourceVersion,
 };
-use crate::kv_hash::SequenceHash;
+use crate::kv_index::request_hash::SequenceHash;
 use crate::kv_index::types::{ResidencyOwner, RoutableTarget, StorageTier, TierBits};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -964,7 +964,7 @@ mod tests {
     use crate::kv_index::{CacheGroup, GroupRule, KvBlockIndexer};
 
     fn owner(name: &str) -> ResidencyOwner {
-        ResidencyOwner::Worker {
+        ResidencyOwner {
             source: Arc::from(name),
             dp_rank: 0,
             incarnation: 1,
@@ -1006,7 +1006,7 @@ mod tests {
     #[test]
     fn last_holder_removal_leaves_a_pinned_row_empty_after_another_rank_recreates_it() {
         let index = KvBlockIndexer::new();
-        let worker = |dp_rank| ResidencyOwner::Worker {
+        let worker = |dp_rank| ResidencyOwner {
             source: Arc::from("w"),
             dp_rank,
             incarnation: 1,

@@ -1,6 +1,6 @@
 //! Event-shape admission, separate from structural decoding and transport.
-use crate::kv_hash::SequenceHash;
 use crate::kv_index::layout::{CacheGroup, GroupRule};
+use crate::kv_index::request_hash::SequenceHash;
 use crate::kv_index::wire::{BlockStored, ExternalBlockHash, KVEvent};
 use crate::kv_index::SourceError;
 

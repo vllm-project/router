@@ -5,14 +5,35 @@
 use std::sync::Arc;
 
 use super::SourceBinding;
-use crate::kv_hash::{BlockKeyGenerator, SequenceHash};
 use crate::kv_index::layout::{CacheGroup, GroupRule};
+use crate::kv_index::request_hash::{BlockKeyGenerator, SequenceHash};
 use crate::kv_index::source::events::validate::event_kind_matches;
 use crate::kv_index::source::test_support::{event_batch, event_payload, gpu_remove, stored_block};
 use crate::kv_index::wire::ExternalBlockHash;
 use crate::kv_index::wire::{BlockRemoved, BlockStored};
 use crate::kv_index::SourceError;
-use crate::kv_index::{KVEvent, KVEventBatch, RoutableTarget};
+use crate::kv_index::{KVEvent, KVEventBatch, RequestHashCache, RoutableTarget};
+
+impl SourceBinding {
+    pub(crate) fn reusable_tokens(&self, tokens: &[u32], max_reusable_tokens: usize) -> u64 {
+        self.reusable_tokens_in(None, tokens, max_reusable_tokens)
+    }
+
+    fn reusable_tokens_in(
+        &self,
+        namespace: Option<&str>,
+        tokens: &[u32],
+        max_reusable_tokens: usize,
+    ) -> u64 {
+        self.credit_parts(
+            namespace,
+            tokens,
+            max_reusable_tokens,
+            &mut RequestHashCache::for_single_target(),
+        )
+        .0
+    }
+}
 
 fn target() -> RoutableTarget {
     RoutableTarget {

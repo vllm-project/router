@@ -32,7 +32,7 @@ pub(crate) fn full_store(
     block_size: u32,
     adapter: Option<(&str, &str)>,
 ) -> BlockStored {
-    let keys = crate::kv_hash::BlockKeyGenerator::new(block_size as usize, 0);
+    let keys = crate::kv_index::request_hash::BlockKeyGenerator::new(block_size as usize, 0);
     let hashes = match adapter {
         Some((name, path)) => keys.generate_block_keys_for_adapter(tokens, name, path),
         None => keys.generate_block_keys(tokens),

@@ -655,7 +655,7 @@ mod tests {
 
     #[tokio::test]
     async fn quiet_replay_recovers_and_polls_until_live_handoff() {
-        use crate::kv_hash::BlockKeyGenerator;
+        use crate::kv_index::request_hash::BlockKeyGenerator;
         use crate::kv_index::wire::{BlockRemoved, ExternalBlockHash};
         use crate::kv_index::{AllBlocksCleared, KVEvent};
 

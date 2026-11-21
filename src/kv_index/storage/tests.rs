@@ -58,7 +58,7 @@ impl KvBlockIndexer {
 }
 
 fn worker(name: &str, dp_rank: u32) -> ResidencyOwner {
-    ResidencyOwner::Worker {
+    ResidencyOwner {
         source: SourceId::from(name),
         dp_rank,
         incarnation: 0,
@@ -273,34 +273,6 @@ fn retiring_many_sources_reclaims_gates_without_erasing_other_owners() {
     }
     assert_eq!(index.source_locks.read().len(), 1);
     assert!(visible_tiers(&index, &keep, 0, key).contains(StorageTier::Device));
-}
-
-#[test]
-fn worker_clear_and_pool_eviction_remove_only_their_own_facts() {
-    let index = KvBlockIndexer::new();
-    let worker = worker("worker", 0);
-    let pool = |id| ResidencyOwner::CacheOwner {
-        pool_id: Arc::from(id),
-        source: worker.target().instance_id,
-        dp_rank: 0,
-    };
-    let first = pool("first");
-    let second = pool("second");
-    let key = [5; 32];
-    store(&index, &worker, 0, key, StorageTier::Device);
-    store(&index, &first, 0, key, StorageTier::External);
-    store(&index, &second, 0, key, StorageTier::External);
-
-    index.with_source_batch(&worker.target(), |tx| tx.clear_owner_exact(&worker));
-    assert_eq!(visible_tiers(&index, &worker, 0, key), TierBits::default());
-    assert!(visible_tiers(&index, &first, 0, key).contains(StorageTier::External));
-    assert!(visible_tiers(&index, &second, 0, key).contains(StorageTier::External));
-
-    index.with_source_batch(&worker.target(), |tx| {
-        tx.remove_hash_pages(&first, 0, StorageTier::External, &[key], false);
-    });
-    assert_eq!(visible_tiers(&index, &first, 0, key), TierBits::default());
-    assert!(visible_tiers(&index, &second, 0, key).contains(StorageTier::External));
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 use serde_json::json;
 use std::time::Duration;
-use vllm_router_rs::kv_hash::BlockKeyGenerator;
+use vllm_router_rs::kv_index::request_hash::BlockKeyGenerator;
 use vllm_router_rs::kv_index::wire::ExternalBlockHash;
 use vllm_router_rs::kv_index::{AllBlocksCleared, BlockStored, CacheCapabilities, KVEvent};
 

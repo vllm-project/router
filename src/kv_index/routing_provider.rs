@@ -1,8 +1,7 @@
 //! Adapt index lookups to the routing policy.
 
-use crate::kv_hash::SequenceHash;
 use crate::kv_index::layout::align_down;
-use crate::kv_index::request_hash::BlockKeyGenerator;
+use crate::kv_index::request_hash::{BlockKeyGenerator, SequenceHash};
 use crate::kv_index::storage::{GroupPages, PageQuery};
 use crate::kv_index::SourceBinding;
 use crate::kv_index::{KvBlockIndexer, TierMatch};

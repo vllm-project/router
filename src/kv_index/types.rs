@@ -21,38 +21,17 @@ pub struct RoutableTarget {
     pub dp_rank: u32,
 }
 
-/// Names a shared pool holding KV blocks across workers (Mooncake).
-pub type CacheOwnerId = Arc<str>;
-
-/// What holds a cached block — one of two domains. A `Worker` is ephemeral
-/// (cleared on attachment restart); a `CacheOwner` is a shared pool (Mooncake)
-/// that survives worker restarts.
+/// A worker rank's cache, scoped to one publisher incarnation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ResidencyOwner {
-    /// A worker's own device/host cache. Cleared on restart via `incarnation`.
-    Worker {
-        source: SourceId,
-        dp_rank: u32,
-        incarnation: u64,
-    },
-    /// A shared-pool copy attributed to the worker that pushed it.
-    CacheOwner {
-        pool_id: CacheOwnerId,
-        source: SourceId,
-        dp_rank: u32,
-    },
+pub struct ResidencyOwner {
+    pub(crate) source: SourceId,
+    pub(crate) dp_rank: u32,
+    pub(crate) incarnation: u64,
 }
 
 impl ResidencyOwner {
     pub(crate) fn target_parts(&self) -> (&SourceId, u32) {
-        match self {
-            ResidencyOwner::Worker {
-                source, dp_rank, ..
-            }
-            | ResidencyOwner::CacheOwner {
-                source, dp_rank, ..
-            } => (source, *dp_rank),
-        }
+        (&self.source, self.dp_rank)
     }
 
     /// The target a hit on this owner routes to.
@@ -229,40 +208,10 @@ mod tests {
 
     #[test]
     fn unknown_medium_is_unaddressable() {
-        // External derives from the owner domain, and a new connector name must
-        // not be priced as local HBM.
+        // A worker's medium cannot attest to shared-pool residency.
         for medium in ["external", "pool", "shared", "nonsense", "MOONCAKE"] {
             assert_eq!(StorageTier::from_medium(Some(medium)), None, "{medium}");
         }
-    }
-
-    #[test]
-    fn target_routes_to_pushing_worker() {
-        let w = ResidencyOwner::Worker {
-            source: Arc::from("w0"),
-            dp_rank: 1,
-            incarnation: 3,
-        };
-        assert_eq!(
-            w.target(),
-            RoutableTarget {
-                instance_id: Arc::from("w0"),
-                dp_rank: 1
-            }
-        );
-        let p = ResidencyOwner::CacheOwner {
-            pool_id: Arc::from("pool"),
-            source: Arc::from("w0"),
-            dp_rank: 1,
-        };
-        // A pool hit is attributed to the worker that pushed it.
-        assert_eq!(
-            p.target(),
-            RoutableTarget {
-                instance_id: Arc::from("w0"),
-                dp_rank: 1
-            }
-        );
     }
 }
 

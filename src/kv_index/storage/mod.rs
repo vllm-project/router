@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 
-use crate::kv_hash::SequenceHash;
+use crate::kv_index::request_hash::SequenceHash;
 mod page_table;
 mod records;
 pub(crate) mod source_transaction;

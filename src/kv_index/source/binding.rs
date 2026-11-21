@@ -31,13 +31,13 @@ impl SourceLease {
 }
 
 use crate::config::KvConnector;
-use crate::kv_hash::BlockKeyGenerator;
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 use crate::kv_index::layout::valid_groups;
 use crate::kv_index::layout::{
     align_down, common_block_alignment, AlignedTailDrop, CacheGroup, DenseLookup, GroupRule,
     TailDrop,
 };
+use crate::kv_index::request_hash::BlockKeyGenerator;
 use crate::kv_index::storage::source_transaction::{StreamControl, StreamPhase, StreamState};
 use crate::kv_index::storage::{
     IndexBatch, PageEvidence, PageMatch, PageQuery, PageTiers, SourceVersion,
@@ -110,7 +110,7 @@ impl SourceBinding {
         keys: BlockKeyGenerator,
     ) -> Self {
         let incarnation = crate::kv_index::next_owner_incarnation();
-        let owner = ResidencyOwner::Worker {
+        let owner = ResidencyOwner {
             source: target.instance_id.clone(),
             dp_rank: target.dp_rank,
             incarnation,
@@ -359,12 +359,6 @@ impl SourceBinding {
             state.lease_id = 0;
         });
     }
-
-    /// Calculate one consistent local snapshot. Zero means a miss or an
-    /// untrusted source.
-    pub fn reusable_tokens(&self, tokens: &[u32], max_reusable_tokens: usize) -> u64 {
-        self.reusable_tokens_in(None, tokens, max_reusable_tokens)
-    }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -600,20 +594,5 @@ impl SourceBinding {
         self.control.generation() == generation
             && self.index.source_version_is_current(version)
             && self.binding.as_ref().is_none_or(SourceLease::is_active)
-    }
-
-    pub(in crate::kv_index) fn reusable_tokens_in(
-        &self,
-        namespace: Option<&str>,
-        tokens: &[u32],
-        max_reusable_tokens: usize,
-    ) -> u64 {
-        self.credit_parts(
-            namespace,
-            tokens,
-            max_reusable_tokens,
-            &mut RequestHashCache::for_single_target(),
-        )
-        .0
     }
 }

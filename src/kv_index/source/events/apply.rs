@@ -1,6 +1,6 @@
 //! Prepare engine events before committing their native hashes.
 
-use crate::kv_hash::SequenceHash;
+use crate::kv_index::request_hash::SequenceHash;
 use crate::kv_index::storage::source_transaction::{StreamPhase, StreamState as State};
 use crate::kv_index::storage::{IndexBatch, PageChanges, PageWriteError};
 use crate::kv_index::wire::BlockStored;

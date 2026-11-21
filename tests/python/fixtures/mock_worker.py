@@ -185,7 +185,6 @@ class GrpcKvWorker:
         self.worker_id = worker_id
         self.block_size = block_size
         self.model = model
-        self.events_enabled = events_enabled
         self.adapters = adapters or {}
         self.failures_remaining = 0
         self.captured = []
