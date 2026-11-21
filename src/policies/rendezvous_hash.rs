@@ -15,7 +15,6 @@ use super::hash_key;
 use super::LoadBalancingPolicy;
 use super::RequestHeaders;
 use crate::core::Worker;
-use crate::metrics::RouterMetrics;
 use crate::policies::ConsistentHashPolicy;
 
 /// Rendezvous hashing (Highest Random Weight) policy
@@ -70,9 +69,7 @@ impl LoadBalancingPolicy for RendezvousHashPolicy {
             hash_key, worker_url, selected_idx
         );
 
-        workers[selected_idx].increment_processed();
-        RouterMetrics::record_processed_request(worker_url);
-        RouterMetrics::record_policy_decision(self.name(), worker_url);
+        super::record_processed_selection(self.name(), workers[selected_idx].as_ref());
 
         Some(selected_idx)
     }

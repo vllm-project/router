@@ -2,7 +2,6 @@
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
-use crate::metrics::RouterMetrics;
 use rand::Rng;
 use std::sync::Arc;
 
@@ -33,10 +32,9 @@ impl LoadBalancingPolicy for RandomPolicy {
 
         let mut rng = rand::rng();
         let random_idx = rng.random_range(0..healthy_indices.len());
-        let worker = workers[healthy_indices[random_idx]].url();
+        let worker = workers[healthy_indices[random_idx]].as_ref();
 
-        RouterMetrics::record_processed_request(worker);
-        RouterMetrics::record_policy_decision(self.name(), worker);
+        super::record_selection_metrics(self.name(), worker);
         Some(healthy_indices[random_idx])
     }
 

@@ -35,6 +35,10 @@ pub trait WorkerManagement: Send + Sync {
     /// Remove a worker from the router
     fn remove_worker(&self, worker_url: &str);
 
+    /// Invalidate router-local state for an object removed or replaced by a
+    /// shared registry owner. Must not mutate registry membership or counts.
+    fn invalidate_worker_state(&self, _worker: &dyn crate::core::Worker) {}
+
     /// Get all worker URLs
     fn get_worker_urls(&self) -> Vec<String>;
 }

@@ -35,7 +35,6 @@ use super::ConsistentHashPolicy;
 use super::LoadBalancingPolicy;
 use super::RequestHeaders;
 use crate::core::Worker;
-use crate::metrics::RouterMetrics;
 
 /// Default session expiration (2 hours), per the design spec.
 pub const DEFAULT_SESSION_EXPIRATION_SECS: u64 = 7200;
@@ -179,9 +178,7 @@ impl StickyLeastLoadedPolicy {
     }
 
     fn record_selection(&self, worker: &Arc<dyn Worker>) {
-        worker.increment_processed();
-        RouterMetrics::record_processed_request(worker.url());
-        RouterMetrics::record_policy_decision(self.name(), worker.url());
+        super::record_processed_selection(self.name(), worker.as_ref());
     }
 
     /// Number of currently active (tracked) sessions. Exposed for tests/metrics.
@@ -228,7 +225,8 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
         let session_id = match session_id {
             Some(id) => id,
             None => {
-                let tie_break = request_text.unwrap_or("");
+                let tie_break =
+                    hash_key::prepared_key(headers).unwrap_or(request_text.unwrap_or(""));
                 let idx = Self::select_least_loaded(&state.active_counts, &candidates, tie_break);
                 drop(state);
                 self.record_selection(&workers[idx]);

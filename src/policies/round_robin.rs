@@ -2,7 +2,6 @@
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
-use crate::metrics::RouterMetrics;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -38,10 +37,9 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
         // Get and increment counter atomically
         let count = self.counter.fetch_add(1, Ordering::Relaxed);
         let selected_idx = count % healthy_indices.len();
-        let worker = workers[healthy_indices[selected_idx]].url();
+        let worker = workers[healthy_indices[selected_idx]].as_ref();
 
-        RouterMetrics::record_processed_request(worker);
-        RouterMetrics::record_policy_decision(self.name(), worker);
+        super::record_selection_metrics(self.name(), worker);
         Some(healthy_indices[selected_idx])
     }
 
