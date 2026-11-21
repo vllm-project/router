@@ -111,6 +111,7 @@ fn inferred_full_revokes_credit_on_an_incompatible_root_or_event_shape() {
         ("group", SourceError::InvalidBatch),
         ("block size", SourceError::InvalidBatch),
         ("cache kind", SourceError::InvalidBatch),
+        ("missing cache kind", SourceError::InvalidBatch),
         ("lookahead", SourceError::InvalidBatch),
     ] {
         let index = full_binding(target(), 16).require_root_proof();
@@ -134,6 +135,7 @@ fn inferred_full_revokes_credit_on_an_incompatible_root_or_event_shape() {
             "group" => wrong.group_idx = Some(1),
             "block size" => wrong.block_size = 8,
             "cache kind" => wrong.kv_cache_spec_kind = Some("mla_attention".into()),
+            "missing cache kind" => wrong.kv_cache_spec_kind = None,
             "lookahead" => wrong.lookahead_token_ids = Some(vec![vec![1]; 2]),
             _ => unreachable!(),
         }

@@ -324,6 +324,58 @@ async fn exhausted_replay_recovers_on_the_configured_live_boundary() {
 }
 
 #[tokio::test]
+async fn mooncake_cpu_store_preserves_worker_credit_live_and_on_replay() {
+    use crate::kv_index::StorageTier;
+    use crate::policies::TieredMatchProvider;
+
+    let mut tcp = TcpReplay::new();
+    let index = Arc::new(full_binding(target("mixed-offload"), BLOCK_SIZE).require_root_proof());
+    let _handle = tcp.start(index.clone(), None);
+    let prompt = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+    let first = store_prompt();
+    let mut host = first.clone();
+    host.medium = Some("CPU".into());
+    let mut second = full_store(&prompt[..8], BLOCK_SIZE, None);
+    second.parent_block_hash = Some(second.block_hashes.remove(0));
+    second.token_ids = prompt[4..8].to_vec();
+    let mut mooncake = second.clone();
+    mooncake.medium = Some("cpu".into());
+    mooncake.kv_cache_spec_kind = None;
+
+    let mut gpu_hashes = first.block_hashes.clone();
+    gpu_hashes.extend(second.block_hashes.iter().cloned());
+    let remove_gpu = batch_payload(&[gpu_remove(Some(0), gpu_hashes)]);
+    let first_batch = batch_payload(&[KVEvent::BlockStored(first), KVEvent::BlockStored(host)]);
+    let mixed = batch_payload(&[KVEvent::BlockStored(mooncake), KVEvent::BlockStored(second)]);
+    let reuse = || index.reusable_tokens(&prompt, usize::MAX);
+
+    tcp.subscribed().await;
+    tcp.history(&tcp.request(0).await, &[]);
+    tcp.live(0, &first_batch);
+    wait_until(|| reuse() == 4).await;
+    tcp.live(1, &mixed);
+    wait_until(|| next_seq(&index) == Some(2)).await;
+    assert_eq!(reuse(), 8);
+
+    tcp.disconnect();
+    wait_until(|| reuse() == 0).await;
+    tcp.reopen().await;
+    tcp.history(&tcp.request(0).await, &[(0, &first_batch), (1, &mixed)]);
+    wait_until(|| reuse() == 8).await;
+
+    tcp.live(2, &remove_gpu);
+    wait_until(|| next_seq(&index) == Some(3)).await;
+    assert_eq!(
+        reuse(),
+        4,
+        "only the local CPU copy should survive GPU eviction"
+    );
+    let matches = index.matches(&prompt, BLOCK_SIZE, None, 0);
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].tier, StorageTier::HostPinned);
+}
+
+#[tokio::test]
 async fn delayed_replay_applies_gap_batch_and_drains_the_live_queue() {
     let mut tcp = TcpReplay::new();
     tcp.hwm = 2;

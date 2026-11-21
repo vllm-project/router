@@ -118,11 +118,18 @@ impl SourceBinding {
         &self,
         batch: &'a KVEventBatch,
     ) -> Result<Vec<PreparedEvent<'a>>, SourceError> {
-        if batch.events.iter().any(publishes_int_hash) {
+        // MooncakeStoreConnector reports writes as CPU stores without a cache
+        // spec kind. That event shape cannot establish worker-local residency.
+        let events = batch.events.iter().filter(|event| {
+            !matches!(event, KVEvent::BlockStored(store)
+                if store.kv_cache_spec_kind.is_none()
+                    && store.medium.as_deref().is_some_and(|medium| medium.eq_ignore_ascii_case("CPU")))
+        });
+        if events.clone().any(publishes_int_hash) {
             return Err(SourceError::IntBlockHashes);
         }
         let mut prepared = Vec::with_capacity(batch.events.len());
-        for event in &batch.events {
+        for event in events {
             match event {
                 KVEvent::BlockStored(store) => {
                     if let Some(event) = self.prepare_store(store)? {
