@@ -72,12 +72,12 @@ impl PdProgramRuntime {
         let dp_size = ctx.router_config.intra_node_data_parallel_size;
         let provider = VllmMetricsObservationProvider::new(
             ctx.client.clone(),
-            ctx.router_config.api_key.clone(),
+            ctx.router_config.api_key.as_deref().map(str::to_owned),
         );
         let kv_config = config.pd.clone();
         let mut default_headers = HeaderMap::new();
         if let Some(key) = &ctx.router_config.api_key {
-            if let Ok(value) = format!("Bearer {key}").parse() {
+            if let Ok(value) = format!("Bearer {}", &**key).parse() {
                 default_headers.insert(axum::http::header::AUTHORIZATION, value);
             }
         }

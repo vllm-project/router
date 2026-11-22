@@ -297,7 +297,7 @@ pub struct Router {
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval_secs: u64,
     intra_node_data_parallel_size: usize,
-    api_key: Option<String>,
+    api_key: Option<crate::config::WorkerApiKey>,
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
     kv_aware_session_affinity_ttl_secs: Option<u64>,
@@ -398,7 +398,7 @@ impl Router {
                     ctx.client.clone(),
                     crate::kv_index::HashMode::Sha256,
                 );
-            supervisor.set_api_key(ctx.router_config.api_key.clone());
+            supervisor.set_api_key(ctx.router_config.api_key.as_deref().map(str::to_owned));
             supervisor.set_strict_recovery(ctx.router_config.kv_event_strict_recovery);
             let static_sources = match &ctx.router_config.policy {
                 crate::config::PolicyConfig::KvAware {
@@ -454,7 +454,7 @@ impl Router {
             // worker address now in the format of "http://host:port@dp_rank"
             dp_utils::get_dp_aware_workers(
                 &worker_urls,
-                &ctx.router_config.api_key,
+                ctx.router_config.api_key.as_deref(),
                 ctx.router_config.intra_node_data_parallel_size,
             )
             .await
@@ -627,7 +627,7 @@ impl Router {
             let worker_registry = ctx.worker_registry.clone();
             let provider = VllmMetricsObservationProvider::new(
                 ctx.client.clone(),
-                ctx.router_config.api_key.clone(),
+                ctx.router_config.api_key.as_deref().map(str::to_owned),
             )
             .with_metrics_base_urls(scheduler.metrics_base_urls());
             Arc::new(tokio::spawn(async move {
@@ -2687,7 +2687,7 @@ impl Router {
                         let url_vec = vec![String::from(worker_url)];
                         let dp_url_vec = dp_utils::get_dp_aware_workers(
                             &url_vec,
-                            &self.api_key,
+                            self.api_key.as_deref(),
                             self.intra_node_data_parallel_size,
                         )
                         .await
@@ -3667,7 +3667,8 @@ impl RouterTrait for Router {
             }
         }
         if let Some(ref key) = self.api_key {
-            request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
+            request_builder =
+                request_builder.header("Authorization", format!("Bearer {}", &**key));
         }
 
         // Send request
@@ -3842,6 +3843,22 @@ mod tests {
     use crate::backend::outcome::EngineUsage;
     use crate::routers::http::program_adapter::MAX_SSE_LINE_BYTES;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn router_debug_redacts_worker_api_key() {
+        let config = RouterConfig {
+            api_key: Some("worker-secret".to_owned().into()),
+            ..Default::default()
+        };
+        let ctx = Arc::new(
+            crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
+        );
+        let router = Router::new(vec![], &ctx).await.unwrap();
+
+        let debug = format!("{router:?}");
+        assert!(!debug.contains("worker-secret"));
+        assert!(debug.contains("api_key: Some([REDACTED])"));
+    }
 
     struct CompletionResponseFixture {
         router: Arc<Router>,
@@ -4135,7 +4152,7 @@ mod tests {
             let worker = format!("http://{}", listener.local_addr().unwrap());
             let http_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let config = RouterConfig {
-                api_key: Some("backend-key".to_owned()),
+                api_key: Some("backend-key".to_owned().into()),
                 policy: PolicyConfig::KvAware {
                     router_temperature: 0.0,
                     kv_penalty_host: 0.8,
@@ -8193,7 +8210,7 @@ mod tests {
 
         // add_worker reports the rejected key the same way.
         let config = RouterConfig {
-            api_key: Some("other-key".to_string()),
+            api_key: Some("other-key".to_string().into()),
             worker_startup_timeout_secs: 1,
             worker_startup_check_interval_secs: 1,
             ..Default::default()

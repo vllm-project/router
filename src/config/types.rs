@@ -2,11 +2,38 @@ use super::ConfigResult;
 use crate::config::validation::ConfigValidator;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::ops::Deref;
 
 use crate::program_scheduling::{
     DecodeThroughputModel, PrefillCostModel, ProgramBindingStrategy, ProgramResumeOrder,
     ProgramSchedulingEnableKey, TokenCountMode,
 };
+
+/// Worker credential that is safe to include in derived debug output.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkerApiKey(String);
+
+impl From<String> for WorkerApiKey {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl Deref for WorkerApiKey {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl fmt::Debug for WorkerApiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,7 +71,7 @@ pub struct RouterConfig {
     #[serde(default = "default_intra_node_data_parallel_size")]
     pub intra_node_data_parallel_size: usize,
     /// The api key used for the authorization with the worker
-    pub api_key: Option<String>,
+    pub api_key: Option<WorkerApiKey>,
     /// API key validation URLs (if set, incoming requests must validate against them)
     #[serde(default)]
     pub api_key_validation_urls: Vec<String>,
@@ -1514,6 +1541,23 @@ impl RouterConfig {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn router_config_debug_redacts_worker_api_key() {
+        let config = RouterConfig {
+            api_key: Some("worker-secret".to_owned().into()),
+            ..Default::default()
+        };
+
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("worker-secret"));
+        assert!(debug.contains("api_key: Some([REDACTED])"));
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert_eq!(serialized["api_key"], "worker-secret");
+        let restored: WorkerApiKey =
+            serde_json::from_value(serialized["api_key"].clone()).unwrap();
+        assert_eq!(&*restored, "worker-secret");
+    }
 
     // ============= RouterConfig Tests =============
 

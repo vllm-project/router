@@ -125,7 +125,7 @@ mod dp_routing_tests {
         ];
         let dp_size = 4;
 
-        let expanded = dp_utils::get_dp_aware_workers(&urls, &None, dp_size)
+        let expanded = dp_utils::get_dp_aware_workers(&urls, None, dp_size)
             .await
             .unwrap();
 
@@ -171,7 +171,7 @@ mod dp_routing_tests {
         let urls = vec!["https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009".to_string()];
         let dp_size = 2;
 
-        let expanded = dp_utils::get_dp_aware_workers(&urls, &None, dp_size)
+        let expanded = dp_utils::get_dp_aware_workers(&urls, None, dp_size)
             .await
             .unwrap();
 
