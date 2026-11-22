@@ -96,8 +96,16 @@ steps:
   - label: ":test_tube: Smoke Test Release Binary (x86_64)"
     key: "smoke-test-binary-x86_64"
     command: |
+      set -euo pipefail
       buildkite-agent artifact download "target/release/vllm-router" .
       chmod +x target/release/vllm-router
+      if ldd target/release/vllm-router | grep -qE 'lib(ssl|crypto)\.so'; then
+        echo "ERROR: vllm-router dynamically links OpenSSL:" >&2
+        ldd target/release/vllm-router | grep -E 'lib(ssl|crypto)\.so' >&2
+        exit 1
+      fi
+      docker run --rm -v "$$PWD:/workdir" -w /workdir debian:bookworm ./target/release/vllm-router --version
+      docker run --rm -v "$$PWD:/workdir" -w /workdir debian:bookworm ./target/release/vllm-router --help
       docker run --rm -v "$$PWD:/workdir" -w /workdir quay.io/pypa/manylinux_2_28_x86_64 ./target/release/vllm-router --version
       docker run --rm -v "$$PWD:/workdir" -w /workdir quay.io/pypa/manylinux_2_28_x86_64 ./target/release/vllm-router --help
     agents:

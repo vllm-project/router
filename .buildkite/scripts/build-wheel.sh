@@ -1,8 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-# Install system dependencies (manylinux_2_28 uses dnf)
-dnf install -y openssl-devel protobuf-compiler protobuf-devel
+# Install system dependencies (manylinux_2_28 uses dnf).
+# perl-core is required to configure and build vendored OpenSSL (openssl-src).
+dnf install -y perl-core protobuf-compiler protobuf-devel
 
 # Install Rust toolchain (explicitly use nightly to match previous pipeline)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
