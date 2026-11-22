@@ -72,7 +72,7 @@ use crate::policies::normalize_model_key;
 use crate::protocols::spec::cache_routing;
 use crate::tree::{PrefixMatchResult, Tree};
 use dashmap::DashMap;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
@@ -97,6 +97,53 @@ pub struct CacheAwarePlacement {
 pub struct PreparedCacheSelection {
     tree: Arc<Tree>,
     candidates: HashMap<String, (Vec<Arc<str>>, f64)>,
+}
+
+/// One eligibility and load observation, reusable for ordered candidate subsets.
+pub(crate) struct PreparedCacheSelectionView<'a> {
+    workers: &'a [Arc<dyn Worker>],
+    prepared: Option<&'a PreparedCacheSelection>,
+    indices: Vec<usize>,
+    loads: Vec<Option<usize>>,
+    // Sample once per view. Re-evaluating the same view has no RNG side effects.
+    tie_seed: u64,
+}
+
+impl PreparedCacheSelectionView<'_> {
+    pub(crate) fn indices(&self) -> &[usize] {
+        &self.indices
+    }
+
+    pub(crate) fn load(&self, index: usize) -> Option<usize> {
+        self.loads.get(index).copied().flatten()
+    }
+}
+
+/// An evaluated choice has no effects until the caller commits the actual one.
+pub(crate) struct PreparedCacheDecision<'a> {
+    target: Option<PreparedCacheTarget<'a>>,
+    min_load: usize,
+    max_load: usize,
+    imbalanced: bool,
+    outcome: Option<&'static str>,
+    cache_update: Option<PreparedCacheUpdate<'a>>,
+}
+
+impl PreparedCacheDecision<'_> {
+    pub(crate) fn worker_index(&self) -> Option<usize> {
+        self.target.as_ref().map(|target| target.index)
+    }
+}
+
+struct PreparedCacheTarget<'a> {
+    index: usize,
+    worker: &'a dyn Worker,
+}
+
+struct PreparedCacheUpdate<'a> {
+    tree: &'a Tree,
+    keys: &'a [Arc<str>],
+    match_rate: f64,
 }
 
 /// Cache-aware routing policy
@@ -342,55 +389,161 @@ impl CacheAwarePolicy {
         stage: &'static str,
     ) -> Option<usize> {
         let healthy = get_healthy_worker_indices(workers);
-        let (min_load, max_load) = self.load_range(workers, &healthy);
-        let imbalanced = self.is_imbalanced(min_load, max_load);
-        if imbalanced {
-            RouterMetrics::record_load_balancing_event();
-            RouterMetrics::set_load_range(max_load, min_load);
+        // Legacy callers read loads again when selecting after the range check.
+        let decision = self.evaluate_prepared_with_load(
+            workers,
+            prepared,
+            &healthy,
+            |index| workers[index].load(),
+            pick_tied,
+        );
+        self.commit_prepared(decision, stage)
+    }
+
+    pub(crate) fn selection_view<'a>(
+        &self,
+        workers: &'a [Arc<dyn Worker>],
+        prepared: Option<&'a PreparedCacheSelection>,
+    ) -> PreparedCacheSelectionView<'a> {
+        let indices = get_healthy_worker_indices(workers);
+        let mut loads = vec![None; workers.len()];
+        for &index in &indices {
+            loads[index] = Some(workers[index].load());
         }
-        let matches: Option<Vec<_>> = healthy
+        PreparedCacheSelectionView {
+            workers,
+            prepared,
+            indices,
+            loads,
+            tie_seed: rand::rng().random(),
+        }
+    }
+
+    /// Recompute the baseline within this ordered subset, using only the view.
+    /// Indices outside the captured eligible set cannot become candidates.
+    pub(crate) fn evaluate_prepared<'a>(
+        &self,
+        view: &PreparedCacheSelectionView<'a>,
+        indices: &[usize],
+    ) -> PreparedCacheDecision<'a> {
+        let candidates: Vec<_> = indices
             .iter()
-            .map(|&i| prepared?.candidates.get(workers[i].url()))
+            .copied()
+            .filter(|&index| view.load(index).is_some())
+            .collect();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(view.tie_seed);
+        self.evaluate_prepared_with_load(
+            view.workers,
+            view.prepared,
+            &candidates,
+            |index| view.load(index).expect("captured eligible candidate"),
+            |tied| (!tied.is_empty()).then(|| tied[rng.random_range(0..tied.len())]),
+        )
+    }
+
+    fn evaluate_prepared_with_load<'a>(
+        &self,
+        workers: &'a [Arc<dyn Worker>],
+        prepared: Option<&'a PreparedCacheSelection>,
+        candidates: &[usize],
+        mut load: impl FnMut(usize) -> usize,
+        pick: impl FnMut(&[usize]) -> Option<usize>,
+    ) -> PreparedCacheDecision<'a> {
+        let (min_load, max_load) = candidates
+            .iter()
+            .fold((usize::MAX, 0), |(min, max), &index| {
+                let value = load(index);
+                (min.min(value), max.max(value))
+            });
+        // Preserve load_range's sentinel handling, including usize::MAX loads.
+        let min_load = if min_load == usize::MAX { 0 } else { min_load };
+        let imbalanced = self.is_imbalanced(min_load, max_load);
+        let mut decision = PreparedCacheDecision {
+            target: None,
+            min_load,
+            max_load,
+            imbalanced,
+            outcome: None,
+            cache_update: None,
+        };
+        let matches: Option<Vec<_>> = candidates
+            .iter()
+            .map(|&index| prepared?.candidates.get(workers[index].url()))
             .collect();
         let Some((prepared, matches)) = prepared.zip(matches) else {
-            RouterMetrics::record_prefix_routing_decision("cache_aware", stage, "missing_tokens");
-            let index = Self::least_loaded(workers, &healthy)?;
-            Self::record_selection(workers, index);
-            return Some(index);
+            decision.outcome = Some("missing_tokens");
+            decision.target = Self::pick_least_loaded_with(
+                candidates.iter().map(|&index| (index, load(index))),
+                pick,
+            )
+            .map(|index| PreparedCacheTarget {
+                index,
+                worker: workers[index].as_ref(),
+            });
+            return decision;
         };
         let best_rate = matches
             .iter()
             .map(|(_, rate)| *rate)
             .fold(0.0_f64, f64::max);
         let use_prefix = !imbalanced && best_rate > self.config.cache_threshold as f64;
-        let position = Self::pick_least_loaded(
-            (0..healthy.len())
+        let Some(position) = Self::pick_least_loaded_with(
+            (0..candidates.len())
                 .filter(|&i| !use_prefix || matches[i].1 == best_rate)
-                .map(|i| (i, workers[healthy[i]].load())),
-        )?;
-        let index = healthy[position];
-        for key in &matches[position].0 {
-            prepared.tree.insert(key, workers[index].url());
+                .map(|i| (i, load(candidates[i]))),
+            pick,
+        ) else {
+            return decision;
+        };
+        decision.target = Some(PreparedCacheTarget {
+            index: candidates[position],
+            worker: workers[candidates[position]].as_ref(),
+        });
+        decision.outcome = Some(if imbalanced {
+            "load_imbalance"
+        } else if use_prefix {
+            "prefix_hit"
+        } else {
+            "prefix_miss"
+        });
+        decision.cache_update = Some(PreparedCacheUpdate {
+            tree: prepared.tree.as_ref(),
+            keys: &matches[position].0,
+            match_rate: matches[position].1,
+        });
+        decision
+    }
+
+    /// Commit only the final choice; discarded evaluations publish nothing.
+    pub(crate) fn commit_prepared(
+        &self,
+        decision: PreparedCacheDecision<'_>,
+        stage: &'static str,
+    ) -> Option<usize> {
+        if decision.imbalanced {
+            RouterMetrics::record_load_balancing_event();
+            RouterMetrics::set_load_range(decision.max_load, decision.min_load);
         }
-        RouterMetrics::record_prefix_routing_decision(
-            "cache_aware",
-            stage,
-            if imbalanced {
-                "load_imbalance"
-            } else if use_prefix {
-                "prefix_hit"
-            } else {
-                "prefix_miss"
-            },
-        );
-        debug!(
-            stage,
-            selected = workers[index].url(),
-            match_rate = matches[position].1,
-            batch_prompts = matches[position].0.len(),
-            "Cache prefix decision"
-        );
-        Self::record_selection(workers, index);
+        if let (Some(target), Some(update)) = (&decision.target, &decision.cache_update) {
+            for key in update.keys {
+                update.tree.insert(key, target.worker.url());
+            }
+        }
+        if let Some(outcome) = decision.outcome {
+            RouterMetrics::record_prefix_routing_decision("cache_aware", stage, outcome);
+        }
+        let index = decision.worker_index()?;
+        let target = decision.target?;
+        if let Some(update) = decision.cache_update {
+            debug!(
+                stage,
+                selected = target.worker.url(),
+                match_rate = update.match_rate,
+                batch_prompts = update.keys.len(),
+                "Cache prefix decision"
+            );
+        }
+        Self::record_worker_selection(target.worker);
         Some(index)
     }
 
@@ -460,6 +613,13 @@ impl CacheAwarePolicy {
     /// Each load is read once so that concurrent updates cannot change
     /// which candidates count as tied.
     fn pick_least_loaded(candidates: impl Iterator<Item = (usize, usize)>) -> Option<usize> {
+        Self::pick_least_loaded_with(candidates, pick_tied)
+    }
+
+    fn pick_least_loaded_with(
+        candidates: impl Iterator<Item = (usize, usize)>,
+        mut pick: impl FnMut(&[usize]) -> Option<usize>,
+    ) -> Option<usize> {
         let mut min_load = usize::MAX;
         let mut tied = Vec::new();
         for (id, load) in candidates {
@@ -471,7 +631,7 @@ impl CacheAwarePolicy {
                 tied.push(id);
             }
         }
-        pick_tied(&tied)
+        pick(&tied)
     }
 
     /// Choose using an approximate affinity observation, but current eligibility
@@ -504,9 +664,13 @@ impl CacheAwarePolicy {
     }
 
     fn record_selection(workers: &[Arc<dyn Worker>], idx: usize) {
-        workers[idx].increment_processed();
-        RouterMetrics::record_processed_request(workers[idx].url());
-        RouterMetrics::record_policy_decision("cache_aware", workers[idx].url());
+        Self::record_worker_selection(workers[idx].as_ref());
+    }
+
+    fn record_worker_selection(worker: &dyn Worker) {
+        worker.increment_processed();
+        RouterMetrics::record_processed_request(worker.url());
+        RouterMetrics::record_policy_decision("cache_aware", worker.url());
     }
 
     /// Prepare cache affinity outside the admission lock, then recheck load and
@@ -809,6 +973,428 @@ mod tests {
             .collect();
         policy.init_workers(&workers);
         (policy, workers)
+    }
+
+    #[test]
+    fn prepared_evaluations_only_commit_actual_choice() {
+        let (policy, workers) = cache_fixture(3, CacheAwareConfig::default());
+        let ids = [1, 2, 3, 4];
+        let prepared = policy
+            .prepare_selection(
+                &workers,
+                KvRequestTokens::Shared(Some(&ids)),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let view = policy.selection_view(&workers, Some(&prepared));
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let before = handle.render();
+
+        let full_target = policy
+            .evaluate_prepared(&view, view.indices())
+            .worker_index();
+        let subset_target = policy.evaluate_prepared(&view, &[2, 1]).worker_index();
+        assert!(matches!(full_target, Some(0..=2)));
+        assert!(matches!(subset_target, Some(1 | 2)));
+        for _ in 0..3 {
+            assert_eq!(
+                policy
+                    .evaluate_prepared(&view, view.indices())
+                    .worker_index(),
+                full_target
+            );
+            assert_eq!(
+                policy.evaluate_prepared(&view, &[2, 1]).worker_index(),
+                subset_target
+            );
+        }
+        let actual = policy.evaluate_prepared(&view, &[1]);
+        assert_eq!(handle.render(), before);
+        for worker in &workers {
+            assert_eq!(worker.processed_requests(), 0);
+            let key = &prepared.candidates[worker.url()].0[0];
+            assert_eq!(
+                prepared
+                    .tree
+                    .prefix_match_tenant_char_count(key, worker.url()),
+                0
+            );
+        }
+
+        assert_eq!(policy.commit_prepared(actual, "prefill"), Some(1));
+        for (index, worker) in workers.iter().enumerate() {
+            assert_eq!(worker.processed_requests(), usize::from(index == 1));
+            let key = &prepared.candidates[worker.url()].0[0];
+            assert_eq!(
+                prepared
+                    .tree
+                    .prefix_match_tenant_char_count(key, worker.url()),
+                if index == 1 { key.chars().count() } else { 0 }
+            );
+        }
+        let rendered = handle.render();
+        for name in [
+            "vllm_router_processed_requests_total",
+            "vllm_router_policy_decisions_total",
+            "vllm_router_prefix_routing_decisions_total",
+        ] {
+            let samples: Vec<_> = rendered
+                .lines()
+                .filter(|line| line.starts_with(name))
+                .collect();
+            assert_eq!(samples.len(), 1, "{rendered}");
+            assert_eq!(
+                samples[0]
+                    .split_whitespace()
+                    .last()
+                    .unwrap()
+                    .parse::<f64>()
+                    .unwrap(),
+                1.0
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_ties_are_repeatable_per_view_without_first_worker_bias() {
+        let (policy, workers) = cache_fixture(3, CacheAwareConfig::default());
+        workers[2].increment_load();
+        let ids = [1, 2, 3, 4];
+        let prepared = policy.prepare_selection(
+            &workers,
+            KvRequestTokens::Shared(Some(&ids)),
+            None,
+            None,
+            None,
+        );
+        for input in [None, prepared.as_ref()] {
+            let mut selected = std::collections::HashSet::new();
+            for seed in 0..64 {
+                let mut view = policy.selection_view(&workers, input);
+                view.tie_seed = seed;
+                let target = policy
+                    .evaluate_prepared(&view, view.indices())
+                    .worker_index()
+                    .unwrap();
+                assert_eq!(
+                    policy
+                        .evaluate_prepared(&view, view.indices())
+                        .worker_index(),
+                    Some(target)
+                );
+                assert!(target < 2, "a higher-load worker must not win a tie");
+                selected.insert(target);
+            }
+            assert_eq!(
+                selected.len(),
+                2,
+                "both equally ranked workers remain selectable"
+            );
+        }
+        assert!(workers
+            .iter()
+            .all(|worker| worker.processed_requests() == 0));
+    }
+
+    #[test]
+    fn prepared_commit_keeps_the_originating_worker_and_tree() {
+        let (policy, workers) = cache_fixture(2, CacheAwareConfig::default());
+        let ids = [1, 2, 3, 4];
+        let first = policy
+            .prepare_selection(
+                &workers,
+                KvRequestTokens::Shared(Some(&ids)),
+                Some("model-a"),
+                None,
+                None,
+            )
+            .unwrap();
+        let other_workers = std::slice::from_ref(&workers[0]);
+        let second = policy
+            .prepare_selection(
+                other_workers,
+                KvRequestTokens::Shared(Some(&ids)),
+                Some("model-b"),
+                None,
+                None,
+            )
+            .unwrap();
+        let first_decision = {
+            let view = policy.selection_view(&workers, Some(&first));
+            policy.evaluate_prepared(&view, &[1])
+        };
+        let second_decision = {
+            let view = policy.selection_view(other_workers, Some(&second));
+            policy.evaluate_prepared(&view, view.indices())
+        };
+        // The other view has no index 1 and uses a different model's tree.
+        assert_eq!(first_decision.worker_index(), Some(1));
+        assert_eq!(policy.commit_prepared(second_decision, "decode"), Some(0));
+        assert_eq!(policy.commit_prepared(first_decision, "prefill"), Some(1));
+        for (prepared, chosen) in [(&first, 1), (&second, 0)] {
+            let key = &prepared.candidates[workers[chosen].url()].0[0];
+            for (index, worker) in workers.iter().enumerate() {
+                assert_eq!(
+                    prepared
+                        .tree
+                        .prefix_match_tenant_char_count(key, worker.url()),
+                    if index == chosen {
+                        key.chars().count()
+                    } else {
+                        0
+                    }
+                );
+            }
+        }
+        assert!(workers
+            .iter()
+            .all(|worker| worker.processed_requests() == 1));
+    }
+
+    #[test]
+    fn prepared_subsets_recompute_prefix_imbalance_and_ties() {
+        let (policy, workers) = cache_fixture(
+            4,
+            CacheAwareConfig {
+                balance_abs_threshold: 3,
+                ..Default::default()
+            },
+        );
+        let ids = [1, 2, 3, 4];
+        for (index, length) in [(0, 4), (1, 3), (2, 3)] {
+            policy.select_worker_with_inputs(
+                std::slice::from_ref(&workers[index]),
+                KvRequestTokens::Shared(Some(&ids[..length])),
+                None,
+                None,
+                None,
+                "prefill",
+            );
+        }
+        for (worker, load) in workers.iter().zip([5, 2, 2, 20]) {
+            for _ in 0..load {
+                worker.increment_load();
+            }
+        }
+        let prepared = policy.prepare_selection(
+            &workers,
+            KvRequestTokens::Shared(Some(&ids)),
+            None,
+            None,
+            None,
+        );
+        let view = policy.selection_view(&workers, prepared.as_ref());
+        let full = policy.evaluate_prepared(&view, view.indices());
+        assert!(matches!(full.worker_index(), Some(1 | 2)));
+        assert_eq!(full.outcome, Some("load_imbalance"));
+        // Removing the overloaded worker must recompute imbalance, enabling affinity.
+        let balanced = policy.evaluate_prepared(&view, &[0, 1, 2]);
+        assert_eq!(
+            (balanced.worker_index(), balanced.outcome),
+            (Some(0), Some("prefix_hit"))
+        );
+        // Removing the global best prefix must allow the best prefix in the subset.
+        let tied = policy.evaluate_prepared(&view, &[2, 1]);
+        assert!(matches!(tied.worker_index(), Some(1 | 2)));
+        assert_eq!(tied.outcome, Some("prefix_hit"));
+    }
+
+    #[test]
+    fn prepared_view_freezes_loads_and_eligibility() {
+        let (policy, workers) = cache_fixture(2, CacheAwareConfig::default());
+        workers[1].increment_load();
+        let view = policy.selection_view(&workers, None);
+        workers[0].increment_load();
+        workers[0].increment_load();
+        workers[0].set_healthy(false);
+        assert_eq!(view.load(0), Some(0));
+        assert_eq!(
+            policy
+                .evaluate_prepared(&view, view.indices())
+                .worker_index(),
+            Some(0)
+        );
+        // A new observation is required before committing after eligibility changes.
+        let fresh = policy.selection_view(&workers, None);
+        assert_eq!(fresh.indices(), &[1]);
+        assert_eq!(
+            policy.evaluate_prepared(&fresh, &[0, 1]).worker_index(),
+            Some(1)
+        );
+        assert_eq!(policy.select_prepared(&workers, None, "prefill"), Some(1));
+    }
+
+    #[test]
+    fn prepared_live_load_selection_preserves_two_stage_reads() {
+        let (policy, workers) = cache_fixture(2, CacheAwareConfig::default());
+        workers[1].increment_load();
+        let ids = [1, 2, 3, 4];
+        let mut prepared = policy
+            .prepare_selection(
+                &workers,
+                KvRequestTokens::Shared(Some(&ids)),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        for input in [None, Some(&prepared)] {
+            let view = policy.selection_view(&workers, input);
+            assert_eq!(
+                policy
+                    .evaluate_prepared(&view, view.indices())
+                    .worker_index(),
+                Some(0)
+            );
+            // A dispatch changes loads between the legacy range and minimum scans.
+            let mut reads = [(0, 0), (1, 1), (0, 9), (1, 0)].into_iter();
+            let decision = policy.evaluate_prepared_with_load(
+                &workers,
+                input,
+                view.indices(),
+                |index| {
+                    let (expected_index, value) = reads.next().expect("unexpected load read");
+                    assert_eq!(index, expected_index);
+                    value
+                },
+                pick_tied,
+            );
+            assert!(reads.next().is_none());
+            assert_eq!((decision.min_load, decision.max_load), (0, 1));
+            assert_eq!(policy.commit_prepared(decision, "regular"), Some(1));
+        }
+
+        prepared.candidates.get_mut(workers[1].url()).unwrap().1 = 1.0;
+        // With affinity, the second scan reads only the best-prefix candidate.
+        let mut reads = [(0, 0), (1, 1), (1, 9)].into_iter();
+        let decision = policy.evaluate_prepared_with_load(
+            &workers,
+            Some(&prepared),
+            &[0, 1],
+            |index| {
+                let (expected_index, value) = reads.next().expect("unexpected load read");
+                assert_eq!(index, expected_index);
+                value
+            },
+            pick_tied,
+        );
+        assert!(reads.next().is_none());
+        assert_eq!(
+            (decision.worker_index(), decision.outcome),
+            (Some(1), Some("prefix_hit"))
+        );
+    }
+
+    #[test]
+    fn prepared_baseline_keeps_strict_thresholds_and_missing_input_fallback() {
+        let (policy, workers) = cache_fixture(
+            2,
+            CacheAwareConfig {
+                balance_abs_threshold: 1,
+                balance_rel_threshold: 2.0,
+                ..Default::default()
+            },
+        );
+        let ids = [1, 2, 3, 4];
+        policy.select_worker_with_inputs(
+            std::slice::from_ref(&workers[1]),
+            KvRequestTokens::Shared(Some(&ids[..2])),
+            None,
+            None,
+            None,
+            "prefill",
+        );
+        workers[1].increment_load();
+        let mut prepared = policy
+            .prepare_selection(
+                &workers,
+                KvRequestTokens::Shared(Some(&ids)),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let view = policy.selection_view(&workers, Some(&prepared));
+        let equal_threshold = policy.evaluate_prepared(&view, view.indices());
+        assert_eq!(
+            (equal_threshold.worker_index(), equal_threshold.outcome),
+            (Some(0), Some("prefix_miss"))
+        );
+
+        // Use full affinity, while 4 == 2 * relative threshold keeps the pool balanced.
+        prepared.candidates.get_mut(workers[1].url()).unwrap().1 = 1.0;
+        for _ in 0..2 {
+            workers[0].increment_load();
+        }
+        for _ in 0..3 {
+            workers[1].increment_load();
+        }
+        let view = policy.selection_view(&workers, Some(&prepared));
+        let equal_relative = policy.evaluate_prepared(&view, view.indices());
+        assert_eq!(
+            (equal_relative.worker_index(), equal_relative.outcome),
+            (Some(1), Some("prefix_hit"))
+        );
+        workers[1].increment_load();
+        let view = policy.selection_view(&workers, Some(&prepared));
+        let imbalanced = policy.evaluate_prepared(&view, view.indices());
+        assert_eq!(
+            (imbalanced.worker_index(), imbalanced.outcome),
+            (Some(0), Some("load_imbalance"))
+        );
+
+        // A partial preparation falls back for the whole subset and earns no tree update.
+        prepared.candidates.remove(workers[0].url());
+        let view = policy.selection_view(&workers, Some(&prepared));
+        let missing = policy.evaluate_prepared(&view, view.indices());
+        assert_eq!(
+            (missing.worker_index(), missing.outcome),
+            (Some(0), Some("missing_tokens"))
+        );
+        assert!(missing.cache_update.is_none());
+        let complete_subset = policy.evaluate_prepared(&view, &[1]);
+        assert_eq!(
+            (complete_subset.worker_index(), complete_subset.outcome),
+            (Some(1), Some("prefix_hit"))
+        );
+    }
+
+    #[test]
+    fn prepared_empty_selection_preserves_missing_token_metric() {
+        let (policy, workers) = cache_fixture(1, CacheAwareConfig::default());
+        let ids = [1];
+        let prepared = policy
+            .prepare_selection(
+                &workers,
+                KvRequestTokens::Shared(Some(&ids)),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        assert_eq!(
+            policy.select_prepared(&[], Some(&prepared), "prefill"),
+            None
+        );
+        assert!(handle.render().is_empty());
+        assert_eq!(policy.select_prepared(&[], None, "prefill"), None);
+        let rendered = handle.render();
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("vllm_router_prefix_routing_decisions_total")
+                    && line.contains("outcome=\"missing_tokens\"")
+                    && line.ends_with(" 1")
+            }),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("vllm_router_processed_requests_total"));
     }
 
     #[test]

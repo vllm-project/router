@@ -90,6 +90,427 @@ mod test_pd_routing {
     }
 
     #[tokio::test]
+    #[ignore = "controlled HTTP 2P/2D stress; not a GPU performance benchmark"]
+    async fn http_pd_cache_aware_pr1_stress() {
+        use axum::{
+            body::Body,
+            extract::State,
+            http::{HeaderMap, Method, StatusCode},
+            response::IntoResponse,
+            routing::{get, post},
+            Json, Router,
+        };
+        use futures_util::{stream, StreamExt};
+        use parking_lot::Mutex;
+        use serde_json::{json, Value};
+        use std::collections::{HashMap, HashSet};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use std::time::{Duration, Instant};
+
+        const PROMPT: &str = "shared HTTP PD cache-aware stress prefix and request";
+
+        struct Handoff {
+            marker: String,
+            prefill: &'static str,
+            decode: Option<&'static str>,
+            params: Value,
+        }
+        #[derive(Default)]
+        struct Observed {
+            handoffs: Mutex<HashMap<String, Handoff>>,
+            tokenized: Mutex<HashMap<&'static str, usize>>,
+            block_id: AtomicUsize,
+        }
+        #[derive(Clone)]
+        struct Engine {
+            name: &'static str,
+            observed: Arc<Observed>,
+        }
+
+        async fn tokenize(State(engine): State<Engine>, Json(body): Json<Value>) -> Json<Value> {
+            assert_eq!(body["model"], "stress-model");
+            assert_eq!(body["prompt"], PROMPT);
+            let tokens: Vec<u32> = std::iter::once(1)
+                .chain(PROMPT.bytes().map(|byte| u32::from(byte) + 256))
+                .collect();
+            *engine
+                .observed
+                .tokenized
+                .lock()
+                .entry(engine.name)
+                .or_default() += 1;
+            Json(json!({"count": tokens.len(), "tokens": tokens, "max_model_len": 4096}))
+        }
+
+        async fn generate(
+            State(engine): State<Engine>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            let request_id = headers["x-request-id"].to_str().unwrap().to_owned();
+            assert!(request_id.contains("___prefill_addr_"), "{request_id}");
+            assert!(request_id.contains("___decode_addr_"), "{request_id}");
+            assert_eq!(body["prompt"], PROMPT);
+            let marker = body["user"].as_str().unwrap().to_owned();
+            if engine.name.starts_with('p') {
+                assert_eq!(body["stream"], false);
+                assert_eq!(body["max_tokens"], 1);
+                assert_eq!(body["kv_transfer_params"]["do_remote_decode"], true);
+                let block = engine.observed.block_id.fetch_add(1, Ordering::Relaxed);
+                let params = json!({
+                    "do_remote_prefill": true,
+                    "do_remote_decode": false,
+                    "remote_engine_id": engine.name,
+                    "remote_block_ids": [[block]],
+                    "remote_host": "127.0.0.1",
+                    "remote_port": 9100,
+                    "tp_size": 1,
+                });
+                assert!(
+                    engine
+                        .observed
+                        .handoffs
+                        .lock()
+                        .insert(
+                            request_id.clone(),
+                            Handoff {
+                                marker,
+                                prefill: engine.name,
+                                decode: None,
+                                params: params.clone()
+                            },
+                        )
+                        .is_none(),
+                    "duplicate prefill request_id {request_id}"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                return Json(json!({
+                    "id": request_id,
+                    "kv_transfer_params": params,
+                    "choices": [{"text": "", "index": 0, "finish_reason": "length"}],
+                    "usage": {"prompt_tokens": 64, "completion_tokens": 1, "total_tokens": 65},
+                }))
+                .into_response();
+            }
+
+            {
+                let mut handoffs = engine.observed.handoffs.lock();
+                let handoff = handoffs
+                    .get_mut(&request_id)
+                    .expect("decode has no matching prefill");
+                assert_eq!(
+                    handoff.marker, marker,
+                    "request_id matched the wrong client request"
+                );
+                assert_eq!(
+                    body["kv_transfer_params"], handoff.params,
+                    "KV handoff changed"
+                );
+                assert!(
+                    handoff.decode.replace(engine.name).is_none(),
+                    "duplicate decode dispatch"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let result = json!({
+                "id": request_id,
+                "choices": [{"text": format!("decoded:{marker}"), "index": 0, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 64, "completion_tokens": 8, "total_tokens": 72},
+            });
+            if body["stream"] == true {
+                let frames =
+                    stream::iter([format!("data: {result}\n\n"), "data: [DONE]\n\n".to_owned()])
+                        .then(|frame| async move {
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(frame))
+                        });
+                return (
+                    [("content-type", "text/event-stream")],
+                    Body::from_stream(frames),
+                )
+                    .into_response();
+            }
+            Json(result).into_response()
+        }
+
+        async fn request(
+            router: &dyn vllm_router_rs::routers::RouterTrait,
+            marker: String,
+            streaming: bool,
+        ) {
+            let response = router.route_transparent(None, "/v1/completions", &Method::POST, json!({
+                "model": "stress-model", "prompt": PROMPT, "user": marker,
+                "max_tokens": 8, "stream": streaming,
+                "stream_options": if streaming { json!({"include_usage": true}) } else { Value::Null },
+            })).await;
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 32 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(text.contains(&format!("decoded:{marker}")), "{text}");
+            if streaming {
+                assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+            } else {
+                let result: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(result["choices"][0]["text"], format!("decoded:{marker}"));
+            }
+        }
+
+        fn samples(text: &str, name: &str, labels: &[&str]) -> Vec<f64> {
+            text.lines()
+                .filter(|line| {
+                    line.starts_with(name) && labels.iter().all(|label| line.contains(label))
+                })
+                .map(|line| {
+                    line.split_whitespace()
+                        .last()
+                        .unwrap()
+                        .parse::<f64>()
+                        .unwrap()
+                })
+                .collect()
+        }
+        fn delta(before: &str, after: &str, name: &str, labels: &[&str]) -> f64 {
+            samples(after, name, labels).iter().sum::<f64>()
+                - samples(before, name, labels).iter().sum::<f64>()
+        }
+        let parameter = |name: &str, default| {
+            std::env::var(name).map_or(default, |value| value.parse::<usize>().unwrap())
+        };
+        let rounds = parameter("ROUTER_PD_STRESS_ROUNDS", 24);
+        let concurrency = parameter("ROUTER_PD_STRESS_CONCURRENCY", 16);
+        assert!(rounds > 0 && concurrency > 0);
+        let requests = rounds.checked_mul(concurrency).unwrap();
+        // The default current-thread runtime also keeps request metrics under this recorder.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let _recording = metrics::set_default_local_recorder(&recorder);
+        let observed = Arc::new(Observed::default());
+        let mut app = Router::new();
+        for name in ["p0", "p1", "d0", "d1"] {
+            let backend = Router::new()
+                .route("/health", get(|| async { "ok" }))
+                .route("/v1/models", get(|| async { Json(json!({"data": [{"id": "stress-model", "parent": null}]})) }))
+                .route("/get_server_info", get(move || async move { Json(json!({
+                    "model_id": "stress-model", "instance_id": name, "block_size": 16,
+                    "vllm_config": {"model_config": {"model": "stress-model", "max_model_len": 4096},
+                        "cache_config": {"block_size": 16},
+                        "parallel_config": {"tensor_parallel_size": 1, "data_parallel_size": 1}},
+                })) }))
+                .route("/get_model_info", get(|| async { Json(json!({"model_path": "stress-model", "is_generation": true})) }))
+                .route("/kv_event_sources", get(|| async { Json(json!({})) }))
+                .route("/v1/completions/render", post(|| async { StatusCode::NOT_FOUND }))
+                .route("/tokenize", post(tokenize))
+                .route("/v1/completions", post(generate))
+                .with_state(Engine { name, observed: observed.clone() });
+            app = app.nest(&format!("/{name}"), backend);
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let policy = PolicyConfig::CacheAware {
+            cache_threshold: 0.3,
+            balance_abs_threshold: 0,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 1 << 22,
+        };
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(format!("{base}/p0"), None), (format!("{base}/p1"), None)],
+                decode_urls: vec![format!("{base}/d0"), format!("{base}/d1")],
+                prefill_policy: Some(policy.clone()),
+                decode_policy: Some(policy.clone()),
+                discovery_address: None,
+            },
+            policy,
+            kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            connection_mode: ConnectionMode::Http,
+            disable_retries: true,
+            disable_circuit_breaker: true,
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let context = Arc::new(
+            vllm_router_rs::server::AppContext::new(config, client, 64, None, vec![]).unwrap(),
+        );
+        let router = RouterFactory::create_router(&context).await.unwrap();
+        stream::iter(0..2)
+            .map(|index| request(router.as_ref(), format!("warmup-{index}"), index == 0))
+            .buffer_unordered(2)
+            .collect::<Vec<_>>()
+            .await;
+        observed.handoffs.lock().clear();
+        observed.tokenized.lock().clear();
+        let before = metrics.render();
+        let started = Instant::now();
+        let mut completed = 0;
+        for round in 0..rounds {
+            let finished = stream::iter(0..concurrency)
+                .map(|index| {
+                    let sequence = round * concurrency + index;
+                    request(
+                        router.as_ref(),
+                        format!("stress-{sequence}"),
+                        sequence % 2 == 0,
+                    )
+                })
+                .buffer_unordered(concurrency)
+                .collect::<Vec<_>>()
+                .await;
+            completed += finished.len();
+        }
+        assert_eq!(completed, requests);
+        let handoffs = observed.handoffs.lock();
+        assert_eq!(handoffs.len(), requests);
+        let markers: HashSet<_> = handoffs
+            .values()
+            .map(|handoff| handoff.marker.as_str())
+            .collect();
+        assert_eq!(markers.len(), requests);
+        assert!(handoffs.values().all(|handoff| {
+            matches!(handoff.prefill, "p0" | "p1") && matches!(handoff.decode, Some("d0" | "d1"))
+        }));
+        let used_prefills: HashSet<_> = handoffs.values().map(|handoff| handoff.prefill).collect();
+        let used_decodes: HashSet<_> = handoffs
+            .values()
+            .map(|handoff| handoff.decode.unwrap())
+            .collect();
+        // Small runs remain useful smoke tests; larger waves must exercise both pools fully.
+        if concurrency >= 8 && rounds >= 2 {
+            assert_eq!(
+                used_prefills.len(),
+                2,
+                "stress never dispatched to both prefills"
+            );
+            assert_eq!(
+                used_decodes.len(),
+                2,
+                "stress never dispatched to both decodes"
+            );
+        }
+        let tokenized = observed.tokenized.lock();
+        for name in ["p0", "p1", "d0", "d1"] {
+            assert!(
+                tokenized.get(name).copied().unwrap_or(0) >= requests,
+                "{name} missed effective input preparation"
+            );
+        }
+        let rendered = metrics.render();
+        let mut commit_counts = serde_json::Map::new();
+        for (stage, names) in [("prefill", ["p0", "p1"]), ("decode", ["d0", "d1"])] {
+            let stage_label = format!("stage=\"{stage}\"");
+            let selections = delta(
+                &before,
+                &rendered,
+                "vllm_router_prefix_routing_decisions_total",
+                &["policy=\"cache_aware\"", stage_label.as_str()],
+            );
+            assert_eq!(
+                selections, requests as f64,
+                "{stage} must commit exactly once per request"
+            );
+            let hits = delta(
+                &before,
+                &rendered,
+                "vllm_router_prefix_routing_decisions_total",
+                &[
+                    "policy=\"cache_aware\"",
+                    stage_label.as_str(),
+                    "outcome=\"prefix_hit\"",
+                ],
+            );
+            assert!(
+                hits > 0.0,
+                "no real {stage} prefix hit during stress: {rendered}"
+            );
+            let missing = delta(
+                &before,
+                &rendered,
+                "vllm_router_prefix_routing_decisions_total",
+                &[
+                    "policy=\"cache_aware\"",
+                    stage_label.as_str(),
+                    "outcome=\"missing_tokens\"",
+                ],
+            );
+            assert_eq!(missing, 0.0, "{stage} silently used missing-token fallback");
+            let worker_deltas = |name: &str, policy_label: bool| -> f64 {
+                names
+                    .iter()
+                    .map(|worker| {
+                        let worker_label = format!("worker=\"{base}/{worker}\"");
+                        let labels = if policy_label {
+                            vec![worker_label.as_str(), "policy=\"cache_aware\""]
+                        } else {
+                            vec![worker_label.as_str()]
+                        };
+                        delta(&before, &rendered, name, &labels)
+                    })
+                    .sum()
+            };
+            let processed = worker_deltas("vllm_router_processed_requests_total", false);
+            let policy_decisions = worker_deltas("vllm_router_policy_decisions_total", true);
+            assert_eq!(
+                processed, requests as f64,
+                "duplicate or missing {stage} processed accounting"
+            );
+            assert_eq!(
+                policy_decisions, requests as f64,
+                "duplicate or missing {stage} policy commit"
+            );
+            commit_counts.insert(stage.to_owned(), json!({
+                "selections": selections, "processed": processed, "policy_decisions": policy_decisions,
+                "prefix_hits": hits, "missing_tokens": missing,
+            }));
+        }
+        for name in [
+            "vllm_router_pd_prefill_occupancy",
+            "vllm_router_pd_active_prefill_tokens",
+            "vllm_router_pd_unknown_prefill_requests",
+            "vllm_router_pd_pending_decode_requests",
+            "vllm_router_pd_active_decode_requests",
+        ] {
+            let values = samples(&rendered, name, &[]);
+            assert!(!values.is_empty(), "missing accounting metric {name}");
+            assert!(
+                values.iter().all(|value| *value == 0.0),
+                "{name}: {values:?}"
+            );
+        }
+        let workers = context.worker_registry.get_all();
+        assert_eq!(workers.len(), 4);
+        assert!(workers.iter().all(|worker| worker.load() == 0));
+        println!(
+            "PD_PRESSURE_STRESS_RESULT {}",
+            json!({
+                "kind": "http_pd", "rounds": rounds, "concurrency": concurrency,
+                "requests": requests, "completed": completed, "handoffs_verified": handoffs.len(),
+                "final_occupancy": 0, "wall_seconds": started.elapsed().as_secs_f64(),
+                "workers_used": {"prefill": used_prefills.len(), "decode": used_decodes.len()},
+                "commit_counts": commit_counts,
+                "fixture": "HTTP NIXL pull mocks; no GPU or real KV transfer",
+            })
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn test_pd_usage_through_sequential_and_nixl_push_router() {
         use axum::{
             http::{Method, StatusCode, Uri},

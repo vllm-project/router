@@ -386,9 +386,12 @@ fn select_stage(
         } else {
             context.decode_cache
         };
-        let picked = cache.select_prepared(
-            &projected,
-            prepared,
+        // PD already supplies one immutable admission load snapshot. Evaluate
+        // against that view, then publish only the actual stage decision.
+        let view = cache.selection_view(&projected, prepared);
+        let decision = cache.evaluate_prepared(&view, view.indices());
+        let picked = cache.commit_prepared(
+            decision,
             if stage == Stage::Prefill {
                 "prefill"
             } else {
@@ -3585,6 +3588,153 @@ mod admission_tests {
         }
         drop(admitted);
         assert!(manager.snapshot().is_empty());
+    }
+
+    /// Manual contention/lifecycle stress, not a model latency benchmark.
+    #[test]
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    #[ignore = "run with the PD pressure evaluation script"]
+    fn pd_cache_aware_pr1_stress() {
+        use crate::policies::{CacheAwareConfig, CacheAwarePolicy, KvRequestTokens};
+        use std::sync::Barrier;
+        use std::time::Instant;
+
+        let setting = |name: &str, default: usize, max: usize| {
+            let value = std::env::var(name)
+                .map(|value| value.parse::<usize>().expect("positive stress setting"))
+                .unwrap_or(default);
+            assert!((1..=max).contains(&value), "{name} must be in 1..={max}");
+            value
+        };
+        let rounds = setting("ROUTER_PD_STRESS_ROUNDS", 24, 10_000);
+        let concurrency = setting("ROUTER_PD_STRESS_CONCURRENCY", 16, 256);
+        let manager = Arc::new(PdLoadManager::default());
+        let p = pool("stress-p", 2);
+        let d = pool("stress-d", 2);
+        let config = CacheAwareConfig {
+            balance_abs_threshold: 1,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let prefill_policy = CacheAwarePolicy::with_config(config.clone());
+        let decode_policy = CacheAwarePolicy::with_config(config);
+        let tokens: Vec<u32> = (0..128).collect();
+        let prepare = |policy: &CacheAwarePolicy, workers: &[Arc<dyn Worker>]| {
+            policy
+                .prepare_selection(
+                    workers,
+                    KvRequestTokens::Shared(Some(&tokens)),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+        };
+        let choose = || {
+            let p_cache = prepare(&prefill_policy, &p);
+            let d_cache = prepare(&decode_policy, &d);
+            let mut ctx = context();
+            ctx.prefill_cache = Some(&p_cache);
+            ctx.decode_cache = Some(&d_cache);
+            let started = Instant::now();
+            let (selection, attempt) = manager
+                .admit(|loads| {
+                    select_pd_pair(loads, &p, &d, &prefill_policy, &decode_policy, &ctx, true)
+                })
+                .unwrap();
+            let elapsed = started.elapsed().as_secs_f64() * 1_000_000.0;
+            attempt.attach_workers(
+                p[selection.prefill.worker_index].clone(),
+                d[selection.decode.worker_index].clone(),
+            );
+            (selection, attempt, elapsed)
+        };
+        // Keep one unrelated request live throughout every cancellation wave.
+        let (_, sentinel, _) = choose();
+        let sentinel_loads = manager.snapshot();
+        let started = Instant::now();
+        let mut admission_us = Vec::with_capacity(rounds * concurrency);
+        for _ in 0..rounds {
+            let barrier = Barrier::new(concurrency);
+            let admitted: Vec<_> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..concurrency)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            choose()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let snapshot = manager.snapshot();
+            assert_eq!(
+                snapshot.values().map(|s| s.prefill_requests).sum::<usize>(),
+                concurrency + 1
+            );
+            assert_eq!(
+                snapshot
+                    .values()
+                    .map(|s| s.pending_decode_requests + s.active_decode_requests)
+                    .sum::<usize>(),
+                concurrency + 1
+            );
+            for (i, (_, attempt, elapsed)) in admitted.into_iter().enumerate() {
+                admission_us.push(elapsed);
+                match i % 4 {
+                    0 => {
+                        attempt.finish_prefill();
+                        attempt.begin_decode();
+                        attempt.finish_decode();
+                        attempt.release();
+                    }
+                    1 => {
+                        // P fails before D starts; both reservations disappear.
+                        attempt.release();
+                        attempt.release();
+                    }
+                    2 => std::thread::scope(|scope| {
+                        scope.spawn(|| attempt.release());
+                        scope.spawn(|| {
+                            attempt.begin_decode();
+                            attempt.finish_prefill();
+                            attempt.finish_decode();
+                        });
+                    }),
+                    _ => {
+                        // The last handle cleans up D after P has completed.
+                        attempt.finish_prefill();
+                    }
+                }
+                drop(attempt);
+            }
+            assert_eq!(manager.snapshot(), sentinel_loads);
+            assert_eq!(p.iter().map(|w| w.load()).sum::<usize>(), 1);
+            assert_eq!(d.iter().map(|w| w.load()).sum::<usize>(), 1);
+        }
+        drop(sentinel);
+        assert!(manager.snapshot().is_empty());
+        assert!(p.iter().chain(&d).all(|w| w.load() == 0));
+        admission_us.sort_by(f64::total_cmp);
+        let percentile =
+            |percent: usize| admission_us[(admission_us.len() * percent).div_ceil(100) - 1];
+        println!(
+            "PD_PRESSURE_STRESS_RESULT {}",
+            serde_json::json!({
+                "stage": "pr1",
+                "kind": "pair_admission",
+                "rounds": rounds,
+                "concurrency": concurrency,
+                "attempts": admission_us.len(),
+                "wall_seconds": started.elapsed().as_secs_f64(),
+                "admission_p50_us": percentile(50),
+                "admission_p95_us": percentile(95),
+                "final_load_entries": manager.snapshot().len(),
+                "sentinel_preserved": true,
+                "evidence": "synthetic admission and cleanup, not TTFT",
+            })
+        );
     }
 
     #[test]
