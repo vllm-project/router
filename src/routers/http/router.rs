@@ -1591,6 +1591,7 @@ impl Router {
 
     /// Select worker for a specific model considering circuit breaker state
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     #[allow(clippy::too_many_arguments)]
     fn select_worker_for_model(
         &self,
