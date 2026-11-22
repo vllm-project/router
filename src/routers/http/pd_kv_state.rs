@@ -121,6 +121,7 @@ impl PdKvState {
     /// `prefill_policy` and `decode_policy` rank the stages that publish KV.
     /// Worker membership comes from `registry`; startup binds through the same
     /// entry point as refresh so the two cannot diverge.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn start(
         client: reqwest::Client,
         api_key: Option<String>,
