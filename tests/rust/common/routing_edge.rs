@@ -1,7 +1,7 @@
 //! Fixtures shared by the edge benchmarks and CI tests.
 //!
-//! With [`BASE_LOADS`], W1 identifies a cache hit, W3 a low-match or
-//! imbalanced selection, and W0 the fallback when W1 is unhealthy.
+//! With [`BASE_LOADS`], W1 identifies a cache hit, and W3 a low-match,
+//! imbalanced or stale-tenant selection.
 //! Routing inserts the probe, so benchmarks reset the fixture outside
 //! each timed call.
 
@@ -21,8 +21,6 @@ pub const WORKER_COUNTS: [usize; 4] = [1, 4, 16, 64];
 pub const TENANT: usize = 1;
 /// The only least-loaded worker under [`BASE_LOADS`].
 pub const MIN_LOAD: usize = 3;
-/// The first healthy worker while [`TENANT`] is down.
-pub const FIRST_HEALTHY: usize = 0;
 /// Balanced loads with W3 as the only least-loaded worker.
 pub const BASE_LOADS: [usize; WORKERS] = [1, 1, 1, 0];
 
@@ -137,6 +135,11 @@ impl CacheAwareFixture {
         self.workers[worker].set_healthy(healthy);
     }
 
+    /// Change worker loads until the next [`reset`](Self::reset).
+    pub fn set_loads(&self, loads: &[usize]) {
+        set_loads(&self.workers, loads);
+    }
+
     pub fn warm_keys(&self) -> impl Iterator<Item = &str> {
         self.warm.iter().map(|(_, key)| key.as_str())
     }
@@ -194,8 +197,7 @@ impl CacheAwareCase {
 pub fn branch(worker: usize) -> &'static str {
     match worker {
         TENANT => "W1 (cache hit)",
-        MIN_LOAD => "W3 (least loaded: low match or imbalanced)",
-        FIRST_HEALTHY => "W0 (stale-tenant fallback)",
+        MIN_LOAD => "W3 (least loaded: low match, imbalanced or stale tenant)",
         _ => "an unexpected worker",
     }
 }

@@ -65,8 +65,10 @@ class RouterManager:
                 "--policy",
                 policy,
             ]
-        # Avoid Prometheus port collisions by assigning a free port per router
         prom_port = find_free_port()
+        # The API port isn't bound yet, so the allocator can return it again.
+        while prom_port == port:
+            prom_port = find_free_port()
         cmd.extend(
             ["--prometheus-port", str(prom_port), "--prometheus-host", "127.0.0.1"]
         )

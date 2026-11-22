@@ -48,6 +48,7 @@ use self::tree::{node_bytes, Hit, Namespace, Node, Step, Tree};
 
 mod boundary;
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests;
 mod tree;
 

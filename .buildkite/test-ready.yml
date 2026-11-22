@@ -79,9 +79,7 @@ steps:
                 - -c
                 - |
                   source .buildkite/scripts/install_packages.sh python
-                  pytest tests/python/ -v --ignore=tests/python/e2e -m "ready and cpu" --cov=vllm_router --cov-report=xml --cov-report=term
-        artifact_paths:
-          - "coverage.xml"
+                  pytest tests/python/ -v --ignore=tests/python/e2e -m "ready and cpu"
         agents:
           queue: "medium_cpu_queue_premerge"
 
