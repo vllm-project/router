@@ -407,7 +407,7 @@ async fn delayed_replay_applies_gap_batch_and_drains_the_live_queue() {
 async fn repeated_live_buffer_overflow_does_not_exhaust_replay() {
     use super::super::transport::MAX_PENDING_LIVE_FRAMES;
 
-    let tcp = TcpReplay::with_hwm(4096);
+    let tcp = TcpReplay::with_hwm((MAX_PENDING_LIVE_FRAMES * 2) as i32);
     let index = Arc::new(full_binding(target("live-backpressure"), BLOCK_SIZE));
     let _handle = tcp.start_with_recovery(index.clone(), None, true);
     let empty = batch_payload(&[]);

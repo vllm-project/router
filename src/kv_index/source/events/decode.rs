@@ -1,20 +1,12 @@
-//! Bounded structural decoding into the shared wire contract.
+//! Structural decoding into the shared wire contract.
 use std::{collections::HashSet, io::Cursor};
 
 use crate::kv_index::wire::{KVEvent, KVEventBatch};
 use rmpv::Value;
 use serde::Deserialize;
 
-const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
-
 /// Decode atomically without conflating structural validity with device admission.
-/// The payload byte cap is checked before parsing; nesting depth is limited
-/// during each parse. The event count is checked after materializing the Value
-/// tree. These limits do not constitute a hard decoded-heap budget.
 pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
-    if payload.len() > MAX_PAYLOAD_BYTES {
-        return Err("KV event payload exceeds 16 MiB".into());
-    }
     // rmpv accepts Reserved as nil; rmp-serde can turn invalid strings into
     // bytes. Use it only for syntax, then retain rmpv's wire type fidelity.
     let mut syntax = rmp_serde::Deserializer::new(Cursor::new(payload));
@@ -44,9 +36,6 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
     let Value::Array(events) = batch.remove(1) else {
         return Err("KV events must be an array".into());
     };
-    if events.len() > 4096 {
-        return Err("KV event batch exceeds the event limit".into());
-    }
     let events = events
         .into_iter()
         .map(decode_event)
@@ -531,10 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_messagepack_and_trailing_bytes() {
-        assert!(decode_batch(&vec![0; MAX_PAYLOAD_BYTES + 1]).is_err());
-        let clear = Value::Map(vec![("type".into(), "AllBlocksCleared".into())]);
-        assert!(decode_batch(&encode(vec![clear; 4097], Value::from(0))).is_err());
+    fn malformed_messagepack_and_trailing_bytes() {
         let mut payload = encode(vec![stored()], Value::from(0));
         payload.push(0);
         assert!(decode_batch(&payload).is_err());
@@ -545,6 +531,40 @@ mod tests {
         let mut event = stored();
         change(&mut event, "extra_keys", deep);
         assert!(decode_batch(&encode(vec![event], Value::from(0))).is_err());
+    }
+
+    #[test]
+    fn large_eviction_batch_decodes() {
+        let removed = Value::Map(vec![
+            ("type".into(), "BlockRemoved".into()),
+            ("medium".into(), "GPU".into()),
+            (
+                "block_hashes".into(),
+                Value::Array(vec![Value::Binary(vec![7; 32])]),
+            ),
+        ]);
+        let batch = decode_batch(&encode(vec![removed; 4712], Value::from(0))).unwrap();
+        assert_eq!(batch.events.len(), 4712);
+    }
+
+    #[test]
+    fn large_event_payload_decodes() {
+        let hash_count = 16 * 1024 * 1024 / 34 + 1;
+        let removed = Value::Map(vec![
+            ("type".into(), "BlockRemoved".into()),
+            ("medium".into(), "GPU".into()),
+            (
+                "block_hashes".into(),
+                Value::Array(vec![Value::Binary(vec![7; 32]); hash_count]),
+            ),
+        ]);
+        let payload = encode(vec![removed], Value::from(0));
+        assert!(payload.len() > 16 * 1024 * 1024);
+        let batch = decode_batch(&payload).unwrap();
+        let KVEvent::BlockRemoved(event) = &batch.events[0] else {
+            panic!("removed expected")
+        };
+        assert_eq!(event.block_hashes.len(), hash_count);
     }
 
     #[test]

@@ -108,6 +108,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_buffers_more_than_1024_live_batches() {
+        let ctx = zmq::Context::new();
+        let endpoint = "inproc://kv-live-buffer-during-replay";
+        let receiver = ctx.socket(zmq::PAIR).unwrap();
+        receiver.set_linger(0).unwrap();
+        receiver.set_rcvhwm(8192).unwrap();
+        receiver.bind(endpoint).unwrap();
+        let mut monitor = ConnectionMonitor::new(&ctx, &receiver).unwrap();
+        let sender = ctx.socket(zmq::PAIR).unwrap();
+        sender.set_linger(0).unwrap();
+        sender.set_sndhwm(8192).unwrap();
+        sender.connect(endpoint).unwrap();
+        for seq in 0_i64..1025 {
+            sender
+                .send_multipart([b"topic".as_slice(), &seq.to_be_bytes(), b"event"], 0)
+                .unwrap();
+        }
+        let mut receiver = ReadableSocket::new(receiver);
+        let mut pending = PendingLive::default();
+        let replay = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Some(0)
+        };
+        let result = while_connected(
+            &mut monitor,
+            replay,
+            false,
+            &mut receiver,
+            &mut pending,
+            b"topic",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, ReplayPoll::Finished(Some(0))));
+        for seq in 0_i64..1025 {
+            assert_eq!(
+                live_sequence(&pending.pop().unwrap(), b"topic"),
+                Ok(Some(seq))
+            );
+        }
+        assert!(pending.pop().is_none());
+    }
+
+    #[tokio::test]
     async fn queued_and_later_messages_wake_without_losing_edges() {
         let (mut receiver, sender) = pair(false);
         // An event arriving before the wait must not be lost.
@@ -376,7 +420,7 @@ pub(super) struct PendingLive {
     bytes: usize,
 }
 
-pub(super) const MAX_PENDING_LIVE_FRAMES: usize = 1024;
+pub(super) const MAX_PENDING_LIVE_FRAMES: usize = 4096;
 
 impl PendingLive {
     pub(super) fn pop(&mut self) -> Option<Vec<Vec<u8>>> {
