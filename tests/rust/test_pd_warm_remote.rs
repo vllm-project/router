@@ -23,6 +23,7 @@ use vllm_router_rs::{
 };
 /// What a [`RecordingPrefill`] saw: request text and headers per call.
 type RecordedCalls = Arc<Mutex<Vec<(Option<String>, Option<RequestHeaders>)>>>;
+type CapabilityHook = Arc<dyn Fn() -> Option<StatusCode> + Send + Sync>;
 
 #[derive(Clone)]
 struct StateData {
@@ -33,6 +34,7 @@ struct StateData {
     partial: bool,
     fail_local: Arc<AtomicBool>,
     capability_probes: Arc<AtomicU64>,
+    on_capability_probe: Arc<Mutex<Option<CapabilityHook>>>,
     reject_status: Arc<AtomicU64>,
     large_text: Arc<AtomicUsize>,
     metrics_kv_milli: Arc<AtomicU64>,
@@ -58,6 +60,7 @@ async fn engine(p: bool, fail_warm: bool, partial: bool) -> Engine {
         partial,
         fail_local: Arc::new(AtomicBool::new(false)),
         capability_probes: Arc::new(AtomicU64::new(0)),
+        on_capability_probe: Arc::new(Mutex::new(None)),
         reject_status: Arc::new(AtomicU64::new(0)),
         large_text: Arc::new(AtomicUsize::new(0)),
         metrics_kv_milli: Arc::new(AtomicU64::new(0)),
@@ -74,6 +77,10 @@ async fn engine(p: bool, fail_warm: bool, partial: bool) -> Engine {
         }))
         .route("/pd_capabilities",get(|State(s):State<StateData>,headers:HeaderMap|async move{
             s.capability_probes.fetch_add(1,Ordering::SeqCst);
+            let hook = s.on_capability_probe.lock().unwrap().clone();
+            if let Some(status) = hook.and_then(|f| f()) {
+                return (status, "probe failed").into_response();
+            }
             if s.auth_gate.load(Ordering::SeqCst)
                 && headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()) != Some("Bearer op-key")
             {
@@ -202,6 +209,21 @@ async fn router_with_custom_prefill_policy(
         warm_router_config(prefills, d, &PolicyConfig::RoundRobin, local, pd_extra);
     let ctx = Arc::new(AppContext::new(cfg, reqwest::Client::new(), 64, None, vec![]).unwrap());
     router_with_selection(&ctx, select, prefill_urls, d).await
+}
+
+async fn router_with_registry_and_policy(
+    prefills: &[&Engine],
+    d: &Engine,
+    select: Arc<dyn LoadBalancingPolicy>,
+    local: bool,
+    pd_extra: serde_json::Value,
+) -> (VllmPDRouter, Arc<vllm_router_rs::core::WorkerRegistry>) {
+    let (cfg, prefill_urls) =
+        warm_router_config(prefills, d, &PolicyConfig::RoundRobin, local, pd_extra);
+    let ctx = Arc::new(AppContext::new(cfg, reqwest::Client::new(), 64, None, vec![]).unwrap());
+    let registry = ctx.worker_registry.clone();
+    let router = router_with_selection(&ctx, select, prefill_urls, d).await;
+    (router, registry)
 }
 
 async fn router_with_selection(
@@ -912,5 +934,119 @@ async fn selection_uses_the_cache_routing_key_when_requested() {
     assert!(
         calls[0].1.is_none(),
         "headers were not requested but were attached"
+    );
+}
+
+#[tokio::test]
+async fn cold_fallback_reselects_when_prefill_is_removed_during_warm_probe() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(true, false, true);
+    let (r, registry) =
+        router_with_registry_and_policy(&[&p0, &p1], &d, policy.clone(), false, json!({})).await;
+    let p0_url = p0.url.clone();
+    assert_eq!(registry.get_prefill_workers()[0].url(), p0_url);
+    let reg = registry.clone();
+    *p0.state.on_capability_probe.lock().unwrap() = Some(Arc::new(move || {
+        assert!(reg.remove_by_url(&p0_url).is_some());
+        Some(StatusCode::SERVICE_UNAVAILABLE)
+    }));
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-session-id", HeaderValue::from_static("session-race"));
+    let body = completion_body("race-removed", &[31, 32, 33], true, false);
+    let (status, _, resp_body) = send_completion(&r, Some(&headers), body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected cold fallback re-selection to succeed, got body: {}",
+        String::from_utf8_lossy(&resp_body)
+    );
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert!(p0.state.calls.lock().unwrap().is_empty());
+    assert_eq!(p1.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected initial + bounded re-selection: {calls:?}"
+    );
+    assert_eq!(calls[0], calls[1]);
+    assert_eq!(
+        calls[1]
+            .1
+            .as_ref()
+            .and_then(|h| h.get("x-session-id"))
+            .map(String::as_str),
+        Some("session-race")
+    );
+}
+
+#[tokio::test]
+async fn cold_fallback_reselects_when_prefill_becomes_unhealthy_during_warm_probe() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(true, false, true);
+    let (r, registry) =
+        router_with_registry_and_policy(&[&p0, &p1], &d, policy.clone(), false, json!({})).await;
+    let p0_url = p0.url.clone();
+    assert_eq!(registry.get_prefill_workers()[0].url(), p0_url);
+    let reg = registry.clone();
+    *p0.state.on_capability_probe.lock().unwrap() = Some(Arc::new(move || {
+        let worker = reg.get_by_url(&p0_url).expect("prefill worker registered");
+        worker.set_healthy(false);
+        Some(StatusCode::SERVICE_UNAVAILABLE)
+    }));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-session-id",
+        HeaderValue::from_static("session-unhealthy"),
+    );
+    let body = completion_body("race-unhealthy", &[34, 35, 36], true, false);
+    let (status, _, resp_body) = send_completion(&r, Some(&headers), body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected cold fallback re-selection to succeed, got body: {}",
+        String::from_utf8_lossy(&resp_body)
+    );
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert!(p0.state.calls.lock().unwrap().is_empty());
+    assert_eq!(p1.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected initial + bounded re-selection: {calls:?}"
+    );
+    assert_eq!(calls[0], calls[1]);
+}
+
+#[tokio::test]
+async fn cold_fallback_returns_503_when_last_prefill_leaves_during_warm_probe() {
+    let p0 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(false, false, false);
+    let (r, registry) =
+        router_with_registry_and_policy(&[&p0], &d, policy.clone(), false, json!({})).await;
+    let p0_url = p0.url.clone();
+    let reg = registry.clone();
+    *p0.state.on_capability_probe.lock().unwrap() = Some(Arc::new(move || {
+        assert!(reg.remove_by_url(&p0_url).is_some());
+        Some(StatusCode::SERVICE_UNAVAILABLE)
+    }));
+
+    let body = completion_body("race-last", &[41, 42, 43], true, false);
+    let (status, _, resp_body) = send_completion(&r, None, body).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert!(p0.state.calls.lock().unwrap().is_empty());
+    let body_text = String::from_utf8_lossy(&resp_body);
+    assert!(
+        body_text.contains("No feasible registered P/D pair"),
+        "expected early no-feasible 503 before reserve_prefill, got: {body_text}"
     );
 }

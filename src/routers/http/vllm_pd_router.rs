@@ -1554,12 +1554,13 @@ impl VllmPDRouter {
                 return Some(program_unavailable(&completion, &error));
             }
         };
-        // One selection per turn. The warm-remote attempt consumes this turn's
-        // selection, and a cold fallback dispatches the P it already chose
-        // instead of asking the policy a second time. The selection also takes
-        // the same request inputs as the cold path (prompt text or cache routing
-        // key, plus headers), so hash and cache-aware policies keep their
-        // affinity on the warm path too.
+        // Normally one selection per turn: the warm-remote attempt consumes this
+        // turn's selection and a cold fallback reuses that P instead of asking
+        // the policy again, unless the carried-over P is no longer live after
+        // awaiting warm probes (handled by one bounded re-selection below). The
+        // selection also takes the same request inputs as the cold path (prompt
+        // text or cache routing key, plus headers), so hash and cache-aware
+        // policies keep their affinity on the warm path too.
         let mut selected = None;
         if let Some(warm_remote) = &runtime.warm_remote {
             // The warm-remote protocol has no discovery incarnation fence, and
@@ -1619,14 +1620,32 @@ impl VllmPDRouter {
                     }
                     // execute() declined the warm/local protocol for this turn
                     // (request shape, engine capability): the cold path reuses
-                    // the P selected above rather than consuming a second one.
+                    // the P selected above if it is still live.
                     selected = Some(prefill_candidates[index].clone());
                 }
             }
         }
-        let Some((prefill_id, prefill_worker)) = selected
-            .or_else(|| self.select_program_prefill(&prefill_candidates, &request, path, headers))
-        else {
+        // If the warm attempt carried a P over after awaiting probes, verify it
+        // is still live before reserving a permit. When it left or became
+        // unhealthy in the meantime, refresh candidates and re-select once;
+        // the normal live path still spends a single selection.
+        let selected = match selected {
+            Some((prefill_id, prefill_worker)) if self.program_prefill_is_live(&prefill_id) => {
+                Some((prefill_id, prefill_worker))
+            }
+            Some(_) => {
+                let fresh_candidates = match self.program_prefill_candidates() {
+                    Ok(candidates) => candidates,
+                    Err(error) => {
+                        RouterMetrics::record_pd_error("server_selection");
+                        return Some(program_unavailable(&completion, &error));
+                    }
+                };
+                self.select_program_prefill(&fresh_candidates, &request, path, headers)
+            }
+            None => self.select_program_prefill(&prefill_candidates, &request, path, headers),
+        };
+        let Some((prefill_id, prefill_worker)) = selected else {
             RouterMetrics::record_pd_error("server_selection");
             return Some(program_unavailable(
                 &completion,
@@ -1783,10 +1802,9 @@ impl VllmPDRouter {
             .filter(|index| *index < workers.len())
     }
 
-    /// Recheck the bound endpoints after a capacity wait: an expired
-    /// registration or a removed worker must not receive the dispatch.
-    fn program_targets_are_live(&self, prefill_id: &str, decode_id: &str) -> bool {
-        let prefill_live = if self.use_discovery {
+    /// Check whether a bound Program prefill target is still present and available.
+    fn program_prefill_is_live(&self, prefill_id: &str) -> bool {
+        if self.use_discovery {
             self.service_registry
                 .get_prefill_instances()
                 .iter()
@@ -1800,7 +1818,13 @@ impl VllmPDRouter {
                     worker.is_available()
                         && pd_program_adapter::worker_target(worker).id == prefill_id
                 })
-        };
+        }
+    }
+
+    /// Recheck the bound endpoints after a capacity wait: an expired
+    /// registration or a removed worker must not receive the dispatch.
+    fn program_targets_are_live(&self, prefill_id: &str, decode_id: &str) -> bool {
+        let prefill_live = self.program_prefill_is_live(prefill_id);
         let decode_live = if self.use_discovery {
             pd_program_adapter::discovered_decode_instance_by_id(
                 &self.service_registry,
