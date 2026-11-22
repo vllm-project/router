@@ -400,6 +400,7 @@ impl Router {
                     crate::kv_index::HashMode::Sha256,
                 );
             supervisor.set_api_key(ctx.router_config.api_key.clone());
+            supervisor.set_strict_recovery(ctx.router_config.kv_event_strict_recovery);
             let static_sources = match &ctx.router_config.policy {
                 crate::config::PolicyConfig::KvAware {
                     static_kv_event_sources,
@@ -4271,6 +4272,27 @@ mod tests {
                         )
                         .unwrap();
                 }
+                let recovered = rmp_serde::to_vec(&(
+                    1.0,
+                    [
+                        json!({"type": "AllBlocksCleared"}),
+                        json!({
+                            "type": "BlockStored", "block_hashes": [4],
+                            "parent_block_hash": null,
+                            "token_ids": vec![4; expected as usize],
+                            "block_size": expected, "medium": "CPU",
+                            "lora_id": null, "lora_name": null
+                        }),
+                    ],
+                    3u32,
+                ))
+                .unwrap();
+                publisher
+                    .send_multipart(
+                        [b"kv/router".as_slice(), &3i64.to_be_bytes(), &recovered],
+                        0,
+                    )
+                    .unwrap();
             } else {
                 publisher
                     .send_multipart(
@@ -4286,18 +4308,19 @@ mod tests {
             let result = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     if replayed {
-                        let fresh = provider.find_tiered_matches(&query(3));
-                        if fresh.is_empty() {
+                        let recovered = provider.find_tiered_matches(&query(4));
+                        if recovered.is_empty() {
                             tokio::task::yield_now().await;
                             continue;
                         }
-                        assert_eq!(fresh.len(), 1);
-                        assert_eq!(fresh[0].target.instance_id.as_ref(), "router-source");
-                        assert_eq!(fresh[0].target.dp_rank, 3);
-                        assert_eq!(fresh[0].tier, StorageTier::HostPinned);
-                        assert_eq!(fresh[0].segments, [(0, 1)]);
+                        assert_eq!(recovered.len(), 1);
+                        assert_eq!(recovered[0].target.instance_id.as_ref(), "router-source");
+                        assert_eq!(recovered[0].target.dp_rank, 3);
+                        assert_eq!(recovered[0].tier, StorageTier::HostPinned);
+                        assert_eq!(recovered[0].segments, [(0, 1)]);
                         assert!(provider.find_tiered_matches(&query(1)).is_empty());
                         assert!(provider.find_tiered_matches(&query(2)).is_empty());
+                        assert!(provider.find_tiered_matches(&query(3)).is_empty());
                         break true;
                     }
                     let old = provider.find_tiered_matches(&query(1));
@@ -7337,6 +7360,7 @@ mod tests {
                 async move {
                     let body = if fail_body {
                         Body::from_stream(futures_util::stream::once(async {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                             Err::<bytes::Bytes, _>(std::io::Error::other("broken backend body"))
                         }))
                     } else {
