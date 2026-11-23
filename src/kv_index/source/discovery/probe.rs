@@ -184,7 +184,9 @@ pub(super) async fn fetch_kv_event_sources(
 ) -> Result<KvEventSourcesResponse, SourcesUnavailable> {
     if crate::backend::is_grpc_url(worker_url) {
         let response =
-            crate::backend::control::get_grpc_kv_event_sources(worker_url, CONTROL_TIMEOUT).await?;
+            crate::backend::control::get_grpc_kv_event_sources(worker_url, CONTROL_TIMEOUT)
+                .await
+                .map_err(|status| grpc_sources_unavailable(worker_url, status))?;
         return Ok(grpc_kv_event_source_entries(worker_url, response.sources));
     }
     let url = format!("{}/kv_event_sources", worker_url.trim_end_matches('/'));
@@ -225,11 +227,12 @@ pub(super) async fn fetch_native_sources(
     Result<Option<CacheCapabilities>, String>,
 ) {
     if crate::backend::is_grpc_url(worker_url) {
-        let response =
-            match crate::backend::control::get_grpc_kv_event_sources(worker_url, timeout).await {
-                Ok(response) => response,
-                Err(error) => return (Err(error.into()), Ok(None)),
-            };
+        let response = match crate::backend::control::get_grpc_kv_event_sources(worker_url, timeout)
+            .await
+        {
+            Ok(response) => response,
+            Err(status) => return (Err(grpc_sources_unavailable(worker_url, status)), Ok(None)),
+        };
         let rank_count = response.sources.len();
         let sources = grpc_kv_event_source_entries(worker_url, response.sources);
         if sources.len() != rank_count {
@@ -314,18 +317,18 @@ fn parse_native_layout(body: serde_json::Value) -> Result<CacheCapabilities, Str
     Ok(capability)
 }
 
-impl From<crate::backend::control::KvEventSourcesError> for SourcesUnavailable {
-    fn from(error: crate::backend::control::KvEventSourcesError) -> Self {
-        let probe = match &error {
-            crate::backend::control::KvEventSourcesError::Unimplemented => {
-                SourcesProbe::Unsupported
-            }
-            crate::backend::control::KvEventSourcesError::Other(_) => SourcesProbe::Failed,
-        };
-        Self {
-            probe,
-            detail: error.detail().to_owned(),
-        }
+fn grpc_sources_unavailable(worker_url: &str, status: tonic::Status) -> SourcesUnavailable {
+    let probe = match status.code() {
+        tonic::Code::Unimplemented => SourcesProbe::Unsupported,
+        _ => SourcesProbe::Failed,
+    };
+    SourcesUnavailable {
+        probe,
+        detail: format!(
+            "grpc GetKvEventSources {worker_url}: {:?}: {}",
+            status.code(),
+            status.message()
+        ),
     }
 }
 

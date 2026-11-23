@@ -50,30 +50,7 @@ pub async fn get_grpc_server_info(
         .map(|response| response.into_inner())
 }
 
-/// Why the optional `GetKvEventSources` RPC failed.
-///
-/// `Unimplemented` is a deployment fact, not a fault: the peer serves the
-/// Control service but predates this RPC (or keeps KV events off), so probing
-/// again cannot help and discovery records the worker as unsupported instead
-/// of warning on every pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KvEventSourcesError {
-    /// The peer does not implement the `GetKvEventSources` RPC.
-    Unimplemented,
-    /// Transport, auth, or other failure; retrying may succeed.
-    Other(String),
-}
-
-impl KvEventSourcesError {
-    pub fn detail(&self) -> &str {
-        match self {
-            Self::Unimplemented => "grpc GetKvEventSources: Unimplemented",
-            Self::Other(detail) => detail,
-        }
-    }
-}
-
-/// Additive response fields for the existing Control RPC.
+/// Event source response with the optional layout field absent from `vllm-proto` 0.2.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct KvEventSourcesResponse {
     #[prost(message, repeated, tag = "1")]
@@ -85,17 +62,16 @@ pub struct KvEventSourcesResponse {
 pub async fn get_grpc_kv_event_sources(
     worker_url: &str,
     timeout: Duration,
-) -> Result<KvEventSourcesResponse, KvEventSourcesError> {
-    let uri = grpc_connect_uri(worker_url).map_err(KvEventSourcesError::Other)?;
+) -> Result<KvEventSourcesResponse, tonic::Status> {
     let channel = control_channel(worker_url, timeout)
         .await
-        .map_err(KvEventSourcesError::Other)?;
+        .map_err(tonic::Status::unavailable)?;
     let mut client = Grpc::new(channel);
     let call = async {
         client
             .ready()
             .await
-            .map_err(|error| tonic::Status::unknown(format!("service not ready: {error}")))?;
+            .map_err(|error| tonic::Status::unavailable(format!("service not ready: {error}")))?;
         let mut request = tonic::Request::new(GetKvEventSourcesRequest {});
         request
             .extensions_mut()
@@ -108,18 +84,10 @@ pub async fn get_grpc_kv_event_sources(
             )
             .await
     };
-    match tokio::time::timeout(timeout, call).await {
-        Err(_) => Err(KvEventSourcesError::Other(format!(
-            "grpc GetKvEventSources timeout {uri}"
-        ))),
-        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
-            Err(KvEventSourcesError::Unimplemented)
-        }
-        Ok(Err(status)) => Err(KvEventSourcesError::Other(format!(
-            "grpc GetKvEventSources {uri}: {status}"
-        ))),
-        Ok(Ok(response)) => Ok(response.into_inner()),
-    }
+    let response = tokio::time::timeout(timeout, call)
+        .await
+        .map_err(|_| tonic::Status::deadline_exceeded("GetKvEventSources timed out"))??;
+    Ok(response.into_inner())
 }
 
 pub fn model_info_json(info: &ModelInfo) -> Value {
