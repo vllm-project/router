@@ -225,7 +225,9 @@ Use the checkpoint and flags from the appropriate platform table. Set `MODEL` to
 
 These recipes use vLLM 0.33.0. Leave `PYTHONHASHSEED` unset.
 
-| Checkpoint | Worker arguments in addition to the [common options](#worker-requirements) | Probe tokens | Layout |
+Choose `--max-model-len` for your workload and GPU memory. The examples use `4096`. The Qwen examples set `--prefix-match-unit 16` to hash every 16 tokens. You can omit it to use vLLM's derived hash unit. An explicit unit must divide each cacheable group's block size and satisfy the engine's cache-boundary rules.
+
+| Checkpoint | Example worker arguments in addition to the [common options](#worker-requirements) | Probe tokens | Layout |
 | --- | --- | ---: | --- |
 | Qwen3-4B-Instruct-2507 | `--block-size 16` | 129 | Automatic |
 | Qwen3.5-4B | `--max-model-len 4096 --prefix-match-unit 16` | 2001 | GPU Qwen, group size 576 |
@@ -250,7 +252,7 @@ Use the [vLLM Ascend A2 image](https://github.com/vllm-project/vllm-ascend/relea
 | [Qwen3.8-Flash-Next W4A8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.8-Flash-Next-w4a8) | HTTP colocated | 2 | 10240 | 0.93 | 4999 | A2 Qwen4Exp |
 | DeepSeek-V4-Flash-0731 W8A8 | HTTP colocated | 8 | 65536 | 0.90 | 16401 | A2 V4 Flash |
 
-Set `--tensor-parallel-size`, `--max-model-len` and `--gpu-memory-utilization` from the table.
+To reproduce these examples, pass the table values to `--tensor-parallel-size`, `--max-model-len` and `--gpu-memory-utilization`.
 
 | Checkpoint | Extra settings |
 | --- | --- |
@@ -277,7 +279,9 @@ Pass the JSON below to the worker's `--speculative-config`. Use one mode per wor
 
 ### Layout template
 
-Save this GPU Qwen3.5-4B example as `layout.json` and pass `--kv-hybrid-layout layout.json`. It uses one DP rank, 576-token group blocks, the default hash seed, and no speculative decoding. Use your worker's HTTP or gRPC URL as the key. For hybrid P/D, add the [pairing fields](#pd-layout).
+Save this GPU Qwen3.5-4B example as `layout.json` and pass `--kv-hybrid-layout layout.json`. It uses one DP rank, 576-token group blocks, 16-token hashes, the default hash seed, and no speculative decoding. Use your worker's HTTP or gRPC URL as the key. For hybrid P/D, add the [pairing fields](#pd-layout).
+
+When changing worker settings, check the effective layout. On vLLM 0.33.0, the startup log lists `kv cache group sizes` and the `vllm:cache_config_info` metric reports `hash_block_size` when available. In a static layout, use those values for `groups[].block_size` and `hash_block_size`. Set `partial_hash_hits` only if the worker uses sub-block prefix hits. If the worker reports its complete layout, use [layout discovery](#choose-a-layout-configuration).
 
 ```json
 {
