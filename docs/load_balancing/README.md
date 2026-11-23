@@ -234,6 +234,8 @@ Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyon
    - Route to worker with lowest load (shortest queue)
    - Still updates the tree to maintain cache state
 
+If several candidate workers have the same lowest load, the policy picks one of them uniformly at random.
+
 ### Best For
 
 - Workloads with repeated prompt prefixes (system prompts, few-shot examples)
@@ -267,9 +269,13 @@ vllm-router --vllm-pd-disaggregation \
 
 Prefill selection considers reusable KV and current work. Decode selection favors the least busy worker. Both stages inherit `--policy` unless overridden.
 
+Decode ranks candidates by logical context tokens, not by request count: a few long sequences and many short ones both look "busy" by count but differ in KV. A request whose prompt length the router could not measure keeps the whole pool on request counts.
+
 Configure the engines' P/D connector and enable prefix caching and KV events on prefill workers. For native Python vLLM metadata discovery, set `VLLM_SERVER_DEV_MODE=1`.
 
 If event discovery is unavailable, add `--pd-kv-events http://prefill:8000=tcp://prefill:5557` for each prefill worker.
+
+Decode is charged only for the context it newly allocates. To credit blocks a Decode engine already holds, enable KV events on Decode workers too (`--kv-events-config` with `enable_kv_cache_events`) and point `--pd-kv-events` at them. Marginal credit applies only when the prompt arrives as token IDs (gRPC, or an explicit token-id prompt); ordinary HTTP string or chat requests fall back to full context tokens, and the decision metric reports `context_tokens` rather than `context_tokens_marginal`.
 
 ### Session affinity
 
