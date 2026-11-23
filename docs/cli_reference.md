@@ -14,8 +14,9 @@ Both install an executable named `vllm-router`. Check which executable is on
 your `PATH` before copying flags between installations. Their options are
 similar, but they are not interchangeable. In particular:
 
-- Both CLIs support `kv_aware` in regular and P/D routing. The [hybrid layout options](load_balancing/kv_aware.md#layout-template) require the Rust binary.
-- Rust also exposes `rendezvous_hash`, backend selection, tracing, API-key validation URLs, history storage and profiling.
+- Rust accepts `rendezvous_hash`; Python does not. Both support `kv_aware` in regular and P/D routing. Rust also exposes backend
+  selection, tracing, API-key validation URLs, history storage and profiling.
+- [Explicit KV layouts](load_balancing/kv_aware.md#choose-a-layout-configuration) require the Rust CLI.
 - Python exposes `--mini-lb`, queue settings and the token bucket refill rate.
   The Rust CLI fixes queue size at `100`, queue timeout at `60` seconds, and
   leaves the refill rate unset (it falls back to `max_concurrent_requests`).
@@ -136,7 +137,7 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--decode` | `string (repeatable)` | `[]` | `string (repeatable)` | `unset` | Add one decode URL per occurrence: `--decode URL`. |
 | `--vllm-discovery-address` | `string` | `unset` | `string` | `unset` | ZMQ registration address for vLLM workers, e.g. `0.0.0.0:30001`. |
 | `--kv-connector` | `nixl, mooncake, moriio` | `nixl` | `nixl, mooncake, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. |
-| `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static KV publishers for a KV-aware prefill or decode stage. Use URL=ENDPOINT[,ENDPOINT...] in DP-rank order. Block size is 16. |
+| `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill or decode KV publishers as URL=ENDPOINT[,ENDPOINT...]; a source belongs to a stage whose policy is kv_aware. Endpoints follow DP-rank order; block size is 16. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
 discovery. For static configuration, provide both prefill and decode workers:

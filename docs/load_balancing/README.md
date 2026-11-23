@@ -14,7 +14,7 @@ the policy is the same for `grpc://host:port`.
 | `consistent_hash` | Multi-turn conversations, KV cache reuse | Yes | No |
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
-| `kv_aware` | KV reuse from worker events | Optional | Yes |
+| `kv_aware` | KV reuse and stage-aware load scoring | Optional | Yes |
 
 ---
 
