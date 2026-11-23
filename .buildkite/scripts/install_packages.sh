@@ -10,6 +10,7 @@
 #
 # rust and nvidia_pd install apt packages from ci_apt_packages.conf.
 # router-bin downloads target/release/vllm-router and checks that it runs.
+# Names under .buildkite/requirements/ install only that Python dependency set.
 # lm-eval installs the ROCm accuracy harness; vLLM and MoRI stay in the image.
 # A sourced python call downloads the binary, creates /tmp/venv, and runs
 # pip install -e .[dev]. python-wheel uses the same apt set and venv, then
@@ -40,7 +41,7 @@ activate_venv() {
 }
 
 if [ "$#" -ne 1 ] || [ -z "${1}" ]; then
-  echo "usage: install_packages.sh <rust|nvidia_pd|router-bin|lm-eval|python|python-wheel>" >&2
+  echo "usage: install_packages.sh <name> (see script modes and requirements/)" >&2
   exit 1
 fi
 
@@ -57,6 +58,12 @@ if [ "${name}" = "lm-eval" ]; then
     requests \
     openai \
     'lm-eval[api]==0.4.12'
+  exit 0
+fi
+
+requirements="$(dirname "${script_path}")/../requirements/${name}.txt"
+if [ -f "${requirements}" ]; then
+  python3 -m pip install --disable-pip-version-check --quiet -r "${requirements}"
   exit 0
 fi
 
@@ -90,6 +97,7 @@ if [ -z "${packages}" ]; then
   echo "  router-bin"
   echo "  lm-eval"
   echo "  python-wheel"
+  echo "Python dependency sets: ${root}/requirements/*.txt"
   exit 1
 fi
 

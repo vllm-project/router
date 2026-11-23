@@ -1,0 +1,3 @@
+# Versions resolved during validation against the pinned ROCm image.
+pytest==9.1.1
+requests==2.34.2
