@@ -142,10 +142,10 @@ def shared_rocm_step(
         raise SystemExit("shared GPU step requires a non-empty command")
     # Preserve the original execution budget separately from the six-hour
     # shared-resource wait. The host supervisor also bounds lease lifetime.
-    merged["timeout_in_minutes"] = execution_minutes + 390
+    merged["timeout_in_minutes"] = execution_minutes + 360 + 30  # lease wait + setup
     merged["command"] = (
-        ': "$${AMD_CI_GPU_LEASE_ID:?shared GPU admission hook is missing}"\n'
-        f"python3 -c {shlex.quote(SHARED_GPU_DEVICE_COUNT_CHECK)}\n"
+        ': "$${AMD_CI_GPU_LEASE_ID:?shared GPU admission hook is missing}" &&\n'
+        f"python3 -c {shlex.quote(SHARED_GPU_DEVICE_COUNT_CHECK)} &&\n"
         f"timeout --signal=TERM --kill-after=60s {execution_minutes * 60} "
         f"bash -euo pipefail -c {shlex.quote(command)}"
     )

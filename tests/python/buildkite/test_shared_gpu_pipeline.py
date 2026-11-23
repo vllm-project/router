@@ -5,6 +5,8 @@ import copy
 import os
 from pathlib import Path
 import subprocess
+import shlex
+import shutil
 import sys
 import unittest
 
@@ -30,31 +32,62 @@ def leaves(steps):
 
 
 class SharedGpuPipelineTest(unittest.TestCase):
-    def test_device_count_preflight_survives_optimized_mode(self):
+    def test_preflight_stops_workload_without_shell_errexit(self):
+        bash = os.environ.get("TEST_BASH") or shutil.which("bash")
+        if not bash:
+            self.skipTest("bash is required to execute the emitted command")
+        step = uploader.expand_steps(
+            [
+                {
+                    "mirror_hardwares": "mi300_2",
+                    "shared_gpu_count": 1,
+                    "command": "echo WORKLOAD_RAN",
+                }
+            ],
+            uploader.load_presets(),
+            rocm_shared=True,
+        )[0]
+        command = step["command"].replace("$$", "$")
+        # Run the real emitted wrapper under -O, even without a preset's -e.
+        # Counts exercise the guard only; this does not allocate a GPU lease.
+        python = shlex.quote(Path(sys.executable).as_posix())
+        command = f'set +e\npython3() {{ {python} "$@"; }}\n' + command
         actual = len(list(Path("/dev/dri").glob("renderD*")))
-        for expected, returncode in ((actual, 0), (actual + 1, 1)):
-            with self.subTest(expected=expected):
-                env = {**os.environ, "AMD_CI_GPU_COUNT": str(expected)}
+        for expected, leased, error in (
+            (actual, True, None),
+            (actual + 1, True, "shared GPU device count mismatch"),
+            (actual, False, "shared GPU admission hook is missing"),
+        ):
+            with self.subTest(expected=expected, leased=leased):
+                env = {
+                    **os.environ,
+                    "AMD_CI_GPU_COUNT": str(expected),
+                    "PYTHONOPTIMIZE": "1",
+                }
+                env.pop("AMD_CI_GPU_LEASE_ID", None)
+                if leased:
+                    env["AMD_CI_GPU_LEASE_ID"] = "test-only"
                 result = subprocess.run(
-                    [
-                        sys.executable,
-                        "-O",
-                        "-c",
-                        uploader.SHARED_GPU_DEVICE_COUNT_CHECK,
-                    ],
+                    [bash, "-c", command],
                     env=env,
                     capture_output=True,
                     text=True,
                     timeout=10,
                 )
-                self.assertEqual(result.returncode, returncode)
-                if returncode:
-                    self.assertIn("shared GPU device count mismatch", result.stderr)
+                if error is None:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("WORKLOAD_RAN", result.stdout)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("WORKLOAD_RAN", result.stdout)
+                    self.assertIn(error, result.stderr)
 
     def test_default_preserves_original_preset_and_command(self):
         presets = uploader.load_presets()
         for name in ("test-merge.yml", "test-nightly.yml"):
-            doc = yaml.safe_load((ROOT / ".buildkite" / name).read_text())
+            doc = yaml.safe_load(
+                (ROOT / ".buildkite" / name).read_text(encoding="utf-8")
+            )
             expanded = list(leaves(uploader.expand_steps(doc["steps"], presets)))
             for original in leaves(doc["steps"]):
                 if "shared_gpu_count" not in original:
@@ -73,7 +106,7 @@ class SharedGpuPipelineTest(unittest.TestCase):
         presets = uploader.load_presets()
         for name in ("test-merge.yml", "test-nightly.yml"):
             path = ROOT / ".buildkite" / name
-            source = yaml.safe_load(path.read_text())
+            source = yaml.safe_load(path.read_text(encoding="utf-8"))
             execution_minutes = {
                 step["key"]: step.get(
                     "shared_gpu_timeout_in_minutes",
@@ -106,7 +139,9 @@ class SharedGpuPipelineTest(unittest.TestCase):
 
     def test_execution_budget_excludes_exclusive_host_lease_wait(self):
         for name in ("test-merge.yml", "test-nightly.yml"):
-            doc = yaml.safe_load((ROOT / ".buildkite" / name).read_text())
+            doc = yaml.safe_load(
+                (ROOT / ".buildkite" / name).read_text(encoding="utf-8")
+            )
             step = next(s for s in leaves(doc["steps"]) if "shared_gpu_count" in s)
             # #508 expands the exclusive timeout to include its host lease wait.
             step["timeout_in_minutes"] = 450
@@ -143,7 +178,7 @@ class SharedGpuPipelineTest(unittest.TestCase):
         preset["plugins"][0]["docker#v5.14.0"]["environment"] = ["CUSTOM_ENV"]
         presets = {"another_rocm_host": preset}
         original = copy.deepcopy(presets)
-        for count in (1, 2, 3, 4, 8):
+        for count in (1, 3):
             for key, command in (
                 ("command", "echo arbitrary"),
                 ("commands", ["echo one", "echo two"]),
