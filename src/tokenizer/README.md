@@ -998,12 +998,24 @@ Prints estimated retained bytes per entry for each prompt size before running.
 ### Metrics
 
 **Metric Names (via TokenizerMetrics):**
+- `vllm_tokenizer_encode_duration_seconds`
+- `vllm_tokenizer_decode_duration_seconds`
+- `vllm_tokenizer_tokens_per_encode`
+- `vllm_tokenizer_chars_per_encode`
+- `vllm_tokenizer_factory_load_duration_seconds`
+- `vllm_tokenizer_stop_sequence_detected`
+- `vllm_tokenizer_stream_incomplete_utf8_total`
 - `vllm_tokenizer_cache_hits_total`
 - `vllm_tokenizer_cache_misses_total`
 - `vllm_tokenizer_cache_evictions_total`
 - `vllm_tokenizer_cache_oversized_total`
 - `vllm_tokenizer_cache_entries` (gauge, total over live caches)
 - `vllm_tokenizer_cache_bytes` (gauge, estimated, total over live caches)
+
+**Labels:**
+- `tokenizer_type`: huggingface, tiktoken, mock
+- `operation`: encode, decode, factory_load
+- `error_type`: Various error conditions
 
 ### Failure Modes
 

@@ -827,7 +827,6 @@ impl PdRouterBase {
                 prefill_score = ?selection.prefill.score,
                 decode_score = ?selection.decode.score,
                 decode_sticky = ?selection.decode.fallback_reason,
-                wall_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64,
                 ?selection,
                 "P/D admission"
             );

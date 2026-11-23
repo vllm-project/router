@@ -304,6 +304,7 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate routing mode configuration
     fn validate_mode(mode: &RoutingMode, has_service_discovery: bool) -> ConfigResult<()> {
         match mode {
             RoutingMode::Regular { worker_urls } => {
@@ -408,6 +409,7 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate policy configuration
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
             PolicyConfig::Random | PolicyConfig::RoundRobin => {
@@ -514,6 +516,7 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate server configuration
     fn validate_server_settings(config: &RouterConfig) -> ConfigResult<()> {
         if config.port == 0 {
             return Err(ConfigError::InvalidValue {
@@ -558,6 +561,7 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate service discovery configuration
     fn validate_discovery(discovery: &DiscoveryConfig, mode: &RoutingMode) -> ConfigResult<()> {
         if !discovery.enabled {
             return Ok(()); // No validation needed if disabled
@@ -607,6 +611,7 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate metrics configuration
     fn validate_metrics(metrics: &MetricsConfig) -> ConfigResult<()> {
         if metrics.port == 0 {
             return Err(ConfigError::InvalidValue {
@@ -627,6 +632,7 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate retry configuration
     fn validate_retry(retry: &RetryConfig) -> ConfigResult<()> {
         if retry.max_retries < 1 {
             return Err(ConfigError::InvalidValue {
@@ -666,6 +672,7 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate circuit breaker configuration
     fn validate_circuit_breaker(cb: &CircuitBreakerConfig) -> ConfigResult<()> {
         if cb.failure_threshold < 1 {
             return Err(ConfigError::InvalidValue {
@@ -698,6 +705,7 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
         if let Some(program) = &config.program_scheduling {
             let pd_mode = matches!(config.mode, RoutingMode::VllmPrefillDecode { .. });
@@ -1075,6 +1083,7 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate URL format
     fn validate_urls(urls: &[String]) -> ConfigResult<()> {
         for url in urls {
             if url.is_empty() {

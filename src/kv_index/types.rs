@@ -56,18 +56,6 @@ pub enum StorageTier {
     External,
 }
 
-/// Warn once when an unrecognized medium cannot be indexed.
-fn warn_unknown_medium(medium: &str) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            medium,
-            "unknown KV cache medium; treating it as unaddressable"
-        );
-    }
-}
-
 impl StorageTier {
     /// Shared ordering for selecting the fastest copy and pricing a restore.
     pub(crate) fn rank(self) -> u8 {
@@ -103,7 +91,6 @@ impl StorageTier {
                 return Some(tier);
             }
         }
-        warn_unknown_medium(medium);
         None
     }
 }

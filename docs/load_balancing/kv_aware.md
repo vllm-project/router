@@ -27,16 +27,17 @@ For gRPC, use one interface for the whole worker pool. P/D uses static worker UR
 | Publisher identity | Generate a fresh topic on each worker start. Each DP rank needs its own live endpoint/topic pair and replay endpoint. |
 | HTTP text prompts | Start the worker with `--enable-scale-out` to expose rendering endpoints. |
 
-### Explicit layouts
+### Choose a layout configuration
 
-| Worker configuration | What to pass to Router |
+| Worker and deployment | What to configure in Router |
 | --- | --- |
-| Ordinary single-group full attention with event discovery, default hash root, no sliding window or speculative decoding | Omit `--kv-hybrid-layout`. Leave `PYTHONHASHSEED` unset. Router confirms the model, block size and hash root before granting reuse credit. |
-| Hybrid attention, sliding-window attention, MTP, DSpark or a custom hash seed | Use the worker's complete layout metadata when available. Otherwise save the matching [model layout](#layout-template) as `layout.json` and pass `--kv-hybrid-layout layout.json`. |
-| Stock HTTP vLLM 0.30.0 | Use the [static event setup](#static-event-endpoints). |
-| Hybrid P/D | Supply a [P/D layout file](#pd-layout) with compatible Decode addresses. Include layout details only for scored workers that cannot report them. |
+| Ordinary single-group full attention with event discovery, the default hash root, and no sliding window or speculation | Omit `--kv-hybrid-layout`. Leave `PYTHONHASHSEED` unset. Router verifies the hash contract before granting credit. |
+| Colocated workers that report a complete layout | Omit `--kv-hybrid-layout`. |
+| Hybrid P/D workers that report complete layouts | Supply a [pairing-only file](#pd-layout). |
+| A scored worker that needs an explicit layout and supports event discovery | Use the [layout template](#layout-template). Router discovers the model, publisher topic, and live and replay addresses. For hybrid P/D, add the [Prefill-to-Decode pairs](#pd-layout). |
+| A worker without event discovery, such as stock HTTP vLLM 0.30.0 | Use the [static event setup](#static-event-endpoints). |
 
-Use the worker URL as the JSON key and one rank entry per DP rank. Use the group order, sizes and effective hash settings of the deployed worker. For fixed event addresses, include the actual served model and publisher topic per rank. For a custom seed, set the same `hash_seed` in the layout and `PYTHONHASHSEED` on the worker. To score LoRA reuse, add `"adapters": [{"name": "my-adapter", "path": "/models/my-adapter"}]` beside `ranks` using the path passed to `--lora-modules`.
+An explicit layout is needed for hybrid attention, sliding-window attention, speculation, or a custom hash seed if the worker does not report its complete layout. For each explicit layout, use the deployed worker's [cache and hash settings](#layout-field-reference).
 
 ### Set the event ports
 
@@ -331,7 +332,7 @@ Pass the JSON below to the worker's `--speculative-config`. Use one mode per wor
 
 ### Layout template
 
-This example is GPU Qwen3.5-4B with event discovery. Replace the URL with your HTTP or gRPC worker address. Set `declared_groups` to the number of entries in `groups`, including scratch groups. For P/D, apply the [pairing rules](#pd-layout) to the Prefill entry and add a Decode entry if it needs an explicit layout. For fixed publishers, set the actual `model` and `publisher_topic` on each rank.
+Save this GPU Qwen3.5-4B example as `layout.json` and pass `--kv-hybrid-layout layout.json`. It uses one DP rank, 576-token group blocks, the default hash seed, and no speculative decoding. Use your worker's HTTP or gRPC URL as the key. For hybrid P/D, add the [pairing fields](#pd-layout).
 
 ```json
 {
@@ -349,7 +350,6 @@ This example is GPU Qwen3.5-4B with event discovery. Replace the URL with your H
       "partial_hash_hits": true,
       "speculative_tokens": 0,
       "hash_lookahead_tokens": 0,
-      "declared_groups": 4,
       "groups": [
         {"group_idx": 0, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "mamba_cache_mode": "align", "prefix_cacheable": true, "prefix_replay_tokens": 0},
         {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "mamba_cache_mode": "align", "prefix_cacheable": true, "prefix_replay_tokens": 0},
@@ -361,7 +361,7 @@ This example is GPU Qwen3.5-4B with event discovery. Replace the URL with your H
 }
 ```
 
-For Ascend layouts, set `"hash_seed":"0"`. Set `partial_hash_hits` to `false` unless the table specifies `true`. For each group, assign its `group_idx` and `block_size` from the layout row and copy the matching fields below. Groups use `prefix_cacheable: true` and `prefix_replay_tokens: 0` unless specified.
+For the Ascend recipes here, use `"hash_seed":"0"` to match the worker's `PYTHONHASHSEED=0`. You can omit `partial_hash_hits` for rows marked false. For each group, use the index and block size from the layout row and copy the matching fields below. Set `prefix_cacheable: true` and `prefix_replay_tokens: 0` unless specified.
 
 | Group | `kind` | `spec_type` | Extra fields |
 | --- | --- | --- | --- |
@@ -387,7 +387,6 @@ For Ascend layouts, set `"hash_seed":"0"`. Set `partial_hash_hits` to `false` un
 | A2 Qwen4Exp | 1664 colocated, 896 P/D | false | 0 Scratch 4 with speculation off, 8 with MTP. 1 Full and 2–5 Mamba (2–6 with MTP), each the hash block size. Set Full `tokens_per_state` to `"1"` and Mamba to `"-1"`. |
 | A2 V4 Flash | 8 | false | 0 Sparse MLA 512 with `"4"`, 1 Sparse MLA 16384 with `"128"`, 2–3 MLA SWA 128 with window 128, 4 MLA SWA 8 with window 8, 5 MLA SWA 32 with window 128. Set `tokens_per_state` to `"1"` on the MLA SWA groups. |
 
-
 ## CLI options
 
 Set the policy to `kv_aware` in the worker pool you want to score. The [CLI reference](../cli_reference.md) lists shared routing, worker and metrics arguments.
@@ -410,11 +409,13 @@ Set the policy to `kv_aware` in the worker pool you want to score. The [CLI refe
 
 ### Static event endpoints
 
-For stock HTTP vLLM 0.30.0, use fixed live and replay ports. Save this [Qwen3-4B](#gpu) example as `layout.json` and replace `replace-with-KV_TOPIC` with the topic from the worker terminal.
+For stock HTTP vLLM 0.30.0, put the live and replay addresses in the layout file. Save this [Qwen3-4B](#gpu) example as `layout.json` and replace `replace-with-KV_TOPIC` with the topic from the worker terminal. Use the worker's served model ID and actual ports.
 
 ```json
 {
   "http://127.0.0.1:8000": {
+    "endpoints": ["tcp://127.0.0.1:5557"],
+    "replay_endpoints": ["tcp://127.0.0.1:5558"],
     "schema_version": 1,
     "ranks": [
       {
@@ -442,10 +443,57 @@ For stock HTTP vLLM 0.30.0, use fixed live and replay ports. Save this [Qwen3-4B
 
 ```bash
 vllm-router --port 19000 --policy kv_aware --worker-urls http://127.0.0.1:8000 \
-  --kv-event-source http://127.0.0.1:8000=tcp://127.0.0.1:5557 \
-  --kv-event-replay-source http://127.0.0.1:8000=tcp://127.0.0.1:5558 \
-  --kv-event-model qwen3 --kv-event-block-size 16 --kv-hybrid-layout layout.json
+  --kv-hybrid-layout layout.json
 ```
+
+## Layout field reference
+
+The top-level object maps Router worker URLs to entries. Use the same scheme, host, and port as the configured worker URL. Every token size below describes the worker's effective runtime setting.
+
+| Worker entry field | JSON type | When to set it |
+| --- | --- | --- |
+| `schema_version` | Unsigned integer | Required for a layout declaration. Use `1`. |
+| `ranks` | Array of rank objects | Required for a layout declaration. Include each DP rank to score. |
+| `adapters` | Array of objects | Optional. Include entries for LoRA reuse. |
+| `adapters[].name` | String | Required in each adapter entry. Use the served adapter name. |
+| `adapters[].path` | String | Required in each adapter entry. Use the exact path string passed to `--lora-modules`. |
+| `endpoints` | Array of TCP address strings | Required when supplying static live addresses. List them in DP-rank order. |
+| `replay_endpoints` | Array of TCP address strings | Required with static live addresses. Supply one replay address for each live address in the same order. |
+| `compatible_decode_urls` | Array of worker URL strings | Required on hybrid Prefill entries. List the Decode workers able to receive their KV transfers. |
+
+| Rank field | JSON type and unit | When to set it |
+| --- | --- | --- |
+| `rank` | Unsigned integer, zero-based DP rank | Required. Use `0` for a single DP rank. |
+| `model` | String | Required with static event addresses. Otherwise discovered from the worker. |
+| `publisher_topic` | String | Required with static event addresses. Otherwise discovered per rank. Use the topic of the current worker instance. |
+| `weight_version` | String | Required and nonempty. Use a deployment weight revision or `"default"` for an unversioned deployment. |
+| `instance_topic` | Boolean | Required and must be `true`. Use a fresh publisher topic on every worker start. |
+| `hash_algorithm` | String | Required. Use `"sha256_cbor"` and configure the worker to use the same algorithm. |
+| `hash_seed` | String | Supply the worker's resolved seed if you omit `root_hash`. Use `"vllm-none-hash"` for the default seed or the actual value set on the worker. |
+| `root_hash` | String, 64 hex digits representing 32 bytes | Alternative to `hash_seed`. If you supply both, they must yield the same hash root. |
+| `full_hashes` | Boolean | Required and must be `true`. Set `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` on the worker. |
+| `prefix_caching` | Boolean | Required and must be `true`. Enable prefix caching on the worker. |
+| `hash_block_size` | Positive unsigned integer, tokens | Required. Use the hash chain's token step, which can be smaller than the cache group's block size. |
+| `partial_hash_hits` | Boolean | Optional, defaults to `false`. Use `true` only when the worker publishes and reuses partial prefixes at hash-block granularity. |
+| `speculative_tokens` | Unsigned integer, tokens | Required. Use `num_speculative_tokens` from the worker configuration, or `0` when speculation is disabled. |
+| `hash_lookahead_tokens` | Unsigned integer, tokens | Required. Use the number of extra tokens included in the worker's block hashes, or `0` when it hashes no lookahead. |
+| `tail_drop_groups` | Array of unsigned group IDs | Required with speculation and zero hash lookahead. List the groups whose lookup drops a trailing unit. Supply `[]` if the worker skips that step. |
+| `dense_lookup_groups` | Array of arrays of unsigned group IDs | Set only when declaring ordered dense lookup batches for fine-grained speculation. Include each full-attention group once in the engine's lookup order. |
+| `declared_groups` | Unsigned integer, group count | Set to `1` for a single full-attention group. Optional for mixed layouts. If supplied, it must equal the number of entries in `groups`, including scratch groups. |
+| `groups` | Array of group objects | Required. Use the complete cache group list, including groups that publish no events. |
+
+| Group field | JSON type and unit | When to set it |
+| --- | --- | --- |
+| `group_idx` | Unsigned integer, group ID | Required. Use the engine's group index. |
+| `kind` | String | Required. Use the matching entry in the [group table](#layout-template). |
+| `spec_type` | String | Required. Use the corresponding engine spec class in the group table. |
+| `block_size` | Positive unsigned integer, tokens | Required. Use the group block size. |
+| `sliding_window` | Positive unsigned integer, tokens | Required for sliding-window groups. Use the engine's window length. |
+| `prefix_cacheable` | Boolean | Required. Set `false` for scratch groups and for sliding groups whose state is rebuilt by bounded replay. |
+| `prefix_replay_tokens` | Unsigned integer, tokens | Required. Use `0` without bounded replay. For a non-cacheable sliding group rebuilt by bounded replay, use its window size. |
+| `mamba_cache_mode` | String | Required for a Mamba checkpoint group. Use `"align"`. |
+| `tokens_per_state` | String containing a token count | Required for sparse MLA and scratch. Use the number of tokens represented by one state for sparse MLA and `"1"` for scratch. Follow the recipe for other engine-reported values. |
+| `cache_role` | String | Set to `"sparse"` for sparse MLA groups. Omit when the engine reports no special cache role. |
 
 ## Troubleshooting
 

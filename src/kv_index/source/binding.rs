@@ -544,43 +544,6 @@ impl SourceBinding {
         max_reusable_tokens: usize,
         cache: &mut RequestHashCache<'a>,
     ) -> (u64, Option<StorageTier>) {
-        if !tracing::enabled!(tracing::Level::DEBUG) {
-            return self.credit_parts_inner(namespace, tokens, max_reusable_tokens, cache);
-        }
-        // The two observations bracket scoring; a changed watermark means that
-        // the score cannot be attributed to either observation alone.
-        let watermark = || {
-            self.index
-                .with_source_snapshot(&self.target, |view| {
-                    view.stream(&self.owner)
-                        .map(|state| (state.next_seq, state.reset_generation, state.visible()))
-                })
-                .flatten()
-        };
-        let before = watermark();
-        let result = self.credit_parts_inner(namespace, tokens, max_reusable_tokens, cache);
-        let after = watermark();
-        tracing::debug!(
-            source = %self.target.instance_id,
-            rank = self.target.dp_rank,
-            input_tokens = tokens.len(),
-            credited_tokens = result.0,
-            tier = ?result.1,
-            watermark_before = ?before,
-            watermark_after = ?after,
-            wall_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64,
-            "KV source score"
-        );
-        result
-    }
-
-    fn credit_parts_inner<'a>(
-        &self,
-        namespace: Option<&str>,
-        tokens: &'a [u32],
-        max_reusable_tokens: usize,
-        cache: &mut RequestHashCache<'a>,
-    ) -> (u64, Option<StorageTier>) {
         let replay_tokens = if cache.count_replay_pages {
             0
         } else {

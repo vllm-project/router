@@ -37,6 +37,8 @@ clap's implicit append action. Put non-repeatable list values after one flag.
 Rust rejects repeated scalar options; Python keeps the last value for scalar
 and non-append list options.
 
+The Rust HTTP backend connection pool has a two-second idle timeout by default; `--pool-idle-timeout-secs 0` disables reuse. This is a Rust-only CLI option.
+
 Rust integer types are unsigned: `u16` is 0–65535, `u32` is 0–4294967295,
 `u64` is 0–18446744073709551615, and `usize` depends on the target pointer
 width. `f32` and `f64` are floating-point values. Python's `integer` and
@@ -52,7 +54,7 @@ width. `f32` and `f64` are floating-point values. Python's `integer` and
 | `--version` | `flag` | `n/a` | — | — | Print the Rust binary version and exit; `-V` is also accepted. |
 | `--max-payload-size` | `usize` | `536870912` | `integer` | `536870912` | Maximum request body size in bytes; the default is 512 MiB. |
 | `--request-timeout-secs` | `u64` | `1800` | `integer` | `1800` | Request timeout in seconds. |
-| `--pool-idle-timeout-secs` | `u64` | `2` | — | — | Maximum time to keep a backend HTTP connection idle in the pool. Use `0` to stop retaining idle connections. |
+| `--pool-idle-timeout-secs` | `u64` | `2` | — | — | Idle lifetime for pooled backend HTTP connections in seconds; 0 disables reuse. |
 | `--max-concurrent-requests` | `usize` | `32768` | `integer` | `32768` | Token bucket capacity for request admission; does not enforce a hard limit on in-flight requests. |
 | `--queue-size` | — | — | `integer` | `100` | Pending request queue capacity; `0` disables queuing and returns 429 when full. |
 | `--queue-timeout-secs` | — | — | `integer` | `60` | Maximum time in seconds spent waiting in the request queue. |

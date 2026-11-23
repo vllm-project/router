@@ -2346,7 +2346,6 @@ impl VllmPDRouter {
                 )
                 .await
             {
-                debug!(client_request_id = ?headers.and_then(|h| h.get("x-request-id")).and_then(|v| v.to_str().ok()), engine_request_id = %request_id, "P/D engine request mapping");
                 return self
                     .process_concurrent_two_stage(
                         ConcurrentDispatch {
@@ -2377,8 +2376,6 @@ impl VllmPDRouter {
         let prefill_zmq_addr = self.get_zmq_address(prefill_worker.as_ref(), ServiceType::Prefill);
         let decode_zmq_addr = self.get_zmq_address(decode_worker.as_ref(), ServiceType::Decode);
         let request_id = Self::generate_vllm_request_id(&prefill_zmq_addr, &decode_zmq_addr);
-
-        debug!(client_request_id = ?headers.and_then(|h| h.get("x-request-id")).and_then(|v| v.to_str().ok()), engine_request_id = %request_id, "P/D engine request mapping");
 
         debug!("Generated vLLM request ID: {}", request_id);
         debug!("🔍 vLLM Proxy Comparison:");
@@ -2711,7 +2708,6 @@ impl VllmPDRouter {
             &self.get_zmq_address(prefill_worker.as_ref(), ServiceType::Prefill),
             &self.get_zmq_address(decode_worker.as_ref(), ServiceType::Decode),
         );
-        debug!(client_request_id = ?headers.and_then(|h| h.get("x-request-id")).and_then(|v| v.to_str().ok()), engine_request_id = %request_id, "P/D engine request mapping");
         let transfer_id = self.generate_transfer_id();
         let prefill_params = match self.build_prefill_kv_transfer_params(
             transfer_id.as_deref(),

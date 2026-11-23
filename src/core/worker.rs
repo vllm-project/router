@@ -179,6 +179,21 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     // === Multi-router support ===
 
+    // TODO: - Enhanced Worker Discovery
+    // The Worker trait should handle async discovery of metadata from the worker itself
+    // rather than having service discovery or other components query /get_server_info.
+    // This keeps service discovery decoupled from worker-specific APIs.
+    //
+    // Proposed additions:
+    // - async fn discover_metadata(&mut self) -> Result<(), Error>
+    //   Query /get_server_info and populate metadata labels with model_id, priority, cost, etc.
+    // - async fn validate_configuration(&self) -> Result<(), Error>
+    //   Ensure worker has required configuration for its mode
+    // - Make worker creation async to allow metadata discovery during initialization
+    //
+    // This way service discovery just calls router.add_worker() and the worker
+    // handles its own metadata discovery internally.
+
     /// Get the model ID this worker serves
     fn model_id(&self) -> &str {
         self.metadata()
@@ -1038,6 +1053,57 @@ mod tests {
     }
 
     // Test WorkerType
+    #[test]
+    fn test_worker_type_display() {
+        assert_eq!(WorkerType::Regular.to_string(), "Regular");
+        assert_eq!(
+            WorkerType::Prefill {
+                bootstrap_port: Some(8080)
+            }
+            .to_string(),
+            "Prefill(bootstrap:8080)"
+        );
+        assert_eq!(
+            WorkerType::Prefill {
+                bootstrap_port: None
+            }
+            .to_string(),
+            "Prefill"
+        );
+        assert_eq!(WorkerType::Decode.to_string(), "Decode");
+    }
+
+    #[test]
+    fn test_worker_type_equality() {
+        assert_eq!(WorkerType::Regular, WorkerType::Regular);
+        assert_ne!(WorkerType::Regular, WorkerType::Decode);
+        assert_eq!(
+            WorkerType::Prefill {
+                bootstrap_port: Some(8080)
+            },
+            WorkerType::Prefill {
+                bootstrap_port: Some(8080)
+            }
+        );
+        assert_ne!(
+            WorkerType::Prefill {
+                bootstrap_port: Some(8080)
+            },
+            WorkerType::Prefill {
+                bootstrap_port: Some(8081)
+            }
+        );
+    }
+
+    #[test]
+    fn test_worker_type_clone() {
+        let original = WorkerType::Prefill {
+            bootstrap_port: Some(8080),
+        };
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
+    }
+
     // Test HealthConfig
     #[test]
     fn test_health_config_default() {
@@ -1047,6 +1113,22 @@ mod tests {
         assert_eq!(config.endpoint, "/health");
         assert_eq!(config.failure_threshold, 3);
         assert_eq!(config.success_threshold, 2);
+    }
+
+    #[test]
+    fn test_health_config_custom() {
+        let config = HealthConfig {
+            timeout_secs: 10,
+            check_interval_secs: 60,
+            endpoint: "/healthz".to_string(),
+            failure_threshold: 5,
+            success_threshold: 3,
+        };
+        assert_eq!(config.timeout_secs, 10);
+        assert_eq!(config.check_interval_secs, 60);
+        assert_eq!(config.endpoint, "/healthz");
+        assert_eq!(config.failure_threshold, 5);
+        assert_eq!(config.success_threshold, 3);
     }
 
     // Test BasicWorker
@@ -1124,6 +1206,34 @@ mod tests {
     }
 
     // Test Worker trait implementation
+    #[test]
+    fn test_worker_url() {
+        let worker = BasicWorker::new("http://worker1:8080".to_string(), WorkerType::Regular);
+        assert_eq!(worker.url(), "http://worker1:8080");
+    }
+
+    #[test]
+    fn test_worker_type_getter() {
+        let regular = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        assert_eq!(regular.worker_type(), WorkerType::Regular);
+
+        let prefill = BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(9090),
+            },
+        );
+        assert_eq!(
+            prefill.worker_type(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(9090)
+            }
+        );
+
+        let decode = BasicWorker::new("http://test:8080".to_string(), WorkerType::Decode);
+        assert_eq!(decode.worker_type(), WorkerType::Decode);
+    }
+
     #[test]
     fn test_health_status() {
         let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
@@ -1500,7 +1610,39 @@ mod tests {
     }
 
     // Test synchronous health check wrapper
+    #[test]
+    fn test_check_health_sync_wrapper() {
+        // We can't easily test the actual HTTP call without mocking,
+        // but we can verify the sync wrapper works
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+
+        // This will fail because there's no server at this URL,
+        // but it tests that the sync wrapper doesn't panic
+        let result = worker.check_health();
+        assert!(result.is_err());
+    }
+
     // Performance test for load counter
+    #[test]
+    fn test_load_counter_performance() {
+        use std::time::Instant;
+
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        let iterations = 1_000_000;
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            worker.increment_load();
+        }
+        let duration = start.elapsed();
+
+        let ops_per_sec = iterations as f64 / duration.as_secs_f64();
+        println!("Load counter operations per second: {:.0}", ops_per_sec);
+
+        // Should be well over 1M ops/sec
+        assert!(ops_per_sec > 1_000_000.0);
+    }
+
     // ===== Tests for DPAwareWorker =====
 
     #[test]

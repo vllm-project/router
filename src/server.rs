@@ -970,9 +970,12 @@ pub fn build_app_with_wasm_middleware(
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    println!("DEBUG: Server startup function called");
+
     // Only initialize logging if not already done (for Python bindings support)
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+    println!("DEBUG: Initializing logging");
     let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
         Some(logging::init_logging(
             LoggingConfig {
@@ -1004,11 +1007,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
         None
     };
+    println!("DEBUG: Logging initialized");
 
     // Initialize prometheus metrics exporter
+    println!("DEBUG: Initializing Prometheus metrics");
     if let Some(prometheus_config) = config.prometheus_config {
-        metrics::start_prometheus(prometheus_config)?;
+        metrics::start_prometheus(prometheus_config);
     }
+    println!("DEBUG: Prometheus metrics initialized");
 
     info!(
         "Starting router on {}:{} | mode: {:?} | policy: {:?} | kv_connector: {:?} | max_payload: {}MB",
@@ -1020,6 +1026,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size / (1024 * 1024)
     );
 
+    println!("DEBUG: Creating HTTP client");
     let mut client_builder = Client::builder()
         .pool_max_idle_per_host(500)
         .timeout(Duration::from_secs(config.request_timeout_secs))
@@ -1035,8 +1042,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let client = client_builder
         .build()
         .expect("Failed to create HTTP client");
+    println!("DEBUG: HTTP client created");
 
     // Create the application context with all dependencies
+    println!("DEBUG: Creating AppContext");
     let app_context = AppContext::new(
         config.router_config.clone(),
         client.clone(),
@@ -1044,6 +1053,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.rate_limit_tokens_per_second,
         config.router_config.api_key_validation_urls.clone(),
     )?;
+    println!("DEBUG: AppContext created");
 
     let app_context = Arc::new(app_context);
 

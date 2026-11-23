@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
 use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::trace::{MakeSpan, OnFailure, OnRequest, OnResponse, TraceLayer};
-use tracing::{debug, error, field::Empty, info, info_span, warn, Instrument, Span};
+use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub use crate::core::token_bucket::TokenBucket;
@@ -47,61 +47,6 @@ fn generate_request_id(path: &str) -> String {
 /// Extension type for storing request ID
 #[derive(Clone, Debug)]
 pub struct RequestId(pub String);
-
-tokio::task_local! {
-    static CURRENT_REQUEST_ID: HeaderValue;
-}
-
-pub(crate) fn current_request_id() -> Option<HeaderValue> {
-    CURRENT_REQUEST_ID.try_with(Clone::clone).ok()
-}
-
-#[cfg_attr(coverage_nightly, coverage(off))]
-#[cfg(all(test, feature = "cpu", feature = "ready"))]
-mod request_id_tests {
-    use super::*;
-    use std::convert::Infallible;
-    use tower::{service_fn, ServiceExt};
-
-    #[tokio::test]
-    async fn propagates_chosen_or_generated_id_to_backend_and_response() {
-        for supplied in [None, Some("client-id")] {
-            let inner = service_fn(|req: Request| async move {
-                assert!(!req.headers().contains_key("x-request-id"));
-                let forwarded =
-                    crate::routers::header_utils::sanitize_request_headers(req.headers());
-                let id = forwarded["x-request-id"].to_str().unwrap();
-                assert_eq!(id, req.extensions().get::<RequestId>().unwrap().0);
-                let mut response = Response::new(axum::body::Body::empty());
-                response
-                    .headers_mut()
-                    .insert("x-observed-id", id.parse().unwrap());
-                Ok::<_, Infallible>(response)
-            });
-            let service = RequestIdLayer::new(vec!["x-correlation-id".into()]).layer(inner);
-            let mut request = Request::builder().uri("/v1/completions");
-            if let Some(id) = supplied {
-                request = request.header("x-correlation-id", id);
-            }
-            let response = service
-                .oneshot(request.body(axum::body::Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(
-                response.headers()["x-request-id"],
-                response.headers()["x-observed-id"]
-            );
-            if let Some(id) = supplied {
-                assert_eq!(response.headers()["x-request-id"], id);
-            } else {
-                assert!(response.headers()["x-request-id"]
-                    .to_str()
-                    .unwrap()
-                    .starts_with("cmpl-"));
-            }
-        }
-    }
-}
 
 /// Tower Layer for request ID middleware
 #[derive(Clone)]
@@ -170,32 +115,24 @@ where
 
         let request_id = request_id.unwrap_or_else(|| generate_request_id(req.uri().path()));
 
-        let request_id_header = HeaderValue::from_str(&request_id)
-            .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id"));
-
         // Insert request ID into request extensions for other middleware/handlers to use
         req.extensions_mut().insert(RequestId(request_id.clone()));
 
         // Call the inner service
         let future = self.inner.call(req);
 
-        let span = tracing::debug_span!(target: "vllm_router_rs::kv_index", "kv_request", request_id = %request_id);
-        Box::pin(
-            CURRENT_REQUEST_ID.scope(
-                request_id_header.clone(),
-                async move {
-                    let mut response = future.await?;
+        Box::pin(async move {
+            let mut response = future.await?;
 
-                    // Add request ID to response headers
-                    response
-                        .headers_mut()
-                        .insert("x-request-id", request_id_header);
+            // Add request ID to response headers
+            response.headers_mut().insert(
+                "x-request-id",
+                HeaderValue::from_str(&request_id)
+                    .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id")),
+            );
 
-                    Ok(response)
-                }
-                .instrument(span),
-            ),
-        )
+            Ok(response)
+        })
     }
 }
 

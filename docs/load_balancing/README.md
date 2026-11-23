@@ -268,6 +268,35 @@ Multiple router replicas need ingress stickiness to preserve affinity.
 
 ## Choosing a Policy
 
+```
+                                    ┌─────────────────────┐
+                                    │  Need session       │
+                                    │  affinity?          │
+                                    └─────────┬───────────┘
+                                              │
+                              ┌───────────────┴───────────────┐
+                              │                               │
+                             Yes                              No
+                              │                               │
+                              ▼                               ▼
+                    ┌─────────────────┐             ┌─────────────────┐
+                    │  Multi-turn or  │             │  Load-sensitive │
+                    │  KV cache reuse?│             │  workload?      │
+                    └────────┬────────┘             └────────┬────────┘
+                             │                               │
+                 ┌───────────┴───────────┐       ┌───────────┴───────────┐
+                 │                       │       │                       │
+                Yes                      No     Yes                      No
+                 │                       │       │                       │
+                 ▼                       ▼       ▼                       ▼
+        ┌────────────────┐     ┌────────────────┐ ┌────────────────┐ ┌────────────────┐
+        │ consistent_hash│     │  cache_aware   │ │  power_of_two  │ │  round_robin   │
+        │                │     │                │ │                │ │  or random     │
+        └────────────────┘     └────────────────┘ └────────────────┘ └────────────────┘
+```
+
+### Quick Reference
+
 | Scenario | Recommended Policy |
 |----------|-------------------|
 | Chat applications with conversation history | `consistent_hash` |

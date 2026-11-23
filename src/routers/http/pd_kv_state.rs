@@ -283,13 +283,12 @@ impl PdKvState {
     fn all_priceable(
         &self,
         workers: &[Arc<dyn Worker>],
-        request_cacheable: bool,
-        cache_salt: Option<&str>,
+        request: &Value,
         allow_credit: &HashMap<String, bool>,
     ) -> bool {
         KvAwarePolicy::all_candidates_priceable(
-            request_cacheable,
-            cache_salt,
+            http_cache_read_fallback(request).is_none(),
+            request.get("cache_salt").and_then(Value::as_str),
             workers.iter().map(|worker| {
                 allow_credit
                     .get(worker.base_url())
@@ -375,12 +374,7 @@ impl PdKvState {
             router_prompts.is_none() && http_input_requires_render(request, route);
         let decode_priced_here = decode_expected
             && !decode_requires_render
-            && self.all_priceable(
-                decode_workers,
-                http_cache_read_fallback(request).is_none(),
-                request.get("cache_salt").and_then(Value::as_str),
-                &allow_credit,
-            );
+            && self.all_priceable(decode_workers, request, &allow_credit);
         let (prefill_results, decode_results) = tokio::join!(
             self.tokenize(prefill_bases, request, route, headers, router_prompts),
             async {
@@ -587,12 +581,7 @@ impl PdKvState {
             .map(|worker| worker.base_url().to_owned())
             .collect();
         let allow_credit = self.credit_by_base(&bases, request).await;
-        if !self.all_priceable(
-            workers,
-            http_cache_read_fallback(request).is_none(),
-            request.get("cache_salt").and_then(Value::as_str),
-            &allow_credit,
-        ) {
+        if !self.all_priceable(workers, request, &allow_credit) {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
             return None;
         }
@@ -1228,7 +1217,7 @@ mod kv_input_tests {
             .await;
         assert_eq!(credit.get(&p_base), Some(&true));
         assert_eq!(credit.get(&d_base), Some(&true));
-        assert!(state.all_priceable(&prefill, true, None, &credit));
+        assert!(state.all_priceable(&prefill, &request, &credit));
         let unbound: Arc<dyn Worker> = Arc::new(BasicWorker::new(
             "http://unbound".to_owned(),
             WorkerType::Decode,
@@ -1236,7 +1225,7 @@ mod kv_input_tests {
         let mixed = [decode[0].clone(), unbound.clone()];
         let mut mixed_credit = credit.clone();
         mixed_credit.insert(unbound.base_url().to_owned(), true);
-        assert!(!state.all_priceable(&mixed, true, None, &mixed_credit));
+        assert!(!state.all_priceable(&mixed, &request, &mixed_credit));
         let prompts: Arc<[Vec<u32>]> = Arc::from(vec![vec![1, 2, 3]]);
         assert!(
             state
@@ -1267,6 +1256,42 @@ mod kv_input_tests {
                 .is_some(),
             "an HTTP direct token-id prompt prices without rendering"
         );
+        for (extra, eligible) in [
+            (json!({}), true),
+            (json!({"cache_salt": "tenant"}), false),
+            (json!({"skip_reading_prefix_cache": true}), false),
+        ] {
+            let mut request = request.clone();
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let (_, admission) = state
+                .prepare_stages(
+                    &prefill,
+                    &prefill_policy,
+                    &decode,
+                    &decode_policy,
+                    &request,
+                    "/v1/completions",
+                    None,
+                    Some(&prompts),
+                    false,
+                )
+                .await;
+            let commit = state
+                .prepare_decode_context(
+                    &decode,
+                    &decode_policy,
+                    &request,
+                    "/v1/completions",
+                    None,
+                    Some(&prompts),
+                )
+                .await;
+            assert_eq!(admission.is_some(), eligible, "admission: {extra}");
+            assert_eq!(commit.is_some(), eligible, "commit: {extra}");
+        }
         assert!(
             state
                 .prepare_decode_context(

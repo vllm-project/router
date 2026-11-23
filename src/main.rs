@@ -868,11 +868,21 @@ impl CliArgs {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
+    println!("DEBUG: Main function started");
 
     // Parse prefill arguments manually before clap parsing
+    println!("DEBUG: Parsing prefill arguments");
     let (prefill_urls, filtered_args) = split_prefill_args_from_others(std::env::args())?;
+    println!("DEBUG: Prefill URLs parsed: {:?}", prefill_urls);
     // Parse CLI arguments with clap using filtered args
+    println!("DEBUG: Parsing CLI arguments with clap");
+    println!("DEBUG: Filtered args: {:?}", filtered_args);
     let cli_args = CliArgs::parse_from(filtered_args);
+    println!("DEBUG: CLI args parsed successfully");
+    println!(
+        "DEBUG: vllm_pd_disaggregation: {}",
+        cli_args.vllm_pd_disaggregation
+    );
 
     // Print startup info
     println!("VLLM Router starting...");
@@ -910,18 +920,34 @@ Provide --worker-urls or PD flags as usual.",
     }
 
     // Convert to RouterConfig
+    println!("DEBUG: Converting to RouterConfig");
     let router_config = cli_args.to_router_config(prefill_urls)?;
+    println!("DEBUG: RouterConfig created successfully");
 
     // Validate configuration
+    println!("DEBUG: Validating configuration");
     router_config.validate()?;
+    println!("DEBUG: Configuration validated successfully");
 
     // Create ServerConfig
+    println!("DEBUG: Creating ServerConfig");
+    println!(
+        "DEBUG: CLI host: {}, port: {}",
+        cli_args.host, cli_args.port
+    );
     let server_config = cli_args.to_server_config(router_config);
+    println!(
+        "DEBUG: ServerConfig created successfully - host: {}, port: {}",
+        server_config.host, server_config.port
+    );
 
     // Create a new runtime for the server (like Python binding does)
+    println!("DEBUG: Creating Tokio runtime");
     let runtime = tokio::runtime::Runtime::new()?;
+    println!("DEBUG: Tokio runtime created successfully");
 
     // Block on the async startup function
+    println!("DEBUG: Starting server startup function");
     runtime.block_on(async move {
         let result = server::startup(server_config).await;
         // Shut down OTel while the Tokio runtime is still alive so the
@@ -939,6 +965,52 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn documented_kv_layout_examples_pass_cli_validation() {
+        let guide = include_str!("../docs/load_balancing/kv_aware.md");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        for (section, is_pd) in [
+            ("### Layout template", false),
+            ("### Static event endpoints", false),
+            ("### P/D layout", true),
+        ] {
+            let example = guide
+                .split_once(section)
+                .and_then(|(_, section)| section.split_once("```json"))
+                .and_then(|(_, example)| example.split_once("```"))
+                .expect("layout example missing")
+                .0;
+            std::fs::write(&path, example).unwrap();
+            let worker = "http://127.0.0.1:8000";
+            let mut cli = vec![
+                "vllm-router",
+                "--policy",
+                "kv_aware",
+                "--kv-hybrid-layout",
+                path.to_str().unwrap(),
+            ];
+            let prefill = if is_pd {
+                cli.extend([
+                    "--vllm-pd-disaggregation",
+                    "--decode",
+                    "http://127.0.0.1:8001",
+                ]);
+                vec![(worker.to_owned(), None)]
+            } else {
+                cli.extend(["--worker-urls", worker]);
+                Vec::new()
+            };
+            let config = CliArgs::try_parse_from(cli)
+                .unwrap()
+                .to_router_config(prefill)
+                .unwrap();
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{section}: {error}"));
+        }
+    }
 
     #[test]
     fn loads_one_kv_layout_for_both_pd_stages() {

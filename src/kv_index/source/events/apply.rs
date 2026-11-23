@@ -1,5 +1,7 @@
 //! Prepare engine events before committing their native hashes.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::kv_index::request_hash::SequenceHash;
 use crate::kv_index::storage::source_transaction::{StreamPhase, StreamState as State};
 use crate::kv_index::storage::{IndexBatch, PageChanges, PageWriteError};
@@ -9,6 +11,17 @@ use crate::kv_index::{
 };
 
 use super::validate::{publishes_int_hash, sequence_hash, validate_store};
+
+fn tier_or_warn(medium: Option<&str>) -> Option<StorageTier> {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let tier = StorageTier::from_medium(medium);
+    if let (None, Some(medium)) = (tier, medium) {
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(medium, "unknown KV cache medium; ignoring its events");
+        }
+    }
+    tier
+}
 
 pub(super) enum PreparedEvent<'a> {
     Store {
@@ -137,7 +150,7 @@ impl SourceBinding {
                     if remove.ownership.is_some() {
                         continue;
                     }
-                    let Some(tier) = StorageTier::from_medium(remove.medium.as_deref()) else {
+                    let Some(tier) = tier_or_warn(remove.medium.as_deref()) else {
                         continue;
                     };
                     if self.requires_root_proof && remove.group_idx != Some(0) {
@@ -240,7 +253,7 @@ impl SourceBinding {
         &self,
         store: &'a BlockStored,
     ) -> Result<Option<PreparedEvent<'a>>, SourceError> {
-        let Some(tier) = StorageTier::from_medium(store.medium.as_deref()) else {
+        let Some(tier) = tier_or_warn(store.medium.as_deref()) else {
             return Ok(None);
         };
         let namespace = store.lora_name.as_deref();

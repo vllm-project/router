@@ -2195,7 +2195,7 @@ impl Router {
                         KvRequestTokens::Shared(ids) => ids.map(<[u32]>::len),
                         KvRequestTokens::PerWorker(_) => None,
                     };
-                    debug!(attempt, worker_url = worker.url(), target = %receipt.decision.target.instance_id, rank = receipt.decision.target.dp_rank, new_prefill_tokens = receipt.new_prefill_tokens, input_known = input_tokens.is_some(), input_tokens, wall_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64, "KV request selected");
+                    debug!(attempt, worker_url = worker.url(), target = %receipt.decision.target.instance_id, rank = receipt.decision.target.dp_rank, new_prefill_tokens = receipt.new_prefill_tokens, input_known = input_tokens.is_some(), input_tokens, "KV request selected");
                 }
                 let load = RequestLoadGuard::from_selection(
                     worker.clone(),
@@ -2534,15 +2534,6 @@ impl Router {
         let stages_on = crate::backend::stages_enabled();
 
         let t_send = Instant::now();
-        debug!(
-            worker_url,
-            route,
-            wall_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64,
-            "worker request dispatch"
-        );
         let res = match otel_http::send_client_request(
             request_builder,
             headers,
