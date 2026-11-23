@@ -155,7 +155,8 @@ impl StaticKvEventSources {
         }
         if let Some(layout) = &self.hybrid {
             let rank = crate::kv_index::source::discovery::split_worker_rank(worker).1;
-            if !layout.matches_hash_block_size(rank, self.block_size) {
+            let discover = self.endpoints.is_empty() && !crate::backend::is_grpc_url(worker);
+            if !layout.matches_hash_block_size(rank, self.block_size, discover) {
                 return Err(ConfigError::ValidationFailed {
                     reason: format!("static KV source for '{worker}' block_size must match the layout hash_block_size"),
                 });

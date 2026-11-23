@@ -281,45 +281,37 @@ Pass the JSON below to the worker's `--speculative-config`. Use one mode per wor
 
 Save this GPU Qwen3.5-4B example as `layout.json` and pass `--kv-hybrid-layout layout.json`. It uses one DP rank, 576-token group blocks, 16-token hashes, the default hash seed, and no speculative decoding. Use your worker's HTTP or gRPC URL as the key. For hybrid P/D, add the [pairing fields](#pd-layout).
 
-When changing worker settings, check the effective layout. On vLLM 0.33.0, the startup log lists `kv cache group sizes` and the `vllm:cache_config_info` metric reports `hash_block_size` when available. In a static layout, use those values for `groups[].block_size` and `hash_block_size`. Set `partial_hash_hits` only if the worker uses sub-block prefix hits. If the worker reports its complete layout, use [layout discovery](#choose-a-layout-configuration).
+When changing worker settings, check the effective layout. On vLLM 0.33.0, the startup log lists `kv cache group sizes` and the `vllm:cache_config_info` metric reports `hash_block_size` when available. Use the reported block sizes in `groups`. For HTTP workers with event discovery, omit `hash_block_size` when metrics report it. Supply it for gRPC workers with a manual layout, static event addresses, or HTTP workers whose metrics omit it. Set `partial_hash_hits` only if the worker uses sub-block prefix hits. If the worker reports its complete layout, use [layout discovery](#choose-a-layout-configuration).
 
 ```json
 {
   "http://127.0.0.1:8000": {
-    "schema_version": 1,
     "ranks": [{
       "rank": 0,
-      "weight_version": "default",
-      "instance_topic": true,
-      "hash_algorithm": "sha256_cbor",
-      "hash_seed": "vllm-none-hash",
-      "full_hashes": true,
-      "prefix_caching": true,
       "hash_block_size": 16,
       "partial_hash_hits": true,
       "speculative_tokens": 0,
-      "hash_lookahead_tokens": 0,
       "groups": [
-        {"group_idx": 0, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "mamba_cache_mode": "align", "prefix_cacheable": true, "prefix_replay_tokens": 0},
-        {"group_idx": 1, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "mamba_cache_mode": "align", "prefix_cacheable": true, "prefix_replay_tokens": 0},
-        {"group_idx": 2, "kind": "mamba", "spec_type": "MambaSpec", "block_size": 576, "mamba_cache_mode": "align", "prefix_cacheable": true, "prefix_replay_tokens": 0},
-        {"group_idx": 3, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 576, "prefix_cacheable": true, "prefix_replay_tokens": 0}
+        {"kind": "mamba", "block_size": 576, "mamba_cache_mode": "align"},
+        {"kind": "mamba", "block_size": 576, "mamba_cache_mode": "align"},
+        {"kind": "mamba", "block_size": 576, "mamba_cache_mode": "align"},
+        {"kind": "full_attention", "block_size": 576}
       ]
     }]
   }
 }
 ```
 
-For the Ascend recipes here, use `"hash_seed":"0"` to match the worker's `PYTHONHASHSEED=0`. You can omit `partial_hash_hits` for rows marked false. For each group, use the index and block size from the layout row and copy the matching fields below. Set `prefix_cacheable: true` and `prefix_replay_tokens: 0` unless specified.
+For these Ascend recipes, set `"hash_seed":"0"` to match `PYTHONHASHSEED=0`. Omit `partial_hash_hits` for rows marked false. List the groups in engine order and use their effective block sizes.
 
-| Group | `kind` | `spec_type` | Extra fields |
-| --- | --- | --- | --- |
-| Full | `full_attention` | `FullAttentionSpec` |  |
-| Mamba | `mamba` | `MambaSpec` | `"mamba_cache_mode":"align"` |
-| SWA | `sliding_window` | `SlidingWindowSpec` | `sliding_window` from the row |
-| MLA SWA | `sliding_window_mla` | `SlidingWindowMLASpec` | `sliding_window` from the row |
-| Sparse MLA | `mla_attention` | `MLAAttentionSpec` | `"cache_role":"sparse"` and `tokens_per_state` as a string |
-| Scratch | `scratch` | `CircularBufferSpec` | `"prefix_cacheable":false,"tokens_per_state":"1"` |
+| Group | `kind` | Extra fields |
+| --- | --- | --- |
+| Full | `full_attention` |  |
+| Mamba | `mamba` | `"mamba_cache_mode":"align"` |
+| SWA | `sliding_window` | `sliding_window` from the row |
+| MLA SWA | `sliding_window_mla` | `sliding_window` from the row |
+| Sparse MLA | `mla_attention` | `"cache_role":"sparse"` and `tokens_per_state` as a string |
+| Scratch | `scratch` | `"tokens_per_state":"1"` |
 
 | Layout | `hash_block_size` | `partial_hash_hits` | Groups in index order, with block size and extra values |
 | --- | ---: | --- | --- |
@@ -328,7 +320,7 @@ For the Ascend recipes here, use `"hash_seed":"0"` to match the worker's `PYTHON
 | GPU Qwen4Exp | 1600 | false | 0–3 Mamba 1600, 4 Scratch 4, 5 Sparse MLA 1600 with `"4"` |
 | GPU V4 Flash | 4 | false | 0–1 MLA SWA 64 with window 128, 2 Sparse MLA 256 with `"4"`, 3 MLA SWA 4 with window 8, 4 MLA SWA 8 with window 128 |
 | GPU V4 Pro | 4 | false | 0–1 MLA SWA 64 with window 128, 2 Sparse MLA 256 with `"128"`, 3 MLA SWA 8 with window 128, 4 MLA SWA 4 with window 8 |
-| GPU V4.1 Flash | 128 | false | 0–4 MLA SWA 32 with window 128, `"prefix_cacheable":false,"prefix_replay_tokens":128`. 5 Sparse MLA 128 with `"2"`, 6 Scratch 8. |
+| GPU V4.1 Flash | 128 | false | 0–4 MLA SWA 32 with window 128, `"prefix_replay_tokens":128`. 5 Sparse MLA 128 with `"2"`, 6 Scratch 8. |
 | A2 Qwen3 | 128 | false | 0 Full 128 |
 | A2 Qwen | Group size from model row | false | 0 Full, 1–3 Mamba, same size on all groups |
 | A2 Qwen3.5 DSpark | 640 | false | 0–1 Full, 2 SWA with window 2048, 3–7 Mamba. All size 640. |
@@ -365,24 +357,16 @@ For stock HTTP vLLM 0.30.0, put the live and replay addresses in the layout file
   "http://127.0.0.1:8000": {
     "endpoints": ["tcp://127.0.0.1:5557"],
     "replay_endpoints": ["tcp://127.0.0.1:5558"],
-    "schema_version": 1,
     "ranks": [
       {
         "rank": 0,
         "model": "qwen3",
         "publisher_topic": "replace-with-KV_TOPIC",
-        "weight_version": "default",
-        "instance_topic": true,
-        "hash_algorithm": "sha256_cbor",
-        "hash_seed": "vllm-none-hash",
-        "full_hashes": true,
         "hash_block_size": 16,
-        "hash_lookahead_tokens": 0,
         "speculative_tokens": 0,
-        "prefix_caching": true,
         "declared_groups": 1,
         "groups": [
-          {"group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec", "block_size": 16, "prefix_cacheable": true, "prefix_replay_tokens": 0}
+          {"kind": "full_attention", "block_size": 16}
         ]
       }
     ]
@@ -397,11 +381,11 @@ vllm-router --port 19000 --policy kv_aware --worker-urls http://127.0.0.1:8000 \
 
 ## Layout field reference
 
-The top-level object maps Router worker URLs to entries. Use the same scheme, host, and port as the configured worker URL. Every token size below describes the worker's effective runtime setting.
+The top-level object maps Router worker URLs to entries. Use the same scheme, host, and port as the configured worker URL. Every token size below describes the worker's effective runtime setting. The CLI supplies the layout defaults below. Apply the [worker requirements](#worker-requirements) on vLLM.
 
 | Worker entry field | JSON type | When to set it |
 | --- | --- | --- |
-| `schema_version` | Unsigned integer | Required for a layout declaration. Use `1`. |
+| `schema_version` | Unsigned integer | Defaults to `1`. |
 | `ranks` | Array of rank objects | Required for a layout declaration. Include each DP rank to score. |
 | `adapters` | Array of objects | Optional. Include entries for LoRA reuse. |
 | `adapters[].name` | String | Required in each adapter entry. Use the served adapter name. |
@@ -415,17 +399,17 @@ The top-level object maps Router worker URLs to entries. Use the same scheme, ho
 | `rank` | Unsigned integer, zero-based DP rank | Required. Use `0` for a single DP rank. |
 | `model` | String | Required with static event addresses. Otherwise discovered from the worker. |
 | `publisher_topic` | String | Required with static event addresses. Otherwise discovered per rank. Use the topic of the current worker instance. |
-| `weight_version` | String | Required and nonempty. Use a deployment weight revision or `"default"` for an unversioned deployment. |
-| `instance_topic` | Boolean | Required and must be `true`. Use a fresh publisher topic on every worker start. |
-| `hash_algorithm` | String | Required. Use `"sha256_cbor"` and configure the worker to use the same algorithm. |
-| `hash_seed` | String | Supply the worker's resolved seed if you omit `root_hash`. Use `"vllm-none-hash"` for the default seed or the actual value set on the worker. |
+| `weight_version` | String | Defaults to `"default"`. |
+| `instance_topic` | Boolean | Defaults to `true`. Use a fresh publisher topic on every worker start. |
+| `hash_algorithm` | String | Defaults to `"sha256_cbor"`. Configure the worker to use it. |
+| `hash_seed` | String | Defaults to `"vllm-none-hash"` if neither seed nor root is specified. Set the actual worker seed when `PYTHONHASHSEED` is set. |
 | `root_hash` | String, 64 hex digits representing 32 bytes | Alternative to `hash_seed`. If you supply both, they must yield the same hash root. |
-| `full_hashes` | Boolean | Required and must be `true`. Set `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` on the worker. |
-| `prefix_caching` | Boolean | Required and must be `true`. Enable prefix caching on the worker. |
-| `hash_block_size` | Positive unsigned integer, tokens | Required. Use the hash chain's token step, which can be smaller than the cache group's block size. |
+| `full_hashes` | Boolean | Defaults to `true`. Set `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` on the worker. |
+| `prefix_caching` | Boolean | Defaults to `true`. Enable prefix caching on the worker. |
+| `hash_block_size` | Positive unsigned integer, tokens | Use the worker's hash step. Omit with HTTP event discovery when metrics report it. |
 | `partial_hash_hits` | Boolean | Optional, defaults to `false`. Use `true` only when the worker publishes and reuses partial prefixes at hash-block granularity. |
 | `speculative_tokens` | Unsigned integer, tokens | Required. Use `num_speculative_tokens` from the worker configuration, or `0` when speculation is disabled. |
-| `hash_lookahead_tokens` | Unsigned integer, tokens | Required. Use the number of extra tokens included in the worker's block hashes, or `0` when it hashes no lookahead. |
+| `hash_lookahead_tokens` | Unsigned integer, tokens | Defaults to `0` when speculation is off. Otherwise set the actual hash lookahead, including `0`. |
 | `tail_drop_groups` | Array of unsigned group IDs | Required with speculation and zero hash lookahead. List the groups whose lookup drops a trailing unit. Supply `[]` if the worker skips that step. |
 | `dense_lookup_groups` | Array of arrays of unsigned group IDs | Set only when declaring ordered dense lookup batches for fine-grained speculation. Include each full-attention group once in the engine's lookup order. |
 | `declared_groups` | Unsigned integer, group count | Set to `1` for a single full-attention group. Optional for mixed layouts. If supplied, it must equal the number of entries in `groups`, including scratch groups. |
@@ -433,13 +417,13 @@ The top-level object maps Router worker URLs to entries. Use the same scheme, ho
 
 | Group field | JSON type and unit | When to set it |
 | --- | --- | --- |
-| `group_idx` | Unsigned integer, group ID | Required. Use the engine's group index. |
+| `group_idx` | Unsigned integer, group ID | Defaults to the group position in the array, starting at zero. |
 | `kind` | String | Required. Use the matching entry in the [group table](#layout-template). |
-| `spec_type` | String | Required. Use the corresponding engine spec class in the group table. |
+| `spec_type` | String | Inferred from `kind` for the supported groups. |
 | `block_size` | Positive unsigned integer, tokens | Required. Use the group block size. |
 | `sliding_window` | Positive unsigned integer, tokens | Required for sliding-window groups. Use the engine's window length. |
-| `prefix_cacheable` | Boolean | Required. Set `false` for scratch groups and for sliding groups whose state is rebuilt by bounded replay. |
-| `prefix_replay_tokens` | Unsigned integer, tokens | Required. Use `0` without bounded replay. For a non-cacheable sliding group rebuilt by bounded replay, use its window size. |
+| `prefix_cacheable` | Boolean | Defaults to `true` for resident groups and `false` for scratch or bounded replay. |
+| `prefix_replay_tokens` | Unsigned integer, tokens | Defaults to `0`. For a sliding group rebuilt by bounded replay, set its window size. |
 | `mamba_cache_mode` | String | Required for a Mamba checkpoint group. Use `"align"`. |
 | `tokens_per_state` | String containing a token count | Required for sparse MLA and scratch. Use the number of tokens represented by one state for sparse MLA and `"1"` for scratch. Follow the recipe for other engine-reported values. |
 | `cache_role` | String | Set to `"sparse"` for sparse MLA groups. Omit when the engine reports no special cache role. |

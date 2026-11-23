@@ -19,6 +19,8 @@ pub(crate) struct EngineCacheConfig {
     pub(crate) block_size: Option<u32>,
     /// Attention block size, which a hybrid layout may report separately.
     pub(crate) effective_attention_block_size: Option<u32>,
+    /// Resolved hash granularity. Older engines may leave it unset.
+    pub(crate) hash_block_size: Option<u32>,
     /// Engine-declared cache layout, once vLLM populates it.
     pub(crate) kv_cache_layout: Option<String>,
 }
@@ -67,6 +69,10 @@ pub(crate) fn parse_cache_config_info(text: &str) -> BTreeMap<u32, EngineCacheCo
         entry.effective_attention_block_size = labels
             .get("effective_attention_block_size")
             .and_then(|value| value.parse().ok());
+        entry.hash_block_size = labels
+            .get("hash_block_size")
+            .and_then(|value| value.parse().ok())
+            .filter(|size| *size > 0);
         entry.kv_cache_layout = labels
             .get("kv_cache_layout")
             .filter(|layout| !is_unset(layout))

@@ -161,17 +161,20 @@ impl CacheCapabilities {
                 .all(RankCapability::has_plain_full_attention_shape)
     }
 
-    pub(crate) fn matches_hash_block_size(&self, rank: Option<u32>, size: u32) -> bool {
+    pub(crate) fn matches_hash_block_size(
+        &self,
+        rank: Option<u32>,
+        size: u32,
+        discover: bool,
+    ) -> bool {
+        let matches = |rank: &RankCapability| {
+            rank.hash_block_size
+                .map_or(discover, |hash_size| hash_size == size)
+        };
         if let Some(rank) = rank {
-            return self
-                .rank_capability(rank)
-                .is_some_and(|rank| rank.hash_block_size == Some(size));
+            return self.rank_capability(rank).is_some_and(matches);
         }
-        !self.ranks.is_empty()
-            && self
-                .ranks
-                .iter()
-                .all(|rank| rank.hash_block_size == Some(size))
+        !self.ranks.is_empty() && self.ranks.iter().all(matches)
     }
 
     /// The capability declared for one DP rank. Ranks are independent

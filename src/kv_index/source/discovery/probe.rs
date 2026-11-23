@@ -1,6 +1,6 @@
 //! Read worker model metadata and KV event source endpoints.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use tracing::{info, warn};
@@ -507,11 +507,7 @@ async fn query_metrics_metadata(
     worker_url: &str,
     api_key: Option<&str>,
 ) -> Result<(ServerInfo, Option<HashSet<String>>), String> {
-    let text = query_worker_text(client, worker_url, "metrics", true, api_key).await?;
-    let engines = metrics_meta::parse_cache_config_info(&text);
-    if engines.is_empty() {
-        return Err("metrics: no vllm:cache_config_info series".to_string());
-    }
+    let engines = query_engine_cache_configs(client, worker_url, api_key).await?;
     let hash_unit = metrics_meta::shared_hash_unit(&engines).map_err(|units| {
         format!("metrics: engines disagree on block size {units:?} — refusing to index")
     })?;
@@ -533,6 +529,19 @@ async fn query_metrics_metadata(
         ..Default::default()
     };
     Ok((info, models.as_ref().map(base_model_names)))
+}
+
+pub(super) async fn query_engine_cache_configs(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Result<BTreeMap<u32, metrics_meta::EngineCacheConfig>, String> {
+    let text = query_worker_text(client, worker_url, "metrics", true, api_key).await?;
+    let engines = metrics_meta::parse_cache_config_info(&text);
+    if engines.is_empty() {
+        return Err("metrics: no vllm:cache_config_info series".to_string());
+    }
+    Ok(engines)
 }
 
 pub(super) async fn query_model_list(

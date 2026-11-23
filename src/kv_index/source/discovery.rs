@@ -627,6 +627,52 @@ impl KvIndexSupervisor {
         }
         discovery.model_id = Ok(Some(model.clone()));
         if let Some(layout) = &mut discovery.hybrid {
+            if layout
+                .ranks
+                .iter()
+                .any(|rank| rank.hash_block_size.is_none())
+            {
+                let engines = match tokio::time::timeout(
+                    CONTROL_TIMEOUT,
+                    probe::query_engine_cache_configs(&self.client, base, api_key),
+                )
+                .await
+                .unwrap_or_else(|_| Err("metrics probe timed out".into()))
+                {
+                    Ok(engines) => engines,
+                    Err(reason) => return failed_hybrid_discovery(SourcesProbe::Failed, reason),
+                };
+                for rank in &mut layout.ranks {
+                    if !sources
+                        .get(&rank.rank.to_string())
+                        .is_some_and(events_enabled)
+                    {
+                        continue;
+                    }
+                    let observed = engines
+                        .get(&rank.rank)
+                        .and_then(|engine| engine.hash_block_size);
+                    match (rank.hash_block_size, observed) {
+                        (Some(declared), Some(observed)) if declared != observed => {
+                            return failed_hybrid_discovery(
+                                SourcesProbe::StaticMismatch,
+                                format!("DP rank {}: configured hash_block_size {declared} differs from worker metrics {observed}", rank.rank),
+                            );
+                        }
+                        (None, Some(size)) => rank.hash_block_size = Some(size),
+                        (None, None) => {
+                            return failed_hybrid_discovery(
+                                SourcesProbe::Failed,
+                                format!("DP rank {}: worker metrics do not report hash_block_size. Set it in the KV layout.", rank.rank),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                if let Ok(info) = &mut discovery.server_info {
+                    info.kv_block_size = layout.ranks.iter().find_map(|rank| rank.hash_block_size);
+                }
+            }
             for rank in &mut layout.ranks {
                 if rank.model.trim().is_empty() {
                     rank.model.clone_from(&model);

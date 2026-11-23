@@ -987,7 +987,9 @@ impl ConfigValidator {
                         )));
                     }
                     if let Some(layout) = &sources.hybrid {
-                        if !layout.matches_hash_block_size(None, sources.block_size) {
+                        let discover =
+                            sources.endpoints.is_empty() && !crate::backend::is_grpc_url(url);
+                        if !layout.matches_hash_block_size(None, sources.block_size, discover) {
                             return Err(invalid(
                                 "block_size must match the layout hash_block_size",
                             ));

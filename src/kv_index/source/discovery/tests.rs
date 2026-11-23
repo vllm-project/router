@@ -1653,6 +1653,35 @@ async fn layout_without_endpoints_discovers_publishers_for_the_declared_topic() 
 }
 
 #[tokio::test]
+async fn declared_http_layout_uses_the_reported_hash_block_size() {
+    use axum::{routing::get, Router};
+    use serde_json::json;
+
+    for (metric, expected) in [("8", Some(8)), ("None", None)] {
+        let (endpoint, replay, _publisher, _replayer) = layout_endpoints();
+        let sources = Arc::new(Mutex::new(json!({"0": {
+            "endpoint": endpoint, "replay_endpoint": replay, "topic": "boot-1",
+            "publisher": "zmq"
+        }})));
+        let metrics = format!(
+            "vllm:cache_config_info{{block_size=\"64\",hash_block_size=\"{metric}\",engine=\"0\"}} 1.0"
+        );
+        let app = Router::new().route("/metrics", get(move || async move { metrics }));
+        let (worker, task) =
+            source_boundary_worker_with_routes(app, json!({"model_id":"m"}), sources).await;
+        let mut config = layout_only_sources("boot-1", 64, "m");
+        config.block_size = 16;
+        config.hybrid.as_mut().unwrap().ranks[0].hash_block_size = None;
+        config.validate(&worker).unwrap();
+        let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
+        let supervisor = supervisor.with_static_sources(HashMap::from([(worker.clone(), config)]));
+        let info = supervisor.on_worker_added(&worker).await.unwrap();
+        assert_eq!(info.cache_key.map(|key| key.block_size), expected);
+        task.abort();
+    }
+}
+
+#[tokio::test]
 async fn hybrid_discovery_uses_reported_fields_in_colocated_and_pd_modes() {
     use axum::{http::StatusCode, routing::get, Json, Router};
     use serde_json::json;
