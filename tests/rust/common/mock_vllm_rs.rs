@@ -101,15 +101,11 @@ pub struct MockVllmRs {
     pub aborts: Arc<Mutex<Vec<String>>>,
     /// After `hold_after` recorded requests, wait until [`HoldGate::release`].
     pub hold: Option<HoldGate>,
-    /// Credential gate applied to Inference and Control RPCs.
+    /// Credential gate applied to Health, Inference and Control RPCs.
     /// Default accepts everything.
     pub authorization: AuthorizationCheck,
     /// Discovery RPC name and whether its metadata matched the credential gate.
     pub(crate) control_calls: Arc<Mutex<Vec<(&'static str, bool)>>>,
-    /// Credential gate applied to `grpc.health.v1`. Kept separate from
-    /// [`Self::authorization`] because the P/D startup wait does not send
-    /// the API key yet (issue #578), while inference on both legs does.
-    pub health_authorization: AuthorizationCheck,
 }
 
 /// Blocks requests after the first `hold_after` ones until [`HoldGate::release`].
@@ -174,12 +170,11 @@ impl Default for MockVllmRs {
             hold: None,
             authorization: AuthorizationCheck::default(),
             control_calls: Default::default(),
-            health_authorization: AuthorizationCheck::default(),
         }
     }
 }
 
-/// `grpc.health.v1` that applies the mock's health [`AuthorizationCheck`] and
+/// `grpc.health.v1` that applies the mock's [`AuthorizationCheck`] and
 /// always answers `SERVING`; the router probes with `check` only, so `watch`
 /// is unimplemented.
 struct AuthHealth(MockVllmRs);
@@ -193,7 +188,7 @@ impl tonic_health::pb::health_server::Health for AuthHealth {
         &self,
         request: Request<tonic_health::pb::HealthCheckRequest>,
     ) -> Result<Response<tonic_health::pb::HealthCheckResponse>, Status> {
-        self.0.health_authorization.verify(&request)?;
+        self.0.authorization.verify(&request)?;
         Ok(Response::new(tonic_health::pb::HealthCheckResponse {
             status: tonic_health::pb::health_check_response::ServingStatus::Serving as i32,
         }))

@@ -54,15 +54,14 @@ passthrough keys return 400 instead of being dropped.
 
 For a configured gRPC worker or authentication proxy that requires bearer
 metadata, set the router's `--api-key`. The router attaches the credential to
-inference, cancellation, model/server/KV discovery, and regular worker
-health checks. The configured transport address covers its DP ranks. A new
-address supplied by worker registration, including IGW registration, receives
-no shared credential. Invalid ASCII metadata is rejected during configuration
-of a gRPC pool.
+inference, cancellation, model/server/KV discovery, and health checks in
+regular and P/D pools. The configured transport address covers its DP ranks.
+A new address supplied by worker registration, including IGW registration,
+receives no shared credential. Invalid ASCII metadata is rejected during
+configuration of a gRPC pool.
 
 The router's `grpc://` transport uses h2c. Deploy credentialed gRPC on a
-trusted link or behind transport protection. On the P/D path, startup and
-periodic Health probes still follow the separate P/D health-auth work.
+trusted link or behind transport protection.
 
 ## Pool Behavior
 

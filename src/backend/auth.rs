@@ -54,20 +54,27 @@ impl WorkerAuth {
     }
 
     pub(crate) fn key_for(&self, url: &str) -> Option<Arc<str>> {
-        let credential = self.0.as_ref()?;
-        if is_grpc_url(url) && self.grpc_bearer_for(url).is_none() {
-            return None;
+        if is_grpc_url(url) {
+            return self.grpc_key_for(url);
         }
-        Some(credential.key.clone())
+        self.0.as_ref().map(|credential| credential.key.clone())
+    }
+
+    pub(crate) fn grpc_key_for(&self, url: &str) -> Option<Arc<str>> {
+        self.configured_grpc_credential(url)
+            .map(|credential| credential.key.clone())
     }
 
     pub(super) fn grpc_bearer_for(&self, url: &str) -> Option<&AsciiMetadataValue> {
+        self.configured_grpc_credential(url)?.grpc_bearer.as_ref()
+    }
+
+    fn configured_grpc_credential(&self, url: &str) -> Option<&Credential> {
         let credential = self.0.as_deref()?;
-        let bearer = credential.grpc_bearer.as_ref()?;
         credential
             .grpc_workers
             .contains(strip_dp_suffix(url).trim_end_matches('/'))
-            .then_some(bearer)
+            .then_some(credential)
     }
 }
 

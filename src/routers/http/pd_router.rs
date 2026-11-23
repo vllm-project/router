@@ -573,6 +573,7 @@ fn build_dp_workers(
     url: &str,
     dp_size: usize,
     worker_type: WorkerType,
+    api_key: Option<Arc<str>>,
     circuit_breaker_config: &CircuitBreakerConfig,
     health_config: Option<&HealthConfig>,
 ) -> Result<Vec<Arc<dyn Worker>>, String> {
@@ -582,6 +583,7 @@ fn build_dp_workers(
     // IPv6+DP URL corruption where HTTP clients read @N as userinfo (RFC 3986).
     let dp_worker = |rank: usize| -> Arc<dyn Worker> {
         let worker = DPAwareWorker::new(base_url.clone(), rank, dp_size, worker_type.clone())
+            .with_worker_api_key(api_key.clone())
             .with_circuit_breaker_config(circuit_breaker_config.clone());
         let worker = match health_config {
             Some(config) => worker.with_health_config(config.clone()),
@@ -596,6 +598,7 @@ fn build_dp_workers(
             Some(rank) => dp_worker(rank),
             None => {
                 let worker = BasicWorker::new(url.to_string(), worker_type.clone())
+                    .with_worker_api_key(api_key.clone())
                     .with_dp_size(dp_size)
                     .with_circuit_breaker_config(circuit_breaker_config.clone());
                 let worker = match health_config {
@@ -815,13 +818,16 @@ impl PdRouterBase {
     }
 
     // Private helper method to perform health check on a new server
-    async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
+    async fn wait_for_server_health(
+        &self,
+        url: &str,
+        api_key: Option<&str>,
+    ) -> Result<(), PDRouterError> {
         crate::routers::http::router::Router::wait_for_healthy_workers(
             &[url.to_string()],
             self.worker_startup_timeout_secs,
             self.worker_startup_check_interval_secs,
-            // PD health checks do not send the API key yet.
-            None,
+            api_key,
         )
         .await
         .map_err(|_| PDRouterError::HealthCheckFailed {
@@ -1029,13 +1035,16 @@ impl PdRouterBase {
         worker_type: WorkerType,
     ) -> Result<String, PDRouterError> {
         // Wait for the new server to be healthy
-        self.wait_for_server_health(&url).await?;
+        let api_key = self.worker_auth.grpc_key_for(&url);
+        self.wait_for_server_health(&url, api_key.as_deref())
+            .await?;
 
         let dp_size = dp_utils::discover_dp_size(&self.client, &url, self.dp_size).await;
         let workers = build_dp_workers(
             &url,
             dp_size,
             worker_type,
+            api_key,
             &self.circuit_breaker_config,
             None,
         )
@@ -1240,10 +1249,6 @@ impl PdRouterBase {
             window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
-        if ctx.router_config.api_key.is_some() {
-            warn!("--api-key is not applied to P/D worker health checks yet");
-        }
-
         // Workers must be up before they can report their engine count.
         let prefill_base_urls: Vec<String> =
             prefill_urls.iter().map(|(url, _)| url.clone()).collect();
@@ -1254,14 +1259,21 @@ impl PdRouterBase {
                 .chain(decode_urls.iter())
                 .map(String::as_str),
         )?;
+        if ctx.router_config.api_key.is_some()
+            && prefill_base_urls
+                .iter()
+                .chain(&decode_urls)
+                .any(|url| !crate::backend::is_grpc_url(url))
+        {
+            warn!("--api-key is not applied to HTTP P/D worker health checks yet");
+        }
         for urls in [&prefill_base_urls, &decode_urls] {
             if !urls.is_empty() {
-                crate::routers::http::router::Router::wait_for_healthy_workers(
+                crate::routers::http::router::Router::wait_for_healthy_workers_with_auth(
                     urls,
                     ctx.router_config.worker_startup_timeout_secs,
                     ctx.router_config.worker_startup_check_interval_secs,
-                    // PD health checks do not send the API key yet.
-                    None,
+                    |url| worker_auth.grpc_key_for(url),
                 )
                 .await?;
             }
@@ -1291,6 +1303,7 @@ impl PdRouterBase {
                 url,
                 dp_size,
                 worker_type,
+                worker_auth.grpc_key_for(url),
                 &core_cb_config,
                 Some(&health_config),
             )? {

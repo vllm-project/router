@@ -566,7 +566,6 @@ async fn assert_control_requests(router: &Router, server: &MockVllmRsServer) {
 async fn api_key_reaches_grpc_health_control_and_generate() {
     let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
         authorization: AuthorizationCheck::Bearer("worker-secret".to_string()),
-        health_authorization: AuthorizationCheck::Bearer("worker-secret".to_string()),
         ..MockVllmRs::default()
     })
     .await;
@@ -605,7 +604,6 @@ async fn api_key_reaches_grpc_health_control_and_generate() {
 async fn without_api_key_no_authorization_metadata_is_sent() {
     let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
         authorization: AuthorizationCheck::Absent,
-        health_authorization: AuthorizationCheck::Absent,
         ..MockVllmRs::default()
     })
     .await;
@@ -686,7 +684,6 @@ async fn igw_registration_discovery_and_inference_omit_the_shared_api_key() {
 async fn wrong_api_key_fails_the_grpc_startup_health_check() {
     let server = MockVllmRsServer::spawn_with_state(MockVllmRs {
         authorization: AuthorizationCheck::Bearer("worker-secret".to_string()),
-        health_authorization: AuthorizationCheck::Bearer("worker-secret".to_string()),
         ..MockVllmRs::default()
     })
     .await;

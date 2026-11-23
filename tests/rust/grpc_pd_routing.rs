@@ -1496,10 +1496,6 @@ async fn send_chat(
     )
 }
 
-/// Both gRPC legs answer `--api-key`: the unary prefill `Generate` and the
-/// decode `GenerateStream` carry the key as `authorization` metadata
-/// (issue #587). The startup health wait keeps its #578 behaviour, so the
-/// mock leaves `grpc.health.v1` open.
 async fn pd_router_with_api_key(
     prefill: &MockVllmRsServer,
     decode: &MockVllmRsServer,
@@ -1547,5 +1543,31 @@ async fn grpc_pd_sends_the_api_key_on_both_legs() {
             Some("Bearer worker-secret"),
             "{leg} leg must send the api key as authorization metadata"
         );
+    }
+
+    router
+        .remove_prefill_server(&prefill.grpc_url)
+        .await
+        .unwrap();
+    let rank_url = format!("{}@0", prefill.grpc_url);
+    router
+        .add_prefill_server(rank_url.clone(), None)
+        .await
+        .unwrap();
+
+    let discovered = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        authorization: AuthorizationCheck::Absent,
+        ..Default::default()
+    })
+    .await;
+    router
+        .add_decode_server(discovered.grpc_url.clone())
+        .await
+        .unwrap();
+
+    // Exercise the same probe the periodic health checker calls on each worker.
+    for url in [&decode.grpc_url, &rank_url, &discovered.grpc_url] {
+        let worker = router.worker_registry().get_by_url(url).unwrap();
+        worker.check_health_async().await.unwrap();
     }
 }

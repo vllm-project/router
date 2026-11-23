@@ -1199,36 +1199,34 @@ impl Router {
 
     /// Wait until at least one of `worker_urls` passes its health check.
     ///
-    /// `api_key` is the bearer token for HTTP health requests. With `None`
-    /// they carry no `Authorization` header.
+    /// Use the same bearer token for all of these workers.
     pub(crate) async fn wait_for_healthy_workers(
         worker_urls: &[String],
         worker_startup_timeout_secs: u64,
         worker_startup_check_interval_secs: u64,
         api_key: Option<&str>,
     ) -> Result<(), String> {
+        let api_key = api_key.map(Arc::<str>::from);
+        Self::wait_for_healthy_workers_with_auth(
+            worker_urls,
+            worker_startup_timeout_secs,
+            worker_startup_check_interval_secs,
+            |_| api_key.clone(),
+        )
+        .await
+    }
+
+    pub(super) async fn wait_for_healthy_workers_with_auth(
+        worker_urls: &[String],
+        worker_startup_timeout_secs: u64,
+        worker_startup_check_interval_secs: u64,
+        key_for: impl Fn(&str) -> Option<Arc<str>>,
+    ) -> Result<(), String> {
         if worker_urls.is_empty() {
             return Err(
                 "Timeout waiting for workers to become healthy: no workers provided".to_string(),
             );
         }
-
-        // Perform health check asynchronously
-        Self::wait_for_healthy_workers_async(
-            worker_urls,
-            worker_startup_timeout_secs,
-            worker_startup_check_interval_secs,
-            api_key,
-        )
-        .await
-    }
-
-    async fn wait_for_healthy_workers_async(
-        worker_urls: &[String],
-        worker_startup_timeout_secs: u64,
-        worker_startup_check_interval_secs: u64,
-        api_key: Option<&str>,
-    ) -> Result<(), String> {
         // Extract unique base URLs (hosts) for health checks
         // This deduplicates DP-aware URLs like http://host:8081@0, @1, @2, @3
         // to only check http://host:8081 once
@@ -1239,11 +1237,7 @@ impl Router {
 
         for url in worker_urls {
             // Extract base URL by removing @rank suffix if present
-            let base_url = if let Some(at_pos) = url.rfind('@') {
-                url[..at_pos].to_string()
-            } else {
-                url.clone()
-            };
+            let base_url = crate::backend::strip_dp_suffix(url).to_owned();
 
             unique_hosts.insert(base_url.clone());
             host_to_workers
@@ -1269,7 +1263,6 @@ impl Router {
             .timeout(Duration::from_secs(2))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-        let api_key: Option<Arc<str>> = api_key.map(Arc::from);
         let mut unhealthy_hosts: Vec<(String, String)> = Vec::new();
 
         loop {
@@ -1291,7 +1284,7 @@ impl Router {
             for base_url in &unique_hosts_vec {
                 let client_clone = client.clone();
                 let url_clone = base_url.clone();
-                let api_key = api_key.clone();
+                let api_key = key_for(base_url);
 
                 let check_health = tokio::spawn(async move {
                     if crate::backend::is_grpc_url(&url_clone) {
