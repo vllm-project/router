@@ -15,6 +15,8 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to create worker HTTP client")
 });
 
+pub(crate) const UNLABELED_WORKER_MODEL_ID: &str = "unknown";
+
 /// GET request to a worker, with the router's API key as a bearer token when
 /// one is configured.
 pub(crate) fn worker_get(
@@ -189,7 +191,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .labels
             .get("model_id")
             .map(|s| s.as_str())
-            .unwrap_or("unknown")
+            .unwrap_or(UNLABELED_WORKER_MODEL_ID)
     }
 
     /// Get the priority of this worker (higher value = higher priority)
@@ -1008,28 +1010,6 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    #[test]
-    fn adapter_names_are_not_served_base_models() {
-        let mut worker = BasicWorker::new("http://127.0.0.1:8000".to_string(), WorkerType::Regular);
-        worker
-            .metadata
-            .labels
-            .insert("model_id".to_string(), "qwen35".to_string());
-        worker.metadata.labels.insert(
-            "served_model_aliases".to_string(),
-            "alias-a,alias-b".to_string(),
-        );
-        assert!(crate::kv_index::discovery::worker_serves_base_model(
-            &worker, "qwen35"
-        ));
-        assert!(crate::kv_index::discovery::worker_serves_base_model(
-            &worker, "alias-a"
-        ));
-        assert!(!crate::kv_index::discovery::worker_serves_base_model(
-            &worker, "lora1"
-        ));
-    }
-
     // Test WorkerType
     #[test]
     fn test_worker_type_display() {
@@ -1148,26 +1128,6 @@ mod tests {
         assert_eq!(worker.metadata().health_config.timeout_secs, 15);
         assert_eq!(worker.metadata().health_config.check_interval_secs, 45);
         assert_eq!(worker.metadata().health_config.endpoint, "/custom-health");
-    }
-
-    #[test]
-    fn worker_auth_uses_only_the_configured_key() {
-        let client = reqwest::Client::new();
-        for (key, expected) in [
-            (None, None),
-            (Some("backend-key"), Some("Bearer backend-key")),
-        ] {
-            let request = worker_get(&client, "https://worker/v1/models", key)
-                .build()
-                .unwrap();
-            assert_eq!(
-                request
-                    .headers()
-                    .get("authorization")
-                    .map(|value| value.to_str().unwrap()),
-                expected
-            );
-        }
     }
 
     #[test]
@@ -2073,15 +2033,6 @@ mod tests {
             .with_labels(labels);
 
         assert_eq!(worker.model_id(), "Qwen3.5-4B");
-        assert!(crate::kv_index::discovery::worker_serves_base_model(
-            &worker,
-            "Qwen3.5-4B"
-        ));
-        assert!(crate::kv_index::discovery::worker_serves_base_model(
-            &worker, "qwen"
-        ));
-        assert!(!crate::kv_index::discovery::worker_serves_base_model(
-            &worker, "lora1"
-        ));
+        assert_eq!(worker.metadata().labels["served_model_aliases"], "qwen");
     }
 }

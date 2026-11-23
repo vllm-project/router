@@ -2,9 +2,8 @@
 
 use std::{collections::HashMap, path::Path};
 
-use crate::config::{
-    ConfigError, ConfigResult, PdKvEventSources, RoutingMode, StaticKvEventSources,
-};
+use super::{PdKvEventSources, StaticKvEventSources};
+use crate::config::{ConfigError, ConfigResult, RoutingMode};
 use crate::kv_index::CacheCapabilities;
 
 #[derive(serde::Deserialize)]

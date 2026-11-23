@@ -873,22 +873,27 @@ mod tests {
 
     #[test]
     fn documented_kv_layout_examples_pass_cli_validation() {
-        let guide = include_str!("../docs/load_balancing/kv_aware.md");
+        let guide = include_str!("../docs/load_balancing/kv_aware.md").replace("\r\n", "\n");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("layout.json");
-        for (section, is_pd) in [
-            ("### Layout template", false),
-            ("### Static event endpoints", false),
-            ("### P/D layout", true),
-        ] {
-            let example = guide
-                .split_once(section)
-                .and_then(|(_, section)| section.split_once("```json"))
-                .and_then(|(_, example)| example.split_once("```"))
-                .expect("layout example missing")
-                .0;
+        let worker = "http://127.0.0.1:8000";
+        let mut coverage = [false; 3];
+        for block in guide.split("\n```json\n").skip(1) {
+            let (example, _) = block.split_once("\n```").expect("unclosed JSON example");
+            let value: serde_json::Value =
+                serde_json::from_str(example).expect("invalid JSON example");
+            let Some(layout) = value.get(worker) else {
+                continue;
+            };
+            let is_pd = layout.get("compatible_decode_urls").is_some();
+            let example_kind = if is_pd {
+                2
+            } else if layout.get("endpoints").is_some() {
+                1
+            } else {
+                0
+            };
             std::fs::write(&path, example).unwrap();
-            let worker = "http://127.0.0.1:8000";
             let mut cli = vec![
                 "vllm-router",
                 "--policy",
@@ -911,10 +916,15 @@ mod tests {
                 .unwrap()
                 .to_router_config(prefill)
                 .unwrap();
-            config
-                .validate()
-                .unwrap_or_else(|error| panic!("{section}: {error}"));
+            config.validate().unwrap_or_else(|error| {
+                panic!("invalid worker layout example: {error}\n{example}")
+            });
+            coverage[example_kind] = true;
         }
+        assert_eq!(
+            coverage, [true; 3],
+            "expected colocated, static and P/D examples"
+        );
     }
 
     #[test]

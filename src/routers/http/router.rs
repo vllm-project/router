@@ -15,10 +15,12 @@ use crate::backend::{
 };
 use crate::config::types::RetryConfig;
 use crate::core::worker::worker_get;
+use crate::core::worker::UNLABELED_WORKER_MODEL_ID;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
     RetryExecutor, Worker, WorkerRegistry, WorkerType,
 };
+use crate::kv_index::discovery::inferred_lora_name;
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -324,7 +326,6 @@ struct ProgramTargetCacheEntry {
 const PROGRAM_MODEL_POOL_ALL: &str = "program:all";
 const PROGRAM_MODEL_POOL_FALLBACK: &str = "program:fallback:unlabeled";
 const PROGRAM_MODEL_POOL_NAMED_PREFIX: &str = "program:model:";
-const UNLABELED_WORKER_MODEL_ID: &str = "unknown";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedProgramModelPool {
@@ -1658,20 +1659,6 @@ impl Router {
             .collect()
     }
 
-    fn inferred_lora_name<'a>(workers: &[Arc<dyn Worker>], requested: &'a str) -> Option<&'a str> {
-        // vLLM selects adapters through model. An incomplete set of base
-        // aliases leaves the identity unclassified.
-        (!workers.is_empty()
-            && workers.iter().all(|worker| {
-                let served = crate::kv_index::discovery::worker_base_model_names(worker.as_ref());
-                served
-                    .iter()
-                    .any(|name| !name.is_empty() && *name != UNLABELED_WORKER_MODEL_ID)
-                    && !served.contains(&requested)
-            }))
-        .then_some(requested)
-    }
-
     fn kv_placement_eligibility(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1691,27 +1678,7 @@ impl Router {
         {
             return None;
         }
-        let mut allowed: Vec<_> = workers
-            .iter()
-            .map(|worker| {
-                model != UNLABELED_WORKER_MODEL_ID
-                    && crate::kv_index::discovery::worker_serves_base_model(worker.as_ref(), model)
-            })
-            .collect();
-        let missing: Vec<_> = workers
-            .iter()
-            .zip(&allowed)
-            .filter(|(_, allowed)| !**allowed)
-            .map(|(worker, _)| worker.base_url().to_owned())
-            .collect();
-        if missing.is_empty() {
-            return None;
-        }
-        let verified = supervisor.worker_model_eligibility(&missing, Some(model));
-        for (worker, allowed) in workers.iter().zip(&mut allowed) {
-            *allowed |= verified.get(worker.base_url()).copied().unwrap_or(false);
-        }
-        Some(allowed)
+        supervisor.cache_eligible_workers(workers, model)
     }
 
     /// Select worker for a specific model considering circuit breaker state
@@ -2054,7 +2021,7 @@ impl Router {
                     if pool == Some(crate::backend::WorkerPoolKind::Grpc) {
                         return None;
                     }
-                    Self::inferred_lora_name(&workers, typed_req.get_model()?)
+                    inferred_lora_name(&workers, typed_req.get_model()?)
                 });
                 let excluded_workers = failed_workers.lock().clone();
                 // Router-rendered token IDs are an exact-token fact, not a
@@ -3678,7 +3645,7 @@ impl RouterTrait for Router {
             .filter(|name| !name.is_empty())
             .or_else(|| {
                 kv_ops?;
-                Self::inferred_lora_name(&workers, model_id?)
+                inferred_lora_name(&workers, model_id?)
             });
         let cache_salt = body
             .get("cache_salt")
@@ -4597,15 +4564,12 @@ mod tests {
         let base = worker("http://known", "base", "alias");
         let unknown = worker("http://unknown", "unknown", "");
         let workers = [base.clone(), unknown];
-        assert_eq!(Router::inferred_lora_name(&workers, "other"), None);
+        assert_eq!(inferred_lora_name(&workers, "other"), None);
         assert_eq!(
-            Router::inferred_lora_name(std::slice::from_ref(&base), "alias"),
+            inferred_lora_name(std::slice::from_ref(&base), "alias"),
             None
         );
-        assert_eq!(
-            Router::inferred_lora_name(&[base], "adapter"),
-            Some("adapter")
-        );
+        assert_eq!(inferred_lora_name(&[base], "adapter"), Some("adapter"));
         let mut router = create_test_kv_router();
         let (supervisor, _) =
             crate::kv_index::KvIndexSupervisor::new_http_full_attention(Client::new());

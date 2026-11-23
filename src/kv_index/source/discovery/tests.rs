@@ -2221,3 +2221,65 @@ fn renewed_grants_do_not_price_pages_seen_only_after_expiry() {
         assert_eq!(calls, 2);
     }
 }
+
+#[test]
+fn server_info_accepts_legacy_block_size_and_optional_kv_fields() {
+    for field in ["kv_block_size", "block_size"] {
+        let info: ServerInfo = serde_json::from_value(serde_json::json!({
+            "model_id": "m", (field): 16, "instance_id": "x", "data_parallel_size": 2
+        }))
+        .unwrap();
+        assert_eq!(info.model_id.as_deref(), Some("m"));
+        assert_eq!(info.instance_id.as_deref(), Some("x"));
+        assert_eq!(info.kv_block_size, Some(16));
+    }
+    assert_eq!(
+        serde_json::from_str::<ServerInfo>("{}").unwrap(),
+        ServerInfo::default()
+    );
+}
+
+#[test]
+fn kv_event_discovery_accepts_both_wire_responses() {
+    use super::probe::GrpcKvEventSourcesResponse;
+    use crate::backend::pb::{GetKvEventSourcesResponse, KvEventSource};
+    use prost::Message;
+
+    let legacy = GetKvEventSourcesResponse {
+        sources: vec![KvEventSource {
+            data_parallel_rank: Some(0),
+            topic: "engine-instance".to_owned(),
+            ..Default::default()
+        }],
+    };
+    let mut decoded =
+        GrpcKvEventSourcesResponse::decode(legacy.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded.sources, legacy.sources);
+    assert_eq!(decoded.kv_routing_capabilities, None);
+
+    decoded.kv_routing_capabilities = Some(br#"{"schema_version":1}"#.to_vec());
+    let payload = decoded.encode_to_vec();
+    assert_eq!(
+        GrpcKvEventSourcesResponse::decode(payload.as_slice()).unwrap(),
+        decoded
+    );
+    assert_eq!(
+        GetKvEventSourcesResponse::decode(payload.as_slice()).unwrap(),
+        legacy
+    );
+}
+
+#[test]
+fn adapter_names_are_not_served_base_models() {
+    use crate::core::{BasicWorker, WorkerType};
+
+    let worker = BasicWorker::new("http://127.0.0.1:8000".into(), WorkerType::Regular).with_labels(
+        HashMap::from([
+            ("model_id".into(), "qwen35".into()),
+            ("served_model_aliases".into(), "alias-a,alias-b".into()),
+        ]),
+    );
+    assert!(worker_serves_base_model(&worker, "qwen35"));
+    assert!(worker_serves_base_model(&worker, "alias-a"));
+    assert!(!worker_serves_base_model(&worker, "lora1"));
+}

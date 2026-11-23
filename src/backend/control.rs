@@ -6,17 +6,21 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tonic::client::Grpc;
 use tonic::transport::Channel;
-use tonic_prost::ProstCodec;
+
+pub use crate::kv_index::discovery::{
+    get_grpc_kv_event_sources, GrpcKvEventSourcesResponse as KvEventSourcesResponse,
+};
 
 use super::detect::grpc_connect_uri;
 use super::pb::{
-    control_client::ControlClient, GetKvEventSourcesRequest, GetModelInfoRequest,
-    GetServerInfoRequest, KvEventSource, ModelInfo, ServerInfo,
+    control_client::ControlClient, GetModelInfoRequest, GetServerInfoRequest, ModelInfo, ServerInfo,
 };
 
-async fn control_channel(worker_url: &str, timeout: Duration) -> Result<Channel, String> {
+pub(crate) async fn control_channel(
+    worker_url: &str,
+    timeout: Duration,
+) -> Result<Channel, String> {
     let uri = grpc_connect_uri(worker_url)?;
     Channel::from_shared(uri.clone())
         .map_err(|e| format!("invalid grpc uri {uri}: {e}"))?
@@ -48,46 +52,6 @@ pub async fn get_grpc_server_info(
         .map_err(|_| format!("grpc GetServerInfo timeout {uri}"))?
         .map_err(|e| format!("grpc GetServerInfo {uri}: {e}"))
         .map(|response| response.into_inner())
-}
-
-/// Event source response with the optional layout field absent from `vllm-proto` 0.2.
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct KvEventSourcesResponse {
-    #[prost(message, repeated, tag = "1")]
-    pub sources: Vec<KvEventSource>,
-    #[prost(bytes = "vec", optional, tag = "2")]
-    pub kv_routing_capabilities: Option<Vec<u8>>,
-}
-
-pub async fn get_grpc_kv_event_sources(
-    worker_url: &str,
-    timeout: Duration,
-) -> Result<KvEventSourcesResponse, tonic::Status> {
-    let channel = control_channel(worker_url, timeout)
-        .await
-        .map_err(tonic::Status::unavailable)?;
-    let mut client = Grpc::new(channel);
-    let call = async {
-        client
-            .ready()
-            .await
-            .map_err(|error| tonic::Status::unavailable(format!("service not ready: {error}")))?;
-        let mut request = tonic::Request::new(GetKvEventSourcesRequest {});
-        request
-            .extensions_mut()
-            .insert(tonic::GrpcMethod::new("vllm.Control", "GetKvEventSources"));
-        client
-            .unary(
-                request,
-                http::uri::PathAndQuery::from_static("/vllm.Control/GetKvEventSources"),
-                ProstCodec::default(),
-            )
-            .await
-    };
-    let response = tokio::time::timeout(timeout, call)
-        .await
-        .map_err(|_| tonic::Status::deadline_exceeded("GetKvEventSources timed out"))??;
-    Ok(response.into_inner())
 }
 
 pub fn model_info_json(info: &ModelInfo) -> Value {
@@ -206,34 +170,7 @@ pub fn openai_models_json(info: &ModelInfo) -> Value {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::backend::pb::{GetKvEventSourcesResponse, ParallelismInfo, RlCapabilities};
-    use prost::Message;
-
-    #[test]
-    fn kv_event_discovery_accepts_both_wire_responses() {
-        let legacy = GetKvEventSourcesResponse {
-            sources: vec![KvEventSource {
-                data_parallel_rank: Some(0),
-                topic: "engine-instance".to_owned(),
-                ..Default::default()
-            }],
-        };
-        let mut decoded =
-            KvEventSourcesResponse::decode(legacy.encode_to_vec().as_slice()).unwrap();
-        assert_eq!(decoded.sources, legacy.sources);
-        assert_eq!(decoded.kv_routing_capabilities, None);
-
-        decoded.kv_routing_capabilities = Some(br#"{"schema_version":1}"#.to_vec());
-        let payload = decoded.encode_to_vec();
-        assert_eq!(
-            KvEventSourcesResponse::decode(payload.as_slice()).unwrap(),
-            decoded
-        );
-        assert_eq!(
-            GetKvEventSourcesResponse::decode(payload.as_slice()).unwrap(),
-            legacy
-        );
-    }
+    use crate::backend::pb::{ParallelismInfo, RlCapabilities};
 
     #[test]
     fn openai_models_uses_served_name_and_aliases() {

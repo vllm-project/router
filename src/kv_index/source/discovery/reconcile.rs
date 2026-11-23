@@ -6,14 +6,43 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::lifecycle::{SourceAction, WorkerLifecycle, WorkerRegistration, CONTROL_TIMEOUT};
-use super::probe::{fetch_kv_event_sources, fetch_native_sources};
+use super::probe::{fetch_kv_event_sources, fetch_native_sources, worker_serves_base_model};
 use super::{
     events_enabled, resolve_endpoint, split_worker_rank, worker_host, KvEventSourceEntry,
     KvIndexSupervisor, SourcesProbe, WorkerDiscovery,
 };
+use crate::core::{worker::UNLABELED_WORKER_MODEL_ID, Worker};
 use crate::kv_index::CacheCapabilities;
 
 impl KvIndexSupervisor {
+    pub(crate) fn cache_eligible_workers(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        model: &str,
+    ) -> Option<Vec<bool>> {
+        let mut allowed: Vec<_> = workers
+            .iter()
+            .map(|worker| {
+                model != UNLABELED_WORKER_MODEL_ID
+                    && worker_serves_base_model(worker.as_ref(), model)
+            })
+            .collect();
+        let missing: Vec<_> = workers
+            .iter()
+            .zip(&allowed)
+            .filter(|(_, allowed)| !**allowed)
+            .map(|(worker, _)| worker.base_url().to_owned())
+            .collect();
+        if missing.is_empty() {
+            return None;
+        }
+        let verified = self.worker_model_eligibility(&missing, Some(model));
+        for (worker, allowed) in workers.iter().zip(&mut allowed) {
+            *allowed |= verified.get(worker.base_url()).copied().unwrap_or(false);
+        }
+        Some(allowed)
+    }
+
     /// Request preparation needs only model eligibility, not cloned registrations.
     pub(crate) fn worker_model_eligibility(
         &self,

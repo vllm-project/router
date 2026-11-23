@@ -1,12 +1,67 @@
 //! KV event-source configuration, including CLI layouts and routing compatibility.
 
-use crate::config::{
-    ConfigError, ConfigResult, PdKvEventSources, PolicyConfig, RouterConfig, RoutingMode,
-    StaticKvEventSources,
-};
+use crate::config::{ConfigError, ConfigResult, PolicyConfig, RouterConfig, RoutingMode};
+use serde::{Deserialize, Serialize};
 
 mod layout_file;
 pub use layout_file::apply_kv_layout_file;
+
+/// Statically configured KV event sources for one prefill worker.
+///
+/// This is authoritative for engines that cannot report their own sources:
+/// the HTTP `/kv_event_sources` route exists only since vLLM 0.31.0, and
+/// OpenAI-compatible frontends never serve it. On v0.29/v0.30 a deployment
+/// must declare its sources here (or use the gRPC Control RPC).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PdKvEventSources {
+    /// ZMQ PUB endpoints, one per data-parallel rank (index = rank).
+    pub endpoints: Vec<String>,
+    /// Optional ZMQ ROUTER (replay) endpoints, same ordering as `endpoints`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_endpoints: Option<Vec<String>>,
+    /// KV cache block size of the engine. Must match the engine's
+    /// `--block-size` (vLLM default: 16).
+    #[serde(default = "default_pd_kv_block_size")]
+    pub block_size: u32,
+    /// Model identity for the cache key. Defaults to the worker URL; the
+    /// served-model check then relies on `/v1/models`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Router-managed cache layout for this prefill or decode worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hybrid: Option<crate::kv_index::CacheCapabilities>,
+    /// Decode base URLs explicitly verified for this hybrid prefill worker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatible_decode_urls: Vec<String>,
+}
+
+fn default_pd_kv_block_size() -> u32 {
+    16
+}
+
+/// Manually configured KV event publishers for one regular-mode worker.
+///
+/// Rust struct literals must supply `topic: String::new()` to retain the
+/// previous empty subscription topic. Serde defaults preserve old JSON
+/// configurations, but do not provide Rust source compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StaticKvEventSources {
+    /// One externally reachable ZMQ PUB endpoint per DP rank.
+    pub endpoints: Vec<String>,
+    /// Optional replay ROUTER endpoint per DP rank for loss recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_endpoints: Option<Vec<String>>,
+    /// Exact ZMQ subscription topic shared by these ranks.
+    #[serde(default)]
+    pub topic: String,
+    /// KV cache block size used to calculate prefix placement.
+    pub block_size: u32,
+    /// Shared model identity across workers that serve the same model.
+    pub model: String,
+    /// Router-managed hybrid layout and per-rank publisher identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hybrid: Option<crate::kv_index::CacheCapabilities>,
+}
 
 /// Parse repeatable `WORKER_URL=ENDPOINT[,ENDPOINT...]` KV event sources.
 pub fn parse_static_kv_event_sources(

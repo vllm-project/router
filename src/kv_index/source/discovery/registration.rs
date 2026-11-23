@@ -11,12 +11,11 @@ use super::lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
 use super::probe::{layout_model, server_instance_id, worker_descriptor};
 use super::{
     discovered_block_size, event_source_label, event_sources_for_worker, metadata_source_label,
-    CacheKey, KvIndexSupervisor, LiveSource, SourcesProbe, WorkerDiscovery, WorkerKvInfo,
-    WorkerSubs,
+    CacheKey, KvIndexSupervisor, LiveSource, ServerInfo, SourcesProbe, WorkerDiscovery,
+    WorkerKvInfo, WorkerSubs,
 };
 use crate::config::KvConnector;
 use crate::kv_index::{EventStream, SourceId};
-use crate::protocols::worker_spec::ServerInfo;
 
 impl KvIndexSupervisor {
     #[cfg(all(test, feature = "cpu", feature = "ready"))]

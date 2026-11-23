@@ -1,19 +1,23 @@
 //! Read worker model metadata and KV event source endpoints.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
+use tonic::client::Grpc;
+use tonic_prost::ProstCodec;
 use tracing::{info, warn};
 
 use super::lifecycle::WorkerLifecycle;
 use super::{
     discovered_block_size, metrics_meta, CacheCapabilities, KvEventSourceEntry,
-    KvEventSourcesResponse, KvIndexSupervisor, SourcesProbe, SourcesUnavailable, WorkerDiscovery,
-    CONTROL_TIMEOUT,
+    KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe, SourcesUnavailable,
+    WorkerDiscovery, CONTROL_TIMEOUT,
 };
-use crate::core::worker::worker_get;
+use crate::backend::control::control_channel;
+use crate::backend::pb::{GetKvEventSourcesRequest, KvEventSource};
+use crate::core::worker::{worker_get, UNLABELED_WORKER_MODEL_ID};
 use crate::core::Worker;
-use crate::protocols::worker_spec::ServerInfo;
 
 pub(super) struct RegistrationProbe {
     pub(super) descriptor: WorkerDescriptor,
@@ -177,6 +181,46 @@ pub(super) fn grpc_model_id(
     })
 }
 
+/// Event source response with the optional layout field absent from `vllm-proto` 0.2.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct GrpcKvEventSourcesResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub sources: Vec<KvEventSource>,
+    #[prost(bytes = "vec", optional, tag = "2")]
+    pub kv_routing_capabilities: Option<Vec<u8>>,
+}
+
+pub async fn get_grpc_kv_event_sources(
+    worker_url: &str,
+    timeout: Duration,
+) -> Result<GrpcKvEventSourcesResponse, tonic::Status> {
+    let channel = control_channel(worker_url, timeout)
+        .await
+        .map_err(tonic::Status::unavailable)?;
+    let mut client = Grpc::new(channel);
+    let call = async {
+        client
+            .ready()
+            .await
+            .map_err(|error| tonic::Status::unavailable(format!("service not ready: {error}")))?;
+        let mut request = tonic::Request::new(GetKvEventSourcesRequest {});
+        request
+            .extensions_mut()
+            .insert(tonic::GrpcMethod::new("vllm.Control", "GetKvEventSources"));
+        client
+            .unary(
+                request,
+                http::uri::PathAndQuery::from_static("/vllm.Control/GetKvEventSources"),
+                ProstCodec::default(),
+            )
+            .await
+    };
+    let response = tokio::time::timeout(timeout, call)
+        .await
+        .map_err(|_| tonic::Status::deadline_exceeded("GetKvEventSources timed out"))??;
+    Ok(response.into_inner())
+}
+
 /// Fetch event publishers from either worker transport.
 pub(super) async fn fetch_kv_event_sources(
     client: &reqwest::Client,
@@ -184,10 +228,9 @@ pub(super) async fn fetch_kv_event_sources(
     api_key: Option<&str>,
 ) -> Result<KvEventSourcesResponse, SourcesUnavailable> {
     if crate::backend::is_grpc_url(worker_url) {
-        let response =
-            crate::backend::control::get_grpc_kv_event_sources(worker_url, CONTROL_TIMEOUT)
-                .await
-                .map_err(|status| grpc_sources_unavailable(worker_url, status))?;
+        let response = get_grpc_kv_event_sources(worker_url, CONTROL_TIMEOUT)
+            .await
+            .map_err(|status| grpc_sources_unavailable(worker_url, status))?;
         return Ok(grpc_kv_event_source_entries(worker_url, response.sources));
     }
     let url = format!("{}/kv_event_sources", worker_url.trim_end_matches('/'));
@@ -228,9 +271,7 @@ pub(super) async fn fetch_native_sources(
     Result<Option<CacheCapabilities>, String>,
 ) {
     if crate::backend::is_grpc_url(worker_url) {
-        let response = match crate::backend::control::get_grpc_kv_event_sources(worker_url, timeout)
-            .await
-        {
+        let response = match get_grpc_kv_event_sources(worker_url, timeout).await {
             Ok(response) => response,
             Err(status) => return (Err(grpc_sources_unavailable(worker_url, status)), Ok(None)),
         };
@@ -619,7 +660,7 @@ fn served_base_model_ids(body: &serde_json::Value) -> impl Iterator<Item = &str>
 
 /// Names this worker serves as base models: the model it registered plus
 /// the `--served-model-name` aliases the engine reported, when known.
-pub(crate) fn worker_base_model_names(worker: &dyn Worker) -> Vec<&str> {
+fn worker_base_model_names(worker: &dyn Worker) -> Vec<&str> {
     let mut served = vec![worker.model_id()];
     if let Some(aliases) = worker.metadata().labels.get("served_model_aliases") {
         served.extend(aliases.split(',').filter(|alias| !alias.is_empty()));
@@ -632,6 +673,23 @@ pub(crate) fn worker_base_model_names(worker: &dyn Worker) -> Vec<&str> {
 /// adapter name is neither the model id nor a served alias.
 pub(crate) fn worker_serves_base_model(worker: &dyn Worker, name: &str) -> bool {
     worker_base_model_names(worker).contains(&name)
+}
+
+pub(crate) fn inferred_lora_name<'a>(
+    workers: &[Arc<dyn Worker>],
+    requested: &'a str,
+) -> Option<&'a str> {
+    // vLLM selects adapters through model. An incomplete set of base
+    // aliases leaves the identity unclassified.
+    (!workers.is_empty()
+        && workers.iter().all(|worker| {
+            let served = worker_base_model_names(worker.as_ref());
+            served
+                .iter()
+                .any(|name| !name.is_empty() && *name != UNLABELED_WORKER_MODEL_ID)
+                && !served.contains(&requested)
+        }))
+    .then_some(requested)
 }
 
 pub(super) fn base_model_names(models: &serde_json::Value) -> HashSet<String> {

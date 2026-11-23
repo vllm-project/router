@@ -18,7 +18,6 @@ use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::EventSubscriberHandle;
 use crate::kv_index::{CacheCapabilities, GroupCapability, RankCapability};
 use crate::kv_index::{IngestionSignal, SourceId};
-use crate::protocols::worker_spec::ServerInfo;
 
 mod lifecycle;
 mod observer;
@@ -31,12 +30,15 @@ use lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
 use observer::WorkerObservation;
 use reconcile::{static_hybrid_sources_match, StaticHybridMatch};
 
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+pub(crate) use probe::worker_serves_base_model;
 use probe::{
     base_model_names, fetch_kv_event_sources, fetch_native_sources, grpc_model_id, layout_model,
     query_model_list, query_worker_metadata_and_models, served_model, server_instance_id,
     server_model_id,
 };
-pub(crate) use probe::{served_model_labels, worker_base_model_names, worker_serves_base_model};
+pub use probe::{get_grpc_kv_event_sources, GrpcKvEventSourcesResponse};
+pub(crate) use probe::{inferred_lora_name, served_model_labels};
 
 /// The worker-stable core of a cache identity. One indexer per key.
 ///
@@ -45,6 +47,38 @@ pub(crate) use probe::{served_model_labels, worker_base_model_names, worker_serv
 pub struct CacheKey {
     pub model: Arc<str>,
     pub block_size: u32,
+}
+
+/// Worker metadata used when constructing a KV cache identity.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct ServerInfo {
+    pub model_id: Option<String>,
+
+    pub model_path: Option<String>,
+
+    pub priority: Option<u32>,
+
+    pub cost: Option<f32>,
+
+    pub worker_type: Option<String>,
+
+    // Optional fields allow discovery on workers with older metadata schemas.
+    #[serde(default)]
+    pub instance_id: Option<String>,
+    #[serde(default, alias = "block_size")]
+    pub kv_block_size: Option<u32>,
+    #[serde(default)]
+    pub effective_attention_block_size: Option<u32>,
+    /// Whether the worker's Mooncake connector trims compressed-model Prefill.
+    #[serde(default)]
+    pub mooncake_truncates_compressed: Option<bool>,
+    /// Engine revision used to interpret versioned cache lookup rules.
+    #[serde(skip)]
+    pub(crate) vllm_version: Option<(u32, u32)>,
+    /// `--served-model-name` aliases, so the router can tell a base-model alias
+    /// from a LoRA adapter selected through the request's `model`.
+    #[serde(default)]
+    pub served_model_aliases: Vec<String>,
 }
 
 /// One DP rank's event publisher, reported by the worker control plane.
