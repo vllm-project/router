@@ -1,6 +1,6 @@
 # router_policy — TraceLab cold replay, router policy × concurrency
 
-Each **scenario JSON** under `cases/` is one policy. `benchmark_params.max-concurrency` lists 8, 16, and 32; pytest expands those into cells `cache_aware/c16` and so on:
+Each **scenario JSON** under `cases/` is one routing scenario. `benchmark_params.max-concurrency` lists 8, 16, and 32; pytest expands those into cells `pd_merge_cache_aware/c16` and so on:
 
 - **`runtime`** — paths **relative to vllm-router repo root** where applicable. **`MODEL`** overrides `runtime.model`. **`AGENTX_PYTHON`** (or `PYTHON`) overrides the pytest interpreter. The CI image runs `vllm-router` from `PATH` (`/usr/local/bin`) and `vllm-rs` from the installed `vllm` package.
 - **agentinfer** — install via **`pip install …whl`** (or `uv pip install …whl`) into the **same env as pytest** (no source checkout). Replay YAML is loaded from the installed package when a cell starts. Optional: `runtime.replay_config`; optional `runtime.agent_infer` for source dev.
@@ -8,7 +8,7 @@ Each **scenario JSON** under `cases/` is one policy. `benchmark_params.max-concu
 - **`router_params`** — policy, gRPC, penalties, balance thresholds
 - **`benchmark_params`** — `max-concurrency` (8, 16, 32), task-num, and the rest of the replay settings. pytest asserts **all** replay rows in `requests.jsonl` are `success` (no fixed request count)
 
-Example: [cases/kv_aware.json](cases/kv_aware.json).
+Example: [cases/pd_merge_kv_aware.json](cases/pd_merge_kv_aware.json).
 
 Worker and router processes use [`perf/process.py`](../process.py), the same launch path as `perf/grpc`.
 
@@ -25,7 +25,7 @@ pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -v
 One concurrency / policy. `-sv` shows worker, router, and replay lines on stderr:
 
 ```bash
-pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -sv -k 'kv_aware/c16'
+pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -sv -k 'pd_merge_kv_aware/c16'
 ```
 
 ## Artifacts layout
@@ -58,9 +58,9 @@ python -m pytest tests/python/unit/test_router_policy_log_summary.py -q
 ## Buildkite nightly (L3)
 
 Job **`router-policy-perf-e2e`** in [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml)
-runs **`cache_aware/c16`**, **`kv_aware/c16`**, **`kv_aware_aff/c16`** on **`l4_4`** (4× L4).
+runs **`pd_merge_cache_aware/c16`**, **`pd_merge_kv_aware/c16`**, **`pd_merge_kv_aware_aff/c16`** on **`l4_4`** (4× L4).
 Case JSON reserves 12 GiB GPU KV per worker, no CPU offload, and `max_model_len=32768`.
 
-Nightly step runs `pip install agentinfer==0.2.0` then one pytest invocation (`-k 'cache_aware/c16 or kv_aware/c16 or kv_aware_aff/c16'`).
+Nightly step runs `pip install agentinfer==0.2.0` then one pytest invocation (`-k 'c16'`).
 The trace is `data/tracelab-ci-uniform-28.jsonl` (8 sessions, 28 requests). Optional Buildkite env **`TRACELAB_JSONL_URL`** replaces that file when set.
 See [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml) (`router-policy-perf-e2e`).

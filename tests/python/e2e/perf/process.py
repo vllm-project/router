@@ -354,7 +354,7 @@ def router_cmd(
     *,
     host: str,
     port: int,
-    worker_urls: str | Sequence[str],
+    worker_urls: str | Sequence[str] | None,
     worker_startup_timeout_secs: int,
     prometheus_host: str | None = None,
     prometheus_port: int | None = None,
@@ -363,20 +363,20 @@ def router_cmd(
     """``vllm-router`` argv.
 
     ``worker_urls`` is one URL or a list of URLs after a single
-    ``--worker-urls``. Other keyword arguments are appended as flags.
+    ``--worker-urls``, or None for PD routing. Other keyword arguments become flags.
     Prometheus flags are omitted when unset.
     """
 
-    urls = [worker_urls] if isinstance(worker_urls, str) else list(worker_urls)
     cmd = [
         binary,
         "--host",
         host,
         "--port",
         str(port),
-        "--worker-urls",
-        *urls,
     ]
+    if worker_urls is not None:
+        urls = [worker_urls] if isinstance(worker_urls, str) else worker_urls
+        cmd.extend(["--worker-urls", *urls])
     if prometheus_host:
         cmd.extend(["--prometheus-host", prometheus_host])
     if prometheus_port is not None:

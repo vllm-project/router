@@ -252,6 +252,8 @@ def allocate_ports(run: RouterPolicyStack) -> None:
     }
     alloc["router"] = reserve()
     alloc["metrics"] = reserve()
+    if run.case.prefill_count:
+        alloc["nixl_side"] = [reserve() for _ in range(n)]
     kv_pub: list[int] = []
     kv_replay: list[int] = []
     for _ in range(n):
@@ -295,6 +297,12 @@ def engine_command(run: RouterPolicyStack, i: int):
                 "self_describing_kv_events": True,
             },
         }
+    if run.case.prefill_count:
+        engine["kv_transfer_config"] = {
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_producer" if i < run.case.prefill_count else "kv_consumer",
+        }
+        engine["disable_hybrid_kv_cache_manager"] = True
     engine["safetensors_load_strategy"] = "prefetch"
     engine["kv_events_config"] = {
         "enable_kv_cache_events": True,
@@ -328,14 +336,15 @@ def router_command(run: RouterPolicyStack):
     scheme = str(rp.get("protocol", "grpc"))
     url_key = "grpc" if scheme == "grpc" else "http"
     ttl = rp.get("kv_aware_session_affinity_ttl_secs")
-    return router_cmd(
+    urls = [f"{scheme}://127.0.0.1:{port}" for port in ports[url_key]]
+    prefill_count = run.case.prefill_count
+    cmd = router_cmd(
         run.case.router_bin,
         host="127.0.0.1",
         port=ports["router"],
-        worker_urls=[
-            f"{scheme}://127.0.0.1:{ports[url_key][i]}"
-            for i in range(run.case.worker_count)
-        ],
+        worker_urls=urls if not prefill_count else None,
+        vllm_pd_disaggregation=bool(prefill_count),
+        kv_connector="nixl" if prefill_count else None,
         worker_startup_timeout_secs=int(rp.get("worker_startup_timeout_secs", 60)),
         prometheus_host="127.0.0.1",
         prometheus_port=ports["metrics"],
@@ -353,6 +362,13 @@ def router_command(run: RouterPolicyStack):
             ttl if ttl and policy == "kv_aware_aff" else None
         ),
     )
+
+    if prefill_count:
+        for url in urls[:prefill_count]:
+            cmd.extend(["--prefill", url])
+        for url in urls[prefill_count:]:
+            cmd.extend(["--decode", url])
+    return cmd
 
 
 def runtime_config(run: RouterPolicyStack):
@@ -633,6 +649,16 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
             for i in range(case.worker_count):
                 release_worker_port_holders(run.port_holders, i, case.worker_count)
                 _release_kv_port_holders(run, i)
+                worker_env = run.env | {"CUDA_VISIBLE_DEVICES": run.gpus[i]}
+                if case.prefill_count:
+                    side_holder = 2 * case.worker_count + 2 + i
+                    run.port_holders[side_holder].close()
+                    run.port_holders[side_holder] = None
+                    worker_env.update(
+                        VLLM_NIXL_SIDE_CHANNEL_HOST="127.0.0.1",
+                        VLLM_NIXL_SIDE_CHANNEL_PORT=str(ports["nixl_side"][i]),
+                        UCX_TLS=run.env.get("UCX_TLS", "all"),
+                    )
                 worker_cmd = engine_command(run, i)
                 worker_log = run.out / f"engine{i}.log"
                 Path(str(worker_log) + ".command.json").write_text(
@@ -642,7 +668,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                     launch_worker(
                         worker_cmd,
                         label=f"engine{i}",
-                        env=run.env | {"CUDA_VISIBLE_DEVICES": run.gpus[i]},
+                        env=worker_env,
                         ready_url=f"http://127.0.0.1:{ports['http'][i]}/health",
                         timeout=1800,
                         log_prefix="router_policy",

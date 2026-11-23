@@ -48,7 +48,14 @@ def test_calibration_counts_filtered_samples(summary_module, tmp_path, monkeypat
     (result / "requests.jsonl").write_text(
         "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
     )
-    case = SimpleNamespace(policy="kv_aware", concurrency=8, task_num=3, worker_count=0)
+    case = SimpleNamespace(
+        policy="kv_aware",
+        result_series="pd_disagg_kv_aware_affinity",
+        prefill_count=2,
+        concurrency=8,
+        task_num=3,
+        worker_count=0,
+    )
     run = SimpleNamespace(case=case, out=tmp_path)
     # No workers/dashboard publication: verify the actual serialized calibration.
     monkeypatch.setattr(
@@ -58,6 +65,8 @@ def test_calibration_counts_filtered_samples(summary_module, tmp_path, monkeypat
         run, result_dir=result, replay_rc=0, wall_seconds=3, stalled=False
     )
     stats = json.loads((tmp_path / "calibration.json").read_text(encoding="utf-8"))
+    assert stats["router_policy"] == "pd_disagg_kv_aware_affinity"
+    assert stats["topology"] == "pd_disaggregated"
     assert stats["success"] == 3
     assert stats["ttft_s"]["n"] == 2
     assert stats["tpot_ms"]["n"] == 1

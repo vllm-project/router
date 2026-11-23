@@ -177,11 +177,11 @@ steps:
       - "tests/python/e2e/results/perf/grpc/**/*.json"
 
   # ============================================================================
-  # L3 router_policy TraceLab replay — cache_aware / kv_aware / kv_aware_aff @ c16.
+  # L3 router_policy TraceLab replay — PD merge and PD disaggregated scenarios at c16.
   # 4× vllm-rs + router per cell (12GiB GPU KV/worker, no CPU offload) → L4×4.
   # Optional: TRACELAB_JSONL_URL to replace data/tracelab-ci-uniform-28.jsonl.
   # ============================================================================
-  - label: ":python: router policy perf (c16 × 3 policies)"
+  - label: ":python: router policy perf (c16, PD merge and disaggregated)"
     key: "router-policy-perf-e2e"
     if: build.env("ROCM_ONLY") != "1"
     timeout_in_minutes: 240
@@ -212,7 +212,7 @@ steps:
       fi
       test -f "$${trace}"
 
-      python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'cache_aware/c16 or kv_aware/c16 or kv_aware_aff/c16'
+      python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'c16'
 
       BASH
     # Performance JSON for the dashboard, plus the cell files used to diagnose a run.

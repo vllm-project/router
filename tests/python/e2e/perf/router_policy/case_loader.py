@@ -187,6 +187,7 @@ class RouterPolicyCase:
     task_num: int
     concurrency: int
     worker_count: int
+    prefill_count: int
     gap_scale: float
     max_inflight: int
     stall_secs: int
@@ -194,6 +195,10 @@ class RouterPolicyCase:
     task_stagger: float
     per_worker: dict[str, Any]
     router: dict[str, Any]
+
+    @property
+    def result_series(self) -> str:
+        return self.id.split("-", 1)[1]
 
 
 def concurrency_levels(case: dict[str, Any]) -> list[int]:
@@ -210,8 +215,7 @@ def concurrency_levels(case: dict[str, Any]) -> list[int]:
 def case_at_concurrency(case: dict[str, Any], concurrency: int) -> dict[str, Any]:
     """Copy a scenario JSON and pin one concurrency.
 
-    The cell id stays ``c<n>-<policy>`` so three levels from one file do not
-    share an output directory.
+    The cell ID uses the scenario name and concurrency to identify its output directory.
     """
 
     stamped = dict(case)
@@ -219,8 +223,8 @@ def case_at_concurrency(case: dict[str, Any], concurrency: int) -> dict[str, Any
     bench["max-concurrency"] = int(concurrency)
     stamped["benchmark_params"] = bench
     router = case.get("router_params") or {}
-    policy = str(router.get("policy") or case.get("id") or "router_policy")
-    stamped["id"] = f"c{int(concurrency)}-{policy}"
+    scenario = str(case.get("id") or router.get("policy") or "router_policy")
+    stamped["id"] = f"c{int(concurrency)}-{scenario}"
     return stamped
 
 
@@ -249,6 +253,17 @@ def load_router_policy_case(
     )
     replay_path = str(runtime.get("replay_config_path") or "").strip()
     agent_infer = str(runtime.get("agent_infer") or "").strip()
+    worker_count = int(workers.get("count", 4))
+    prefill_count = int(workers.get("prefill_count", 0))
+    if not 0 <= prefill_count < worker_count:
+        raise ValueError(
+            f"{case_id}: invalid prefill_count {prefill_count} for {worker_count} workers"
+        )
+    if prefill_count and (
+        router.get("protocol", "grpc") != "grpc"
+        or int((workers.get("per_worker") or {}).get("cpu_kv_bytes", 0))
+    ):
+        raise ValueError(f"{case_id}: PD requires gRPC and GPU KV transfer")
     return RouterPolicyCase(
         path=case_file,
         id=case_id,
@@ -269,7 +284,8 @@ def load_router_policy_case(
         policy=policy,
         task_num=int(bench.get("task-num", 128)),
         concurrency=int(bench.get("max-concurrency", 8)),
-        worker_count=int(workers.get("count", 4)),
+        worker_count=worker_count,
+        prefill_count=prefill_count,
         gap_scale=float(bench.get("gap_scale", 0.0)),
         max_inflight=int(bench.get("max_inflight", 1)),
         stall_secs=int(bench.get("stall_secs", 900)),

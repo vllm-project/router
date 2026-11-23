@@ -346,11 +346,13 @@ def write_calibration(
     stats = add_missing_metadata(
         stats,
         {
-            "router_policy": case.policy,
+            "router_policy": case.result_series,
             "concurrency": case.concurrency,
             "task_num": case.task_num,
         },
     )
+    if case.prefill_count:
+        stats.update(topology="pd_disaggregated", routing_policy=case.policy)
     (run.out / "calibration.json").write_text(json.dumps(stats, indent=2))
     emit_run_summary(
         run,
