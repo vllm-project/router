@@ -277,8 +277,6 @@ steps:
       rm -rf "$$EVIDENCE_DIR"
       mkdir -p "$$EVIDENCE_DIR"
       timeout --signal=TERM --kill-after=30s 600 bash .buildkite/scripts/install_packages.sh router-bin
-      # Pin the dependency versions resolved during manual validation against
-      # this image digest; they are installed packages, not image assertions.
       timeout --signal=TERM --kill-after=30s 600 bash .buildkite/scripts/install_packages.sh rocm-kv-aware
       export ROUTER_BIN=/workdir/target/release/vllm-router
       export CUDA_VISIBLE_DEVICES=0,1
