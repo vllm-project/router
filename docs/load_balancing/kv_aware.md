@@ -36,7 +36,6 @@ A manual layout describes the worker's cache groups, hashing and reuse rules. Wi
 | Hash algorithm | Pass `--prefix-caching-hash-algo sha256_cbor` so Router and vLLM compute the same block keys. |
 | Event hashes | Set `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` to publish the full 32-byte hashes. |
 | KV events | Enable events through `--kv-events-config` and keep incremental reporting. Router uses live events to track cache changes and replay to recover missed events. |
-| HTTP text and chat | Add `--enable-scale-out` so Router can use the worker's tokenizer and chat template to score reuse. Workers serving pretokenized prompts without rendering can omit it. |
 
 ### Set the event ports
 
@@ -64,9 +63,10 @@ In the Router terminal, use `LAYOUT_ARGS=()` when Router can derive or discover 
 
 #### HTTP workers
 
+The command below accepts token IDs through `/v1/completions`. To score reuse for text and chat prompts, add `--enable-scale-out`. Router then uses the worker's tokenizer and chat template to get the actual prompt tokens.
+
 ```bash
-vllm serve "$MODEL" --host 127.0.0.1 \
-  --enable-scale-out "${KV_ARGS[@]}"
+vllm serve "$MODEL" --host 127.0.0.1 "${KV_ARGS[@]}"
 ```
 
 ```bash
@@ -132,11 +132,11 @@ In the Router terminal, use `LAYOUT_ARGS=(--kv-hybrid-layout layout.json)` when 
 
 #### HTTP P/D
 
-Run the worker command on Prefill first, then Decode.
+Run the worker command on Prefill first, then Decode. To score Prefill reuse for text and chat prompts, add `--enable-scale-out` to the Prefill command.
 
 ```bash
 vllm serve "$MODEL" --host 127.0.0.1 --port "$HTTP_PORT" \
-  --enable-scale-out "${KV_ARGS[@]}" --kv-transfer-config "$TRANSFER"
+  "${KV_ARGS[@]}" --kv-transfer-config "$TRANSFER"
 ```
 
 ```bash
