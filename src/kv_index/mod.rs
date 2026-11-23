@@ -23,10 +23,13 @@ pub(crate) use endpoints::canonical_endpoint;
 pub use endpoints::{parse_endpoint_mapping, resolve_endpoints};
 pub use indexer::{KvBlockIndexer, MatchQuery, TierMatch};
 pub use subscriber::local_hashes;
+pub(crate) use types::SourceRecoveryReason;
 pub use types::{
     CacheOwnerId, ClearScope, HashMode, Locality, ResidencyOwner, RoutableTarget, SourceId,
     StorageTier,
 };
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+pub(crate) use types::{SourceRecoveryState, SourceRecoveryStatus};
 pub use wire::{AllBlocksCleared, BlockRemoved, BlockStored, KVEvent, KVEventBatch};
 
 // Compatibility export; the consumer owns the port and the index implements it.
@@ -88,11 +91,6 @@ pub(crate) fn record_signal_loss() {
 /// `EXACT`/`DEGRADED`/`FALLBACK` state machine is the trust arbiter's contract.
 #[derive(Debug, Clone)]
 pub enum IngestionSignal {
-    Invalidated {
-        source: SourceId,
-        dp_rank: u32,
-        reason: &'static str,
-    },
     Advance {
         source: SourceId,
         last_seq: i64,
