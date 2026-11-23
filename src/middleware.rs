@@ -393,7 +393,13 @@ pub struct QueuedRequest {
     /// Time when the request was queued
     queued_at: tokio::time::Instant,
     /// Channel to send the permit back when acquired
-    permit_tx: oneshot::Sender<Result<QueueGrant, StatusCode>>,
+    permit_tx: oneshot::Sender<Result<QueueGrant, QueueRejection>>,
+}
+
+#[derive(Debug)]
+enum QueueRejection {
+    DeadlineExpired,
+    SemaphoreClosed,
 }
 
 /// Own both reservations across the oneshot handoff until dispatch starts.
@@ -461,7 +467,7 @@ impl QueueProcessor {
                 let concurrency_semaphore = concurrency_semaphore.clone();
 
                 if tokio::time::Instant::now() >= deadline {
-                    return Some(Err(StatusCode::REQUEST_TIMEOUT));
+                    return Some(Err(QueueRejection::DeadlineExpired));
                 }
 
                 let permit = tokio::select! {
@@ -469,7 +475,7 @@ impl QueueProcessor {
                     _ = queued.permit_tx.closed() => return None,
                     result = concurrency_semaphore.acquire_owned() => match result {
                         Ok(permit) => permit,
-                        Err(_) => return Some(Err(StatusCode::SERVICE_UNAVAILABLE)),
+                        Err(_) => return Some(Err(QueueRejection::SemaphoreClosed)),
                     },
                 };
 
@@ -501,16 +507,16 @@ impl QueueProcessor {
                         debug!("Queued request was cancelled before permit delivery");
                     }
                 }
-                Ok(Some(Err(status))) => {
-                    debug!("Queue: request rejected with {}", status);
-                    let _ = queued.permit_tx.send(Err(status));
+                Ok(Some(Err(reason))) => {
+                    debug!(?reason, "Queue: request rejected");
+                    let _ = queued.permit_tx.send(Err(reason));
                 }
                 Ok(None) => {
                     debug!("Queued request was cancelled while waiting for a permit or rate token");
                 }
                 Err(_) => {
                     warn!("Queue: request timed out waiting for a permit or rate token");
-                    let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
+                    let _ = queued.permit_tx.send(Err(QueueRejection::DeadlineExpired));
                 }
             }
         }
@@ -698,7 +704,11 @@ pub async fn concurrency_limit_middleware(
                         let response = next.run(request).await;
                         hold_permit_for_body(response, permit)
                     }
-                    Ok(Err(status)) => {
+                    Ok(Err(reason)) => {
+                        let status = match reason {
+                            QueueRejection::DeadlineExpired => StatusCode::REQUEST_TIMEOUT,
+                            QueueRejection::SemaphoreClosed => StatusCode::SERVICE_UNAVAILABLE,
+                        };
                         warn!("Queue returned error status: {}", status);
                         status.into_response()
                     }
@@ -727,7 +737,7 @@ mod queue_grant_tests {
     async fn delivered_grant() -> (
         Arc<TokenBucket>,
         Arc<Semaphore>,
-        oneshot::Receiver<Result<QueueGrant, StatusCode>>,
+        oneshot::Receiver<Result<QueueGrant, QueueRejection>>,
     ) {
         let bucket = Arc::new(TokenBucket::new(1, 1));
         let semaphore = Arc::new(Semaphore::new(1));

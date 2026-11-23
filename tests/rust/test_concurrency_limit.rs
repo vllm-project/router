@@ -55,10 +55,11 @@ async fn app_with_queue_processor(
         ..Default::default()
     };
     let mut context =
-        Arc::new(AppContext::new(config, reqwest::Client::new(), 1, Some(rate), vec![]).unwrap());
+        AppContext::new(config, reqwest::Client::new(), 1, Some(rate), vec![]).unwrap();
     if let Some(semaphore) = semaphore {
-        Arc::get_mut(&mut context).unwrap().concurrency_semaphore = semaphore;
+        context.concurrency_semaphore = semaphore;
     }
+    let context = Arc::new(context);
     let router = Arc::from(
         RouterFactory::create_regular_router(&[], &context)
             .await

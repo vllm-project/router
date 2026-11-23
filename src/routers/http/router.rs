@@ -2158,7 +2158,14 @@ impl Router {
                 let mut stream = stream;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
+                while let Some(chunk) = tokio::select! {
+                    biased;
+                    _ = tx.closed() => {
+                        stream_succeeded = false;
+                        None
+                    }
+                    chunk = stream.next() => chunk,
+                } {
                     match chunk {
                         Ok(bytes) => {
                             if completion_echo.is_none() {
@@ -2250,7 +2257,14 @@ impl Router {
                 let mut stream = stream;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
+                while let Some(chunk) = tokio::select! {
+                    biased;
+                    _ = tx.closed() => {
+                        stream_succeeded = false;
+                        None
+                    }
+                    chunk = stream.next() => chunk,
+                } {
                     match chunk {
                         Ok(bytes) => {
                             if first_sse {
@@ -6330,6 +6344,11 @@ mod tests {
                     .is_err());
             }
             drop(body);
+            if matches!(case, "cancel" | "http_error") {
+                tokio::time::timeout(Duration::from_secs(5), tx.closed())
+                    .await
+                    .expect("dropping the response must close the stalled upstream body");
+            }
             drop(tx);
             assert_eq!(fixture.worker.load(), 1, "{case}");
             assert_eq!(
