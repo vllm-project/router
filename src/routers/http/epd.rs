@@ -232,6 +232,7 @@ impl EncoderStage {
         // each, so 31 items take that path. Completion order returns the first
         // error and drops the rest. Replies are written back by group index so
         // a successful fan-out stays in the order the zip below expects.
+        let consumer_addr = consumer_addr.map(String::as_str);
         let mut inflight = FuturesUnordered::new();
         for (group_index, (encoder, indices)) in groups.iter().enumerate() {
             let encoder_url = &self.config.encoder_urls[*encoder];
@@ -254,7 +255,6 @@ impl EncoderStage {
             }
             let items = &items;
             let body = &body;
-            let consumer_addr = consumer_addr.map(String::as_str);
             inflight.push(async move {
                 encode_group(request, items, indices, body, consumer_addr)
                     .await
@@ -270,6 +270,8 @@ impl EncoderStage {
             reject_unusable_item_indices(&groups[group_index].1, &reply)?;
             replies[group_index] = Some(reply);
         }
+        // The queue is already empty, so this does not cancel anything. It ends
+        // the futures' borrow of `body` before the rewrite below mutates it.
         drop(inflight);
         let replies = replies.into_iter().collect::<Option<Vec<_>>>().ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -297,25 +299,23 @@ impl EncoderStage {
             // shape are fallbacks for encoders without position metadata.
             let mut by_position: HashMap<usize, (&String, &Value)> = HashMap::new();
             if indices.len() > 1 {
+                // `reject_unusable_item_indices` already returned 502 for a
+                // duplicate or out-of-range index, before the other groups
+                // finished. This loop only records a position for the rewrite.
                 for (mm_hash, reported) in params.iter() {
-                    if let Some(item_indices) =
-                        reported.get("item_indices").and_then(Value::as_array)
-                    {
-                        for local in item_indices {
-                            let local = local
-                                .as_u64()
-                                .map(|v| v as usize)
-                                .filter(|&v| v < indices.len())
-                                .ok_or_else(|| {
-                                    (StatusCode::BAD_GATEWAY, "Invalid encoder item index".into())
-                                })?;
-                            if by_position.insert(local, (mm_hash, reported)).is_some() {
-                                return Err((
-                                    StatusCode::BAD_GATEWAY,
-                                    "Duplicate encoder item index".into(),
-                                ));
-                            }
-                        }
+                    let Some(item_indices) = reported.get("item_indices").and_then(Value::as_array)
+                    else {
+                        continue;
+                    };
+                    for local in item_indices {
+                        let Some(local) = local
+                            .as_u64()
+                            .map(|v| v as usize)
+                            .filter(|&v| v < indices.len())
+                        else {
+                            continue;
+                        };
+                        by_position.entry(local).or_insert((mm_hash, reported));
                     }
                 }
             }
@@ -965,9 +965,12 @@ mod tests {
 
     #[tokio::test]
     async fn failed_encoder_cancels_a_blocked_sibling_past_join_all_limit() {
-        // 31 singleton groups cross futures-util's try_join_all threshold of 30.
-        // Group 0 blocks on the first encoder. Group 1 returns 503. The stage
-        // must return without waiting out the blocked call.
+        // 31 singleton groups used to cross futures-util's try_join_all
+        // threshold of 30, where a later error waited for every earlier
+        // group. `FuturesUnordered` has no such threshold. This fails if the
+        // fan-out is switched back to `try_join_all`. Group 0 blocks on the
+        // first encoder. Group 1 returns 503. The stage must return without
+        // waiting out the blocked call.
         let cancelled = Arc::new(AtomicBool::new(false));
         let slow = Router::new()
             .route("/v1/chat/completions", post(slow_encode))
