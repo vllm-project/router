@@ -16,12 +16,13 @@ mod consumer_2xx_with_stalled_or_invalid_body {
     use tokio::task::JoinHandle;
 
     /// Sends a request with P in `mode`. Returns while P's body stalls: P has
-    /// the request, the client waits, and the armed guard sends nothing.
+    /// sent its headers and first part, the client waits, and the armed guard
+    /// sends nothing.
     async fn p_body_stalled(path: Path, mode: Mode) -> (Rig, JoinHandle<Response>) {
         let mut rig = Rig::new(path).await;
         rig.consumer.set_mode(mode);
         let mut client = rig.send(two_images());
-        rig.consumer.wait_requests(1).await;
+        rig.consumer.wait_stalls(1).await;
         expect_waiting(&mut client).await;
         rig.expect_no_cancel().await;
         (rig, client)
@@ -101,7 +102,7 @@ mod consumer_2xx_with_stalled_or_invalid_body {
         let mut rig = Rig::new(Path::SplitPdSequential).await;
         rig.consumer.set_mode(Mode::StallBody);
         let mut client = rig.send(two_images());
-        rig.consumer.wait_requests(1).await;
+        rig.consumer.wait_stalls(1).await;
         expect_waiting(&mut client).await;
         disconnect(client).await;
         rig.consumer.expect_aborted().await;
@@ -158,8 +159,8 @@ mod consumer_2xx_with_stalled_or_invalid_body {
         rig.consumer.set_mode(Mode::StallBody);
         rig.decode.set_mode(Mode::StallBody);
         let mut client = rig.send(two_images());
-        rig.consumer.wait_requests(1).await;
-        rig.decode.wait_requests(1).await;
+        rig.consumer.wait_stalls(1).await;
+        rig.decode.wait_stalls(1).await;
         expect_waiting(&mut client).await;
         disconnect(client).await;
         rig.consumer.expect_aborted().await;

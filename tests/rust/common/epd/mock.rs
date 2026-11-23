@@ -75,8 +75,10 @@ pub struct MockState {
     role: Role,
     mode: Mutex<Mode>,
     requests: Mutex<Vec<Value>>,
+    stalls: Mutex<usize>,
     ends: Mutex<Vec<End>>,
     arrived: Notify,
+    stalled: Notify,
     ended: Notify,
     release: Semaphore,
 }
@@ -88,8 +90,10 @@ impl Mock {
             role,
             mode: Mutex::new(Mode::Reply),
             requests: Mutex::default(),
+            stalls: Mutex::default(),
             ends: Mutex::default(),
             arrived: Notify::new(),
+            stalled: Notify::new(),
             ended: Notify::new(),
             release: Semaphore::new(0),
         }))
@@ -123,13 +127,18 @@ impl Mock {
         self.0.requests.lock().unwrap().clone()
     }
 
+    fn stalls(&self) -> usize {
+        *self.0.stalls.lock().unwrap()
+    }
+
     fn ends(&self) -> Vec<End> {
         self.0.ends.lock().unwrap().clone()
     }
 
-    /// Forgets the requests and ends seen so far (after the rig's warm-up).
+    /// Forgets what the mock has seen so far (after the rig's warm-up).
     pub fn reset(&self) {
         self.0.requests.lock().unwrap().clear();
+        *self.0.stalls.lock().unwrap() = 0;
         self.0.ends.lock().unwrap().clear();
     }
 
@@ -151,6 +160,12 @@ impl Mock {
         }
     }
 
+    /// Records a reply that now holds the rest of its body.
+    fn stall(&self) {
+        *self.0.stalls.lock().unwrap() += 1;
+        self.0.stalled.notify_one();
+    }
+
     /// Whether `count` requests arrive within `WAIT_DURATION`.
     pub async fn got_requests(&self, count: usize) -> bool {
         tokio::time::timeout(WAIT_DURATION, async {
@@ -169,6 +184,26 @@ impl Mock {
             "[dispatch] {} got {} of {count} requests",
             self.0.name,
             self.requests().len()
+        );
+    }
+
+    /// `[stall]`: `count` replies have sent their headers and first part,
+    /// and hold the rest (the `Stall*` modes and `BreakBody`). The mock
+    /// cannot see the router read them: `expect_waiting` after this check
+    /// gives the router the time `QUIET` to do that.
+    pub async fn wait_stalls(&self, count: usize) {
+        let stalled = tokio::time::timeout(WAIT_DURATION, async {
+            while self.stalls() < count {
+                self.0.stalled.notified().await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            stalled,
+            "[stall] {} stalled {} of {count} replies",
+            self.0.name,
+            self.stalls()
         );
     }
 
@@ -326,6 +361,10 @@ async fn handle(State(mock): State<Mock>, Json(request): Json<Value>) -> Respons
             // `life` moves into the body: if hyper drops the body before the
             // release, the request ends as `Aborted`.
             let rest = futures_util::stream::once(async move {
+                // hyper asks for `rest` only after it has taken the headers
+                // and the first part, and it writes them out before its task
+                // yields.
+                mock.stall();
                 mock.hold().await;
                 life.finish();
                 if mode == Mode::BreakBody {
