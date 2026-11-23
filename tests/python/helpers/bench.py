@@ -13,10 +13,10 @@ from pathlib import Path
 import pytest
 
 from tests.python.helpers.monitor import (
-    _gpu_monitor_should_run,
-    _launch_gpu_monitor,
-    _log_and_assert_gpu_thresholds,
-    _read_gpu_monitor_result,
+    gpu_monitor_should_run,
+    launch_gpu_monitor,
+    log_and_assert_gpu_thresholds,
+    read_gpu_monitor_result,
 )
 from tests.python.helpers.process import stop_any
 
@@ -100,10 +100,10 @@ def run_genai_bench(
     )
     monitor_path = None
     monitor_proc = None
-    want_gpu_monitor = _gpu_monitor_should_run(thresholds)
+    want_gpu_monitor = gpu_monitor_should_run(thresholds)
     if want_gpu_monitor:
         interval = float(os.environ.get("GPU_UTIL_SAMPLE_INTERVAL", "2.0"))
-        monitor_proc, monitor_path = _launch_gpu_monitor(
+        monitor_proc, monitor_path = launch_gpu_monitor(
             bench_pid=proc.pid,
             experiment_folder=experiment_folder,
             interval=interval,
@@ -195,8 +195,8 @@ def run_genai_bench(
                     monitor_proc.join(timeout=5)
             except Exception:
                 pass
-            _log_and_assert_gpu_thresholds(
-                _read_gpu_monitor_result(monitor_path), thresholds
+            log_and_assert_gpu_thresholds(
+                read_gpu_monitor_result(monitor_path), thresholds
             )
     finally:
         if kill_procs:

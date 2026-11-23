@@ -245,7 +245,7 @@ def test_pd_cache_aware_prefix_overrides_load(
         daemon=True,
     )
     holder.start()
-    mock_worker_manager.wait_for_decode_load(cached)
+    mock_worker_manager.wait_for_load(cached)
     diverted = completion(rh.url, other_prompt, timeout=10)
 
     replay_box = {}
@@ -256,7 +256,7 @@ def test_pd_cache_aware_prefix_overrides_load(
     replay_thread = threading.Thread(target=replay, daemon=True)
     replay_thread.start()
     try:
-        mock_worker_manager.wait_for_decode_load(cached, minimum=2)
+        mock_worker_manager.wait_for_load(cached, minimum=2)
     finally:
         release.write_text("go")
     holder.join(timeout=10)

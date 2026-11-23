@@ -12,7 +12,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-def _gpu_monitor_should_run(thresholds: Optional[dict]) -> bool:
+def gpu_monitor_should_run(thresholds: Optional[dict]) -> bool:
     """Decide whether to enable the GPU monitor.
 
     Runs if thresholds request GPU checks or if GPU_UTIL_LOG is truthy.
@@ -36,7 +36,7 @@ def _gpu_monitor_path(experiment_folder: str) -> str:
     return str(base / "gpu_utilization.json")
 
 
-def _launch_gpu_monitor(bench_pid: int, experiment_folder: str, interval: float):
+def launch_gpu_monitor(bench_pid: int, experiment_folder: str, interval: float):
     """Start the GPU monitor process. Returns (proc, path) or (None, None)."""
     try:
         from multiprocessing import Process
@@ -54,7 +54,7 @@ def _launch_gpu_monitor(bench_pid: int, experiment_folder: str, interval: float)
         return None, None
 
 
-def _read_gpu_monitor_result(path: Optional[str]) -> Optional[dict]:
+def read_gpu_monitor_result(path: Optional[str]) -> Optional[dict]:
     try:
         if path and os.path.exists(path):
             with open(path, "r") as f:
@@ -64,7 +64,7 @@ def _read_gpu_monitor_result(path: Optional[str]) -> Optional[dict]:
     return None
 
 
-def _log_and_assert_gpu_thresholds(
+def log_and_assert_gpu_thresholds(
     result: Optional[dict], thresholds: Optional[dict]
 ) -> None:
     if not result or not isinstance(result, dict) or result.get("count", 0) <= 0:

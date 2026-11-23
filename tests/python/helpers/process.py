@@ -87,14 +87,16 @@ def _pipe(
     return thread
 
 
-def _wait_http(
+def wait_http(
     url: str,
     timeout: float,
     proc: subprocess.Popen,
     label: str,
     *,
     prefix: str,
+    interval: float = 2.0,
 ) -> None:
+    """Wait for an HTTP endpoint while its process is running."""
     start = time.monotonic()
     last_log = start
     while time.monotonic() - start < timeout:
@@ -114,7 +116,7 @@ def _wait_http(
                 prefix, f"waiting for {url} ({now - start:.0f}s / {timeout:.0f}s)…"
             )
             last_log = now
-        time.sleep(2)
+        time.sleep(interval)
     raise TimeoutError(f"{label} not ready at {url} within {timeout}s")
 
 
@@ -479,7 +481,7 @@ def launch_worker(
     thread = _pipe(proc, label, None, threading.Lock(), log_fp)
     try:
         if ready_url:
-            _wait_http(ready_url, timeout, proc, label, prefix=log_prefix)
+            wait_http(ready_url, timeout, proc, label, prefix=log_prefix)
         elif sleep_s > 0:
             time.sleep(sleep_s)
         if proc.poll() is not None:
@@ -521,7 +523,7 @@ def launch_router(
     proc = _popen(cmd, env, prefix=log_prefix)
     thread = _pipe(proc, "vllm-router", lines if keep_log else None, lock, log_fp)
     try:
-        _wait_http(
+        wait_http(
             router_url.rstrip("/") + "/health",
             timeout,
             proc,

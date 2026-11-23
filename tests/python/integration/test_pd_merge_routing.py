@@ -9,6 +9,7 @@ prefill and decode pools.
 import collections
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -186,7 +187,7 @@ def test_merge_cache_aware_prefix_overrides_load(
         daemon=True,
     )
     holder.start()
-    mock_worker_manager.wait_for_decode_load(cached)
+    mock_worker_manager.wait_for_load(cached)
     diverted = completion(rh.url, other_prompt, timeout=10)
 
     replay_box = {}
@@ -197,7 +198,7 @@ def test_merge_cache_aware_prefix_overrides_load(
     replay_thread = threading.Thread(target=replay, daemon=True)
     replay_thread.start()
     try:
-        mock_worker_manager.wait_for_decode_load(cached, minimum=2)
+        mock_worker_manager.wait_for_load(cached, minimum=2)
     finally:
         release.write_text("go")
     holder.join(timeout=10)
@@ -231,12 +232,13 @@ def test_merge_kv_aware_spreads_concurrent_load(router_manager, mock_worker_mana
 
 
 @pytest.mark.integration
-def test_merge_kv_aware_affinity_sticks_to_session(router_manager, mock_worker_manager):
-    # Idle workers tie, and a tie goes to the first worker. Two sessions only
-    # land apart when the second starts while the first is still in flight.
-    # After that, a session that is not on the first worker can only stay put
-    # through its affinity binding.
-    _, urls, ids = mock_worker_manager.start_workers(n=2, args=["--latency-ms", "500"])
+def test_merge_kv_aware_affinity_sticks_to_session(
+    router_manager, mock_worker_manager, tmp_path
+):
+    release = tmp_path / "release"
+    _, urls, ids = mock_worker_manager.start_workers(
+        n=2, args=["--hold-after", "1", "--release-file", str(release)]
+    )
     rh = _router(
         router_manager,
         urls,
@@ -253,21 +255,21 @@ def test_merge_kv_aware_affinity_sticks_to_session(router_manager, mock_worker_m
             timeout=10,
         )
 
-    first = {}
-    alpha_start = threading.Thread(
-        target=lambda: first.update(alpha=session_worker("alpha", 0)), daemon=True
-    )
-    alpha_start.start()
-    time.sleep(0.2)
-    first["beta"] = session_worker("beta", 0)
-    alpha_start.join(timeout=10)
+    # Prime alpha's worker so its next request waits on the release file.
+    alpha = session_worker("alpha", 0)
+    assert alpha in worker_ids
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        held_alpha = pool.submit(session_worker, "alpha", 1)
+        try:
+            mock_worker_manager.wait_for_load(alpha)
+            beta = session_worker("beta", 0)
+        finally:
+            release.touch()
+        assert held_alpha.result() == alpha
 
-    assert {first["alpha"], first["beta"]} == worker_ids, first
-
-    alpha = [first["alpha"]] + [session_worker("alpha", turn) for turn in range(1, 5)]
-    beta = [first["beta"]] + [session_worker("beta", turn) for turn in range(1, 5)]
-    assert set(alpha) == {first["alpha"]}, alpha
-    assert set(beta) == {first["beta"]}, beta
+    assert {alpha, beta} == worker_ids
+    assert {session_worker("alpha", turn) for turn in range(2, 6)} == {alpha}
+    assert {session_worker("beta", turn) for turn in range(1, 5)} == {beta}
 
 
 @pytest.mark.integration

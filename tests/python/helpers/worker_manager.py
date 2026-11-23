@@ -16,6 +16,7 @@ import requests
 
 from tests.python.helpers.client import get_load
 from tests.python.helpers.ports import find_free_port
+from tests.python.helpers.process import stop_any, wait_http
 
 _MOCK_WORKER = Path(__file__).resolve().parent / "mock_worker.py"
 
@@ -84,15 +85,15 @@ class MockWorkerManager:
         self.decode_ids.update(worker_ids)
         return urls, worker_ids
 
-    def wait_for_decode_load(
+    def wait_for_load(
         self, worker_id: str, minimum: int = 1, timeout: float = 5.0
     ) -> None:
-        """Wait until a mock decode worker reports at least ``minimum`` in-flight load."""
+        """Wait until a mock worker reports at least ``minimum`` in-flight load."""
         url = f"http://127.0.0.1:{str(worker_id).removeprefix('worker-')}"
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         last = None
         with requests.Session() as session:
-            while time.time() < deadline:
+            while time.monotonic() < deadline:
                 last = get_load(url, session=session)
                 if isinstance(last, int) and last >= minimum:
                     return
@@ -101,12 +102,7 @@ class MockWorkerManager:
 
     def stop_all(self) -> None:
         for process in self._children:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+            stop_any(process, timeout=3)
         self._children.clear()
 
     def _spawn(self, args: list[str]) -> tuple[subprocess.Popen, str, str]:
@@ -124,19 +120,11 @@ class MockWorkerManager:
         process = subprocess.Popen(cmd)
         self._children.append(process)
         url = f"http://127.0.0.1:{port}"
-        _wait_health(url)
+        try:
+            wait_http(
+                f"{url}/health", 10, process, worker_id, prefix="mock", interval=0.1
+            )
+        except Exception:
+            stop_any(process, timeout=3)
+            raise
         return process, url, worker_id
-
-
-def _wait_health(url: str, timeout: float = 10.0) -> None:
-    start = time.time()
-    with requests.Session() as session:
-        while time.time() - start < timeout:
-            try:
-                response = session.get(f"{url}/health", timeout=1)
-                if response.status_code == 200:
-                    return
-            except requests.RequestException:
-                pass
-            time.sleep(0.1)
-    raise TimeoutError(f"Mock worker at {url} did not become healthy")
