@@ -1,3 +1,4 @@
+use super::completion_output::{CompletionOutputObserver, HistoryOutput};
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
 use super::program_adapter::{
     prepare_stream_usage_body, settle_grpc_response, ProgramCompletion, SseUsageStripper, StreamEnd,
@@ -2122,7 +2123,13 @@ impl Router {
                             completion,
                             load,
                             prepared: (*prepared).clone(),
-                            history: observation.map(|observation| (policy.clone(), observation)),
+                            history: observation
+                                .filter(|_| !is_http || match typed_req.grpc_request() {
+                                    Some(GrpcRequestRef::Completion(request)) => !request.echo,
+                                    Some(GrpcRequestRef::Chat(request)) => request.echo != Some(true),
+                                    _ => false,
+                                })
+                                .map(|observation| (policy.clone(), observation)),
                             request_body: injected_body.clone(),
                         },
                         program_completion.clone(),
@@ -2489,16 +2496,26 @@ impl Router {
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        if status.is_success() {
-            if let Some((policy, observation)) = history {
-                if let (Some(kv), Some(current)) = (
-                    kv_aware_ops(policy.as_ref()),
-                    self.worker_registry.get_by_url(worker_url),
-                ) {
-                    kv.observe_completion_milestone(current.as_ref(), observation);
-                }
-            }
-        }
+        // History inspects only recognizable output, without changing forwarding
+        // or negotiating a different encoding for this optional observation.
+        let history = history
+            .filter(|_| {
+                status.is_success()
+                    && res
+                        .headers()
+                        .get_all(http::header::CONTENT_ENCODING)
+                        .iter()
+                        .all(|value| value.as_bytes().eq_ignore_ascii_case(b"identity"))
+            })
+            .and_then(|(policy, observation)| {
+                let output = match (route, is_stream) {
+                    ("/v1/completions", _) => HistoryOutput::Completion,
+                    ("/v1/chat/completions", true) => HistoryOutput::ChatDelta,
+                    ("/v1/chat/completions", false) => HistoryOutput::ChatMessage,
+                    _ => return None,
+                };
+                Some((policy, observation, output))
+            });
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
         if strip_usage
@@ -2534,6 +2551,16 @@ impl Router {
                     if let Some(completion) = &program_completion {
                         completion.observe_json(&body);
                     }
+                    if let Some((policy, observation, _)) =
+                        history.filter(|(_, _, output)| output.has_output(&body))
+                    {
+                        if let (Some(kv), Some(current)) = (
+                            kv_aware_ops(policy.as_ref()),
+                            self.worker_registry.get_by_url(worker_url),
+                        ) {
+                            kv.observe_completion_milestone(current.as_ref(), observation);
+                        }
+                    }
                     let mut response = Response::new(axum::body::Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
@@ -2552,6 +2579,15 @@ impl Router {
             response
         } else if load_incremented {
             let mut completion_output = completion.map(|input| input.output_observer(status));
+            let mut history = history.map(|(policy, observation, output)| {
+                (
+                    policy,
+                    observation,
+                    CompletionOutputObserver::for_history(output),
+                    self.worker_registry.clone(),
+                    worker_url.to_owned(),
+                )
+            });
             // The forwarding task and response body share one cleanup receipt.
             let completion = if status.is_success() {
                 program_completion
@@ -2646,6 +2682,9 @@ impl Router {
                                 },
                                 None => bytes,
                             };
+                            let history_ready = history
+                                .as_mut()
+                                .is_some_and(|(_, _, observer, _, _)| observer.observe(&outgoing));
                             let sent = match producer_output_frame.as_mut() {
                                 Some(output_frame) => output_frame.send(&tx, outgoing, has_output),
                                 None => tx.send(Ok(outgoing)).is_ok(),
@@ -2653,6 +2692,20 @@ impl Router {
                             if !sent {
                                 stream_succeeded = false;
                                 break;
+                            }
+                            if history_ready {
+                                if let Some((policy, observation, _, registry, url)) =
+                                    history.take()
+                                {
+                                    if let (Some(kv), Some(current)) =
+                                        (kv_aware_ops(policy.as_ref()), registry.get_by_url(&url))
+                                    {
+                                        kv.observe_completion_milestone(
+                                            current.as_ref(),
+                                            observation,
+                                        );
+                                    }
+                                }
                             }
                             if has_output {
                                 producer_load.begin_decode();
@@ -5470,7 +5523,12 @@ mod tests {
                         let frame = serde_json::json!({"choices":[event],"worker":worker_index});
                         return ([(CONTENT_TYPE, "text/event-stream")], format!("data: {frame}\n\ndata: [DONE]\n\n")).into_response();
                     }
-                    Json(serde_json::json!({"worker": worker_index, "choices": []})).into_response()
+                    let choice = if path == "/v1/chat/completions" {
+                        serde_json::json!({"message":{"role":"assistant","content":"x"}})
+                    } else {
+                        serde_json::json!({"text":"x"})
+                    };
+                    Json(serde_json::json!({"worker": worker_index, "choices": [choice]})).into_response()
                 }
             }));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5540,14 +5598,7 @@ mod tests {
             .await
             .unwrap();
         let payload = if streaming {
-            let body = std::str::from_utf8(&bytes).unwrap();
-            let body = if body.starts_with(": router-stages ") {
-                body.split_once("\n\n")
-                    .expect("router-stages comment must be a complete SSE frame")
-                    .1
-            } else {
-                body
-            };
+            let body = std::str::from_utf8(without_router_stages(&bytes)).unwrap();
             let frame = body
                 .strip_prefix("data: ")
                 .and_then(|frame| frame.strip_suffix("\n\ndata: [DONE]\n\n"))
@@ -5768,12 +5819,13 @@ mod tests {
                 assert!(f.workers.iter().all(|w| w.load() == 0), "{path}");
             }
         }
-        // Exercise identity gating on the real Chat caller, before capture.
+        // Exercise identity and echo gating on the real Chat caller.
         f.workers[0].set_healthy(false);
         for (field, value, expected_tokens) in [
             ("prompt_adapter_request", json!({"id":7}), 0),
             ("lora_name", json!("adapter"), 0),
             ("cache_salt", json!("tenant"), 33),
+            ("echo", json!(true), 33),
         ] {
             for w in &f.workers {
                 register_history_target(kv, w, kv.target_for_worker(w.as_ref()), "model", 16);
@@ -5827,27 +5879,63 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn completion_history_observes_successful_headers_before_body_not_before_cancel() {
-        use bytes::Bytes;
+    async fn completion_history_response_fixture() -> CompletionResponseFixture {
         let mut f = completion_response_fixture().await;
         Arc::get_mut(&mut f.router)
             .unwrap()
             .kv_aware_completion_history = true;
         let policy = f.router.policy_registry.get_default_policy();
         let kv = kv_aware_policy(policy.as_ref()).unwrap();
+        register_history_target(
+            kv,
+            &f.worker,
+            kv.target_for_worker(f.worker.as_ref()),
+            "model",
+            16,
+        );
+        f
+    }
+
+    fn completion_history_request(id: u32, stream: bool, echo: bool) -> CompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "model", "prompt": vec![id; 16], "stream": stream, "echo": echo
+        }))
+        .unwrap()
+    }
+
+    const HISTORY_TEST_OUTPUT: &[u8] = b"data: {\"choices\":[{\"text\":\"generated\"}]}\n\n";
+    const HISTORY_TEST_KEEPALIVE: &[u8] = b": worker keepalive\n\n";
+
+    fn without_router_stages(body: &[u8]) -> &[u8] {
+        if body.starts_with(b": router-stages ") {
+            let end = body
+                .windows(2)
+                .position(|part| part == b"\n\n")
+                .expect("router-stages comment must be a complete SSE frame");
+            &body[end + 2..]
+        } else {
+            body
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_history_observes_first_generated_output_before_eof() {
+        use bytes::Bytes;
+        let mut f = completion_history_response_fixture().await;
+        let policy = f.router.policy_registry.get_default_policy();
+        let kv = kv_aware_policy(policy.as_ref()).unwrap();
         let target = kv.target_for_worker(f.worker.as_ref());
-        register_history_target(kv, &f.worker, target.clone(), "model", 16);
         let manager = kv.slot_manager().unwrap();
         let dispatch = |id: u32| {
             let router = f.router.clone();
             tokio::spawn(async move {
-                let req: CompletionRequest = serde_json::from_value(
-                    serde_json::json!({"model":"model","prompt":vec![id;16]}),
-                )
-                .unwrap();
                 router
-                    .route_typed_request(None, &req, "/v1/completions", None)
+                    .route_typed_request(
+                        None,
+                        &completion_history_request(id, true, false),
+                        "/v1/completions",
+                        None,
+                    )
                     .await
             })
         };
@@ -5868,25 +5956,41 @@ mod tests {
                 UnboundedReceiverStream::new(chunks),
             )))
             .unwrap();
-        send.send(Ok(Bytes::from_static(b"partial"))).unwrap();
-        // The nonstream request is still reading its body. Waiting on the
-        // actual observation (not a delay) distinguishes headers from return.
-        tokio::time::timeout(timeout, async {
-            while kv.observed_completion_prefix(f.worker.as_ref(), &[7; 16]) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(!held.is_finished());
+        send.send(Ok(Bytes::from_static(HISTORY_TEST_KEEPALIVE)))
+            .unwrap();
+        let response = tokio::time::timeout(timeout, held).await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            kv.observed_completion_prefix(f.worker.as_ref(), &[7; 16]),
+            0,
+            "2xx headers without generated output must not train history"
+        );
+
         let cancel = dispatch(9);
         tokio::time::timeout(timeout, f.requests.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(manager.sample(&target).active_prefill_tokens, 32);
-        cancel.abort();
-        assert!(cancel.await.unwrap_err().is_cancelled());
+        let keepalive_only = futures_util::stream::iter([Ok::<_, std::io::Error>(
+            Bytes::from_static(HISTORY_TEST_KEEPALIVE),
+        )])
+        .chain(futures_util::stream::pending());
+        f.responses
+            .send(Response::new(Body::from_stream(keepalive_only)))
+            .unwrap();
+        let cancelled = tokio::time::timeout(timeout, cancel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        assert_eq!(
+            manager.sample(&target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 32,
+                active_requests: 2,
+            }
+        );
+        drop(cancelled);
         assert_eq!(
             kv.observed_completion_prefix(f.worker.as_ref(), &[9; 16]),
             0
@@ -5895,20 +5999,64 @@ mod tests {
             manager.sample(&target),
             crate::policies::LoadSample {
                 active_prefill_tokens: 16,
-                active_requests: 1
+                active_requests: 1,
             }
         );
         assert_eq!(f.worker.load(), 1);
-        send.send(Err(std::io::Error::other("truncated test response")))
+
+        let mut body = response.into_body().into_data_stream();
+        let keepalive = tokio::time::timeout(timeout, body.next())
+            .await
+            .unwrap()
+            .unwrap()
             .unwrap();
-        assert_eq!(
-            tokio::time::timeout(timeout, held)
+        let keepalive = if keepalive.starts_with(b": router-stages ") {
+            tokio::time::timeout(timeout, body.next())
                 .await
                 .unwrap()
                 .unwrap()
-                .status(),
-            StatusCode::INTERNAL_SERVER_ERROR
+                .unwrap()
+        } else {
+            keepalive
+        };
+        assert_eq!(keepalive.as_ref(), HISTORY_TEST_KEEPALIVE);
+        for (part, observed) in [
+            (b"data: {\"choices\":[{\"text\":\"gen".as_slice(), 0),
+            (b"erated\"}]}\n\n".as_slice(), 16),
+            (
+                b"data: {\"choices\":[{\"text\":\"tail\",\"finish_reason\":\"abort\"}]}\n\n"
+                    .as_slice(),
+                16,
+            ),
+        ] {
+            send.send(Ok(Bytes::from_static(part))).unwrap();
+            let forwarded = tokio::time::timeout(timeout, body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(forwarded.as_ref(), part);
+            // The upstream channel is still open; neither forwarding nor history waits for EOF.
+            assert_eq!(
+                kv.observed_completion_prefix(f.worker.as_ref(), &[7; 16]),
+                observed
+            );
+        }
+        assert_eq!(
+            manager.sample(&target),
+            crate::policies::LoadSample {
+                active_prefill_tokens: 0,
+                active_requests: 1,
+            }
         );
+        send.send(Err(std::io::Error::other("truncated test response")))
+            .unwrap();
+        assert!(tokio::time::timeout(timeout, body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        drop(body);
         assert_eq!(
             kv.observed_completion_prefix(f.worker.as_ref(), &[7; 16]),
             16
@@ -5918,6 +6066,217 @@ mod tests {
             crate::policies::LoadSample::default()
         );
         assert_eq!(f.worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn completion_history_rejections_preserve_http_responses() {
+        // gzip-compressed HISTORY_TEST_OUTPUT, with no filename or timestamp.
+        const GZIP_OUTPUT: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x4b\x49\x2c\x49\xb4\x52\xa8\x56\x4a\xce\
+            \xc8\xcf\x4c\x4e\x2d\x56\xb2\x8a\xae\x56\x2a\x49\xad\x28\x51\xb2\x52\x4a\x4f\xcd\
+            \x4b\x2d\x4a\x2c\x49\x4d\x51\xaa\x8d\xad\xe5\xe2\x02\x00\x2c\xe7\x28\xd1\x2a\x00\x00\x00";
+        let mut f = completion_history_response_fixture().await;
+        Arc::get_mut(&mut f.router).unwrap().client = reqwest::Client::builder()
+            .no_proxy()
+            .no_gzip()
+            .build()
+            .unwrap();
+        let policy = f.router.policy_registry.get_default_policy();
+        let kv = kv_aware_policy(policy.as_ref()).unwrap();
+        let manager = kv.slot_manager().unwrap();
+        let target = kv.target_for_worker(f.worker.as_ref());
+        for (id, (case, stream, echo, encoding, before, after)) in [
+            (
+                "done after metadata",
+                true,
+                false,
+                None,
+                concat!(
+                    ": keepalive\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":16}}\n\n",
+                    "data: [DONE]\n\n"
+                ).as_bytes(),
+                HISTORY_TEST_OUTPUT,
+            ),
+            (
+                "first abort with text",
+                true,
+                false,
+                None,
+                b"data: {\"choices\":[{\"text\":\"not generated\",\"finish_reason\":\"abort\"}]}\n\n".as_slice(),
+                HISTORY_TEST_OUTPUT,
+            ),
+            (
+                "first error",
+                true,
+                false,
+                None,
+                b"data: {\"error\":{\"message\":\"failed\"}}\n\n".as_slice(),
+                HISTORY_TEST_OUTPUT,
+            ),
+            ("echo", true, true, None, HISTORY_TEST_OUTPUT, b""),
+            ("gzip", true, false, Some("gzip"), GZIP_OUTPUT, b""),
+            ("empty choices", false, false, None, b"{\"choices\":[]}", b""),
+            ("malformed JSON", false, false, None, b"{\"choices\":[{\"text\":\"partial\"}", b""),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = id as u32 + 1;
+            let request = completion_history_request(id, stream, echo);
+            let upstream_bytes = [before, after].concat();
+            let content_type = if stream { "text/event-stream" } else { "application/json" };
+            let mut upstream = Response::builder().header(CONTENT_TYPE, content_type);
+            if let Some(encoding) = encoding {
+                upstream = upstream.header(http::header::CONTENT_ENCODING, encoding);
+            }
+            f.responses.send(upstream.body(Body::from(upstream_bytes.clone())).unwrap()).unwrap();
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                f.router.route_typed_request(None, &request, "/v1/completions", None),
+            ).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{case}");
+            assert_eq!(response.headers()[CONTENT_TYPE], content_type, "{case}");
+            assert_eq!(response.headers().get(http::header::CONTENT_ENCODING).map(|value| value.to_str().unwrap()), encoding, "{case}");
+            let forwarded = tokio::time::timeout(Duration::from_secs(5), to_bytes(response.into_body(), 4096)).await.unwrap().unwrap();
+            assert_eq!(without_router_stages(&forwarded), upstream_bytes, "{case}");
+            let sent: serde_json::Value = serde_json::from_slice(&f.requests.try_recv().unwrap()).unwrap();
+            assert_eq!(sent["echo"], echo, "{case}");
+            assert_eq!(kv.observed_completion_prefix(f.worker.as_ref(), &[id; 16]), 0, "{case}");
+            assert_eq!(manager.sample(&target), crate::policies::LoadSample::default(), "{case}");
+            assert_eq!(f.worker.load(), 0, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_history_rejects_nonstream_body_io_error() {
+        use bytes::Bytes;
+        let f = completion_history_response_fixture().await;
+        let (started, body_started) = tokio::sync::oneshot::channel();
+        let (close, closed) = tokio::sync::oneshot::channel();
+        let body = futures_util::stream::iter([Ok(Bytes::from_static(
+            br#"{"choices":[{"text":"generated"}]}"#,
+        ))])
+        .chain(futures_util::stream::once(async move {
+            started.send(()).unwrap();
+            closed.await.unwrap();
+            Err(std::io::Error::other("truncated test response"))
+        }));
+        f.responses
+            .send(Response::new(Body::from_stream(body)))
+            .unwrap();
+        let router = f.router.clone();
+        let dispatch = tokio::spawn(async move {
+            router
+                .route_typed_request(
+                    None,
+                    &completion_history_request(7, false, false),
+                    "/v1/completions",
+                    None,
+                )
+                .await
+        });
+        let timeout = Duration::from_secs(5);
+        tokio::time::timeout(timeout, body_started)
+            .await
+            .unwrap()
+            .unwrap();
+        let policy = f.router.policy_registry.get_default_policy();
+        let kv = kv_aware_policy(policy.as_ref()).unwrap();
+        assert!(!dispatch.is_finished(), "nonstream waits for the full body");
+        close.send(()).unwrap();
+        let response = tokio::time::timeout(timeout, dispatch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap()
+            .starts_with(b"Failed to get response body:"));
+        assert_eq!(
+            kv.observed_completion_prefix(f.worker.as_ref(), &[7; 16]),
+            0
+        );
+        assert_eq!(
+            kv.slot_manager()
+                .unwrap()
+                .sample(&kv.target_for_worker(f.worker.as_ref())),
+            crate::policies::LoadSample::default()
+        );
+        assert_eq!(f.worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn completion_history_checks_worker_again_at_output() {
+        use bytes::Bytes;
+        let f = completion_history_response_fixture().await;
+        let (send, chunks) =
+            tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+        f.responses
+            .send(Response::new(Body::from_stream(
+                UnboundedReceiverStream::new(chunks),
+            )))
+            .unwrap();
+        send.send(Ok(Bytes::from_static(HISTORY_TEST_KEEPALIVE)))
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            f.router.route_typed_request(
+                None,
+                &completion_history_request(7, true, false),
+                "/v1/completions",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let policy = f.router.policy_registry.get_default_policy();
+        let kv = kv_aware_policy(policy.as_ref()).unwrap();
+        let target = kv.target_for_worker(f.worker.as_ref());
+        assert_eq!(
+            kv.slot_manager().unwrap().sample(&target).active_requests,
+            1
+        );
+        // Keep the old policy binding while the registry has the new worker.
+        // A commit using a worker saved at headers could still train that old binding.
+        let registry = &f.router.worker_registry;
+        assert!(Arc::ptr_eq(
+            &registry.remove_by_url(f.worker.url()).unwrap(),
+            &f.worker
+        ));
+        let replacement: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            f.worker.url().to_string(),
+            WorkerType::Regular,
+        ));
+        registry.register(replacement.clone());
+        send.send(Ok(Bytes::from_static(HISTORY_TEST_OUTPUT)))
+            .unwrap();
+        drop(send);
+        let forwarded =
+            tokio::time::timeout(Duration::from_secs(5), to_bytes(response.into_body(), 4096))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            without_router_stages(&forwarded),
+            [HISTORY_TEST_KEEPALIVE, HISTORY_TEST_OUTPUT].concat()
+        );
+        assert_eq!(
+            kv.observed_completion_prefix(f.worker.as_ref(), &[7; 16]),
+            0
+        );
+        assert_eq!(
+            kv.observed_completion_prefix(replacement.as_ref(), &[7; 16]),
+            0
+        );
+        assert_eq!(
+            kv.slot_manager().unwrap().sample(&target),
+            crate::policies::LoadSample::default()
+        );
+        assert_eq!(f.worker.load(), 0);
+        assert_eq!(replacement.load(), 0);
     }
 
     #[tokio::test]

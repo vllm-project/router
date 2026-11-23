@@ -224,8 +224,8 @@ pub trait KvAwareOps: Send + Sync {
         None
     }
 
-    /// Commit the adapter's observation at its milestone, without owning load.
-    /// HTTP headers and a valid gRPC generation message are distinct milestones.
+    /// Commit once at the first verified generated output, without owning load.
+    /// HTTP and gRPC both require output evidence, not response headers or stream opening.
     fn observe_completion_milestone(&self, _worker: &dyn Worker, _observation: HistoryObservation) {
     }
 

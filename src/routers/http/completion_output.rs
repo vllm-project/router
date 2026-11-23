@@ -1,14 +1,76 @@
-//! Conservative model-output detection for proxied Completion SSE streams.
+//! Conservative model-output detection for HTTP load and history observation.
+
+use serde_json::Value;
 
 use super::sse::{sse_lines, FrameScanner};
 
-const MAX_EVENT_BYTES: usize = 1024 * 1024;
+const MAX_OBSERVABLE_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy)]
+pub(super) enum HistoryOutput {
+    Completion,
+    ChatDelta,
+    ChatMessage,
+}
+
+enum Observation {
+    Ignore,
+    Output,
+    Terminal,
+}
+
+impl HistoryOutput {
+    pub(super) fn has_output(self, body: &[u8]) -> bool {
+        body.len() <= MAX_OBSERVABLE_BYTES
+            && serde_json::from_slice(body)
+                .is_ok_and(|value| matches!(self.inspect(&value), Observation::Output))
+    }
+
+    fn inspect(self, value: &Value) -> Observation {
+        if value.get("error").is_some_and(|error| !error.is_null())
+            || value.get("object").and_then(Value::as_str) == Some("error")
+        {
+            return Observation::Terminal;
+        }
+        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+            return Observation::Ignore;
+        };
+        let mut output = false;
+        for choice in choices {
+            let reason = choice.get("finish_reason").and_then(Value::as_str);
+            if matches!(reason, Some("abort" | "error")) {
+                return Observation::Terminal;
+            }
+            output |= self.choice_has_output(choice);
+        }
+        if output {
+            Observation::Output
+        } else {
+            Observation::Ignore
+        }
+    }
+
+    fn choice_has_output(self, choice: &Value) -> bool {
+        // Reasoning (including reasoning_content), tools, roles and prompt
+        // metadata are not evidence of generated text on these routes.
+        let text = match self {
+            Self::Completion => choice.get("text"),
+            Self::ChatDelta => choice.get("delta").and_then(|delta| delta.get("content")),
+            Self::ChatMessage => choice
+                .get("message")
+                .and_then(|message| message.get("content")),
+        };
+        text.and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+    }
+}
 
 pub(super) struct CompletionOutputObserver {
     event: Vec<u8>,
     scanner: FrameScanner,
     first_event: bool,
     stopped: bool,
+    history: Option<HistoryOutput>,
 }
 
 impl CompletionOutputObserver {
@@ -18,6 +80,14 @@ impl CompletionOutputObserver {
             scanner: FrameScanner::default(),
             first_event: true,
             stopped: disabled,
+            history: None,
+        }
+    }
+
+    pub(super) fn for_history(output: HistoryOutput) -> Self {
+        Self {
+            history: Some(output),
+            ..Self::new(false)
         }
     }
 
@@ -30,10 +100,10 @@ impl CompletionOutputObserver {
             return false;
         }
         while !chunk.is_empty() {
-            let scan_len = chunk.len().min(MAX_EVENT_BYTES - self.event.len() + 1);
+            let scan_len = chunk.len().min(MAX_OBSERVABLE_BYTES - self.event.len() + 1);
             let end = self.scanner.frame_end(&chunk[..scan_len]);
             let consumed = end.unwrap_or(scan_len);
-            if consumed > MAX_EVENT_BYTES - self.event.len() {
+            if consumed > MAX_OBSERVABLE_BYTES - self.event.len() {
                 self.event.clear();
                 self.stopped = true;
                 return false;
@@ -48,11 +118,11 @@ impl CompletionOutputObserver {
                 } else {
                     &self.event
                 };
-                let output = event_has_output(event);
+                let observation = inspect_event(event, self.history);
                 self.event.clear();
-                if output {
+                if !matches!(observation, Observation::Ignore) {
                     self.stopped = true;
-                    return true;
+                    return matches!(observation, Observation::Output);
                 }
             }
         }
@@ -60,7 +130,7 @@ impl CompletionOutputObserver {
     }
 }
 
-fn event_has_output(event: &[u8]) -> bool {
+fn inspect_event(event: &[u8], history: Option<HistoryOutput>) -> Observation {
     let mut data = Vec::new();
     let mut event_type = None;
     for (line, _) in sse_lines(event) {
@@ -73,24 +143,36 @@ fn event_has_output(event: &[u8]) -> bool {
             event_type = Some(value.strip_prefix(b" ").unwrap_or(value));
         }
     }
-    if event_type == Some(b"error".as_slice()) {
-        return false;
+    if history.is_some()
+        && (matches!(event_type, Some(b"error" | b"abort")) || data.trim_ascii() == b"[DONE]")
+    {
+        return Observation::Terminal;
     }
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&data) else {
-        return false;
+    if event_type == Some(b"error".as_slice()) {
+        return Observation::Ignore;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&data) else {
+        return Observation::Ignore;
     };
-    value.get("error").is_none()
+    if let Some(history) = history {
+        return history.inspect(&value);
+    }
+    // Keep load's existing Completion-only frame predicate, including its
+    // distinct handling of error fields and terminal events.
+    if value.get("error").is_none()
         && value
             .get("choices")
-            .and_then(serde_json::Value::as_array)
+            .and_then(Value::as_array)
             .is_some_and(|choices| {
-                choices.iter().any(|choice| {
-                    choice
-                        .get("text")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|text| !text.is_empty())
-                })
+                choices
+                    .iter()
+                    .any(|choice| HistoryOutput::Completion.choice_has_output(choice))
             })
+    {
+        Observation::Output
+    } else {
+        Observation::Ignore
+    }
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -99,27 +181,33 @@ mod tests {
     use super::*;
 
     fn assert_output_at(event: &[u8], complete_at: usize) {
-        for split in 0..=event.len() {
-            let mut observer = CompletionOutputObserver::new(false);
-            assert_eq!(
-                observer.observe(&event[..split]),
-                split >= complete_at,
-                "split {split}"
-            );
-            assert_eq!(
-                observer.observe(&event[split..]),
-                split < complete_at,
-                "split {split}"
-            );
-            assert!(!observer.observe(event), "output transition is idempotent");
-        }
-        let mut observer = CompletionOutputObserver::new(false);
-        for (index, byte) in event.iter().enumerate() {
-            assert_eq!(
-                observer.observe(&[*byte]),
-                index + 1 == complete_at,
-                "byte {index}"
-            );
+        for (mode, history) in [("load", None), ("history", Some(HistoryOutput::Completion))] {
+            let observer = || match history {
+                Some(output) => CompletionOutputObserver::for_history(output),
+                None => CompletionOutputObserver::new(false),
+            };
+            for split in 0..=event.len() {
+                let mut observer = observer();
+                assert_eq!(
+                    observer.observe(&event[..split]),
+                    split >= complete_at,
+                    "{mode}, split {split}"
+                );
+                assert_eq!(
+                    observer.observe(&event[split..]),
+                    split < complete_at,
+                    "{mode}, split {split}"
+                );
+                assert!(!observer.observe(event), "{mode}: repeated output");
+            }
+            let mut observer = observer();
+            for (index, byte) in event.iter().enumerate() {
+                assert_eq!(
+                    observer.observe(&[*byte]),
+                    index + 1 == complete_at,
+                    "{mode}, byte {index}"
+                );
+            }
         }
     }
 
@@ -199,12 +287,131 @@ mod tests {
 
     #[test]
     fn oversized_event_disables_detection_before_buffer_growth() {
-        let mut observer = CompletionOutputObserver::new(false);
-        assert!(!observer.observe(&vec![b'x'; MAX_EVENT_BYTES]));
-        assert_eq!(observer.event.len(), MAX_EVENT_BYTES);
-        assert!(!observer.observe(b"x\n\ndata: {\"choices\":[{\"text\":\"false positive\"}]}\n\n"));
-        assert!(observer.event.is_empty());
-        assert!(observer.stopped);
-        assert!(!observer.observe(b"data: {\"choices\":[{\"text\":\"still disabled\"}]}\n\n"));
+        let pending = vec![b'x'; MAX_OBSERVABLE_BYTES];
+        for mut observer in [
+            CompletionOutputObserver::new(false),
+            CompletionOutputObserver::for_history(HistoryOutput::Completion),
+        ] {
+            assert!(!observer.observe(&pending));
+            assert_eq!(observer.event.len(), MAX_OBSERVABLE_BYTES);
+            assert!(
+                !observer.observe(b"x\n\ndata: {\"choices\":[{\"text\":\"false positive\"}]}\n\n")
+            );
+            assert!(observer.event.is_empty());
+            assert!(observer.stopped);
+            assert!(!observer.observe(b"data: {\"choices\":[{\"text\":\"still disabled\"}]}\n\n"));
+        }
+    }
+
+    #[test]
+    fn history_requires_route_specific_generated_text() {
+        for (case, json, expected) in [
+            (
+                "final completion text",
+                r#"{"error":null,"choices":[{"text":" ","finish_reason":"stop"}]}"#,
+                [true, true, false, false],
+            ),
+            (
+                "chat delta",
+                r#"{"choices":[{"delta":{"content":"generated"}}]}"#,
+                [false, false, true, false],
+            ),
+            (
+                "chat message",
+                r#"{"choices":[{"message":{"content":"generated"},"finish_reason":"length"}]}"#,
+                [false, false, false, true],
+            ),
+            (
+                "wrong types and empty text",
+                r#"{"choices":[{"text":"","delta":{"content":42},"message":{"content":[]}}]}"#,
+                [false; 4],
+            ),
+            (
+                "role, reasoning, tools and prompt metadata",
+                r#"{"choices":[{"prompt_token_ids":[1],"delta":{"role":"assistant","reasoning":"hidden","tool_calls":[{}]},"message":{"role":"assistant","reasoning_content":"hidden","tool_calls":[{}]}}]}"#,
+                [false; 4],
+            ),
+            (
+                "usage only",
+                r#"{"choices":[],"usage":{"completion_tokens":1}}"#,
+                [false; 4],
+            ),
+            (
+                "incomplete JSON",
+                r#"{"choices":[{"text":"partial"}"#,
+                [false; 4],
+            ),
+            (
+                "abort takes precedence over text in any choice",
+                r#"{"choices":[{"text":"not output","delta":{"content":"not output"},"message":{"content":"not output"}},{"finish_reason":"abort"}]}"#,
+                [false; 4],
+            ),
+            (
+                "error object takes precedence over text",
+                r#"{"object":"error","choices":[{"text":"not output","delta":{"content":"not output"},"message":{"content":"not output"}}]}"#,
+                [false; 4],
+            ),
+            (
+                "non-null error field takes precedence over text",
+                r#"{"error":{},"choices":[{"text":"not output","delta":{"content":"not output"},"message":{"content":"not output"}}]}"#,
+                [false; 4],
+            ),
+        ] {
+            let event = format!("data: {json}\n\n");
+            for ((output, stream, mode), expected) in [
+                (HistoryOutput::Completion, true, "completion stream"),
+                (HistoryOutput::Completion, false, "completion body"),
+                (HistoryOutput::ChatDelta, true, "chat stream"),
+                (HistoryOutput::ChatMessage, false, "chat body"),
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                let observed = if stream {
+                    CompletionOutputObserver::for_history(output).observe(event.as_bytes())
+                } else {
+                    output.has_output(json.as_bytes())
+                };
+                assert_eq!(observed, expected, "{case}: {mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn history_stops_at_terminal_frames_before_later_output() {
+        let output = "data: {\"choices\":[{\"text\":\"too late\"}]}\n\n";
+        for terminal in [
+            "data: \t[DONE] \t\n\n",
+            "event: error\ndata: {\"choices\":[{\"text\":\"not output\"}]}\n\n",
+            "event: abort\n\n",
+            "data: {\"error\":{}}\n\n",
+            "data: {\"object\":\"error\"}\n\n",
+            "data: {\"choices\":[{\"text\":\"not output\",\"finish_reason\":\"abort\"}]}\n\n",
+            "data: {\"choices\":[{\"text\":\"not output\",\"finish_reason\":\"error\"}]}\n\n",
+        ] {
+            let mut observer = CompletionOutputObserver::for_history(HistoryOutput::Completion);
+            assert!(!observer.observe(b": router-stages\n\ndata: not-json\n\n"));
+            assert!(!observer.stopped);
+            assert!(
+                !observer.observe(format!("{terminal}{output}").as_bytes()),
+                "{terminal:?}"
+            );
+            assert!(!observer.observe(output.as_bytes()), "{terminal:?}");
+        }
+        // A normal finish belongs to one choice, not the entire response.
+        let mut observer = CompletionOutputObserver::for_history(HistoryOutput::Completion);
+        assert!(!observer.observe(
+            b"data: {\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\"stop\"}]}\n\n"
+        ));
+        assert!(observer.observe(b"data: {\"choices\":[{\"index\":1,\"text\":\"generated\"}]}\n\n"));
+    }
+
+    #[test]
+    fn history_bounds_complete_json_before_parsing() {
+        let mut body = br#"{"choices":[{"text":"generated"}]}"#.to_vec();
+        body.resize(MAX_OBSERVABLE_BYTES, b' ');
+        assert!(HistoryOutput::Completion.has_output(&body));
+        body.push(b' ');
+        assert!(!HistoryOutput::Completion.has_output(&body));
     }
 }
