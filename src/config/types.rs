@@ -92,6 +92,11 @@ pub struct RouterConfig {
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
     #[serde(default)]
     pub enable_igw: bool,
+    /// Stage overrides for the PD router that IGW hosts; `None` outside IGW.
+    /// Kept apart from `mode` so IGW keeps its regular placeholder and the
+    /// Program scheduling contract that comes with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub igw_pd_policies: Option<IgwPdPolicies>,
     /// History backend configuration (memory or none, default: memory)
     #[serde(default = "default_history_backend")]
     pub history_backend: HistoryBackend,
@@ -107,6 +112,13 @@ pub struct RouterConfig {
     /// Optional Program-level admission and continuity scheduling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_scheduling: Option<ProgramSchedulingConfig>,
+}
+
+/// Per-stage policy overrides; an unset stage inherits the main policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IgwPdPolicies {
+    pub prefill: Option<PolicyConfig>,
+    pub decode: Option<PolicyConfig>,
 }
 
 fn default_profile_timeout_secs() -> u64 {
@@ -1418,6 +1430,7 @@ impl Default for RouterConfig {
             kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            igw_pd_policies: None,
             connection_mode: ConnectionMode::Http,
             history_backend: default_history_backend(),
             enable_profiling: false,
@@ -2320,6 +2333,7 @@ mod tests {
             kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            igw_pd_policies: None,
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
@@ -2392,6 +2406,7 @@ mod tests {
             kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            igw_pd_policies: None,
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
@@ -2460,6 +2475,7 @@ mod tests {
             kv_aware_session_affinity_ttl_secs: None,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            igw_pd_policies: None,
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,

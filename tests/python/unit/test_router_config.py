@@ -89,6 +89,17 @@ class TestRouterConfigValidation:
             # Should create router instance via from_args
             router_mod.from_args.assert_called_once()
 
+    def test_pd_config_with_igw_allows_empty_urls(self):
+        """IGW registers PD workers through /workers, so none are needed at startup."""
+        args = RouterArgs(
+            vllm_pd_disaggregation=True,
+            prefill_urls=[],
+            decode_urls=[],
+            enable_igw=True,
+        )
+
+        args._validate_router_args()
+
     def test_regular_mode_without_workers_allows_empty_urls(self):
         """Test that regular mode allows empty worker URLs."""
         args = RouterArgs(worker_urls=[], service_discovery=False)

@@ -503,8 +503,8 @@ class TestStartupValidation:
             # Should create router instance
             router_mod.from_args.assert_called_once()
 
-    def test_policy_warning_during_startup(self):
-        """Test policy warning during startup in PD mode."""
+    def test_policy_info_both_stages_during_startup(self):
+        """Test policy info logging when both PD stages have an override."""
         args = RouterArgs(
             vllm_pd_disaggregation=True,
             prefill_urls=[("http://prefill1:8000", None)],
@@ -522,13 +522,13 @@ class TestStartupValidation:
             with patch("vllm_router.router_args.logger") as mock_logger:
                 launch_router(args)
 
-                # Should log warning about policy usage
-                mock_logger.warning.assert_called_once()
-                warning_call = mock_logger.warning.call_args[0][0]
-                assert (
-                    "Both --prefill-policy and --decode-policy are specified"
-                    in warning_call
-                )
+                # Stage overrides take precedence independently; the main policy
+                # is only used for stages without an override.
+                mock_logger.info.assert_called_once()
+                info_call = mock_logger.info.call_args[0][0]
+                assert "Using stage-specific policies for PD mode" in info_call
+                assert "prefill_policy='power_of_two'" in info_call
+                assert "decode_policy='round_robin'" in info_call
 
                 # Should create router instance
                 router_mod.from_args.assert_called_once()
@@ -688,8 +688,10 @@ class TestStartupFlow:
                 router_mod.from_args.assert_called_once()
                 mock_router_instance.start.assert_called_once()
 
-                # Verify policy warning was logged
-                mock_logger.warning.assert_called_once()
+                # Verify stage-specific policy information was logged.
+                mock_logger.info.assert_called_once()
+                info_call = mock_logger.info.call_args[0][0]
+                assert "Using stage-specific policies for PD mode" in info_call
 
     def test_complete_startup_flow_with_all_features(self):
         """Test complete startup flow with all features enabled."""

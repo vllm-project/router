@@ -89,10 +89,12 @@ class RouterManager:
             if decode_urls:
                 for url in decode_urls:
                     cmd.extend(["--decode", url])
-            if prefill_policy:
-                cmd.extend(["--prefill-policy", prefill_policy])
-            if decode_policy:
-                cmd.extend(["--decode-policy", decode_policy])
+        # Stage policies are independent flags: IGW hosts a PD router even
+        # without --vllm-pd-disaggregation.
+        if prefill_policy:
+            cmd.extend(["--prefill-policy", prefill_policy])
+        if decode_policy:
+            cmd.extend(["--decode-policy", decode_policy])
 
         # Map supported extras to CLI flags (subset for integration)
         if extra:
@@ -100,6 +102,7 @@ class RouterManager:
                 "max_payload_size": "--max-payload-size",
                 "intra_node_data_parallel_size": "--intra-node-data-parallel-size",
                 "api_key": "--api-key",
+                "enable_igw": "--enable-igw",
                 # Health/monitoring
                 "worker_startup_check_interval": "--worker-startup-check-interval",
                 "worker_startup_timeout_secs": "--worker-startup-timeout-secs",

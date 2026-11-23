@@ -167,7 +167,7 @@ impl Router {
 
         // Determine routing mode
         let mode = if self.enable_igw {
-            // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
+            // IGW keeps a regular placeholder; PD stage overrides are stored separately.
             RoutingMode::Regular {
                 worker_urls: vec![],
             }
@@ -285,6 +285,10 @@ impl Router {
                 endpoint: self.health_check_endpoint.clone(),
             },
             enable_igw: self.enable_igw,
+            igw_pd_policies: self.enable_igw.then(|| config::IgwPdPolicies {
+                prefill: self.prefill_policy.as_ref().map(convert_policy),
+                decode: self.decode_policy.as_ref().map(convert_policy),
+            }),
             history_backend: config::HistoryBackend::Memory,
             enable_profiling: false, // Profiling disabled in Python binding by default
             profile_timeout_secs: 10, // Default profiling timeout

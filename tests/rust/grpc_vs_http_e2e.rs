@@ -68,6 +68,7 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
         kv_aware_session_affinity_ttl_secs: None,
         health_check: vllm_router_rs::config::HealthCheckConfig::default(),
         enable_igw: false,
+        igw_pd_policies: None,
         connection_mode: ConnectionMode::Http,
         history_backend: HistoryBackend::Memory,
         enable_profiling: false,

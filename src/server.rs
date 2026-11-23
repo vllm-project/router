@@ -1090,17 +1090,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             }
 
             // 2. HTTP vLLM PD Router
-            match RouterFactory::create_vllm_pd_router(
-                &[],
-                &[],
-                None,
-                None,
-                None,
-                &config.router_config.policy,
-                &app_context,
-            )
-            .await
-            {
+            match create_igw_pd_router(&app_context).await {
                 Ok(http_pd) => {
                     info!("Created HTTP vLLM PD router");
                     router_manager
@@ -1343,10 +1333,72 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     cors.max_age(Duration::from_secs(3600))
 }
 
+async fn create_igw_pd_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+    let policies = ctx.router_config.igw_pd_policies.as_ref();
+    RouterFactory::create_vllm_pd_router(
+        &[],
+        &[],
+        None,
+        policies.and_then(|policies| policies.prefill.as_ref()),
+        policies.and_then(|policies| policies.decode.as_ref()),
+        &ctx.router_config.policy,
+        ctx,
+    )
+    .await
+}
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn igw_stage_overrides_preserve_program_validation_and_runtime_policies() {
+        use crate::config::{IgwPdPolicies, PolicyConfig, ProgramSchedulingConfig, RoutingMode};
+
+        for (prefill, decode, expected_prefill, expected_decode) in [
+            (
+                Some(PolicyConfig::CacheAware {
+                    cache_threshold: 0.3,
+                    balance_abs_threshold: 64,
+                    balance_rel_threshold: 1.5,
+                    eviction_interval_secs: 120,
+                    max_tree_size: 1024,
+                }),
+                Some(PolicyConfig::ConsistentHash { virtual_nodes: 160 }),
+                "cache_aware",
+                "consistent_hash",
+            ),
+            (Some(PolicyConfig::Random), None, "random", "round_robin"),
+            (
+                None,
+                Some(PolicyConfig::ConsistentHash { virtual_nodes: 160 }),
+                "round_robin",
+                "consistent_hash",
+            ),
+            (None, None, "round_robin", "round_robin"),
+        ] {
+            let config = RouterConfig {
+                enable_igw: true,
+                igw_pd_policies: Some(IgwPdPolicies { prefill, decode }),
+                policy: PolicyConfig::RoundRobin,
+                program_scheduling: Some(ProgramSchedulingConfig::default()),
+                ..Default::default()
+            };
+            assert!(matches!(config.mode, RoutingMode::Regular { .. }));
+            config.validate().unwrap();
+            let ctx = Arc::new(AppContext::new(config, Client::new(), 32, None, vec![]).unwrap());
+            let _router = create_igw_pd_router(&ctx).await.unwrap();
+            assert_eq!(
+                ctx.policy_registry.get_prefill_policy().name(),
+                expected_prefill
+            );
+            assert_eq!(
+                ctx.policy_registry.get_decode_policy().name(),
+                expected_decode
+            );
+        }
+    }
 
     #[tokio::test]
     async fn completion_extractor_matches_locked_axum_json() {
