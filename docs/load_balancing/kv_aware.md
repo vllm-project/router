@@ -194,9 +194,11 @@ If each scored worker reports its layout, the file only needs the Prefill-to-Dec
 
 Save the layout as `layout.json` and pass `--kv-hybrid-layout layout.json`. Use your worker's HTTP or gRPC URL as the key. For hybrid P/D, add the [pairing fields](#pd-layout).
 
-Add one `ranks` entry per DP rank to score. Use `rank: 0` for one rank. List all cache groups in engine order and use their actual block sizes in tokens. Set `speculative_tokens: 0` when speculation is off.
+Add one `ranks` entry per DP rank to score. Use `rank: 0` for one rank. Set `speculative_tokens: 0` when speculation is off.
 
-This Qwen3.5-4B HTTP example uses one DP rank and 576-token groups. Router reads the hash block size from the worker's metrics.
+Read `kv cache group sizes` in each worker's startup log. Copy each value to `groups[].block_size` in the printed order. For example, `kv cache group sizes (576, 576, 576, 576)` means groups 0 through 3 each use 576-token blocks.
+
+This Qwen3.5-4B HTTP example uses those four groups and one DP rank. Router discovers the hash block size separately. After starting Router, [check cache reuse](#check-cache-reuse) with your layout.
 
 ```json
 {
@@ -223,27 +225,29 @@ For a manual layout, add only the fields the deployment needs.
 
 ### Model layout reference
 
-Use these profiles to fill the required cache groups for a manual layout.
+Use these profiles for the group types and order in a manual layout. Check the [version table](#versions) for worker compatibility. vLLM chooses cache block sizes for each deployment, and the same checkpoint can use different sizes on different workers.
 
-| Platform and vLLM | Checkpoint | Layout |
+| Platform | Checkpoint | Layout |
 | --- | --- | --- |
-| GPU, 0.33.0 | Qwen3-4B-Instruct-2507 | Automatic for single-group full attention |
-| GPU, 0.33.0 | Qwen3.5-4B | GPU Qwen, 576-token groups |
-| GPU, 0.33.0 | Qwen3.6-27B | GPU Qwen, 832-token groups |
-| GPU, 0.33.0 | Qwen3.8-27B | GPU Qwen, 832-token groups. With DSpark, use GPU Qwen3.8 DSpark. |
-| GPU, 0.33.0 | Qwen3.8-Flash-Next-FP8 (Qwen4Exp QSA) | GPU Qwen4Exp |
-| GPU, 0.33.0 | DeepSeek-V4-Flash-0731 | GPU V4 Flash |
-| GPU, 0.33.0 | DeepSeek-V4-Pro | GPU V4 Pro |
-| GPU, 0.33.0 | DeepSeek-V4.1-Flash (1017) | GPU V4.1 Flash with bounded replay |
-| Ascend A2, 0.32.0 | Qwen3-4B | A2 Qwen3 |
-| Ascend A2, 0.32.0 | Qwen3.5-4B | A2 Qwen, 640-token groups. With DSpark, use A2 Qwen3.5 DSpark. |
-| Ascend A2, 0.32.0 | Qwen3.6-27B W8A8 | A2 Qwen, 896-token groups |
-| Ascend A2, 0.32.0 | Qwen3.8-27B W8A8 | A2 Qwen, 896-token groups. Use the MTP profile for gRPC. |
-| Ascend A2, 0.32.0 | Qwen3.8-27B BF16 with DSpark | A2 Qwen3.8 DSpark |
-| Ascend A2, 0.32.0 | Qwen3.8-Flash-Next W4A8 | A2 Qwen4Exp |
-| Ascend A2, 0.32.0 | DeepSeek-V4-Flash-0731 W8A8 | A2 V4 Flash |
+| GPU | Qwen3-4B-Instruct-2507 | Automatic for single-group full attention |
+| GPU | Qwen3.5-4B | GPU Qwen |
+| GPU | Qwen3.6-27B | GPU Qwen |
+| GPU | Qwen3.8-27B | GPU Qwen |
+| GPU | Qwen3.8-27B with DSpark | GPU Qwen3.8 DSpark |
+| GPU | Qwen3.8-Flash-Next-FP8 (Qwen4Exp QSA) | GPU Qwen4Exp |
+| GPU | DeepSeek-V4-Flash-0731 | GPU V4 Flash |
+| GPU | DeepSeek-V4-Pro | GPU V4 Pro |
+| GPU | DeepSeek-V4.1-Flash (1017) | GPU V4.1 Flash with bounded replay |
+| Ascend A2 | Qwen3-4B | A2 Qwen3 |
+| Ascend A2 | Qwen3.5-4B | A2 Qwen |
+| Ascend A2 | Qwen3.5-4B with DSpark | A2 Qwen3.5 DSpark |
+| Ascend A2 | Qwen3.6-27B W8A8 | A2 Qwen |
+| Ascend A2 | Qwen3.8-27B W8A8 | A2 Qwen. Use the MTP profile for gRPC. |
+| Ascend A2 | Qwen3.8-27B BF16 with DSpark | A2 Qwen3.8 DSpark |
+| Ascend A2 | Qwen3.8-Flash-Next W4A8 | A2 Qwen4Exp |
+| Ascend A2 | DeepSeek-V4-Flash-0731 W8A8 | A2 V4 Flash |
 
-Use the hash sizes below as references for manual declarations.
+The token sizes below are examples. Use the worker's actual group and hash block sizes.
 
 | Group | `kind` | Required fields for this group |
 | --- | --- | --- |
@@ -257,15 +261,15 @@ Use the hash sizes below as references for manual declarations.
 | Layout | Hash size (tokens) | Groups in index order, with block size and extra values |
 | --- | ---: | --- |
 | GPU Qwen | Worker-reported size | 0–2 Mamba, 3 Full, same size on all groups |
-| GPU Qwen3.8 DSpark | Worker-reported size | 0–9 Mamba, 10–13 Full, 14 SWA with window 2048. All size 832. |
+| GPU Qwen3.8 DSpark | Worker-reported size | 0–9 Mamba, 10–13 Full, 14 SWA with window 2048 |
 | GPU Qwen4Exp | 1600 | 0–3 Mamba 1600, 4 Scratch 4, 5 Sparse MLA 1600 with `"4"` |
 | GPU V4 Flash | 4 | 0–1 MLA SWA 64 with window 128, 2 Sparse MLA 256 with `"4"`, 3 MLA SWA 4 with window 8, 4 MLA SWA 8 with window 128 |
 | GPU V4 Pro | 4 | 0–1 MLA SWA 64 with window 128, 2 Sparse MLA 256 with `"128"`, 3 MLA SWA 8 with window 128, 4 MLA SWA 4 with window 8 |
 | GPU V4.1 Flash | 128 | 0–4 MLA SWA 32 with window 128, `"prefix_replay_tokens":128`. 5 Sparse MLA 128 with `"2"`, 6 Scratch 8. |
 | A2 Qwen3 | 128 | 0 Full 128 |
-| A2 Qwen | Group size from model row | 0 Full, 1–3 Mamba, same size on all groups |
-| A2 Qwen3.5 DSpark | 640 | 0–1 Full, 2 SWA with window 2048, 3–7 Mamba. All size 640. |
-| A2 Qwen3.8 DSpark | 896 | 0–3 Full, 4 SWA with window 2048, 5–14 Mamba. All size 896. |
+| A2 Qwen | Worker-reported size | 0 Full, 1–3 Mamba, same size on all groups |
+| A2 Qwen3.5 DSpark | Worker-reported size | 0–1 Full, 2 SWA with window 2048, 3–7 Mamba |
+| A2 Qwen3.8 DSpark | Worker-reported size | 0–3 Full, 4 SWA with window 2048, 5–14 Mamba |
 | A2 Qwen4Exp | 1664 | 0 Scratch 4 with speculation off, 8 with MTP. 1 Full and 2–5 Mamba (2–6 with MTP), each the hash block size. Set Full `tokens_per_state` to `"1"` and Mamba to `"-1"`. |
 | A2 V4 Flash | 8 | 0 Sparse MLA 512 with `"4"`, 1 Sparse MLA 16384 with `"128"`, 2–3 MLA SWA 128 with window 128, 4 MLA SWA 8 with window 8, 5 MLA SWA 32 with window 128. Set `tokens_per_state` to `"1"` on the MLA SWA groups. |
 
