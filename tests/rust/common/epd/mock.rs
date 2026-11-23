@@ -5,7 +5,7 @@
 //! it ended, so a test can check what the router sent and whether the router
 //! closed the connection.
 
-use super::{CHAT_ROUTE, WAIT_DURATION};
+use super::consts::{CHAT_ROUTE, WAIT_DURATION};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;

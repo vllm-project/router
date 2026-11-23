@@ -1,6 +1,6 @@
 //! The E/P/D rig: a real router in front of mock workers and an EC control
 //! recorder. `mock.rs` has the workers, `client.rs` the request and the checks
-//! on the router's answer.
+//! on the router's answer, and `consts.rs` the shared constants.
 
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
@@ -17,13 +17,8 @@ use vllm_router_rs::config::{
 use vllm_router_rs::routers::{RouterFactory, RouterTrait};
 use vllm_router_rs::server::AppContext;
 
-pub const CHAT_ROUTE: &str = "/v1/chat/completions";
-/// How long a check waits for something that must happen.
-pub const WAIT_DURATION: Duration = Duration::from_secs(5);
-/// How long a check waits for something that must *not* happen (`QUIET` in the
-/// test file). Such a check can miss a late event, but it cannot fail while the
-/// behavior is as described.
-pub const QUIET_DURATION: Duration = Duration::from_millis(300);
+mod consts;
+pub use consts::*;
 
 mod mock;
 pub use mock::*;
@@ -257,6 +252,8 @@ impl Rig {
             ..RouterConfig::default()
         };
         ConfigValidator::validate(&config).expect("valid E/P/D config");
+        // Not `common::create_test_context`: its `Client::new()` has no timeout and can use a
+        // proxy, which would hide the router's own connection from the mocks.
         let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(60))
@@ -317,7 +314,7 @@ impl Rig {
     /// Rig assumption: a new router sends image 0 to E0 and image 1 to E1
     /// (round-robin per item in `EncoderStage::prepare`), so E0's comes first.
     fn expect_encoder_assignment(&self) {
-        for (mock, image) in [(&self.e0, "base64,AAAA"), (&self.e1, "base64,BBBB")] {
+        for (mock, image) in [(&self.e0, IMAGE_0), (&self.e1, IMAGE_1)] {
             let requests = mock.requests();
             assert!(
                 requests.len() == 1 && requests[0]["messages"].to_string().contains(image),

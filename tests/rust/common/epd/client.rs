@@ -1,6 +1,6 @@
 //! The client side of the E/P/D rig: the request body and checks on the router's answer.
 
-use super::{QUIET_DURATION, WAIT_DURATION};
+use super::consts::{IMAGE_0, IMAGE_1, QUIET_DURATION, WAIT_DURATION};
 use axum::body::BodyDataStream;
 use axum::response::Response;
 use futures_util::StreamExt;
@@ -17,8 +17,8 @@ pub fn two_images() -> Value {
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}},
+                {"type": "image_url", "image_url": {"url": IMAGE_0}},
+                {"type": "image_url", "image_url": {"url": IMAGE_1}},
                 {"type": "text", "text": "compare"},
             ],
         }],
