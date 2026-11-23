@@ -6,14 +6,13 @@
 
 Pair `vllm-rs` with the same vLLM release as its Python engine. Use the Rust `vllm-router` binary for the examples below.
 
-| vLLM | HTTP event sources | gRPC event sources | Layout and hashing | vLLM Ascend pairing |
-| --- | --- | --- | --- | --- |
-| 0.30.0 | [Static addresses and layout](#static-event-endpoints) | `Control.GetKvEventSources` | Zero hash lookahead | [0.30.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.30.0) |
-| 0.31.0–0.32.0 | `/kv_event_sources` | `Control.GetKvEventSources` | Zero hash lookahead. Supports V4.1 bounded replay with the corresponding model layout. | [0.31.0rc1](https://pypi.org/project/vllm-ascend/0.31.0rc1/) or [0.32.0rc1](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.32.0rc1), respectively |
-| 0.33.0 | `/kv_event_sources` | `Control.GetKvEventSources` | Supports nonzero hash lookahead carried by `BlockStored.lookahead_token_ids`. | Build against vLLM 0.33.0 |
-| 0.34.0 | `/kv_event_sources` | `Control.GetKvEventSources` | Uses 64-token blocks when the backend has no preferred size. Use the worker's actual sizes in a layout. | Build against vLLM 0.34.0 |
+| vLLM | Worker setup | Cache reuse support | vLLM Ascend |
+| --- | --- | --- | --- |
+| 0.30.0 | Automatic discovery for gRPC. Stock HTTP needs [static setup](#static-event-endpoints). | Speculation with zero hash lookahead. | [0.30.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.30.0) |
+| 0.31.0–0.32.0 | Automatic discovery for HTTP and gRPC. | Speculation with zero hash lookahead. DeepSeek V4.1 bounded replay with the matching layout. | [0.31.0rc1](https://pypi.org/project/vllm-ascend/0.31.0rc1/) and [0.32.0rc1](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.32.0rc1), respectively |
+| 0.33.0–0.34.0 | Automatic discovery for HTTP and gRPC. | Speculation with zero or nonzero hash lookahead. DeepSeek V4.1 bounded replay with the matching layout. | Build against the matching vLLM version. |
 
-Use one worker interface throughout a pool. gRPC P/D uses explicitly configured worker URLs. Router renders chat locally using `vllm-chat` pinned to vLLM 0.30.0. See the [gRPC API compatibility table](../backend/grpc.md#api-compatibility) for request features and tokenizer settings.
+Use the [model layout reference](#model-layout-reference) to choose a layout for your model. Use one worker interface throughout a pool. For gRPC P/D, specify the worker URLs directly. See [gRPC API compatibility](../backend/grpc.md#api-compatibility) for text, chat and tokenizer requirements.
 
 ## Choose a layout configuration
 
@@ -37,7 +36,7 @@ A manual layout describes the worker's cache groups, hashing and reuse rules. Wi
 | Hash algorithm | Pass `--prefix-caching-hash-algo sha256_cbor` so Router and vLLM compute the same block keys. |
 | Event hashes | Set `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` to publish the full 32-byte hashes. |
 | KV events | Enable events through `--kv-events-config` and keep incremental reporting. Router uses live events to track cache changes and replay to recover missed events. |
-| HTTP text prompts | Add `--enable-scale-out` so Router can use the worker's rendering endpoints. |
+| HTTP text and chat | Add `--enable-scale-out` so Router can use the worker's tokenizer and chat template to score reuse. Workers serving pretokenized prompts without rendering can omit it. |
 
 ### Set the event ports
 
@@ -195,9 +194,9 @@ If each scored worker reports its layout, the file only needs the Prefill-to-Dec
 
 Save the layout as `layout.json` and pass `--kv-hybrid-layout layout.json`. Use your worker's HTTP or gRPC URL as the key. For hybrid P/D, add the [pairing fields](#pd-layout).
 
-Use the worker's effective layout. On vLLM 0.33.0, use `kv cache group sizes` from the startup log for `groups[].block_size`. For HTTP workers with event discovery, omit `hash_block_size` when `vllm:cache_config_info` reports it. For other manual layouts, supply the worker's effective hash block size. Set `partial_hash_hits` only if the worker uses sub-block prefix hits.
+Add one `ranks` entry per DP rank to score. Use `rank: 0` for one rank. List all cache groups in engine order and use their actual block sizes in tokens. Set `speculative_tokens: 0` when speculation is off.
 
-This example is for a GPU Qwen3.5-4B HTTP worker whose metrics report the hash size. It has one DP rank, 576-token group blocks and speculation disabled. Use your worker's group sizes and add `partial_hash_hits` only if it uses sub-block hits.
+This Qwen3.5-4B HTTP example uses one DP rank and 576-token groups. Router reads the hash block size from the worker's metrics.
 
 ```json
 {
@@ -216,9 +215,15 @@ This example is for a GPU Qwen3.5-4B HTTP worker whose metrics report the hash s
 }
 ```
 
+For a manual layout, add only the fields the deployment needs.
+
+- `hash_block_size` (tokens) when Router cannot discover it. HTTP event discovery can read it from worker metrics.
+- `partial_hash_hits: true` when the worker can reuse prefixes at boundaries inside a cache block.
+- `hash_seed` (string) when the worker uses a custom `PYTHONHASHSEED`. Use the same value.
+
 ### Model layout reference
 
-Use these profiles for manual layouts. Use token sizes from the running worker.
+Use these profiles to fill the required cache groups for a manual layout.
 
 | Platform and vLLM | Checkpoint | Layout |
 | --- | --- | --- |
@@ -238,7 +243,7 @@ Use these profiles for manual layouts. Use token sizes from the running worker.
 | Ascend A2, 0.32.0 | Qwen3.8-Flash-Next W4A8 | A2 Qwen4Exp |
 | Ascend A2, 0.32.0 | DeepSeek-V4-Flash-0731 W8A8 | A2 V4 Flash |
 
-List groups in engine order. Use the hash sizes below as references for manual declarations.
+Use the hash sizes below as references for manual declarations.
 
 | Group | `kind` | Required fields for this group |
 | --- | --- | --- |
@@ -275,42 +280,6 @@ When a worker runs MTP or DSpark and requires a manual layout, set `speculative_
 | GPU Qwen3.8 or V4 Flash, DSpark | 0 | `[]` |
 | Ascend A2 Qwen3.5, Qwen3.6, Qwen3.8 W8A8 or Qwen4Exp, MTP | 0 | `[]` |
 | Ascend A2 Qwen3.5, Qwen3.6, Qwen3.8 BF16 or V4 Flash, DSpark | 0 | `[]` |
-
-### Layout field reference
-
-The top-level object maps Router worker URLs to entries. Use the same scheme, host, and port as the configured worker URL. Set only the fields needed for the deployment. Use effective worker values for every token size.
-
-| Worker entry field | JSON type | When to set it |
-| --- | --- | --- |
-| `ranks` | Array of rank objects | Required for a layout declaration. Include each DP rank to score. |
-| `adapters` | Array of objects | Optional. Include entries for LoRA reuse. |
-| `adapters[].name` | String | Required in each adapter entry. Use the served adapter name. |
-| `adapters[].path` | String | Required in each adapter entry. Use the exact path string passed to `--lora-modules`. |
-| `compatible_decode_urls` | Array of worker URL strings | Required on hybrid Prefill entries. List the Decode workers able to receive their KV transfers. |
-
-| Rank field | JSON type and unit | When to set it |
-| --- | --- | --- |
-| `rank` | Unsigned integer, zero-based DP rank | Required. Use `0` for a single DP rank. |
-| `hash_seed` | String | Set only when the worker uses a custom seed. Use its exact `PYTHONHASHSEED` value. |
-| `root_hash` | String, 64 hex digits representing 32 bytes | Use only to supply a custom worker root directly. Supply either the root or the seed. |
-| `hash_block_size` | Positive unsigned integer, tokens | Use the worker's hash step. Omit with HTTP event discovery when metrics report it. |
-| `partial_hash_hits` | Boolean | Set to `true` only when the worker publishes and reuses partial prefixes at hash-block granularity. |
-| `speculative_tokens` | Unsigned integer, tokens | Required. Use `num_speculative_tokens` from the worker configuration, or `0` when speculation is disabled. |
-| `hash_lookahead_tokens` | Unsigned integer, tokens | Set only when speculation is enabled. Use the actual hash lookahead, including `0`. |
-| `tail_drop_groups` | Array of unsigned group IDs | Required with speculation and zero hash lookahead. List the groups whose lookup drops a trailing unit. Supply `[]` if the worker skips that step. |
-| `dense_lookup_groups` | Array of arrays of unsigned group IDs | Set only when declaring ordered dense lookup batches for fine-grained speculation. Include each full-attention group once in the engine's lookup order. |
-| `declared_groups` | Unsigned integer, group count | Set to `1` for a manually declared single full-attention group. |
-| `groups` | Array of group objects | Required. Use the complete cache group list, including groups that publish no events. |
-
-| Group field | JSON type and unit | When to set it |
-| --- | --- | --- |
-| `kind` | String | Required. Use the matching entry in the [group table](#layout-template). |
-| `block_size` | Positive unsigned integer, tokens | Required. Use the group block size. |
-| `sliding_window` | Positive unsigned integer, tokens | Required for sliding-window groups. Use the engine's window length. |
-| `prefix_replay_tokens` | Unsigned integer, tokens | Set the replay window only for a sliding group rebuilt by bounded replay. |
-| `mamba_cache_mode` | String | Required for a Mamba checkpoint group. Use `"align"`. |
-| `tokens_per_state` | String containing a token count | Required for sparse MLA and scratch. Use the number of tokens represented by one state for sparse MLA and `"1"` for scratch. Follow the recipe for other engine-reported values. |
-| `cache_role` | String | Set to `"sparse"` for sparse MLA groups. Omit when the engine reports no special cache role. |
 
 ## Static event endpoints
 
@@ -390,7 +359,7 @@ See the [CLI reference](../cli_reference.md#routing-policies) for the full optio
 
 | Symptom | Check |
 | --- | --- |
-| Worker reports reuse and Router stays at zero | Check the served model, hash settings, publisher topic and reachability of both event ports. Inspect `/kv_event_sources` or `Control.GetKvEventSources`. |
+| Worker reports reuse and Router stays at zero | Check that the worker publishes events and Router can reach both event ports. For a static source, confirm the model ID and publisher topic. |
 | Router rejects the layout | Use `--log-level debug` and inspect `worker-reported KV layout rejected`. Match the JSON to the actual model, rank, groups and speculation settings. |
 | Worker reports `Address already in use` | Check HTTP, gRPC, event and connector ports. Reserve separate ranges for DP ranks. |
 | Worker restarted | Generate a new publisher topic. Update a static layout that pins the topic. A Router restart uses the available replay history. |
