@@ -104,6 +104,36 @@ struct RequestLoadState {
     tracker: Mutex<Option<RequestTracker>>,
 }
 
+impl RequestLoadState {
+    fn begin_slot_decode(&self) {
+        if !self.decode_started.swap(true, Ordering::AcqRel) {
+            if let Some(slot) = &self.kv_slot {
+                slot.begin_decode();
+            }
+        }
+    }
+
+    fn on_first_output_unverified(&self) {
+        if self.released.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(tracker) = self.tracker.lock().as_mut() {
+            tracker.on_first_output_unverified();
+        }
+        self.begin_slot_decode();
+    }
+
+    fn on_output_tokens(&self, count: u32) {
+        if count == 0 || self.released.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(tracker) = self.tracker.lock().as_mut() {
+            tracker.on_output_tokens(count);
+        }
+        self.begin_slot_decode();
+    }
+}
+
 /// Owns an admitted attempt across dispatch and response consumption. Any
 /// cancellation or completion releases the shared counters exactly once.
 #[derive(Clone)]
@@ -150,8 +180,8 @@ impl RequestLoadGuard {
         if is_stream && !self.has_tracker() {
             None
         } else {
-            let load = self.clone();
-            Some(Arc::new(move |tokens| load.on_output_tokens(tokens)))
+            let state = Arc::clone(&self.state);
+            Some(Arc::new(move |tokens| state.on_output_tokens(tokens)))
         }
     }
 
@@ -160,21 +190,15 @@ impl RequestLoadGuard {
     }
 
     fn begin_slot_decode(&self) {
-        if !self.state.decode_started.swap(true, Ordering::AcqRel) {
-            if let Some(slot) = &self.state.kv_slot {
-                slot.begin_decode();
-            }
-        }
+        self.state.begin_slot_decode();
+    }
+
+    fn on_first_output_unverified(&self) {
+        self.state.on_first_output_unverified();
     }
 
     fn on_output_tokens(&self, count: u32) {
-        if count == 0 || self.state.released.load(Ordering::Acquire) {
-            return;
-        }
-        if let Some(tracker) = self.state.tracker.lock().as_mut() {
-            tracker.on_output_tokens(count);
-        }
-        self.begin_slot_decode();
+        self.state.on_output_tokens(count);
     }
 
     fn spawn_non_streaming_prefill_release(&self) {
@@ -185,13 +209,16 @@ impl RequestLoadGuard {
             .as_ref()
             .and_then(|t| t.estimated_prefill());
         if let Some(duration) = est {
-            let load = self.clone();
+            let state = Arc::clone(&self.state);
             tokio::spawn(async move {
                 tokio::time::sleep(duration).await;
-                if let Some(mut tracker) = load.state.tracker.lock().take() {
+                if state.released.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(mut tracker) = state.tracker.lock().take() {
                     tracker.release_pending_without_sample();
                 }
-                load.begin_slot_decode();
+                state.begin_slot_decode();
             });
         }
     }
@@ -236,8 +263,10 @@ impl futures_util::Stream for LoadTrackedBody {
             } else if self.observe_sse {
                 if self.load.has_tracker() {
                     let step = self.first_token.observe_stream(bytes);
-                    if step.outputs > 0 {
-                        self.load.on_output_tokens(step.outputs);
+                    if step.verified_tokens > 0 {
+                        self.load.on_output_tokens(step.verified_tokens);
+                    } else if step.saw_output {
+                        self.load.on_first_output_unverified();
                     }
                     if step.ended {
                         self.load.discard_tracker();
@@ -1976,8 +2005,10 @@ impl Router {
                         Ok(bytes) => {
                             if producer_load.has_tracker() {
                                 let step = first_token.observe_stream(&bytes);
-                                if step.outputs > 0 {
-                                    producer_load.on_output_tokens(step.outputs);
+                                if step.verified_tokens > 0 {
+                                    producer_load.on_output_tokens(step.verified_tokens);
+                                } else if step.saw_output {
+                                    producer_load.on_first_output_unverified();
                                 }
                                 if step.ended {
                                     producer_load.discard_tracker();
@@ -4925,5 +4956,64 @@ mod tests {
         assert!(RequestLoadGuard::new(None, None)
             .first_output_callback(true)
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn non_streaming_prefill_timer_releases_pending_without_releasing_worker_load() {
+        use std::sync::atomic::AtomicUsize;
+        struct Observer {
+            pending: AtomicUsize,
+            samples: AtomicUsize,
+        }
+        impl crate::policies::RequestObserver for Observer {
+            fn charge(&self, work: u64) {
+                self.pending.fetch_add(work as usize, Ordering::SeqCst);
+            }
+            fn finish(&self, work: u64, elapsed: Option<Duration>) {
+                self.pending.fetch_sub(work as usize, Ordering::SeqCst);
+                if elapsed.is_some() {
+                    self.samples.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://non-streaming-slow".into(),
+            WorkerType::Regular,
+        ));
+        worker.increment_load();
+        let observed = Arc::new(Observer {
+            pending: AtomicUsize::new(0),
+            samples: AtomicUsize::new(0),
+        });
+        let tracker = RequestTracker::new_with_sample(
+            observed.clone(),
+            128,
+            128,
+            Some(Duration::from_millis(20)),
+        );
+        let load = RequestLoadGuard::new(Some(worker.clone()), None).with_tracker(Some(tracker));
+        load.spawn_non_streaming_prefill_release();
+
+        // Keep the mock non-streaming request open well past the 20ms prefill estimate.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            observed.pending.load(Ordering::SeqCst),
+            0,
+            "prefill timer should release pending prefill work"
+        );
+        assert_eq!(
+            observed.samples.load(Ordering::SeqCst),
+            0,
+            "prefill timer must not record a rate sample"
+        );
+        assert_eq!(
+            worker.load(),
+            1,
+            "prefill timer drop must NOT release worker load while request is still running"
+        );
+
+        // Dropping the owning guard once the response completes releases worker load.
+        drop(load);
+        assert_eq!(worker.load(), 0);
     }
 }

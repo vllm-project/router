@@ -151,6 +151,24 @@ impl RequestTracker {
         self.on_output_tokens(1);
     }
 
+    /// Signal that output has started (releasing prefill work and recording TTFT)
+    /// without contributing an unverified token count to decode TPOT / beta learning.
+    pub fn on_first_output_unverified(&mut self) {
+        let Some(observer) = self.observer.as_ref() else {
+            return;
+        };
+        if let TrackerPhase::Prefill { started } = self.phase {
+            let now = Instant::now();
+            let elapsed = self
+                .sample_rate
+                .then(|| now.saturating_duration_since(started));
+            observer.finish_with_sample(self.work, self.sample_work, elapsed);
+            self.phase = TrackerPhase::Decode {
+                window_anchor: None,
+            };
+        }
+    }
+
     pub fn on_output_tokens(&mut self, count: u32) {
         if count == 0 {
             return;

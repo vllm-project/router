@@ -646,6 +646,7 @@ impl GenerationRequest for ChatCompletionRequest {
         Some(RoutingPrompt {
             text: String::from_utf8(text).ok()?,
             est_hit_chars,
+            cache_identity: extract_http_cache_identity(self.lora_path.as_ref(), &self.other),
         })
     }
 
@@ -985,6 +986,7 @@ impl GenerationRequest for CompletionRequest {
             PromptInput::String(text) => Some(RoutingPrompt {
                 text: text.clone(),
                 est_hit_chars: text.chars().count(),
+                cache_identity: extract_http_cache_identity(self.lora_path.as_ref(), &self.other),
             }),
             _ => None,
         }
@@ -2563,10 +2565,81 @@ pub enum GrpcRequestRef<'a> {
     Completion(&'a CompletionRequest),
 }
 
+/// Cache isolation identity for HTTP text-tree prefix lookups.
+///
+/// Requests with different adapters or cache salts cannot share KV blocks on a
+/// worker even when their prompt text is identical.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CacheIdentity {
+    /// Base model with no adapter or cache salt; shares the worker's default model tree.
+    #[default]
+    Shared,
+    /// Explicitly scoped by a known adapter and/or cache salt; shares only with identical scopes.
+    Scoped(String),
+    /// Cache compatibility cannot be verified (e.g., non-string salt, batch/structured LoRA);
+    /// withhold tree reuse credit and avoid polluting shared history.
+    Unknown,
+}
+
+fn extract_http_cache_identity(
+    lora_path: Option<&LoRAPath>,
+    other: &serde_json::Map<String, serde_json::Value>,
+) -> CacheIdentity {
+    // Structured or opaque LoRA selectors cannot be safely mapped to a single key.
+    for opaque in ["lora_request", "lora_id", "lora_int_id"] {
+        if other.get(opaque).is_some_and(|v| !v.is_null()) {
+            return CacheIdentity::Unknown;
+        }
+    }
+
+    let mut adapter: Option<&str> = None;
+    if let Some(path) = lora_path {
+        match path {
+            LoRAPath::Single(Some(s)) if !s.is_empty() => adapter = Some(s.as_str()),
+            LoRAPath::Single(_) => {}
+            LoRAPath::Batch(_) => return CacheIdentity::Unknown,
+        }
+    }
+    if let Some(val) = other.get("lora_name").filter(|v| !v.is_null()) {
+        let Some(name) = val.as_str() else {
+            return CacheIdentity::Unknown;
+        };
+        if !name.is_empty() {
+            if let Some(existing) = adapter {
+                if existing != name {
+                    return CacheIdentity::Unknown;
+                }
+            } else {
+                adapter = Some(name);
+            }
+        }
+    }
+
+    let mut salt: Option<&str> = None;
+    if let Some(val) = other.get("cache_salt").filter(|v| !v.is_null()) {
+        let Some(s) = val.as_str() else {
+            return CacheIdentity::Unknown;
+        };
+        if !s.is_empty() {
+            salt = Some(s);
+        }
+    }
+
+    match (adapter, salt) {
+        (None, None) => CacheIdentity::Shared,
+        (a, s) => CacheIdentity::Scoped(format!(
+            "lora={}\0salt={}",
+            a.unwrap_or(""),
+            s.unwrap_or("")
+        )),
+    }
+}
+
 /// Text-only affinity input with the historical boundary at the last assistant turn.
 pub struct RoutingPrompt {
     pub text: String,
     pub est_hit_chars: usize,
+    pub cache_identity: CacheIdentity,
 }
 
 /// Extract optional affinity metadata without cloning an intermediate JSON value.

@@ -4,7 +4,7 @@ mod kv;
 use crate::config::SMetricConfig;
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
-use crate::protocols::spec::RoutingPrompt;
+use crate::protocols::spec::{CacheIdentity, RoutingPrompt};
 use crate::tree::Tree;
 use dashmap::DashMap;
 use kv::PrefixMatch;
@@ -100,6 +100,14 @@ impl SMetricStrategy {
         })
     }
 
+    fn http_tree_key(worker: &Arc<dyn Worker>, prompt: &RoutingPrompt) -> Option<String> {
+        match &prompt.cache_identity {
+            CacheIdentity::Shared => Some(worker.model_id().to_string()),
+            CacheIdentity::Scoped(scope) => Some(format!("{}\0{scope}", worker.model_id())),
+            CacheIdentity::Unknown => None,
+        }
+    }
+
     fn select_prefill(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -127,13 +135,12 @@ impl SMetricStrategy {
             }
             let hit = if let Some(hits) = &event_hits {
                 hits[idx].chars
+            } else if let Some(tree_key) = Self::http_tree_key(worker, prompt) {
+                self.trees.get(&tree_key).as_ref().map_or(0, |tree| {
+                    tree.prefix_match_tenant_char_count(&prompt.text, &Self::tenant_key(worker))
+                })
             } else {
-                self.trees
-                    .get(worker.model_id())
-                    .as_ref()
-                    .map_or(0, |tree| {
-                        tree.prefix_match_tenant_char_count(&prompt.text, &Self::tenant_key(worker))
-                    })
+                0
             };
             let n = l.saturating_sub(hit) as f64;
             let cost = (self.config.c_lin * n + self.config.c_att * n * (l as f64 - n / 2.0)).ceil()
@@ -209,10 +216,12 @@ impl SMetricStrategy {
             (min_idx, min_cost, min_score, min_pwork)
         };
         if !prompt.text.is_empty() && event_hits.is_none() {
-            self.trees
-                .entry(workers[idx].model_id().to_string())
-                .or_insert_with(|| Arc::new(Tree::new()))
-                .insert(&prompt.text, &Self::tenant_key(&workers[idx]));
+            if let Some(tree_key) = Self::http_tree_key(&workers[idx], prompt) {
+                self.trees
+                    .entry(tree_key)
+                    .or_insert_with(|| Arc::new(Tree::new()))
+                    .insert(&prompt.text, &Self::tenant_key(&workers[idx]));
+            }
         }
         RouterMetrics::record_processed_request(workers[idx].url());
         RouterMetrics::record_policy_decision("kv_aware", workers[idx].url());
@@ -513,10 +522,22 @@ impl SMetricStrategy {
         {
             self.model_betas.remove(model_id);
         }
-        self.trees.remove_if(model_id, |_, tree| {
-            tree.remove_tenant(&Self::tenant_key(worker));
-            tree.tenant_char_count.is_empty()
-        });
+        let tenant = Self::tenant_key(worker);
+        let scoped_prefix = format!("{model_id}\0");
+        let keys: Vec<String> = self
+            .trees
+            .iter()
+            .filter_map(|entry| {
+                let k = entry.key();
+                (k == model_id || k.starts_with(&scoped_prefix)).then(|| k.clone())
+            })
+            .collect();
+        for key in keys {
+            self.trees.remove_if(&key, |_, tree| {
+                tree.remove_tenant(&tenant);
+                tree.tenant_char_count.is_empty()
+            });
+        }
     }
 
     pub(super) fn with_active_worker<T>(
@@ -572,6 +593,7 @@ mod tests {
         let prompt = RoutingPrompt {
             text: "abcdefghijklm".into(),
             est_hit_chars: 0,
+            cache_identity: CacheIdentity::Shared,
         };
         let (_, mut tracker, _) = policy
             .select_prefill(
@@ -1002,7 +1024,74 @@ mod tests {
         RoutingPrompt {
             text: text.to_owned(),
             est_hit_chars,
+            cache_identity: CacheIdentity::Shared,
         }
+    }
+
+    #[test]
+    fn http_tree_isolates_cache_salts_adapters_and_withholds_unknown_identity() {
+        let policy = SMetricStrategy::new(
+            serde_yaml::from_str(
+                "C_LIN: 1\nC_ATT: 0\nSLACK: 1\nHIT_RATIO: 0.1\nTTFT_SLO_BASE: 20\nTTFT_SLO_PER_CHAR: 0\nEVICTION_INTERVAL_SECS: 0\n",
+            )
+            .unwrap(),
+        );
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://worker:1".into(),
+            WorkerType::Regular,
+        ));
+        let workers = std::slice::from_ref(&worker);
+        let shared = prompt("shared prefix across requests", 20);
+        let (_, t1, _) = policy.select_prefill(workers, &shared, true, true, None, None).unwrap();
+        assert_eq!(t1.work, 29);
+        drop(t1);
+
+        // Same shared identity gets full prefix credit.
+        let (_, t2, _) = policy.select_prefill(workers, &shared, true, true, None, None).unwrap();
+        assert_eq!(t2.work, 0);
+        drop(t2);
+
+        // Different cache salt must NOT receive reuse credit from the base tree.
+        let salted_a = RoutingPrompt {
+            text: shared.text.clone(),
+            est_hit_chars: 20,
+            cache_identity: CacheIdentity::Scoped("lora=\0salt=tenant-a".into()),
+        };
+        let (_, t3, _) = policy.select_prefill(workers, &salted_a, true, true, None, None).unwrap();
+        assert_eq!(t3.work, 29);
+        drop(t3);
+
+        // Repeat with the SAME salt gets full reuse credit.
+        let (_, t4, _) = policy.select_prefill(workers, &salted_a, true, true, None, None).unwrap();
+        assert_eq!(t4.work, 0);
+        drop(t4);
+
+        // Different salt or adapter gets zero credit from tenant-a.
+        let salted_b = RoutingPrompt {
+            text: shared.text.clone(),
+            est_hit_chars: 20,
+            cache_identity: CacheIdentity::Scoped("lora=adapter-1\0salt=tenant-a".into()),
+        };
+        let (_, t5, _) = policy.select_prefill(workers, &salted_b, true, true, None, None).unwrap();
+        assert_eq!(t5.work, 29);
+        drop(t5);
+
+        // Unknown cache identity withholds credit and never populates the tree.
+        let unknown = RoutingPrompt {
+            text: shared.text.clone(),
+            est_hit_chars: 20,
+            cache_identity: CacheIdentity::Unknown,
+        };
+        let (_, t6, _) = policy.select_prefill(workers, &unknown, true, true, None, None).unwrap();
+        assert_eq!(t6.work, 29);
+        drop(t6);
+        let (_, t7, _) = policy.select_prefill(workers, &unknown, true, true, None, None).unwrap();
+        assert_eq!(t7.work, 29);
+        drop(t7);
+
+        // Worker removal clears all scoped trees for that model.
+        policy.on_worker_removed(&worker);
+        assert!(policy.trees.is_empty());
     }
 
     fn select(

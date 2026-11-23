@@ -17,7 +17,11 @@ pub(super) enum Observation {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct StreamObservation {
-    pub(super) outputs: u32,
+    /// True once any generated output is observed (including text-only fallbacks).
+    pub(super) saw_output: bool,
+    /// Verified generated token count from explicit `token_ids` fields only;
+    /// zero for text/delta fallback events whose framing cannot verify token count.
+    pub(super) verified_tokens: u32,
     pub(super) ended: bool,
 }
 
@@ -64,7 +68,8 @@ impl FirstTokenObserver {
     pub(super) fn observe_stream(&mut self, bytes: &[u8]) -> StreamObservation {
         if self.finished {
             return StreamObservation {
-                outputs: 0,
+                saw_output: false,
+                verified_tokens: 0,
                 ended: true,
             };
         }
@@ -90,8 +95,12 @@ impl FirstTokenObserver {
                 let data = std::mem::take(&mut self.data);
                 match classify_tokens(&data) {
                     FrameKind::Pending => {}
-                    FrameKind::Output(tokens) => {
-                        step.outputs = step.outputs.saturating_add(tokens);
+                    FrameKind::VerifiedOutput(tokens) => {
+                        step.saw_output = true;
+                        step.verified_tokens = step.verified_tokens.saturating_add(tokens);
+                    }
+                    FrameKind::UnverifiedOutput => {
+                        step.saw_output = true;
                     }
                     FrameKind::End => {
                         self.finished = true;
@@ -114,7 +123,8 @@ impl FirstTokenObserver {
 #[derive(Debug, PartialEq, Eq)]
 enum FrameKind {
     Pending,
-    Output(u32),
+    VerifiedOutput(u32),
+    UnverifiedOutput,
     End,
 }
 
@@ -130,7 +140,7 @@ fn function_output(value: &Value) -> bool {
 fn classify(data: &[u8]) -> Observation {
     match classify_tokens(data) {
         FrameKind::Pending => Observation::Pending,
-        FrameKind::Output(_) => Observation::Output,
+        FrameKind::VerifiedOutput(_) | FrameKind::UnverifiedOutput => Observation::Output,
         FrameKind::End => Observation::End,
     }
 }
@@ -148,16 +158,25 @@ fn classify_tokens(data: &[u8]) -> FrameKind {
     let Some(choices) = value.get("choices").and_then(Value::as_array) else {
         return FrameKind::Pending;
     };
-    for choice in choices {
-        if let Some(ids) = choice
+    if choices.len() == 1 {
+        if let Some(ids) = choices[0]
             .get("token_ids")
             .and_then(Value::as_array)
             .filter(|ids| !ids.is_empty())
         {
-            return FrameKind::Output(ids.len() as u32);
+            return FrameKind::VerifiedOutput(ids.len() as u32);
+        }
+    }
+    for choice in choices {
+        if choice
+            .get("token_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| !ids.is_empty())
+        {
+            return FrameKind::UnverifiedOutput;
         }
         if nonempty(choice.get("text")) {
-            return FrameKind::Output(1);
+            return FrameKind::UnverifiedOutput;
         }
         if let Some(delta) = choice.get("delta") {
             if ["content", "reasoning", "reasoning_content", "refusal"]
@@ -173,7 +192,7 @@ fn classify_tokens(data: &[u8]) -> FrameKind {
                             .any(|call| call.get("function").is_some_and(function_output))
                     })
             {
-                return FrameKind::Output(1);
+                return FrameKind::UnverifiedOutput;
             }
         }
     }
@@ -264,5 +283,28 @@ mod tests {
             observer.observe(b"data: {\"choices\":[{\"text\":\"late\"}]}\n\n"),
             Observation::End,
         );
+    }
+
+    #[test]
+    fn text_fallback_and_multichoice_signal_output_without_unverified_token_count() {
+        let mut observer = FirstTokenObserver::default();
+        let text_step = observer.observe_stream(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"coalesced text\"}}]}\n\n",
+        );
+        assert!(text_step.saw_output);
+        assert_eq!(text_step.verified_tokens, 0);
+        assert!(!text_step.ended);
+
+        let multi_choice = observer.observe_stream(
+            b"data: {\"choices\":[{\"index\":0,\"token_ids\":[1,2]},{\"index\":1,\"token_ids\":[3]}]}\n\n",
+        );
+        assert!(multi_choice.saw_output);
+        assert_eq!(multi_choice.verified_tokens, 0);
+
+        let verified = observer.observe_stream(
+            b"data: {\"choices\":[{\"token_ids\":[11,12,13],\"text\":\"abc\"}]}\n\n",
+        );
+        assert!(verified.saw_output);
+        assert_eq!(verified.verified_tokens, 3);
     }
 }

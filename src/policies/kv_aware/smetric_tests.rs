@@ -2,7 +2,7 @@ use super::*;
 use crate::core::{BasicWorker, WorkerType};
 use crate::kv_index::{ClearScope, HashMode, KvBlockIndexer, ResidencyOwner};
 use crate::policies::KvRequestContext;
-use crate::protocols::spec::RoutingPrompt;
+use crate::protocols::spec::{CacheIdentity, RoutingPrompt};
 
 fn policy() -> KvAwarePolicy {
     KvAwarePolicy::default().with_smetric(serde_yaml::from_str(
@@ -82,6 +82,7 @@ fn work(
     let prompt = RoutingPrompt {
         text: "x".repeat(chars),
         est_hit_chars: chars,
+        cache_identity: CacheIdentity::Shared,
     };
     let (receipt, tracker) = policy
         .select_request_with_receipt(std::slice::from_ref(worker), &context(&prompt, tokens))
@@ -164,6 +165,7 @@ fn lower_tiers_and_other_namespaces_do_not_reduce_smetric_work() {
     let prompt = RoutingPrompt {
         text: "x".repeat(13),
         est_hit_chars: 13,
+        cache_identity: CacheIdentity::Shared,
     };
     for (lora_name, cache_salt) in [(Some("adapter"), None), (None, Some("private"))] {
         let mut ctx = context(&prompt, &tokens);
@@ -199,6 +201,7 @@ fn shared_queries_keep_model_cache_identities_separate() {
     let prompt = RoutingPrompt {
         text: "x".repeat(13),
         est_hit_chars: 13,
+        cache_identity: CacheIdentity::Shared,
     };
     let tokens: Vec<_> = (1..=13).collect();
     let (receipt, _) = policy
@@ -226,6 +229,7 @@ fn retired_worker_cannot_overwrite_or_remove_its_same_url_replacement() {
     let prompt = RoutingPrompt {
         text: "x".repeat(13),
         est_hit_chars: 13,
+        cache_identity: CacheIdentity::Shared,
     };
     assert!(policy
         .select_request_with_receipt(&[old], &context(&prompt, &tokens))
@@ -282,6 +286,7 @@ fn ttft_budget_overrides_event_affinity_until_pending_work_is_released() {
     let prompt = RoutingPrompt {
         text: "x".repeat(13),
         est_hit_chars: 13,
+        cache_identity: CacheIdentity::Shared,
     };
     let tokens: Vec<_> = (1..=13).collect();
     let workers = [cold, hot.clone()];
@@ -296,6 +301,7 @@ fn ttft_budget_overrides_event_affinity_until_pending_work_is_released() {
     let busy_prompt = RoutingPrompt {
         text: "y".repeat(40),
         est_hit_chars: 0,
+        cache_identity: CacheIdentity::Shared,
     };
     let busy_tokens: Vec<_> = (100..140).collect();
     let busy = policy
