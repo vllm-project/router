@@ -283,21 +283,20 @@ impl PdKvState {
     fn all_priceable(
         &self,
         workers: &[Arc<dyn Worker>],
-        request: &Value,
+        request_cacheable: bool,
+        cache_salt: Option<&str>,
         allow_credit: &HashMap<String, bool>,
     ) -> bool {
-        if workers.is_empty() || http_cache_read_fallback(request).is_some() {
-            return false;
-        }
-        let cache_salt = request.get("cache_salt").and_then(Value::as_str);
-        workers.iter().all(|worker| {
-            let base = worker.base_url();
-            KvAwarePolicy::credit_fallback(
-                cache_salt,
-                allow_credit.get(base).copied().unwrap_or(false),
-            )
-            .is_none()
-        }) && self.supervisor.workers_have_cache_bindings(
+        KvAwarePolicy::all_candidates_priceable(
+            request_cacheable,
+            cache_salt,
+            workers.iter().map(|worker| {
+                allow_credit
+                    .get(worker.base_url())
+                    .copied()
+                    .unwrap_or(false)
+            }),
+        ) && self.supervisor.workers_have_cache_bindings(
             workers
                 .iter()
                 .map(|worker| (worker.base_url(), worker.dp_rank().unwrap_or(0) as u32)),
@@ -330,10 +329,7 @@ impl PdKvState {
 
     /// Prepare both stages for one request.
     ///
-    /// Rendering runs for both pools at once, because it is the only network work here;
-    /// estimation is local and walks the rendered prompts once, sharing one hash cache and
-    /// one credit decision. Awaiting one pool and then the other made two slow backends add
-    /// up in admission latency.
+    /// Render both pools concurrently, then share the local hash cache and credit decision.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn prepare_stages(
         &self,
@@ -379,7 +375,12 @@ impl PdKvState {
             router_prompts.is_none() && http_input_requires_render(request, route);
         let decode_priced_here = decode_expected
             && !decode_requires_render
-            && self.all_priceable(decode_workers, request, &allow_credit);
+            && self.all_priceable(
+                decode_workers,
+                http_cache_read_fallback(request).is_none(),
+                request.get("cache_salt").and_then(Value::as_str),
+                &allow_credit,
+            );
         let (prefill_results, decode_results) = tokio::join!(
             self.tokenize(prefill_bases, request, route, headers, router_prompts),
             async {
@@ -586,7 +587,12 @@ impl PdKvState {
             .map(|worker| worker.base_url().to_owned())
             .collect();
         let allow_credit = self.credit_by_base(&bases, request).await;
-        if !self.all_priceable(workers, request, &allow_credit) {
+        if !self.all_priceable(
+            workers,
+            http_cache_read_fallback(request).is_none(),
+            request.get("cache_salt").and_then(Value::as_str),
+            &allow_credit,
+        ) {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
             return None;
         }
@@ -1222,7 +1228,7 @@ mod kv_input_tests {
             .await;
         assert_eq!(credit.get(&p_base), Some(&true));
         assert_eq!(credit.get(&d_base), Some(&true));
-        assert!(state.all_priceable(&prefill, &request, &credit));
+        assert!(state.all_priceable(&prefill, true, None, &credit));
         let unbound: Arc<dyn Worker> = Arc::new(BasicWorker::new(
             "http://unbound".to_owned(),
             WorkerType::Decode,
@@ -1230,7 +1236,7 @@ mod kv_input_tests {
         let mixed = [decode[0].clone(), unbound.clone()];
         let mut mixed_credit = credit.clone();
         mixed_credit.insert(unbound.base_url().to_owned(), true);
-        assert!(!state.all_priceable(&mixed, &request, &mixed_credit));
+        assert!(!state.all_priceable(&mixed, true, None, &mixed_credit));
         let prompts: Arc<[Vec<u32>]> = Arc::from(vec![vec![1, 2, 3]]);
         assert!(
             state

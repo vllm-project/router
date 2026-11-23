@@ -11,6 +11,49 @@ use std::sync::Arc;
 
 use foldhash::fast::RandomState;
 
+/// Read-only placement provider for the routing policy.
+///
+/// Hashes prompts using the verified source contract and reports the prefix
+/// that the cache layout can restore.
+pub trait TieredMatchProvider: Send + Sync {
+    /// Match the prompt using the provider's complete restore rules.
+    fn matches(
+        &self,
+        _tokens: &[u32],
+        _block_size: u32,
+        _lora_name: Option<&str>,
+        _dp_rank: u32,
+    ) -> Vec<TierMatch> {
+        Vec::new()
+    }
+
+    #[doc(hidden)]
+    fn matches_with_cache<'a>(
+        &self,
+        tokens: &'a [u32],
+        block_size: u32,
+        lora_name: Option<&str>,
+        dp_rank: u32,
+        _cache: &mut RequestHashCache<'a>,
+    ) -> Vec<TierMatch> {
+        self.matches(tokens, block_size, lora_name, dp_rank)
+    }
+
+    /// Group restore evidence belongs to one target; dense lookups cover all targets.
+    fn target_scoped(&self) -> bool {
+        false
+    }
+
+    #[doc(hidden)]
+    fn shared_prefix_lookup(&self, _rank: u32) -> Option<SharedPrefixLookup> {
+        None
+    }
+
+    fn nixl_decode_credit(&self, _rank: u32, _prompt_len: usize, reused: u64) -> u64 {
+        reused
+    }
+}
+
 /// Cache domain and hash contract for a plain group-zero prefix lookup.
 pub struct SharedPrefixLookup {
     index: Arc<KvBlockIndexer>,

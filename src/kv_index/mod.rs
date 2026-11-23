@@ -3,6 +3,7 @@
 pub mod request_hash;
 mod routing_provider;
 pub(crate) use routing_provider::PromptKey;
+pub use routing_provider::TieredMatchProvider;
 #[doc(hidden)]
 pub use routing_provider::{RequestHashCache, SharedPrefixLookup};
 pub(crate) mod source;

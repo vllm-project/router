@@ -7,6 +7,7 @@ use serde::Deserialize;
 
 /// Decode atomically without conflating structural validity with device admission.
 pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
+    // Publishers must be trusted: live batches have no per-frame size limit.
     // rmpv accepts Reserved as nil; rmp-serde can turn invalid strings into
     // bytes. Use it only for syntax, then retain rmpv's wire type fidelity.
     let mut syntax = rmp_serde::Deserializer::new(Cursor::new(payload));

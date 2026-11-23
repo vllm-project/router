@@ -21,48 +21,7 @@ use crate::kv_index::{
 };
 use crate::request_identity::StableIdentity;
 
-/// Read-only placement port owned by its policy consumer.
-///
-/// The provider hashes the prompt using the verified source contract and
-/// reports the prefix its cache layout can restore.
-pub trait TieredMatchProvider: Send + Sync {
-    /// Match the prompt using the provider's complete restore rules.
-    fn matches(
-        &self,
-        _tokens: &[u32],
-        _block_size: u32,
-        _lora_name: Option<&str>,
-        _dp_rank: u32,
-    ) -> Vec<TierMatch> {
-        Vec::new()
-    }
-
-    #[doc(hidden)]
-    fn matches_with_cache<'a>(
-        &self,
-        tokens: &'a [u32],
-        block_size: u32,
-        lora_name: Option<&str>,
-        dp_rank: u32,
-        _cache: &mut RequestHashCache<'a>,
-    ) -> Vec<TierMatch> {
-        self.matches(tokens, block_size, lora_name, dp_rank)
-    }
-
-    /// Group restore evidence belongs to one target; dense lookups cover all targets.
-    fn target_scoped(&self) -> bool {
-        false
-    }
-
-    #[doc(hidden)]
-    fn shared_prefix_lookup(&self, _rank: u32) -> Option<SharedPrefixLookup> {
-        None
-    }
-
-    fn nixl_decode_credit(&self, _rank: u32, _prompt_len: usize, reused: u64) -> u64 {
-        reused
-    }
-}
+pub use crate::kv_index::TieredMatchProvider;
 
 /// Exact prompt sequences rendered by each HTTP backend. DP ranks share their
 /// base URL's input; separate prompts in a batch never form one prefix chain.
@@ -1639,6 +1598,18 @@ impl KvAwarePolicy {
         } else {
             None
         }
+    }
+
+    /// Every candidate must be eligible for a shared Decode credit estimate.
+    pub(crate) fn all_candidates_priceable(
+        request_cacheable: bool,
+        cache_salt: Option<&str>,
+        model_verified: impl IntoIterator<Item = bool>,
+    ) -> bool {
+        let mut models = model_verified.into_iter().peekable();
+        request_cacheable
+            && models.peek().is_some()
+            && models.all(|verified| Self::credit_fallback(cache_salt, verified).is_none())
     }
 
     /// Healthy workers, their target bindings, and per-candidate KV matches.
@@ -3588,6 +3559,23 @@ mod tests {
                 .map(|receipt| receipt.worker_index),
             Some(1)
         );
+    }
+
+    #[test]
+    fn decode_credit_requires_every_candidate_to_be_eligible() {
+        for (cacheable, salt, models, expected) in [
+            (true, None, vec![true, true], true),
+            (true, Some(""), vec![true], true),
+            (false, None, vec![true], false),
+            (true, Some("tenant"), vec![true], false),
+            (true, None, vec![true, false], false),
+            (true, None, vec![], false),
+        ] {
+            assert_eq!(
+                KvAwarePolicy::all_candidates_priceable(cacheable, salt, models),
+                expected
+            );
+        }
     }
 
     #[test]
