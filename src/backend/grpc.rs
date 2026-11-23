@@ -31,6 +31,7 @@ use super::openai::{
     completion_final_response, final_response, finish_reason_name, now_secs, sse_chunk,
     sse_usage_chunk, SSE_DONE,
 };
+use super::outcome::{EngineOutcomeObserver, EngineUsage};
 use super::pb::control_client::ControlClient;
 use super::pb::finish_info::FinishReason;
 use super::pb::inference_client::InferenceClient;
@@ -137,6 +138,7 @@ pub struct GrpcStreamTask {
 
 impl GrpcStreamTask {
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn new(handle: tokio::task::JoinHandle<()>) -> Self {
         Self {
             handle: Arc::new(std::sync::Mutex::new(Some(handle))),
@@ -213,6 +215,24 @@ enum Enqueue {
     Stalled,
 }
 
+/// Starts the client-stall timer. A concurrent P/D decode response is held
+/// inside the router until prefill returns, so the timer stays unarmed until
+/// that response is handed toward the client.
+#[derive(Clone)]
+pub(crate) struct ClientStallArm(watch::Sender<bool>);
+
+impl ClientStallArm {
+    pub(crate) fn arm(&self) {
+        self.0.send_replace(true);
+    }
+}
+
+pub(crate) fn arm_client_stall(response: &Response) {
+    if let Some(arm) = response.extensions().get::<ClientStallArm>() {
+        arm.arm();
+    }
+}
+
 async fn enqueue_sse(
     tx: &mpsc::Sender<Result<String, std::io::Error>>,
     output: &mut OutputFrameProducer,
@@ -220,6 +240,7 @@ async fn enqueue_sse(
     chunk: String,
     has_generated_output: bool,
     request_timeout: Duration,
+    stall_arm: &mut watch::Receiver<bool>,
 ) -> Enqueue {
     tokio::select! {
         biased;
@@ -230,11 +251,27 @@ async fn enqueue_sse(
                 Enqueue::Closed
             }
         }
-        _ = tokio::time::sleep(request_timeout) => {
+        _ = client_stall(stall_arm, request_timeout) => {
             terminal.send_replace(Some(GRPC_SSE_STALL_ERROR.to_string()));
             Enqueue::Stalled
         }
     }
+}
+
+/// The stall timeout starts only after handoff. A dropped arm, from a held
+/// response that never reached the client, does not become a stall.
+async fn client_stall(arm: &mut watch::Receiver<bool>, request_timeout: Duration) {
+    if !*arm.borrow() && arm.wait_for(|armed| *armed).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+    tokio::time::sleep(request_timeout).await;
+}
+
+/// An upstream terminal error must not wait for a free SSE slot. A full queue
+/// would otherwise spend another `request_timeout` and replace this line with
+/// the client-stall error.
+fn publish_terminal(terminal: &watch::Sender<Option<String>>, line: String) {
+    terminal.send_replace(Some(line));
 }
 
 fn grpc_status_code(status: &tonic::Status) -> StatusCode {
@@ -385,6 +422,7 @@ impl GrpcEngineBackend {
         prepared: PreparedRequest,
         on_first_output: Option<FirstOutputCallback>,
         handoff: KvHandoff,
+        observer: Option<std::sync::Arc<EngineOutcomeObserver>>,
     ) -> Response {
         let PreparedRequest {
             request,
@@ -516,6 +554,7 @@ impl GrpcEngineBackend {
             on_first_output,
             fail_on_abort: abort_request_id.is_some(),
             abort,
+            observer,
         };
         if request.stream {
             stream_openai(stream, reply, n_prompt_tokens).await
@@ -548,6 +587,7 @@ struct ChatReply {
     /// path can cancel P instead of returning an aborted reply as success.
     fail_on_abort: bool,
     abort: EngineAbortGuard,
+    observer: Option<std::sync::Arc<EngineOutcomeObserver>>,
 }
 
 fn fill_engine_ms(stages: &mut serde_json::Value) {
@@ -571,6 +611,21 @@ fn fill_engine_ms(stages: &mut serde_json::Value) {
     }
 }
 
+/// Settle the producer's terminal `finish_reason` for a streaming attempt.
+///
+/// The body ends normally after `finish_reason="abort"`, so the attempt must
+/// record an error (and therefore settle as failed) rather than succeeding on
+/// EOF.
+fn record_finish_outcome(observer: Option<&EngineOutcomeObserver>, finish: Option<&str>) -> bool {
+    let aborted = finish == Some("abort");
+    if aborted {
+        if let Some(observer) = observer {
+            observer.record_error();
+        }
+    }
+    !aborted
+}
+
 async fn stream_openai<S>(mut stream: S, reply: ChatReply, n_prompt_tokens: usize) -> Response
 where
     S: Stream<Item = Result<super::pb::GenerateResponse, tonic::Status>> + Unpin + Send + 'static,
@@ -592,6 +647,7 @@ where
         on_first_output: _,
         fail_on_abort: _,
         abort,
+        observer,
     } = reply;
     let header_stages = stages.clone();
     let stages_on = crate::backend::stages_enabled();
@@ -599,7 +655,9 @@ where
     let (terminal_tx, terminal_rx) = watch::channel(None::<String>);
     let (mut producer_output_frame, output_frame) = output_frame_tracking();
     let (failed_tx, failed_rx) = watch::channel(false);
+    let (stall_arm_tx, stall_arm_rx) = watch::channel(false);
     let producer = tokio::spawn(async move {
+        let mut stall_arm = stall_arm_rx;
         let finished = async {
             let mut detok = tok
                 .as_ref()
@@ -607,22 +665,21 @@ where
             let mut first = true;
             let mut first_token_logged = false;
             let mut prompt_tokens = n_prompt_tokens as u32;
+            let mut engine_prompt_tokens: Option<u32> = None;
             let mut completion_tokens = 0u32;
             loop {
                 let item = match tokio::time::timeout(request_timeout, stream.next()).await {
                     Ok(Some(item)) => item,
                     Ok(None) => break,
                     Err(_) => {
-                        let _ = enqueue_sse(
-                            &tx,
-                            &mut producer_output_frame,
+                        if let Some(observer) = &observer {
+                            observer.record_error();
+                        }
+                        publish_terminal(
                             &terminal_tx,
                             "data: {\"error\":\"gRPC stream exceeded request timeout\"}\n\n"
                                 .to_string(),
-                            false,
-                            request_timeout,
-                        )
-                        .await;
+                        );
                         return false;
                     }
                 };
@@ -634,6 +691,7 @@ where
                         }
                         if let Some(info) = &msg.prompt_info {
                             prompt_tokens = info.num_prompt_tokens;
+                            engine_prompt_tokens = Some(info.num_prompt_tokens);
                         }
                         if let Some(outputs) = &msg.outputs {
                             completion_tokens =
@@ -643,18 +701,16 @@ where
                             match output_text_and_finish(&msg, &mut detok, prefer_worker_text) {
                                 Ok(output) => output,
                                 Err(error) => {
-                                    let _ = enqueue_sse(
-                                        &tx,
-                                        &mut producer_output_frame,
+                                    if let Some(observer) = &observer {
+                                        observer.record_error();
+                                    }
+                                    publish_terminal(
                                         &terminal_tx,
                                         format!(
                                             "data: {{\"error\":{}}}\n\n",
                                             serde_json::to_string(&error).unwrap_or_default()
                                         ),
-                                        false,
-                                        request_timeout,
-                                    )
-                                    .await;
+                                    );
                                     return false;
                                 }
                             };
@@ -674,6 +730,7 @@ where
                                         format!(": router-stages {stages}\n\n"),
                                         false,
                                         request_timeout,
+                                        &mut stall_arm,
                                     )
                                     .await,
                                     Enqueue::Stalled
@@ -717,6 +774,7 @@ where
                                     line,
                                     generated_output,
                                     request_timeout,
+                                    &mut stall_arm,
                                 )
                                 .await,
                                 Enqueue::Queued
@@ -726,6 +784,13 @@ where
                             first = false;
                         }
                         if finish.is_some() {
+                            if let Some(observer) = &observer {
+                                observer.record_usage(EngineUsage {
+                                    prompt_tokens: engine_prompt_tokens
+                                        .map(|tokens| tokens as usize),
+                                    completion_tokens: completion_tokens as usize,
+                                });
+                            }
                             if include_usage {
                                 let usage = Usage {
                                     prompt_tokens,
@@ -743,6 +808,7 @@ where
                                         line,
                                         false,
                                         request_timeout,
+                                        &mut stall_arm,
                                     )
                                     .await,
                                     Enqueue::Stalled
@@ -758,41 +824,38 @@ where
                                     SSE_DONE.to_string(),
                                     false,
                                     request_timeout,
+                                    &mut stall_arm,
                                 )
                                 .await,
                                 Enqueue::Stalled
                             ) {
                                 return false;
                             }
-                            return finish.as_deref() != Some("abort");
+                            return record_finish_outcome(observer.as_deref(), finish.as_deref());
                         }
                     }
                     Err(status) => {
-                        let _ = enqueue_sse(
-                            &tx,
-                            &mut producer_output_frame,
+                        if let Some(observer) = &observer {
+                            observer.record_error();
+                        }
+                        publish_terminal(
                             &terminal_tx,
                             format!(
                                 "data: {{\"error\":{}}}\n\n",
                                 serde_json::to_string(status.message()).unwrap_or_default()
                             ),
-                            false,
-                            request_timeout,
-                        )
-                        .await;
+                        );
                         return false;
                     }
                 }
             }
-            let _ = enqueue_sse(
-                &tx,
-                &mut producer_output_frame,
+            if let Some(observer) = &observer {
+                observer.record_error();
+            }
+            publish_terminal(
                 &terminal_tx,
                 "data: {\"error\":\"gRPC stream closed before finish_info\"}\n\n".to_string(),
-                false,
-                request_timeout,
-            )
-            .await;
+            );
             false
         }
         .await;
@@ -818,6 +881,9 @@ where
     let mut response = builder
         .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    response
+        .extensions_mut()
+        .insert(ClientStallArm(stall_arm_tx));
     response
         .extensions_mut()
         .insert(GrpcStreamTask::with_output_frame(producer, output_frame).with_failure(failed_rx));
@@ -877,6 +943,7 @@ async fn collect_openai(
         on_first_output,
         fail_on_abort,
         abort,
+        observer,
     } = reply;
     let mut detok = tok
         .as_ref()
@@ -885,6 +952,7 @@ async fn collect_openai(
     let mut token_ids: Vec<u32> = Vec::new();
     let mut finish = None;
     let mut prompt_tokens = prompt_ids.len() as u32;
+    let mut engine_prompt_tokens: Option<u32> = None;
     let mut completion_tokens = 0u32;
     let mut first_output_seen = false;
     loop {
@@ -892,6 +960,9 @@ async fn collect_openai(
             Ok(Some(item)) => item,
             Ok(None) => break,
             Err(_) => {
+                if let Some(observer) = &observer {
+                    observer.record_error();
+                }
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
                     "gRPC stream exceeded request timeout",
@@ -907,11 +978,15 @@ async fn collect_openai(
                 }
                 if let Some(info) = &msg.prompt_info {
                     prompt_tokens = info.num_prompt_tokens;
+                    engine_prompt_tokens = Some(info.num_prompt_tokens);
                 }
                 let (delta, reason) =
                     match output_text_and_finish(&msg, &mut detok, prefer_worker_text) {
                         Ok(output) => output,
                         Err(error) => {
+                            if let Some(observer) = &observer {
+                                observer.record_error();
+                            }
                             return (StatusCode::BAD_GATEWAY, error).into_response();
                         }
                     };
@@ -939,6 +1014,9 @@ async fn collect_openai(
                 }
             }
             Err(status) => {
+                if let Some(observer) = &observer {
+                    observer.record_error();
+                }
                 return (
                     StatusCode::BAD_GATEWAY,
                     format!("grpc stream: {}", status.message()),
@@ -948,14 +1026,26 @@ async fn collect_openai(
         }
     }
     if finish.is_none() {
+        if let Some(observer) = &observer {
+            observer.record_error();
+        }
         return (
             StatusCode::BAD_GATEWAY,
             "gRPC stream closed before finish_info",
         )
             .into_response();
     }
+    if let Some(observer) = &observer {
+        observer.record_usage(EngineUsage {
+            prompt_tokens: engine_prompt_tokens.map(|tokens| tokens as usize),
+            completion_tokens: completion_tokens as usize,
+        });
+    }
     abort.disarm();
-    if fail_on_abort && finish.as_deref() == Some("abort") {
+    // Program settlement must see aborts even when this adapter preserves the
+    // regular (non-PD) HTTP response status for compatibility.
+    let succeeded = record_finish_outcome(observer.as_deref(), finish.as_deref());
+    if fail_on_abort && !succeeded {
         warn!(%request_id, "gRPC decode finished aborted");
         return (StatusCode::BAD_GATEWAY, "gRPC decode finished aborted").into_response();
     }
@@ -997,7 +1087,12 @@ fn notify_first_output(
     first_output_seen: &mut bool,
     callback: Option<&FirstOutputCallback>,
 ) {
-    if !*first_output_seen && has_generated_output(msg, text) {
+    let aborted = msg
+        .outputs
+        .as_ref()
+        .and_then(|output| output.finish_info.as_ref())
+        .is_some_and(|finish| finish.finish_reason == FinishReason::Aborted as i32);
+    if !*first_output_seen && !aborted && has_generated_output(msg, text) {
         *first_output_seen = true;
         if let Some(callback) = callback {
             callback();
@@ -1056,6 +1151,7 @@ fn has_generated_output(msg: &super::pb::GenerateResponse, text: &str) -> bool {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::backend::pb::{GenerateResponse, PromptInfo, SequenceOutput};
@@ -1096,6 +1192,31 @@ mod tests {
         notify_first_output(&output, "", &mut first_output_seen, Some(&callback));
         notify_first_output(&output, "", &mut first_output_seen, Some(&callback));
         assert_eq!(decode_started.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn aborted_response_does_not_notify_first_output() {
+        let aborted = GenerateResponse {
+            outputs: Some(SequenceOutput {
+                num_tokens: 1,
+                token_ids: vec![42],
+                finish_info: Some(super::super::pb::FinishInfo {
+                    finish_reason: FinishReason::Aborted as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            prompt_info: None,
+        };
+        let decode_started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let decode_started_callback = decode_started.clone();
+        let callback: FirstOutputCallback = Arc::new(move || {
+            decode_started_callback.fetch_add(1, Ordering::Relaxed);
+        });
+        let mut first_output_seen = false;
+        notify_first_output(&aborted, "", &mut first_output_seen, Some(&callback));
+        assert!(!first_output_seen);
+        assert_eq!(decode_started.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -1180,6 +1301,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
                 answered: true,
             },
+            observer: None,
         }
     }
 
@@ -1193,6 +1315,7 @@ mod tests {
             pulled: pulled.clone(),
         };
         let response = stream_openai(stream, reply_for(Duration::from_millis(200)), 0).await;
+        arm_client_stall(&response);
         tokio::time::sleep(Duration::from_millis(500)).await;
         let after_stall = pulled.load(Ordering::Relaxed);
         assert_eq!(
@@ -1218,6 +1341,7 @@ mod tests {
             pulled: pulled.clone(),
         };
         let response = stream_openai(stream, reply_for(Duration::from_millis(200)), 0).await;
+        arm_client_stall(&response);
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(pulled.load(Ordering::Relaxed), GRPC_SSE_QUEUE_CHUNKS + 1);
 
@@ -1259,6 +1383,7 @@ mod tests {
             pulled: pulled.clone(),
         };
         let response = stream_openai(stream, reply_for(Duration::from_secs(30)), 0).await;
+        arm_client_stall(&response);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("sse body");
@@ -1271,5 +1396,97 @@ mod tests {
         }
         assert!(text.contains("[DONE]"), "{text}");
         assert_eq!(pulled.load(Ordering::Relaxed), total);
+    }
+
+    #[tokio::test]
+    async fn held_response_does_not_stall_before_handoff() {
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let total = 100;
+        let stream = ReadyFrames {
+            left: total,
+            total,
+            pulled: pulled.clone(),
+        };
+        let response = stream_openai(stream, reply_for(Duration::from_millis(200)), 0).await;
+        let failed = response
+            .extensions()
+            .get::<GrpcStreamTask>()
+            .expect("stream task")
+            .failure();
+        tokio::pin!(failed);
+        tokio::select! {
+            _ = &mut failed => panic!("held decode failed before the response was returned"),
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+        }
+        assert_eq!(pulled.load(Ordering::Relaxed), GRPC_SSE_QUEUE_CHUNKS + 1);
+        arm_client_stall(&response);
+        tokio::time::timeout(Duration::from_secs(2), failed)
+            .await
+            .expect("stall after handoff");
+    }
+
+    /// Eight ready frames fill the queue. The next pull stays pending, so
+    /// `GenerateStream` hits `request_timeout` with no free SSE slot.
+    struct FramesThenPending {
+        left: usize,
+        pulled: Arc<AtomicUsize>,
+    }
+
+    impl Stream for FramesThenPending {
+        type Item = Result<GenerateResponse, tonic::Status>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            if this.left == 0 {
+                return Poll::Pending;
+            }
+            let index = GRPC_SSE_QUEUE_CHUNKS - this.left;
+            this.left -= 1;
+            this.pulled.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Some(Ok(token_frame(index, false))))
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_timeout_is_not_replaced_by_a_client_stall() {
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let stream = FramesThenPending {
+            left: GRPC_SSE_QUEUE_CHUNKS,
+            pulled: pulled.clone(),
+        };
+        let started = tokio::time::Instant::now();
+        let response = stream_openai(stream, reply_for(Duration::from_millis(400)), 0).await;
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("sse body");
+        let elapsed = started.elapsed();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "a full queue must not wait a second timeout, elapsed {elapsed:?}: {text}"
+        );
+        assert!(
+            text.contains("gRPC stream exceeded request timeout"),
+            "{text}"
+        );
+        assert!(!text.contains("stopped reading"), "{text}");
+        assert!(!text.contains("[DONE]"), "{text}");
+        for index in 0..GRPC_SSE_QUEUE_CHUNKS {
+            assert!(text.contains(&format!("tok-{index}")), "{text}");
+        }
+    }
+
+    #[test]
+    fn abort_finish_records_an_error_and_fails_the_round() {
+        let observer = EngineOutcomeObserver::default();
+        assert!(!record_finish_outcome(Some(&observer), Some("abort")));
+        assert!(observer.failed());
+
+        let observer = EngineOutcomeObserver::default();
+        assert!(record_finish_outcome(Some(&observer), Some("stop")));
+        assert!(!observer.failed());
+
+        // No observer still reports the aborted round as failed.
+        assert!(!record_finish_outcome(None, Some("abort")));
     }
 }
