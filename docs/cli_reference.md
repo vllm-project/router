@@ -87,7 +87,7 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | `--kv-event-block-size` | `u32` | `16` | `integer` | `16` | KV cache block size in tokens for workers registered through `--kv-event-source`. |
 | `--kv-event-model` | `string` | `unset` | `string` | `unset` | Model id advertised to static KV-event sources; `unset` keeps the served model id. |
 | `--kv-event-strict-recovery` | `flag` | `false` | `flag` | `false` | Require complete worker recovery or a worker KV clear before granting cache credit. Requests remain routable by load while the source is recovering. |
-| `--kv-hybrid-layout` | `std::path::PathBuf` | `unset` | — | — | KV cache layout JSON for colocated or P/D routing, keyed by worker URL. [Setup](load_balancing/kv_aware.md#explicit-layouts). |
+| `--kv-hybrid-layout` | `std::path::PathBuf` | `unset` | — | — | KV cache layout JSON for colocated or P/D routing, keyed by worker URL. [Setup](load_balancing/kv_aware.md#choose-a-layout-configuration). |
 
 The Rust CLI requires worker URLs in regular mode unless service discovery is
 enabled. The Python launcher permits an empty worker list without service

@@ -211,14 +211,7 @@ impl Default for PredictionProfileConfig {
 pub struct PdProgramSchedulingConfig {
     /// Event residency is advisory and never authorizes a warm transfer.
     pub kv_events: bool,
-    /// Accept old Program scheduling configurations without retaining the obsolete value.
-    #[doc(hidden)]
-    #[serde(
-        rename = "kv_hash_mode",
-        skip_serializing,
-        deserialize_with = "discard_kv_hash_mode"
-    )]
-    pub _legacy_kv_hash_mode: (),
+    pub kv_hash_mode: String,
     pub max_prefill_requests_per_target: usize,
     /// Only bounded explicit TTL is supported; otherwise Acting TTL is zero.
     pub explicit_ttl: bool,
@@ -288,15 +281,11 @@ pub struct PdProgramSchedulingConfig {
     pub calibration: Option<crate::program_scheduling::pd_cost::PdCalibration>,
 }
 
-fn discard_kv_hash_mode<'de, D: Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
-    serde::de::IgnoredAny::deserialize(deserializer).map(drop)
-}
-
 impl Default for PdProgramSchedulingConfig {
     fn default() -> Self {
         Self {
             kv_events: false,
-            _legacy_kv_hash_mode: (),
+            kv_hash_mode: "sha256".to_string(),
             max_prefill_requests_per_target: 1,
             explicit_ttl: false,
             exclusive_capacity_accounting: true,
@@ -1086,27 +1075,11 @@ pub enum RoutingMode {
 }
 
 impl RoutingMode {
-    pub fn connection_mode(&self) -> ConnectionMode {
-        let worker_url = match self {
-            Self::Regular { worker_urls } => worker_urls.first(),
-            Self::VllmPrefillDecode {
-                prefill_urls,
-                decode_urls,
-                ..
-            } => prefill_urls
-                .first()
-                .map(|(url, _)| url)
-                .or_else(|| decode_urls.first()),
-            Self::OpenAI { .. } => None,
-        };
-        if worker_url.is_some_and(|url| crate::backend::is_grpc_url(url)) {
-            ConnectionMode::Grpc
-        } else {
-            ConnectionMode::Http
-        }
+    pub fn is_pd_mode(&self) -> bool {
+        matches!(self, RoutingMode::VllmPrefillDecode { .. })
     }
 
-    pub fn is_pd_mode(&self) -> bool {
+    pub fn is_vllm_pd_mode(&self) -> bool {
         matches!(self, RoutingMode::VllmPrefillDecode { .. })
     }
 
@@ -1495,7 +1468,6 @@ impl RouterConfig {
     /// Create a new configuration with mode and policy
     pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
         Self {
-            connection_mode: mode.connection_mode(),
             mode,
             policy,
             ..Default::default()

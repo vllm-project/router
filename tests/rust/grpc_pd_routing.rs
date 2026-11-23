@@ -806,36 +806,10 @@ async fn send_chat_ok(router: &VllmPDRouter) {
 
 #[tokio::test]
 async fn grpc_pd_nixl_push_dispatches_both_legs_once_identity_is_cached() {
-    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
-    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
-        finish_kv_transfer_params: Some(push_kv()),
-        reply_gate: Some(gate.clone()),
-        ..Default::default()
-    })
-    .await;
-    let decode = MockVllmRsServer::spawn().await;
-    let router = pd_router(&prefill, &decode).await;
-    gate.add_permits(1);
-    let warmup = router.route_chat(None, &chat(false), None).await;
-    assert!(warmup.status().is_success());
+    let (prefill, decode, router) = push_pair().await;
 
-    for (index, stream) in [false, true].into_iter().enumerate() {
-        let request = chat(stream);
-        let mut response = Box::pin(router.route_chat(None, &request, None));
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::select! {
-                _ = &mut response => panic!("request returned before held Prefill replied"),
-                _ = async {
-                    while decode.captured().len() < index + 2 {
-                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                    }
-                } => {}
-            }
-        })
-        .await
-        .expect("Decode must be sent while Prefill is still held");
-        gate.add_permits(1);
-        let response = response.await;
+    for stream in [false, false, true] {
+        let response = router.route_chat(None, &chat(stream), None).await;
         assert!(response.status().is_success(), "stream={stream}");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -845,13 +819,19 @@ async fn grpc_pd_nixl_push_dispatches_both_legs_once_identity_is_cached() {
 
     let (p, d) = (prefill.captured(), decode.captured());
     assert_eq!((p.len(), d.len()), (3, 3));
-    for (p, d) in p.iter().zip(&d) {
+    for (i, (p, d)) in p.iter().zip(&d).enumerate() {
         assert!(p.unary);
         assert_eq!(p.request_id, d.request_id);
         assert_eq!(
             d.kv_transfer_params.as_ref(),
             Some(&push_decode_kv(&d.request_id))
         );
+        let gap = d.received_at.unwrap() - p.received_at.unwrap();
+        if i == 0 {
+            assert!(gap >= PREFILL_DELAY, "first request learns the identity");
+        } else {
+            assert!(gap < PREFILL_DELAY / 2, "request {i}: D waited {gap:?}");
+        }
     }
 }
 

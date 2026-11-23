@@ -108,28 +108,6 @@ async fn generate(
     Json(value).into_response()
 }
 
-async fn wait_for_program(router: &VllmPDRouter, predicate: impl Fn(&Value) -> bool) {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let body = router.get_worker_loads().await.into_body();
-            let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-            let value: Value = serde_json::from_slice(&bytes).unwrap();
-            if value["program_scheduling"]["scheduler"]["ranks"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .flat_map(|rank| rank["programs"].as_array().into_iter().flatten())
-                .any(&predicate)
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("program did not reach the expected scheduling state");
-}
-
 async fn wait_calls(mock: &Mock, count: usize) {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while mock.calls.lock().unwrap().len() < count {
@@ -170,10 +148,7 @@ async fn check_prefill_slot(push: bool) {
             .route_completion(None, &req, Some("test"))
             .await
     });
-    wait_for_program(&router, |program| {
-        program["root_program_id"] == "other-task" && program["in_flight_requests"] == 1
-    })
-    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     assert_eq!(
         p.calls.lock().unwrap().len(),
         1,
@@ -400,11 +375,7 @@ async fn no_identity_and_disabled_feature_keep_native_round_robin() {
 
 #[test]
 fn pd_requires_explicit_capacity_and_rejects_unverified_modes() {
-    let valid: ProgramSchedulingConfig =
-        serde_json::from_value(json!({"pd": {"kv_hash_mode": "xxhash_cbor"}})).unwrap();
-    assert!(serde_json::to_value(&valid).unwrap()["pd"]
-        .get("kv_hash_mode")
-        .is_none());
+    let valid: ProgramSchedulingConfig = serde_json::from_value(json!({"pd":{}})).unwrap();
     let mut config = RouterConfig {
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://p:8000".into(), None)],
@@ -421,13 +392,14 @@ fn pd_requires_explicit_capacity_and_rejects_unverified_modes() {
     program.token_capacity_per_dp_rank = Some(100000);
     program.enable_batch_gain_admission = false;
     assert!(ConfigValidator::validate(&config).is_ok());
-    for mutation in 0..3 {
+    for mutation in 0..4 {
         let mut bad = config.clone();
         let program = bad.program_scheduling.as_mut().unwrap();
         match mutation {
             0 => program.binding_only = true,
             1 => program.enable_batch_gain_admission = true,
-            _ => program.pd.max_prefill_requests_per_target = 0,
+            2 => program.pd.max_prefill_requests_per_target = 0,
+            _ => program.pd.kv_hash_mode = "unknown".into(),
         }
         assert!(ConfigValidator::validate(&bad).is_err());
     }
@@ -442,18 +414,26 @@ async fn dropping_decode_body_unblocks_only_the_waiting_turn() {
     let p = mock(true).await;
     let d = mock(false).await;
     let router = Arc::new(router(&p, &d, true).await);
-    let mut streaming = request(true);
-    streaming.stream = true;
     let first = router
-        .route_completion(None, &streaming, Some("test"))
+        .route_completion(None, &request(true), Some("test"))
         .await;
     assert!(first.status().is_success());
-    let mut second = Box::pin(router.route_completion(None, &streaming, Some("test")));
-    assert!(futures_util::poll!(&mut second).is_pending());
+    let second_router = router.clone();
+    let mut second = tokio::spawn(async move {
+        second_router
+            .route_completion(None, &request(true), Some("test"))
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut second)
+            .await
+            .is_err()
+    );
     assert_eq!(p.calls.lock().unwrap().len(), 1);
     drop(first);
-    let second = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), second)
         .await
+        .unwrap()
         .unwrap();
     assert!(second.status().is_success());
     axum::body::to_bytes(second.into_body(), usize::MAX)

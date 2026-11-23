@@ -1,6 +1,5 @@
 //! Explicitly gated, exact-token NIXL multi-turn orchestration.
 //! Metadata is engine-owned and single-use. Neither leases nor cost estimates grant capacity.
-use super::pd_types::bounded_pull_metadata;
 use super::{dp_utils, pd_program_adapter::PdProgramRuntime, program_adapter::ProgramCompletion};
 use crate::config::types::PdProgramSchedulingConfig;
 use crate::core::Worker;
@@ -96,17 +95,13 @@ impl PdWarmRemoteRuntime {
             .store(enabled, std::sync::atomic::Ordering::Release);
     }
     fn refresh_loss(&self) {
-        let mut state = self.state.lock();
-        self.refresh_loss_locked(&mut state);
-    }
-    fn refresh_loss_locked(&self, state: &mut WarmRemoteState) {
         use std::sync::atomic::Ordering;
         if !self.event_tracking.load(Ordering::Acquire) {
             return;
         }
         let current = crate::kv_index::signal_loss_epoch();
         if self.loss_epoch.swap(current, Ordering::AcqRel) != current {
-            Self::invalidate_all_locked(state);
+            self.invalidate_all();
         }
     }
     fn count(&self, key: &'static str) {
@@ -171,9 +166,6 @@ impl PdWarmRemoteRuntime {
     }
     pub fn invalidate_all(&self) {
         let mut s = self.state.lock();
-        Self::invalidate_all_locked(&mut s);
-    }
-    fn invalidate_all_locked(s: &mut WarmRemoteState) {
         s.invalidation_revision = s.invalidation_revision.wrapping_add(1);
         s.candidates.clear();
         s.identities.clear();
@@ -181,9 +173,6 @@ impl PdWarmRemoteRuntime {
     }
     fn revision_for(&self, target: &ProgramTarget) -> (u64, u64, u64) {
         let state = self.state.lock();
-        Self::revision_for_locked(&state, target)
-    }
-    fn revision_for_locked(state: &WarmRemoteState, target: &ProgramTarget) -> (u64, u64, u64) {
         (
             state.invalidation_revision,
             *state
@@ -218,8 +207,8 @@ impl PdWarmRemoteRuntime {
         prompt: &[u32],
         identity: [u8; 32],
     ) -> Option<Candidate> {
+        self.refresh_loss();
         let mut s = self.state.lock();
-        self.refresh_loss_locked(&mut s);
         let c = s.candidates.remove(dispatch.program())?;
         let expiry_ok = c.expires
             > Instant::now()
@@ -375,8 +364,36 @@ fn request_identity(request: &Value) -> [u8; 32] {
     Sha256::digest(serde_json::to_vec(&v).unwrap_or_default()).into()
 }
 fn bounded_metadata(params: &Value, max: usize) -> bool {
-    params.get("transfer_mode").and_then(Value::as_str) == Some("pull")
-        && bounded_pull_metadata(params, max)
+    params.is_object()
+        && serde_json::to_vec(params).is_ok_and(|v| v.len() <= max)
+        && params
+            .get("remote_engine_id")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty() && s.len() <= 256)
+        && params
+            .get("remote_request_id")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty() && s.len() <= 512)
+        && params
+            .get("remote_host")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty() && s.len() <= 256)
+        && params
+            .get("remote_port")
+            .and_then(Value::as_u64)
+            .is_some_and(|p| p > 0 && p <= 65535)
+        && params
+            .get("remote_block_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|groups| {
+                !groups.is_empty()
+                    && groups.len() <= 128
+                    && groups.iter().all(|g| {
+                        g.as_array()
+                            .is_some_and(|ids| ids.iter().all(|id| id.as_u64().is_some()))
+                    })
+            })
+        && params.get("transfer_mode").and_then(Value::as_str) == Some("pull")
 }
 /// Capability probes sit on the turn's hot path; a failed probe safely falls
 /// back to the cold path, so do not stall a turn for the engine-core queue.
@@ -1511,15 +1528,6 @@ impl PdResponseContext {
             return;
         }
         let mut s = self.runtime.state.lock();
-        // A source may have been invalidated while response metadata was
-        // processed. Check the fence while holding the publication lock.
-        self.runtime.refresh_loss_locked(&mut s);
-        if PdWarmRemoteRuntime::revision_for_locked(&s, &self.source) != self.event_revision {
-            *s.counters
-                .entry("incomplete_candidate_discarded")
-                .or_default() += 1;
-            return;
-        }
         s.candidates.retain(|_, c| c.expires > Instant::now());
         // Bound retained prompt-prefix memory, not only the candidate count.
         let token_budget = self.runtime.config.max_candidate_tokens;
@@ -1729,36 +1737,6 @@ mod tests {
         let before = r.revision_for(&target);
         r.invalidate_all();
         assert_ne!(r.revision_for(&target), before);
-    }
-    #[test]
-    fn event_loss_invalidates_warm_candidate_before_claim() {
-        let (runtime, dispatch) = runtime_with_candidate();
-        runtime.set_event_tracking(true);
-        crate::kv_index::record_signal_loss();
-        assert!(runtime.claim(&dispatch, &[1, 2, 3], [7; 32]).is_none());
-        assert!(runtime.state.lock().candidates.is_empty());
-    }
-    #[test]
-    fn event_loss_changes_revision_before_candidate_publication() {
-        let (runtime, dispatch) = runtime_with_candidate();
-        runtime.set_event_tracking(true);
-        let source = runtime
-            .state
-            .lock()
-            .candidates
-            .get(dispatch.program())
-            .unwrap()
-            .source
-            .clone();
-        let old_revision = runtime.revision_for(&source);
-        crate::kv_index::record_signal_loss();
-        let mut state = runtime.state.lock();
-        runtime.refresh_loss_locked(&mut state);
-        assert_ne!(
-            PdWarmRemoteRuntime::revision_for_locked(&state, &source),
-            old_revision
-        );
-        assert!(state.candidates.is_empty());
     }
     #[test]
     fn no_hot_route_from_text_or_client_metadata() {

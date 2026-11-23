@@ -1785,22 +1785,42 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires VLLM_ROUTER_MODEL and a Python environment with vLLM"]
-    async fn vllm_chat_tokenize_matches_python_vllm() {
-        let model = model_dir().expect("set VLLM_ROUTER_MODEL to a model dir with tokenizer.json");
-        for messages in [
-            serde_json::json!([{"role": "user", "content": "hello"}]),
-            serde_json::json!([
-                {"role": "system", "content": "You are a test."},
-                {"role": "user", "content": "ping"}
-            ]),
-        ] {
-            let py_ids = python_vllm_chat_ids(&model, &messages)
-                .expect("run the Python vLLM tokenizer")
-                .expect("Python cannot import vLLM; set PYTHON or VIRTUAL_ENV");
-            let rust_ids = rust_vllm_chat_ids(&model, messages.clone()).await;
-            assert_eq!(rust_ids, py_ids, "messages: {messages}");
-        }
+    async fn vllm_chat_tokenize_matches_python_vllm_user() {
+        let Some(model) = model_dir() else {
+            eprintln!("skip: set VLLM_ROUTER_MODEL to a model dir with tokenizer.json");
+            return;
+        };
+        let messages = serde_json::json!([{"role": "user", "content": "hello"}]);
+        let Some(py_ids) = python_vllm_chat_ids(&model, &messages).expect("python vllm") else {
+            eprintln!("skip: python cannot import vllm (set PYTHON or VIRTUAL_ENV)");
+            return;
+        };
+        let rust_ids = rust_vllm_chat_ids(&model, messages).await;
+        assert_eq!(
+            rust_ids, py_ids,
+            "vllm-chat+vllm-tokenizer must match Python vllm.tokenizers.get_tokenizer"
+        );
+    }
+
+    #[tokio::test]
+    async fn vllm_chat_tokenize_matches_python_vllm_system_user() {
+        let Some(model) = model_dir() else {
+            eprintln!("skip: set VLLM_ROUTER_MODEL to a model dir with tokenizer.json");
+            return;
+        };
+        let messages = serde_json::json!([
+            {"role": "system", "content": "You are a test."},
+            {"role": "user", "content": "ping"}
+        ]);
+        let Some(py_ids) = python_vllm_chat_ids(&model, &messages).expect("python vllm") else {
+            eprintln!("skip: python cannot import vllm (set PYTHON or VIRTUAL_ENV)");
+            return;
+        };
+        let rust_ids = rust_vllm_chat_ids(&model, messages).await;
+        assert_eq!(
+            rust_ids, py_ids,
+            "vllm-chat+vllm-tokenizer must match Python vllm on system+user"
+        );
     }
 
     #[test]

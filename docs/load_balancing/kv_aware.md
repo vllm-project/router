@@ -102,23 +102,9 @@ VLLM_ROUTER_TOKENIZER="$MODEL" vllm-router --host 127.0.0.1 --port 19000 \
 
 ## P/D routing
 
-### Choose a connector
+The examples use GPU workers and `NixlConnector`. Run the same model checkpoint, engine version and connector on both stages. Assign disjoint GPUs with `CUDA_VISIBLE_DEVICES`. For separate hosts, use reachable bind and advertised addresses.
 
-Choose the worker connector from the model and platform. Use the same model checkpoint, engine version and connector on both stages.
-
-| Platform | Models and modes | Worker interface | Worker connector | Router `--kv-connector` |
-| --- | --- | --- | --- | --- |
-| GPU | Qwen3-4B, Qwen3.5-4B, DeepSeek V4 Flash 0731 with DSpark | HTTP | `NixlConnector` | `nixl` |
-| GPU | Qwen3.8-27B MTP with zero hash lookahead, or DSpark | HTTP | `MooncakeConnector` | `mooncake` |
-| Ascend A2 | Qwen3-4B, Qwen3.5-4B, Qwen3.6-27B W8A8, Qwen3.8-27B BF16 with DSpark | HTTP | `MooncakeConnectorV1` | `mooncake` |
-| Ascend A2 | Qwen3.8-27B W8A8 | HTTP; gRPC with MTP | `MooncakeConnectorV1` | `mooncake` |
-| Ascend A2 | Qwen4Exp W4A8 with MTP or off | HTTP | `MooncakeConnectorV2` | `mooncake` |
-
-Use `CONNECTOR=nixl` or `CONNECTOR=mooncake` in the Router terminal. HTTP and gRPC describe the Router-to-worker interface. The connector transfers KV between Prefill and Decode.
-
-### Set worker ports and connector parameters
-
-Start Prefill and Decode in separate terminals. After loading the same recipe in each terminal, assign disjoint devices with `CUDA_VISIBLE_DEVICES` or `ASCEND_RT_VISIBLE_DEVICES`. The examples bind to localhost. For separate hosts, use reachable bind and advertised addresses.
+### Set worker ports and transfer parameters
 
 | Setting | Prefill | Decode |
 | --- | --- | --- |
@@ -127,64 +113,31 @@ Start Prefill and Decode in separate terminals. After loading the same recipe in
 | `LIVE_PORT` and `REPLAY_PORT` | `5557` / `5558` | `5559` / `5560` |
 | Connector role | `kv_producer` | `kv_consumer` |
 | NIXL side-channel port | `5600` | `5601` |
-| Ascend Mooncake `kv_port` | `38352` | `38353` |
 
-Copy the settings for each stage into its terminal, then run the [event setup](#set-the-event-ports) to build `KV_ARGS`. For Ascend, set `TP` from the model recipe and choose `MOONCAKE_CONNECTOR` from the connector table.
+Set each stage's ports and role in its terminal, then run the [event setup](#set-the-event-ports) to build `KV_ARGS`. For Qwen3.5, export `VLLM_SSM_CONV_STATE_LAYOUT=DS` on both stages.
 
 ```bash
 # Prefill terminal
 HTTP_PORT=8000 GRPC_PORT=50051 LIVE_PORT=5557 REPLAY_PORT=5558
-KV_ROLE=kv_producer NIXL_PORT=5600 KV_PORT=38352 ENGINE_ID=prefill-a2
+KV_ROLE=kv_producer NIXL_PORT=5600
 ```
 
 ```bash
 # Decode terminal
 HTTP_PORT=8001 GRPC_PORT=50052 LIVE_PORT=5559 REPLAY_PORT=5560
-KV_ROLE=kv_consumer NIXL_PORT=5601 KV_PORT=38353 ENGINE_ID=decode-a2
+KV_ROLE=kv_consumer NIXL_PORT=5601
 ```
 
-Set `TRANSFER` in each terminal using the connector below.
-
-<details>
-<summary>GPU NIXL</summary>
-
-Set `NIXL_PORT` to the side-channel port for this worker. For Qwen3.5, export `VLLM_SSM_CONV_STATE_LAYOUT=DS` on both stages.
-
 ```bash
+# Both terminals
 export VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1
 export VLLM_NIXL_SIDE_CHANNEL_PORT="$NIXL_PORT"
 TRANSFER=$(printf '{"kv_connector":"NixlConnector","kv_role":"%s"}' "$KV_ROLE")
 ```
 
-</details>
-
-<details>
-<summary>GPU Mooncake</summary>
-
-Install the [Mooncake Transfer Engine for your CUDA version](https://docs.vllm.ai/en/latest/features/mooncake_connector_usage/#installation). Use the same bootstrap port in the Prefill and Router commands.
-
-```bash
-export VLLM_MOONCAKE_BOOTSTRAP_PORT=8998
-TRANSFER=$(printf '{"kv_connector":"MooncakeConnector","kv_role":"%s"}' "$KV_ROLE")
-```
-
-</details>
-
-<details>
-<summary>Ascend Mooncake</summary>
-
-Set `MOONCAKE_CONNECTOR` to the worker connector from the table. Set `KV_PORT` from the port table and assign different `ENGINE_ID` values, such as `prefill-a2` and `decode-a2`. Set `TP` to the recipe's tensor parallel size for each stage. The following config uses DP1 and the same TP on both stages.
-
-```bash
-TRANSFER=$(printf '{"kv_connector":"%s","kv_role":"%s","kv_buffer_device":"npu","engine_id":"%s","kv_port":%s,"kv_load_failure_policy":"fail","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":%s},"decode":{"dp_size":1,"tp_size":%s}}}' \
-  "$MOONCAKE_CONNECTOR" "$KV_ROLE" "$ENGINE_ID" "$KV_PORT" "$TP" "$TP")
-```
-
-</details>
-
 ### HTTP P/D
 
-Run on Prefill first, then Decode, with the port, role and event settings for each stage. Set `LAYOUT_ARGS=(--kv-hybrid-layout layout.json)` when using a [P/D layout](#pd-layout), or `LAYOUT_ARGS=()` for ordinary full-attention discovery. Set `PREFILL_BOOTSTRAP=()` for NIXL and Ascend Mooncake, or `PREFILL_BOOTSTRAP=(8998)` for GPU Mooncake.
+Run the worker command on Prefill first, then Decode. In the Router terminal, set `LAYOUT_ARGS=(--kv-hybrid-layout layout.json)` when using a [P/D layout](#pd-layout), or `LAYOUT_ARGS=()` for ordinary full-attention discovery.
 
 ```bash
 vllm serve "$MODEL" --host 127.0.0.1 --port "$HTTP_PORT" --served-model-name "$SERVED_MODEL" \
@@ -193,28 +146,20 @@ vllm serve "$MODEL" --host 127.0.0.1 --port "$HTTP_PORT" --served-model-name "$S
 
 ```bash
 vllm-router --port 19000 --vllm-pd-disaggregation \
-  --prefill http://127.0.0.1:8000 "${PREFILL_BOOTSTRAP[@]}" --decode http://127.0.0.1:8001 \
-  --prefill-policy kv_aware --decode-policy round_robin --kv-connector "$CONNECTOR" \
+  --prefill http://127.0.0.1:8000 --decode http://127.0.0.1:8001 \
+  --prefill-policy kv_aware --decode-policy round_robin --kv-connector nixl \
   "${LAYOUT_ARGS[@]}"
 ```
 
 ### gRPC P/D
 
-For Ascend A2, use [Qwen3.8 W8A8 MTP](#ascend-a2). Set `MOONCAKE_CONNECTOR=MooncakeConnectorV1` on both workers before building `TRANSFER`. Run the worker command on Prefill first and then Decode with the stage settings above.
-
-```bash
-VLLM_USE_RUST_FRONTEND=1 vllm serve "$MODEL" --host 127.0.0.1 \
-  --port "$HTTP_PORT" --grpc-port "$GRPC_PORT" --served-model-name "$SERVED_MODEL" \
-  --enable-scale-out "${KV_ARGS[@]}" "${MODEL_ARGS[@]}" --kv-transfer-config "$TRANSFER"
-```
-
-Use the same [tokenizer setup as colocated gRPC](#grpc-workers). Save the model's [gRPC P/D layout](#ascend-a2) as `layout.json`.
+Use the [gRPC P/D worker setup](../backend/grpc.md#pd-disaggregation), NIXL settings above and the same [tokenizer setup as colocated gRPC](#grpc-workers). Use gRPC worker URLs as keys if supplying a layout.
 
 ```bash
 VLLM_ROUTER_TOKENIZER="$MODEL" vllm-router --port 19000 --vllm-pd-disaggregation \
   --prefill grpc://127.0.0.1:50051 --decode grpc://127.0.0.1:50052 \
-  --prefill-policy kv_aware --decode-policy round_robin --kv-connector mooncake \
-  --kv-hybrid-layout layout.json
+  --prefill-policy kv_aware --decode-policy round_robin --kv-connector nixl \
+  "${LAYOUT_ARGS[@]}"
 ```
 
 To score Decode reuse as well, set `--decode-policy kv_aware`, enable Decode's events and include its layout when required. For HTTP Decode scoring, supply explicit prompt token IDs. Each gRPC stage uses the token IDs produced by Router. Use one worker interface throughout the P/D pool.
@@ -269,7 +214,7 @@ done
 | --- | --- | --- |
 | Router placement | Router `/metrics` on port `29000`. Look for `vllm_router_kv_placement_lookups_total{result="hit"}`. | Increases on the repeat after events arrive. |
 | Worker local reuse | Worker `/metrics`. Look for `vllm:prefix_cache_hits_total`. With `--enable-prompt-tokens-details` on HTTP, inspect `usage.prompt_tokens_details.cached_tokens`. | Increases on the repeat. For P/D, inspect Prefill. |
-| P/D transfer | Send a fresh prompt. Read Decode's Mooncake completion log or compare its `vllm:nixl_bytes_transferred_sum` counter. | Requests that need remote KV complete a read. |
+| P/D transfer | Send a fresh prompt. Compare Decode's `vllm:nixl_bytes_transferred_sum` counter. | Requests that need remote KV complete a read. |
 | MTP or DSpark | On the worker generating tokens, inspect `vllm:spec_decode_num_draft_tokens_total` or the speculative-decoding log. | Drafted tokens increase during generation. |
 
 ## Model recipes
@@ -297,12 +242,12 @@ Use the [vLLM Ascend A2 image](https://github.com/vllm-project/vllm-ascend/relea
 
 | Checkpoint | Deployment | TP | Max model length | GPU memory utilization flag | Probe tokens | Layout |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| Qwen3-4B | HTTP colocated or Mooncake V1 P/D | 1 | 10240 | 0.80 | 391 | A2 Qwen3 |
-| Qwen3.5-4B | HTTP colocated or Mooncake V1 P/D | 1 | 10240, or 4096 with DSpark | 0.80 | 1927 | A2 Qwen, group size 640. For DSpark use A2 Qwen3.5 DSpark. |
-| [Qwen3.6-27B W8A8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.6-27B-w8a8) | HTTP colocated or Mooncake V1 P/D | 1 | 10240 | 0.80 | 2695 | A2 Qwen, group size 896 |
-| Qwen3.8-27B W8A8 | HTTP colocated or Mooncake V1 P/D. Use the MTP profile for gRPC. | 1 | 10240 | 0.80 | 2695 | A2 Qwen, group size 896 |
-| Qwen3.8-27B BF16 | HTTP colocated or Mooncake V1 P/D with DSpark | 2 | 4096 | 0.80 | 2695 | A2 Qwen3.8 DSpark |
-| [Qwen3.8-Flash-Next W4A8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.8-Flash-Next-w4a8) | HTTP colocated or Mooncake V2 P/D | 2 | 10240 | 0.93 | 4999 colocated, 2695 P/D | A2 Qwen4Exp |
+| Qwen3-4B | HTTP colocated | 1 | 10240 | 0.80 | 391 | A2 Qwen3 |
+| Qwen3.5-4B | HTTP colocated | 1 | 10240, or 4096 with DSpark | 0.80 | 1927 | A2 Qwen, group size 640. For DSpark use A2 Qwen3.5 DSpark. |
+| [Qwen3.6-27B W8A8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.6-27B-w8a8) | HTTP colocated | 1 | 10240 | 0.80 | 2695 | A2 Qwen, group size 896 |
+| Qwen3.8-27B W8A8 | HTTP or gRPC colocated. Use the MTP profile for gRPC. | 1 | 10240 | 0.80 | 2695 | A2 Qwen, group size 896 |
+| Qwen3.8-27B BF16 | HTTP colocated | 2 | 4096 | 0.80 | 2695 | A2 Qwen3.8 DSpark |
+| [Qwen3.8-Flash-Next W4A8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.8-Flash-Next-w4a8) | HTTP colocated | 2 | 10240 | 0.93 | 4999 | A2 Qwen4Exp |
 | DeepSeek-V4-Flash-0731 W8A8 | HTTP colocated | 8 | 65536 | 0.90 | 16401 | A2 V4 Flash |
 
 Set `--tensor-parallel-size`, `--max-model-len` and `--gpu-memory-utilization` from the table.
@@ -311,7 +256,7 @@ Set `--tensor-parallel-size`, `--max-model-len` and `--gpu-memory-utilization` f
 | --- | --- |
 | Qwen3-4B | `--block-size 16`. Use the effective 128-token hash blocks in the layout. |
 | W8A8 or W4A8 checkpoints | `--quantization ascend` |
-| Qwen4Exp | Export `VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ASCEND_PLE_BACKEND=torch`. Use 128 GiB of container shared memory. Add `--trust-remote-code --enable-expert-parallel --mamba-cache-mode align --engram-config '{"cpu_offload":true,"dp_shared_memory":false}'`. For P/D add `--mamba-ssm-cache-dtype bfloat16`. |
+| Qwen4Exp | Export `VLLM_USE_V2_MODEL_RUNNER=1 VLLM_ASCEND_PLE_BACKEND=torch`. Use 128 GiB of container shared memory. Add `--trust-remote-code --enable-expert-parallel --mamba-cache-mode align --engram-config '{"cpu_offload":true,"dp_shared_memory":false}'`. |
 | V4 Flash | Export `HCCL_OP_EXPANSION_MODE=AIV OMP_NUM_THREADS=8 VLLM_ASCEND_ENABLE_FLASHCOMM1=1 VLLM_PREFIX_CACHE_RETENTION_INTERVAL=16384`. Set `HCCL_IF_IP`, `HCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME` and `TP_SOCKET_IFNAME` for the node. Add `--max-num-batched-tokens 8192 --max-num-seqs 4 --enforce-eager --skip-mm-profiling --enable-prompt-tokens-details --enable-expert-parallel --tokenizer-mode deepseek_v4 --block-size 128 --attention_config.indexer_kv_dtype int8 --no-disable-hybrid-kv-cache-manager --prefix-cache-retention-interval 16384 --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":16}'`. |
 
 ### MTP and DSpark
@@ -321,8 +266,8 @@ Pass the JSON below to the worker's `--speculative-config`. Use one mode per wor
 | Worker | Deployment or mode | Speculative config | Hash lookahead tokens | Tail-drop groups |
 | --- | --- | --- | ---: | --- |
 | GPU Qwen3.8 | Colocated, MTP | `{"method":"mtp","num_speculative_tokens":3}` | 1 | Omit |
-| GPU Qwen3.8 | Colocated or Mooncake P/D, MTP | `{"method":"mtp","num_speculative_tokens":3,"disable_lookahead_block_hashes":true}` | 0 | `[3]` |
-| GPU Qwen3.8 or A2 Qwen3.8 BF16 | Colocated or Mooncake P/D, DSpark | `{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.8-27B-speculator.dspark"}` | 0 | `[]` |
+| GPU Qwen3.8 | Zero hash lookahead, MTP | `{"method":"mtp","num_speculative_tokens":3,"disable_lookahead_block_hashes":true}` | 0 | `[3]` |
+| GPU Qwen3.8 or A2 Qwen3.8 BF16 | DSpark | `{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.8-27B-speculator.dspark"}` | 0 | `[]` |
 | GPU V4 Flash | Colocated or NIXL P/D, DSpark | `{"method":"dspark","num_speculative_tokens":4}` | 0 | `[]` |
 | A2 Qwen3.5, Qwen3.6 or Qwen3.8 W8A8 | MTP | `{"method":"mtp","num_speculative_tokens":3}` | 0 | `[]` |
 | A2 Qwen3.5 | DSpark | `{"method":"dspark","num_speculative_tokens":8,"model":"/models/Qwen3.5-4B-DSpark"}` | 0 | `[]` |
@@ -384,7 +329,7 @@ For the Ascend recipes here, use `"hash_seed":"0"` to match the worker's `PYTHON
 | A2 Qwen | Group size from model row | false | 0 Full, 1–3 Mamba, same size on all groups |
 | A2 Qwen3.5 DSpark | 640 | false | 0–1 Full, 2 SWA with window 2048, 3–7 Mamba. All size 640. |
 | A2 Qwen3.8 DSpark | 896 | false | 0–3 Full, 4 SWA with window 2048, 5–14 Mamba. All size 896. |
-| A2 Qwen4Exp | 1664 colocated, 896 P/D | false | 0 Scratch 4 with speculation off, 8 with MTP. 1 Full and 2–5 Mamba (2–6 with MTP), each the hash block size. Set Full `tokens_per_state` to `"1"` and Mamba to `"-1"`. |
+| A2 Qwen4Exp | 1664 | false | 0 Scratch 4 with speculation off, 8 with MTP. 1 Full and 2–5 Mamba (2–6 with MTP), each the hash block size. Set Full `tokens_per_state` to `"1"` and Mamba to `"-1"`. |
 | A2 V4 Flash | 8 | false | 0 Sparse MLA 512 with `"4"`, 1 Sparse MLA 16384 with `"128"`, 2–3 MLA SWA 128 with window 128, 4 MLA SWA 8 with window 8, 5 MLA SWA 32 with window 128. Set `tokens_per_state` to `"1"` on the MLA SWA groups. |
 
 ## CLI options

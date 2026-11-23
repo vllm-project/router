@@ -267,12 +267,12 @@ class RouterArgs:
             default=None,
             help="Shared model identity for workers with static event sources",
         )
+        # PD-specific arguments
         parser.add_argument(
             f"--{prefix}kv-event-strict-recovery",
             action="store_true",
             help="Require authoritative full KV event recovery before restoring credit",
         )
-        # PD-specific arguments
         parser.add_argument(
             f"--{prefix}pd-kv-events",
             action="append",

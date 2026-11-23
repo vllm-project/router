@@ -709,7 +709,9 @@ impl ConfigValidator {
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
         if let Some(program) = &config.program_scheduling {
             let pd_mode = matches!(config.mode, RoutingMode::VllmPrefillDecode { .. });
-            if !matches!(config.mode, RoutingMode::Regular { .. }) && !pd_mode {
+            if (!matches!(config.mode, RoutingMode::Regular { .. }) && !pd_mode)
+                || (pd_mode && config.connection_mode != ConnectionMode::Http)
+            {
                 return Err(ConfigError::IncompatibleConfig {
                     reason: "Program scheduling requires regular HTTP mode or vLLM PD HTTP mode"
                         .to_string(),
@@ -756,10 +758,14 @@ impl ConfigValidator {
                     || program.enable_batch_gain_admission
                     || program.token_capacity_per_dp_rank.is_none()
                     || program.pd.max_prefill_requests_per_target == 0
-                    || program.pd.max_prefill_requests_per_target > u32::MAX as usize)
+                    || program.pd.max_prefill_requests_per_target > u32::MAX as usize
+                    || !matches!(
+                        program.pd.kv_hash_mode.as_str(),
+                        "sha256" | "python_hash_seed" | "xxhash_cbor"
+                    ))
             {
                 return Err(ConfigError::IncompatibleConfig {
-                    reason: "PD scheduling requires per-rank capacity and positive bounded P concurrency. Binding-only mode and uncalibrated batch gain are unsupported".to_string(),
+                    reason: "PD scheduling requires per-rank capacity, positive bounded P concurrency and a known KV hash mode; binding_only and uncalibrated batch gain are unsupported".to_string(),
                 });
             }
         }
@@ -880,27 +886,6 @@ impl ConfigValidator {
 
         // DP-aware routing is now automatically enabled when data_parallel_size > 1
         // and is compatible with service discovery
-
-        // `base@rank` in --worker-urls is a per-rank address, not a URL: a
-        // worker is created per rank only by intra-node DP. Treating it as a
-        // plain URL silently requests `http://0.0.0.0/...` because `@rank`
-        // parses as URL userinfo, so refuse it instead.
-        if config.intra_node_data_parallel_size == 1 {
-            if let RoutingMode::Regular { worker_urls } = &config.mode {
-                if let Some(url) = worker_urls.iter().find(|url| {
-                    crate::kv_index::source::discovery::split_worker_rank(url)
-                        .1
-                        .is_some()
-                }) {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: format!(
-                            "worker URL '{url}' pins a data-parallel rank; declare the base URL \
-                             and set --intra-node-data-parallel-size to the number of ranks"
-                        ),
-                    });
-                }
-            }
-        }
 
         // MoRI-IO requires service discovery: ZMQ addresses are obtained via instance
         // registration and are not available in direct URL mode.
@@ -1187,29 +1172,6 @@ mod tests {
     }
 
     #[test]
-    fn rank_pinned_worker_url_requires_data_parallel_size() {
-        for scheme in ["http", "grpc"] {
-            let mut config = RouterConfig::new(
-                RoutingMode::Regular {
-                    worker_urls: vec![format!("{scheme}://worker:8000@1")],
-                },
-                PolicyConfig::Random,
-            );
-            let error = ConfigValidator::validate(&config).unwrap_err();
-            assert!(
-                error.to_string().contains("pins a data-parallel rank"),
-                "{error}"
-            );
-
-            config.intra_node_data_parallel_size = 2;
-            config.mode = RoutingMode::Regular {
-                worker_urls: vec![format!("{scheme}://worker:8000")],
-            };
-            assert!(ConfigValidator::validate(&config).is_ok());
-        }
-    }
-
-    #[test]
     fn test_validate_program_scheduling_boundaries() {
         let valid = ProgramSchedulingConfig::default();
         assert!(ConfigValidator::validate_program_scheduling(&valid).is_ok());
@@ -1387,13 +1349,12 @@ mod tests {
             RoutingMode::Regular {
                 worker_urls: vec![
                     "grpc://worker:50051".to_string(),
-                    "grpc://worker:50052".to_string(),
+                    "grpc://worker:50052@0".to_string(),
                 ],
             },
             PolicyConfig::Random,
         );
 
-        assert_eq!(config.connection_mode, ConnectionMode::Grpc);
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 

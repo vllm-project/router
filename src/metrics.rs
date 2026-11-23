@@ -320,10 +320,6 @@ pub fn init_metrics() {
             "vllm_router_pd_decode_commit_total",
             "Decode commitment outcomes after Prefill",
         ),
-        (
-            "vllm_router_pd_body_over_limit_total",
-            "P/D stage responses that exceeded the Router buffer limit",
-        ),
     ] {
         describe_counter!(name, help);
     }

@@ -247,8 +247,7 @@ proto media fields and adding parity tests against vLLM HTTP behavior.
 
 ## P/D Disaggregation
 
-`--vllm-pd-disaggregation` accepts static all-`grpc://` prefill and decode pools
-for `/v1/chat/completions` and flat token-ID `/v1/completions` requests.
+`--vllm-pd-disaggregation` accepts all-`grpc://` prefill and decode pools.
 The router sends P a unary one-token `Generate` and D a `GenerateStream`, both
 carrying the connector's JSON in `GenerateRequest.kv.kv_transfer_params`.
 P's `FinishInfo.kv_transfer_params` is handed to D. NIXL push mode runs both

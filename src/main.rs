@@ -3,8 +3,8 @@
 use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
+    CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
+    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
     ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, StaticKvEventSources,
     TraceConfig,
 };
@@ -452,7 +452,7 @@ struct CliArgs {
     #[arg(long, default_value_t = false)]
     profile: bool,
 
-    /// KV connector for P/D disaggregation
+    /// KV connector type for PD disaggregation (nixl or mooncake)
     #[arg(long, value_enum, default_value_t = KvConnector::Nixl)]
     kv_connector: KvConnector,
 }
@@ -712,7 +712,7 @@ impl CliArgs {
             host: self.prometheus_host.clone(),
         });
 
-        let connection_mode = mode.connection_mode();
+        let connection_mode = ConnectionMode::Http;
 
         let api_key_validation_urls = if !self.api_key_validation_urls.is_empty() {
             self.api_key_validation_urls.clone()
