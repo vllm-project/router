@@ -146,9 +146,11 @@ impl EcRecorder {
             );
         }
         self.expect_running();
+        // The next check judges only the messages that come after this one.
+        self.seen.clear();
     }
 
-    /// `[EC cancel]`: the control address gets no traffic during `QUIET`.
+    /// `[EC cancel]`: no control traffic since the last check, up to `QUIET` from now.
     async fn expect_no_cancel(&mut self) {
         tokio::time::sleep(QUIET_DURATION).await;
         self.take_new();
