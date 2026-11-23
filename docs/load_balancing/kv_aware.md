@@ -110,28 +110,22 @@ These P/D commands use GPU workers and `NixlConnector`. Use the same checkpoint 
 | --- | --- | --- |
 | Worker HTTP port | `8000` | `8001` |
 | Worker gRPC port, if used | `50051` | `50052` |
-| Connector role | `kv_producer` | `kv_consumer` |
 | NIXL side-channel port | `5600` | `5601` |
 
-Set the ports and transfer role in each stage's terminal. Run the [event setup](#set-the-event-ports) on Prefill. For NIXL Mamba transfers, set `VLLM_SSM_CONV_STATE_LAYOUT=DS` on both stages.
+Prefill supplies the KV cache and Decode reads it. Use the transfer configuration for each stage below. Run the [event setup](#set-the-event-ports) on Prefill. For NIXL Mamba transfers, set `VLLM_SSM_CONV_STATE_LAYOUT=DS` on both stages.
 
 ```bash
 # Prefill terminal
 HTTP_PORT=8000 GRPC_PORT=50051
-KV_ROLE=kv_producer
+TRANSFER='{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'
 ```
 
 ```bash
 # Decode terminal
 HTTP_PORT=8001 GRPC_PORT=50052
-KV_ROLE=kv_consumer
+TRANSFER='{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'
 export VLLM_NIXL_SIDE_CHANNEL_PORT=5601
 KV_ARGS=()
-```
-
-```bash
-# Both terminals
-TRANSFER=$(printf '{"kv_connector":"NixlConnector","kv_role":"%s"}' "$KV_ROLE")
 ```
 
 In the Router terminal, use `LAYOUT_ARGS=(--kv-hybrid-layout layout.json)` when using [hybrid P/D](#hybrid-pd-pairing) or a manual layout and `LAYOUT_ARGS=()` otherwise.
