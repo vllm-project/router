@@ -1,7 +1,7 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
+use super::completion_route::reject_full_report;
 use super::dp_utils;
-use super::kv_event_guard::reject_full_report;
 use super::logprobs_merge;
 use super::pd_cached_tokens;
 use super::pd_program_adapter::{self, PdProgramRuntime};

@@ -15,7 +15,7 @@ use crate::protocols::worker_spec::{
     WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse, WorkerInfo, WorkerListResponse,
     WorkerStats, WorkerTypeStats,
 };
-use crate::routers::http::kv_event_guard::{is_full_report, reject_full_report};
+use crate::routers::http::completion_route::{is_full_report, reject_full_report};
 use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{

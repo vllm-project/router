@@ -1,5 +1,4 @@
-use super::completion_route::{prepare_completion_route, CompletionRoute};
-use super::kv_event_guard::reject_full_report;
+use super::completion_route::{prepare_completion_route, reject_full_report, CompletionRoute};
 use super::program_adapter::{
     prepare_stream_usage_body, settle_grpc_response, ProgramCompletion, SseUsageStripper, StreamEnd,
 };
