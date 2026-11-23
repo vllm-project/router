@@ -63,8 +63,6 @@ In the Router terminal, use `LAYOUT_ARGS=()` when Router can derive or discover 
 
 #### HTTP workers
 
-The command below accepts token IDs through `/v1/completions`. To score reuse for text and chat prompts, add `--enable-scale-out`. Router then uses the worker's tokenizer and chat template to get the actual prompt tokens.
-
 ```bash
 vllm serve "$MODEL" --host 127.0.0.1 "${KV_ARGS[@]}"
 ```
@@ -132,7 +130,7 @@ In the Router terminal, use `LAYOUT_ARGS=(--kv-hybrid-layout layout.json)` when 
 
 #### HTTP P/D
 
-Run the worker command on Prefill first, then Decode. To score Prefill reuse for text and chat prompts, add `--enable-scale-out` to the Prefill command.
+Run the worker command on Prefill first, then Decode.
 
 ```bash
 vllm serve "$MODEL" --host 127.0.0.1 --port "$HTTP_PORT" \
@@ -188,7 +186,7 @@ If each scored worker reports its layout, the file only needs the Prefill-to-Dec
 
 Save the layout as `layout.json` and pass `--kv-hybrid-layout layout.json`. Use your worker's HTTP or gRPC URL as the key. For hybrid P/D, add the [pairing fields](#hybrid-pd-pairing).
 
-Add one `ranks` entry per DP rank to score. Use `rank: 0` for one rank. Set `speculative_tokens: 0` when speculation is off.
+Add one `ranks` entry per DP rank to score. Use `rank: 0` for one rank. Put the cache groups in `groups` and set `speculative_tokens: 0` when speculation is off. For a manual layout with a single full-attention group, add `"declared_groups": 1` to that rank.
 
 Read `kv cache group sizes` in each worker's startup log. Copy each value to `groups[].block_size` in the printed order. For example, `kv cache group sizes (576, 576, 576, 576)` means groups 0 through 3 each use 576-token blocks.
 
@@ -219,45 +217,305 @@ For a manual layout, add only the fields the deployment needs.
 
 ### Model layout reference
 
-Choose the row for your checkpoint and mode when writing a manual layout. The token sizes are examples. Use the worker's actual sizes.
+Expand the profile for your checkpoint and mode, then replace the object inside `ranks` in the [layout template](#layout-template). The array order defines the group IDs. Keep every group, including scratch groups. Use the block sizes from your worker's startup log and the actual group settings for your deployment.
 
-| Group | `kind` | Required fields for this group |
-| --- | --- | --- |
-| Full | `full_attention` |  |
-| Mamba | `mamba` | `"mamba_cache_mode":"align"` |
-| SWA | `sliding_window` | `sliding_window` from the row |
-| MLA SWA | `sliding_window_mla` | `sliding_window` from the row |
-| Sparse MLA | `mla_attention` | `"cache_role":"sparse"` and `tokens_per_state` as a string |
-| Scratch | `scratch` | `"tokens_per_state":"1"` |
+- GPU Qwen3.5-4B, Qwen3.6-27B and Qwen3.8-27B without speculation use the four groups in the layout template.
+- The shared Ascend Qwen example shows 896-token blocks. Replace them with the sizes reported by your worker, such as 640 for Qwen3.5-4B.
+- Set `hash_block_size` to your worker's actual value when Router cannot discover it.
 
-| Platform | Checkpoint or mode | Example hash size (tokens) | Cache groups in index order |
-| --- | --- | ---: | --- |
-| GPU | Qwen3.5-4B, Qwen3.6-27B, Qwen3.8-27B | Worker-reported size | 0–2 Mamba, 3 Full, same size on all groups |
-| GPU | Qwen3.8-27B with DSpark | Worker-reported size | 0–9 Mamba, 10–13 Full, 14 SWA with window 2048 |
-| GPU | Qwen3.8-Flash-Next-FP8 (Qwen4Exp QSA) | 1600 | 0–3 Mamba 1600, 4 Scratch 4, 5 Sparse MLA 1600 with `"4"` |
-| GPU | DeepSeek-V4-Flash-0731 | 4 | 0–1 MLA SWA 64 with window 128, 2 Sparse MLA 256 with `"4"`, 3 MLA SWA 4 with window 8, 4 MLA SWA 8 with window 128 |
-| GPU | DeepSeek-V4-Pro | 4 | 0–1 MLA SWA 64 with window 128, 2 Sparse MLA 256 with `"128"`, 3 MLA SWA 8 with window 128, 4 MLA SWA 4 with window 8 |
-| GPU | DeepSeek-V4.1-Flash (1017) with bounded replay | 128 | 0–4 MLA SWA 32 with window 128, `"prefix_replay_tokens":128`. 5 Sparse MLA 128 with `"2"`, 6 Scratch 8. |
-| Ascend A2 | Qwen3-4B | 128 | 0 Full 128 |
-| Ascend A2 | Qwen3.5-4B, Qwen3.6-27B W8A8, Qwen3.8-27B W8A8 | Worker-reported size | 0 Full, 1–3 Mamba, same size on all groups |
-| Ascend A2 | Qwen3.5-4B with DSpark | Worker-reported size | 0–1 Full, 2 SWA with window 2048, 3–7 Mamba |
-| Ascend A2 | Qwen3.8-27B BF16 with DSpark | Worker-reported size | 0–3 Full, 4 SWA with window 2048, 5–14 Mamba |
-| Ascend A2 | Qwen3.8-Flash-Next W4A8 (Qwen4Exp) | 1664 | 0 Scratch 4 with speculation off, 8 with MTP. 1 Full and 2–5 Mamba (2–6 with MTP), each the hash block size. Set Full `tokens_per_state` to `"1"` and Mamba to `"-1"`. |
-| Ascend A2 | DeepSeek-V4-Flash-0731 W8A8 | 8 | 0 Sparse MLA 512 with `"4"`, 1 Sparse MLA 16384 with `"128"`, 2–3 MLA SWA 128 with window 128, 4 MLA SWA 8 with window 8, 5 MLA SWA 32 with window 128. Set `tokens_per_state` to `"1"` on the MLA SWA groups. |
+<details>
+<summary>GPU · Qwen3.8-27B with MTP and one hash lookahead token</summary>
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 16,
+  "speculative_tokens": 3,
+  "hash_lookahead_tokens": 1,
+  "partial_hash_hits": true,
+  "groups": [
+    {"kind": "mamba", "block_size": 832, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 832, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 832, "mamba_cache_mode": "align"},
+    {"kind": "full_attention", "block_size": 832}
+  ]
+}
+```
+
+</details>
+
+<details>
+<summary>GPU · Qwen3.8-27B with DSpark</summary>
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 16,
+  "speculative_tokens": 8,
+  "hash_lookahead_tokens": 0,
+  "tail_drop_groups": [],
+  "groups": [
+    {"kind": "mamba", "block_size": 832, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 832, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 832, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 832, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 832, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 832, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 832, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 832, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 832, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 832, "mamba_cache_mode": "align"},
+    {"kind": "full_attention", "block_size": 832},
+    {"kind": "full_attention", "block_size": 832},
+    {"kind": "full_attention", "block_size": 832},
+    {"kind": "full_attention", "block_size": 832},
+    {"kind": "sliding_window", "block_size": 832, "sliding_window": 2048}
+  ]
+}
+```
+
+</details>
+
+<details>
+<summary>GPU · Qwen3.8-Flash-Next-FP8 (Qwen4Exp QSA)</summary>
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 1600,
+  "speculative_tokens": 0,
+  "groups": [
+    {"kind": "mamba", "block_size": 1600, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 1600, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 1600, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 1600, "mamba_cache_mode": "align"},
+    {"kind": "scratch", "block_size": 4, "tokens_per_state": "1"},
+    {"kind": "mla_attention", "block_size": 1600, "cache_role": "sparse", "tokens_per_state": "4"}
+  ]
+}
+```
+
+</details>
+
+<details>
+<summary>GPU · DeepSeek-V4-Flash-0731</summary>
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 4,
+  "speculative_tokens": 0,
+  "groups": [
+    {"kind": "sliding_window_mla", "block_size": 64, "sliding_window": 128},
+    {"kind": "sliding_window_mla", "block_size": 64, "sliding_window": 128},
+    {"kind": "mla_attention", "block_size": 256, "cache_role": "sparse", "tokens_per_state": "4"},
+    {"kind": "sliding_window_mla", "block_size": 4, "sliding_window": 8},
+    {"kind": "sliding_window_mla", "block_size": 8, "sliding_window": 128}
+  ]
+}
+```
+
+</details>
+
+<details>
+<summary>GPU · DeepSeek-V4-Pro</summary>
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 4,
+  "speculative_tokens": 0,
+  "groups": [
+    {"kind": "sliding_window_mla", "block_size": 64, "sliding_window": 128},
+    {"kind": "sliding_window_mla", "block_size": 64, "sliding_window": 128},
+    {"kind": "mla_attention", "block_size": 256, "cache_role": "sparse", "tokens_per_state": "128"},
+    {"kind": "sliding_window_mla", "block_size": 8, "sliding_window": 128},
+    {"kind": "sliding_window_mla", "block_size": 4, "sliding_window": 8}
+  ]
+}
+```
+
+</details>
+
+<details>
+<summary>GPU · DeepSeek-V4.1-Flash (1017) with bounded replay</summary>
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 128,
+  "speculative_tokens": 0,
+  "groups": [
+    {"kind": "sliding_window_mla", "block_size": 32, "sliding_window": 128, "prefix_replay_tokens": 128},
+    {"kind": "sliding_window_mla", "block_size": 32, "sliding_window": 128, "prefix_replay_tokens": 128},
+    {"kind": "sliding_window_mla", "block_size": 32, "sliding_window": 128, "prefix_replay_tokens": 128},
+    {"kind": "sliding_window_mla", "block_size": 32, "sliding_window": 128, "prefix_replay_tokens": 128},
+    {"kind": "sliding_window_mla", "block_size": 32, "sliding_window": 128, "prefix_replay_tokens": 128},
+    {"kind": "mla_attention", "block_size": 128, "cache_role": "sparse", "tokens_per_state": "2"},
+    {"kind": "scratch", "block_size": 8, "tokens_per_state": "1"}
+  ]
+}
+```
+
+</details>
+
+<details>
+<summary>Ascend A2 · Qwen3-4B, manual full-attention layout</summary>
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 128,
+  "speculative_tokens": 0,
+  "declared_groups": 1,
+  "groups": [
+    {"kind": "full_attention", "block_size": 128}
+  ]
+}
+```
+
+</details>
+
+<details>
+<summary>Ascend A2 · Qwen3.5-4B, Qwen3.6-27B W8A8 and Qwen3.8-27B W8A8</summary>
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 896,
+  "speculative_tokens": 0,
+  "groups": [
+    {"kind": "full_attention", "block_size": 896},
+    {"kind": "mamba", "block_size": 896, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 896, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 896, "mamba_cache_mode": "align"}
+  ]
+}
+```
+
+</details>
+
+<details>
+<summary>Ascend A2 · Qwen3.5-4B with DSpark</summary>
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 640,
+  "speculative_tokens": 8,
+  "hash_lookahead_tokens": 0,
+  "tail_drop_groups": [],
+  "groups": [
+    {"kind": "full_attention", "block_size": 640},
+    {"kind": "full_attention", "block_size": 640},
+    {"kind": "sliding_window", "block_size": 640, "sliding_window": 2048},
+    {"kind": "mamba", "block_size": 640, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 640, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 640, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 640, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 640, "mamba_cache_mode": "align"}
+  ]
+}
+```
+
+</details>
+
+<details>
+<summary>Ascend A2 · Qwen3.8-27B BF16 with DSpark</summary>
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 896,
+  "speculative_tokens": 8,
+  "hash_lookahead_tokens": 0,
+  "tail_drop_groups": [],
+  "groups": [
+    {"kind": "full_attention", "block_size": 896},
+    {"kind": "full_attention", "block_size": 896},
+    {"kind": "full_attention", "block_size": 896},
+    {"kind": "full_attention", "block_size": 896},
+    {"kind": "sliding_window", "block_size": 896, "sliding_window": 2048},
+    {"kind": "mamba", "block_size": 896, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 896, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 896, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 896, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 896, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 896, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 896, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 896, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 896, "mamba_cache_mode": "align"},
+    {"kind": "mamba", "block_size": 896, "mamba_cache_mode": "align"}
+  ]
+}
+```
+
+</details>
+
+<details>
+<summary>Ascend A2 · Qwen3.8-Flash-Next W4A8 (Qwen4Exp) with MTP</summary>
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 1664,
+  "speculative_tokens": 3,
+  "hash_lookahead_tokens": 0,
+  "tail_drop_groups": [],
+  "groups": [
+    {"kind": "scratch", "block_size": 8, "tokens_per_state": "1"},
+    {"kind": "full_attention", "block_size": 1664, "tokens_per_state": "1"},
+    {"kind": "mamba", "block_size": 1664, "mamba_cache_mode": "align", "tokens_per_state": "-1"},
+    {"kind": "mamba", "block_size": 1664, "mamba_cache_mode": "align", "tokens_per_state": "-1"},
+    {"kind": "mamba", "block_size": 1664, "mamba_cache_mode": "align", "tokens_per_state": "-1"},
+    {"kind": "mamba", "block_size": 1664, "mamba_cache_mode": "align", "tokens_per_state": "-1"},
+    {"kind": "mamba", "block_size": 1664, "mamba_cache_mode": "align", "tokens_per_state": "-1"}
+  ]
+}
+```
+
+</details>
+
+<details>
+<summary>Ascend A2 · DeepSeek-V4-Flash-0731 W8A8</summary>
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 8,
+  "speculative_tokens": 0,
+  "groups": [
+    {"kind": "mla_attention", "block_size": 512, "cache_role": "sparse", "tokens_per_state": "4"},
+    {"kind": "mla_attention", "block_size": 16384, "cache_role": "sparse", "tokens_per_state": "128"},
+    {"kind": "sliding_window_mla", "block_size": 128, "sliding_window": 128, "tokens_per_state": "1"},
+    {"kind": "sliding_window_mla", "block_size": 128, "sliding_window": 128, "tokens_per_state": "1"},
+    {"kind": "sliding_window_mla", "block_size": 8, "sliding_window": 8, "tokens_per_state": "1"},
+    {"kind": "sliding_window_mla", "block_size": 32, "sliding_window": 128, "tokens_per_state": "1"}
+  ]
+}
+```
+
+</details>
 
 ### MTP and DSpark
 
-For Qwen3.8-27B W8A8 on Ascend A2 with gRPC, use the MTP profile.
+Use a [model example](#model-layout-reference) that matches the worker's cache groups. Set the fields below next to `rank` and `groups`, replacing any existing values for those fields. Use the worker's `num_speculative_tokens` for `speculative_tokens`.
 
-When a worker runs MTP or DSpark and requires a manual layout, set `speculative_tokens` to the worker's configured count. Match the hash lookahead and tail-drop groups to the worker's runtime. Workers that report their layouts supply these values automatically.
+Use the worker's actual hash lookahead. For zero lookahead, include `tail_drop_groups` even when it is empty. In P/D, configure each scored rank using the rules for its stage. For Qwen3.8-27B W8A8 on Ascend A2 with gRPC, use the MTP profile.
 
-| Worker profile | `hash_lookahead_tokens` | `tail_drop_groups` |
-| --- | ---: | --- |
-| GPU Qwen3.8, MTP with hash lookahead | 1 | Omit |
-| GPU Qwen3.8, MTP with hash lookahead disabled | 0 | `[3]` |
-| GPU Qwen3.8 or V4 Flash, DSpark | 0 | `[]` |
-| Ascend A2 Qwen3.5, Qwen3.6, Qwen3.8 W8A8 or Qwen4Exp, MTP | 0 | `[]` |
-| Ascend A2 Qwen3.5, Qwen3.6, Qwen3.8 BF16 or V4 Flash, DSpark | 0 | `[]` |
+| Worker and mode | Fields in the `ranks[]` object |
+| --- | --- |
+| GPU Qwen3.8, MTP with hash lookahead | `"speculative_tokens":3,"hash_lookahead_tokens":1` |
+| GPU Qwen3.8, MTP with `disable_lookahead_block_hashes` | `"speculative_tokens":3,"hash_lookahead_tokens":0,"tail_drop_groups":[3]` |
+| GPU Qwen3.8, DSpark | `"speculative_tokens":8,"hash_lookahead_tokens":0,"tail_drop_groups":[]` |
+| GPU DeepSeek V4 Flash, DSpark | `"speculative_tokens":4,"hash_lookahead_tokens":0,"tail_drop_groups":[]` |
+| Ascend A2 Qwen3.5, Qwen3.6, Qwen3.8 W8A8 or Qwen4Exp, MTP | `"speculative_tokens":3,"hash_lookahead_tokens":0,"tail_drop_groups":[]` |
+| Ascend A2 Qwen3.5, Qwen3.6 or Qwen3.8 BF16, DSpark | `"speculative_tokens":8,"hash_lookahead_tokens":0,"tail_drop_groups":[]` |
+| Ascend A2 DeepSeek V4 Flash, DSpark | `"speculative_tokens":7,"hash_lookahead_tokens":0,"tail_drop_groups":[]` |
+
+For GPU Qwen3.8 MTP, use the four base groups. With zero hash lookahead, replace the rank fields as shown in the table. With DSpark, copy the full DSpark rank object because the groups change.
+
+For Ascend Qwen4Exp with speculation off, use one Full group and four Mamba groups after scratch. In the example, set scratch `block_size` to `4`, remove the last Mamba group, set `speculative_tokens` to `0`, and omit `hash_lookahead_tokens` and `tail_drop_groups`.
 
 ## Static event endpoints
 
