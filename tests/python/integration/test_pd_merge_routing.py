@@ -174,39 +174,25 @@ def test_merge_cache_aware_prefix_overrides_load(
     rh = _router(router_manager, urls, "cache_aware")
     worker_ids = set(ids)
     cached_prompt = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    busy_prompt = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109]
     other_prompt = [200, 201, 202, 203, 204, 205, 206, 207, 208, 209]
 
     cached = completion(rh.url, cached_prompt, timeout=10)
     assert cached in worker_ids
 
-    holder = threading.Thread(
-        target=completion,
-        args=(rh.url, busy_prompt),
-        kwargs={"timeout": 10},
-        daemon=True,
-    )
-    holder.start()
-    mock_worker_manager.wait_for_load(cached)
-    diverted = completion(rh.url, other_prompt, timeout=10)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        # Replay the cached prefix through the router to reserve its worker.
+        holder = pool.submit(completion, rh.url, cached_prompt, timeout=10)
+        try:
+            mock_worker_manager.wait_for_load(cached)
+            diverted = completion(rh.url, other_prompt, timeout=10)
+            replay = pool.submit(completion, rh.url, cached_prompt, timeout=10)
+            mock_worker_manager.wait_for_load(cached, minimum=2)
+        finally:
+            release.touch()
+        assert holder.result() == cached
+        assert replay.result() == cached
 
-    replay_box = {}
-
-    def replay():
-        replay_box["worker"] = completion(rh.url, cached_prompt, timeout=10)
-
-    replay_thread = threading.Thread(target=replay, daemon=True)
-    replay_thread.start()
-    try:
-        mock_worker_manager.wait_for_load(cached, minimum=2)
-    finally:
-        release.write_text("go")
-    holder.join(timeout=10)
-    replay_thread.join(timeout=10)
-
-    assert diverted in worker_ids and replay_box["worker"] in worker_ids
-    assert diverted != cached, (cached, diverted, replay_box)
-    assert replay_box["worker"] == cached, (cached, diverted, replay_box)
+    assert diverted in worker_ids - {cached}
 
 
 @pytest.mark.integration
