@@ -561,7 +561,7 @@ pub struct PdRouterBase {
     pub worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub client: Client,
-    api_key: Option<String>,
+    api_key: Option<crate::config::WorkerApiKey>,
     pub circuit_breaker_config: CircuitBreakerConfig,
     // Fallback DP size for servers that report no engine metrics
     pub dp_size: usize,
@@ -1359,7 +1359,7 @@ impl PdRouterBase {
             Some(
                 PdKvState::start(
                     ctx.client.clone(),
-                    ctx.router_config.api_key.clone(),
+                    ctx.router_config.api_key.as_deref().map(str::to_owned),
                     ctx.router_config.pd_kv_event_sources.clone(),
                     Arc::clone(&ctx.worker_registry),
                     kv_aware_ops(prefill_policy.as_ref())
@@ -1922,6 +1922,16 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size: 1,
         }
+    }
+
+    #[test]
+    fn pd_router_debug_redacts_worker_api_key() {
+        let mut router = create_test_pd_router();
+        router.api_key = Some("worker-secret".to_owned().into());
+
+        let debug = format!("{router:?}");
+        assert!(!debug.contains("worker-secret"));
+        assert!(debug.contains("api_key: Some([REDACTED])"));
     }
 
     fn create_test_pd_router_with_dp(dp_size: usize) -> PdRouterBase {

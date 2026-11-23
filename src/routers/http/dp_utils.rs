@@ -93,7 +93,7 @@ pub async fn discover_dp_size(
 /// ```
 pub async fn get_dp_aware_workers(
     worker_urls: &[String],
-    _api_key: &Option<String>,
+    _api_key: Option<&str>,
     dp_size: usize,
 ) -> Result<Vec<String>, String> {
     let mut dp_aware_workers: Vec<String> = Vec::new();
@@ -336,7 +336,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_dp_aware_workers_ipv6() {
         let urls = vec!["https://[2a03:83e4:5006:0090:5f5a:f8c5:0400:0000]:20009".to_string()];
-        let result = get_dp_aware_workers(&urls, &None, 4).await.unwrap();
+        let result = get_dp_aware_workers(&urls, None, 4).await.unwrap();
         assert_eq!(result.len(), 4);
         assert_eq!(
             result[0],
