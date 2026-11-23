@@ -24,6 +24,33 @@ class DisconnectUntested(ValueError):
     """The response finished before the client could disconnect it."""
 
 
+def _sse_event(raw):
+    """Return (text, finish_reason, done), or None for a comment/blank line."""
+    line = raw.strip()
+    if not line or line.startswith(b":"):
+        return None
+    if not line.startswith(b"data:"):
+        raise ValueError("unexpected SSE line")
+    data = line[5:].strip()
+    if data == b"[DONE]":
+        return "", None, True
+    event = json.loads(data.decode("utf-8"))
+    if not isinstance(event, dict) or "error" in event:
+        raise ValueError("invalid SSE completion object")
+    choices = event.get("choices")
+    if choices == [] and event.get("usage") is not None:
+        return "", None, False
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise ValueError("invalid SSE choices")
+    choice = choices[0]
+    if not isinstance(choice, dict) or not isinstance(choice.get("text"), str):
+        raise ValueError("invalid SSE text")
+    reason = choice.get("finish_reason")
+    if reason is not None and reason not in ("stop", "length"):
+        raise ValueError("invalid SSE finish_reason")
+    return choice["text"], reason, False
+
+
 def _buffered_sse_completed(buffered, eof, finished=False):
     """Validate complete buffered events and identify a finished response."""
     lines = buffered.split(b"\n")
@@ -32,35 +59,13 @@ def _buffered_sse_completed(buffered, eof, finished=False):
         raise ValueError("truncated buffered SSE line")
     done = False
     for pending in lines:
-        pending = pending.strip()
-        if not pending or pending.startswith(b":"):
+        event = _sse_event(pending)
+        if event is None:
             continue
-        if not pending.startswith(b"data:"):
-            raise ValueError("invalid buffered SSE line")
-        data = pending[5:].strip()
         if done:
             raise ValueError("buffered data after [DONE]")
-        if data == b"[DONE]":
-            done = True
-            continue
-        event = json.loads(data)
-        if not isinstance(event, dict) or "error" in event:
-            raise ValueError("invalid buffered SSE completion")
-        choices = event.get("choices")
-        if choices == [] and event.get("usage") is not None:
-            continue
-        if (
-            not isinstance(choices, list)
-            or len(choices) != 1
-            or not isinstance(choices[0], dict)
-            or not isinstance(choices[0].get("text"), str)
-        ):
-            raise ValueError("invalid buffered SSE choices")
-        reason = choices[0].get("finish_reason")
-        if reason is not None:
-            if reason not in ("stop", "length"):
-                raise ValueError("invalid buffered SSE finish_reason")
-            finished = True
+        _, reason, done = event
+        finished |= reason is not None
     if done and not finished:
         raise ValueError("buffered stream ended without finish_reason")
     if eof and not done:
@@ -84,35 +89,18 @@ async def request(session, url, model, mode, sequence):
         text_seen = False
         finished = False
         async for raw in response.content:
-            line = raw.decode("utf-8").strip()
-            if not line or line.startswith(":"):
+            event = _sse_event(raw)
+            if event is None:
                 continue
-            if not line.startswith("data:"):
-                raise ValueError("unexpected SSE line")
-            data = line[5:].strip()
-            if data == "[DONE]":
+            text, reason, done = event
+            if done:
                 if mode == "disconnect":
                     raise ValueError("stream ended before an active disconnect")
                 if not text_seen or not finished:
                     raise ValueError("stream ended without text and finish_reason")
                 return "completed"
-            chunk = json.loads(data)
-            if not isinstance(chunk, dict) or "error" in chunk:
-                raise ValueError("invalid SSE completion object")
-            choices = chunk.get("choices")
-            if choices == [] and chunk.get("usage") is not None:
-                continue
-            if not isinstance(choices, list) or len(choices) != 1:
-                raise ValueError("invalid SSE choices")
-            choice = choices[0]
-            if not isinstance(choice, dict) or not isinstance(choice.get("text"), str):
-                raise ValueError("invalid SSE text")
-            text_seen |= bool(choice["text"].strip())
-            reason = choice.get("finish_reason")
-            if reason is not None:
-                if reason not in ("stop", "length"):
-                    raise ValueError("invalid SSE finish_reason")
-                finished = True
+            text_seen |= bool(text.strip())
+            finished |= reason is not None
             if mode == "disconnect" and text_seen:
                 # is_eof includes unread buffered bytes, unlike at_eof(). Drain
                 # and validate them before classifying an EOF as normal completion.
@@ -245,7 +233,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--router-url", required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4, 8])
+    parser.add_argument("--concurrency", nargs="+", default=["1", "2", "4", "8"])
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--output", type=Path, required=True)
@@ -255,7 +243,7 @@ def main():
             probe(
                 args.router_url,
                 args.model,
-                args.concurrency,
+                [int(n) for arg in args.concurrency for n in arg.split()],
                 args.rounds,
                 args.timeout,
                 args.output,

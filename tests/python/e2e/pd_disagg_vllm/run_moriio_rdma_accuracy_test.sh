@@ -68,29 +68,6 @@ case "${RUN_PD_LIFECYCLE}" in
   true|false) ;;
   *) echo "ERROR: RUN_PD_LIFECYCLE must be true or false" >&2; exit 2 ;;
 esac
-# These values enter the evaluation shell even when the probe is disabled;
-# accept only bounded integers before interpolating them.
-if ! [[ "${PD_PROBE_CONCURRENCY}" =~ ^[1-9][0-9]?(\ [1-9][0-9]?)*$ ]]; then
-  echo "ERROR: PD_PROBE_CONCURRENCY must be space-separated integers in 1..32" >&2
-  exit 2
-fi
-read -r -a probe_levels <<< "${PD_PROBE_CONCURRENCY}"
-if (( ${#probe_levels[@]} > 8 )); then
-  echo "ERROR: at most eight concurrency levels are allowed" >&2
-  exit 2
-fi
-for level in "${probe_levels[@]}"; do
-  if (( level > 32 )); then
-    echo "ERROR: probe concurrency must not exceed 32" >&2
-    exit 2
-  fi
-done
-if ! [[ "${PD_PROBE_ROUNDS}" =~ ^([1-9]|10)$ ]] ||
-   ! [[ "${PD_PROBE_TIMEOUT}" =~ ^[1-9][0-9]{0,2}$ ]] ||
-   (( PD_PROBE_TIMEOUT > 600 )); then
-  echo "ERROR: probe rounds must be 1..10 and timeout 1..600 seconds" >&2
-  exit 2
-fi
 if [[ "${RUN_PD_LIFECYCLE}" == true ]]; then
   evidence_mode=rw
   if [[ "${SMOKE_ONLY}" == true ]]; then
@@ -364,7 +341,11 @@ python3 tests/python/helpers/completion_validation.py /evidence/smoke-response.j
 if [[ "${SMOKE_ONLY}" == true ]]; then exit 0; fi
 export PIP_ROOT_USER_ACTION=ignore
 export PIP_CACHE_DIR=/root/.cache/pip
-python3 -m pip install --disable-pip-version-check --quiet requests
+if [[ ${RUN_PD_LIFECYCLE} == true ]]; then
+  bash .buildkite/scripts/install_packages.sh pd-lifecycle
+else
+  python3 -m pip install --disable-pip-version-check --quiet requests
+fi
 if [[ ${SKIP_LM_EVAL} != true ]]; then
   python3 -m pip install --disable-pip-version-check --quiet openai 'lm-eval[api]==0.4.12'
 fi
@@ -374,16 +355,15 @@ python3 tests/python/e2e/pd_disagg_vllm/test_pd_accuracy.py \\
   --num-requests ${NUM_SANITY_REQUESTS} \\
   --skip-streaming
 if [[ ${RUN_PD_LIFECYCLE} == true ]]; then
-  python3 -c 'import aiohttp' 2>/dev/null || \\
-    python3 -m pip install --disable-pip-version-check --quiet aiohttp
+  # Probe settings are arguments to this shell, never shell source.
   # Run the probe first intentionally: LM-eval then checks useful recovery load
   # after active disconnects, while a lifecycle failure preserves first cause.
   python3 tests/python/helpers/pd_lifecycle.py \\
     --router-url http://127.0.0.1:${ROUTER_PORT} \\
     --model ${MODEL_NAMES} \\
-    --concurrency ${PD_PROBE_CONCURRENCY} \\
-    --rounds ${PD_PROBE_ROUNDS} \\
-    --timeout ${PD_PROBE_TIMEOUT} \\
+    --concurrency "\$1" \\
+    --rounds "\$2" \\
+    --timeout "\$3" \\
     --output /evidence/pd-lifecycle.json
 fi
 if [[ ${SKIP_LM_EVAL} == true ]]; then exit 0; fi
@@ -410,7 +390,8 @@ docker run --rm \
   -w /workdir \
   --entrypoint bash \
   "${ROCM_VLLM_IMAGE}" \
-  -lc "${EVAL_COMMAND}"
+  -lc "${EVAL_COMMAND}" -- \
+  "${PD_PROBE_CONCURRENCY}" "${PD_PROBE_ROUNDS}" "${PD_PROBE_TIMEOUT}"
 
 if [[ "${SMOKE_ONLY}" == true ]]; then
   echo "MoRI RDMA cross-node smoke passed (read_mode=${MORIIO_READ_MODE})"

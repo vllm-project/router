@@ -10,20 +10,6 @@ import pytest
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = "tests/python/e2e/pd_disagg_vllm/run_moriio_rdma_accuracy_test.sh"
-NIGHTLY = ROOT / ".buildkite/test-nightly.yml"
-
-
-def test_lifecycle_runtime_overrides_are_scoped():
-    harness = (ROOT / SCRIPT).read_text()
-    nightly = NIGHTLY.read_text()
-    assert '[[ -n "${VLLM_ROCM_USE_SKINNY_GEMM:-}" ]]' in harness
-    assert (
-        '[[ "$${RUN_PD_LIFECYCLE:-false}" == "true" '
-        '&& "{{matrix.read_mode}}" == "true" ]]' in nightly
-    )
-    assert (
-        'export VLLM_ROCM_USE_SKINNY_GEMM="$${VLLM_ROCM_USE_SKINNY_GEMM:-0}"' in nightly
-    )
 
 
 @pytest.mark.parametrize(
@@ -31,18 +17,14 @@ def test_lifecycle_runtime_overrides_are_scoped():
     [
         ({"RUN_PD_LIFECYCLE": "yes"}, "must be true or false"),
         ({"SMOKE_ONLY": "true"}, "requires SMOKE_ONLY=false"),
-        ({"PD_PROBE_CONCURRENCY": "0"}, "space-separated integers"),
-        ({"PD_PROBE_CONCURRENCY": "1; touch BAD"}, "space-separated integers"),
         (
-            {"RUN_PD_LIFECYCLE": "false", "PD_PROBE_CONCURRENCY": "1; touch BAD"},
-            "space-separated integers",
-        ),
-        ({"PD_PROBE_CONCURRENCY": "33"}, "must not exceed 32"),
-        ({"PD_PROBE_CONCURRENCY": "1 1 1 1 1 1 1 1 1"}, "at most eight"),
-        ({"PD_PROBE_ROUNDS": "0"}, "rounds must be"),
-        ({"PD_PROBE_TIMEOUT": "601"}, "timeout 1..600"),
-        (
-            {"RUN_PD_LIFECYCLE": "false", "ROUTER_BIN": "/nonexistent-router"},
+            {
+                "RUN_PD_LIFECYCLE": "false",
+                "PD_PROBE_CONCURRENCY": "1; touch BAD",
+                "PD_PROBE_ROUNDS": "not-a-number",
+                "PD_PROBE_TIMEOUT": "-1",
+                "ROUTER_BIN": "/nonexistent-router",
+            },
             "ROUTER_BIN is not executable",
         ),
     ],

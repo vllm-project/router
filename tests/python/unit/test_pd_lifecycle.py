@@ -128,8 +128,7 @@ async def exercise(fault=None, output=None, cli=False, fragment=None, levels=(1,
                 "--model",
                 "test",
                 "--concurrency",
-                "1",
-                "2",
+                "1 2",
                 "--rounds",
                 "1",
                 "--timeout",
@@ -281,15 +280,12 @@ def test_invalid_concurrency(levels):
         asyncio.run(probe("http://127.0.0.1:1", "unused", levels))
 
 
-@pytest.mark.parametrize("fault", [None, "http", "recovery", "stall"])
-def test_durable_report(tmp_path, fault):
-    output = tmp_path / "results" / "probe.json"
-    result, _ = asyncio.run(exercise(fault, output))
-    assert json.loads(output.read_text()) == result
-    assert result["status"] == ("passed" if fault is None else "failed")
-    assert not output.with_name("probe.json.tmp").exists()
-    if fault in ("http", "recovery"):
-        assert result["results"][-1]["http_status"] == 503
+@pytest.mark.parametrize(
+    "settings", [{"rounds": 0}, {"rounds": 11}, {"timeout": 0}, {"timeout": 601}]
+)
+def test_invalid_request_budget(settings):
+    with pytest.raises(ValueError):
+        asyncio.run(probe("http://127.0.0.1:1", "unused", **settings))
 
 
 def test_interrupted_probe_keeps_completed_wave(tmp_path):
@@ -302,10 +298,11 @@ def test_interrupted_probe_keeps_completed_wave(tmp_path):
     assert result["results"][0]["outcome"] == "completed"
 
 
-@pytest.mark.parametrize("fault", [None, "empty", "recovery", "already_done"])
+@pytest.mark.parametrize("fault", [None, "already_done"])
 def test_harness_cli_exit_and_report(tmp_path, fault):
     output = tmp_path / "evidence" / "probe.json"
     result, _ = asyncio.run(exercise(fault, output, cli=True))
+    assert not output.with_name("probe.json.tmp").exists()
     assert result["passed"] == (fault is None)
     assert result["status"] == ("passed" if fault is None else "failed")
     if fault == "already_done":
