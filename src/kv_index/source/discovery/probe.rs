@@ -1,6 +1,6 @@
 //! Read worker model metadata and KV event source endpoints.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use tracing::{info, warn};
@@ -11,7 +11,8 @@ use super::{
     KvEventSourcesResponse, KvIndexSupervisor, SourcesProbe, SourcesUnavailable, WorkerDiscovery,
     CONTROL_TIMEOUT,
 };
-use crate::core::worker::{served_base_model_ids, worker_get};
+use crate::core::worker::worker_get;
+use crate::core::Worker;
 use crate::protocols::worker_spec::ServerInfo;
 
 pub(super) struct RegistrationProbe {
@@ -417,7 +418,7 @@ pub(super) async fn query_worker_metadata_and_models(
 }
 
 /// The control endpoints can report server aliases. A metrics scrape cannot.
-pub(crate) async fn query_worker_control_metadata(
+async fn query_worker_control_metadata(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
@@ -552,6 +553,85 @@ pub(super) async fn query_model_list(
     query_worker_json(client, worker_url, "v1/models", true, api_key)
         .await
         .ok()
+}
+
+/// Base-model names used to distinguish served aliases from LoRA names.
+/// Probe `/v1/models` only when no model-list snapshot was supplied.
+pub(crate) async fn served_model_labels(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+    dp_rank: Option<usize>,
+    base_models: Option<HashSet<String>>,
+) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    if crate::backend::is_grpc_url(worker_url) {
+        return labels;
+    }
+    let timeout = Duration::from_secs(2);
+    let mut aliases: Vec<String> = if let Some(models) = base_models {
+        models.into_iter().collect()
+    } else {
+        let url = format!("{}/v1/models", worker_url.trim_end_matches('/'));
+        let mut probe = worker_get(client, &url, api_key).timeout(timeout);
+        if let Some(rank) = dp_rank {
+            probe = probe.header("X-data-parallel-rank", rank.to_string());
+        }
+        let served = match probe.send().await {
+            Ok(response) if response.status().is_success() => {
+                response.json::<serde_json::Value>().await.ok()
+            }
+            _ => None,
+        };
+        served
+            .as_ref()
+            .into_iter()
+            .flat_map(served_base_model_ids)
+            .map(str::to_owned)
+            .collect()
+    };
+    if let Ok(Ok(info)) = tokio::time::timeout(
+        timeout,
+        query_worker_control_metadata(client, worker_url, api_key),
+    )
+    .await
+    {
+        aliases.extend(info.served_model_aliases);
+    }
+    if !aliases.is_empty() {
+        aliases.sort_unstable();
+        aliases.dedup();
+        labels.insert("served_model_aliases".to_string(), aliases.join(","));
+    }
+    labels
+}
+
+/// Base model IDs in the OpenAI model list. A LoRA entry names its parent.
+fn served_base_model_ids(body: &serde_json::Value) -> impl Iterator<Item = &str> {
+    body.get("data")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.get("parent").is_none_or(serde_json::Value::is_null))
+        .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
+        .filter(|id| !id.trim().is_empty())
+}
+
+/// Names this worker serves as base models: the model it registered plus
+/// the `--served-model-name` aliases the engine reported, when known.
+pub(crate) fn worker_base_model_names(worker: &dyn Worker) -> Vec<&str> {
+    let mut served = vec![worker.model_id()];
+    if let Some(aliases) = worker.metadata().labels.get("served_model_aliases") {
+        served.extend(aliases.split(',').filter(|alias| !alias.is_empty()));
+    }
+    served
+}
+
+/// Whether `name` selects this worker's base model rather than one of its
+/// adapters. vLLM selects an adapter through the request's `model`, and an
+/// adapter name is neither the model id nor a served alias.
+pub(crate) fn worker_serves_base_model(worker: &dyn Worker, name: &str) -> bool {
+    worker_base_model_names(worker).contains(&name)
 }
 
 pub(super) fn base_model_names(models: &serde_json::Value) -> HashSet<String> {

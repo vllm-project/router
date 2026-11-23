@@ -29,17 +29,6 @@ pub(crate) fn worker_get(
     }
 }
 
-/// Base model IDs in the OpenAI model list. A LoRA entry names its parent.
-pub(crate) fn served_base_model_ids(body: &serde_json::Value) -> impl Iterator<Item = &str> {
-    body.get("data")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|entry| entry.get("parent").is_none_or(serde_json::Value::is_null))
-        .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
-        .filter(|id| !id.trim().is_empty())
-}
-
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug {
@@ -201,23 +190,6 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .get("model_id")
             .map(|s| s.as_str())
             .unwrap_or("unknown")
-    }
-
-    /// Names this worker serves as base models: the model it registered plus
-    /// the `--served-model-name` aliases the engine reported, when known.
-    fn served_base_models(&self) -> Vec<&str> {
-        let mut served = vec![self.model_id()];
-        if let Some(aliases) = self.metadata().labels.get("served_model_aliases") {
-            served.extend(aliases.split(',').filter(|alias| !alias.is_empty()));
-        }
-        served
-    }
-
-    /// Whether `name` selects this worker's base model rather than one of its
-    /// adapters. vLLM selects an adapter through the request's `model`, and an
-    /// adapter name is neither the model id nor a served alias.
-    fn serves_base_model(&self, name: &str) -> bool {
-        self.served_base_models().contains(&name)
     }
 
     /// Get the priority of this worker (higher value = higher priority)
@@ -1047,9 +1019,15 @@ mod tests {
             "served_model_aliases".to_string(),
             "alias-a,alias-b".to_string(),
         );
-        assert!(worker.serves_base_model("qwen35"));
-        assert!(worker.serves_base_model("alias-a"));
-        assert!(!worker.serves_base_model("lora1"));
+        assert!(crate::kv_index::discovery::worker_serves_base_model(
+            &worker, "qwen35"
+        ));
+        assert!(crate::kv_index::discovery::worker_serves_base_model(
+            &worker, "alias-a"
+        ));
+        assert!(!crate::kv_index::discovery::worker_serves_base_model(
+            &worker, "lora1"
+        ));
     }
 
     // Test WorkerType
@@ -2095,8 +2073,15 @@ mod tests {
             .with_labels(labels);
 
         assert_eq!(worker.model_id(), "Qwen3.5-4B");
-        assert!(worker.serves_base_model("Qwen3.5-4B"));
-        assert!(worker.serves_base_model("qwen"));
-        assert!(!worker.serves_base_model("lora1"));
+        assert!(crate::kv_index::discovery::worker_serves_base_model(
+            &worker,
+            "Qwen3.5-4B"
+        ));
+        assert!(crate::kv_index::discovery::worker_serves_base_model(
+            &worker, "qwen"
+        ));
+        assert!(!crate::kv_index::discovery::worker_serves_base_model(
+            &worker, "lora1"
+        ));
     }
 }

@@ -62,7 +62,6 @@ pub(super) fn prepare_completion_route(
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
-    use crate::routers::reject_full_report;
     use serde_json::json;
 
     #[test]
@@ -91,22 +90,6 @@ mod tests {
         assert!(prepare_completion_route(&unknown, None)
             .cache_read_fallback
             .is_some());
-    }
-
-    #[test]
-    fn full_report_is_rejected_only_for_monitored_streams() {
-        for (monitored, mode, rejected) in [
-            (true, json!({"kv_cache_report_mode": "full"}), true),
-            (true, json!({"kv_cache_report_mode": "incremental"}), false),
-            (true, json!({}), false),
-            (false, json!({"kv_cache_report_mode": "full"}), false),
-        ] {
-            assert_eq!(
-                reject_full_report(monitored, Some(&mode)).is_some(),
-                rejected
-            );
-        }
-        assert!(reject_full_report(true, None).is_none());
     }
 
     #[test]

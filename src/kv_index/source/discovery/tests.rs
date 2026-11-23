@@ -1932,7 +1932,7 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
                 [&worker],
             with_replay
         );
-        let labels = crate::routers::served_model_labels(
+        let labels = crate::kv_index::discovery::served_model_labels(
             &reqwest::Client::new(),
             &worker,
             None,

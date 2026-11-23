@@ -1,6 +1,7 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
+use super::kv_event_guard::reject_full_report;
 use super::logprobs_merge;
 use super::pd_cached_tokens;
 use super::pd_program_adapter::{self, PdProgramRuntime};
@@ -18,7 +19,7 @@ use crate::policies::{
     kv_aware_ops, AffinityKey, LoadBalancingPolicy, PolicyRegistry, WorkerTokenInputs,
 };
 use crate::program_scheduling::ProgramIdentity;
-use crate::routers::{header_utils, reject_full_report, RouterTrait, WorkerManagement};
+use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
     body::Body,

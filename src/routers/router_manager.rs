@@ -15,7 +15,8 @@ use crate::protocols::worker_spec::{
     WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse, WorkerInfo, WorkerListResponse,
     WorkerStats, WorkerTypeStats,
 };
-use crate::routers::{is_full_report, reject_full_report, RouterTrait, WorkerManagement};
+use crate::routers::http::kv_event_guard::{is_full_report, reject_full_report};
+use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -206,7 +207,7 @@ impl RouterManager {
             || labels.get("policy").is_some_and(|hint| hint == "kv_aware");
         if uses_kv && !labels.contains_key("served_model_aliases") {
             labels.extend(
-                crate::routers::served_model_labels(
+                crate::kv_index::discovery::served_model_labels(
                     &self.client,
                     &config.url,
                     None,
@@ -1045,7 +1046,10 @@ mod tests {
                 .unwrap();
             let worker = registry.get_by_url(&url).unwrap();
             assert_eq!(requests.load(Ordering::Relaxed) > 0, expected_probe);
-            assert_eq!(worker.serves_base_model("base-alias"), expected_probe);
+            assert_eq!(
+                crate::kv_index::discovery::worker_serves_base_model(worker.as_ref(), "base-alias"),
+                expected_probe
+            );
         }
         server.abort();
     }

@@ -1,4 +1,5 @@
 use super::completion_route::{prepare_completion_route, CompletionRoute};
+use super::kv_event_guard::reject_full_report;
 use super::program_adapter::{
     prepare_stream_usage_body, settle_grpc_response, ProgramCompletion, SseUsageStripper, StreamEnd,
 };
@@ -41,7 +42,7 @@ use crate::protocols::spec::{
 use crate::request_identity::{resolve_affinity_identity, IdentityFields};
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
-use crate::routers::{reject_full_report, RouterTrait, WorkerManagement};
+use crate::routers::{RouterTrait, WorkerManagement};
 use crate::token_estimator::{MomentumTokenEstimator, TokenEstimateScope};
 use axum::body::to_bytes;
 use axum::{
@@ -519,7 +520,7 @@ impl Router {
                     .get(&base_url)
                     .filter(|_| dp_rank.is_none())
                     .and_then(|(_, models)| models.clone());
-                crate::routers::served_model_labels(
+                crate::kv_index::discovery::served_model_labels(
                     &ctx.client,
                     &base_url,
                     ctx.router_config.api_key.as_deref(),
@@ -1663,7 +1664,7 @@ impl Router {
         // aliases leaves the identity unclassified.
         (!workers.is_empty()
             && workers.iter().all(|worker| {
-                let served = worker.served_base_models();
+                let served = crate::kv_index::discovery::worker_base_model_names(worker.as_ref());
                 served
                     .iter()
                     .any(|name| !name.is_empty() && *name != UNLABELED_WORKER_MODEL_ID)
@@ -1693,7 +1694,10 @@ impl Router {
         }
         let mut allowed: Vec<_> = workers
             .iter()
-            .map(|worker| model != UNLABELED_WORKER_MODEL_ID && worker.serves_base_model(model))
+            .map(|worker| {
+                model != UNLABELED_WORKER_MODEL_ID
+                    && crate::kv_index::discovery::worker_serves_base_model(worker.as_ref(), model)
+            })
             .collect();
         let missing: Vec<_> = workers
             .iter()
@@ -2888,7 +2892,7 @@ impl Router {
                             let (base_url, dp_rank) = dp_utils::parse_worker_url(dp_url);
                             let policy = self.policy_registry.get_default_policy();
                             let labels = if kv_aware_ops(policy.as_ref()).is_some() {
-                                crate::routers::served_model_labels(
+                                crate::kv_index::discovery::served_model_labels(
                                     &self.client,
                                     &base_url,
                                     self.api_key.as_deref(),
@@ -2952,7 +2956,7 @@ impl Router {
                                 .as_ref()
                                 .filter(|_| dp_rank.is_none())
                                 .and_then(|(_, models)| models.clone());
-                            crate::routers::served_model_labels(
+                            crate::kv_index::discovery::served_model_labels(
                                 &self.client,
                                 worker_url,
                                 self.api_key.as_deref(),
@@ -5172,9 +5176,14 @@ mod tests {
                 }
             }));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let labels =
-            crate::routers::served_model_labels(&Client::new(), worker.url(), None, None, None)
-                .await;
+        let labels = crate::kv_index::discovery::served_model_labels(
+            &Client::new(),
+            worker.url(),
+            None,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(
             labels.get("served_model_aliases"),
             worker.metadata().labels.get("served_model_aliases")
@@ -6411,7 +6420,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let labels = crate::routers::served_model_labels(
+        let labels = crate::kv_index::discovery::served_model_labels(
             &reqwest::Client::new(),
             &url,
             Some("secret"),
@@ -6421,10 +6430,21 @@ mod tests {
         .await;
         let worker = BasicWorker::new(url.clone(), WorkerType::Regular).with_labels(labels);
         assert_eq!(worker.model_id(), "unknown");
-        assert!(worker.serves_base_model("base-model"));
-        assert!(worker.serves_base_model("served-alias"));
-        assert!(worker.serves_base_model("metadata-alias"));
-        assert!(!worker.serves_base_model("adapter"));
+        assert!(crate::kv_index::discovery::worker_serves_base_model(
+            &worker,
+            "base-model"
+        ));
+        assert!(crate::kv_index::discovery::worker_serves_base_model(
+            &worker,
+            "served-alias"
+        ));
+        assert!(crate::kv_index::discovery::worker_serves_base_model(
+            &worker,
+            "metadata-alias"
+        ));
+        assert!(!crate::kv_index::discovery::worker_serves_base_model(
+            &worker, "adapter"
+        ));
 
         let router = create_test_regular_router();
         router.worker_registry.register(Arc::new(worker));
@@ -6434,7 +6454,7 @@ mod tests {
             assert_eq!(router.program_targets_for_model(&pool).len(), 3);
         }
         models_available.store(false, Ordering::Relaxed);
-        let labels = crate::routers::served_model_labels(
+        let labels = crate::kv_index::discovery::served_model_labels(
             &reqwest::Client::new(),
             &url,
             Some("secret"),
@@ -6443,8 +6463,13 @@ mod tests {
         )
         .await;
         let worker = BasicWorker::new(url, WorkerType::Regular).with_labels(labels);
-        assert!(worker.serves_base_model("metadata-alias"));
-        assert!(!worker.serves_base_model("adapter"));
+        assert!(crate::kv_index::discovery::worker_serves_base_model(
+            &worker,
+            "metadata-alias"
+        ));
+        assert!(!crate::kv_index::discovery::worker_serves_base_model(
+            &worker, "adapter"
+        ));
         server.abort();
     }
 
@@ -6471,7 +6496,8 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let labels =
-            crate::routers::served_model_labels(&Client::new(), &url, None, None, None).await;
+            crate::kv_index::discovery::served_model_labels(&Client::new(), &url, None, None, None)
+                .await;
         assert_eq!(labels["served_model_aliases"], "model");
         assert_eq!(requests.load(Ordering::Relaxed), 1);
         server.abort();

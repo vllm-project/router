@@ -5,96 +5,14 @@ use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, StaticKvEventSources,
-    TraceConfig,
+    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
-use vllm_router_rs::kv_index::CacheCapabilities;
+use vllm_router_rs::kv_index::apply_kv_layout_file;
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
 use vllm_router_rs::service_discovery::ServiceDiscoveryConfig;
 
 type PrefillArgs = (String, Option<u16>);
-
-#[derive(serde::Deserialize)]
-struct WorkerKvLayout {
-    #[serde(flatten)]
-    layout: serde_json::Map<String, serde_json::Value>,
-    #[serde(default)]
-    endpoints: Vec<String>,
-    replay_endpoints: Option<Vec<String>>,
-    #[serde(default)]
-    compatible_decode_urls: Vec<String>,
-}
-
-/// Fill defaults for operator-supplied layouts. Worker reports use the strict wire schema.
-fn parse_kv_layout(
-    mut layout: serde_json::Map<String, serde_json::Value>,
-) -> serde_json::Result<CacheCapabilities> {
-    use serde_json::{json, Value};
-
-    layout.entry("schema_version").or_insert(json!(1));
-    if let Some(ranks) = layout.get_mut("ranks").and_then(Value::as_array_mut) {
-        for rank in ranks.iter_mut().filter_map(Value::as_object_mut) {
-            for (field, value) in [
-                ("weight_version", json!("default")),
-                ("instance_topic", json!(true)),
-                ("hash_algorithm", json!("sha256_cbor")),
-                ("full_hashes", json!(true)),
-                ("prefix_caching", json!(true)),
-            ] {
-                rank.entry(field).or_insert(value);
-            }
-            if !rank.contains_key("root_hash") {
-                rank.entry("hash_seed").or_insert(json!("vllm-none-hash"));
-            }
-            if rank.get("speculative_tokens").and_then(Value::as_u64) == Some(0) {
-                rank.entry("hash_lookahead_tokens").or_insert(json!(0));
-            }
-            if let Some(groups) = rank.get_mut("groups").and_then(Value::as_array_mut) {
-                for (idx, group) in groups.iter_mut().enumerate() {
-                    let Some(group) = group.as_object_mut() else {
-                        continue;
-                    };
-                    let kind = group.get("kind").and_then(Value::as_str);
-                    let spec = match kind {
-                        Some("full_attention") => Some("FullAttentionSpec"),
-                        Some("mla_attention") => Some("MLAAttentionSpec"),
-                        Some("sliding_window") => Some("SlidingWindowSpec"),
-                        Some("sliding_window_mla") => Some("SlidingWindowMLASpec"),
-                        Some("mamba") => Some("MambaSpec"),
-                        Some("scratch") => Some("CircularBufferSpec"),
-                        _ => None,
-                    };
-                    let cacheable = kind != Some("scratch")
-                        && group
-                            .get("prefix_replay_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0)
-                            == 0;
-                    if let Some(spec) = spec {
-                        group.entry("spec_type").or_insert(json!(spec));
-                    }
-                    group.entry("group_idx").or_insert(json!(idx));
-                    group.entry("prefix_cacheable").or_insert(json!(cacheable));
-                    group.entry("prefix_replay_tokens").or_insert(json!(0));
-                }
-            }
-        }
-    }
-    serde_json::from_value(Value::Object(layout))
-}
-
-fn read_json_config<T: serde::de::DeserializeOwned>(
-    path: &std::path::Path,
-    description: &str,
-) -> ConfigResult<T> {
-    let data = std::fs::read(path).map_err(|error| ConfigError::ValidationFailed {
-        reason: format!("cannot read {description} {}: {error}", path.display()),
-    })?;
-    serde_json::from_slice(&data).map_err(|error| ConfigError::ValidationFailed {
-        reason: format!("invalid {description} {}: {error}", path.display()),
-    })
-}
 
 fn split_prefill_args_from_others(
     args: impl IntoIterator<Item = String>,
@@ -655,91 +573,12 @@ impl CliArgs {
 
         let mut pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
         if let Some(path) = &self.kv_hybrid_layout {
-            let layouts: HashMap<String, WorkerKvLayout> =
-                read_json_config(path, "KV cache layout")?;
-            for (worker, config) in layouts {
-                let WorkerKvLayout {
-                    layout,
-                    endpoints,
-                    replay_endpoints,
-                    compatible_decode_urls,
-                } = config;
-                let pd = matches!(&mode, RoutingMode::VllmPrefillDecode { .. });
-                let layout: Option<CacheCapabilities> =
-                    if pd && !compatible_decode_urls.is_empty() && layout.is_empty() {
-                        None
-                    } else {
-                        let layout = parse_kv_layout(layout).map_err(|error| {
-                            ConfigError::ValidationFailed {
-                                reason: format!("invalid KV cache layout for '{worker}': {error}"),
-                            }
-                        })?;
-                        if layout.ranks.is_empty() {
-                            return Err(ConfigError::ValidationFailed {
-                                reason: format!(
-                                    "KV cache layout for '{worker}' must declare at least one rank"
-                                ),
-                            });
-                        }
-                        Some(layout)
-                    };
-                let rank = layout.as_ref().and_then(|layout| {
-                    if let Some(rank) = vllm_router_rs::backend::parse_dp_rank(&worker) {
-                        layout.rank_capability(rank)
-                    } else {
-                        layout.ranks.iter().min_by_key(|rank| rank.rank)
-                    }
-                });
-                let block_size = rank
-                    .and_then(|rank| rank.hash_block_size)
-                    .or_else(|| {
-                        layout
-                            .as_ref()?
-                            .ranks
-                            .iter()
-                            .find_map(|rank| rank.hash_block_size)
-                    })
-                    .unwrap_or(16);
-                let model = rank
-                    .map(|rank| rank.model.clone())
-                    .filter(|model| !model.is_empty());
-                if pd {
-                    let source = PdKvEventSources {
-                        endpoints,
-                        replay_endpoints,
-                        block_size,
-                        model,
-                        hybrid: layout,
-                        compatible_decode_urls,
-                    };
-                    if pd_kv_event_sources.insert(worker.clone(), source).is_some() {
-                        return Err(ConfigError::ValidationFailed {
-                            reason: format!("duplicate PD KV event source for '{worker}'"),
-                        });
-                    }
-                } else if let Some(source) = static_kv_event_sources.get_mut(&worker) {
-                    if !endpoints.is_empty() || replay_endpoints.is_some() {
-                        return Err(ConfigError::ValidationFailed {
-                            reason: format!("duplicate KV event endpoints for '{worker}'"),
-                        });
-                    }
-                    source.hybrid = layout;
-                } else {
-                    static_kv_event_sources.insert(
-                        worker,
-                        StaticKvEventSources {
-                            endpoints,
-                            replay_endpoints,
-                            topic: rank
-                                .and_then(|rank| rank.publisher_topic.clone())
-                                .unwrap_or_default(),
-                            block_size,
-                            model: model.unwrap_or_default(),
-                            hybrid: layout,
-                        },
-                    );
-                }
-            }
+            apply_kv_layout_file(
+                path,
+                &mode,
+                &mut static_kv_event_sources,
+                &mut pd_kv_event_sources,
+            )?;
         }
 
         // Main policy
@@ -1076,110 +915,6 @@ mod tests {
                 .validate()
                 .unwrap_or_else(|error| panic!("{section}: {error}"));
         }
-    }
-
-    #[test]
-    fn loads_one_kv_layout_for_both_pd_stages() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("layout.json");
-        for (prefill, decode) in [
-            ("http://prefill:8000", "http://decode:8000"),
-            ("grpc://prefill:50051", "grpc://decode:50051"),
-        ] {
-            let source = |host: &str| {
-                serde_json::json!({
-                    "schema_version": 1,
-                    "endpoints": [format!("tcp://{host}:5557")],
-                    "replay_endpoints": [format!("tcp://{host}:5558")],
-                    "ranks": [{
-                        "rank": 0, "model": "model", "weight_version": "v1",
-                        "publisher_topic": format!("boot-{host}"), "instance_topic": true,
-                        "hash_algorithm": "sha256_cbor", "hash_seed": "0", "full_hashes": true,
-                        "hash_block_size": 16, "hash_lookahead_tokens": 0, "declared_groups": 1,
-                        "speculative_tokens": 0, "prefix_caching": true,
-                        "groups": [{
-                            "group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec",
-                            "block_size": 16, "prefix_cacheable": true, "prefix_replay_tokens": 0
-                        }]
-                    }]
-                })
-            };
-            std::fs::write(
-                &path,
-                serde_json::to_vec(&serde_json::json!({
-                    (prefill): source("prefill"),
-                    (decode): source("decode")
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-            let args = CliArgs::try_parse_from([
-                "vllm-router",
-                "--vllm-pd-disaggregation",
-                "--decode",
-                decode,
-                "--prefill-policy",
-                "kv_aware",
-                "--decode-policy",
-                "kv_aware",
-                "--kv-hybrid-layout",
-                path.to_str().unwrap(),
-            ])
-            .unwrap();
-            let config = args
-                .to_router_config(vec![(prefill.to_owned(), None)])
-                .unwrap();
-            config.validate().unwrap();
-            assert_eq!(config.pd_kv_event_sources.len(), 2);
-            for worker in [prefill, decode] {
-                let source = &config.pd_kv_event_sources[worker];
-                assert_eq!(source.model.as_deref(), Some("model"));
-                assert_eq!(source.block_size, 16);
-                assert!(source.hybrid.is_some());
-            }
-
-            std::fs::write(
-                &path,
-                serde_json::to_vec(&serde_json::json!({
-                    (prefill): {"compatible_decode_urls": [decode]}
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-            let config = args
-                .to_router_config(vec![(prefill.to_owned(), None)])
-                .unwrap();
-            config.validate().unwrap();
-            let source = &config.pd_kv_event_sources[prefill];
-            assert_eq!(source.compatible_decode_urls, [decode]);
-            assert!(source.hybrid.is_none());
-        }
-    }
-
-    #[test]
-    fn rejects_empty_worker_layout_before_creating_a_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("layout.json");
-        std::fs::write(
-            &path,
-            r#"{"http://worker:8000":{"schema_version":1,"ranks":[]}}"#,
-        )
-        .unwrap();
-        let args = CliArgs::try_parse_from([
-            "vllm-router",
-            "--policy",
-            "kv_aware",
-            "--worker-urls",
-            "http://worker:8000",
-            "--kv-hybrid-layout",
-            path.to_str().unwrap(),
-        ])
-        .unwrap();
-        assert!(args
-            .to_router_config(Vec::new())
-            .unwrap_err()
-            .to_string()
-            .contains("http://worker:8000' must declare at least one rank"));
     }
 
     #[test]
