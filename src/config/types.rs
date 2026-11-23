@@ -100,6 +100,12 @@ pub struct RouterConfig {
     /// KV connector type for PD disaggregation
     #[serde(default)]
     pub kv_connector: KvConnector,
+    /// Additional retry budget after an empty deferred Decode commitment.
+    #[serde(default)]
+    pub pd_decode_commit_wait_ms: u64,
+    /// Explicit block ownership after Prefill; unknown never implies a release.
+    #[serde(default)]
+    pub pd_held_kv_mode: PdHeldKvMode,
     /// Optional Program-level admission and continuity scheduling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_scheduling: Option<ProgramSchedulingConfig>,
@@ -979,6 +985,19 @@ pub enum HistoryBackend {
     None,
 }
 
+/// Block ownership after a completed Prefill, configured independently of connector names.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum PdHeldKvMode {
+    #[default]
+    #[value(name = "unknown")]
+    Unknown,
+    #[value(name = "prefill")]
+    Prefill,
+    #[value(name = "transferred")]
+    Transferred,
+}
+
 /// KV connector type for PD disaggregation
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -1447,6 +1466,8 @@ impl Default for RouterConfig {
             profile_timeout_secs: default_profile_timeout_secs(),
             epd: None,
             kv_connector: KvConnector::default(),
+            pd_decode_commit_wait_ms: 0,
+            pd_held_kv_mode: PdHeldKvMode::Unknown,
             program_scheduling: None,
         }
     }
@@ -1591,6 +1612,8 @@ mod tests {
     #[test]
     fn test_router_config_default() {
         let config = RouterConfig::default();
+        assert_eq!(config.pd_decode_commit_wait_ms, 0);
+        assert_eq!(config.pd_held_kv_mode, PdHeldKvMode::Unknown);
 
         assert!(
             matches!(config.mode, RoutingMode::Regular { worker_urls } if worker_urls.is_empty())
@@ -1606,6 +1629,22 @@ mod tests {
         assert!(config.metrics.is_none());
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
+    }
+
+    #[test]
+    fn pd_commit_mitigation_defaults_preserve_old_configs() {
+        let mut json = serde_json::to_value(RouterConfig::default()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("pd_decode_commit_wait_ms");
+        object.remove("pd_held_kv_mode");
+        let restored: RouterConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(restored.pd_decode_commit_wait_ms, 0);
+        assert_eq!(restored.pd_held_kv_mode, PdHeldKvMode::Unknown);
+        json["pd_decode_commit_wait_ms"] = serde_json::json!(50);
+        json["pd_held_kv_mode"] = serde_json::json!("prefill");
+        let restored: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.pd_decode_commit_wait_ms, 50);
+        assert_eq!(restored.pd_held_kv_mode, PdHeldKvMode::Prefill);
     }
 
     #[test]
@@ -2330,6 +2369,8 @@ mod tests {
             profile_timeout_secs: default_profile_timeout_secs(),
             epd: None,
             kv_connector: KvConnector::default(),
+            pd_decode_commit_wait_ms: 0,
+            pd_held_kv_mode: PdHeldKvMode::Unknown,
             program_scheduling: None,
         };
 
@@ -2401,6 +2442,8 @@ mod tests {
             profile_timeout_secs: default_profile_timeout_secs(),
             epd: None,
             kv_connector: KvConnector::default(),
+            pd_decode_commit_wait_ms: 0,
+            pd_held_kv_mode: PdHeldKvMode::Unknown,
             program_scheduling: None,
         };
 
@@ -2468,6 +2511,8 @@ mod tests {
             profile_timeout_secs: default_profile_timeout_secs(),
             epd: None,
             kv_connector: KvConnector::default(),
+            pd_decode_commit_wait_ms: 0,
+            pd_held_kv_mode: PdHeldKvMode::Unknown,
             program_scheduling: None,
         };
 

@@ -18,6 +18,46 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 class TestRouterConfigValidation:
     """Test router configuration validation logic."""
 
+    def test_pd_commit_mitigation_arguments(self):
+        from vllm_router.launch_router import parse_router_args
+
+        args = parse_router_args(
+            [
+                "--pd-decode-commit-wait-ms",
+                "75",
+                "--pd-held-kv-mode",
+                "prefill",
+            ]
+        )
+        assert args.pd_decode_commit_wait_ms == 75
+        assert args.pd_held_kv_mode == "prefill"
+        args._validate_router_args()
+        assert RouterArgs().pd_decode_commit_wait_ms == 0
+        assert RouterArgs().pd_held_kv_mode == "unknown"
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"pd_decode_commit_wait_ms": -1},
+            {"pd_held_kv_mode": "guessed"},
+        ],
+    )
+    def test_pd_commit_mitigation_rejects_invalid_arguments(self, kwargs):
+        with pytest.raises(ValueError):
+            RouterArgs(**kwargs)._validate_router_args()
+
+    def test_pd_commit_mitigation_reaches_rust_binding(self):
+        from vllm_router.router import Router
+
+        # Constructor and conversion paths must agree on the new keyword arguments.
+        router = Router.from_args(
+            RouterArgs(
+                pd_decode_commit_wait_ms=75,
+                pd_held_kv_mode="prefill",
+            )
+        )
+        assert router is not None
+
     def test_valid_basic_config(self):
         """Test that a valid basic configuration passes validation."""
         args = RouterArgs(
