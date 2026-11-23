@@ -339,6 +339,8 @@ steps:
     command: |
       set -euo pipefail
 
+      # Match the artifact glob: no old probe report if download fails early.
+      rm -f -- target/ci-logs/moriio-rdma-*/pd-lifecycle.json{,.tmp}
       bash .buildkite/scripts/install_packages.sh router-bin
 
       export MORIIO_READ_MODE="{{matrix.read_mode}}"
