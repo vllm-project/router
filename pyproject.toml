@@ -30,6 +30,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
+    "PyYAML>=6.0",
     "grpcio-tools>=1.60",
     "grpcio-health-checking>=1.60",
     "pyzmq>=25",

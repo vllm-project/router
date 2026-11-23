@@ -11,6 +11,8 @@ and other platforms must come from ``hardware_test`` or ``hardware_marks`` so
 Rust (``tests/rust/*.rs`` and ``tests/*.rs`` integration crates, and ``src/**/*.rs`` that contain a
 test module): the file must name one Cargo feature tagged ``[ci-level]`` and
 one tagged ``[hardware-platform]`` (currently ``ready`` and ``cpu``).
+Test-only modules, functions and impls in ``src/`` must also carry the
+conditional ``coverage(off)`` marker used by the nightly coverage jobs.
 """
 
 from __future__ import annotations
@@ -39,6 +41,22 @@ _TEST_ITEM_RE = re.compile(
 )
 RUST_INTEGRATION_RE = re.compile(r"^tests/(?:rust/)?[^/]+\.rs$")
 RUST_TEST_CFG_RE = re.compile(r"#\[\s*(?:cfg\(\s*test\b|cfg\(\s*all\(\s*test\b|test\b)")
+_RUST_NON_CODE_RE = re.compile(
+    r'/\*|//[^\n]*|b?r(?P<hashes>\#*)".*?"(?P=hashes)'
+    r'|b?"(?:\\.|[^"\\])*"|b?\'(?:\\.|[^\'\\])\'',
+    re.S,
+)
+_RUST_ATTRIBUTE_RE = re.compile(r"#\[[^\]]*\]", re.S)
+_RUST_ATTRIBUTED_ITEM_RE = re.compile(
+    r"(?P<attributes>(?:#\[[^\]]*\]\s*)+)"
+    r"(?:pub(?:\([^)]*\))?\s+)?"
+    r"(?:(?:async|const|unsafe|extern)\s+)*(?:mod|fn|impl)\b",
+    re.S,
+)
+_RUST_COVERAGE_OFF_RE = re.compile(
+    r"#\[\s*cfg_attr\s*\(\s*coverage_nightly\s*,\s*"
+    r"coverage\s*\(\s*off\s*\)\s*,?\s*\)\s*\]"
+)
 
 MISSING_LEVEL = "Level"
 MISSING_MACHINE = "Machine"
@@ -201,6 +219,68 @@ def _strip_rust_comments(contents: str) -> str:
     return re.sub(r"//.*?$", "", without_blocks, flags=re.M)
 
 
+def _rust_code(contents: str) -> str:
+    """Mask literals and comments, preserving positions for diagnostics."""
+    parts: list[str] = []
+    position = 0
+    while match := _RUST_NON_CODE_RE.search(contents, position):
+        parts.append(contents[position : match.start()])
+        end = match.end()
+        if match.group() == "/*":
+            depth = 1
+            while depth:
+                delimiter = re.search(r"/\*|\*/", contents[end:])
+                if delimiter is None:
+                    end = len(contents)
+                    break
+                depth += 1 if delimiter.group() == "/*" else -1
+                end += delimiter.end()
+        parts.append(_blank_keeping_newlines(contents[match.start() : end]))
+        position = end
+    parts.append(contents[position:])
+    return "".join(parts)
+
+
+def _test_only_cfg(attribute: str) -> bool:
+    match = re.fullmatch(r"#\[\s*cfg\s*\(\s*(.*?)\s*\)\s*\]", attribute, re.S)
+    if match is None:
+        return False
+    expression = match[1].strip()
+    if expression == "test":
+        return True
+    all_args = re.fullmatch(r"all\s*\((.*)\)", expression, re.S)
+    if all_args is None:
+        return False
+    # Only a top-level `test` term makes an all(...) gate test-only.
+    # `not(test)` and `any(test, feature = ...)` can include production code.
+    depth = 0
+    start = 0
+    arguments = all_args[1] + ","
+    for index, char in enumerate(arguments):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            if arguments[start:index].strip() == "test":
+                return True
+            start = index + 1
+    return False
+
+
+def _rust_coverage_problems(contents: str) -> list[str]:
+    code = _rust_code(contents)
+    problems = []
+    for item in _RUST_ATTRIBUTED_ITEM_RE.finditer(code):
+        attributes = _RUST_ATTRIBUTE_RE.findall(item["attributes"])
+        if any(_test_only_cfg(attribute) for attribute in attributes) and not any(
+            _RUST_COVERAGE_OFF_RE.fullmatch(attribute) for attribute in attributes
+        ):
+            line = code.count("\n", 0, item.start()) + 1
+            problems.append(f"missing coverage exclusion at line {line}")
+    return problems
+
+
 def _is_pytest_module(scanned: str) -> bool:
     if "import pytest" in scanned or "pytestmark" in scanned or "@pytest" in scanned:
         return True
@@ -242,14 +322,18 @@ def _is_rust_test(rel: str, contents: str) -> bool:
 
 
 def _rust_problems(rel: str, contents: str) -> list[str]:
+    coverage_problems = (
+        _rust_coverage_problems(contents) if rel.startswith("src/") else []
+    )
     if not _is_rust_test(rel, contents):
-        return []
+        return coverage_problems
     code = _strip_rust_comments(contents)
     missing: list[str] = []
     if not _feature_re(rust_level_features()).search(code):
         missing.append(MISSING_LEVEL)
     if not _feature_re(rust_machine_features()).search(code):
         missing.append(MISSING_MACHINE)
+    missing.extend(coverage_problems)
     return missing
 
 
@@ -289,6 +373,8 @@ def main(argv: list[str]) -> int:
         f"({', '.join(rust_level_features()) or 'none'}) and one machine "
         f"({', '.join(rust_machine_features()) or 'none'}), "
         'for example feature = "ready" and feature = "cpu".\n\n'
+        "Rust src/ test-only modules, functions and impls also need "
+        "#[cfg_attr(coverage_nightly, coverage(off))].\n\n"
         "The following files failed:\n"
         f"{lines}\n\n"
         "To skip: SKIP=check-mark git commit ..."
