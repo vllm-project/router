@@ -1050,3 +1050,109 @@ async fn cold_fallback_returns_503_when_last_prefill_leaves_during_warm_probe() 
         "expected early no-feasible 503 before reserve_prefill, got: {body_text}"
     );
 }
+
+#[tokio::test]
+async fn warm_probe_200_reselects_when_prefill_is_removed_during_probe() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(true, false, true);
+    let (r, registry) =
+        router_with_registry_and_policy(&[&p0, &p1], &d, policy.clone(), false, json!({})).await;
+    let p0_url = p0.url.clone();
+    assert_eq!(registry.get_prefill_workers()[0].url(), p0_url);
+    let reg = registry.clone();
+    *p0.state.on_capability_probe.lock().unwrap() = Some(Arc::new(move || {
+        assert!(reg.remove_by_url(&p0_url).is_some());
+        None
+    }));
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-session-id", HeaderValue::from_static("session-race-200"));
+    let body = completion_body("race-removed-200", &[44, 45, 46], true, false);
+    let (status, _, resp_body) = send_completion(&r, Some(&headers), body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected re-selection after 200 probe race to succeed, got body: {}",
+        String::from_utf8_lossy(&resp_body)
+    );
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert!(p0.state.calls.lock().unwrap().is_empty());
+    assert_eq!(p1.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected initial + bounded re-selection: {calls:?}"
+    );
+    assert_eq!(calls[0], calls[1]);
+}
+
+#[tokio::test]
+async fn warm_probe_200_reselects_when_prefill_becomes_unhealthy_during_probe() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(true, false, true);
+    let (r, registry) =
+        router_with_registry_and_policy(&[&p0, &p1], &d, policy.clone(), false, json!({})).await;
+    let p0_url = p0.url.clone();
+    assert_eq!(registry.get_prefill_workers()[0].url(), p0_url);
+    let reg = registry.clone();
+    *p0.state.on_capability_probe.lock().unwrap() = Some(Arc::new(move || {
+        let worker = reg.get_by_url(&p0_url).expect("prefill worker registered");
+        worker.set_healthy(false);
+        None
+    }));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-session-id",
+        HeaderValue::from_static("session-unhealthy-200"),
+    );
+    let body = completion_body("race-unhealthy-200", &[47, 48, 49], true, false);
+    let (status, _, resp_body) = send_completion(&r, Some(&headers), body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected re-selection when P turned unhealthy with 200 probe, got body: {}",
+        String::from_utf8_lossy(&resp_body)
+    );
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert!(p0.state.calls.lock().unwrap().is_empty());
+    assert_eq!(p1.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected initial + bounded re-selection: {calls:?}"
+    );
+    assert_eq!(calls[0], calls[1]);
+}
+
+#[tokio::test]
+async fn warm_probe_200_returns_no_feasible_when_last_prefill_leaves_during_probe() {
+    let p0 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(false, false, false);
+    let (r, registry) =
+        router_with_registry_and_policy(&[&p0], &d, policy.clone(), false, json!({})).await;
+    let p0_url = p0.url.clone();
+    let reg = registry.clone();
+    *p0.state.on_capability_probe.lock().unwrap() = Some(Arc::new(move || {
+        assert!(reg.remove_by_url(&p0_url).is_some());
+        None
+    }));
+
+    let body = completion_body("race-last-200", &[51, 52, 53], true, false);
+    let (status, _, resp_body) = send_completion(&r, None, body).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert!(p0.state.calls.lock().unwrap().is_empty());
+    let body_text = String::from_utf8_lossy(&resp_body);
+    assert!(
+        body_text.contains("No feasible registered P/D pair"),
+        "expected early no-feasible 503 instead of stale epoch error, got: {body_text}"
+    );
+}
