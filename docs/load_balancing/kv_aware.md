@@ -20,7 +20,7 @@ Use the [model layout reference](#model-layout-reference) to choose a layout for
 | --- | --- |
 | Ordinary single-group full attention with event discovery, the default hash seed, and no sliding window or speculation | Worker URLs. Router derives the single-group layout and checks the hash contract against worker events. |
 | Colocated worker that reports its complete layout | Worker URLs. Router discovers the layout and event addresses. |
-| Hybrid P/D with worker-reported layouts | Worker URLs and a [pairing-only file](#pd-layout). |
+| Hybrid P/D with worker-reported layouts | Worker URLs and a [pairing-only file](#hybrid-pd-pairing). |
 | Worker with event discovery that needs a layout declaration | A [layout file](#layout-template) for the missing group and hash information. Router discovers the served model, publisher topic and event addresses. Add Prefill-to-Decode pairs for hybrid P/D. |
 | Worker without event discovery, such as stock HTTP vLLM 0.30.0 | [Static event addresses and a layout](#static-event-endpoints). |
 
@@ -134,7 +134,7 @@ KV_ARGS=()
 TRANSFER=$(printf '{"kv_connector":"NixlConnector","kv_role":"%s"}' "$KV_ROLE")
 ```
 
-In the Router terminal, use `LAYOUT_ARGS=(--kv-hybrid-layout layout.json)` when a [P/D layout](#pd-layout) is required and `LAYOUT_ARGS=()` otherwise.
+In the Router terminal, use `LAYOUT_ARGS=(--kv-hybrid-layout layout.json)` when using [hybrid P/D](#hybrid-pd-pairing) or a manual layout and `LAYOUT_ARGS=()` otherwise.
 
 #### HTTP P/D
 
@@ -170,11 +170,11 @@ vllm-router --vllm-pd-disaggregation \
 
 For KV-aware Decode, add `--decode-policy kv_aware` and run the event setup on Decode with separate ports. Include its layout if needed. HTTP Decode scoring requires explicit prompt token IDs.
 
-#### P/D layout
+#### Hybrid P/D pairing
 
-For hybrid P/D, list the Decode workers that can receive KV from each Prefill. Add a [layout declaration](#layout-template) for each scored worker that needs one.
+`--prefill` and `--decode` register the worker pools. For hybrid KV transfer, add `compatible_decode_urls` under each Prefill URL in the file passed to `--kv-hybrid-layout`. Router selects only the declared pairs. Use the worker URLs from the command, without DP-rank suffixes.
 
-Use the same worker URL as the Router command, without a DP-rank suffix. Leave Program scheduling disabled for hybrid P/D layouts.
+If a scored worker cannot report its cache layout, add its [cache groups](#layout-template) to the same file. Leave Program scheduling disabled for hybrid P/D.
 
 If each scored worker reports its layout, the file only needs the Prefill-to-Decode pairs.
 
@@ -192,7 +192,7 @@ If each scored worker reports its layout, the file only needs the Prefill-to-Dec
 
 ### Layout template
 
-Save the layout as `layout.json` and pass `--kv-hybrid-layout layout.json`. Use your worker's HTTP or gRPC URL as the key. For hybrid P/D, add the [pairing fields](#pd-layout).
+Save the layout as `layout.json` and pass `--kv-hybrid-layout layout.json`. Use your worker's HTTP or gRPC URL as the key. For hybrid P/D, add the [pairing fields](#hybrid-pd-pairing).
 
 Add one `ranks` entry per DP rank to score. Use `rank: 0` for one rank. Set `speculative_tokens: 0` when speculation is off.
 
@@ -225,29 +225,7 @@ For a manual layout, add only the fields the deployment needs.
 
 ### Model layout reference
 
-Use these profiles for the group types and order in a manual layout. Check the [version table](#versions) for worker compatibility. vLLM chooses cache block sizes for each deployment, and the same checkpoint can use different sizes on different workers.
-
-| Platform | Checkpoint | Layout |
-| --- | --- | --- |
-| GPU | Qwen3-4B-Instruct-2507 | Automatic for single-group full attention |
-| GPU | Qwen3.5-4B | GPU Qwen |
-| GPU | Qwen3.6-27B | GPU Qwen |
-| GPU | Qwen3.8-27B | GPU Qwen |
-| GPU | Qwen3.8-27B with DSpark | GPU Qwen3.8 DSpark |
-| GPU | Qwen3.8-Flash-Next-FP8 (Qwen4Exp QSA) | GPU Qwen4Exp |
-| GPU | DeepSeek-V4-Flash-0731 | GPU V4 Flash |
-| GPU | DeepSeek-V4-Pro | GPU V4 Pro |
-| GPU | DeepSeek-V4.1-Flash (1017) | GPU V4.1 Flash with bounded replay |
-| Ascend A2 | Qwen3-4B | A2 Qwen3 |
-| Ascend A2 | Qwen3.5-4B | A2 Qwen |
-| Ascend A2 | Qwen3.5-4B with DSpark | A2 Qwen3.5 DSpark |
-| Ascend A2 | Qwen3.6-27B W8A8 | A2 Qwen |
-| Ascend A2 | Qwen3.8-27B W8A8 | A2 Qwen. Use the MTP profile for gRPC. |
-| Ascend A2 | Qwen3.8-27B BF16 with DSpark | A2 Qwen3.8 DSpark |
-| Ascend A2 | Qwen3.8-Flash-Next W4A8 | A2 Qwen4Exp |
-| Ascend A2 | DeepSeek-V4-Flash-0731 W8A8 | A2 V4 Flash |
-
-The token sizes below are examples. Use the worker's actual group and hash block sizes.
+Choose the row for your checkpoint and mode when writing a manual layout. The token sizes are examples. Use the worker's actual sizes.
 
 | Group | `kind` | Required fields for this group |
 | --- | --- | --- |
@@ -258,22 +236,24 @@ The token sizes below are examples. Use the worker's actual group and hash block
 | Sparse MLA | `mla_attention` | `"cache_role":"sparse"` and `tokens_per_state` as a string |
 | Scratch | `scratch` | `"tokens_per_state":"1"` |
 
-| Layout | Hash size (tokens) | Groups in index order, with block size and extra values |
-| --- | ---: | --- |
-| GPU Qwen | Worker-reported size | 0–2 Mamba, 3 Full, same size on all groups |
-| GPU Qwen3.8 DSpark | Worker-reported size | 0–9 Mamba, 10–13 Full, 14 SWA with window 2048 |
-| GPU Qwen4Exp | 1600 | 0–3 Mamba 1600, 4 Scratch 4, 5 Sparse MLA 1600 with `"4"` |
-| GPU V4 Flash | 4 | 0–1 MLA SWA 64 with window 128, 2 Sparse MLA 256 with `"4"`, 3 MLA SWA 4 with window 8, 4 MLA SWA 8 with window 128 |
-| GPU V4 Pro | 4 | 0–1 MLA SWA 64 with window 128, 2 Sparse MLA 256 with `"128"`, 3 MLA SWA 8 with window 128, 4 MLA SWA 4 with window 8 |
-| GPU V4.1 Flash | 128 | 0–4 MLA SWA 32 with window 128, `"prefix_replay_tokens":128`. 5 Sparse MLA 128 with `"2"`, 6 Scratch 8. |
-| A2 Qwen3 | 128 | 0 Full 128 |
-| A2 Qwen | Worker-reported size | 0 Full, 1–3 Mamba, same size on all groups |
-| A2 Qwen3.5 DSpark | Worker-reported size | 0–1 Full, 2 SWA with window 2048, 3–7 Mamba |
-| A2 Qwen3.8 DSpark | Worker-reported size | 0–3 Full, 4 SWA with window 2048, 5–14 Mamba |
-| A2 Qwen4Exp | 1664 | 0 Scratch 4 with speculation off, 8 with MTP. 1 Full and 2–5 Mamba (2–6 with MTP), each the hash block size. Set Full `tokens_per_state` to `"1"` and Mamba to `"-1"`. |
-| A2 V4 Flash | 8 | 0 Sparse MLA 512 with `"4"`, 1 Sparse MLA 16384 with `"128"`, 2–3 MLA SWA 128 with window 128, 4 MLA SWA 8 with window 8, 5 MLA SWA 32 with window 128. Set `tokens_per_state` to `"1"` on the MLA SWA groups. |
+| Platform | Checkpoint or mode | Example hash size (tokens) | Cache groups in index order |
+| --- | --- | ---: | --- |
+| GPU | Qwen3.5-4B, Qwen3.6-27B, Qwen3.8-27B | Worker-reported size | 0–2 Mamba, 3 Full, same size on all groups |
+| GPU | Qwen3.8-27B with DSpark | Worker-reported size | 0–9 Mamba, 10–13 Full, 14 SWA with window 2048 |
+| GPU | Qwen3.8-Flash-Next-FP8 (Qwen4Exp QSA) | 1600 | 0–3 Mamba 1600, 4 Scratch 4, 5 Sparse MLA 1600 with `"4"` |
+| GPU | DeepSeek-V4-Flash-0731 | 4 | 0–1 MLA SWA 64 with window 128, 2 Sparse MLA 256 with `"4"`, 3 MLA SWA 4 with window 8, 4 MLA SWA 8 with window 128 |
+| GPU | DeepSeek-V4-Pro | 4 | 0–1 MLA SWA 64 with window 128, 2 Sparse MLA 256 with `"128"`, 3 MLA SWA 8 with window 128, 4 MLA SWA 4 with window 8 |
+| GPU | DeepSeek-V4.1-Flash (1017) with bounded replay | 128 | 0–4 MLA SWA 32 with window 128, `"prefix_replay_tokens":128`. 5 Sparse MLA 128 with `"2"`, 6 Scratch 8. |
+| Ascend A2 | Qwen3-4B | 128 | 0 Full 128 |
+| Ascend A2 | Qwen3.5-4B, Qwen3.6-27B W8A8, Qwen3.8-27B W8A8 | Worker-reported size | 0 Full, 1–3 Mamba, same size on all groups |
+| Ascend A2 | Qwen3.5-4B with DSpark | Worker-reported size | 0–1 Full, 2 SWA with window 2048, 3–7 Mamba |
+| Ascend A2 | Qwen3.8-27B BF16 with DSpark | Worker-reported size | 0–3 Full, 4 SWA with window 2048, 5–14 Mamba |
+| Ascend A2 | Qwen3.8-Flash-Next W4A8 (Qwen4Exp) | 1664 | 0 Scratch 4 with speculation off, 8 with MTP. 1 Full and 2–5 Mamba (2–6 with MTP), each the hash block size. Set Full `tokens_per_state` to `"1"` and Mamba to `"-1"`. |
+| Ascend A2 | DeepSeek-V4-Flash-0731 W8A8 | 8 | 0 Sparse MLA 512 with `"4"`, 1 Sparse MLA 16384 with `"128"`, 2–3 MLA SWA 128 with window 128, 4 MLA SWA 8 with window 8, 5 MLA SWA 32 with window 128. Set `tokens_per_state` to `"1"` on the MLA SWA groups. |
 
 ### MTP and DSpark
+
+For Qwen3.8-27B W8A8 on Ascend A2 with gRPC, use the MTP profile.
 
 When a worker runs MTP or DSpark and requires a manual layout, set `speculative_tokens` to the worker's configured count. Match the hash lookahead and tail-drop groups to the worker's runtime. Workers that report their layouts supply these values automatically.
 
