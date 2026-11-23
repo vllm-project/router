@@ -136,17 +136,35 @@ pytest ... --task-num 16 --max-concurrency 8   # optional overrides (same as swe
 | `benchmark_params.model` | Served name passed to replay CLI (`glm-5`). |
 | `benchmark_params.worker_metrics_url` / `worker_tokenizer_base_url` | Worker observability endpoints (yaml may mirror; case keeps worker URL explicit for single-host). |
 
-Trace path and prefix tuning live in [`configs/replay-full.yaml`](configs/replay-full.yaml) (via `benchmark_params.config`).
+Trace path and replay knobs live in a YAML file pointed at by `benchmark_params.config` (see below).
 
 ## Replay configuration
 
-[`configs/replay-full.yaml`](configs/replay-full.yaml):
+Pick a replay YAML by **trace type**; L2 case JSON only needs a different `benchmark_params.config` (and matching `task-num` / `max-concurrency` if you change `experiment` defaults).
 
-- Traffic: `backend.base_url` → Router (`:3001`).
-- Observability / tokenize: `metrics_url`, `tokenizer_base_url` → worker (often `:8077` on loopback for single-host).
-- `endpoint: /v1/chat/completions` with `prompt_transport: completion_token_ids` for agentinfer trace replay.
-- `experiment.result_dir` must **not** exist before the run; override per run via CLI/case like other perf suites.
-- Prefix and trace fields are trace-specific; tune on the deployment copy, not in the main repo.
+| Trace | Config file | `replay.trace_type` | Typical endpoint | Notes |
+| ----- | ----------- | ------------------- | ---------------- | ----- |
+| AgentInfer (token-id traces) | [`configs/replay-full.yaml`](configs/replay-full.yaml) | `agentinfer` | `/v1/chat/completions` | `prompt_transport: completion_token_ids`, prefix / context tuning fields |
+| AgentX (full hash-block snapshots) | [`configs/replay-agentx-full.yaml`](configs/replay-agentx-full.yaml) | `agentX` | `/v1/completions` | `max_inflight_requests`; no AgentInfer prefix block |
+
+Both templates send **traffic** through the Router (`backend.base_url` → `:3001`). **Metrics / tokenizer** stay on the vLLM worker (`:8077` on single-host). CLI still runs `vllm bench serve --agentinfer replay`; trace handling is driven by the YAML (`trace_type`, `trace_path`, etc.).
+
+Example — same router case, AgentX trace file:
+
+```json
+"benchmark_params": {
+  "workload": "router-replay",
+  "config": "tests/python/e2e/perf/agentaware/configs/replay-agentx-full.yaml",
+  "model": "glm-5",
+  "task-num": 8,
+  "max-concurrency": 4,
+  "timeout": 3600,
+  "worker_metrics_url": "http://127.0.0.1:8077/metrics",
+  "worker_tokenizer_base_url": "http://127.0.0.1:8077"
+}
+```
+
+Edit `replay.trace_path` locally (repo-relative or absolute). `experiment.result_dir` in YAML is a placeholder; pytest allocates a fresh directory per run and must **not** reuse an existing result dir.
 
 ## Repository layout
 
@@ -157,7 +175,8 @@ Trace path and prefix tuning live in [`configs/replay-full.yaml`](configs/replay
 | `helpers/replay_cli.py` | Build `vllm bench … replay` argv (Router `base-url`) |
 | `helpers/replay_runner.py` | `managed_vllm` → `managed_router` → replay → validate |
 | `cases/…/*.json` | Cases (four task×concurrency shapes × two router arms) |
-| `configs/replay-full.yaml` | Replay YAML (set trace path locally) |
+| `configs/replay-full.yaml` | AgentInfer replay YAML |
+| `configs/replay-agentx-full.yaml` | AgentX replay YAML |
 | `prepare_l1.py` | L1 prerequisite: serve → calibrate → program JSON → stop serve |
 | `configs/l1-serve.json` | Serve config for L1 |
 

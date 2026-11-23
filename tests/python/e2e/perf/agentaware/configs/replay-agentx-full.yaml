@@ -1,0 +1,30 @@
+# Trace replay defaults for AgentX full hash-block snapshots (router perf).
+# Run pytest from the vllm-router repo root; set trace_path to your snapshot JSONL.
+# Traffic goes through the Router (same as replay-full.yaml); metrics/tokenizer stay on the worker.
+
+experiment:
+  task_num: 8
+  result_dir: test-results/agentaware/replay-agentx-placeholder
+  max_concurrency: 4
+  task_timeout_seconds: 3600
+  run_timeout_seconds: null
+
+backend:
+  type: vllm
+  base_url: http://127.0.0.1:3001
+  metrics_url: http://127.0.0.1:8077/metrics
+  tokenizer_base_url: http://127.0.0.1:8077
+  model: glm-5
+  endpoint: /v1/completions
+  chat_template_kwargs: {}
+  api_key_env: null
+
+replay:
+  trace_type: agentX
+  trace_path: results/agentaware/traces/agentx-traces.jsonl
+  trace_same_agent_gap_scale: 1.0
+  trace_same_agent_gap_offset_seconds: 0.0
+  interval_mode: trace
+  sample_seed: 0
+  max_inflight_requests: 8
+  request_timeout_seconds: 3600

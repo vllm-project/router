@@ -1,4 +1,6 @@
-# Replay config for agent-aware router perf (run pytest from vllm-router repo root).
+# AgentInfer trace replay (completion_token_ids + prefix tuning) for router perf.
+# For AgentX hash-block snapshots use configs/replay-agentx-full.yaml instead.
+# Run pytest from the vllm-router repo root.
 # Paths below are relative to the repository root unless absolute.
 # CLI overrides (--task-num, --max-concurrency, --result-dir) take precedence when wired in case JSON.
 
