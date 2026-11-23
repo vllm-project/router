@@ -12,11 +12,14 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::config::StaticKvEventSources;
+use crate::config::{types::KvSnapshotSource, StaticKvEventSources};
 use crate::core::worker::worker_get;
+use crate::core::WorkerId;
 use crate::kv_index::indexer::KvBlockIndexer;
 use crate::kv_index::subscriber::{EventSource, SubscriberHandle};
-use crate::kv_index::{HashMode, IngestionSignal, SourceId, SourceRecoveryReason};
+use crate::kv_index::{
+    publisher_snapshot, HashMode, IngestionSignal, SourceId, SourceRecoveryReason,
+};
 use crate::protocols::worker_spec::ServerInfo;
 
 /// The worker-stable core of a cache identity. One indexer per key.
@@ -78,11 +81,48 @@ pub(crate) struct WorkerDiscovery {
     model_id: Result<Option<String>, String>,
 }
 
+/// Only the enrollment and exact registration capture survive the network await.
+pub(crate) struct SnapshotProbe {
+    config: KvSnapshotSource,
+    observed: Option<Arc<AtomicBool>>,
+    api_key: Option<String>,
+}
+
+pub(crate) struct SnapshotDiscovery {
+    observed: Option<Arc<AtomicBool>>,
+    model: String,
+    publisher: String,
+}
+
+pub(crate) fn snapshot_worker_instance(worker_id: &WorkerId) -> String {
+    format!("snapshot-worker:{}", worker_id.as_str())
+}
+
+impl SnapshotProbe {
+    pub(crate) async fn discover(self, worker_url: &str) -> Result<SnapshotDiscovery, String> {
+        // Bracket HTTP metadata with the same publisher identity: the
+        // subscriber must observe this UUID again before accepting its cut.
+        let publisher = publisher_snapshot::discover(self.config).await?;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|_| "snapshot worker client")?;
+        let model = query_snapshot_model(&client, worker_url, self.api_key.as_deref()).await?;
+        Ok(SnapshotDiscovery {
+            observed: self.observed,
+            model,
+            publisher,
+        })
+    }
+}
+
 /// Per-worker subscriber state retained for removal-time cleanup.
 struct WorkerSubs {
     active: Arc<AtomicBool>,
     key: CacheKey,
     source_id: SourceId,
+    snapshot_publisher: Option<(String, u32)>,
     worker_origin: Option<String>,
     replay_endpoints: Vec<String>,
     live_sources: Vec<LiveSource>,
@@ -107,6 +147,7 @@ pub struct KvIndexSupervisor {
     hash_mode: HashMode,
     full_attention_http: bool,
     strict_recovery: bool,
+    snapshot_sources: HashMap<String, KvSnapshotSource>,
     http_pd: bool,
     /// Explicit event sources override discovery for configured regular workers.
     static_sources: HashMap<String, StaticKvEventSources>,
@@ -151,6 +192,7 @@ impl KvIndexSupervisor {
             hash_mode,
             full_attention_http: false,
             strict_recovery: false,
+            snapshot_sources: HashMap::new(),
             http_pd: false,
             static_sources: HashMap::new(),
             static_pd_sources: HashMap::new(),
@@ -208,6 +250,65 @@ impl KvIndexSupervisor {
         self.api_key = api_key;
     }
 
+    pub(crate) fn set_snapshot_sources(
+        &mut self,
+        sources: HashMap<String, KvSnapshotSource>,
+    ) -> Result<(), String> {
+        if !sources.is_empty() && (!self.strict_recovery || !self.full_attention_http) {
+            return Err("snapshot control requires strict regular HTTP recovery".into());
+        }
+        let mut enrolled = HashMap::new();
+        let mut live_bindings = HashSet::new();
+        let mut snapshot_endpoints = HashSet::new();
+        for (worker, mut source) in sources {
+            let origin = super::endpoints::canonical_worker(&worker)?.0;
+            if source.block_size == 0 {
+                return Err("invalid snapshot enrollment".into());
+            }
+            let protocol = &mut source.publisher_snapshot;
+            publisher_snapshot::validate_config(protocol)?;
+            protocol.endpoint = super::endpoints::canonical_endpoint(&protocol.endpoint)?;
+            protocol.snapshot_endpoint =
+                super::endpoints::canonical_endpoint(&protocol.snapshot_endpoint)?;
+            if !live_bindings.insert((protocol.endpoint.clone(), protocol.topic.clone()))
+                || !snapshot_endpoints.insert(protocol.snapshot_endpoint.clone())
+            {
+                return Err("snapshot workers must use independent publisher bindings".into());
+            }
+            if enrolled.insert(origin, source).is_some() {
+                return Err("duplicate snapshot worker origin".into());
+            }
+        }
+        self.snapshot_sources = enrolled;
+        Ok(())
+    }
+
+    fn snapshot_source(&self, worker_url: &str) -> Option<&KvSnapshotSource> {
+        if self.snapshot_sources.is_empty() {
+            return None;
+        }
+        let (origin, _) = super::endpoints::canonical_worker(worker_url).ok()?;
+        self.snapshot_sources.get(&origin)
+    }
+
+    pub(crate) fn is_snapshot_worker(&self, worker_url: &str) -> bool {
+        self.snapshot_source(worker_url).is_some()
+    }
+
+    pub(crate) fn snapshot_probe(&self, worker_url: &str) -> Option<SnapshotProbe> {
+        let config = self.snapshot_source(worker_url)?;
+        let workers = self.workers.lock();
+        let current = workers.get(worker_url);
+        if current.is_some_and(|worker| worker.handles.iter().any(|task| !task.is_finished())) {
+            return None;
+        }
+        Some(SnapshotProbe {
+            config: config.clone(),
+            observed: current.map(|worker| worker.active.clone()),
+            api_key: self.api_key.clone(),
+        })
+    }
+
     pub fn with_static_sources(
         mut self,
         static_sources: HashMap<String, StaticKvEventSources>,
@@ -220,6 +321,9 @@ impl KvIndexSupervisor {
     /// this worker's identity's indexer. A 404 on /kv_event_sources (engine
     /// without the endpoint or events off) is a soft skip.
     pub async fn on_worker_added(&self, worker_url: &str) -> Result<WorkerKvInfo, String> {
+        if self.is_snapshot_worker(worker_url) {
+            return Err("snapshot worker requires a registered HTTP target".into());
+        }
         // Discovery awaits without the owner lock. A failed/stale re-add must
         // leave the prior registration and its observed placement intact.
         let observed = self
@@ -444,7 +548,7 @@ impl KvIndexSupervisor {
                 if worker.live_sources.iter().any(|live| {
                     live.publisher == source.pub_endpoint
                         && live.topic == source.topic
-                        && live.rank == source.dp_rank
+                        && (live.rank == source.dp_rank || self.is_snapshot_worker(url))
                 }) {
                     return Err("live KV streams must be independent".into());
                 }
@@ -542,6 +646,7 @@ impl KvIndexSupervisor {
                 active,
                 key: key.clone(),
                 source_id,
+                snapshot_publisher: None,
                 worker_origin,
                 replay_endpoints,
                 live_sources,
@@ -567,6 +672,98 @@ impl KvIndexSupervisor {
             self.retire_worker(subs);
             info!("kv_index {}: removed subscribers", worker_url);
         }
+    }
+
+    /// Commit a completed probe against the same captured registration. The
+    /// caller also pins the HTTP worker registration while binding the result.
+    pub(crate) fn install_snapshot_worker(
+        &self,
+        worker_url: &str,
+        worker_id: &WorkerId,
+        discovery: SnapshotDiscovery,
+    ) -> Result<(WorkerKvInfo, Arc<KvBlockIndexer>), String> {
+        let enrollment = self
+            .snapshot_source(worker_url)
+            .ok_or("worker is not enrolled")?;
+        let origin = super::endpoints::canonical_worker(worker_url)?.0;
+        let key = CacheKey {
+            model: Arc::from(discovery.model),
+            hash_mode: self.hash_mode,
+            block_size: enrollment.block_size,
+        };
+        let source_id: SourceId = Arc::from(snapshot_worker_instance(worker_id));
+        let snapshot_publisher = (discovery.publisher, enrollment.rank);
+        let protocol = &enrollment.publisher_snapshot;
+        let mut workers = self.workers.lock();
+        let unchanged = match (discovery.observed, workers.get(worker_url)) {
+            (Some(active), Some(current)) => Arc::ptr_eq(&active, &current.active),
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            return Err("KV worker changed while snapshot discovery was pending".into());
+        }
+        if workers.iter().any(|(url, worker)| {
+            url != worker_url
+                && (worker.worker_origin.as_ref() == Some(&origin)
+                    || worker.source_id == source_id
+                    || worker.snapshot_publisher.as_ref() == Some(&snapshot_publisher)
+                    || worker
+                        .replay_endpoints
+                        .contains(&protocol.snapshot_endpoint)
+                    || worker.live_sources.iter().any(|live| {
+                        live.publisher == protocol.endpoint && live.topic == protocol.topic
+                    }))
+        }) {
+            return Err("snapshot workers must use independent publisher bindings".into());
+        }
+        // Wire rank identifies the producer. The independently addressable
+        // BasicWorker's match target is always local rank zero.
+        let rank = 0;
+        if let Some(previous) = workers.remove(worker_url) {
+            self.retire_worker(previous);
+        }
+        let indexer = self.acquire_identity(&key);
+        indexer.register_source(&source_id, rank);
+        let active = Arc::new(AtomicBool::new(true));
+        let lease = super::binding::SourceLease {
+            strict_rank: Arc::new(Mutex::new(true)),
+            active: active.clone(),
+        };
+        let handle = publisher_snapshot::spawn(
+            enrollment.clone(),
+            snapshot_publisher.0.clone(),
+            indexer.clone(),
+            source_id.clone(),
+            lease.clone(),
+        );
+        let info = WorkerKvInfo {
+            instance_id: source_id.to_string(),
+            block_size: Some(key.block_size),
+            ranks: vec![rank],
+            cache_key: Some(key.clone()),
+        };
+        workers.insert(
+            worker_url.to_owned(),
+            WorkerSubs {
+                active,
+                key,
+                source_id,
+                snapshot_publisher: Some(snapshot_publisher),
+                worker_origin: Some(origin),
+                replay_endpoints: vec![protocol.snapshot_endpoint.clone()],
+                live_sources: vec![LiveSource {
+                    publisher: protocol.endpoint.clone(),
+                    topic: protocol.topic.clone(),
+                    rank,
+                    lease,
+                }],
+                ranks: vec![rank],
+                indexer: indexer.clone(),
+                handles: vec![handle],
+            },
+        );
+        Ok((info, indexer))
     }
 
     fn retire_worker(&self, subs: WorkerSubs) {
@@ -1069,24 +1266,67 @@ async fn query_served_model_id(
     worker_url: &str,
     api_key: Option<&str>,
 ) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct Models {
-        data: Vec<ServedModel>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct ServedModel {
-        id: String,
-    }
-
-    let models: Models = query_worker_json(client, worker_url, "v1/models", true, api_key)
+    let models: ServedModels = query_worker_json(client, worker_url, "v1/models", true, api_key)
         .await
         .ok()?;
+    models.model_id()
+}
+
+#[derive(Deserialize)]
+struct ServedModels {
+    data: Vec<ServedModel>,
+}
+
+#[derive(Deserialize)]
+struct ServedModel {
+    id: String,
+}
+
+impl ServedModels {
+    fn model_id(self) -> Option<String> {
+        self.data
+            .into_iter()
+            .map(|model| model.id)
+            .find(|id| !id.trim().is_empty())
+    }
+}
+
+async fn query_snapshot_model(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Result<String, &'static str> {
+    const MAX_BYTES: usize = 64 * 1024;
+    let url = format!("{}/v1/models", worker_url.trim_end_matches('/'));
+    let mut response = worker_get(client, &url, api_key)
+        .send()
+        .await
+        .map_err(|_| "snapshot worker model metadata unavailable")?;
+    if !response.status().is_success() {
+        return Err("snapshot worker model metadata unavailable");
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_BYTES as u64)
+    {
+        return Err("snapshot worker model metadata capacity");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "snapshot worker model metadata body")?
+    {
+        if chunk.len() > MAX_BYTES - body.len() {
+            return Err("snapshot worker model metadata capacity");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let models: ServedModels =
+        serde_json::from_slice(&body).map_err(|_| "invalid snapshot worker model metadata")?;
     models
-        .data
-        .into_iter()
-        .map(|model| model.id)
-        .find(|id| !id.trim().is_empty())
+        .model_id()
+        .ok_or("snapshot worker model metadata unavailable")
 }
 
 pub(crate) async fn query_pd_server_info(
@@ -1332,6 +1572,51 @@ vllm:cache_config_info{block_size="32",engine="1"} 1.0
 mod tests {
     use super::*;
     use crate::kv_index::{MatchQuery, StorageTier};
+
+    #[tokio::test]
+    async fn snapshot_model_probe_bounds_fragmented_response() {
+        use axum::{body::Body, routing::get, Router};
+        use bytes::Bytes;
+        let large = Arc::new(AtomicBool::new(false));
+        let large_response = large.clone();
+        let app = Router::new().route(
+            "/v1/models",
+            get(move || {
+                let padding = if large_response.load(Ordering::Acquire) {
+                    40 * 1024
+                } else {
+                    1
+                };
+                async move {
+                    Body::from_stream(futures_util::stream::iter([
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                            br#"{"data":[{"id":"model"}]"#,
+                        )),
+                        Ok(Bytes::from(vec![b' '; padding])),
+                        Ok(Bytes::from(vec![b' '; padding])),
+                        Ok(Bytes::from_static(b"}")),
+                    ]))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert_eq!(
+            query_snapshot_model(&client, &url, None).await,
+            Ok("model".into())
+        );
+        large.store(true, Ordering::Release);
+        assert_eq!(
+            query_snapshot_model(&client, &url, None).await,
+            Err("snapshot worker model metadata capacity")
+        );
+        server.abort();
+    }
 
     #[tokio::test]
     async fn configured_event_sources_skip_unavailable_control_discovery() {

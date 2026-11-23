@@ -233,6 +233,7 @@ impl Router {
             mode,
             pd_kv_event_sources: config::parse_pd_kv_events(&self.pd_kv_events)?,
             kv_event_strict_recovery: self.kv_event_strict_recovery,
+            kv_snapshot_sources: Default::default(),
             policy,
             host: self.host.clone(),
             port: self.port,

@@ -513,6 +513,16 @@ struct SourceRecoveryRecord {
     replay_state: Option<SourceRecoveryState>,
 }
 
+impl SourceRecoveryRecord {
+    fn replay_scope(self, attempt: u64) -> Option<SourceRecoveryState> {
+        (self.attempt == attempt
+            && self.status.state == SourceRecoveryState::Degraded
+            && self.status.reason == SourceRecoveryReason::SequenceGap)
+            .then_some(self.replay_state)
+            .flatten()
+    }
+}
+
 impl KvBlockIndexer {
     pub fn new() -> Self {
         KvBlockIndexer {
@@ -544,29 +554,28 @@ impl KvBlockIndexer {
         dp_rank: u32,
         state: SourceRecoveryState,
         reason: SourceRecoveryReason,
-    ) {
+    ) -> u64 {
         let key = (source.clone(), dp_rank);
         let status = SourceRecoveryStatus { state, reason };
-        let previous = match self.source_states.entry(key) {
+        let next = || SourceRecoveryRecord {
+            status,
+            attempt: self.recovery_attempt.fetch_add(1, Ordering::Relaxed),
+            replay_state: None,
+        };
+        let (previous, attempt) = match self.source_states.entry(key) {
             Entry::Occupied(mut entry) => {
                 let previous = entry.get().status;
                 if previous == status {
-                    return;
+                    return entry.get().attempt;
                 }
-                entry.insert(SourceRecoveryRecord {
-                    status,
-                    attempt: self.recovery_attempt.fetch_add(1, Ordering::Relaxed),
-                    replay_state: None,
-                });
-                Some(previous)
+                let record = next();
+                entry.insert(record);
+                (Some(previous), record.attempt)
             }
             Entry::Vacant(entry) => {
-                entry.insert(SourceRecoveryRecord {
-                    status,
-                    attempt: self.recovery_attempt.fetch_add(1, Ordering::Relaxed),
-                    replay_state: None,
-                });
-                None
+                let record = next();
+                entry.insert(record);
+                (None, record.attempt)
             }
         };
         tracing::debug!(source = %source, rank = dp_rank,
@@ -578,6 +587,7 @@ impl KvBlockIndexer {
             state.as_str(),
             reason.as_str(),
         );
+        attempt
     }
 
     /// Get-or-create the shard for `group_idx`. Fast path takes a read lock so
@@ -732,17 +742,87 @@ impl KvBlockIndexer {
         operation: impl FnOnce() -> T,
     ) -> Option<T> {
         let _guard = self.source_mutations.lock();
-        {
-            let record = self.source_states.get(&(source.clone(), dp_rank))?;
-            if record.attempt != attempt
-                || record.status.state != SourceRecoveryState::Degraded
-                || record.status.reason != SourceRecoveryReason::SequenceGap
-                || record.replay_state.is_none()
-            {
-                return None;
-            }
-        }
+        self.recovery_record(source, dp_rank)?
+            .replay_scope(attempt)?;
         Some(operation())
+    }
+
+    fn recovery_record(&self, source: &SourceId, rank: u32) -> Option<SourceRecoveryRecord> {
+        self.source_states
+            .get(&(source.clone(), rank))
+            .map(|record| *record)
+    }
+
+    /// Caller holds the active registration lease. Keep the complete prepared
+    /// cut hidden until its source-local state and its live token are published.
+    pub(super) fn install_snapshot_if_current(
+        &self,
+        source: &SourceId,
+        rank: u32,
+        attempt: u64,
+        apply: impl FnOnce() -> bool,
+    ) -> Option<u64> {
+        let _guard = self.source_mutations.lock();
+        let record = self.recovery_record(source, rank)?;
+        if record.replay_scope(attempt) != Some(SourceRecoveryState::WorkerExact) {
+            return None;
+        }
+        for shard in self.shards.iter() {
+            shard.clear_source(source, rank);
+        }
+        if !apply() {
+            self.invalidate_source_locked(source, rank, SourceRecoveryReason::ReplayFailed);
+            return None;
+        }
+        Some(self.publish_recovery(
+            source,
+            rank,
+            Some(record.status.state),
+            SourceRecoveryState::WorkerExact,
+            SourceRecoveryReason::ReplayApplied,
+        ))
+    }
+
+    pub(super) fn with_current_snapshot<T>(
+        &self,
+        source: &SourceId,
+        rank: u32,
+        token: u64,
+        operation: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _guard = self.source_mutations.lock();
+        self.is_published_snapshot(source, rank, token)
+            .then(operation)
+    }
+
+    fn is_published_snapshot(&self, source: &SourceId, rank: u32, token: u64) -> bool {
+        self.recovery_record(source, rank).is_some_and(|record| {
+            record.attempt == token
+                && record.status.state == SourceRecoveryState::WorkerExact
+                && record.status.reason == SourceRecoveryReason::ReplayApplied
+                && record.replay_state.is_none()
+        })
+    }
+
+    pub(super) fn fail_snapshot_if_current(
+        &self,
+        source: &SourceId,
+        rank: u32,
+        token: u64,
+        published: bool,
+        reason: SourceRecoveryReason,
+    ) {
+        let _guard = self.source_mutations.lock();
+        let current = if published {
+            self.is_published_snapshot(source, rank, token)
+        } else {
+            self.recovery_record(source, rank)
+                .and_then(|record| record.replay_scope(token))
+                == Some(SourceRecoveryState::WorkerExact)
+        };
+        if current {
+            self.invalidate_source_locked(source, rank, reason);
+        }
     }
 
     pub(crate) fn finish_replay_if_current(
@@ -782,10 +862,7 @@ impl KvBlockIndexer {
         strict: bool,
     ) -> bool {
         let _guard = self.source_mutations.lock();
-        let record = self
-            .source_states
-            .get(&(source.clone(), dp_rank))
-            .map(|record| *record);
+        let record = self.recovery_record(source, dp_rank);
         let previous = record.map(|record| record.status.state);
         use SourceRecoveryState::{Exact, Observed, WorkerExact};
         let (state, reason) = match boundary {
@@ -810,27 +887,32 @@ impl KvBlockIndexer {
                 (Observed, SourceRecoveryReason::FreshObservation)
             }
             RecoveryBoundary::Replay { attempt } => {
-                let Some(replay_state) = record
-                    .filter(|record| {
-                        record.attempt == attempt
-                            && record.status.state == SourceRecoveryState::Degraded
-                            && record.status.reason == SourceRecoveryReason::SequenceGap
-                    })
-                    .and_then(|record| record.replay_state)
+                let Some(replay_state) = record.and_then(|record| record.replay_scope(attempt))
                 else {
                     return false;
                 };
                 (replay_state, SourceRecoveryReason::ReplayApplied)
             }
         };
+        self.publish_recovery(source, dp_rank, previous, state, reason);
+        true
+    }
+
+    fn publish_recovery(
+        &self,
+        source: &SourceId,
+        dp_rank: u32,
+        previous: Option<SourceRecoveryState>,
+        state: SourceRecoveryState,
+        reason: SourceRecoveryReason,
+    ) -> u64 {
         if previous.is_some_and(|s| !Self::visible_state(s))
             || (previous == Some(SourceRecoveryState::WorkerExact))
                 != (state == SourceRecoveryState::WorkerExact)
         {
             self.source_generation.fetch_add(1, Ordering::AcqRel);
         }
-        self.transition_source(source, dp_rank, state, reason);
-        true
+        self.transition_source(source, dp_rank, state, reason)
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -955,6 +1037,110 @@ mod tests {
 
     fn h(s: &str) -> Arc<str> {
         Arc::<str>::from(s)
+    }
+
+    #[test]
+    fn snapshot_publication_replaces_the_staging_token_and_keeps_credit_worker_local() {
+        let indexer = KvBlockIndexer::new();
+        let source = SourceId::from("snapshot-worker");
+        let other = SourceId::from("independent-worker");
+        let device = StorageTier::Device;
+        let external = StorageTier::External;
+        indexer.register_source(&source, 0);
+        indexer.register_source(&other, 0);
+        assert!(indexer.resume_boundary(&other, 0, RecoveryBoundary::Initial, false));
+        indexer.store(
+            0,
+            worker(&other),
+            device,
+            None,
+            &[(h("other"), h("other-prefix"))],
+        );
+        let (_, staged) = indexer.begin_replay(&source, 0, -1, true);
+        let matches = query(&["prefix"], &[device, external]);
+        let insert = || {
+            for (owner, tier) in [
+                (worker(&source), device),
+                (pool("shared", &source), external),
+            ] {
+                indexer.store(0, owner, tier, None, &[(h("engine"), h("prefix"))]);
+            }
+        };
+        assert!(indexer
+            .install_snapshot_if_current(&source, 0, staged, || {
+                insert();
+                assert_eq!(indexer.shard(0).find_matches(&matches).len(), 2);
+                assert!(indexer.find_matches(&matches).is_empty());
+                false
+            })
+            .is_none());
+        assert!(indexer.shard(0).find_matches(&matches).is_empty());
+        let (_, staged) = indexer.begin_replay(&source, 0, -1, true);
+        let published = indexer
+            .install_snapshot_if_current(&source, 0, staged, || {
+                insert();
+                assert!(indexer.find_matches(&matches).is_empty());
+                true
+            })
+            .unwrap();
+        assert_ne!(staged, published);
+        let hits = indexer.find_matches(&matches);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].tier, device);
+        assert_eq!(hits[0].segments, [(0, 1)]);
+        assert_eq!(
+            indexer.source_recovery_status(&source, 0),
+            Some(SourceRecoveryStatus {
+                state: SourceRecoveryState::WorkerExact,
+                reason: SourceRecoveryReason::ReplayApplied,
+            })
+        );
+        assert!(indexer
+            .with_current_snapshot(&source, 0, staged, || panic!("staging token is not live"))
+            .is_none());
+        indexer.fail_snapshot_if_current(
+            &source,
+            0,
+            staged,
+            false,
+            SourceRecoveryReason::ReplayFailed,
+        );
+        assert_eq!(indexer.find_matches(&matches).len(), 1);
+        indexer
+            .with_current_snapshot(&source, 0, published, || {
+                indexer.remove(0, &worker(&source), device, &[h("engine")]);
+            })
+            .unwrap();
+        assert!(indexer.find_matches(&matches).is_empty());
+        indexer.forget_source(&source, 0);
+        indexer.register_source(&source, 0);
+        let (_, replacement) = indexer.begin_replay(&source, 0, -1, true);
+        indexer.fail_snapshot_if_current(
+            &source,
+            0,
+            published,
+            true,
+            SourceRecoveryReason::IncarnationReset,
+        );
+        assert!(indexer
+            .with_current_snapshot(&source, 0, published, || panic!("retired live token"))
+            .is_none());
+        assert!(indexer
+            .install_snapshot_if_current(&source, 0, staged, || panic!("retired staging token"))
+            .is_none());
+        assert!(indexer
+            .install_snapshot_if_current(&source, 0, replacement, || {
+                insert();
+                true
+            })
+            .is_some());
+        assert_eq!(indexer.find_matches(&matches).len(), 1);
+        assert_eq!(
+            indexer
+                .find_matches(&query(&["other-prefix"], &[device]))
+                .len(),
+            1
+        );
     }
 
     #[test]
