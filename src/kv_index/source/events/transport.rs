@@ -509,10 +509,9 @@ impl PendingLive {
         });
         if let Some(first) = baseline.filter(|_| verified) {
             self.frames.retain(|frames| {
-                let seq = buffered_sequence(frames, topic).expect("validated live frame");
-                if seq >= first {
+                let Some(seq) = buffered_sequence(frames, topic).filter(|&seq| seq < first) else {
                     return true;
-                }
+                };
                 replayed.release_live(seq as u64);
                 self.bytes -= frames.iter().map(Vec::len).sum::<usize>();
                 false

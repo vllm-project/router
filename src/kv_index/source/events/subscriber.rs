@@ -192,7 +192,7 @@ impl Subscriber {
         &self,
         ctx: &zmq::Context,
         mut last: i64,
-        through: &mut Option<i64>,
+        required_through: &mut Option<i64>,
         baseline: &mut Option<i64>,
         gap_batch: Option<&(u64, Vec<u8>)>,
         replayed: &ReplayOverlap,
@@ -247,7 +247,8 @@ impl Subscriber {
                         // The first live batch after a gap can finish a contiguous
                         // replay when the publisher has not buffered that batch yet.
                         if let Some((seq, payload)) = gap_batch.filter(|(seq, _)| {
-                            *seq == next && through.is_some_and(|required| *seq as i64 == required)
+                            *seq == next
+                                && required_through.is_some_and(|required| *seq as i64 == required)
                         }) {
                             self.apply(*seq, payload, false)
                                 .map_err(|_| ReplayError::Invalid)?;
@@ -257,7 +258,7 @@ impl Subscriber {
                             last = *seq as i64;
                             next += 1;
                         }
-                        if through.is_some_and(|required| next as i64 <= required) {
+                        if required_through.is_some_and(|required| next as i64 <= required) {
                             return Err(ReplayError::Retry(last));
                         }
                         *socket = Some(dealer);
@@ -266,7 +267,8 @@ impl Subscriber {
                     if !(0..i64::MAX).contains(&wire_seq) || frame_topic != topic.as_bytes() {
                         return Err(ReplayError::Invalid);
                     }
-                    *through = (*through).max(Some(wire_seq));
+                    // A rejected reply can still reveal a sequence the next replay must cover.
+                    *required_through = (*required_through).max(Some(wire_seq));
                     let seq = wire_seq as u64;
                     if seq != next {
                         if next != start || seq < start {
@@ -573,14 +575,14 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             (Reason::ReplayFailed, "failed")
                         };
                         RouterMetrics::record_kv_replay_outcome(outcome);
-                        if let ReplayPoll::Finished(Err(ReplayError::Retry(high))) = result {
+                        if let ReplayPoll::Finished(Err(ReplayError::Retry(applied))) = result {
                             if !exhausted {
                                 // Leave the verified prefix hidden and retry only unapplied
                                 // batches. The gap watermark and its buffered frame still apply.
                                 if subscriber.suspend(reason).is_err() {
                                     break;
                                 }
-                                last_seq = high;
+                                last_seq = applied;
                                 suspended = true;
                                 next_catchup =
                                     tokio::time::Instant::now() + Duration::from_millis(500);
