@@ -107,6 +107,16 @@ impl TcpReplay {
         signals: Option<mpsc::Sender<IngestionSignal>>,
         strict: bool,
     ) -> SubscriberHandle {
+        self.start_with_idle_timeout(index, signals, strict, REPLAY_IDLE_TIMEOUT)
+    }
+
+    fn start_with_idle_timeout(
+        &self,
+        index: Arc<SourceBinding>,
+        signals: Option<mpsc::Sender<IngestionSignal>>,
+        strict: bool,
+        replay_idle_timeout: Duration,
+    ) -> SubscriberHandle {
         let source = EventSource {
             source: index.target.instance_id.clone(),
             dp_rank: index.target.dp_rank,
@@ -117,7 +127,14 @@ impl TcpReplay {
         };
         let stream = Arc::new(EventStream::new(index).with_strict_recovery(strict));
         let lease = stream.begin_replay().unwrap();
-        spawn(source, stream, lease, self.ctx.clone(), signals)
+        spawn_with_idle_timeout(
+            source,
+            stream,
+            lease,
+            self.ctx.clone(),
+            signals,
+            replay_idle_timeout,
+        )
     }
 
     async fn subscribed(&self) {
@@ -408,7 +425,8 @@ async fn replay_retry_keeps_the_verified_gap_cursor() {
     for timed_out in [false, true] {
         let tcp = TcpReplay::new();
         let index = Arc::new(full_binding(target("retained-gap"), BLOCK_SIZE));
-        let _handle = tcp.start_with_recovery(index.clone(), None, true);
+        let _handle =
+            tcp.start_with_idle_timeout(index.clone(), None, true, Duration::from_secs(1));
         let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
         let empty = batch_payload(&[]);
 
@@ -424,9 +442,6 @@ async fn replay_retry_keeps_the_verified_gap_cursor() {
         let missing = if timed_out {
             tcp.reply(&request, 2, &empty);
             wait_until(|| next_seq(&index) == Some(3)).await;
-            // Give the idle timer a head start so the remaining idle timeout
-            // and retry backoff fit within the fixture's 5-second receive timeout.
-            tokio::time::sleep(Duration::from_secs(1)).await;
             3
         } else {
             tcp.history(&request, &[]);
@@ -841,6 +856,7 @@ fn monitor_failure_fences_only_active_source_and_respects_stale_lease() {
         stream.finish_replay(lease, 1).unwrap();
     }
     let subscriber = |lease| Subscriber {
+        replay_idle_timeout: REPLAY_IDLE_TIMEOUT,
         source: EventSource {
             source: active.target.instance_id.clone(),
             dp_rank: 0,

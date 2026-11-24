@@ -15,7 +15,7 @@ use crate::kv_index::source::events::transport::retry_backoff;
 use crate::kv_index::storage::source_transaction::{StreamPhase as Phase, StreamState};
 use crate::kv_index::storage::IndexBatch;
 use crate::kv_index::types::SourceRecoveryReason as Reason;
-use crate::kv_index::{IngestionSignal, KVEvent, SourceBinding, SourceError};
+use crate::kv_index::{IngestionSignal, KVEvent, KVEventBatch, SourceBinding, SourceError};
 use crate::metrics::RouterMetrics;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,7 +128,12 @@ impl EventStream {
         seq: u64,
         payload: &[u8],
     ) -> Result<bool, StreamError> {
-        self.apply_payload_at(lease, seq, payload, BatchMode::Continuous)
+        self.apply_batch_at(
+            lease,
+            seq,
+            crate::kv_index::decode_batch(payload),
+            BatchMode::Continuous,
+        )
     }
 
     /// Rebase a hidden replay on a validated clear from the same source and lease.
@@ -136,9 +141,9 @@ impl EventStream {
         &self,
         lease: StreamLease,
         seq: u64,
-        payload: &[u8],
+        batch: KVEventBatch,
     ) -> Result<bool, StreamError> {
-        self.apply_payload_at(lease, seq, payload, BatchMode::ReplayClear)
+        self.apply_batch_at(lease, seq, Ok(batch), BatchMode::ReplayClear)
     }
 
     /// Start from a fresh SUB connection after the replay budget is exhausted.
@@ -149,17 +154,21 @@ impl EventStream {
         seq: u64,
         payload: &[u8],
     ) -> Result<bool, StreamError> {
-        self.apply_payload_at(lease, seq, payload, BatchMode::FreshLive)
+        self.apply_batch_at(
+            lease,
+            seq,
+            crate::kv_index::decode_batch(payload),
+            BatchMode::FreshLive,
+        )
     }
 
-    fn apply_payload_at(
+    fn apply_batch_at(
         &self,
         lease: StreamLease,
         seq: u64,
-        payload: &[u8],
+        batch: Result<KVEventBatch, String>,
         mode: BatchMode,
     ) -> Result<bool, StreamError> {
-        let batch = crate::kv_index::decode_batch(payload);
         let prepared = batch
             .as_ref()
             .ok()

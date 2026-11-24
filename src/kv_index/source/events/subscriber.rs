@@ -8,8 +8,8 @@ use tracing::{debug, info, warn};
 
 use super::event_stream::{EventStream, StreamLease};
 use super::transport::{
-    live_sequence, retry_backoff, ConnectionMonitor, PendingLive, ReplayOverlap, ReplayPoll,
-    IDLE_REPLAY_INTERVAL,
+    live_sequence, retry_backoff, ConnectionMonitor, PendingLive, ReplayError, ReplayOverlap,
+    ReplayPoll, IDLE_REPLAY_INTERVAL,
 };
 use crate::kv_index::types::SourceRecoveryReason as Reason;
 use crate::kv_index::IngestionSignal;
@@ -19,11 +19,6 @@ use crate::metrics::RouterMetrics;
 const END_SEQ: i64 = -1;
 const MAX_REPLAY_FAILURES: u32 = 3;
 const REPLAY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
-
-enum ReplayError {
-    Retry(i64),
-    Invalid,
-}
 
 pub use crate::kv_index::source::endpoints::EventSource;
 
@@ -45,9 +40,21 @@ pub(super) fn spawn(
     ctx: Arc<zmq::Context>,
     signals: Option<mpsc::Sender<IngestionSignal>>,
 ) -> SubscriberHandle {
+    spawn_with_idle_timeout(source, stream, lease, ctx, signals, REPLAY_IDLE_TIMEOUT)
+}
+
+fn spawn_with_idle_timeout(
+    source: EventSource,
+    stream: Arc<EventStream>,
+    lease: StreamLease,
+    ctx: Arc<zmq::Context>,
+    signals: Option<mpsc::Sender<IngestionSignal>>,
+    replay_idle_timeout: Duration,
+) -> SubscriberHandle {
     spawn_subscriber(
         Subscriber {
             source,
+            replay_idle_timeout,
             binding: Some((stream, lease)),
             signals: signals.filter(|tx| !tx.is_closed()),
         },
@@ -64,6 +71,7 @@ pub(in crate::kv_index::source) fn spawn_observer(
     spawn_subscriber(
         Subscriber {
             source,
+            replay_idle_timeout: REPLAY_IDLE_TIMEOUT,
             binding: None,
             signals: Some(signals),
         },
@@ -73,6 +81,7 @@ pub(in crate::kv_index::source) fn spawn_observer(
 
 struct Subscriber {
     source: EventSource,
+    replay_idle_timeout: Duration,
     binding: Option<(Arc<EventStream>, StreamLease)>,
     signals: Option<mpsc::Sender<IngestionSignal>>,
 }
@@ -149,7 +158,7 @@ impl Subscriber {
         }
         let (stream, lease) = self.binding.as_ref().ok_or(ReplayError::Invalid)?;
         stream
-            .rebase_replay(*lease, seq, payload)
+            .rebase_replay(*lease, seq, batch)
             .map_err(|_| ReplayError::Invalid)?;
         self.invalidated("engine cleared KV cache");
         Ok(true)
@@ -217,9 +226,9 @@ impl Subscriber {
             warn!(%topic, %error, "KV replay request failed");
             return Err(ReplayError::Retry(last));
         }
-        let mut deadline = tokio::time::Instant::now() + REPLAY_IDLE_TIMEOUT;
+        let mut deadline = tokio::time::Instant::now() + self.replay_idle_timeout;
         let mut next = start;
-        let mut seeking_clear = false;
+        let mut awaiting_clear = false;
         while tokio::time::Instant::now() < deadline
             && shutdown.is_empty()
             && !shutdown.is_closed()
@@ -230,7 +239,7 @@ impl Subscriber {
                     let (wire_seq, frame_topic, payload) =
                         super::transport::replay_frame(&frames).ok_or(ReplayError::Invalid)?;
                     if wire_seq == END_SEQ && frame_topic.is_empty() && payload.is_empty() {
-                        if seeking_clear {
+                        if awaiting_clear {
                             return Err(ReplayError::Invalid);
                         }
                         // The first live batch after a gap can finish a contiguous
@@ -261,7 +270,7 @@ impl Subscriber {
                             warn!(%topic, seq, expected = next, "KV replay sequence gap");
                             return Err(ReplayError::Invalid);
                         }
-                        seeking_clear = true;
+                        awaiting_clear = true;
                     }
                     if gap_batch.is_some_and(|(live_seq, live_payload)| {
                         *live_seq == seq && live_payload.as_slice() != payload
@@ -277,17 +286,17 @@ impl Subscriber {
                     replayed
                         .record(seq, payload)
                         .map_err(|_| ReplayError::Invalid)?;
-                    if seeking_clear {
-                        seeking_clear = !self.try_replay_clear(seq, payload)?;
+                    if awaiting_clear {
+                        awaiting_clear = !self.try_replay_clear(seq, payload)?;
                     } else {
                         self.apply(seq, payload, false)
                             .map_err(|_| ReplayError::Invalid)?;
                     }
-                    if !seeking_clear {
+                    if !awaiting_clear {
                         last = wire_seq;
                     }
                     next = seq + 1;
-                    deadline = tokio::time::Instant::now() + REPLAY_IDLE_TIMEOUT;
+                    deadline = tokio::time::Instant::now() + self.replay_idle_timeout;
                     tokio::task::yield_now().await;
                 }
                 Err(zmq::Error::EAGAIN) => tokio::time::sleep(Duration::from_millis(1)).await,

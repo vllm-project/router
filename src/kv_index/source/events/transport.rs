@@ -131,7 +131,7 @@ mod tests {
         let overlap = ReplayOverlap::default();
         let replay = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            Some(0)
+            Ok(0)
         };
         let result = while_connected(
             &mut monitor,
@@ -144,7 +144,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(result, ReplayPoll::Finished(Some(0))));
+        assert!(matches!(result, ReplayPoll::Finished(Ok(0))));
         for seq in 0_i64..1025 {
             assert_eq!(
                 live_sequence(&pending.pop().unwrap(), b"topic"),
@@ -496,22 +496,27 @@ impl PendingLive {
     }
 }
 
-pub(super) enum ReplayPoll<T> {
-    Finished(T),
+pub(super) enum ReplayError {
+    Retry(i64),
+    Invalid,
+}
+
+pub(super) enum ReplayPoll {
+    Finished(Result<i64, ReplayError>),
     Disconnected,
     BufferFull,
 }
 
 /// Watch the connection and drain the live socket while replay is in progress.
-pub(super) async fn while_connected<T>(
+pub(super) async fn while_connected(
     connection: &mut ConnectionMonitor,
-    replay: impl std::future::Future<Output = T>,
+    replay: impl std::future::Future<Output = Result<i64, ReplayError>>,
     watch: bool,
     sub: &mut ReadableSocket,
     pending: &mut PendingLive,
     topic: &[u8],
     overlap: &ReplayOverlap,
-) -> io::Result<ReplayPoll<T>> {
+) -> io::Result<ReplayPoll> {
     tokio::pin!(replay);
     loop {
         tokio::select! {
@@ -641,6 +646,9 @@ impl OverlapEvidence {
     }
 }
 
+#[derive(Debug)]
+pub(super) struct ConflictingReplayFingerprint;
+
 impl ReplayOverlap {
     fn track_live(&self, seq: u64) {
         let mut evidence = self.0.lock();
@@ -662,14 +670,18 @@ impl ReplayOverlap {
         }
     }
 
-    pub(super) fn record(&self, seq: u64, payload: &[u8]) -> Result<(), ()> {
+    pub(super) fn record(
+        &self,
+        seq: u64,
+        payload: &[u8],
+    ) -> Result<(), ConflictingReplayFingerprint> {
         let fingerprint = Sha256::digest(payload).into();
         let mut evidence = self.0.lock();
         if evidence
             .fingerprint(seq)
             .is_some_and(|known| known != fingerprint)
         {
-            return Err(());
+            return Err(ConflictingReplayFingerprint);
         }
         if let Some(buffered) = evidence.buffered.get_mut(&seq) {
             buffered.fingerprint = Some(fingerprint);
