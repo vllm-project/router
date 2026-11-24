@@ -227,6 +227,7 @@ pub struct KvIndexSupervisor {
     http_pd: bool,
     pd_connector: Option<KvConnector>,
     strict_recovery: bool,
+    replay_idle_timeout: Duration,
     /// Explicit event sources override discovery for configured regular workers.
     static_sources: HashMap<String, StaticKvEventSources>,
     /// Static KV event sources per prefill URL; these workers skip HTTP
@@ -270,6 +271,9 @@ impl KvIndexSupervisor {
             http_pd: false,
             pd_connector: None,
             strict_recovery: false,
+            replay_idle_timeout: Duration::from_secs(
+                crate::config::default_kv_event_replay_idle_timeout_secs().into(),
+            ),
             static_sources: HashMap::new(),
             static_pd_sources: HashMap::new(),
             ctx: Arc::new(zmq::Context::new()),
@@ -333,6 +337,10 @@ impl KvIndexSupervisor {
 
     pub(crate) fn set_pd_connector(&mut self, connector: KvConnector) {
         self.pd_connector = Some(connector);
+    }
+
+    pub(crate) fn set_replay_idle_timeout(&mut self, timeout: Duration) {
+        self.replay_idle_timeout = timeout;
     }
 
     pub(crate) fn set_strict_recovery(&mut self, enabled: bool) {

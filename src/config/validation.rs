@@ -7,6 +7,13 @@ pub struct ConfigValidator;
 impl ConfigValidator {
     /// Validate a complete router configuration
     pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        if config.kv_event_replay_idle_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "kv_event_replay_idle_timeout_secs".to_string(),
+                value: "0".to_string(),
+                reason: "Must be at least 1 second".to_string(),
+            });
+        }
         if let Some(ttl_secs) = config.kv_aware_session_affinity_ttl_secs {
             if !(1..=31_536_000).contains(&ttl_secs) {
                 return Err(ConfigError::InvalidValue {

@@ -86,6 +86,7 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | `--kv-event-replay-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Replay endpoint(s) for a static KV-event source, same `WORKER_URL=ENDPOINT[,ENDPOINT...]` form. In P/D mode, matches a `--pd-kv-events` source. |
 | `--kv-event-block-size` | `u32` | `16` | `integer` | `16` | KV cache block size in tokens for static event publishers. |
 | `--kv-event-model` | `string` | `unset` | `string` | `unset` | Model id advertised to static KV-event sources; `unset` keeps the served model id. |
+| `--kv-event-replay-idle-timeout-secs` | `u32` | `5` | `integer` | `5` | Seconds without a replay batch before the subscriber retries. |
 | `--kv-event-strict-recovery` | `flag` | `false` | `flag` | `false` | Require complete worker recovery or a worker KV clear before granting cache credit. Requests remain routable by load while the source is recovering. |
 | `--kv-hybrid-layout` | `std::path::PathBuf` | `unset` | `string` | `unset` | Cache group, hash and reuse rules keyed by worker URL. [Setup](load_balancing/kv_aware.md#choose-a-layout-configuration). |
 | `--kv-event-topic` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static event topics as `WORKER_URL=TOPIC[,TOPIC...]`, in DP-rank order. |

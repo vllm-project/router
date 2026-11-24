@@ -36,6 +36,8 @@ impl TestContext {
             pd_kv_event_sources: Default::default(),
             pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
+            kv_event_replay_idle_timeout_secs:
+                vllm_router_rs::config::default_kv_event_replay_idle_timeout_secs(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3002,
@@ -1587,6 +1589,8 @@ mod error_tests {
             pd_kv_event_sources: Default::default(),
             pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
+            kv_event_replay_idle_timeout_secs:
+                vllm_router_rs::config::default_kv_event_replay_idle_timeout_secs(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3010,
@@ -1955,6 +1959,8 @@ mod pd_mode_tests {
             pd_kv_event_sources: Default::default(),
             pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
+            kv_event_replay_idle_timeout_secs:
+                vllm_router_rs::config::default_kv_event_replay_idle_timeout_secs(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3011,
@@ -2126,6 +2132,8 @@ mod request_id_tests {
             pd_kv_event_sources: Default::default(),
             pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
+            kv_event_replay_idle_timeout_secs:
+                vllm_router_rs::config::default_kv_event_replay_idle_timeout_secs(),
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3002,

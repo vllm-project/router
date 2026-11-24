@@ -64,7 +64,14 @@ impl KvIndexSupervisor {
         });
         let subscribers = sources
             .into_iter()
-            .map(|source| spawn_observer(source, self.ctx.clone(), self.signal_tx.clone()))
+            .map(|source| {
+                spawn_observer(
+                    source,
+                    self.ctx.clone(),
+                    self.signal_tx.clone(),
+                    self.replay_idle_timeout,
+                )
+            })
             .collect();
         observers.lock().insert(
             worker_url.to_owned(),
