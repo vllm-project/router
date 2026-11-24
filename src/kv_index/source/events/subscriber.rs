@@ -136,6 +136,7 @@ impl Subscriber {
     /// claims only if the suffix supplies a valid clear for this worker rank.
     fn try_replay_clear(&self, seq: u64, payload: &[u8]) -> Result<bool, ReplayError> {
         let batch = crate::kv_index::decode_batch(payload).map_err(|_| ReplayError::Invalid)?;
+        // The publisher stamps the batch rank, and the bound index requires it.
         if batch.data_parallel_rank != Some(self.source.dp_rank) {
             return Err(ReplayError::Invalid);
         }

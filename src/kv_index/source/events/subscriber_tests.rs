@@ -424,8 +424,8 @@ async fn replay_retry_keeps_the_verified_gap_cursor() {
         let missing = if timed_out {
             tcp.reply(&request, 2, &empty);
             wait_until(|| next_seq(&index) == Some(3)).await;
-            // Let the replay idle timeout elapse. The fixture's 5-second
-            // receive timeout is shorter than the idle timeout plus backoff.
+            // Give the idle timer a head start so the remaining idle timeout
+            // and retry backoff fit within the fixture's 5-second receive timeout.
             tokio::time::sleep(Duration::from_secs(1)).await;
             3
         } else {

@@ -675,9 +675,9 @@ impl ReplayOverlap {
             buffered.fingerprint = Some(fingerprint);
         }
         evidence.recent.insert(seq, fingerprint);
-        // Keep late arrivals within the normal publisher history window.
-        // Long replays still keep proofs for sequences already in the queue.
-        const RECENT_LIMIT: usize = 16_384;
+        // Keep the original window for late arrivals. Frames already in the
+        // queue retain their proof until the last copy is consumed.
+        const RECENT_LIMIT: usize = 4_096;
         if evidence.recent.len() > RECENT_LIMIT {
             let floor = seq.saturating_sub((RECENT_LIMIT / 2) as u64);
             evidence.recent.retain(|known, _| *known >= floor);
