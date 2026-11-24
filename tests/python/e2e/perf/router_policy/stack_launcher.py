@@ -77,6 +77,7 @@ class RouterPolicyStack:
     replay_stream: RunningProc | None = None
     port_holders: list[socket.socket | None] = field(default_factory=list)
     kv_port_holders: list[socket.socket | None] = field(default_factory=list)
+    nixl_port_holders: list[socket.socket | None] = field(default_factory=list)
     did_cleanup: bool = False
 
 
@@ -182,6 +183,7 @@ def cleanup(run: RouterPolicyStack) -> None:
     run.stack.clear()
     release_all_port_holders(run.port_holders)
     release_all_port_holders(run.kv_port_holders)
+    release_all_port_holders(run.nixl_port_holders)
 
 
 def interrupted(*_):
@@ -240,6 +242,7 @@ def allocate_ports(run: RouterPolicyStack) -> None:
 
     release_all_port_holders(run.port_holders)
     release_all_port_holders(run.kv_port_holders)
+    release_all_port_holders(run.nixl_port_holders)
     holders: list[socket.socket | None] = []
     kv_holders: list[socket.socket | None] = []
     n = run.case.worker_count
@@ -253,7 +256,7 @@ def allocate_ports(run: RouterPolicyStack) -> None:
     alloc["router"] = reserve()
     alloc["metrics"] = reserve()
     if run.case.prefill_count:
-        alloc["nixl_side"] = [reserve() for _ in range(n)]
+        alloc["nixl_side"] = [reserve_port(run.nixl_port_holders) for _ in range(n)]
     kv_pub: list[int] = []
     kv_replay: list[int] = []
     for _ in range(n):
@@ -651,9 +654,8 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
                 _release_kv_port_holders(run, i)
                 worker_env = run.env | {"CUDA_VISIBLE_DEVICES": run.gpus[i]}
                 if case.prefill_count:
-                    side_holder = 2 * case.worker_count + 2 + i
-                    run.port_holders[side_holder].close()
-                    run.port_holders[side_holder] = None
+                    run.nixl_port_holders[i].close()
+                    run.nixl_port_holders[i] = None
                     worker_env.update(
                         VLLM_NIXL_SIDE_CHANNEL_HOST="127.0.0.1",
                         VLLM_NIXL_SIDE_CHANNEL_PORT=str(ports["nixl_side"][i]),

@@ -181,7 +181,7 @@ steps:
   # 4× vllm-rs + router per cell (12GiB GPU KV/worker, no CPU offload) → L4×4.
   # Optional: TRACELAB_JSONL_URL to replace data/tracelab-ci-uniform-28.jsonl.
   # ============================================================================
-  - label: ":python: router policy perf (c16, PD merge and disaggregated)"
+  - label: ":python: router policy perf (c16, PD merge)"
     key: "router-policy-perf-e2e"
     if: build.env("ROCM_ONLY") != "1"
     timeout_in_minutes: 240
@@ -212,7 +212,55 @@ steps:
       fi
       test -f "$${trace}"
 
-      python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'c16'
+      python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'pd_merge and c16'
+
+      BASH
+    # Performance JSON for the dashboard, plus the cell files used to diagnose a run.
+    artifact_paths:
+      - "tests/python/e2e/results/perf/router_policy/**/*.json"
+      - "tests/python/e2e/run/perf/router_policy/*/result/summary.json"
+      - "tests/python/e2e/run/perf/router_policy/*/result/manifest.json"
+      - "tests/python/e2e/run/perf/router_policy/*/router.log"
+      - "tests/python/e2e/run/perf/router_policy/*/engine*.log"
+      - "tests/python/e2e/run/perf/router_policy/*/replay.log"
+      - "tests/python/e2e/run/perf/router_policy/*/replay_entry.py"
+      - "tests/python/e2e/run/perf/router_policy/*/runtime-replay.yaml"
+      - "tests/python/e2e/run/perf/router_policy/*/*.command.json"
+
+  - label: ":python: router policy perf (c16, PD disaggregated)"
+    key: "router-policy-pd-disagg-perf-e2e"
+    if: build.env("ROCM_ONLY") != "1"
+    # Four-GPU PD validation is pending. Keep collecting results independently.
+    soft_fail: true
+    timeout_in_minutes: 240
+    retry:
+      automatic:
+        - exit_status: "*"
+          limit: 1
+      manual:
+        allowed: true
+        reason: "GPU perf cold starts / long replay — retry after checking logs"
+    mirror_hardwares: l4_4
+    depends_on:
+      - "upload-nightly-pipeline"
+      - "image-build"
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+
+      python -m pip install --no-cache-dir 'agentinfer==0.2.0'
+
+      export AGENTX_CELL_GAP_SEC="${AGENTX_CELL_GAP_SEC:-15}"
+      export AGENTX_PORT_SETTLE_SEC="${AGENTX_PORT_SETTLE_SEC:-5}"
+
+      trace="tests/python/e2e/perf/router_policy/data/tracelab-ci-uniform-28.jsonl"
+      if [[ -n "${TRACELAB_JSONL_URL:-}" ]]; then
+        mkdir -p "$$(dirname "$${trace}")"
+        curl -fsSL "${TRACELAB_JSONL_URL}" -o "$${trace}"
+      fi
+      test -f "$${trace}"
+
+      python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'pd_disagg and c16'
 
       BASH
     # Performance JSON for the dashboard, plus the cell files used to diagnose a run.

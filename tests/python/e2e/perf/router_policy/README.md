@@ -32,7 +32,7 @@ pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -sv -
 
 Performance JSON and the run directory are separate. The nightly dashboard copies `tests/python/e2e/results` only.
 
-- `tests/python/e2e/results/perf/router_policy/<policy>_<run_suffix>/c<concurrency>_t<task_num>.json` — copy of `calibration.json` when the cell is ok. One directory per policy and session; one file per concurrency. The `concurrency` / `task_num` fields match the file name.
+- `tests/python/e2e/results/perf/router_policy/<scenario>_<run_suffix>/c<concurrency>_t<task_num>.json` — copy of `calibration.json` when the cell is ok. One directory per scenario and session; one file per concurrency. The `concurrency` / `task_num` fields match the file name.
 - `tests/python/e2e/run/perf/router_policy/<case_id>-<run_suffix>/` — cell files. Nightly uploads `result/summary.json`, `result/manifest.json`, `router.log`, `engineN.log`, `replay.log`, `replay_entry.py`, `runtime-replay.yaml`, and `*.command.json`. Prometheus snapshots, `requests.jsonl`, `ports.json`, and `calibration.json` stay on the agent. The generated replay wrapper (`replay_entry.py`, including compatibility and stagger patches) is retained beside its command and logs after cleanup and uploaded for diagnosis and reproduction. Model caches stay under `tests/python/e2e/run/perf/router_policy/cache/` (shared across cells in this work root, excluded from nightly uploads). The same stdout is also printed (`[engineN]`, `[vllm-router]`, `[replay]`).
 
 `<run_suffix>` is local time `YYYYMMDD_HHMMSS` (same format as grpc and l1_encode) unless you set **`AGENTX_RUN_SUFFIX`** (same suffix for all cells in one matrix, e.g. `export AGENTX_RUN_SUFFIX=20251029_171300`). The run directory is generated automatically from the case ID and run suffix.
@@ -45,7 +45,7 @@ Before replay, the cell runner **removes `result/`** if it already exists. The c
 
 Worker and router processes are started with `perf/process.py` (`launch_worker` once per worker, then `launch_router`). Pytest hides the stderr stream unless the invocation uses **`-sv`**.
 
-When replay exits, [`log_summary.py`](log_summary.py) writes **`calibration.json`** (TTFT, TPOT, JCT, concurrency, task count, and the other cell stats); when the cell is ok, the same JSON is copied to `tests/python/e2e/results/perf/router_policy/<policy>_<run_suffix>/c<concurrency>_t<task_num>.json` and prints **`--- cell summary ---`**, **`STATS`**, and **`ARTIFACTS`** on stdout. Quantile blocks (`ttft_s`, `tpot_ms`, `jct_s`) include `n`, the actual number of samples used for that metric, which can differ from `success`. TTFT excludes missing timings; TPOT also excludes missing latency and outputs with at most one token. JCT counts the duration samples used; precomputed JCT preserves `n` or `count`, or reports `n: null` when unknown. Empty sample sets report `n: 0`. Cell-level request counts remain in `requests` and `success`. **`ARTIFACTS`** lists the run directory and the results JSON path (`results_json`). Workers and the router are stopped after that.
+When replay exits, [`log_summary.py`](log_summary.py) writes **`calibration.json`** (TTFT, TPOT, JCT, concurrency, task count, and the other cell stats); when the cell is ok, the same JSON is copied to `tests/python/e2e/results/perf/router_policy/<scenario>_<run_suffix>/c<concurrency>_t<task_num>.json` and prints **`--- cell summary ---`**, **`STATS`**, and **`ARTIFACTS`** on stdout. Quantile blocks (`ttft_s`, `tpot_ms`, `jct_s`) include `n`, the actual number of samples used for that metric, which can differ from `success`. TTFT excludes missing timings; TPOT also excludes missing latency and outputs with at most one token. JCT counts the duration samples used; precomputed JCT preserves `n` or `count`, or reports `n: null` when unknown. Empty sample sets report `n: 0`. Cell-level request counts remain in `requests` and `success`. **`ARTIFACTS`** lists the run directory and the results JSON path (`results_json`). Workers and the router are stopped after that.
 
 Layout matches **`perf/grpc`**: case JSON + [`case_loader.py`](case_loader.py) + [`stack_launcher.py`](stack_launcher.py). [`log_summary.py`](log_summary.py) writes the stats and prints the cell summary.
 
@@ -55,12 +55,59 @@ The sample-count regression tests run on CPU without model weights:
 python -m pytest tests/python/unit/test_router_policy_log_summary.py -q
 ```
 
+## Results schema
+
+Each case filename and its JSON `id` use the same scenario name. The loader keeps
+that name in `scenario` and adds concurrency to the run-directory ID so concurrent
+cells have separate output files.
+
+| Scenario | Routing policy | Topology |
+| --- | --- | --- |
+| `pd_merge_cache_aware` | `cache_aware` | `pd_merged` |
+| `pd_merge_kv_aware` | `kv_aware` | `pd_merged` |
+| `pd_merge_kv_aware_affinity` | `kv_aware_aff` | `pd_merged` |
+| `pd_disagg_cache_aware` | `cache_aware` | `pd_disaggregated` |
+| `pd_disagg_kv_aware_affinity` | `kv_aware_aff` | `pd_disaggregated` |
+
+Result JSON includes `scenario`, `topology`, and `router_policy`. The existing
+`arm` field also identifies the routing policy for historical consumers.
+The dashboard uses policy and topology to retain historical merged series and
+match each disaggregated policy with a disaggregated cache-aware baseline.
+
+A cell must have successful requests and valid TTFT, TPOT, and JCT measurements
+before it publishes a result. Every metric needs finite, nonnegative mean,
+p50, p95, and p99 values. A known sample count must be positive. Precomputed
+JCT aggregates with an unknown count (`n: null`) remain supported. Failed
+measurement checks are recorded in `missing_latency_metrics` and fail the cell.
+
 ## Buildkite nightly (L3)
 
-Job **`router-policy-perf-e2e`** in [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml)
-runs **`pd_merge_cache_aware/c16`**, **`pd_merge_kv_aware/c16`**, **`pd_merge_kv_aware_aff/c16`** on **`l4_4`** (4× L4).
-Case JSON reserves 12 GiB GPU KV per worker, no CPU offload, and `max_model_len=32768`.
+Two steps in [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml)
+run on `l4_4` (four L4 GPUs).
 
-Nightly step runs `pip install agentinfer==0.2.0` then one pytest invocation (`-k 'c16'`).
-The trace is `data/tracelab-ci-uniform-28.jsonl` (8 sessions, 28 requests). Optional Buildkite env **`TRACELAB_JSONL_URL`** replaces that file when set.
-See [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml) (`router-policy-perf-e2e`).
+- `router-policy-perf-e2e` selects `pd_merge and c16` and runs the three merged scenarios.
+- `router-policy-pd-disagg-perf-e2e` selects `pd_disagg and c16` and runs the two
+  disaggregated scenarios. It uses `soft_fail: true` while four-GPU validation
+  is pending, allowing merged performance results to be collected independently.
+
+The PD cases use two prefill workers and two decode workers, each on its own
+GPU, with Rust gRPC frontends and NIXL KV transfer. Set `workers.prefill_count`
+to the number of prefill workers. The remaining workers decode. Merged cases
+use the default `prefill_count=0`. All cases reserve 12 GiB GPU KV per worker,
+use no CPU offload, and set `max_model_len=32768`.
+
+Both steps install `agentinfer==0.2.0`. The CI image supplies vLLM 0.30.0,
+NIXL, and the Rust router. The trace is `data/tracelab-ci-uniform-28.jsonl`
+with eight sessions and 28 requests. Optional `TRACELAB_JSONL_URL` replaces
+that file.
+
+Run the two PD scenarios in an environment with four supported CUDA GPUs.
+
+```bash
+python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'pd_disagg and c16'
+```
+
+Both scenarios passed a two-L20, one-prefill/one-decode replay with all 28
+requests successful. That run used the vLLM native sampler because FlashInfer
+CUDA compilation failed in the test container. Four-GPU, two-prefill/two-decode
+validation remains pending.

@@ -1,5 +1,5 @@
 {
-  "id": "kv_aware",
+  "id": "pd_merge_kv_aware",
   "runtime": {
     "model": "Qwen/Qwen3-4B-Instruct-2507",
     "trace_path": "tests/python/e2e/perf/router_policy/data/tracelab-ci-uniform-28.jsonl",

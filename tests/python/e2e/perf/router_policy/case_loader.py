@@ -171,6 +171,7 @@ class RouterPolicyCase:
 
     path: Path
     id: str
+    scenario: str
     model: str
     served_model_name: str
     python: str
@@ -196,10 +197,6 @@ class RouterPolicyCase:
     per_worker: dict[str, Any]
     router: dict[str, Any]
 
-    @property
-    def result_series(self) -> str:
-        return self.id.split("-", 1)[1]
-
 
 def concurrency_levels(case: dict[str, Any]) -> list[int]:
     """``benchmark_params.max-concurrency`` as a list, or one integer."""
@@ -215,7 +212,8 @@ def concurrency_levels(case: dict[str, Any]) -> list[int]:
 def case_at_concurrency(case: dict[str, Any], concurrency: int) -> dict[str, Any]:
     """Copy a scenario JSON and pin one concurrency.
 
-    The cell ID uses the scenario name and concurrency to identify its output directory.
+    Each scenario/concurrency pair needs its own output directory so cells
+    from the same JSON do not overwrite each other's replay files.
     """
 
     stamped = dict(case)
@@ -224,6 +222,7 @@ def case_at_concurrency(case: dict[str, Any], concurrency: int) -> dict[str, Any
     stamped["benchmark_params"] = bench
     router = case.get("router_params") or {}
     scenario = str(case.get("id") or router.get("policy") or "router_policy")
+    stamped["scenario"] = scenario
     stamped["id"] = f"c{int(concurrency)}-{scenario}"
     return stamped
 
@@ -248,9 +247,7 @@ def load_router_policy_case(
     workers = raw.get("workers") or {}
     router = dict(raw.get("router_params") or {})
     case_id = str(raw["id"])
-    policy = str(
-        router.get("policy") or raw.get("router_policy") or case_id.split("-", 1)[-1]
-    )
+    policy = str(router.get("policy") or raw.get("router_policy") or raw["scenario"])
     replay_path = str(runtime.get("replay_config_path") or "").strip()
     agent_infer = str(runtime.get("agent_infer") or "").strip()
     worker_count = int(workers.get("count", 4))
@@ -267,6 +264,7 @@ def load_router_policy_case(
     return RouterPolicyCase(
         path=case_file,
         id=case_id,
+        scenario=str(raw["scenario"]),
         model=runtime["model"],
         served_model_name=runtime["served_model_name"],
         python=runtime["python"],
@@ -317,12 +315,12 @@ def cell_output_dir(case: dict[str, Any], *, run_suffix: str | None = None) -> P
 
 
 def router_policy_result_path(
-    policy: str, concurrency: int, task_num: int, run_suffix: str
+    scenario: str, concurrency: int, task_num: int, run_suffix: str
 ) -> Path:
-    """``results/perf/router_policy/<policy>_<stamp>/c<concurrency>_t<task_num>.json``."""
+    """``results/perf/router_policy/<scenario>_<stamp>/c<concurrency>_t<task_num>.json``."""
 
     return (
         PERF_RESULTS_DIR
-        / f"{policy}_{run_suffix}"
+        / f"{scenario}_{run_suffix}"
         / f"c{int(concurrency)}_t{int(task_num)}.json"
     )

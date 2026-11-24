@@ -32,7 +32,7 @@ def _run_cell(case_file: Path, concurrency: int) -> Path:
     )
     stats = json.loads((cell_out / "calibration.json").read_text(encoding="utf-8"))
     summary = router_policy_result_path(
-        stats["router_policy"], stats["concurrency"], stats["task_num"], run_suffix
+        stats["scenario"], stats["concurrency"], stats["task_num"], run_suffix
     )
     assert summary.is_file(), f"missing results JSON {summary}"
     return cell_out

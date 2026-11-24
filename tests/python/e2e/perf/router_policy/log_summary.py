@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import re
 import statistics
 from contextlib import redirect_stdout
@@ -52,7 +53,7 @@ def _write_results_summary_from_calibration(out: Path) -> list[tuple[str, Path]]
     if any(key not in stats for key in required):
         return []
     dest = router_policy_result_path(
-        stats["router_policy"],
+        stats.get("scenario", stats["router_policy"]),
         stats["concurrency"],
         stats["task_num"],
         cell_run_suffix(),
@@ -90,6 +91,12 @@ def emit_run_summary(
             failed = True
             if replay_rc not in (0, None):
                 print(f"DIAGNOSTIC replay failed (exit {replay_rc})", flush=True)
+            elif stats.get("missing_latency_metrics"):
+                print(
+                    "DIAGNOSTIC missing latency measurements: "
+                    + ", ".join(stats["missing_latency_metrics"]),
+                    flush=True,
+                )
             elif stalled or stats["success"] != stats["requests"]:
                 print(
                     "DIAGNOSTIC stalled or non-success rows in requests.jsonl",
@@ -296,7 +303,10 @@ def write_calibration(
         "wall_seconds": wall_seconds,
         "makespan_seconds": makespan,
         "throughput_tok_s": (output_tokens / makespan) if makespan else None,
-        "ok": replay_rc in (0, None) and not stalled and len(ok) == len(rows),
+        "ok": replay_rc in (0, None)
+        and not stalled
+        and bool(rows)
+        and len(ok) == len(rows),
         "stalled": stalled,
         "requests": len(rows),
         "success": len(ok),
@@ -343,16 +353,30 @@ def write_calibration(
             ),
         ),
     }
+    missing_metrics = [
+        metric
+        for metric in ("ttft_s", "tpot_ms", "jct_s")
+        if (stats[metric]["n"] is not None and stats[metric]["n"] <= 0)
+        or not all(
+            _is_number(stats[metric][quantile])
+            and math.isfinite(stats[metric][quantile])
+            and stats[metric][quantile] >= 0
+            for quantile in ("mean", "p50", "p95", "p99")
+        )
+    ]
+    if missing_metrics:
+        stats["ok"] = False
+        stats["missing_latency_metrics"] = missing_metrics
     stats = add_missing_metadata(
         stats,
         {
-            "router_policy": case.result_series,
+            "router_policy": case.policy,
+            "scenario": case.scenario,
+            "topology": "pd_disaggregated" if case.prefill_count else "pd_merged",
             "concurrency": case.concurrency,
             "task_num": case.task_num,
         },
     )
-    if case.prefill_count:
-        stats.update(topology="pd_disaggregated", routing_policy=case.policy)
     (run.out / "calibration.json").write_text(json.dumps(stats, indent=2))
     emit_run_summary(
         run,
