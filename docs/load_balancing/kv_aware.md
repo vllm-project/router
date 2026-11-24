@@ -597,12 +597,6 @@ Transfer credits are fractions of reusable tokens counted as work avoided. `0` i
 | `--kv-aware-session-affinity-ttl-secs` | Integer from `1` to `31536000` seconds | Off | Enable session affinity with an idle expiration. In P/D, apply a soft preference to the session's Decode worker. |
 | `--kv-event-strict-recovery` | Flag | Off | After loss of event history, require complete recovery or a worker KV cache clear before restoring cache credit. Requests continue routing by load during recovery. |
 
-When a replay ends early or times out during gap recovery, Router keeps the
-verified prefix hidden and retries from the first unapplied batch. A retained
-worker-local clear can start a new baseline when older history is gone. Router
-restores credit only after validating the continuous tail and any buffered live
-overlap. Other worker ranks keep their own credit.
-
 ### Verification
 
 | Option | Value | Default | Purpose |
