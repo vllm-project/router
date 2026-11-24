@@ -646,7 +646,13 @@ impl GenerationRequest for ChatCompletionRequest {
         Some(RoutingPrompt {
             text: String::from_utf8(text).ok()?,
             est_hit_chars,
-            cache_identity: extract_http_cache_identity(self.lora_path.as_ref(), &self.other),
+            cache_identity: extract_http_cache_identity(
+                self.model.as_deref(),
+                self.lora_path.as_ref(),
+                self.chat_template_kwargs.as_ref(),
+                self.reasoning_effort.as_ref(),
+                &self.other,
+            ),
         })
     }
 
@@ -986,7 +992,13 @@ impl GenerationRequest for CompletionRequest {
             PromptInput::String(text) => Some(RoutingPrompt {
                 text: text.clone(),
                 est_hit_chars: text.chars().count(),
-                cache_identity: extract_http_cache_identity(self.lora_path.as_ref(), &self.other),
+                cache_identity: extract_http_cache_identity(
+                    self.model.as_deref(),
+                    self.lora_path.as_ref(),
+                    None,
+                    None,
+                    &self.other,
+                ),
             }),
             _ => None,
         }
@@ -2566,73 +2578,98 @@ pub enum GrpcRequestRef<'a> {
 }
 
 /// Cache isolation identity for HTTP text-tree prefix lookups.
-///
-/// Requests with different adapters or cache salts cannot share KV blocks on a
-/// worker even when their prompt text is identical.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum CacheIdentity {
-    /// Base model with no adapter or cache salt; shares the worker's default model tree.
     #[default]
     Shared,
-    /// Explicitly scoped by a known adapter and/or cache salt; shares only with identical scopes.
+    /// Fixed-length SHA-256 hex digest over length-prefixed cache-affecting fields.
     Scoped(String),
-    /// Cache compatibility cannot be verified (e.g., non-string salt, batch/structured LoRA);
-    /// withhold tree reuse credit and avoid polluting shared history.
     Unknown,
 }
 
 fn extract_http_cache_identity(
+    model: Option<&str>,
     lora_path: Option<&LoRAPath>,
-    other: &serde_json::Map<String, serde_json::Value>,
+    chat_template_kwargs: Option<&HashMap<String, Value>>,
+    reasoning_effort: Option<&ReasoningEffort>,
+    other: &serde_json::Map<String, Value>,
 ) -> CacheIdentity {
-    // Structured or opaque LoRA selectors cannot be safely mapped to a single key.
-    for opaque in ["lora_request", "lora_id", "lora_int_id"] {
-        if other.get(opaque).is_some_and(|v| !v.is_null()) {
-            return CacheIdentity::Unknown;
+    use sha2::Digest;
+    use std::fmt::Write;
+    const OPAQUE: [&str; 9] = [
+        "lora_request",
+        "lora_id",
+        "lora_int_id",
+        "prompt_adapter_request",
+        "prompt_adapter_name",
+        "prompt_adapter_id",
+        "chat_template",
+        "truncate_prompt_tokens",
+        "documents",
+    ];
+    if OPAQUE
+        .iter()
+        .any(|k| other.get(*k).is_some_and(|v| !v.is_null()))
+    {
+        return CacheIdentity::Unknown;
+    }
+    let opt_str = |k: &str| match other.get(k).filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(v) => v.as_str().map(|s| (!s.is_empty()).then_some(s)).ok_or(()),
+    };
+    let path_lora = match lora_path {
+        Some(LoRAPath::Single(Some(s))) if !s.is_empty() => Some(s.as_str()),
+        Some(LoRAPath::Single(_)) | None => None,
+        Some(LoRAPath::Batch(_)) => return CacheIdentity::Unknown,
+    };
+    let Ok(other_lora) = opt_str("lora_name") else {
+        return CacheIdentity::Unknown;
+    };
+    let adapter = match (path_lora, other_lora) {
+        (Some(a), Some(b)) if a != b => return CacheIdentity::Unknown,
+        (a, b) => a.or(b),
+    };
+    let Ok(salt) = opt_str("cache_salt") else {
+        return CacheIdentity::Unknown;
+    };
+    let add_special = match other.get("add_special_tokens").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => match v.as_bool() {
+            Some(b) => Some([u8::from(b)]),
+            None => return CacheIdentity::Unknown,
+        },
+    };
+    let model = model.filter(|m| !m.is_empty());
+    let reasoning_bytes = reasoning_effort.and_then(|r| serde_json::to_vec(r).ok());
+    let kwargs_bytes = chat_template_kwargs
+        .filter(|m| !m.is_empty())
+        .and_then(|m| {
+            serde_json::to_vec(&m.iter().collect::<std::collections::BTreeMap<_, _>>()).ok()
+        });
+    let fields: [(u8, Option<&[u8]>); 6] = [
+        (1, model.map(str::as_bytes)),
+        (2, adapter.map(str::as_bytes)),
+        (3, salt.map(str::as_bytes)),
+        (4, add_special.as_ref().map(<[u8; 1]>::as_slice)),
+        (5, reasoning_bytes.as_deref()),
+        (6, kwargs_bytes.as_deref()),
+    ];
+    if fields.iter().all(|(_, v)| v.is_none()) {
+        return CacheIdentity::Shared;
+    }
+    let mut hasher = sha2::Sha256::new();
+    for (tag, val) in fields {
+        if let Some(bytes) = val {
+            hasher.update([tag]);
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
         }
     }
-
-    let mut adapter: Option<&str> = None;
-    if let Some(path) = lora_path {
-        match path {
-            LoRAPath::Single(Some(s)) if !s.is_empty() => adapter = Some(s.as_str()),
-            LoRAPath::Single(_) => {}
-            LoRAPath::Batch(_) => return CacheIdentity::Unknown,
-        }
+    let mut hex = String::with_capacity(64);
+    for b in hasher.finalize() {
+        let _ = write!(&mut hex, "{b:02x}");
     }
-    if let Some(val) = other.get("lora_name").filter(|v| !v.is_null()) {
-        let Some(name) = val.as_str() else {
-            return CacheIdentity::Unknown;
-        };
-        if !name.is_empty() {
-            if let Some(existing) = adapter {
-                if existing != name {
-                    return CacheIdentity::Unknown;
-                }
-            } else {
-                adapter = Some(name);
-            }
-        }
-    }
-
-    let mut salt: Option<&str> = None;
-    if let Some(val) = other.get("cache_salt").filter(|v| !v.is_null()) {
-        let Some(s) = val.as_str() else {
-            return CacheIdentity::Unknown;
-        };
-        if !s.is_empty() {
-            salt = Some(s);
-        }
-    }
-
-    match (adapter, salt) {
-        (None, None) => CacheIdentity::Shared,
-        (a, s) => CacheIdentity::Scoped(format!(
-            "lora={}\0salt={}",
-            a.unwrap_or(""),
-            s.unwrap_or("")
-        )),
-    }
+    CacheIdentity::Scoped(hex)
 }
 
 /// Text-only affinity input with the historical boundary at the last assistant turn.
@@ -2963,6 +3000,44 @@ mod tests {
                 serde_json::to_value(request).unwrap()["messages"],
                 body["messages"]
             );
+        }
+    }
+
+    #[test]
+    fn smetric_http_cache_identity_isolates_models_adapters_salts_and_templates() {
+        let id = |body: Value| {
+            affinity_prompt_from_json("/v1/chat/completions", &body)
+                .unwrap()
+                .0
+                .cache_identity
+        };
+        let msg = serde_json::json!([{"role": "user", "content": "hi"}]);
+        assert_eq!(
+            id(serde_json::json!({"messages": msg})),
+            CacheIdentity::Shared
+        );
+        assert_ne!(
+            id(serde_json::json!({"model": "base", "messages": msg})),
+            id(serde_json::json!({"model": "sql-lora", "messages": msg}))
+        );
+        // Null bytes cannot forge collisions across adapter/salt boundaries.
+        assert_ne!(
+            id(serde_json::json!({"messages": msg, "lora_name": "a\0salt=b", "cache_salt": "c"})),
+            id(serde_json::json!({"messages": msg, "lora_name": "a", "cache_salt": "b\0salt=c"}))
+        );
+        assert_eq!(
+            id(serde_json::json!({"messages": msg, "chat_template_kwargs": {"a": 1, "b": 2}})),
+            id(serde_json::json!({"messages": msg, "chat_template_kwargs": {"b": 2, "a": 1}}))
+        );
+        for opaque in [
+            serde_json::json!({"messages": msg, "lora_path": "a", "lora_name": "b"}),
+            serde_json::json!({"messages": msg, "lora_path": ["a", "b"]}),
+            serde_json::json!({"messages": msg, "cache_salt": 123}),
+            serde_json::json!({"messages": msg, "lora_request": {"lora_name": "a"}}),
+            serde_json::json!({"messages": msg, "chat_template": "{{ messages }}"}),
+            serde_json::json!({"messages": msg, "truncate_prompt_tokens": 128}),
+        ] {
+            assert_eq!(id(opaque), CacheIdentity::Unknown);
         }
     }
 

@@ -806,10 +806,14 @@ impl KvAwarePolicy {
                 &healthy,
                 &candidates,
                 bindings.iter().map(|binding| {
-                    let ready = binding.cache_key.is_some()
-                        && placement_enabled
-                        && binding.matches.is_target_ready(&binding.target);
-                    (binding.block_size, ready)
+                    if binding.cache_key.is_none() {
+                        super::smetric::KvBinding::Unmanaged
+                    } else if placement_enabled && binding.matches.is_target_ready(&binding.target)
+                    {
+                        super::smetric::KvBinding::Ready(binding.block_size)
+                    } else {
+                        super::smetric::KvBinding::Unavailable
+                    }
                 }),
                 context,
             );

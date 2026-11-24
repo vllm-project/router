@@ -7,7 +7,6 @@ pub(super) struct FirstTokenObserver {
     finished: bool,
 }
 
-#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Observation {
     Pending,
@@ -15,18 +14,7 @@ pub(super) enum Observation {
     End,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct StreamObservation {
-    /// True once any generated output is observed (including text-only fallbacks).
-    pub(super) saw_output: bool,
-    /// Verified generated token count from explicit `token_ids` fields only;
-    /// zero for text/delta fallback events whose framing cannot verify token count.
-    pub(super) verified_tokens: u32,
-    pub(super) ended: bool,
-}
-
 impl FirstTokenObserver {
-    #[cfg(test)]
     pub(super) fn observe(&mut self, bytes: &[u8]) -> Observation {
         if self.finished {
             return Observation::End;
@@ -64,68 +52,6 @@ impl FirstTokenObserver {
         }
         Observation::Pending
     }
-
-    pub(super) fn observe_stream(&mut self, bytes: &[u8]) -> StreamObservation {
-        if self.finished {
-            return StreamObservation {
-                saw_output: false,
-                verified_tokens: 0,
-                ended: true,
-            };
-        }
-        let mut step = StreamObservation::default();
-        for part in bytes.split_inclusive(|byte| *byte == b'\n') {
-            if self.line.len() + self.data.len() + part.len() > 1024 * 1024 {
-                self.finished = true;
-                self.line.clear();
-                self.data.clear();
-                step.ended = true;
-                return step;
-            }
-            self.line.extend_from_slice(part);
-            if part.last() != Some(&b'\n') {
-                continue;
-            }
-            let mut line = std::mem::take(&mut self.line);
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            if line.is_empty() {
-                let data = std::mem::take(&mut self.data);
-                match classify_tokens(&data) {
-                    FrameKind::Pending => {}
-                    FrameKind::VerifiedOutput(tokens) => {
-                        step.saw_output = true;
-                        step.verified_tokens = step.verified_tokens.saturating_add(tokens);
-                    }
-                    FrameKind::UnverifiedOutput => {
-                        step.saw_output = true;
-                    }
-                    FrameKind::End => {
-                        self.finished = true;
-                        step.ended = true;
-                        return step;
-                    }
-                }
-            } else if let Some(data) = line.strip_prefix(b"data:") {
-                if !self.data.is_empty() {
-                    self.data.push(b'\n');
-                }
-                self.data
-                    .extend_from_slice(data.strip_prefix(b" ").unwrap_or(data));
-            }
-        }
-        step
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum FrameKind {
-    Pending,
-    VerifiedOutput(u32),
-    UnverifiedOutput,
-    End,
 }
 
 fn nonempty(value: Option<&Value>) -> bool {
@@ -136,47 +62,27 @@ fn function_output(value: &Value) -> bool {
     nonempty(value.get("name")) || nonempty(value.get("arguments"))
 }
 
-#[cfg(test)]
 fn classify(data: &[u8]) -> Observation {
-    match classify_tokens(data) {
-        FrameKind::Pending => Observation::Pending,
-        FrameKind::VerifiedOutput(_) | FrameKind::UnverifiedOutput => Observation::Output,
-        FrameKind::End => Observation::End,
-    }
-}
-
-fn classify_tokens(data: &[u8]) -> FrameKind {
     if data == b"[DONE]" {
-        return FrameKind::End;
+        return Observation::End;
     }
     let Ok(value) = serde_json::from_slice::<Value>(data) else {
-        return FrameKind::Pending;
+        return Observation::Pending;
     };
     if value.get("error").is_some_and(|error| !error.is_null()) {
-        return FrameKind::End;
+        return Observation::End;
     }
     let Some(choices) = value.get("choices").and_then(Value::as_array) else {
-        return FrameKind::Pending;
+        return Observation::Pending;
     };
-    if choices.len() == 1 {
-        if let Some(ids) = choices[0]
-            .get("token_ids")
-            .and_then(Value::as_array)
-            .filter(|ids| !ids.is_empty())
-        {
-            return FrameKind::VerifiedOutput(ids.len() as u32);
-        }
-    }
     for choice in choices {
-        if choice
-            .get("token_ids")
-            .and_then(Value::as_array)
-            .is_some_and(|ids| !ids.is_empty())
+        if nonempty(choice.get("text"))
+            || choice
+                .get("token_ids")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| !ids.is_empty())
         {
-            return FrameKind::UnverifiedOutput;
-        }
-        if nonempty(choice.get("text")) {
-            return FrameKind::UnverifiedOutput;
+            return Observation::Output;
         }
         if let Some(delta) = choice.get("delta") {
             if ["content", "reasoning", "reasoning_content", "refusal"]
@@ -192,11 +98,11 @@ fn classify_tokens(data: &[u8]) -> FrameKind {
                             .any(|call| call.get("function").is_some_and(function_output))
                     })
             {
-                return FrameKind::UnverifiedOutput;
+                return Observation::Output;
             }
         }
     }
-    FrameKind::Pending
+    Observation::Pending
 }
 
 #[cfg(test)]
@@ -283,28 +189,5 @@ mod tests {
             observer.observe(b"data: {\"choices\":[{\"text\":\"late\"}]}\n\n"),
             Observation::End,
         );
-    }
-
-    #[test]
-    fn text_fallback_and_multichoice_signal_output_without_unverified_token_count() {
-        let mut observer = FirstTokenObserver::default();
-        let text_step = observer.observe_stream(
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"coalesced text\"}}]}\n\n",
-        );
-        assert!(text_step.saw_output);
-        assert_eq!(text_step.verified_tokens, 0);
-        assert!(!text_step.ended);
-
-        let multi_choice = observer.observe_stream(
-            b"data: {\"choices\":[{\"index\":0,\"token_ids\":[1,2]},{\"index\":1,\"token_ids\":[3]}]}\n\n",
-        );
-        assert!(multi_choice.saw_output);
-        assert_eq!(multi_choice.verified_tokens, 0);
-
-        let verified = observer.observe_stream(
-            b"data: {\"choices\":[{\"token_ids\":[11,12,13],\"text\":\"abc\"}]}\n\n",
-        );
-        assert!(verified.saw_output);
-        assert_eq!(verified.verified_tokens, 3);
     }
 }

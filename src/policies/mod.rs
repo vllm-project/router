@@ -59,74 +59,45 @@ pub struct RoutingContext<'a> {
     pub route: &'a str,
 }
 
-/// Number of consecutive pure-decode tokens aggregated into one TPOT sample.
-pub const DECODE_SAMPLE_TOKENS: u32 = 8;
-
 /// Shared per-worker state; trackers reuse its Arc rather than allocate callbacks.
 pub trait RequestObserver: Send + Sync {
     fn charge(&self, work: u64);
     /// Release charged work; elapsed is present only for a first-token observation.
     fn finish(&self, work: u64, elapsed: Option<Duration>);
-    /// Release `work` from pending while recording `sample_work / elapsed` when learning prefill rate.
-    fn finish_with_sample(&self, work: u64, sample_work: u64, elapsed: Option<Duration>) {
-        let _ = sample_work;
-        self.finish(work, elapsed);
-    }
-    /// Return the count of *other* co-resident requests on this worker iff no
-    /// prefill work is currently pending (`pending == 0`), or `None` when
-    /// contaminated by concurrent prefill or when online decode learning is off.
-    fn pure_decode_peers(&self) -> Option<usize> {
-        None
-    }
-    /// Record one pure-decode inter-token latency sample `(peers, tpot_secs)`.
-    fn record_decode_step(&self, _peers: usize, _tpot_secs: f64) {}
 }
 
-#[derive(Clone, Copy, Debug)]
-enum TrackerPhase {
-    Prefill {
-        started: Instant,
-    },
-    Decode {
-        /// `(window_start, peers, tokens_accumulated)` during an uncontaminated pure-decode run.
-        window_anchor: Option<(Instant, usize, u32)>,
-    },
-    Done,
-}
-
-/// Own one prefill work reservation (released once on first token or Drop) and
-/// optionally sample pure-decode inter-token intervals across streaming output.
+/// Own one prefill work reservation, released exactly once on first token,
+/// non-streaming timer/completion, or Drop.
 pub struct RequestTracker {
     observer: Option<Arc<dyn RequestObserver>>,
     work: u64,
-    sample_work: u64,
+    started: Instant,
     sample_rate: bool,
     estimated_prefill: Option<Duration>,
-    phase: TrackerPhase,
+    on_commit: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl RequestTracker {
     pub fn new(observer: Arc<dyn RequestObserver>, work: u64) -> Self {
-        Self::new_with_sample(observer, work, work, None)
-    }
-
-    pub(crate) fn new_with_sample(
-        observer: Arc<dyn RequestObserver>,
-        work: u64,
-        sample_work: u64,
-        estimated_prefill: Option<Duration>,
-    ) -> Self {
         observer.charge(work);
         Self {
             observer: Some(observer),
             work,
-            sample_work,
+            started: Instant::now(),
             sample_rate: true,
-            estimated_prefill,
-            phase: TrackerPhase::Prefill {
-                started: Instant::now(),
-            },
+            estimated_prefill: None,
+            on_commit: None,
         }
+    }
+
+    pub(crate) fn with_estimated_prefill(mut self, est: Option<Duration>) -> Self {
+        self.estimated_prefill = est;
+        self
+    }
+
+    pub(crate) fn with_on_commit(mut self, f: impl FnOnce() + Send + 'static) -> Self {
+        self.on_commit = Some(Box::new(f));
+        self
     }
 
     pub(crate) fn without_rate_sample(mut self) -> Self {
@@ -139,87 +110,37 @@ impl RequestTracker {
     }
 
     pub(crate) fn release_pending_without_sample(&mut self) {
-        if matches!(self.phase, TrackerPhase::Prefill { .. }) {
-            if let Some(observer) = self.observer.take() {
-                observer.finish_with_sample(self.work, self.sample_work, None);
-            }
-            self.phase = TrackerPhase::Done;
-        }
+        self.finish(None, false);
+    }
+
+    pub(crate) fn commit_without_sample(&mut self) {
+        self.finish(None, true);
     }
 
     pub fn on_first_token(&mut self) {
-        self.on_output_tokens(1);
+        self.finish(self.sample_rate.then(|| self.started.elapsed()), true);
     }
 
-    /// Signal that output has started (releasing prefill work and recording TTFT)
-    /// without contributing an unverified token count to decode TPOT / beta learning.
-    pub fn on_first_output_unverified(&mut self) {
-        let Some(observer) = self.observer.as_ref() else {
-            return;
-        };
-        if let TrackerPhase::Prefill { started } = self.phase {
-            let now = Instant::now();
-            let elapsed = self
-                .sample_rate
-                .then(|| now.saturating_duration_since(started));
-            observer.finish_with_sample(self.work, self.sample_work, elapsed);
-            self.phase = TrackerPhase::Decode {
-                window_anchor: None,
-            };
-        }
+    #[cfg(test)]
+    pub(crate) fn backdate_for_test(&mut self, delta: Duration) {
+        self.started -= delta;
     }
 
-    pub fn on_output_tokens(&mut self, count: u32) {
-        if count == 0 {
-            return;
+    fn finish(&mut self, elapsed: Option<Duration>, commit: bool) {
+        if let Some(observer) = self.observer.take() {
+            observer.finish(self.work, elapsed);
         }
-        let Some(observer) = self.observer.as_ref() else {
-            return;
-        };
-        let now = Instant::now();
-        match &mut self.phase {
-            TrackerPhase::Prefill { started } => {
-                let elapsed = self
-                    .sample_rate
-                    .then(|| now.saturating_duration_since(*started));
-                observer.finish_with_sample(self.work, self.sample_work, elapsed);
-                let window_anchor = observer.pure_decode_peers().map(|peers| (now, peers, 0));
-                self.phase = TrackerPhase::Decode { window_anchor };
+        if commit {
+            if let Some(on_commit) = self.on_commit.take() {
+                on_commit();
             }
-            TrackerPhase::Decode { window_anchor } => match observer.pure_decode_peers() {
-                None => {
-                    // Concurrent prefill started on this worker; discard partial decode window.
-                    *window_anchor = None;
-                }
-                Some(peers) => match *window_anchor {
-                    None => {
-                        *window_anchor = Some((now, peers, 0));
-                    }
-                    Some((_, win_peers, _)) if win_peers != peers => {
-                        *window_anchor = Some((now, peers, 0));
-                    }
-                    Some((win_start, _, win_tokens)) => {
-                        let total_tokens = win_tokens.saturating_add(count);
-                        if total_tokens >= DECODE_SAMPLE_TOKENS {
-                            let dt = now.saturating_duration_since(win_start).as_secs_f64();
-                            if dt > 0.0 {
-                                observer.record_decode_step(peers, dt / f64::from(total_tokens));
-                            }
-                            *window_anchor = Some((now, peers, 0));
-                        } else {
-                            *window_anchor = Some((win_start, peers, total_tokens));
-                        }
-                    }
-                },
-            },
-            TrackerPhase::Done => {}
         }
     }
 }
 
 impl Drop for RequestTracker {
     fn drop(&mut self) {
-        self.release_pending_without_sample();
+        self.finish(None, false);
     }
 }
 

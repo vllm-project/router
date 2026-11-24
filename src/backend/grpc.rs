@@ -33,7 +33,7 @@ use crate::protocols::spec::Usage;
 
 const DP_RANK_METADATA: &str = "x-data-parallel-rank";
 
-pub(crate) type OutputCallback = Arc<dyn Fn(u32) + Send + Sync + 'static>;
+pub(crate) type FirstOutputCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub struct GrpcStreamTask {
@@ -156,7 +156,7 @@ impl GrpcEngineBackend {
         &self,
         worker_url: &str,
         prepared: PreparedRequest,
-        on_output: Option<OutputCallback>,
+        on_first_output: Option<FirstOutputCallback>,
     ) -> Response {
         let PreparedRequest {
             request,
@@ -268,7 +268,7 @@ impl GrpcEngineBackend {
             request_timeout: self.request_timeout,
             stages,
             t_req,
-            on_output,
+            on_first_output,
         };
         if request.stream {
             stream_openai(stream, reply, n_prompt_tokens).await
@@ -296,7 +296,7 @@ struct ChatReply {
     request_timeout: Duration,
     stages: serde_json::Value,
     t_req: Instant,
-    on_output: Option<OutputCallback>,
+    on_first_output: Option<FirstOutputCallback>,
 }
 
 fn fill_engine_ms(stages: &mut serde_json::Value) {
@@ -339,7 +339,7 @@ async fn stream_openai(
         request_timeout,
         mut stages,
         t_req,
-        on_output,
+        on_first_output,
     } = reply;
     let header_stages = stages.clone();
     let stages_on = crate::backend::stages_enabled();
@@ -351,6 +351,7 @@ async fn stream_openai(
             .map(|t| decode_stream(&**t, prompt_ids.as_ref(), skip_special));
         let mut first = true;
         let mut first_token_logged = false;
+        let mut first_output_seen = false;
         let mut prompt_tokens = n_prompt_tokens as u32;
         let mut completion_tokens = 0u32;
         loop {
@@ -397,7 +398,12 @@ async fn stream_openai(
                             }
                         };
                     let generated_output = has_generated_output(&msg, &text);
-                    notify_output(&msg, &text, on_output.as_ref());
+                    notify_first_output(
+                        &msg,
+                        &text,
+                        &mut first_output_seen,
+                        on_first_output.as_ref(),
+                    );
                     if !first_token_logged && !text.is_empty() {
                         stages["first_token_ms"] =
                             serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
@@ -527,7 +533,7 @@ async fn collect_openai(
         request_timeout,
         mut stages,
         t_req,
-        on_output,
+        on_first_output,
     } = reply;
     let mut detok = tok
         .as_ref()
@@ -537,6 +543,7 @@ async fn collect_openai(
     let mut finish = None;
     let mut prompt_tokens = prompt_ids.len() as u32;
     let mut completion_tokens = 0u32;
+    let mut first_output_seen = false;
     loop {
         let item = match tokio::time::timeout(request_timeout, stream.next()).await {
             Ok(Some(item)) => item,
@@ -565,7 +572,12 @@ async fn collect_openai(
                             return (StatusCode::BAD_GATEWAY, error).into_response();
                         }
                     };
-                notify_output(&msg, &delta, on_output.as_ref());
+                notify_first_output(
+                    &msg,
+                    &delta,
+                    &mut first_output_seen,
+                    on_first_output.as_ref(),
+                );
                 if stages.get("first_token_ms").is_none() && !delta.is_empty() {
                     stages["first_token_ms"] =
                         serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
@@ -631,25 +643,18 @@ async fn collect_openai(
     resp
 }
 
-fn notify_output(msg: &super::pb::GenerateResponse, text: &str, callback: Option<&OutputCallback>) {
-    let tokens = generated_token_count(msg, text);
-    if tokens > 0 {
+fn notify_first_output(
+    msg: &super::pb::GenerateResponse,
+    text: &str,
+    first_output_seen: &mut bool,
+    callback: Option<&FirstOutputCallback>,
+) {
+    if !*first_output_seen && has_generated_output(msg, text) {
+        *first_output_seen = true;
         if let Some(callback) = callback {
-            callback(tokens);
+            callback();
         }
     }
-}
-
-fn generated_token_count(msg: &super::pb::GenerateResponse, text: &str) -> u32 {
-    msg.outputs.as_ref().map_or(0, |outputs| {
-        if outputs.num_tokens > 0 {
-            outputs.num_tokens
-        } else if !outputs.token_ids.is_empty() {
-            outputs.token_ids.len() as u32
-        } else {
-            u32::from(!text.is_empty())
-        }
-    })
 }
 
 fn output_text_and_finish(
@@ -719,13 +724,14 @@ mod tests {
         };
         assert!(!has_generated_output(&prompt_info, ""));
 
-        let tokens_observed = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let tokens_observed_callback = tokens_observed.clone();
-        let callback: OutputCallback = Arc::new(move |count| {
-            tokens_observed_callback.fetch_add(count, Ordering::Relaxed);
+        let decode_started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let decode_started_callback = decode_started.clone();
+        let callback: FirstOutputCallback = Arc::new(move || {
+            decode_started_callback.fetch_add(1, Ordering::Relaxed);
         });
-        notify_output(&prompt_info, "", Some(&callback));
-        assert_eq!(tokens_observed.load(Ordering::Relaxed), 0);
+        let mut first_output_seen = false;
+        notify_first_output(&prompt_info, "", &mut first_output_seen, Some(&callback));
+        assert_eq!(decode_started.load(Ordering::Relaxed), 0);
 
         let output = GenerateResponse {
             prompt_info: None,
@@ -736,9 +742,9 @@ mod tests {
             }),
         };
         assert!(has_generated_output(&output, ""));
-        notify_output(&output, "", Some(&callback));
-        notify_output(&output, "", Some(&callback));
-        assert_eq!(tokens_observed.load(Ordering::Relaxed), 2);
+        notify_first_output(&output, "", &mut first_output_seen, Some(&callback));
+        notify_first_output(&output, "", &mut first_output_seen, Some(&callback));
+        assert_eq!(decode_started.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -788,8 +794,8 @@ mod tests {
             .dispatch_with_first_output(
                 &worker.grpc_url,
                 prepared,
-                Some(Arc::new(move |tokens| {
-                    observed.fetch_add(tokens as usize, Ordering::SeqCst);
+                Some(Arc::new(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
                 })),
             )
             .await;
@@ -798,14 +804,15 @@ mod tests {
         while count.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(
-            count.load(Ordering::SeqCst) >= 1,
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
             "generated output must notify before body polling or producer cleanup"
         );
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
             .await
             .unwrap();
         assert!(!bytes.is_empty());
-        assert!(count.load(Ordering::SeqCst) >= 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

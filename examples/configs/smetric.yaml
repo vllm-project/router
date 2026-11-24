@@ -1,57 +1,20 @@
 # SMetric selection: --policy kv_aware --smetric-config <this file>
-# These are example starting values. Calibrate the cost model for your deployment
-# and set the TTFT and TPOT budgets to your service's latency requirements.
+# Set your TTFT SLO in token units; per-worker prefill rate is learned online
+# (rolling P90 over streaming/gRPC first-token or P/D prefill latencies).
 # Design and parameter roles: https://arxiv.org/html/2607.08565v2#S4.SS2
 
-# Deployment calibration
-# Estimated uncached prefill work = C_LIN * n + C_ATT * n * (L - n / 2).
-# L is the full prompt length; n is its uncached length, both in characters.
-# Local GPU KV-event token hits are converted to equivalent characters before
-# evaluating this model.
-# Only the ratio C_ATT / C_LIN affects dimensionless routing when PREFILL_RATE is
-# learned online; C_LIN defaults to 1.0 when omitted.
-C_LIN: 1.0
-
-# Context-dependent attention work, in cost units/character^2.
-# Increase relative to C_LIN if profiling shows stronger long-context cost.
-C_ATT: 0.0001
-
-# Optional fixed processing rate in the SAME cost units/second as above (> 0).
-# Omit this key to learn a per-worker median (P50) concurrency-scaled prefill
-# rate online from first-token observations.
-# PREFILL_RATE: 10000.0
-
-# Routing controls
-# Unified dimensionless load functional on colocated worker w:
-#   Phi(w) = ((Q_w + C_w) * (B_w + 1)) / (R_w * T_SLO(L)) + DECODE_WEIGHT * B_w
-# where T_SLO(L) = SLACK * (TTFT_SLO_BASE + TTFT_SLO_PER_CHAR * L), and B_w is
-# the number of active co-resident requests on worker w (0 in P/D prefill mode).
-# A worker meets the latency budget iff Phi(w) <= 1.0.
-SLACK: 1.0
-
-# Standing decode contention weight (beta, alias BETA) per co-resident request.
-# Omit this key to start from the 0.5 default and learn beta online from pure-decode
-# inter-token step slopes (d_TPOT / d_B) normalized by (TPOT_SLO - tau_1).
-# Set an explicit nonnegative value (e.g. 0.5) to pin a fixed decode weight.
-# DECODE_WEIGHT: 0.5
-
-# Target inter-token decode latency SLO in seconds (> 0), used to normalize
-# online DECODE_WEIGHT learning when DECODE_WEIGHT is omitted.
-TPOT_SLO: 0.020
-
-# Train online prefill rate on all bound KV-event requests, including confirmed
-# 0-block cold misses. Recommended true when omitting PREFILL_RATE under KV Events.
-SAMPLE_ALL_EVENT_REQUESTS: true
-
-# Cache-affinity evidence threshold, in [0, 1]. A candidate's local cached prefix
-# must exceed HIT_RATIO * the expected reusable history to claim session affinity.
-HIT_RATIO: 0.1
-
-# User TTFT budget: BASE + PER_CHAR * L, in seconds.
+# User TTFT budget (seconds): TTFT_SLO_SECS + TTFT_SLO_SECS_PER_1K_TOKENS * (L / 1000),
+# where L is prompt length in tokens (estimated as chars / 4 without KV Events).
 # Both terms must be nonnegative, with at least one positive.
-TTFT_SLO_BASE: 0.2
-TTFT_SLO_PER_CHAR: 0.0001
+TTFT_SLO_SECS: 1.0
+TTFT_SLO_SECS_PER_1K_TOKENS: 0.0625
 
-# Tree maintenance (applies only to request-history Tree routing without KV Events).
-MAX_TREE_SIZE: 67108864
-EVICTION_INTERVAL_SECS: 30
+# Optional context length L_eq (tokens) where attention matches linear prefill cost:
+# prefill_cost = n + n * (L - n / 2) / L_eq, for n = max(L - hit, 0) uncached tokens.
+# Defaults to 16384 (GQA dense/MoE and dense MLA). Set 0 for a pure linear model
+# (recommended for DSA / sparse-attention models; use ~65536 for hybrid linear/SWA).
+# ATTENTION_CROSSOVER_TOKENS: 16384
+
+# Optional fixed processing rate in linear-token equivalents/sec (> 0). Omit to
+# learn online; set explicitly for pure non-streaming HTTP deployments.
+# PREFILL_RATE: 10000.0

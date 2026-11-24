@@ -75,8 +75,9 @@ async fn run_event_placement(shared_mode: bool) {
     let hot = EventWorker::spawn("hot").await;
     let urls = vec![cold.url.clone(), hot.url.clone()];
     let smetric: Box<vllm_router_rs::config::SMetricConfig> = serde_yaml::from_str(
-        "C_LIN: 1\nC_ATT: 0\nPREFILL_RATE: 1000000\nSLACK: 1\nDECODE_WEIGHT: 0\nHIT_RATIO: 0.1\nTTFT_SLO_BASE: 10\nTTFT_SLO_PER_CHAR: 0\nEVICTION_INTERVAL_SECS: 0\n"
-    ).unwrap();
+        "TTFT_SLO_SECS: 10\nATTENTION_CROSSOVER_TOKENS: 0\nPREFILL_RATE: 1000000\nEVICTION_INTERVAL_SECS: 0\n",
+    )
+    .unwrap();
     let policy = if shared_mode {
         serde_json::from_value(json!({"type":"kv_aware", "smetric":smetric})).unwrap()
     } else {

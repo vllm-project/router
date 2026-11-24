@@ -50,6 +50,9 @@ impl Drop for Backend {
 }
 
 async fn backend_reply(State(id): State<String>, Json(body): Json<Value>) -> Response {
+    if body.get("fail").and_then(Value::as_bool) == Some(true) {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     if body.get("hold").and_then(Value::as_bool) == Some(true) {
         let first = if body.get("silent").and_then(Value::as_bool) == Some(true) {
             None
@@ -153,8 +156,8 @@ async fn wait_until_idle(ctx: &AppContext) {
 #[tokio::test]
 async fn forced_program_target_keeps_smetric_work_until_request_cleanup() {
     let policy = serde_json::from_value(json!({"type":"kv_aware", "smetric": {
-        "C_LIN":1, "C_ATT":0, "PREFILL_RATE":1, "SLACK":1, "HIT_RATIO":0.1,
-        "TTFT_SLO_BASE":100, "TTFT_SLO_PER_CHAR":0, "EVICTION_INTERVAL_SECS":0
+        "TTFT_SLO_SECS": 100, "ATTENTION_CROSSOVER_TOKENS": 0, "PREFILL_RATE": 1,
+        "EVICTION_INTERVAL_SECS": 0
     }}))
     .unwrap();
     let (app, ctx, workers) = setup_with_program(policy, true).await;
@@ -237,8 +240,37 @@ async fn kv_aware_smetric_mode_keeps_http_continuation_affinity_under_load() {
 }
 
 #[tokio::test]
-async fn smetric_continuation_reuses_the_warmed_worker() {
-    let (app, ctx, _workers) = setup(smetric()).await;
+async fn smetric_continuation_reuses_the_warmed_worker_and_ignores_5xx() {
+    let (app, ctx, workers) = setup(smetric()).await;
+    // A failed non-streaming 500 must NOT populate the HTTP prefix tree.
+    let failed_prefix = "failed prefix never cached ".repeat(20);
+    let failed = app
+        .clone()
+        .oneshot(request(
+            "/v1/completions",
+            json!({"model":"test-model", "prompt":failed_prefix, "max_tokens":1, "fail":true}),
+            "1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    wait_until_idle(&ctx).await;
+    let w0 = ctx.worker_registry.get_by_url(&workers[0].url).unwrap();
+    w0.increment_load();
+    let after_fail = reply_json(
+        app.clone()
+            .oneshot(request(
+                "/v1/completions",
+                json!({"model":"test-model", "prompt":format!("{failed_prefix}next"), "max_tokens":1}),
+                "2",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(after_fail["id"], "worker-1");
+    w0.decrement_load();
+
     let prefix = "shared conversation history ".repeat(20);
     let first = app
         .clone()

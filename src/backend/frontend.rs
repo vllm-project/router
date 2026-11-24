@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use axum::response::Response;
 
-use super::grpc::{GrpcEngineBackend, OutputCallback};
+use super::grpc::{FirstOutputCallback, GrpcEngineBackend};
 use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
 use crate::protocols::spec::ChatCompletionRequest;
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
@@ -192,10 +192,10 @@ impl EngineFrontend {
         &self,
         worker_url: &str,
         prepared: PreparedRequest,
-        on_output: Option<OutputCallback>,
+        on_first_output: Option<FirstOutputCallback>,
     ) -> Response {
         self.grpc
-            .dispatch_prepared(worker_url, prepared, on_output)
+            .dispatch_prepared(worker_url, prepared, on_first_output)
             .await
     }
 

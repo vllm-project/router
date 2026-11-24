@@ -1,4 +1,4 @@
-//! SMetric: session cache affinity with a prefill-work fallback.
+//! SMetric: session-centric, SLO-aware routing with a prefill-work fallback.
 use super::{RequestObserver, RequestTracker, RoutingContext};
 mod kv;
 use crate::config::SMetricConfig;
@@ -7,35 +7,51 @@ use crate::metrics::RouterMetrics;
 use crate::protocols::spec::{CacheIdentity, RoutingPrompt};
 use crate::tree::Tree;
 use dashmap::DashMap;
+pub(in crate::policies) use kv::KvBinding;
 use kv::PrefixMatch;
 use parking_lot::{Mutex, RwLock};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Weak};
 use std::time::Duration;
 use tracing::{debug, warn};
 
-/// Cold-start default for `DECODE_WEIGHT` (`beta`) when omitted from config:
-/// places the saturation boundary at `B* = 1 / 0.5 = 2` co-resident decode streams
-/// until pure-decode step observations excite online linear slope estimation.
-pub(super) const DEFAULT_BETA: f64 = 0.5;
-const BETA_MIN: f64 = 0.02;
-const BETA_MAX: f64 = 2.0;
-const BETA_UNSET: u64 = u64::MAX;
-const BETA_SAMPLE_WINDOW: usize = 128;
-const BETA_MIN_BUCKET_SAMPLES: usize = 2;
+/// Characters per token used when KV token IDs are absent (HTTP text routing).
+const CHARS_PER_TOKEN: f64 = 4.0;
+/// Cache-affinity evidence threshold: a warm worker must hold more than 50% of
+/// the request's expected reusable history to claim session stickiness.
+const HIT_RATIO: f64 = 0.5;
+const RATE_WINDOW: usize = 64;
+const RATE_MIN_SAMPLES: usize = 8;
+/// Rolling P90 tracks peak prefill throughput and avoids the flapping trap
+/// where congestion-depressed mean/median rates trigger unnecessary migration.
+const RATE_QUANTILE: f64 = 0.9;
+/// Safety ceiling on single-request prefill cost so `pending` cannot saturate `u64::MAX`.
+const MAX_PREFILL_COST: f64 = (1u64 << 50) as f64;
 
 #[derive(Debug)]
 pub(super) struct SMetricStrategy {
     config: SMetricConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
-    model_betas: DashMap<String, Arc<BetaState>>,
     round_robin: AtomicUsize,
     states: DashMap<usize, Arc<WorkerState>>,
-    retired: RwLock<HashMap<usize, Weak<dyn Worker>>>,
+    retired: Arc<RwLock<HashMap<usize, Weak<dyn Worker>>>>,
     fallback_warnings: AtomicU8,
     eviction_shutdown: Option<mpsc::Sender<()>>,
     eviction_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy)]
+struct Candidate {
+    idx: usize,
+    hit: f64,
+    cost: u64,
+    queued: u64,
+    score: u64,
+    meets: bool,
+    rate: Option<f64>,
+    can_sample: bool,
+    used_tree: bool,
 }
 
 impl SMetricStrategy {
@@ -45,6 +61,19 @@ impl SMetricStrategy {
 
     fn tenant_key(worker: &Arc<dyn Worker>) -> String {
         format!("{}#{:x}", worker.url(), Self::instance_id(worker))
+    }
+
+    /// Namespace scoped HTTP prompts inside the worker's single per-model `Tree` using a
+    /// disjoint fixed-length prefix so all scopes share one unified `MAX_TREE_SIZE` LRU.
+    fn scoped_tree_text(prompt: &RoutingPrompt) -> Option<(String, usize)> {
+        match &prompt.cache_identity {
+            CacheIdentity::Shared => Some((format!("0\0{}", prompt.text), 2)),
+            CacheIdentity::Scoped(scope) => Some((
+                format!("1{scope}\0{}", prompt.text),
+                scope.chars().count() + 2,
+            )),
+            CacheIdentity::Unknown => None,
+        }
     }
 
     pub fn new(config: SMetricConfig) -> Self {
@@ -64,11 +93,16 @@ impl SMetricStrategy {
                     let Some(trees) = eviction_trees.upgrade() else {
                         break;
                     };
-                    for entry in trees.iter() {
+                    // Clone Arc<Tree> handles first so DashMap shard locks are never held across eviction.
+                    let snapshot: Vec<Arc<Tree>> = trees
+                        .iter()
+                        .map(|entry| Arc::clone(entry.value()))
+                        .collect();
+                    for tree in snapshot {
                         if receiver.try_recv().is_ok() {
                             return;
                         }
-                        entry.value().evict_tenant_by_size(max_size);
+                        tree.evict_tenant_by_size(max_size);
                     }
                 }
             });
@@ -77,9 +111,8 @@ impl SMetricStrategy {
         Self {
             config,
             trees,
-            model_betas: DashMap::new(),
             states: DashMap::new(),
-            retired: RwLock::new(HashMap::new()),
+            retired: Arc::new(RwLock::new(HashMap::new())),
             round_robin: AtomicUsize::new(0),
             fallback_warnings: AtomicU8::new(0),
             eviction_shutdown,
@@ -87,210 +120,220 @@ impl SMetricStrategy {
         }
     }
 
-    fn effective_beta(&self, worker: &Arc<dyn Worker>, state: Option<&WorkerState>) -> f64 {
-        self.config.decode_weight.unwrap_or_else(|| {
-            state
-                .and_then(|s| s.beta.get())
-                .or_else(|| {
-                    self.model_betas
-                        .get(worker.model_id())
-                        .and_then(|b| b.get())
-                })
-                .unwrap_or(DEFAULT_BETA)
-        })
+    /// Prefill cost in linear-token equivalents: `n + n * (L - n / 2) / L_eq`
+    /// when `ATTENTION_CROSSOVER_TOKENS > 0`, or pure linear `n` when `0`.
+    fn prefill_cost(&self, len: f64, hit: f64) -> f64 {
+        let new = (len - hit).max(0.0);
+        let raw = if self.config.attention_crossover_tokens > 0.0 {
+            new + new * (len - new / 2.0) / self.config.attention_crossover_tokens
+        } else {
+            new
+        };
+        raw.clamp(0.0, MAX_PREFILL_COST)
     }
 
-    fn http_tree_key(worker: &Arc<dyn Worker>, prompt: &RoutingPrompt) -> Option<String> {
-        match &prompt.cache_identity {
-            CacheIdentity::Shared => Some(worker.model_id().to_string()),
-            CacheIdentity::Scoped(scope) => Some(format!("{}\0{scope}", worker.model_id())),
-            CacheIdentity::Unknown => None,
-        }
+    fn ttft_budget_secs(&self, len: f64) -> f64 {
+        self.config.ttft_slo_secs + self.config.ttft_slo_secs_per_1k_tokens * (len / 1000.0)
     }
 
     fn select_prefill(
         &self,
         workers: &[Arc<dyn Worker>],
-        prompt: &RoutingPrompt,
-        passes_turn_gate: bool,
-        colocated: bool,
+        context: &RoutingContext<'_>,
         event_hits: Option<&[PrefixMatch]>,
         loads: Option<&[usize]>,
     ) -> Option<(usize, RequestTracker, u64)> {
+        let input_tokens = context.kv.as_ref().map(|kv| kv.token_ids.len());
+        let total_chars = context.prompt.map_or(0, |p| p.text.chars().count());
+        let len = if let Some(n) = input_tokens {
+            n as f64
+        } else if context.prompt.is_some() {
+            total_chars as f64 / CHARS_PER_TOKEN
+        } else {
+            return None;
+        };
+        let chars_to_tokens = if total_chars > 0 {
+            len / total_chars as f64
+        } else {
+            0.0
+        };
+        // Chat sets `est_hit_chars` through the last assistant turn; `/v1/completions`
+        // lacks turn boundaries so `est_hit_chars == total_chars` (cold turns have
+        // `hit == 0`, fail `hit > HIT_RATIO * history`, and balance). Token-ID
+        // requests without text (`prompt == None`) use `history == len`.
+        let history = match context.prompt {
+            Some(p) if total_chars > 0 => p.est_hit_chars.min(total_chars) as f64 * chars_to_tokens,
+            _ => len,
+        };
+        let tree_allowed = context.kv.as_ref().is_none_or(|kv| {
+            kv.cache_salt.is_none_or(str::is_empty) && kv.lora_name.is_none_or(str::is_empty)
+        });
+        let scoped_prompt = context
+            .prompt
+            .filter(|_| tree_allowed)
+            .and_then(Self::scoped_tree_text);
+        let can_write_tree =
+            scoped_prompt.is_some() && context.prompt.is_some_and(|p| !p.text.is_empty());
+
         let retired = self.retired.read();
-        let l = prompt.text.chars().count();
-        let budget = self.config.slack
-            * (self.config.ttft_slo_base + self.config.ttft_slo_per_char * l as f64);
+        let budget = self.ttft_budget_secs(len);
         let start = self.round_robin.fetch_add(1, Ordering::Relaxed) % workers.len().max(1);
-        // min: (index, meets, phi, prefill_work, coloc_load, queued, score, own_cost)
-        let mut min: Option<(usize, bool, Option<f64>, u64, usize, u64, u64, u64)> = None;
-        // prev: (index, hit, own_cost, meets, score, prefill_work)
-        let mut prev: Option<(usize, usize, u64, bool, u64, u64)> = None;
-        let mut any_meets_slo = false;
+        let mut min: Option<Candidate> = None;
+        let mut prev: Option<Candidate> = None;
+        let mut any_meets_ttft = false;
+
         for offset in 0..workers.len() {
             let idx = (start + offset) % workers.len();
             let worker = &workers[idx];
             if retired.contains_key(&Self::instance_id(worker)) || !worker.is_available() {
                 continue;
             }
-            let hit = if let Some(hits) = &event_hits {
-                hits[idx].chars
-            } else if let Some(tree_key) = Self::http_tree_key(worker, prompt) {
-                self.trees.get(&tree_key).as_ref().map_or(0, |tree| {
-                    tree.prefix_match_tenant_char_count(&prompt.text, &Self::tenant_key(worker))
-                })
-            } else {
-                0
+            let (hit, can_sample, used_tree) = match event_hits.map(|hits| hits[idx]) {
+                Some(PrefixMatch::Bound(tokens)) => (tokens as f64, input_tokens != Some(0), false),
+                Some(PrefixMatch::Unavailable) => (0.0, false, false),
+                Some(PrefixMatch::Unmanaged) | None => {
+                    if let Some((ref scoped, prefix_chars)) = scoped_prompt {
+                        let tree = self.trees.get(worker.model_id()).map(|t| Arc::clone(&t));
+                        let tree_chars = tree.map_or(0, |tree| {
+                            tree.prefix_match_tenant_char_count(scoped, &Self::tenant_key(worker))
+                                .saturating_sub(prefix_chars)
+                        });
+                        let hit = (tree_chars as f64 * chars_to_tokens).min(len);
+                        (hit, event_hits.is_none(), can_write_tree)
+                    } else {
+                        (0.0, false, false)
+                    }
+                }
             };
-            let n = l.saturating_sub(hit) as f64;
-            let cost = (self.config.c_lin * n + self.config.c_att * n * (l as f64 - n / 2.0)).ceil()
-                as u64;
+            let cost = self.prefill_cost(len, hit).ceil() as u64;
             let state = self.states.get(&Self::instance_id(worker));
-            let pending_work = state
+            let queued = state
                 .as_ref()
-                .map_or(0, |s| s.pending.load(Ordering::Acquire));
-            let queued = pending_work.saturating_add(cost);
-            let worker_load = loads.map_or_else(|| worker.load(), |loads| loads[idx]);
-            let coloc_load = if colocated { worker_load } else { 0 };
-            let batch_factor = (coloc_load as u64).saturating_add(1);
-            let prefill_work = queued.saturating_mul(batch_factor);
+                .map_or(0, |s| s.pending.load(Ordering::Acquire))
+                .saturating_add(cost);
             let rate = self
                 .config
                 .prefill_rate
                 .or_else(|| state.as_ref().and_then(|s| s.rates.lock().rate));
-            let beta = if colocated {
-                self.effective_beta(worker, state.as_deref().map(Arc::as_ref))
+            let meets = rate.is_none_or(|rate| (queued as f64) / rate <= budget);
+            any_meets_ttft |= meets;
+            let inflight = loads.map_or_else(|| worker.load(), |loads| loads[idx]) as u64;
+            // Floor `queued` at 1 so a full cache hit (`cost == 0`) does not zero out
+            // decode load on a busy worker, while idle workers (`inflight == 0`) still tie at 0.
+            let score = if context.colocated {
+                queued.max(1).saturating_mul(inflight)
             } else {
-                0.0
+                queued
             };
-            let decode_fraction = beta * (coloc_load as f64);
-            let phi = rate
-                .filter(|&r| r > 0.0 && budget > 0.0)
-                .map(|r| (prefill_work as f64) / (r * budget) + decode_fraction);
-            let meets = phi.map_or(decode_fraction <= 1.0, |p| p <= 1.0);
-            any_meets_slo |= meets;
-            let score = match phi {
-                Some(p) if beta > 0.0 => (p * 1_000_000.0).ceil() as u64,
-                _ => prefill_work,
+            let candidate = Candidate {
+                idx,
+                hit,
+                cost,
+                queued,
+                score,
+                meets,
+                rate,
+                can_sample,
+                used_tree,
             };
-            if min.is_none_or(
-                |(_, best_meets, best_phi, best_pwork, best_load, best_q, _, _)| {
-                    if meets != best_meets {
-                        return meets;
-                    }
-                    if let (Some(p), Some(best_p)) = (phi, best_phi) {
-                        let cmp = p.total_cmp(&best_p);
-                        if cmp != std::cmp::Ordering::Equal {
-                            return cmp == std::cmp::Ordering::Less;
-                        }
-                        return queued < best_q;
-                    }
-                    (prefill_work, coloc_load, queued) < (best_pwork, best_load, best_q)
-                },
-            ) {
-                min = Some((
-                    idx,
-                    meets,
-                    phi,
-                    prefill_work,
-                    coloc_load,
-                    queued,
-                    score,
-                    cost,
-                ));
-            }
-            if prev.is_none_or(|(_, best_hit, _, _, best_score, _)| {
-                hit > best_hit || (hit == best_hit && score < best_score)
+            if min.is_none_or(|b| {
+                (!candidate.meets, candidate.score, candidate.queued)
+                    < (!b.meets, b.score, b.queued)
             }) {
-                prev = Some((idx, hit, cost, meets, score, prefill_work));
+                min = Some(candidate);
+            }
+            if candidate.hit > HIT_RATIO * history
+                && prev.is_none_or(|b| {
+                    candidate
+                        .meets
+                        .cmp(&b.meets)
+                        .then_with(|| candidate.hit.total_cmp(&b.hit))
+                        .then_with(|| b.queued.cmp(&candidate.queued))
+                        .then_with(|| b.score.cmp(&candidate.score))
+                        .is_gt()
+                })
+            {
+                prev = Some(candidate);
             }
         }
-        let (prev_idx, hit, prev_cost, prev_meets, prev_score, prev_pwork) = prev?;
-        let (min_idx, _, _, min_pwork, _, _, min_score, min_cost) = min?;
-        let (idx, cost, score, sample_work) = if passes_turn_gate
-            && (hit as f64) > self.config.hit_ratio * prompt.est_hit_chars as f64
-            && (prev_meets || !any_meets_slo)
-        {
-            (prev_idx, prev_cost, prev_score, prev_pwork)
-        } else {
-            (min_idx, min_cost, min_score, min_pwork)
+        let chosen = match prev {
+            Some(p) if context.allow_affinity && (p.meets || !any_meets_ttft) => p,
+            _ => min?,
         };
-        if !prompt.text.is_empty() && event_hits.is_none() {
-            if let Some(tree_key) = Self::http_tree_key(&workers[idx], prompt) {
-                self.trees
-                    .entry(tree_key)
-                    .or_insert_with(|| Arc::new(Tree::new()))
-                    .insert(&prompt.text, &Self::tenant_key(&workers[idx]));
+        drop(retired);
+
+        let worker = &workers[chosen.idx];
+        RouterMetrics::record_processed_request(worker.url());
+        RouterMetrics::record_policy_decision("kv_aware", worker.url());
+        let est_prefill = chosen
+            .rate
+            .filter(|&r| r > 0.0 && chosen.cost > 0)
+            .and_then(|r| {
+                let cap = (budget * 4.0).clamp(5.0, 300.0);
+                Duration::try_from_secs_f64((chosen.queued as f64 / r).clamp(0.001, cap)).ok()
+            });
+        let mut tracker = self
+            .track(worker, chosen.cost)
+            .with_estimated_prefill(est_prefill);
+        if chosen.used_tree {
+            if let Some((scoped_text, _)) = scoped_prompt {
+                let trees = Arc::clone(&self.trees);
+                let retired = Arc::clone(&self.retired);
+                let worker_weak = Arc::downgrade(worker);
+                let worker_id = Self::instance_id(worker);
+                let model_id = worker.model_id().to_string();
+                let tenant = Self::tenant_key(worker);
+                tracker = tracker.with_on_commit(move || {
+                    let retired = retired.read();
+                    if worker_weak.strong_count() > 0 && !retired.contains_key(&worker_id) {
+                        let tree =
+                            trees
+                                .get(&model_id)
+                                .map(|t| Arc::clone(&t))
+                                .unwrap_or_else(|| {
+                                    trees
+                                        .entry(model_id)
+                                        .or_insert_with(|| Arc::new(Tree::new()))
+                                        .clone()
+                                });
+                        tree.insert(&scoped_text, &tenant);
+                    }
+                });
             }
         }
-        RouterMetrics::record_processed_request(workers[idx].url());
-        RouterMetrics::record_policy_decision("kv_aware", workers[idx].url());
-        let selected_rate = self.config.prefill_rate.or_else(|| {
-            self.states
-                .get(&Self::instance_id(&workers[idx]))
-                .and_then(|s| s.rates.lock().rate)
-        });
-        let est_prefill = selected_rate.filter(|&r| r > 0.0).map(|r| {
-            Duration::from_secs_f64(((sample_work as f64) / r).clamp(0.001, budget.max(0.05)))
-        });
-        let tracker = self.track_with_sample(&workers[idx], cost, sample_work, est_prefill);
-        let skip_rate_sample = event_hits.as_ref().is_some_and(|hits| {
-            let h = &hits[idx];
-            !h.observed && !(self.config.sample_all_event_requests && h.index_bound)
-        });
-        let tracker = if skip_rate_sample {
-            tracker.without_rate_sample()
-        } else {
-            tracker
-        };
-        Some((idx, tracker, score))
+        if !chosen.can_sample {
+            tracker = tracker.without_rate_sample();
+        }
+        Some((chosen.idx, tracker, chosen.score))
     }
 
-    #[cfg(test)]
     fn track(&self, worker: &Arc<dyn Worker>, work: u64) -> RequestTracker {
-        self.track_with_sample(worker, work, work, None)
-    }
-
-    fn track_with_sample(
-        &self,
-        worker: &Arc<dyn Worker>,
-        work: u64,
-        sample_work: u64,
-        estimated_prefill: Option<Duration>,
-    ) -> RequestTracker {
         let state = self
             .states
             .get(&Self::instance_id(worker))
             .map(|s| s.clone())
             .unwrap_or_else(|| {
-                let learn_beta = self.config.decode_weight.is_none();
-                let pool_beta = learn_beta.then(|| {
-                    self.model_betas
-                        .entry(worker.model_id().to_string())
-                        .or_insert_with(|| Arc::new(BetaState::new()))
-                        .clone()
-                });
                 self.states
                     .entry(Self::instance_id(worker))
                     .or_insert_with(|| {
                         Arc::new(WorkerState {
-                            worker: Arc::downgrade(worker),
-                            model_id: worker.model_id().to_string(),
+                            _worker: Arc::downgrade(worker),
                             pending: AtomicU64::new(0),
                             rates: Mutex::new(RateHistory::default()),
-                            beta: BetaState::new(),
-                            pool_beta,
-                            tpot_slo: self.config.tpot_slo,
                             learn_rate: self.config.prefill_rate.is_none(),
-                            learn_beta,
                         })
                     })
                     .clone()
             });
-        RequestTracker::new_with_sample(state, work, sample_work, estimated_prefill)
+        RequestTracker::new(state, work)
     }
 
-    fn balance(&self, workers: &[Arc<dyn Worker>], route: &str) -> Option<usize> {
+    fn balance(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        route: &str,
+        loads: Option<&[usize]>,
+    ) -> Option<usize> {
         let retired = self.retired.read();
         let start = self.round_robin.fetch_add(1, Ordering::Relaxed) % workers.len().max(1);
         let idx = (0..workers.len())
@@ -299,7 +342,7 @@ impl SMetricStrategy {
                 !retired.contains_key(&Self::instance_id(&workers[idx]))
                     && workers[idx].is_available()
             })
-            .min_by_key(|&idx| workers[idx].load())?;
+            .min_by_key(|&idx| loads.map_or_else(|| workers[idx].load(), |ls| ls[idx]))?;
         let (input, category) = match route {
             "/v1/chat/completions" => ("non-text chat", 1),
             "/v1/completions" => ("batched or token-ID prompt", 2),
@@ -329,18 +372,6 @@ impl Drop for SMetricStrategy {
     }
 }
 
-const RATE_WINDOW: usize = 64;
-const RATE_MIN_SAMPLES: usize = 8;
-
-fn sorted_median(sorted: &[f64]) -> f64 {
-    let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 1 {
-        sorted[mid]
-    } else {
-        0.5 * (sorted[mid - 1] + sorted[mid])
-    }
-}
-
 #[derive(Debug, Default)]
 struct RateHistory {
     samples: VecDeque<f64>,
@@ -359,106 +390,17 @@ impl RateHistory {
         if self.samples.len() >= RATE_MIN_SAMPLES {
             let mut sorted: Vec<_> = self.samples.iter().copied().collect();
             sorted.sort_by(f64::total_cmp);
-            self.rate = Some(sorted_median(&sorted));
+            self.rate = Some(sorted[((sorted.len() - 1) as f64 * RATE_QUANTILE).round() as usize]);
         }
-    }
-}
-
-/// Online estimator of the standing decode contention weight:
-/// `TPOT_pure(b) = tau_1 + delta_tau * b  =>  beta = delta_tau / (TPOT_SLO - tau_1)`
-/// fitted across per-concurrency bucket medians once >= 2 distinct concurrency
-/// buckets `b` (other co-resident requests) have been observed.
-#[derive(Debug)]
-struct BetaState {
-    cached_bits: AtomicU64,
-    samples: Mutex<VecDeque<(usize, f64)>>,
-}
-
-impl BetaState {
-    fn new() -> Self {
-        Self {
-            cached_bits: AtomicU64::new(BETA_UNSET),
-            samples: Mutex::new(VecDeque::with_capacity(BETA_SAMPLE_WINDOW)),
-        }
-    }
-
-    fn get(&self) -> Option<f64> {
-        let bits = self.cached_bits.load(Ordering::Acquire);
-        (bits != BETA_UNSET).then(|| f64::from_bits(bits))
-    }
-
-    fn record(&self, peers: usize, tpot_secs: f64, tpot_slo: f64) {
-        if !tpot_secs.is_finite() || tpot_secs <= 0.0 || !tpot_slo.is_finite() || tpot_slo <= 0.0 {
-            return;
-        }
-        let mut samples = self.samples.lock();
-        if samples.len() == BETA_SAMPLE_WINDOW {
-            samples.pop_front();
-        }
-        samples.push_back((peers, tpot_secs));
-
-        let mut by_peers: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
-        for &(b, tpot) in samples.iter() {
-            by_peers.entry(b).or_default().push(tpot);
-        }
-        let mut buckets: Vec<(f64, f64)> = Vec::with_capacity(by_peers.len());
-        let mut isolated_median: Option<f64> = None;
-        for (b, mut vals) in by_peers {
-            if vals.len() < BETA_MIN_BUCKET_SAMPLES {
-                continue;
-            }
-            vals.sort_by(f64::total_cmp);
-            let med = sorted_median(&vals);
-            if b == 0 {
-                isolated_median = Some(med);
-            }
-            buckets.push((b as f64, med));
-        }
-
-        let learned = if buckets.len() < 2 {
-            // Persistence of Excitation not yet met: keep cold-start default unless
-            // isolated single-stream decode (b = 0) already exhausts TPOT_SLO.
-            isolated_median
-                .filter(|&m0| m0 >= tpot_slo)
-                .map(|_| BETA_MAX)
-        } else {
-            let k = buckets.len() as f64;
-            let mean_b = buckets.iter().map(|(b, _)| *b).sum::<f64>() / k;
-            let mean_m = buckets.iter().map(|(_, m)| *m).sum::<f64>() / k;
-            let mut num = 0.0;
-            let mut den = 0.0;
-            for &(b, m) in &buckets {
-                let db = b - mean_b;
-                num += db * (m - mean_m);
-                den += db * db;
-            }
-            let delta_tau = if den > 0.0 { (num / den).max(0.0) } else { 0.0 };
-            let tau_1 = (mean_m - delta_tau * mean_b).max(0.0);
-            let headroom = tpot_slo - tau_1;
-            let beta = if headroom <= 1e-6 {
-                BETA_MAX
-            } else {
-                (delta_tau / headroom).clamp(BETA_MIN, BETA_MAX)
-            };
-            Some(beta)
-        };
-
-        let bits = learned.map_or(BETA_UNSET, f64::to_bits);
-        self.cached_bits.store(bits, Ordering::Release);
     }
 }
 
 #[derive(Debug)]
 struct WorkerState {
-    worker: Weak<dyn Worker>,
-    model_id: String,
+    _worker: Weak<dyn Worker>,
     pending: AtomicU64,
     rates: Mutex<RateHistory>,
-    beta: BetaState,
-    pool_beta: Option<Arc<BetaState>>,
-    tpot_slo: f64,
     learn_rate: bool,
-    learn_beta: bool,
 }
 
 impl RequestObserver for WorkerState {
@@ -471,39 +413,17 @@ impl RequestObserver for WorkerState {
     }
 
     fn finish(&self, work: u64, elapsed: Option<Duration>) {
-        self.finish_with_sample(work, work, elapsed);
-    }
-
-    fn finish_with_sample(&self, work: u64, sample_work: u64, elapsed: Option<Duration>) {
         let _ = self
             .pending
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                 Some(pending.saturating_sub(work))
             });
         if let Some(elapsed) =
-            elapsed.filter(|elapsed| self.learn_rate && sample_work > 0 && !elapsed.is_zero())
+            elapsed.filter(|elapsed| self.learn_rate && work > 0 && !elapsed.is_zero())
         {
             self.rates
                 .lock()
-                .record(sample_work as f64 / elapsed.as_secs_f64());
-        }
-    }
-
-    fn pure_decode_peers(&self) -> Option<usize> {
-        if !self.learn_beta || self.pending.load(Ordering::Acquire) != 0 {
-            return None;
-        }
-        let worker = self.worker.upgrade()?;
-        Some(worker.load().saturating_sub(1))
-    }
-
-    fn record_decode_step(&self, peers: usize, tpot_secs: f64) {
-        if !self.learn_beta || self.pending.load(Ordering::Acquire) != 0 {
-            return;
-        }
-        self.beta.record(peers, tpot_secs, self.tpot_slo);
-        if let Some(pool_beta) = &self.pool_beta {
-            pool_beta.record(peers, tpot_secs, self.tpot_slo);
+                .record(work as f64 / elapsed.as_secs_f64());
         }
     }
 }
@@ -514,30 +434,11 @@ impl SMetricStrategy {
         retired.retain(|_, worker| worker.strong_count() > 0);
         retired.insert(Self::instance_id(worker), Arc::downgrade(worker));
         self.states.remove(&Self::instance_id(worker));
-        let model_id = worker.model_id();
-        if !self
-            .states
-            .iter()
-            .any(|entry| entry.value().model_id == model_id)
-        {
-            self.model_betas.remove(model_id);
-        }
         let tenant = Self::tenant_key(worker);
-        let scoped_prefix = format!("{model_id}\0");
-        let keys: Vec<String> = self
-            .trees
-            .iter()
-            .filter_map(|entry| {
-                let k = entry.key();
-                (k == model_id || k.starts_with(&scoped_prefix)).then(|| k.clone())
-            })
-            .collect();
-        for key in keys {
-            self.trees.remove_if(&key, |_, tree| {
-                tree.remove_tenant(&tenant);
-                tree.tenant_char_count.is_empty()
-            });
-        }
+        self.trees.remove_if(worker.model_id(), |_, tree| {
+            tree.remove_tenant(&tenant);
+            tree.tenant_char_count.is_empty()
+        });
     }
 
     pub(super) fn with_active_worker<T>(
@@ -561,19 +462,17 @@ impl SMetricStrategy {
         hits: Option<&[PrefixMatch]>,
         loads: Option<&[usize]>,
     ) -> Option<(usize, Option<RequestTracker>, u64)> {
-        if let Some(prompt) = context.prompt {
-            self.select_prefill(
-                workers,
-                prompt,
-                context.allow_affinity,
-                context.colocated,
-                hits,
-                loads,
-            )
-            .map(|(idx, tracker, score)| (idx, Some(tracker), score))
+        if context.prompt.is_some() || context.kv.is_some_and(|kv| !kv.token_ids.is_empty()) {
+            self.select_prefill(workers, context, hits, loads)
+                .map(|(idx, tracker, score)| (idx, Some(tracker), score))
         } else {
-            self.balance(workers, context.route)
-                .map(|idx| (idx, None, workers[idx].load() as u64))
+            self.balance(workers, context.route, loads).map(|idx| {
+                (
+                    idx,
+                    None,
+                    loads.map_or_else(|| workers[idx].load(), |ls| ls[idx]) as u64,
+                )
+            })
         }
     }
 }
@@ -582,38 +481,137 @@ impl SMetricStrategy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
+    use crate::policies::KvRequestContext;
+
+    fn test_config(slo: f64, prefill_rate: Option<f64>) -> SMetricConfig {
+        SMetricConfig {
+            ttft_slo_secs: slo,
+            ttft_slo_secs_per_1k_tokens: 0.0,
+            attention_crossover_tokens: 0.0,
+            prefill_rate,
+            max_tree_size: 1000,
+            eviction_interval_secs: 0,
+        }
+    }
+
+    fn worker(url: &str) -> Arc<dyn Worker> {
+        Arc::new(BasicWorker::new(url.into(), WorkerType::Regular))
+    }
+
+    fn workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
+        urls.iter().map(|u| worker(u)).collect()
+    }
+
+    fn prompt(text: &str, est_hit_chars: usize) -> RoutingPrompt {
+        RoutingPrompt {
+            text: text.to_owned(),
+            est_hit_chars,
+            cache_identity: CacheIdentity::Shared,
+        }
+    }
+
+    fn pending(policy: &SMetricStrategy, w: &Arc<dyn Worker>) -> u64 {
+        policy
+            .states
+            .get(&SMetricStrategy::instance_id(w))
+            .unwrap()
+            .pending
+            .load(Ordering::Acquire)
+    }
+
+    fn matched_chars(policy: &SMetricStrategy, w: &Arc<dyn Worker>, p: &RoutingPrompt) -> usize {
+        let Some((scoped, prefix)) = SMetricStrategy::scoped_tree_text(p) else {
+            return 0;
+        };
+        policy.trees.get(w.model_id()).map_or(0, |tree| {
+            tree.prefix_match_tenant_char_count(&scoped, &SMetricStrategy::tenant_key(w))
+                .saturating_sub(prefix)
+        })
+    }
+
+    fn select(
+        policy: &SMetricStrategy,
+        ws: &[Arc<dyn Worker>],
+        p: &RoutingPrompt,
+        allow_affinity: bool,
+        colocated: bool,
+    ) -> (usize, RequestTracker) {
+        let ctx = RoutingContext {
+            prompt: Some(p),
+            kv: None,
+            allow_affinity,
+            colocated,
+            route: "/v1/chat/completions",
+        };
+        let (idx, t, _) = policy.select_prefill(ws, &ctx, None, None).unwrap();
+        (idx, t)
+    }
+
+    fn removal_test_policy() -> SMetricStrategy {
+        SMetricStrategy::new(
+            serde_yaml::from_str("TTFT_SLO_SECS: 10\nATTENTION_CROSSOVER_TOKENS: 0\n").unwrap(),
+        )
+    }
 
     #[test]
-    fn unobserved_event_work_is_released_without_training_the_rate() {
-        let policy = SMetricStrategy::new(serde_yaml::from_str("C_LIN: 1\nC_ATT: 0\nSLACK: 1\nHIT_RATIO: 0.1\nTTFT_SLO_BASE: 20\nTTFT_SLO_PER_CHAR: 0\nEVICTION_INTERVAL_SECS: 0\n").unwrap());
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            "grpc://worker:1".into(),
-            WorkerType::Regular,
-        ));
-        let prompt = RoutingPrompt {
-            text: "abcdefghijklm".into(),
-            est_hit_chars: 0,
-            cache_identity: CacheIdentity::Shared,
+    fn bound_cold_miss_trains_rate_while_unavailable_and_unknown_skip_it() {
+        let policy = SMetricStrategy::new(test_config(20.0, None));
+        let w = worker("grpc://worker:1");
+        let p = prompt("abcdefghijklm", 0);
+        let tokens: Vec<u32> = (1..=13).collect();
+        let kv_ctx = RoutingContext {
+            prompt: Some(&p),
+            kv: Some(KvRequestContext {
+                token_ids: &tokens,
+                lora_name: None,
+                cache_salt: None,
+            }),
+            allow_affinity: true,
+            colocated: true,
+            route: "/v1/chat/completions",
         };
-        let (_, mut tracker, _) = policy
+        let (_, mut unavail, _) = policy
             .select_prefill(
-                std::slice::from_ref(&worker),
-                &prompt,
-                true,
-                true,
-                Some(&[PrefixMatch::default()]),
+                std::slice::from_ref(&w),
+                &kv_ctx,
+                Some(&[PrefixMatch::Unavailable]),
                 None,
             )
             .unwrap();
+        assert_eq!(pending(&policy, &w), 13);
+        unavail.backdate_for_test(Duration::from_millis(1));
+        unavail.on_first_token();
+        assert_eq!(pending(&policy, &w), 0);
         let state = policy
             .states
-            .get(&SMetricStrategy::instance_id(&worker))
+            .get(&SMetricStrategy::instance_id(&w))
             .unwrap()
             .clone();
-        assert_eq!(state.pending.load(Ordering::Acquire), 13);
-        tracker.on_first_token();
-        assert_eq!(state.pending.load(Ordering::Acquire), 0);
         assert!(state.rates.lock().samples.is_empty());
+
+        // HTTP CacheIdentity::Unknown must also skip rate training so phantom misses cannot poison P90.
+        let unknown = RoutingPrompt {
+            text: p.text.clone(),
+            est_hit_chars: 0,
+            cache_identity: CacheIdentity::Unknown,
+        };
+        let (_, mut u_tracker) = select(&policy, std::slice::from_ref(&w), &unknown, false, true);
+        u_tracker.backdate_for_test(Duration::from_millis(1));
+        u_tracker.on_first_token();
+        assert!(state.rates.lock().samples.is_empty());
+
+        // Bound live source trains on confirmed 0-block cold misses.
+        let (_, mut bound, _) = policy
+            .select_prefill(
+                std::slice::from_ref(&w),
+                &kv_ctx,
+                Some(&[PrefixMatch::Bound(0)]),
+                None,
+            )
+            .unwrap();
+        bound.backdate_for_test(Duration::from_millis(1));
+        bound.on_first_token();
+        assert_eq!(state.rates.lock().samples.len(), 1);
     }
 
     #[derive(Clone)]
@@ -624,14 +622,13 @@ mod tests {
             self.0.lock().extend_from_slice(buf);
             Ok(buf.len())
         }
-
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
 
     #[test]
-    fn fallback_warns_once_per_bounded_category_and_policy() {
+    fn fallback_warns_once_balances_least_inflight_and_skips_unavailable() {
         let _other_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let output = LogCapture(Arc::new(Mutex::new(Vec::new())));
         let writer = output.clone();
@@ -641,10 +638,8 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .with_writer(move || writer.clone())
             .finish();
-        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
-            "http://fallback-worker".into(),
-            WorkerType::Regular,
-        ))];
+        let ws = workers(&["http://w0", "http://w1"]);
+        ws[0].increment_load();
         tracing::subscriber::with_default(subscriber, || {
             let policy = removal_test_policy();
             for route in [
@@ -657,115 +652,70 @@ mod tests {
                 "/custom/one",
                 "/custom/two",
             ] {
-                let context = RoutingContext {
+                let ctx = RoutingContext {
                     prompt: None,
                     allow_affinity: false,
                     colocated: false,
                     route,
                     kv: None,
                 };
-                assert_eq!(
-                    policy
-                        .select_request(&workers, &context, None, None)
-                        .unwrap()
-                        .0,
-                    0
-                );
+                assert_eq!(policy.select_request(&ws, &ctx, None, None).unwrap().0, 1);
             }
             assert_eq!(
-                removal_test_policy().balance(&workers, "/v1/chat/completions"),
-                Some(0)
+                removal_test_policy().balance(&ws, "/v1/chat/completions", None),
+                Some(1)
             );
+            ws[0].decrement_load();
+            assert_eq!(
+                (
+                    policy.balance(&ws, "<generic>", None),
+                    policy.balance(&ws, "<generic>", None)
+                ),
+                (Some(0), Some(1))
+            );
+            ws[1].set_healthy(false);
+            assert_eq!(policy.balance(&ws, "/v1/embeddings", None), Some(0));
+            ws[0].set_healthy(false);
+            assert_eq!(policy.balance(&ws, "/v1/embeddings", None), None);
         });
-        let lines = String::from_utf8(output.0.lock().clone()).unwrap();
-        assert!(!lines.contains("private fallback payload"));
-        let events: Vec<serde_json::Value> = lines
+        let events: Vec<serde_json::Value> = String::from_utf8(output.0.lock().clone())
+            .unwrap()
             .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
+            .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         assert_eq!(
-            events
+            events[..9]
                 .iter()
-                .filter(|event| event["level"] == "WARN")
-                .count(),
-            4
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event["level"] == "DEBUG")
-                .count(),
-            5
-        );
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| event["level"].as_str().unwrap())
+                .map(|e| e["level"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             ["WARN", "DEBUG", "WARN", "DEBUG", "WARN", "DEBUG", "DEBUG", "DEBUG", "WARN"]
         );
-        for event in &events {
-            assert_eq!(event["fields"]["selected_worker"], "http://fallback-worker");
-            assert_eq!(event["fields"]["fallback"], "least_inflight");
-            assert!(event["fields"]["route"].as_str().unwrap().starts_with('/'));
-            assert!([
-                "non-text chat",
-                "batched or token-ID prompt",
-                "unsupported endpoint or missing typed prompt"
-            ]
-            .contains(&event["fields"]["input"].as_str().unwrap()));
-        }
+        assert_eq!(events[0]["fields"]["fallback"], "least_inflight");
+        assert_eq!(events[0]["fields"]["selected_worker"], "http://w1");
+        assert_eq!(events[0]["fields"]["input"], "non-text chat");
     }
 
     #[test]
     fn configured_eviction_expires_cache_while_zero_preserves_it() {
-        let yaml = "C_LIN: 1\nC_ATT: 0\nSLACK: 1\nHIT_RATIO: 0.5\nTTFT_SLO_BASE: 10\nTTFT_SLO_PER_CHAR: 0\nMAX_TREE_SIZE: 1\n";
+        let yaml = "TTFT_SLO_SECS: 10\nMAX_TREE_SIZE: 1\n";
         let enabled = SMetricStrategy::new(
             serde_yaml::from_str(&format!("{yaml}EVICTION_INTERVAL_SECS: 1\n")).unwrap(),
         );
         let disabled = SMetricStrategy::new(
             serde_yaml::from_str(&format!("{yaml}EVICTION_INTERVAL_SECS: 0\n")).unwrap(),
         );
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            "http://eviction-worker".into(),
-            WorkerType::Regular,
-        ));
+        let w = worker("http://eviction-worker");
+        let p = prompt("cached history", 0);
         for policy in [&enabled, &disabled] {
-            drop(select(
-                policy,
-                std::slice::from_ref(&worker),
-                &prompt("cached history", 0),
-                false,
-                false,
-            ));
+            let (_, mut t) = select(policy, std::slice::from_ref(&w), &p, false, false);
+            t.on_first_token();
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(4);
-        let enabled_tree = enabled.trees.get(worker.model_id()).unwrap().clone();
-        while enabled_tree
-            .prefix_match_tenant_char_count("cached history", &SMetricStrategy::tenant_key(&worker))
-            != 0
-            && std::time::Instant::now() < deadline
-        {
+        while matched_chars(&enabled, &w, &p) != 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(
-            enabled_tree.prefix_match_tenant_char_count(
-                "cached history",
-                &SMetricStrategy::tenant_key(&worker)
-            ),
-            0
-        );
-        assert_eq!(
-            disabled
-                .trees
-                .get(worker.model_id())
-                .unwrap()
-                .prefix_match_tenant_char_count(
-                    "cached history",
-                    &SMetricStrategy::tenant_key(&worker)
-                ),
-            14
-        );
+        assert_eq!(matched_chars(&enabled, &w, &p), 0);
+        assert_eq!(matched_chars(&disabled, &w, &p), 14);
     }
 
     #[test]
@@ -773,578 +723,283 @@ mod tests {
         let mut policy = removal_test_policy();
         assert_eq!(policy.config.eviction_interval_secs, 30);
         let handle = policy.eviction_handle.take().unwrap();
-
         drop(policy);
-
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         while !handle.is_finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(
-            handle.is_finished(),
-            "idle eviction thread must stop when its policy is dropped"
-        );
+        assert!(handle.is_finished());
         handle.join().unwrap();
     }
 
-    fn removal_test_policy() -> SMetricStrategy {
-        SMetricStrategy::new(serde_yaml::from_str(
-            "C_LIN: 1\nC_ATT: 0\nSLACK: 1\nHIT_RATIO: 0.5\nTTFT_SLO_BASE: 10\nTTFT_SLO_PER_CHAR: 0\n",
-        ).unwrap())
-    }
-
     #[test]
-    fn worker_removal_rejects_stale_prefill_snapshot_before_first_selection() {
-        let policy = removal_test_policy();
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            "http://stale-prefill".into(),
-            WorkerType::Regular,
-        ));
+    fn deferred_tree_insert_ignores_failed_attempts_and_retired_workers() {
+        let policy = SMetricStrategy::new(test_config(10.0, None));
+        let w = worker("http://deferred");
+        let (_, failed) = select(
+            &policy,
+            std::slice::from_ref(&w),
+            &prompt("failed attempt", 0),
+            false,
+            true,
+        );
+        drop(failed);
+        assert_eq!(pending(&policy, &w), 0);
+        assert!(policy.trees.is_empty());
 
-        policy.on_worker_removed(&worker);
+        let ok_p = prompt("succeeded prefix", 0);
+        let (_, mut ok) = select(&policy, std::slice::from_ref(&w), &ok_p, false, true);
+        ok.on_first_token();
+        assert_eq!(matched_chars(&policy, &w, &ok_p), 16);
 
-        assert!(policy
-            .select_prefill(
-                std::slice::from_ref(&worker),
-                &prompt("stale request", 0),
-                false,
-                false,
-                None,
-                None
-            )
-            .is_none());
-        assert!(policy.states.is_empty());
+        let (_, mut late) = select(
+            &policy,
+            std::slice::from_ref(&w),
+            &prompt("late prefix", 0),
+            false,
+            true,
+        );
+        policy.on_worker_removed(&w);
+        late.on_first_token();
         assert!(policy.trees.is_empty());
     }
 
     #[test]
-    fn worker_removal_rejects_stale_fallback_snapshot_before_first_selection() {
-        let policy = removal_test_policy();
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            "http://stale-fallback".into(),
-            WorkerType::Regular,
-        ));
+    fn worker_removal_preserves_replacement_clears_only_its_tenant_and_prunes_dead_markers() {
+        let policy = SMetricStrategy::new(test_config(10.0, None));
+        let never_selected = worker("http://stale-first");
+        policy.on_worker_removed(&never_selected);
+        assert!(policy
+            .select_prefill(
+                std::slice::from_ref(&never_selected),
+                &RoutingContext {
+                    prompt: Some(&prompt("stale", 0)),
+                    ..RoutingContext::default()
+                },
+                None,
+                None
+            )
+            .is_none());
+        assert!(policy.states.is_empty() && policy.trees.is_empty());
+        drop(never_selected);
 
-        policy.on_worker_removed(&worker);
-
-        assert_eq!(
-            policy.balance(std::slice::from_ref(&worker), "/v1/embeddings"),
-            None
-        );
-    }
-
-    #[test]
-    fn worker_removal_preserves_replacement_selected_before_old_notification() {
-        let policy = removal_test_policy();
-        let old: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            "http://same-url".into(),
-            WorkerType::Regular,
-        ));
-        let replacement: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            "http://same-url".into(),
-            WorkerType::Regular,
-        ));
-        let (_, mut old_tracker) = select(
+        let old = worker("http://same-url");
+        let rep = worker("http://same-url");
+        let old_p = prompt("old history", 0);
+        let rep_p = prompt("new history", 0);
+        let (_, mut old_seed) = select(&policy, std::slice::from_ref(&old), &old_p, false, false);
+        old_seed.commit_without_sample();
+        let (_, mut old_t) = select(
             &policy,
             std::slice::from_ref(&old),
-            &prompt("old history", 0),
+            &prompt("in flight", 0),
             false,
             false,
         );
-        let (_, replacement_tracker) = select(
+        let (_, mut rep_t) = select(&policy, std::slice::from_ref(&rep), &rep_p, false, false);
+        rep_t.commit_without_sample();
+        let (_, rep_active) = select(
             &policy,
-            std::slice::from_ref(&replacement),
-            &prompt("new history", 0),
+            std::slice::from_ref(&rep),
+            &prompt("active pending", 0),
             false,
             false,
         );
 
         policy.on_worker_removed(&old);
-
-        assert!(policy
-            .states
-            .contains_key(&SMetricStrategy::instance_id(&replacement)));
-        let replacement_state = policy
-            .states
-            .get(&SMetricStrategy::instance_id(&replacement))
+        assert_eq!(matched_chars(&policy, &old, &old_p), 0);
+        assert!(!policy
+            .trees
+            .get(rep.model_id())
             .unwrap()
-            .clone();
-        assert_eq!(replacement_state.pending.load(Ordering::Acquire), 11);
-        assert_eq!(
-            policy
-                .trees
-                .get(replacement.model_id())
-                .unwrap()
-                .prefix_match_tenant_char_count(
-                    "new history",
-                    &SMetricStrategy::tenant_key(&replacement)
-                ),
-            11
-        );
-        old_tracker.on_first_token();
-        assert_eq!(replacement_state.pending.load(Ordering::Acquire), 11);
-        assert!(replacement_state.rates.lock().samples.is_empty());
-        drop(replacement_tracker);
-        assert_eq!(replacement_state.pending.load(Ordering::Acquire), 0);
-    }
+            .tenant_char_count
+            .contains_key(SMetricStrategy::tenant_key(&old).as_str()));
+        assert_eq!(matched_chars(&policy, &rep, &rep_p), 11);
+        assert_eq!(pending(&policy, &rep), 4);
+        old_t.on_first_token();
+        assert_eq!(pending(&policy, &rep), 4);
+        drop(rep_active);
+        assert_eq!(pending(&policy, &rep), 0);
 
-    #[test]
-    fn worker_removal_prunes_dead_markers_but_keeps_live_snapshots() {
-        let policy = removal_test_policy();
-        let stale: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            "http://retained-snapshot".into(),
-            WorkerType::Regular,
-        ));
-        policy.on_worker_removed(&stale);
-        assert_eq!(policy.retired.read().len(), 1);
-
-        for index in 0..16 {
-            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-                format!("http://temporary-{index}"),
-                WorkerType::Regular,
-            ));
-            let weak = Arc::downgrade(&worker);
-            policy.on_worker_removed(&worker);
+        for i in 0..8 {
+            let tmp = worker(&format!("http://tmp-{i}"));
+            policy.on_worker_removed(&tmp);
             assert_eq!(policy.retired.read().len(), 2);
-            drop(worker);
-            assert!(weak.upgrade().is_none());
         }
         assert_eq!(
-            policy.balance(std::slice::from_ref(&stale), "/v1/embeddings"),
+            policy.balance(std::slice::from_ref(&old), "/v1/embeddings", None),
             None
         );
+        policy.on_worker_removed(&rep);
+        assert!(policy.states.is_empty() && policy.trees.is_empty());
     }
 
     #[test]
-    fn worker_removal_clears_state_and_only_its_tree_tenant() {
-        let policy = removal_test_policy();
-        let first: Arc<dyn Worker> =
-            Arc::new(BasicWorker::new("http://first".into(), WorkerType::Regular));
-        let second: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            "http://second".into(),
-            WorkerType::Regular,
-        ));
-        drop(select(
-            &policy,
-            std::slice::from_ref(&first),
-            &prompt("first history", 0),
-            false,
-            false,
-        ));
-        drop(select(
-            &policy,
-            std::slice::from_ref(&second),
-            &prompt("second history", 0),
-            false,
-            false,
-        ));
-
-        policy.on_worker_removed(&first);
-
-        assert!(!policy
-            .states
-            .contains_key(&SMetricStrategy::instance_id(&first)));
-        assert!(policy
-            .states
-            .contains_key(&SMetricStrategy::instance_id(&second)));
-        let tree = policy.trees.get(first.model_id()).unwrap();
-        assert_eq!(
-            tree.prefix_match_tenant_char_count(
-                "first history",
-                &SMetricStrategy::tenant_key(&first)
-            ),
-            0
-        );
-        assert!(!tree
-            .tenant_char_count
-            .contains_key(SMetricStrategy::tenant_key(&first).as_str()));
-        assert_eq!(
-            tree.prefix_match_tenant_char_count(
-                "second history",
-                &SMetricStrategy::tenant_key(&second)
-            ),
-            14
-        );
-        drop(tree);
-
-        policy.on_worker_removed(&second);
-
-        assert!(policy.states.is_empty());
-        assert!(policy.trees.is_empty());
-    }
-
-    #[test]
-    fn worker_removal_keeps_old_tracker_isolated_from_same_url_replacement() {
-        let policy = removal_test_policy();
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            "http://reused".into(),
-            WorkerType::Regular,
-        ));
-        let (_, mut old_tracker) = select(
-            &policy,
-            std::slice::from_ref(&worker),
-            &prompt("shared", 0),
-            false,
-            false,
-        );
-        let old_state = policy
-            .states
-            .get(&SMetricStrategy::instance_id(&worker))
-            .unwrap()
-            .clone();
-
-        policy.on_worker_removed(&worker);
-        let replacement: Arc<dyn Worker> =
-            Arc::new(BasicWorker::new(worker.url().into(), WorkerType::Regular));
-        let (_, replacement_tracker) = select(
-            &policy,
-            std::slice::from_ref(&replacement),
-            &prompt("shared", 0),
-            false,
-            false,
-        );
-        let replacement_state = policy
-            .states
-            .get(&SMetricStrategy::instance_id(&replacement))
-            .unwrap()
-            .clone();
-
-        assert!(!Arc::ptr_eq(&old_state, &replacement_state));
-        assert_eq!(replacement_state.pending.load(Ordering::Acquire), 6);
-        old_tracker.on_first_token();
-        drop(old_tracker);
-        assert_eq!(old_state.pending.load(Ordering::Acquire), 0);
-        assert_eq!(replacement_state.pending.load(Ordering::Acquire), 6);
-        assert!(replacement_state.rates.lock().samples.is_empty());
-        drop(replacement_tracker);
-        assert_eq!(replacement_state.pending.load(Ordering::Acquire), 0);
-    }
-
-    fn prompt(text: &str, est_hit_chars: usize) -> RoutingPrompt {
-        RoutingPrompt {
-            text: text.to_owned(),
-            est_hit_chars,
-            cache_identity: CacheIdentity::Shared,
-        }
-    }
-
-    #[test]
-    fn http_tree_isolates_cache_salts_adapters_and_withholds_unknown_identity() {
-        let policy = SMetricStrategy::new(
-            serde_yaml::from_str(
-                "C_LIN: 1\nC_ATT: 0\nSLACK: 1\nHIT_RATIO: 0.1\nTTFT_SLO_BASE: 20\nTTFT_SLO_PER_CHAR: 0\nEVICTION_INTERVAL_SECS: 0\n",
-            )
-            .unwrap(),
-        );
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            "http://worker:1".into(),
-            WorkerType::Regular,
-        ));
-        let workers = std::slice::from_ref(&worker);
+    fn single_model_tree_isolates_scopes_without_growing_tree_map() {
+        let policy = SMetricStrategy::new(test_config(20.0, None));
+        let w = worker("http://worker:1");
+        let ws = std::slice::from_ref(&w);
         let shared = prompt("shared prefix across requests", 20);
-        let (_, t1, _) = policy.select_prefill(workers, &shared, true, true, None, None).unwrap();
-        assert_eq!(t1.work, 29);
-        drop(t1);
+        let (_, mut t1) = select(&policy, ws, &shared, true, true);
+        assert_eq!(t1.work, 8);
+        t1.on_first_token();
+        assert_eq!(select(&policy, ws, &shared, true, true).1.work, 0);
 
-        // Same shared identity gets full prefix credit.
-        let (_, t2, _) = policy.select_prefill(workers, &shared, true, true, None, None).unwrap();
-        assert_eq!(t2.work, 0);
-        drop(t2);
-
-        // Different cache salt must NOT receive reuse credit from the base tree.
-        let salted_a = RoutingPrompt {
+        let scope_a = RoutingPrompt {
             text: shared.text.clone(),
             est_hit_chars: 20,
-            cache_identity: CacheIdentity::Scoped("lora=\0salt=tenant-a".into()),
+            cache_identity: CacheIdentity::Scoped("a".repeat(64)),
         };
-        let (_, t3, _) = policy.select_prefill(workers, &salted_a, true, true, None, None).unwrap();
-        assert_eq!(t3.work, 29);
-        drop(t3);
+        let (_, mut t3) = select(&policy, ws, &scope_a, true, true);
+        assert_eq!(t3.work, 8);
+        t3.on_first_token();
+        assert_eq!(select(&policy, ws, &scope_a, true, true).1.work, 0);
 
-        // Repeat with the SAME salt gets full reuse credit.
-        let (_, t4, _) = policy.select_prefill(workers, &salted_a, true, true, None, None).unwrap();
-        assert_eq!(t4.work, 0);
-        drop(t4);
-
-        // Different salt or adapter gets zero credit from tenant-a.
-        let salted_b = RoutingPrompt {
+        let scope_b = RoutingPrompt {
             text: shared.text.clone(),
             est_hit_chars: 20,
-            cache_identity: CacheIdentity::Scoped("lora=adapter-1\0salt=tenant-a".into()),
+            cache_identity: CacheIdentity::Scoped("b".repeat(64)),
         };
-        let (_, t5, _) = policy.select_prefill(workers, &salted_b, true, true, None, None).unwrap();
-        assert_eq!(t5.work, 29);
-        drop(t5);
+        assert_eq!(select(&policy, ws, &scope_b, true, true).1.work, 8);
+        // All scopes share one per-model Tree (bounded by MAX_TREE_SIZE, no per-salt map growth).
+        assert_eq!(policy.trees.len(), 1);
 
-        // Unknown cache identity withholds credit and never populates the tree.
         let unknown = RoutingPrompt {
             text: shared.text.clone(),
             est_hit_chars: 20,
             cache_identity: CacheIdentity::Unknown,
         };
-        let (_, t6, _) = policy.select_prefill(workers, &unknown, true, true, None, None).unwrap();
-        assert_eq!(t6.work, 29);
-        drop(t6);
-        let (_, t7, _) = policy.select_prefill(workers, &unknown, true, true, None, None).unwrap();
-        assert_eq!(t7.work, 29);
-        drop(t7);
+        let (_, mut t6) = select(&policy, ws, &unknown, true, true);
+        t6.on_first_token();
+        assert_eq!(select(&policy, ws, &unknown, true, true).1.work, 8);
 
-        // Worker removal clears all scoped trees for that model.
-        policy.on_worker_removed(&worker);
+        policy.on_worker_removed(&w);
         assert!(policy.trees.is_empty());
     }
 
-    fn select(
-        policy: &SMetricStrategy,
-        workers: &[Arc<dyn Worker>],
-        prompt: &RoutingPrompt,
-        turn_gate: bool,
-        colocated: bool,
-    ) -> (usize, RequestTracker) {
-        policy
-            .select_prefill(workers, prompt, turn_gate, colocated, None, None)
-            .map(|(index, tracker, _)| (index, tracker))
-            .unwrap()
-    }
-
     #[test]
-    fn cache_affinity_yields_to_a_feasible_worker_but_survives_when_none_meet_ttft() {
-        let config = SMetricConfig {
-            c_lin: 1.0,
-            c_att: 0.0,
-            prefill_rate: Some(1.0),
-            slack: 1.0,
-            hit_ratio: 0.5,
-            ttft_slo_base: 20.0,
-            ttft_slo_per_char: 0.0,
-            tpot_slo: 0.020,
-            decode_weight: None,
-            sample_all_event_requests: false,
-            max_tree_size: 1000,
-            eviction_interval_secs: 30,
-        };
-        let policy = SMetricStrategy::new(config);
-        let workers: Vec<Arc<dyn Worker>> = ["http://one", "http://two"]
-            .into_iter()
-            .map(|url| {
-                Arc::new(BasicWorker::new(url.into(), WorkerType::Regular)) as Arc<dyn Worker>
-            })
-            .collect();
-        assert_eq!(
-            select(&policy, &workers, &prompt("shared", 0), false, false).0,
-            0
-        );
-        let first = policy.track(&workers[0], 100);
-        assert_eq!(
-            select(&policy, &workers, &prompt("shared plus", 6), true, false).0,
-            1
-        );
-        let second = policy.track(&workers[1], 1000);
-        // Both exceed TTFT. Worker 1 has the longest history even though its q is higher.
+    fn affinity_feasible_migration_and_equal_hit_tie_break() {
+        let policy = SMetricStrategy::new(test_config(20.0, Some(1.0)));
+        let ws = workers(&["http://one", "http://two", "http://three"]);
+        let (idx0, mut t0) = select(&policy, &ws[..2], &prompt("shared", 0), false, false);
+        assert_eq!(idx0, 0);
+        t0.on_first_token();
+
+        let first = policy.track(&ws[0], 100);
+        let (idx1, mut t1) = select(&policy, &ws[..2], &prompt("shared plus", 6), true, false);
+        assert_eq!(idx1, 1);
+        t1.on_first_token();
+
+        // Both exceed TTFT: worker 1 keeps affinity (longest history).
+        let second = policy.track(&ws[1], 1000);
         assert_eq!(
             select(
                 &policy,
-                &workers,
+                &ws[..2],
                 &prompt("shared plus more", 11),
                 true,
-                false,
-            )
-            .0,
-            1
-        );
-        drop(first);
-        drop(second);
-        assert_eq!(
-            policy
-                .states
-                .get(&SMetricStrategy::instance_id(&workers[0]))
-                .unwrap()
-                .pending
-                .load(Ordering::Acquire),
-            0
-        );
-        assert_eq!(
-            policy
-                .states
-                .get(&SMetricStrategy::instance_id(&workers[1]))
-                .unwrap()
-                .pending
-                .load(Ordering::Acquire),
-            0
-        );
-    }
-
-    #[test]
-    fn colocated_balance_counts_inflight_requests_but_pd_prefill_does_not() {
-        let config = SMetricConfig {
-            c_lin: 1.0,
-            c_att: 0.0,
-            prefill_rate: Some(1.0),
-            slack: 1.0,
-            hit_ratio: 0.5,
-            ttft_slo_base: 10.0,
-            ttft_slo_per_char: 0.0,
-            tpot_slo: 0.020,
-            decode_weight: None,
-            sample_all_event_requests: false,
-            max_tree_size: 1000,
-            eviction_interval_secs: 30,
-        };
-        let workers: Vec<Arc<dyn Worker>> = ["http://one", "http://two"]
-            .into_iter()
-            .map(|url| {
-                Arc::new(BasicWorker::new(url.into(), WorkerType::Regular)) as Arc<dyn Worker>
-            })
-            .collect();
-        for _ in 0..3 {
-            workers[0].increment_load();
-        }
-        workers[1].increment_load();
-        let prompt = prompt("first turn", 0);
-        assert_eq!(
-            select(
-                &SMetricStrategy::new(config.clone()),
-                &workers,
-                &prompt,
-                false,
-                true
-            )
-            .0,
-            1
-        );
-        assert_eq!(
-            select(
-                &SMetricStrategy::new(config),
-                &workers,
-                &prompt,
-                false,
                 false
             )
             .0,
-            0
+            1
         );
+
+        // When worker 0 & 1 are infeasible while worker 2 is feasible (even with higher load),
+        // `min` must pick feasible worker 2 instead of infeasible worker 0.
+        ws[2].increment_load();
+        ws[2].increment_load();
+        assert_eq!(
+            select(&policy, &ws, &prompt("shared plus more", 11), true, true).0,
+            2
+        );
+        ws[2].decrement_load();
+        ws[2].decrement_load();
+        drop(first);
+        drop(second);
+
+        // Equal-hit tie-breaking in `prev`: lower `queued` wins regardless of round-robin start.
+        let p_eq = prompt("shared", 6);
+        let (_, mut seed1) = select(&policy, std::slice::from_ref(&ws[1]), &p_eq, false, false);
+        seed1.on_first_token();
+        let busy0 = policy.track(&ws[0], 10);
+        for _ in 0..2 {
+            assert_eq!(select(&policy, &ws[..2], &p_eq, true, false).0, 1);
+        }
+        drop(busy0);
+        assert_eq!((pending(&policy, &ws[0]), pending(&policy, &ws[1])), (0, 0));
     }
 
     #[test]
-    fn learned_rate_is_used_only_without_a_configured_rate() {
-        let config = SMetricConfig {
-            c_lin: 1.0,
-            c_att: 0.0,
-            prefill_rate: None,
-            slack: 1.0,
-            hit_ratio: 0.5,
-            ttft_slo_base: 20.0,
-            ttft_slo_per_char: 0.0,
-            tpot_slo: 0.020,
-            decode_weight: None,
-            sample_all_event_requests: false,
-            max_tree_size: 1000,
-            eviction_interval_secs: 30,
-        };
-        let workers: Vec<Arc<dyn Worker>> = ["http://one", "http://two"]
-            .into_iter()
-            .map(|url| {
-                Arc::new(BasicWorker::new(url.into(), WorkerType::Regular)) as Arc<dyn Worker>
-            })
-            .collect();
-        let dynamic = SMetricStrategy::new(config.clone());
+    fn colocated_score_counts_inflight_even_on_zero_cost_hit_while_pd_ignores_inflight() {
+        let config = test_config(10.0, Some(1.0));
+        let ws = workers(&["http://one", "http://two"]);
+        for _ in 0..3 {
+            ws[0].increment_load();
+        }
+        ws[1].increment_load();
+        let p = prompt("first turn", 0);
         assert_eq!(
-            select(&dynamic, &workers, &prompt("shared", 0), false, false).0,
+            select(&SMetricStrategy::new(config.clone()), &ws, &p, false, true).0,
+            1
+        );
+        assert_eq!(
+            select(&SMetricStrategy::new(config.clone()), &ws, &p, false, false).0,
             0
         );
-        let queued = dynamic.track(&workers[0], 100);
-        let follow_up = prompt("shared plus", 6);
-        assert_eq!(select(&dynamic, &workers, &follow_up, true, false).0, 0);
-        let rate_history = dynamic
-            .states
-            .get(&SMetricStrategy::instance_id(&workers[0]))
-            .unwrap();
-        for _ in 0..RATE_MIN_SAMPLES {
-            rate_history.rates.lock().record(1.0);
+
+        // Full cache hit (`cost == 0`) on heavily loaded worker 0 must NOT zero out inflight load.
+        let policy = SMetricStrategy::new(config);
+        let (_, mut seed) = select(&policy, std::slice::from_ref(&ws[0]), &p, false, true);
+        seed.on_first_token();
+        for _ in 0..7 {
+            ws[0].increment_load();
         }
-        drop(rate_history);
-        assert_eq!(select(&dynamic, &workers, &follow_up, true, false).0, 1);
+        assert_eq!(select(&policy, &ws, &p, false, true).0, 1);
+    }
+
+    #[test]
+    fn learned_rate_p90_and_config_override() {
+        let config = test_config(20.0, None);
+        let ws = workers(&["http://one", "http://two"]);
+        let dynamic = SMetricStrategy::new(config.clone());
+        let (i0, mut t0) = select(&dynamic, &ws, &prompt("shared", 0), false, false);
+        assert_eq!(i0, 0);
+        t0.on_first_token();
+        let queued = dynamic.track(&ws[0], 100);
+        let follow_up = prompt("shared plus", 6);
+        assert_eq!(select(&dynamic, &ws, &follow_up, true, false).0, 0);
+        {
+            let h = dynamic
+                .states
+                .get(&SMetricStrategy::instance_id(&ws[0]))
+                .unwrap();
+            for _ in 0..RATE_MIN_SAMPLES {
+                h.rates.lock().record(1.0);
+            }
+        }
+        assert_eq!(select(&dynamic, &ws, &follow_up, true, false).0, 1);
         drop(queued);
 
-        let fixed = SMetricStrategy::new(SMetricConfig {
-            prefill_rate: Some(1000.0),
-            ..config
-        });
-        assert_eq!(
-            select(&fixed, &workers, &prompt("shared", 0), false, false).0,
-            0
-        );
-        let fixed_queue = fixed.track(&workers[0], 100);
-        // The configured rate remains authoritative even if observed rates exist.
-        fixed
-            .states
-            .get(&SMetricStrategy::instance_id(&workers[0]))
-            .unwrap()
-            .rates
-            .lock()
-            .rate = Some(1.0);
-        assert_eq!(select(&fixed, &workers, &follow_up, true, false).0, 0);
-        drop(fixed_queue);
-    }
-
-    #[test]
-    fn first_token_releases_pending_work_and_trains_only_unconfigured_rates() {
-        let config = SMetricConfig {
-            c_lin: 1.0,
-            c_att: 0.0,
-            prefill_rate: None,
-            slack: 1.0,
-            hit_ratio: 0.5,
-            ttft_slo_base: 20.0,
-            ttft_slo_per_char: 0.0,
-            tpot_slo: 0.020,
-            decode_weight: None,
-            sample_all_event_requests: false,
-            max_tree_size: 1000,
-            eviction_interval_secs: 30,
-        };
-        let worker: Arc<dyn Worker> =
-            Arc::new(BasicWorker::new("http://one".into(), WorkerType::Regular));
-        let workers = vec![worker.clone()];
         let learned = SMetricStrategy::new(config.clone());
         for i in 0..RATE_MIN_SAMPLES {
-            let sample = prompt(&format!("prefill-{i}"), 0);
-            let other = learned.track(&worker, 13);
-            let (_, mut tracker) = select(&learned, &workers, &sample, false, true);
-            assert!(
-                learned
-                    .states
-                    .get(&SMetricStrategy::instance_id(&worker))
-                    .unwrap()
-                    .pending
-                    .load(Ordering::Acquire)
-                    > 13
+            let other = learned.track(&ws[0], 13);
+            let (_, mut t) = select(
+                &learned,
+                &ws[..1],
+                &prompt(&format!("prefill-{i}"), 0),
+                false,
+                true,
             );
-            tracker.on_first_token();
-            tracker.on_first_token();
-            assert_eq!(
-                learned
-                    .states
-                    .get(&SMetricStrategy::instance_id(&worker))
-                    .unwrap()
-                    .pending
-                    .load(Ordering::Acquire),
-                13
-            );
+            assert!(pending(&learned, &ws[0]) > 13);
+            t.backdate_for_test(Duration::from_millis(1));
+            t.on_first_token();
+            t.on_first_token();
+            assert_eq!(pending(&learned, &ws[0]), 13);
             drop(other);
             assert_eq!(
                 learned
                     .states
-                    .get(&SMetricStrategy::instance_id(&worker))
-                    .unwrap()
-                    .pending
-                    .load(Ordering::Acquire),
-                0
-            );
-            assert_eq!(
-                learned
-                    .states
-                    .get(&SMetricStrategy::instance_id(&worker))
+                    .get(&SMetricStrategy::instance_id(&ws[0]))
                     .unwrap()
                     .rates
                     .lock()
@@ -1354,301 +1009,123 @@ mod tests {
             );
         }
 
+        let mut history = RateHistory::default();
+        for &r in &[100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0] {
+            history.record(r);
+        }
+        assert_eq!(history.rate, Some(700.0));
+
         let fixed = SMetricStrategy::new(SMetricConfig {
             prefill_rate: Some(1000.0),
             ..config
         });
-        let (_, mut tracker) = select(&fixed, &workers, &prompt("fixed prefill", 0), false, true);
-        tracker.on_first_token();
-        assert_eq!(
-            fixed
-                .states
-                .get(&SMetricStrategy::instance_id(&worker))
-                .unwrap()
-                .pending
-                .load(Ordering::Acquire),
-            0
-        );
-
-        let (_, tracker) = select(
-            &learned,
-            &workers,
-            &prompt("cancelled prefill", 0),
-            false,
-            true,
-        );
-        drop(tracker);
-        assert_eq!(
-            learned
-                .states
-                .get(&SMetricStrategy::instance_id(&worker))
-                .unwrap()
-                .pending
-                .load(Ordering::Acquire),
-            0
-        );
+        let (_, mut ft) = select(&fixed, &ws[..1], &prompt("fixed prefill", 0), false, true);
+        ft.backdate_for_test(Duration::from_millis(1));
+        ft.on_first_token();
+        assert!(fixed
+            .states
+            .get(&SMetricStrategy::instance_id(&ws[0]))
+            .unwrap()
+            .rates
+            .lock()
+            .samples
+            .is_empty());
     }
 
     #[test]
-    fn fallback_balances_without_seeding_affinity_and_skips_unavailable_workers() {
-        let policy = SMetricStrategy::new(SMetricConfig {
-            c_lin: 1.0,
-            c_att: 0.0,
-            prefill_rate: Some(1000.0),
-            slack: 1.0,
-            hit_ratio: 0.1,
-            ttft_slo_base: 20.0,
-            ttft_slo_per_char: 0.0,
-            tpot_slo: 0.020,
-            decode_weight: None,
-            sample_all_event_requests: false,
-            max_tree_size: 1000,
-            eviction_interval_secs: 30,
-        });
-        let workers: Vec<Arc<dyn Worker>> = ["http://one", "http://two"]
-            .into_iter()
-            .map(|url| {
-                Arc::new(BasicWorker::new(url.into(), WorkerType::Regular)) as Arc<dyn Worker>
-            })
-            .collect();
-        drop(select(&policy, &workers, &prompt("known", 0), false, false));
-        workers[0].increment_load();
-        let context = RoutingContext {
+    fn token_id_kv_events_mixed_pool_cjk_units_cold_completion_and_crossover() {
+        let policy = SMetricStrategy::new(test_config(20.0, Some(1000.0)));
+        let ws = workers(&["grpc://bound", "http://tree-only"]);
+        let tokens: Vec<u32> = (1..=100).collect();
+
+        // 1. Token-ID request (`prompt: None`) with bound KV events routes via KV affinity.
+        ws[0].increment_load();
+        let mm_ctx = RoutingContext {
             prompt: None,
-            allow_affinity: false,
+            kv: Some(KvRequestContext {
+                token_ids: &tokens,
+                lora_name: None,
+                cache_salt: None,
+            }),
+            allow_affinity: true,
             colocated: true,
-            route: "/v1/embeddings",
-            kv: None,
+            route: "/v1/completions",
+        };
+        let (picked, tracker, _) = policy
+            .select_request(
+                &ws,
+                &mm_ctx,
+                Some(&[PrefixMatch::Bound(80), PrefixMatch::Bound(0)]),
+                None,
+            )
+            .unwrap();
+        assert_eq!((picked, tracker.unwrap().work), (0, 20));
+
+        // Salted/unavailable token-ID request still enters `select_prefill` (tracks pending work).
+        let (_, salted_tracker, _) = policy
+            .select_request(
+                &ws,
+                &mm_ctx,
+                Some(&[PrefixMatch::Unavailable, PrefixMatch::Unavailable]),
+                None,
+            )
+            .unwrap();
+        assert_eq!(salted_tracker.unwrap().work, 100);
+        ws[0].decrement_load();
+
+        // 2. Mixed pool with dense CJK text (~1 char/token): unified `chars_to_tokens` keeps 100% hit.
+        let cjk = prompt(&"中".repeat(100), 100);
+        let (_, mut seed) = select(&policy, std::slice::from_ref(&ws[1]), &cjk, false, true);
+        seed.on_first_token();
+        ws[1].increment_load();
+        let mixed_ctx = RoutingContext {
+            prompt: Some(&cjk),
+            kv: Some(KvRequestContext {
+                token_ids: &tokens,
+                lora_name: None,
+                cache_salt: None,
+            }),
+            allow_affinity: true,
+            colocated: true,
+            route: "/v1/chat/completions",
         };
         assert_eq!(
             policy
-                .select_request(&workers, &context, None, None)
+                .select_request(
+                    &ws,
+                    &mixed_ctx,
+                    Some(&[PrefixMatch::Bound(0), PrefixMatch::Unmanaged]),
+                    None
+                )
                 .unwrap()
                 .0,
             1
         );
-        workers[0].decrement_load();
-        // If fallback had inserted its input, this would incorrectly stick to worker 1.
-        assert_eq!(
-            select(&policy, &workers, &prompt("fresh", 5), true, false).0,
-            0
-        );
-        assert_eq!(
-            (
-                policy.balance(&workers, "<generic-policy-call>"),
-                policy.balance(&workers, "<generic-policy-call>")
-            ),
-            (Some(1), Some(0))
-        );
-        workers[1].set_healthy(false);
-        assert_eq!(policy.balance(&workers, "<generic-policy-call>"), Some(0));
-        workers[0].set_healthy(false);
-        assert_eq!(policy.balance(&workers, "<generic-policy-call>"), None);
-    }
 
-    #[test]
-    fn unified_phi_defaults_to_beta_half_and_sheds_when_decode_saturates() {
-        let policy = SMetricStrategy::new(
-            serde_yaml::from_str(
-                "C_LIN: 1\nC_ATT: 0\nPREFILL_RATE: 1000000\nSLACK: 1\nHIT_RATIO: 0.5\nTTFT_SLO_BASE: 10\nTTFT_SLO_PER_CHAR: 0\nEVICTION_INTERVAL_SECS: 0\n",
-            )
-            .unwrap(),
-        );
-        let workers: Vec<Arc<dyn Worker>> = ["http://home", "http://idle"]
-            .into_iter()
-            .map(|url| {
-                Arc::new(BasicWorker::new(url.into(), WorkerType::Regular)) as Arc<dyn Worker>
-            })
-            .collect();
-        assert_eq!(policy.effective_beta(&workers[0], None), 0.5);
-        assert_eq!(
-            select(&policy, &workers, &prompt("shared prefix", 0), false, true).0,
-            0
-        );
-
-        // At B_home = 1, Phi(home) ~= 0.5 <= 1.0: session stays on warm home worker.
-        workers[0].increment_load();
+        // 3. Cold first-turn `/v1/completions` (`hit == 0`) fails `hit > HIT_RATIO * history` and balances.
         assert_eq!(
             select(
                 &policy,
-                &workers,
-                &prompt("shared prefix next", 13),
+                &ws,
+                &prompt("brand new completion prompt", 27),
                 true,
                 true
             )
             .0,
             0
         );
+        ws[1].decrement_load();
 
-        // At B_home = 2 with nonzero prefill work, Phi(home) = prefill + 1.0 > 1.0:
-        // home exceeds the unified budget and yields to idle worker 1.
-        workers[0].increment_load();
-        assert_eq!(
-            select(
-                &policy,
-                &workers,
-                &prompt("shared prefix turn3", 18),
-                true,
-                true
-            )
-            .0,
-            1
-        );
-        workers[0].decrement_load();
-        workers[0].decrement_load();
-    }
-
-    #[test]
-    fn rate_history_uses_p50_median_to_resist_fast_outliers() {
-        let mut history = RateHistory::default();
-        // Five normal prefill samples at 1000/s and three fast outliers at 50_000/s.
-        for &r in &[
-            1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 50_000.0, 50_000.0, 50_000.0,
-        ] {
-            history.record(r);
-        }
-        assert_eq!(history.rate, Some(1000.0));
-    }
-
-    #[test]
-    fn beta_estimator_recovers_pure_decode_slope_and_ignores_prefill_stalls() {
-        let policy = SMetricStrategy::new(
-            serde_yaml::from_str(
-                "C_LIN: 1\nC_ATT: 0\nPREFILL_RATE: 1000000\nSLACK: 1\nHIT_RATIO: 0.5\nTTFT_SLO_BASE: 10\nTTFT_SLO_PER_CHAR: 0\nTPOT_SLO: 0.020\nEVICTION_INTERVAL_SECS: 0\n",
-            )
-            .unwrap(),
-        );
-        let worker: Arc<dyn Worker> =
-            Arc::new(BasicWorker::new("http://w0".into(), WorkerType::Regular));
-        let workers = vec![worker.clone()];
-
-        // Admit one streaming request (`worker.load() == 1` => `peers = 0`).
-        let (_, mut tracker) = select(&policy, &workers, &prompt("turn1", 0), false, true);
-        worker.increment_load();
-        tracker.on_first_token();
-        let state = policy
-            .states
-            .get(&SMetricStrategy::instance_id(&worker))
-            .unwrap()
-            .clone();
-        assert_eq!(state.pure_decode_peers(), Some(0));
-
-        // Only one concurrency bucket (b = 0) observed: Persistence of Excitation
-        // keeps beta at DEFAULT_BETA = 0.5.
-        state.record_decode_step(0, 0.012);
-        state.record_decode_step(0, 0.012);
-        assert_eq!(policy.effective_beta(&worker, Some(&state)), 0.5);
-
-        // Second concurrency bucket (b = 1): tau_1 = 12ms, tau(1) = 14ms => delta_tau = 2ms,
-        // headroom = 20ms - 12ms = 8ms => beta = 2 / 8 = 0.25.
-        state.record_decode_step(1, 0.014);
-        state.record_decode_step(1, 0.014);
-        let learned = policy.effective_beta(&worker, Some(&state));
-        assert!(
-            (learned - 0.25).abs() < 1e-6,
-            "expected learned beta 0.25, got {learned}"
-        );
-
-        // Third bucket (b = 2) with an outlier inside the bucket: median resists outlier.
-        state.record_decode_step(2, 0.016);
-        state.record_decode_step(2, 0.016);
-        state.record_decode_step(2, 0.250);
-        let learned = policy.effective_beta(&worker, Some(&state));
-        assert!(
-            (learned - 0.25).abs() < 1e-6,
-            "bucket median must reject spike outlier, got {learned}"
-        );
-
-        // While another request is prefilling (`pending > 0`), `pure_decode_peers` is None
-        // and any overlapping decode window is discarded instead of polluting beta.
-        let concurrent_prefill = policy.track(&worker, 500);
-        assert_eq!(state.pure_decode_peers(), None);
-        for _ in 0..16 {
-            std::thread::sleep(Duration::from_millis(2));
-            tracker.on_output_tokens(1);
-        }
-        let after_prefill_overlap = policy.effective_beta(&worker, Some(&state));
-        assert!(
-            (after_prefill_overlap - 0.25).abs() < 1e-6,
-            "prefill-contaminated decode tokens must not alter beta, got {after_prefill_overlap}"
-        );
-        drop(concurrent_prefill);
-
-        // End-to-end streaming window test on clean pure decode (`pending == 0`, `b = 1`):
-        worker.increment_load(); // total load = 2 => peers = 1
-        let clean_policy = SMetricStrategy::new(
-            serde_yaml::from_str(
-                "C_LIN: 1\nC_ATT: 0\nPREFILL_RATE: 1000000\nSLACK: 1\nHIT_RATIO: 0.5\nTTFT_SLO_BASE: 10\nTTFT_SLO_PER_CHAR: 0\nTPOT_SLO: 0.050\nEVICTION_INTERVAL_SECS: 0\n",
-            )
-            .unwrap(),
-        );
-        let (_, mut stream_tracker) =
-            select(&clean_policy, &workers, &prompt("stream", 0), false, true);
-        stream_tracker.on_first_token();
-        for _ in 0..16 {
-            std::thread::sleep(Duration::from_millis(1));
-            stream_tracker.on_output_tokens(1);
-        }
-        let clean_state = clean_policy
-            .states
-            .get(&SMetricStrategy::instance_id(&worker))
-            .unwrap();
-        assert_eq!(clean_state.beta.samples.lock().len(), 2);
-
-        worker.decrement_load();
-        worker.decrement_load();
-    }
-
-    #[test]
-    fn sample_all_event_requests_trains_bound_cold_misses_only() {
-        let policy = SMetricStrategy::new(
-            serde_yaml::from_str(
-                "C_LIN: 1\nC_ATT: 0\nSLACK: 1\nHIT_RATIO: 0.1\nTTFT_SLO_BASE: 20\nTTFT_SLO_PER_CHAR: 0\nSAMPLE_ALL_EVENT_REQUESTS: true\nEVICTION_INTERVAL_SECS: 0\n",
-            )
-            .unwrap(),
-        );
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            "grpc://worker:1".into(),
-            WorkerType::Regular,
-        ));
-        let p = prompt("cold-prompt", 0);
-
-        // Unbound / suspended source (`index_bound: false`) still skips rate training.
-        let (_, mut unbound_tracker, _) = policy
-            .select_prefill(
-                std::slice::from_ref(&worker),
-                &p,
-                false,
-                true,
-                Some(&[PrefixMatch::default()]),
-                None,
-            )
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(1));
-        unbound_tracker.on_first_token();
-        let state = policy
-            .states
-            .get(&SMetricStrategy::instance_id(&worker))
-            .unwrap()
-            .clone();
-        assert!(state.rates.lock().samples.is_empty());
-
-        // Bound live source (`index_bound: true`) records confirmed 0-block cold miss.
-        let (_, mut bound_tracker, _) = policy
-            .select_prefill(
-                std::slice::from_ref(&worker),
-                &p,
-                false,
-                true,
-                Some(&[PrefixMatch {
-                    index_bound: true,
-                    ..PrefixMatch::default()
-                }]),
-                None,
-            )
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(1));
-        bound_tracker.on_first_token();
-        assert_eq!(state.rates.lock().samples.len(), 1);
+        // 4. ATTENTION_CROSSOVER_TOKENS (0 vs 16384, cold & partial hit) + per-1K SLO scaling.
+        let quad = SMetricStrategy::new(SMetricConfig {
+            ttft_slo_secs: 1.0,
+            ttft_slo_secs_per_1k_tokens: 0.5,
+            attention_crossover_tokens: 16_384.0,
+            ..test_config(1.0, Some(1000.0))
+        });
+        assert_eq!(policy.prefill_cost(16_384.0, 0.0), 16_384.0);
+        assert_eq!(quad.prefill_cost(16_384.0, 0.0), 24_576.0);
+        assert_eq!(quad.prefill_cost(16_384.0, 8_192.0), 14_336.0);
+        assert!((quad.ttft_budget_secs(4_000.0) - 3.0).abs() < 1e-9);
     }
 }

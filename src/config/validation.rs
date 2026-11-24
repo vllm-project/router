@@ -26,12 +26,6 @@ impl ConfigValidator {
             ..
         } = &config.mode
         {
-            if let Some(policy) = prefill_policy {
-                Self::validate_policy(policy)?;
-            }
-            if let Some(policy) = decode_policy {
-                Self::validate_policy(policy)?;
-            }
             if decode_policy
                 .as_ref()
                 .unwrap_or(&config.policy)
@@ -673,54 +667,49 @@ impl ConfigValidator {
     }
 
     fn validate_smetric(config: &super::types::SMetricConfig) -> ConfigResult<()> {
-        if config
-            .prefill_rate
-            .is_some_and(|rate| !rate.is_finite() || rate <= 0.0)
-        {
-            return Err(ConfigError::InvalidValue {
-                field: "PREFILL_RATE".into(),
-                value: format!("{:?}", config.prefill_rate),
-                reason: "Must be finite and positive when configured".into(),
-            });
-        }
-        if config
-            .decode_weight
-            .is_some_and(|beta| !beta.is_finite() || beta < 0.0)
-        {
-            return Err(ConfigError::InvalidValue {
-                field: "DECODE_WEIGHT".into(),
-                value: format!("{:?}", config.decode_weight),
-                reason: "Must be finite and nonnegative when configured".into(),
-            });
-        }
-        for (field, value, positive) in [
-            ("C_LIN", config.c_lin, false),
-            ("C_ATT", config.c_att, false),
-            ("SLACK", config.slack, true),
-            ("HIT_RATIO", config.hit_ratio, false),
-            ("TTFT_SLO_BASE", config.ttft_slo_base, false),
-            ("TTFT_SLO_PER_CHAR", config.ttft_slo_per_char, false),
-            ("TPOT_SLO", config.tpot_slo, true),
-        ] {
-            if !value.is_finite() || value < 0.0 || (positive && value == 0.0) {
+        if let Some(rate) = config.prefill_rate {
+            if !rate.is_finite() || rate <= 0.0 {
                 return Err(ConfigError::InvalidValue {
-                    field: field.into(),
-                    value: value.to_string(),
-                    reason:
-                        "Must be finite and nonnegative (positive for rates, TPOT_SLO and slack)"
-                            .into(),
+                    field: "PREFILL_RATE".into(),
+                    value: rate.to_string(),
+                    reason: "Must be finite and positive when configured".into(),
                 });
             }
         }
-        if config.c_lin == 0.0 && config.c_att == 0.0
-            || config.ttft_slo_base == 0.0 && config.ttft_slo_per_char == 0.0
-            || config.max_tree_size == 0
-            || config.hit_ratio > 1.0
-        {
+        for (field, value) in [
+            ("TTFT_SLO_SECS", config.ttft_slo_secs),
+            (
+                "TTFT_SLO_SECS_PER_1K_TOKENS",
+                config.ttft_slo_secs_per_1k_tokens,
+            ),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(ConfigError::InvalidValue {
+                    field: field.into(),
+                    value: value.to_string(),
+                    reason: "Must be finite and nonnegative".into(),
+                });
+            }
+        }
+        let crossover = config.attention_crossover_tokens;
+        if !crossover.is_finite() || crossover < 0.0 || (crossover > 0.0 && crossover < 1.0) {
+            return Err(ConfigError::InvalidValue {
+                field: "ATTENTION_CROSSOVER_TOKENS".into(),
+                value: crossover.to_string(),
+                reason: "Must be 0 (linear) or finite and >= 1.0 tokens".into(),
+            });
+        }
+        if config.ttft_slo_secs == 0.0 && config.ttft_slo_secs_per_1k_tokens == 0.0 {
             return Err(ConfigError::ValidationFailed {
-                reason:
-                    "SMetric requires nonzero cost/SLO models, MAX_TREE_SIZE > 0 and HIT_RATIO <= 1"
-                        .into(),
+                reason: "SMetric requires TTFT_SLO_SECS > 0 or TTFT_SLO_SECS_PER_1K_TOKENS > 0"
+                    .into(),
+            });
+        }
+        if config.max_tree_size == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "MAX_TREE_SIZE".into(),
+                value: "0".into(),
+                reason: "Must be greater than 0".into(),
             });
         }
         Ok(())
@@ -1338,36 +1327,35 @@ mod tests {
     fn kv_aware_smetric_validates_the_nested_cost_model() {
         let mut smetric: super::super::types::SMetricConfig =
             serde_yaml::from_str(include_str!("../../examples/configs/smetric.yaml")).unwrap();
-        assert_eq!(smetric.decode_weight, None);
-        assert_eq!(smetric.tpot_slo, 0.020);
-        assert!(smetric.sample_all_event_requests);
-        smetric.c_lin = -1.0;
-        let selection: PolicyConfig =
+        assert_eq!(smetric.attention_crossover_tokens, 16_384.0);
+        assert_eq!(smetric.prefill_rate, None);
+
+        // ATTENTION_CROSSOVER_TOKENS: 0 is valid and selects pure linear prefill cost.
+        smetric.attention_crossover_tokens = 0.0;
+        let linear: PolicyConfig =
             serde_json::from_value(serde_json::json!({"type":"kv_aware", "smetric":smetric}))
                 .unwrap();
-        assert!(
-            matches!(ConfigValidator::validate_policy(&selection), Err(ConfigError::InvalidValue { field, .. }) if field == "C_LIN")
-        );
+        assert!(ConfigValidator::validate_policy(&linear).is_ok());
 
-        let mut bad_beta: super::super::types::SMetricConfig =
-            serde_yaml::from_str(include_str!("../../examples/configs/smetric.yaml")).unwrap();
-        bad_beta.decode_weight = Some(-0.1);
-        let selection: PolicyConfig =
-            serde_json::from_value(serde_json::json!({"type":"kv_aware", "smetric":bad_beta}))
-                .unwrap();
-        assert!(
-            matches!(ConfigValidator::validate_policy(&selection), Err(ConfigError::InvalidValue { field, .. }) if field == "DECODE_WEIGHT")
-        );
+        for bad in [-1.0, 0.5] {
+            smetric.attention_crossover_tokens = bad;
+            let bad_crossover: PolicyConfig =
+                serde_json::from_value(serde_json::json!({"type":"kv_aware", "smetric":smetric}))
+                    .unwrap();
+            assert!(
+                matches!(ConfigValidator::validate_policy(&bad_crossover), Err(ConfigError::InvalidValue { field, .. }) if field == "ATTENTION_CROSSOVER_TOKENS")
+            );
+        }
 
-        let mut bad_tpot: super::super::types::SMetricConfig =
-            serde_yaml::from_str(include_str!("../../examples/configs/smetric.yaml")).unwrap();
-        bad_tpot.tpot_slo = 0.0;
-        let selection: PolicyConfig =
-            serde_json::from_value(serde_json::json!({"type":"kv_aware", "smetric":bad_tpot}))
+        let zero_slo: super::super::types::SMetricConfig =
+            serde_yaml::from_str("TTFT_SLO_SECS: 0\nTTFT_SLO_SECS_PER_1K_TOKENS: 0\n").unwrap();
+        let bad_slo: PolicyConfig =
+            serde_json::from_value(serde_json::json!({"type":"kv_aware", "smetric":zero_slo}))
                 .unwrap();
-        assert!(
-            matches!(ConfigValidator::validate_policy(&selection), Err(ConfigError::InvalidValue { field, .. }) if field == "TPOT_SLO")
-        );
+        assert!(matches!(
+            ConfigValidator::validate_policy(&bad_slo),
+            Err(ConfigError::ValidationFailed { .. })
+        ));
     }
 
     #[test]

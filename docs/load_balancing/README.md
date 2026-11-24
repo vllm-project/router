@@ -268,28 +268,27 @@ a compatibility alias for the same implementation. YAML router configuration
 can select this mode with `policy: {type: kv_aware, smetric: {...}}`.
 
 Worker binding, event queries and candidate collection are shared by both modes.
-SMetric retains its character-cost and rate history because these quantities
-are different from the default mode's token counters. Its `RequestTracker`
-uses the same router request-lifecycle guard; it does not add a second token
-slot reservation. HTTP and P/D prefill retain the existing Tree behavior.
-Temperature and non-device transfer-credit options apply to the default mode;
-SMetric uses its deterministic affinity/budget rule and local GPU prefix credit.
+SMetric tracks queued prefill work in linear-token equivalents (`n + n * (L - n / 2) / L_eq`,
+where `n = max(L - hit, 0)` is uncached prompt tokens and `ATTENTION_CROSSOVER_TOKENS` defaults
+to `16384`, or `0` for a pure linear model) and learns a per-worker rolling P90 prefill rate
+online from streaming/gRPC first-token or P/D prefill latencies (pure non-streaming HTTP
+deployments should set an explicit `PREFILL_RATE`). Its `RequestTracker` uses the same router
+request-lifecycle guard without adding a second slot reservation, and HTTP text-tree updates
+are deferred until first generated output (or non-streaming 2xx completion) with per-scope
+prefix isolation inside one shared Tree per model. Temperature and non-device transfer-credit
+options apply to the default mode; SMetric uses its deterministic affinity/budget rule (50%
+reusable-history gate) and local GPU prefix credit.
 
-The YAML is required to select SMetric; calibrate its character-based cost coefficients, rate and
-TTFT budget for the deployment. Omit `PREFILL_RATE` to learn a per-worker rate
-from the first generated output in a stream or successful PD prefill completion.
-Stream metadata and error events do not train the rate estimate.
-An explicit rate stays fixed. `MAX_TREE_SIZE` defaults to 67,108,864 characters
-per worker. The optional `EVICTION_INTERVAL_SECS` defaults to 30; set it to `0`
-to disable size eviction. Dropping the policy stops its eviction thread.
+The YAML selects SMetric and sets your token-scale TTFT budget (`TTFT_SLO_SECS` and
+`TTFT_SLO_SECS_PER_1K_TOKENS`). `MAX_TREE_SIZE` defaults to 67,108,864 characters per worker
+(shared across all scopes on that model) and `EVICTION_INTERVAL_SECS` defaults to `30` (`0`
+disables periodic eviction).
 
 ### Cache state and token input
 
-HTTP workers, including the HTTP P/D path, continue to use the request-history
-Tree. With regular gRPC chat workers, SMetric reuses the shared KV Events
-discovery and index, querying the same prepared token IDs sent to the engine.
-The engine must expose its KV Events configuration through the gRPC Control
-service and publish events. No additional SMetric configuration is needed:
+HTTP workers (including HTTP P/D) use the request-history Tree. Regular gRPC workers reuse
+the shared KV Events discovery and index on the prepared token IDs, selected per worker so
+unbound peers fall back to their text tree without losing affinity on bound peers:
 
 ```bash
 ./target/release/vllm-router --policy kv_aware \
@@ -297,45 +296,19 @@ service and publish events. No additional SMetric configuration is needed:
   --worker-urls grpc://worker1:8000 grpc://worker2:8000
 ```
 
-An unpinned address needs Control metadata confirming a single DP rank.
-Explicit `@rank` addresses bind to that rank; an ambiguous target receives
-no event-derived credit.
+An unpinned address needs Control metadata confirming a single DP rank; explicit `@rank`
+addresses bind to that rank. SMetric credits contiguous local GPU blocks in cache group 0
+(capped before the final prompt token), ignoring non-device tiers and nonempty `cache_salt`
+requests. Bound live sources train the online P90 prefill rate on unsalted non-empty requests
+including confirmed 0-block cold misses, while unbound or suspended sources skip rate training.
 
-SMetric credits contiguous local GPU blocks in cache group 0, capped at the
-complete blocks before the final prompt token that must be recomputed for
-logits. Host and external cache tiers receive no credit. The index handles
-block removals, cache clears and event sequence gaps; worker removal also
-clears SMetric's binding. Token requests do not populate or consult the Tree.
-Missing metadata or prefix evidence, and requests with a nonempty `cache_salt`,
-receive zero cache credit. LoRA names use the shared index's hash namespace.
-Event interpretation and cache-identity semantics follow the shared upstream index.
-
-The cost model keeps its character units. For a prompt of `L` characters and
-`N` prepared tokens, `H` reusable tokens become `floor(L * H / N)` equivalent
-cached characters. This is a cost approximation based on event-derived token
-residency; it does not recover exact token-to-character offsets. Existing cost
-coefficients, TTFT budgets and rate parameters keep their meaning. Online rate
-learning uses requests with observed event-prefix evidence; zero-match requests
-release their pending work without training the rate, since the shared query
-does not distinguish a cold miss from unavailable cache state. A configured
-`PREFILL_RATE` remains fixed. Tree size and eviction settings apply only to
-the request-history path.
-
-Multimodal chat parts and tool results, unrecognized message roles,
-batched/token-ID completion prompts and other endpoints fall back to
-**least-inflight balancing**, with rotating ties among available
-workers. They do not populate the prefix tree or train prefill rates. Native HTTP
-forwarding preserves unsupported content parts; the token-ID-only gRPC path
-still rejects multimodal input.
-Re-encoded PD JSON responses regenerate body-length and framing headers.
-
-Each policy instance warns once for each fixed input category: non-text chat,
-batched or token-ID prompts, and unsupported endpoints or missing typed prompts.
-Subsequent fallbacks in the same category log at debug level. Both levels include
-`route`, input category, `fallback=least_inflight` and `selected_worker`, without
-logging the input payload. SMetric request load
-is released on completion, error or cancellation; retry attempts own separate
-load reservations. This does not change Power-of-Two load accounting.
+Single token-ID `/v1/completions` prompts route using tokenized KV affinity when bound KV Events
+are available. Multimodal chat parts, unrecognized message roles, batched completion prompts,
+and other endpoints fall back to **least-inflight balancing** (rotating ties) on HTTP without
+populating the prefix tree or training rates (the token-ID-only gRPC chat frontend rejects
+multimodal parts and unrecognized roles), logging one warning per bounded input category per
+policy. SMetric request load is released on completion, error or cancellation; retry attempts
+own separate load reservations.
 
 The [archived reproduction](https://github.com/clateral912/smetric-router-repro)
 contains a historical Power-of-Two **zero-load/load-feedback-limited baseline**.

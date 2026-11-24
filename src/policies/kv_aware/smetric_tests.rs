@@ -5,9 +5,12 @@ use crate::policies::KvRequestContext;
 use crate::protocols::spec::{CacheIdentity, RoutingPrompt};
 
 fn policy() -> KvAwarePolicy {
-    KvAwarePolicy::default().with_smetric(serde_yaml::from_str(
-        "C_LIN: 1\nC_ATT: 0\nPREFILL_RATE: 1\nSLACK: 1\nHIT_RATIO: 0.1\nTTFT_SLO_BASE: 20\nTTFT_SLO_PER_CHAR: 0\nEVICTION_INTERVAL_SECS: 0\n"
-    ).unwrap())
+    KvAwarePolicy::default().with_smetric(
+        serde_yaml::from_str(
+            "TTFT_SLO_SECS: 20\nATTENTION_CROSSOVER_TOKENS: 0\nPREFILL_RATE: 1\nEVICTION_INTERVAL_SECS: 0\n",
+        )
+        .unwrap(),
+    )
 }
 
 fn worker(url: &str) -> Arc<dyn Worker> {
@@ -106,17 +109,17 @@ fn block_credit_and_cost_units_survive_the_shared_selection_path() {
         Some(index.clone()),
     );
     store(&index, "engine", 0, StorageTier::Device);
-    for (n, remaining_tokens, remaining_work, observed) in [
+    for (n, remaining_tokens, remaining_work, sample_rate) in [
         (13, 1, 1, true),
-        (9, 1, 2, true),
-        (8, 4, 7, true),
-        (7, 3, 6, true),
-        (3, 3, 13, false),
-        (0, 0, 13, false),
+        (9, 1, 1, true),
+        (8, 4, 4, true),
+        (7, 3, 3, true),
+        (3, 3, 3, true),
+        (0, 0, 0, false),
     ] {
         assert_eq!(
             work(&policy, &worker, &(1..=n).collect::<Vec<_>>(), 13),
-            (remaining_tokens, remaining_work, observed)
+            (remaining_tokens, remaining_work, sample_rate)
         );
     }
 }
@@ -145,7 +148,7 @@ fn event_removal_clear_and_suspension_change_admitted_work() {
     index.resume_source(&Arc::from("engine"), 0);
     assert_eq!(work(&policy, &worker, &tokens, 13).0, 9);
     index.clear(&owner("engine", 0), ClearScope::Worker);
-    assert_eq!(work(&policy, &worker, &tokens, 13), (13, 13, false));
+    assert_eq!(work(&policy, &worker, &tokens, 13), (13, 13, true));
 }
 
 #[test]

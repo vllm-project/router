@@ -6,6 +6,32 @@ use crate::policies::{
 };
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug)]
+pub(in crate::policies) enum KvBinding {
+    /// Worker is not bound to a KV-event index (may fall back to HTTP text tree).
+    Unmanaged,
+    /// Worker is KV-event managed, but placement is disabled (salted) or source is suspended.
+    Unavailable,
+    /// Worker is bound to a live KV-event index with the given block size.
+    Ready(u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PrefixMatch {
+    Unmanaged,
+    Unavailable,
+    Bound(usize),
+}
+
+impl PrefixMatch {
+    fn tokens(self) -> usize {
+        match self {
+            Self::Bound(tokens) => tokens,
+            Self::Unmanaged | Self::Unavailable => 0,
+        }
+    }
+}
+
 impl SMetricStrategy {
     pub(in crate::policies) fn match_query(
         token_ids: Option<&[u32]>,
@@ -55,21 +81,16 @@ impl SMetricStrategy {
         workers: &[Arc<dyn Worker>],
         healthy: &[usize],
         candidates: &[CandidateView<'_>],
-        binding_meta: impl Iterator<Item = (u32, bool)>,
+        bindings: impl Iterator<Item = KvBinding>,
         context: Option<&RoutingContext<'_>>,
     ) -> Option<(KvSelectionReceipt, Option<RequestTracker>)> {
         let empty_context = RoutingContext::default();
         let context = context.unwrap_or(&empty_context);
-        let chars = context
-            .prompt
-            .map_or(0, |prompt| prompt.text.chars().count());
         let hits = context.kv.as_ref().map(|_| {
             candidates
                 .iter()
-                .zip(binding_meta)
-                .map(|(candidate, (block_size, index_bound))| {
-                    prefix_match(candidate, block_size, index_bound, chars)
-                })
+                .zip(bindings)
+                .map(|(candidate, binding)| prefix_match(candidate, binding))
                 .collect::<Vec<_>>()
         });
         let selected_workers: Vec<_> = healthy.iter().map(|&i| workers[i].clone()).collect();
@@ -82,7 +103,7 @@ impl SMetricStrategy {
         let candidate = &candidates[picked];
         let new_prefill_tokens = candidate
             .input_tokens
-            .saturating_sub(hits.as_ref().map_or(0, |hits| hits[picked].tokens))
+            .saturating_sub(hits.as_ref().map_or(0, |hits| hits[picked].tokens()))
             as u64;
         Some((
             KvSelectionReceipt {
@@ -102,24 +123,15 @@ impl SMetricStrategy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct PrefixMatch {
-    pub(super) chars: usize,
-    pub(super) tokens: usize,
-    pub(super) observed: bool,
-    pub(super) index_bound: bool,
-}
-
-fn prefix_match(
-    candidate: &CandidateView<'_>,
-    block_size: u32,
-    index_bound: bool,
-    chars: usize,
-) -> PrefixMatch {
+fn prefix_match(candidate: &CandidateView<'_>, binding: KvBinding) -> PrefixMatch {
+    let block_size = match binding {
+        KvBinding::Unmanaged => return PrefixMatch::Unmanaged,
+        KvBinding::Unavailable => return PrefixMatch::Unavailable,
+        KvBinding::Ready(b) => b as usize,
+    };
     let n = candidate.input_tokens;
-    let b = block_size as usize;
-    if n == 0 || b == 0 {
-        return PrefixMatch::default();
+    if n == 0 || block_size == 0 {
+        return PrefixMatch::Bound(0);
     }
     let blocks = candidate
         .matches
@@ -134,11 +146,5 @@ fn prefix_match(
         .map(|(_, end)| *end as usize)
         .max()
         .unwrap_or(0);
-    let tokens = blocks.min(n.saturating_sub(1) / b) * b;
-    PrefixMatch {
-        chars: ((chars as u128 * tokens as u128) / n as u128) as usize,
-        tokens,
-        observed: blocks > 0,
-        index_bound,
-    }
+    PrefixMatch::Bound(blocks.min(n.saturating_sub(1) / block_size) * block_size)
 }
