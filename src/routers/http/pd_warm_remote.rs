@@ -868,16 +868,21 @@ pub(super) async fn execute(
                 .reserve_prefill(&p.id)
                 .await
                 .map_err(|_| "P capacity timeout")?;
+            if !prefill_target_is_live(runtime, &p.id) {
+                warm_remote.invalidate_target(&p.base_url, p.dp_rank);
+                return Err(ExecuteError::Reselect);
+            }
             let current_pe = warm_remote
                 .identify(client, p, headers, topology_revision)
                 .await;
+            if !prefill_target_is_live(runtime, &p.id) {
+                warm_remote.invalidate_target(&p.base_url, p.dp_rank);
+                return Err(ExecuteError::Reselect);
+            }
             if runtime.worker_registry.revision() != topology_revision
                 || current_pe.as_ref().ok() != Some(&pe)
             {
                 warm_remote.invalidate_target(&p.base_url, p.dp_rank);
-                if !prefill_target_is_live(runtime, &p.id) {
-                    return Err(ExecuteError::Reselect);
-                }
                 return Err(match current_pe {
                     Err(err) => err.into(),
                     Ok(_) => ExecuteError::Failed("P epoch changed after capacity wait".into()),

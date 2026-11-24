@@ -24,6 +24,7 @@ use vllm_router_rs::{
 /// What a [`RecordingPrefill`] saw: request text and headers per call.
 type RecordedCalls = Arc<Mutex<Vec<(Option<String>, Option<RequestHeaders>)>>>;
 type CapabilityHook = Arc<dyn Fn() -> Option<StatusCode> + Send + Sync>;
+type CompletionGate = Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>;
 
 #[derive(Clone)]
 struct StateData {
@@ -40,6 +41,7 @@ struct StateData {
     metrics_kv_milli: Arc<AtomicU64>,
     metrics_running: Arc<AtomicU64>,
     auth_gate: Arc<AtomicBool>,
+    prefill_gate: CompletionGate,
 }
 struct Engine {
     url: String,
@@ -66,6 +68,7 @@ async fn engine(p: bool, fail_warm: bool, partial: bool) -> Engine {
         metrics_kv_milli: Arc::new(AtomicU64::new(0)),
         metrics_running: Arc::new(AtomicU64::new(0)),
         auth_gate: Arc::new(AtomicBool::new(false)),
+        prefill_gate: Arc::new(Mutex::new(None)),
     };
     let app=Router::new().route("/health",get(||async{"ok"}))
         .route("/get_server_info",get(||async{Json(json!({"model_id":"test","data_parallel_size":1}))}))
@@ -102,6 +105,11 @@ async fn generate(
     Json(r): Json<Value>,
 ) -> axum::response::Response {
     s.calls.lock().unwrap().push(r.clone());
+    let gate = s.prefill_gate.lock().unwrap().take();
+    if let Some((entered, release)) = gate {
+        entered.notify_one();
+        release.notified().await;
+    }
     if r.pointer("/kv_transfer_params/pd_probe_only") == Some(&json!(true)) {
         return Json(json!({"choices":[],"usage":{"prompt_tokens":r["prompt"].as_array().unwrap().len(),"completion_tokens":0},"kv_transfer_params":{"pd_probe":true,"pd_instance_epoch":s.epoch.load(Ordering::SeqCst).to_string(),"pd_feedback":{"local_cached_tokens":6}}})).into_response();
     }
@@ -771,16 +779,31 @@ struct RecordingPrefill {
     needs_text: bool,
     needs_cache_key: bool,
     needs_headers: bool,
+    rotate: bool,
     calls: RecordedCalls,
     counter: AtomicUsize,
 }
 
 impl RecordingPrefill {
     fn new(needs_text: bool, needs_cache_key: bool, needs_headers: bool) -> Arc<Self> {
+        Self::with_rotation(needs_text, needs_cache_key, needs_headers, true)
+    }
+
+    fn pinned_first(needs_text: bool, needs_cache_key: bool, needs_headers: bool) -> Arc<Self> {
+        Self::with_rotation(needs_text, needs_cache_key, needs_headers, false)
+    }
+
+    fn with_rotation(
+        needs_text: bool,
+        needs_cache_key: bool,
+        needs_headers: bool,
+        rotate: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             needs_text,
             needs_cache_key,
             needs_headers,
+            rotate,
             calls: Arc::new(Mutex::new(Vec::new())),
             counter: AtomicUsize::new(0),
         })
@@ -802,7 +825,12 @@ impl LoadBalancingPolicy for RecordingPrefill {
             .lock()
             .unwrap()
             .push((request_text.map(str::to_string), headers.cloned()));
-        Some(self.counter.fetch_add(1, Ordering::SeqCst) % workers.len())
+        let index = if self.rotate {
+            self.counter.fetch_add(1, Ordering::SeqCst) % workers.len()
+        } else {
+            0
+        };
+        Some(index)
     }
 
     fn name(&self) -> &'static str {
@@ -1154,5 +1182,160 @@ async fn warm_probe_200_returns_no_feasible_when_last_prefill_leaves_during_prob
     assert!(
         body_text.contains("No feasible registered P/D pair"),
         "expected early no-feasible 503 instead of stale epoch error, got: {body_text}"
+    );
+}
+
+async fn wait_for_worker_load(worker: &dyn Worker, expected: usize, at_least: bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let current = worker.load();
+            if if at_least {
+                current >= expected
+            } else {
+                current == expected
+            } {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed out waiting for worker load");
+}
+
+async fn run_capacity_wait_circuit_breaker_race(
+    prefills: &[&Engine],
+    policy: Arc<RecordingPrefill>,
+    headers: Option<HeaderMap>,
+) -> (StatusCode, Vec<u8>) {
+    let p0 = prefills[0];
+    let d = engine(false, false, false).await;
+    let (r, registry) = router_with_registry_and_policy(
+        prefills,
+        &d,
+        policy,
+        false,
+        json!({"max_prefill_requests_per_target": 1}),
+    )
+    .await;
+    let r = Arc::new(r);
+    let p0_worker = registry
+        .get_by_url(&p0.url)
+        .expect("prefill worker registered");
+    assert_eq!(registry.get_prefill_workers()[0].url(), p0.url);
+    let rev_before = registry.revision();
+
+    // Populate warm capability cache for p0 and d before taking the capacity slot.
+    let (warm_status, _, warm_body) = send_completion(
+        &r,
+        None,
+        completion_body("cb-warm", &[10, 11, 12], true, false),
+    )
+    .await;
+    assert_eq!(
+        warm_status,
+        StatusCode::OK,
+        "warmup turn failed: {}",
+        String::from_utf8_lossy(&warm_body)
+    );
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 1);
+    wait_for_worker_load(p0_worker.as_ref(), 0, false).await;
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *p0.state.prefill_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+
+    let r1 = Arc::clone(&r);
+    let req1 = tokio::spawn(async move {
+        send_completion(
+            &r1,
+            None,
+            completion_body("cb-hold", &[20, 21, 22], true, false),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("timed out waiting for req1 to enter prefill gate");
+    assert_eq!(p0_worker.load(), 1);
+
+    let r2 = Arc::clone(&r);
+    let req2 = tokio::spawn(async move {
+        send_completion(
+            &r2,
+            headers.as_ref(),
+            completion_body("cb-wait", &[30, 31, 32], true, false),
+        )
+        .await
+    });
+    wait_for_worker_load(p0_worker.as_ref(), 2, true).await;
+    // Allow req2 to park on reserve_prefill before tripping p0's circuit breaker.
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+    p0_worker.circuit_breaker().force_open();
+    assert!(!p0_worker.is_available());
+    assert_eq!(registry.revision(), rev_before);
+
+    release.notify_one();
+    let (status1, _, body1) = req1.await.unwrap();
+    assert_eq!(
+        status1,
+        StatusCode::OK,
+        "holding request failed: {}",
+        String::from_utf8_lossy(&body1)
+    );
+    let (status2, _, body2) = req2.await.unwrap();
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    (status2, body2)
+}
+
+#[tokio::test]
+async fn capacity_wait_reselects_when_prefill_circuit_breaker_opens() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let policy = RecordingPrefill::pinned_first(true, false, true);
+    let mut headers = HeaderMap::new();
+    headers.insert("x-session-id", HeaderValue::from_static("session-cb-wait"));
+
+    let (status2, body2) =
+        run_capacity_wait_circuit_breaker_race(&[&p0, &p1], policy.clone(), Some(headers)).await;
+    assert_eq!(
+        status2,
+        StatusCode::OK,
+        "expected reselection after circuit breaker opened during capacity wait, got: {}",
+        String::from_utf8_lossy(&body2)
+    );
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 2);
+    assert_eq!(p1.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        4,
+        "expected warmup + hold + wait + reselect calls: {calls:?}"
+    );
+    assert_eq!(calls[2], calls[3]);
+    assert_eq!(
+        calls[3]
+            .1
+            .as_ref()
+            .and_then(|h| h.get("x-session-id"))
+            .map(String::as_str),
+        Some("session-cb-wait")
+    );
+}
+
+#[tokio::test]
+async fn capacity_wait_returns_no_feasible_when_last_prefill_circuit_breaker_opens() {
+    let p0 = engine(true, false, false).await;
+    let policy = RecordingPrefill::pinned_first(false, false, false);
+
+    let (status2, body2) = run_capacity_wait_circuit_breaker_race(&[&p0], policy, None).await;
+    assert_eq!(status2, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 2);
+    let body_text = String::from_utf8_lossy(&body2);
+    assert!(
+        body_text.contains("No feasible registered P/D pair"),
+        "expected no-feasible 503 after last prefill tripped circuit breaker during wait, got: {body_text}"
     );
 }
