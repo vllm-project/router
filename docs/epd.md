@@ -202,8 +202,10 @@ processed/policy metrics. HTTP batch execution owns that accounting.
 Encode `processed_requests` counts completed HTTP batch attempts, including
 HTTP, transport, and response-JSON failures. Dropping an unfinished future
 releases load without adding a completion or a circuit-breaker outcome.
-Successful JSON responses and HTTP 4xx count as reachable-worker outcomes;
-transport errors, HTTP 5xx, and unreadable JSON count as failed outcomes.
+Successful responses with valid JSON and transfer reports, including omitted or
+null reports, count as reachable-worker outcomes, as do HTTP 4xx responses.
+Transport errors, HTTP 5xx, unreadable JSON, and malformed transfer reports
+count as failed outcomes.
 
 ## Request and metadata behavior
 
@@ -215,13 +217,14 @@ re-preprocesses into the same mm_hash and can still reuse the published
 embedding. Repeated images keep their original positions and independent
 transfer IDs.
 
-Encoder responses use the existing JSON metadata contract. When `item_indices`
-is present it must be a batch-local integer array with in-range, non-repeated
-positions; malformed indices or non-numeric metadata fail the request with
-`502` before the consumer is called. Three missing-data cases remain valid
-fallbacks: no EC report, no entry for an item, or an entry without non-empty
-placeholder metadata. In each case the router keeps the raw media with its
-content-derived UUID and forwards the reported transfer handle when one exists.
+Encoder responses may omit `ec_transfer_params` or set it to `null`. Any other
+value must be a JSON object. When `item_indices` is present it must be a
+batch-local integer array with in-range, non-repeated positions. A malformed
+report type, malformed indices, or non-numeric metadata fail the request with
+`502` before the consumer is called. The router keeps the raw media with its
+content-derived UUID when the EC report is omitted or null, when it has no entry
+for the item, or when the entry has no non-empty placeholder metadata. It
+forwards the reported transfer handle when one exists.
 Connector-specific fields under `ec_transfer_params` remain opaque and are
 passed through unchanged.
 Other request fields, including sampling options, pass through unchanged.

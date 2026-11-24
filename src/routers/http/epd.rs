@@ -606,8 +606,15 @@ fn parse_batch_response(
     items: &[MediaItem],
     indices: &[usize],
 ) -> Result<Vec<Option<EncodedItem>>, EpdError> {
-    let Some(Value::Object(params)) = reply.get("ec_transfer_params") else {
-        return Ok(indices.iter().map(|_| None).collect());
+    let params = match reply.get("ec_transfer_params") {
+        Some(Value::Object(params)) => params,
+        None | Some(Value::Null) => return Ok(indices.iter().map(|_| None).collect()),
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "Encoder ec_transfer_params must be a JSON object or null".into(),
+            ));
+        }
     };
     // Position is the reliable correlation when the engine rehashes uuids
     // with processing options; uuid and single-entry shapes are fallbacks.
@@ -1013,6 +1020,9 @@ mod tests {
         if state.mode == "no_report" {
             return (StatusCode::OK, Json(json!({})));
         }
+        if state.mode == "null_report" {
+            return (StatusCode::OK, Json(json!({"ec_transfer_params": null})));
+        }
         if state.mode == "missing_entry" {
             return (
                 StatusCode::OK,
@@ -1330,13 +1340,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_outcomes_cover_http_json_and_transport_failures() {
+    async fn batch_outcomes_cover_http_response_and_transport_failures() {
         use axum::response::IntoResponse;
         for (status, response_body, success) in [
             (StatusCode::OK, "{}", true),
             (StatusCode::BAD_REQUEST, "bad input", true),
             (StatusCode::INTERNAL_SERVER_ERROR, "failed", false),
             (StatusCode::OK, "invalid json", false),
+            (StatusCode::OK, r#"{"ec_transfer_params":[]}"#, false),
+            (StatusCode::OK, r#"{"ec_transfer_params":"report"}"#, false),
+            (StatusCode::OK, r#"{"ec_transfer_params":42}"#, false),
+            (StatusCode::OK, r#"{"ec_transfer_params":true}"#, false),
         ] {
             let app = Router::new().route(
                 "/v1/chat/completions",
@@ -1364,7 +1378,11 @@ mod tests {
             let result = stage
                 .prepare(&Client::new(), request(), "pd", None, None)
                 .await;
-            assert_eq!(result.is_ok(), status.is_success() && success);
+            assert_eq!(
+                result.is_ok(),
+                status.is_success() && success,
+                "encoder returned {status} with body {response_body}"
+            );
             if let Err((actual, _)) = result {
                 assert_eq!(
                     actual,
@@ -1764,14 +1782,18 @@ mod tests {
 
     #[tokio::test]
     async fn missing_report_and_missing_entry_keep_raw_media_with_uuid() {
-        for mode in ["no_report", "missing_entry"] {
+        for mode in ["no_report", "null_report", "missing_entry"] {
             let (stage, seen, server) = mock(mode).await;
+            let worker = stage.worker_registry.get_by_type(&WorkerType::Encode)[0].clone();
             let input = request();
             let (body, pending) = stage
                 .prepare(&Client::new(), input.clone(), "pd", None, None)
                 .await
                 .unwrap();
             assert!(pending.is_none());
+            assert!(body.get("ec_transfer_params").is_none());
+            assert_eq!(worker.circuit_breaker().total_successes(), 1);
+            assert_eq!(worker.circuit_breaker().total_failures(), 0);
 
             let encoded = seen.lock().unwrap();
             let uuid = encoded[0]["messages"][0]["content"][0]["uuid"]
