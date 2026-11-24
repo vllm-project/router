@@ -552,16 +552,59 @@ done
 
 ## Router options
 
-| Option | Type | When to use it |
-| --- | --- | --- |
-| `--policy kv_aware` | Policy name | Score reuse in a colocated pool. |
-| `--prefill-policy kv_aware` | Policy name | Score Prefill reuse in P/D. |
-| `--decode-policy kv_aware` | Policy name | Score Decode reuse in P/D when Decode publishes KV events. |
-| `--kv-hybrid-layout` | JSON file path | Supply missing cache groups, hashing and reuse rules. |
-| `--pd-pair` | Repeatable `PREFILL=DECODE[,DECODE...]` | Limit routing to specified transfer-compatible pairs. |
-| `--kv-event-topic` | Repeatable `WORKER_URL=TOPIC[,TOPIC...]` | Declare topics for static publishers in DP-rank order. |
+Both the Rust and Python launchers accept these options. Configure vLLM workers with the separate [worker options](#worker-requirements).
 
-See the [CLI reference](../cli_reference.md#routing-policies) for the full option list.
+### Routing and layout
+
+| Option | Value | Default | Purpose |
+| --- | --- | --- | --- |
+| `--policy` | Policy name | `cache_aware` | Set `kv_aware` for colocated routing or as the default policy for both P/D stages. |
+| `--worker-urls` | List of worker URLs | Empty list | Register a colocated pool of HTTP or gRPC workers. |
+| `--intra-node-data-parallel-size` | Positive integer | `1` | Number of DP ranks per worker URL for DP-aware routing. |
+| `--vllm-pd-disaggregation` | Flag | Off | Enable P/D routing. |
+| `--prefill` | `URL [PORT or none]`, repeatable | No workers | Register a Prefill worker with an optional bootstrap port. |
+| `--decode` | `URL`, repeatable | No workers | Register a Decode worker. |
+| `--prefill-policy` | Policy name | Inherits `--policy` | Set `kv_aware` to score Prefill prefix reuse. |
+| `--decode-policy` | Policy name | Inherits `--policy` | Set `kv_aware` to route Decode by context load. Enable Decode KV events to credit cache reuse. |
+| `--kv-connector` | `nixl`, `mooncake`, or `moriio` | `nixl` | Match the connector used by the P/D workers. MoRI-IO requires vLLM ZMQ discovery. |
+| `--vllm-discovery-address` | `HOST:PORT` | Unset | Listen for vLLM ZMQ worker registration when using P/D discovery. Use explicit URLs for gRPC P/D. |
+| `--pd-pair` | `PREFILL=DECODE[,DECODE...]`, repeatable | All peers in one compatible pool | Restrict a mixed pool to the declared P/D pairs. Supply one entry per Prefill. |
+| `--kv-hybrid-layout` | JSON file path | Unset | Supply cache groups, hashing, and reuse rules when the Router cannot derive them or read them from the worker. |
+
+### Static KV events
+
+Use these options when workers cannot report their event sources. Provide endpoint and topic lists in DP-rank order. See the [static setup example](#static-event-endpoints).
+
+| Option | Value | Default | Purpose |
+| --- | --- | --- | --- |
+| `--kv-event-source` | `WORKER_URL=ENDPOINT[,ENDPOINT...]`, repeatable | Empty list | Set live ZMQ publisher addresses for colocated workers. |
+| `--pd-kv-events` | `WORKER_URL=ENDPOINT[,ENDPOINT...]`, repeatable | Empty list | Set live ZMQ publisher addresses for workers in a stage that uses `kv_aware`. |
+| `--kv-event-replay-source` | `WORKER_URL=ENDPOINT[,ENDPOINT...]`, repeatable | Empty list | Set replay addresses for the worker's `--kv-event-source` or `--pd-kv-events` entry. |
+| `--kv-event-topic` | `WORKER_URL=TOPIC[,TOPIC...]`, repeatable | Empty list | Supply each static publisher's current event topic. |
+| `--kv-event-model` | Served model ID | Unset | Set the model ID for static publishers. Use the ID from the worker's `/v1/models`. |
+| `--kv-event-block-size` | Positive integer in tokens | `16` | Set the hash block size for static publishers. Match the worker's hash unit. |
+
+### Scoring and recovery
+
+Transfer credits are fractions of reusable tokens counted as work avoided. `0` ignores reuse from that tier and `1` gives full credit.
+
+| Option | Value | Default | Purpose |
+| --- | --- | --- | --- |
+| `--router-temperature` | Nonnegative float | `0.0` | Set how strongly colocated and P/D Prefill selection favors lower cost. Zero picks a minimum-cost worker. |
+| `--kv-penalty-host` | Float in `[0, 1]` | `0.8` | Set credit for reusable KV in worker-local host memory. |
+| `--kv-penalty-external` | Float in `[0, 1]` | `0.6` | Set credit for confirmed external KV. Stock worker events alone cannot establish shared-pool residency. |
+| `--kv-penalty-disk` | Float in `[0, 1]` | `0.3` | Set credit for reusable KV on disk. |
+| `--kv-aware-session-affinity-ttl-secs` | Integer from `1` to `31536000` seconds | Off | Enable session affinity with an idle expiration. In P/D, apply a soft preference to the session's Decode worker. |
+| `--kv-event-strict-recovery` | Flag | Off | After loss of event history, require complete recovery or a worker KV cache clear before restoring cache credit. Requests continue routing by load during recovery. |
+
+### Verification
+
+| Option | Value | Default | Purpose |
+| --- | --- | --- | --- |
+| `--port` | TCP port | `30000` | Set the Router's inference API port. |
+| `--prometheus-host` | Bind address | `127.0.0.1` | Set the Router's metrics listening address. |
+| `--prometheus-port` | TCP port | `29000` | Set the port for [Router cache metrics](#check-cache-reuse). |
+| `--log-level` | Log level | `info` | Use `debug` to diagnose rejected layouts or event sources. |
 
 ## Troubleshooting
 
