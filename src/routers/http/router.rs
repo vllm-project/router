@@ -6687,6 +6687,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn round_robin_stream_disconnect_closes_stalled_upstream_body() {
+        let (upstream_tx, upstream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
+        upstream_tx
+            .send(Ok(bytes::Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            )))
+            .unwrap();
+        let upstream_rx = Arc::new(Mutex::new(Some(upstream_rx)));
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let upstream_rx = upstream_rx.lock().take().unwrap();
+                async move { Body::from_stream(UnboundedReceiverStream::new(upstream_rx)) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let router = router_pointing_at(listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}], "stream": true,
+        }))
+        .unwrap();
+        let timeout = Duration::from_secs(5);
+        let response = tokio::time::timeout(timeout, router.route_chat(None, &request, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        tokio::time::timeout(timeout, body.next())
+            .await
+            .expect("the upstream must start streaming")
+            .unwrap()
+            .unwrap();
+        assert!(!upstream_tx.is_closed());
+
+        // Drop the downstream body while the backend is waiting to send its next frame.
+        drop(body);
+        let closed = tokio::time::timeout(timeout, upstream_tx.closed()).await;
+        server.abort();
+        closed.expect("dropping the response must close the stalled upstream body");
+    }
+
+    #[tokio::test]
     async fn typed_request_cancellation_before_headers_or_during_body_releases_load() {
         use axum::routing::post;
         for (headers_ready, streaming) in [(false, false), (false, true), (true, false)] {

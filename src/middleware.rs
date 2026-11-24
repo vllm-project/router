@@ -389,11 +389,34 @@ pub fn log_request(entry: RequestLogEntry) {
 // ============ Concurrency Limiting with Queue Support ============
 
 /// Request queue entry
-pub struct QueuedRequest {
+struct QueuedRequest {
     /// Time when the request was queued
     queued_at: tokio::time::Instant,
     /// Channel to send the permit back when acquired
     permit_tx: oneshot::Sender<Result<QueueGrant, QueueRejection>>,
+    /// Counts this request even after it leaves the channel.
+    queue_slot: OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+pub struct ConcurrencyQueueSender {
+    tx: mpsc::Sender<QueuedRequest>,
+    slots: Arc<Semaphore>,
+}
+
+impl ConcurrencyQueueSender {
+    fn try_enqueue(&self) -> Option<oneshot::Receiver<Result<QueueGrant, QueueRejection>>> {
+        let queue_slot = self.slots.clone().try_acquire_owned().ok()?;
+        let (permit_tx, permit_rx) = oneshot::channel();
+        self.tx
+            .try_send(QueuedRequest {
+                queued_at: tokio::time::Instant::now(),
+                permit_tx,
+                queue_slot,
+            })
+            .ok()?;
+        Some(permit_rx)
+    }
 }
 
 #[derive(Debug)]
@@ -433,7 +456,7 @@ pub struct QueueProcessor {
 }
 
 impl QueueProcessor {
-    pub fn new(
+    fn new(
         token_bucket: Arc<TokenBucket>,
         concurrency_semaphore: Arc<Semaphore>,
         queue_rx: mpsc::Receiver<QueuedRequest>,
@@ -456,10 +479,8 @@ impl QueueProcessor {
         } = self;
         info!("Starting concurrency queue processor");
 
-        // Process one queued request at a time. This keeps the bounded channel
-        // as the actual cap on waiting requests instead of spawning a detached
-        // task per dequeued request, which could grow without bound as senders
-        // refill the channel.
+        // Process queued requests in order. Each owns a queue slot until the
+        // admission attempt ends, including while it waits outside the channel.
         while let Some(mut queued) = queue_rx.recv().await {
             let deadline = queued.queued_at + queue_timeout;
             let acquisition = tokio::time::timeout_at(deadline, async {
@@ -501,6 +522,7 @@ impl QueueProcessor {
             })
             .await;
 
+            drop(queued.queue_slot);
             match acquisition {
                 Ok(Some(Ok(grant))) => {
                     if queued.permit_tx.send(Ok(grant)).is_err() {
@@ -527,7 +549,7 @@ impl QueueProcessor {
 
 /// State for the concurrency limiter
 pub struct ConcurrencyLimiter {
-    pub queue_tx: Option<mpsc::Sender<QueuedRequest>>,
+    pub queue_tx: Option<ConcurrencyQueueSender>,
 }
 
 impl ConcurrencyLimiter {
@@ -545,7 +567,10 @@ impl ConcurrencyLimiter {
 
             (
                 Self {
-                    queue_tx: Some(queue_tx),
+                    queue_tx: Some(ConcurrencyQueueSender {
+                        tx: queue_tx,
+                        slots: Arc::new(Semaphore::new(queue_size)),
+                    }),
                 },
                 Some(processor),
             )
@@ -682,17 +707,8 @@ pub async fn concurrency_limit_middleware(
     if let Some(queue_tx) = &app_state.concurrency_queue_tx {
         debug!("No immediate admission available, attempting to queue request");
 
-        // Receive the semaphore permit from the queue processor.
-        let (permit_tx, permit_rx) = oneshot::channel();
-
-        let queued = QueuedRequest {
-            queued_at: tokio::time::Instant::now(),
-            permit_tx,
-        };
-
-        // Try to send to queue
-        match queue_tx.try_send(queued) {
-            Ok(_) => {
+        match queue_tx.try_enqueue() {
+            Some(permit_rx) => {
                 let queue_metric = EmbeddingsQueueMetricGuard::new(is_embeddings);
                 let permit_result = permit_rx.await;
                 drop(queue_metric);
@@ -718,7 +734,7 @@ pub async fn concurrency_limit_middleware(
                     }
                 }
             }
-            Err(_) => {
+            None => {
                 warn!("Request queue is full, returning 429");
                 too_many_requests(&token_bucket).await
             }
@@ -744,13 +760,7 @@ mod queue_grant_tests {
         let (limiter, processor) =
             ConcurrencyLimiter::new(bucket.clone(), semaphore.clone(), 1, Duration::from_secs(5));
         let queue_tx = limiter.queue_tx.unwrap();
-        let (permit_tx, permit_rx) = oneshot::channel();
-        assert!(queue_tx
-            .try_send(QueuedRequest {
-                queued_at: tokio::time::Instant::now(),
-                permit_tx,
-            })
-            .is_ok());
+        let permit_rx = queue_tx.try_enqueue().unwrap();
         // Drive the real processor to completion without polling the receiver.
         drop(queue_tx);
         processor.unwrap().run().await;

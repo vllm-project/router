@@ -360,20 +360,34 @@ fn assert_retry_after(response: &Response) {
 
 #[tokio::test]
 async fn full_queue_returns_retry_after_without_starting_request() {
-    let (app, mut started, _, _processor) =
+    let (app, mut started, _, processor) =
         app_with_queue_processor(1, 100, Duration::from_secs(3), false, None).await;
     let first = request(app.clone(), "/stream").await;
     let _tx = started.recv().await.unwrap();
-    let mut queued = tokio::spawn(request(app.clone(), "/short"));
-    assert!(tokio::time::timeout(Duration::from_millis(50), &mut queued)
+    let mut queued = Box::pin(request(app.clone(), "/short"));
+    assert!(futures::poll!(&mut queued).is_pending());
+    let mut processor = Box::pin(processor.unwrap().run());
+    // Dequeue the waiter and leave it blocked by the active stream. The freed
+    // channel slot must not let another request exceed the queue budget.
+    assert!(futures::poll!(&mut processor).is_pending());
+    let rejected = tokio::time::timeout(Duration::from_secs(1), request(app.clone(), "/short"))
         .await
-        .is_err());
-    let rejected = request(app, "/short").await;
+        .expect("a full queue must reject without waiting");
     assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_retry_after(&rejected);
-    queued.abort();
-    assert!(queued.await.unwrap_err().is_cancelled());
+
+    drop(queued);
+    assert!(futures::poll!(&mut processor).is_pending());
+    let mut next = Box::pin(request(app.clone(), "/short"));
+    assert!(futures::poll!(&mut next).is_pending());
     drop(first);
+    let processor = tokio::spawn(processor);
+    let response = tokio::time::timeout(Duration::from_secs(1), next)
+        .await
+        .expect("cancelling the queued request must return its slot");
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(app);
+    processor.await.unwrap();
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@ use crate::{
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
-    middleware::{self, QueuedRequest, TokenBucket},
+    middleware::{self, ConcurrencyQueueSender, TokenBucket},
     policies::PolicyRegistry,
     protocols::{
         spec::{
@@ -115,7 +115,7 @@ impl AppContext {
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
-    pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
+    pub concurrency_queue_tx: Option<ConcurrencyQueueSender>,
     pub router_manager: Option<Arc<RouterManager>>,
 }
 
