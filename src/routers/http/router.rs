@@ -408,9 +408,6 @@ impl Router {
                 crate::kv_index::KvIndexSupervisor::new_http_full_attention(ctx.client.clone());
             supervisor.set_api_key(ctx.router_config.api_key.clone());
             supervisor.set_strict_recovery(ctx.router_config.kv_event_strict_recovery);
-            supervisor.set_replay_idle_timeout(Duration::from_secs(
-                ctx.router_config.kv_event_replay_idle_timeout_secs.into(),
-            ));
             let static_sources = match &ctx.router_config.policy {
                 crate::config::PolicyConfig::KvAware {
                     static_kv_event_sources,

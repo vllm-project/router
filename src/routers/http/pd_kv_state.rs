@@ -66,7 +66,6 @@ impl PdKvState {
         prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
         decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
         strict_recovery: bool,
-        replay_idle_timeout: Duration,
         allow_hybrid_layouts: bool,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
@@ -81,9 +80,6 @@ impl PdKvState {
         state.nixl_decode_replay = connector == KvConnector::Nixl;
         state.supervisor.set_api_key(state.api_key.clone());
         state.supervisor.set_strict_recovery(strict_recovery);
-        state
-            .supervisor
-            .set_replay_idle_timeout(replay_idle_timeout);
         state.supervisor.set_pd_connector(connector);
         state.registry = Some(registry);
         state.prefill_policy = prefill_policy;
@@ -1189,7 +1185,6 @@ mod kv_input_tests {
             Some(prefill_policy.clone()),
             Some(decode_policy.clone()),
             false,
-            Duration::from_secs(crate::config::DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS.into()),
             true,
         )
         .await;

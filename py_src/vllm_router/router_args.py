@@ -36,7 +36,6 @@ class RouterArgs:
     kv_event_block_size: int = 16
     kv_event_model: Optional[str] = None
     kv_event_strict_recovery: bool = False
-    kv_event_replay_idle_timeout_secs: int = 5
     kv_hybrid_layout: Optional[str] = None
     kv_event_topic: List[str] = dataclasses.field(default_factory=list)
     pd_pair: List[str] = dataclasses.field(default_factory=list)
@@ -289,12 +288,6 @@ class RouterArgs:
             default=[],
             metavar="PREFILL=DECODE[,DECODE...]",
             help="Explicit pairs for a mixed P/D pool.",
-        )
-        parser.add_argument(
-            f"--{prefix}kv-event-replay-idle-timeout-secs",
-            type=int,
-            default=5,
-            help="Seconds without a replay batch before the subscriber retries.",
         )
         # PD-specific arguments
         parser.add_argument(

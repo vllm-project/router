@@ -3897,9 +3897,6 @@ mod tests {
                 Some(Arc::new(crate::policies::KvAwarePolicy::default())),
                 None,
                 false,
-                std::time::Duration::from_secs(
-                    crate::config::DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS.into(),
-                ),
                 true,
             )
             .await,

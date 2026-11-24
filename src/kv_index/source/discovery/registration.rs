@@ -308,7 +308,6 @@ impl KvIndexSupervisor {
                 stream,
                 self.ctx.clone(),
                 Some(self.signal_tx.clone()),
-                self.replay_idle_timeout,
             ) {
                 Ok(handle) => handle,
                 Err(error) => {

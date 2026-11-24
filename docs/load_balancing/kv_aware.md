@@ -595,7 +595,6 @@ Transfer credits are fractions of reusable tokens counted as work avoided. `0` i
 | `--kv-penalty-external` | Float in `[0, 1]` | `0.6` | Set credit for confirmed external KV. Stock worker events alone cannot establish shared-pool residency. |
 | `--kv-penalty-disk` | Float in `[0, 1]` | `0.3` | Set credit for reusable KV on disk. |
 | `--kv-aware-session-affinity-ttl-secs` | Integer from `1` to `31536000` seconds | Off | Enable session affinity with an idle expiration. In P/D, apply a soft preference to the session's Decode worker. |
-| `--kv-event-replay-idle-timeout-secs` | Positive integer seconds | `5` | Retry KV event replay after this long without progress. |
 | `--kv-event-strict-recovery` | Flag | Off | After loss of event history, require complete recovery or a worker KV cache clear before restoring cache credit. Requests continue routing by load during recovery. |
 
 ### Verification

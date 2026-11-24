@@ -107,12 +107,7 @@ impl TcpReplay {
         signals: Option<mpsc::Sender<IngestionSignal>>,
         strict: bool,
     ) -> SubscriberHandle {
-        self.start_with_idle_timeout(
-            index,
-            signals,
-            strict,
-            Duration::from_secs(crate::config::DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS.into()),
-        )
+        self.start_with_idle_timeout(index, signals, strict, REPLAY_IDLE_TIMEOUT)
     }
 
     fn start_with_idle_timeout(
@@ -132,7 +127,7 @@ impl TcpReplay {
         };
         let stream = Arc::new(EventStream::new(index).with_strict_recovery(strict));
         let lease = stream.begin_replay().unwrap();
-        spawn(
+        spawn_with_idle_timeout(
             source,
             stream,
             lease,
@@ -861,9 +856,7 @@ fn monitor_failure_fences_only_active_source_and_respects_stale_lease() {
         stream.finish_replay(lease, 1).unwrap();
     }
     let subscriber = |lease| Subscriber {
-        replay_idle_timeout: Duration::from_secs(
-            crate::config::DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS.into(),
-        ),
+        replay_idle_timeout: REPLAY_IDLE_TIMEOUT,
         source: EventSource {
             source: active.target.instance_id.clone(),
             dp_rank: 0,

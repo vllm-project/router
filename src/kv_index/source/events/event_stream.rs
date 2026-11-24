@@ -4,6 +4,7 @@
 //! replay/live watermark. A local generation is not a publisher epoch.
 
 use std::sync::Arc;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -387,13 +388,7 @@ fn spawn_zmq(
     stream: Arc<EventStream>,
     ctx: Arc<zmq::Context>,
 ) -> Result<EventSubscriberHandle, &'static str> {
-    spawn_zmq_with_signals(
-        source,
-        stream,
-        ctx,
-        None,
-        Duration::from_secs(crate::config::DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS.into()),
-    )
+    spawn_zmq_with_signals(source, stream, ctx, None)
 }
 
 pub(in crate::kv_index::source) fn spawn_zmq_with_signals(
@@ -401,7 +396,6 @@ pub(in crate::kv_index::source) fn spawn_zmq_with_signals(
     stream: Arc<EventStream>,
     ctx: Arc<zmq::Context>,
     signals: Option<mpsc::Sender<IngestionSignal>>,
-    replay_idle_timeout: Duration,
 ) -> Result<EventSubscriberHandle, &'static str> {
     if source.replay_endpoint.as_deref().is_none_or(str::is_empty) {
         return Err("replay endpoint required");
@@ -412,14 +406,7 @@ pub(in crate::kv_index::source) fn spawn_zmq_with_signals(
     let lease = stream
         .begin_replay()
         .map_err(|_| "KV source is no longer active")?;
-    let subscriber = super::subscriber::spawn(
-        source,
-        stream.clone(),
-        lease,
-        ctx,
-        signals,
-        replay_idle_timeout,
-    );
+    let subscriber = super::subscriber::spawn(source, stream.clone(), lease, ctx, signals);
     Ok(EventSubscriberHandle {
         subscriber,
         stream,

@@ -227,9 +227,6 @@ struct CliArgs {
     /// Require complete KV event recovery or a worker KV clear to restore placement credit.
     #[arg(long, default_value_t = false)]
     kv_event_strict_recovery: bool,
-    /// Seconds without a replay batch before the subscriber retries.
-    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
-    kv_event_replay_idle_timeout_secs: u32,
     /// KV cache layouts for colocated or P/D workers, keyed by worker URL.
     #[arg(long)]
     kv_hybrid_layout: Option<std::path::PathBuf>,
@@ -657,7 +654,6 @@ impl CliArgs {
             pd_kv_event_sources: kv_sources.pd,
             pd_worker_pairs: vllm_router_rs::config::parse_pd_worker_pairs(&self.pd_pair)?,
             kv_event_strict_recovery: self.kv_event_strict_recovery,
-            kv_event_replay_idle_timeout_secs: self.kv_event_replay_idle_timeout_secs,
             policy,
             connection_mode,
             host: self.host.clone(),
@@ -879,30 +875,6 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn replay_idle_timeout_cli_reaches_router_config() {
-        for (args, expected) in [
-            (vec![], 5),
-            (vec!["--kv-event-replay-idle-timeout-secs", "8"], 8),
-        ] {
-            let config = CliArgs::try_parse_from(
-                ["vllm-router", "--worker-urls", "http://127.0.0.1:8000"]
-                    .into_iter()
-                    .chain(args),
-            )
-            .unwrap()
-            .to_router_config(Vec::new())
-            .unwrap();
-            assert_eq!(config.kv_event_replay_idle_timeout_secs, expected);
-        }
-        assert!(CliArgs::try_parse_from([
-            "vllm-router",
-            "--kv-event-replay-idle-timeout-secs",
-            "0",
-        ])
-        .is_err());
-    }
 
     #[test]
     fn documented_kv_layout_examples_pass_cli_validation() {

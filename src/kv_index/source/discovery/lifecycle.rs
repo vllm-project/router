@@ -334,7 +334,6 @@ impl KvIndexSupervisor {
         let static_config = self.resolved_static_source(worker_url);
         let installed = Arc::downgrade(&self.installed);
         let strict_recovery = self.strict_recovery;
-        let replay_idle_timeout = self.replay_idle_timeout;
         tokio::spawn(async move {
             let invalidate = |handles: &[Arc<EventSubscriberHandle>]| {
                 for handle in handles {
@@ -406,7 +405,6 @@ impl KvIndexSupervisor {
                                 stream,
                                 probe_ctx.clone(),
                                 signals.clone(),
-                                replay_idle_timeout,
                             ) {
                                 Ok(handle) => handles.push(Arc::new(handle)),
                                 Err(_) => recovered = false,

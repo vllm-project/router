@@ -18,6 +18,7 @@ use crate::metrics::RouterMetrics;
 /// The signed sentinel ending a replay stream: `seq = -1`.
 const END_SEQ: i64 = -1;
 const MAX_REPLAY_FAILURES: u32 = 3;
+const REPLAY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub use crate::kv_index::source::endpoints::EventSource;
 
@@ -33,6 +34,16 @@ impl SubscriberHandle {
 }
 
 pub(super) fn spawn(
+    source: EventSource,
+    stream: Arc<EventStream>,
+    lease: StreamLease,
+    ctx: Arc<zmq::Context>,
+    signals: Option<mpsc::Sender<IngestionSignal>>,
+) -> SubscriberHandle {
+    spawn_with_idle_timeout(source, stream, lease, ctx, signals, REPLAY_IDLE_TIMEOUT)
+}
+
+fn spawn_with_idle_timeout(
     source: EventSource,
     stream: Arc<EventStream>,
     lease: StreamLease,
@@ -56,12 +67,11 @@ pub(in crate::kv_index::source) fn spawn_observer(
     source: EventSource,
     ctx: Arc<zmq::Context>,
     signals: mpsc::Sender<IngestionSignal>,
-    replay_idle_timeout: Duration,
 ) -> SubscriberHandle {
     spawn_subscriber(
         Subscriber {
             source,
-            replay_idle_timeout,
+            replay_idle_timeout: REPLAY_IDLE_TIMEOUT,
             binding: None,
             signals: Some(signals),
         },
