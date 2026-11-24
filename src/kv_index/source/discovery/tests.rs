@@ -31,12 +31,11 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
     lifecycle.state.lock().verified_at = Instant::now() - Duration::from_secs(6);
     let provider = LayoutWorkerProvider {
         indexes: HashMap::default(),
+        bound: HashMap::new(),
         lifecycle,
     };
     assert!(!provider.is_trusted());
-    assert!(provider
-        .lifecycle
-        .expire_if_needed(&mut provider.lifecycle.state.lock()));
+    assert!(provider.lifecycle.expire_if_needed());
     assert!(active.load(Ordering::Acquire));
     assert_eq!(
         provider.lifecycle.observe_layout(
@@ -54,14 +53,10 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
         SourceAction::Recover
     );
     assert!(!provider.is_trusted()); // Replay must be started before publication.
-    assert!(provider
-        .lifecycle
-        .finish_layout_recovery(&mut provider.lifecycle.state.lock(), true));
+    assert!(provider.lifecycle.finish_layout_recovery(true));
     assert!(provider.is_trusted());
     provider.lifecycle.state.lock().verified_at = Instant::now() - Duration::from_secs(6);
-    assert!(provider
-        .lifecycle
-        .expire_if_needed(&mut provider.lifecycle.state.lock()));
+    assert!(provider.lifecycle.expire_if_needed());
     assert_eq!(
         provider.lifecycle.observe_layout(
             &mut provider.lifecycle.state.lock(),
@@ -74,9 +69,7 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
         state.info = Some(WorkerKvInfo::default());
         state.revision
     };
-    assert!(!provider
-        .lifecycle
-        .finish_layout_recovery(&mut provider.lifecycle.state.lock(), false));
+    assert!(!provider.lifecycle.finish_layout_recovery(false));
     {
         let state = provider.lifecycle.state.lock();
         assert!(state.info.is_none());
@@ -105,10 +98,7 @@ fn changed_layout_rebinds_without_waiting_for_the_descriptor_interval() {
     assert!(lifecycle.layout_rebind_due());
     assert!(lifecycle.refresh_due());
 
-    assert_eq!(
-        lifecycle.observe_descriptor("http://worker", None, None),
-        SourceAction::Keep
-    );
+    assert_eq!(lifecycle.observe_descriptor(None), SourceAction::Keep);
     assert!(!lifecycle.layout_rebind_due());
     assert!(!lifecycle.refresh_due());
 }
@@ -2127,71 +2117,30 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
         supervisor.worker_registrations()[&worker].revision,
         revision
     );
+    // The descriptor refresh can fence the last remaining binding using the same path.
+    *reported.lock() = metrics("xxhash", "xxhash").replace(
+        "engine=\"2\"",
+        "engine=\"2\",prefix_caching_hash_algo=\"xxhash\"",
+    );
+    lifecycle.state.lock().checked = None;
+    assert!(refresh().await[&worker]
+        .info
+        .as_ref()
+        .unwrap()
+        .ranks
+        .is_empty());
+    assert!(!has_binding(2) && !hits(2));
+
+    supervisor.on_worker_removed(&worker);
+    assert!(refresh().await[&worker]
+        .info
+        .as_ref()
+        .unwrap()
+        .ranks
+        .is_empty());
+    assert!(supervisor.match_provider_for_worker(&worker).is_none());
     supervisor.shutdown();
     server.abort();
-}
-
-#[tokio::test]
-async fn a_worker_with_all_ranks_hash_fenced_stays_load_only() {
-    use super::lifecycle::REFRESH_INTERVAL;
-
-    for initially_fenced in [false, true] {
-        let (endpoint, replay_endpoint, publisher, _replay) = layout_endpoints();
-        let sources = Arc::new(Mutex::new(serde_json::json!({"0": {
-            "endpoint": endpoint, "replay_endpoint": replay_endpoint,
-            "topic": "kv/old", "publisher": "zmq"
-        }})));
-        let incompatible = METRICS_ONLY.replace("sha256_cbor", "sha256");
-        let metrics = Arc::new(Mutex::new(if initially_fenced {
-            incompatible.clone()
-        } else {
-            METRICS_ONLY.to_owned()
-        }));
-        let router = hash_metadata_router(
-            {
-                let metrics = metrics.clone();
-                move || metrics.lock().clone()
-            },
-            sources,
-        );
-        let (worker, server) = spawn_metrics_only_worker(router).await;
-        let (supervisor, _signals) =
-            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-        let info = supervisor.on_worker_added(&worker).await.unwrap();
-        let old = supervisor.lifecycle_for_worker(&worker);
-        let has_binding =
-            || supervisor.workers_have_cache_bindings([(worker.as_str(), 0)].into_iter());
-        if initially_fenced {
-            assert!(info.ranks.is_empty());
-            assert!(supervisor.match_provider_for_worker(&worker).is_none());
-        } else {
-            assert_eq!(info.ranks, [0]);
-            boundary_subscription(&publisher, "kv/old", true).await;
-            *metrics.lock() = incompatible;
-            old.state.lock().hash_checked = Instant::now() - REFRESH_INTERVAL;
-            wait_for(|| !has_binding()).await;
-        }
-
-        *metrics.lock() = METRICS_ONLY.to_owned();
-        {
-            let mut state = old.state.lock();
-            state.checked = None;
-            state.trusted = false;
-        }
-        assert!(supervisor.refresh_discovered_workers().await.is_empty());
-        assert!(!has_binding());
-        let refreshed = supervisor
-            .refresh_workers(
-                &HashSet::from([worker.clone()]),
-                &HashSet::new(),
-                &HashSet::new(),
-            )
-            .await;
-        assert!(refreshed[&worker].info.as_ref().unwrap().ranks.is_empty());
-        assert!(old.active.load(Ordering::Acquire));
-        supervisor.shutdown();
-        server.abort();
-    }
 }
 
 #[tokio::test]
@@ -2334,10 +2283,7 @@ fn descriptor_refresh_covers_identity_changes_and_failure_threshold() {
             Some(descriptor("initial")),
         );
         lifecycle.state.lock().info = installed.then(WorkerKvInfo::default);
-        assert_eq!(
-            lifecycle.observe_descriptor("http://worker", signature, None),
-            expected
-        );
+        assert_eq!(lifecycle.observe_descriptor(signature), expected);
     }
     let lifecycle = WorkerLifecycle::new(
         Arc::new(AtomicBool::new(true)),
@@ -2346,16 +2292,10 @@ fn descriptor_refresh_covers_identity_changes_and_failure_threshold() {
     );
     lifecycle.state.lock().info = Some(WorkerKvInfo::default());
     for failures in 1..MAX_PROBE_FAILURES {
-        assert_eq!(
-            lifecycle.observe_descriptor("http://worker", None, None),
-            SourceAction::Keep
-        );
+        assert_eq!(lifecycle.observe_descriptor(None), SourceAction::Keep);
         assert_eq!(lifecycle.state.lock().probe_failures, failures);
     }
-    assert_eq!(
-        lifecycle.observe_descriptor("http://worker", None, None),
-        SourceAction::Stop
-    );
+    assert_eq!(lifecycle.observe_descriptor(None), SourceAction::Stop);
     assert!(lifecycle.state.lock().info.is_none());
 
     let lifecycle = WorkerLifecycle::new(
@@ -2366,7 +2306,7 @@ fn descriptor_refresh_covers_identity_changes_and_failure_threshold() {
     lifecycle.state.lock().info = Some(WorkerKvInfo::default());
     lifecycle.state.lock().trusted = false;
     assert_eq!(
-        lifecycle.observe_descriptor("http://worker", Some(&initial), None),
+        lifecycle.observe_descriptor(Some(&initial)),
         SourceAction::Rebuild
     );
 }

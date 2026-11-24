@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 use crate::config::{KvConnector, StaticKvEventSources};
 use crate::kv_index::storage::KvBlockIndexer;
 use crate::kv_index::subscriber::EventSource;
+use crate::kv_index::EventSubscriberHandle;
 use crate::kv_index::{CacheCapabilities, GroupCapability, RankCapability};
 use crate::kv_index::{IngestionSignal, SourceId};
 
@@ -202,6 +203,7 @@ struct WorkerSubs {
     ranks: Vec<u32>,
     indexer: Arc<KvBlockIndexer>,
     provider: Arc<LayoutWorkerProvider>,
+    handles: Vec<Arc<EventSubscriberHandle>>,
 }
 
 struct LiveSource {
@@ -652,21 +654,15 @@ impl KvIndexSupervisor {
             },
             async {
                 if requires_hash_size {
-                    tokio::time::timeout(
-                        CONTROL_TIMEOUT,
-                        probe::query_engine_cache_configs(&self.client, base, api_key),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err("metrics probe timed out".into()))
-                    .map(Some)
+                    None
                 } else {
-                    Ok(probe::probe_engine_cache_configs(
+                    probe::probe_engine_cache_configs(
                         &self.client,
                         base,
                         api_key,
                         CONTROL_TIMEOUT / 4,
                     )
-                    .await)
+                    .await
                 }
             }
         );
@@ -698,17 +694,18 @@ impl KvIndexSupervisor {
             info.model_id = Some(model.clone());
         }
         discovery.model_id = Ok(Some(model.clone()));
-        discovery.engine_cache_configs = match configs {
-            Ok(configs) => configs,
-            Err(reason) => return failed_hybrid_discovery(SourcesProbe::Failed, reason),
-        };
+        discovery.engine_cache_configs = configs;
         if let Some(layout) = &mut discovery.hybrid {
             if requires_hash_size {
-                let Some(engines) = discovery.engine_cache_configs.as_ref() else {
-                    return failed_hybrid_discovery(
-                        SourcesProbe::Failed,
-                        "worker metrics are required to discover hash_block_size".into(),
-                    );
+                let engines = match tokio::time::timeout(
+                    CONTROL_TIMEOUT,
+                    probe::query_engine_cache_configs(&self.client, base, api_key),
+                )
+                .await
+                .unwrap_or_else(|_| Err("metrics probe timed out".into()))
+                {
+                    Ok(engines) => engines,
+                    Err(reason) => return failed_hybrid_discovery(SourcesProbe::Failed, reason),
                 };
                 for rank in &mut layout.ranks {
                     if !sources
@@ -740,6 +737,7 @@ impl KvIndexSupervisor {
                 if let Ok(info) = &mut discovery.server_info {
                     info.kv_block_size = layout.ranks.iter().find_map(|rank| rank.hash_block_size);
                 }
+                discovery.engine_cache_configs = Some(engines);
             }
             for rank in &mut layout.ranks {
                 if rank.model.trim().is_empty() {

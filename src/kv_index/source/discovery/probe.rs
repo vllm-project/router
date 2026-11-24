@@ -121,9 +121,7 @@ impl KvIndexSupervisor {
             let cached = {
                 let state = lifecycle.state.lock();
                 (state.info.is_some()
-                    && state.descriptor.as_ref().is_some_and(|previous| {
-                        previous.matches_unfenced(&descriptor, &state.hash_fences)
-                    })
+                    && state.descriptor.as_ref() == Some(&descriptor)
                     && (descriptor
                         .server_info
                         .instance_id
@@ -538,11 +536,7 @@ pub(super) async fn query_worker_metadata_and_models(
         Ok(info) => return Ok((info, None, metrics)),
         Err(error) => error,
     };
-    let engines = match metrics {
-        Some(scrape) => Ok(scrape),
-        None => query_engine_cache_configs(client, worker_url, api_key).await,
-    };
-    query_metrics_metadata(client, worker_url, api_key, engines)
+    query_metrics_metadata(client, worker_url, api_key, metrics)
         .await
         .and_then(|(info, models, configs)| {
             validate_worker_metadata(worker_url, "metrics", Ok(info))
@@ -641,9 +635,12 @@ async fn query_metrics_metadata(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-    engines: Result<EngineCacheConfigs, String>,
+    engines: Option<EngineCacheConfigs>,
 ) -> Result<WorkerMetadata, String> {
-    let engines = engines?;
+    let engines = match engines {
+        Some(engines) => engines,
+        None => query_engine_cache_configs(client, worker_url, api_key).await?,
+    };
     let hash_unit = metrics_meta::shared_hash_unit(&engines).map_err(|units| {
         format!("metrics: engines disagree on block size {units:?} — refusing to index")
     })?;

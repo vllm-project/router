@@ -259,13 +259,23 @@ impl KvIndexSupervisor {
             {
                 continue;
             }
-            let action = lifecycle.observe_descriptor(
-                &base,
-                probe.as_ref().map(|probe| &probe.descriptor),
-                probe
-                    .as_ref()
-                    .and_then(|probe| probe.worker.engine_cache_configs.as_ref()),
-            );
+            let configs = probe
+                .as_ref()
+                .and_then(|probe| probe.worker.engine_cache_configs.as_ref());
+            if configs.is_some() {
+                let provider = self
+                    .installed
+                    .workers
+                    .lock()
+                    .get(&base)
+                    .filter(|worker| Arc::ptr_eq(&worker.provider.lifecycle, &lifecycle))
+                    .map(|worker| worker.provider.clone());
+                if let Some(provider) = provider {
+                    provider.fence_runtime_hashes(&base, configs, &Some(self.signal_tx.clone()));
+                }
+            }
+            let action =
+                lifecycle.observe_descriptor(probe.as_ref().map(|probe| &probe.descriptor));
             match action {
                 SourceAction::Keep => {
                     if let Some(probe) = probe {
@@ -371,9 +381,9 @@ pub(super) fn runtime_hash_mismatch(
 }
 
 /// Check the surviving publisher set against the same source snapshot.
-pub(super) fn observed_sources_match<'a>(
+pub(super) fn observed_sources_match(
     worker: &str,
-    mut active: impl Iterator<Item = &'a EventSource>,
+    bound: &BoundSources,
     fences: &BoundSources,
     expected: Option<&CacheCapabilities>,
     observed: &Result<(KvEventSourcesResponse, Option<CacheCapabilities>), SourcesProbe>,
@@ -385,20 +395,9 @@ pub(super) fn observed_sources_match<'a>(
     let Some(host) = worker_host(split_worker_rank(worker).0) else {
         return StaticHybridMatch::Differs;
     };
+    let active = bound.iter().filter(|(rank, _)| !fences.contains_key(rank));
     if layouts_match(expected, layout.as_ref(), fences)
-        && active.all(|source| {
-            sources
-                .get(&source.dp_rank.to_string())
-                .is_some_and(|actual| {
-                    source_matches(
-                        &host,
-                        actual,
-                        &source.pub_endpoint,
-                        source.replay_endpoint.as_deref(),
-                        &source.topic,
-                    )
-                })
-        })
+        && bound_sources_match(&host, active.map(|(&rank, source)| (rank, source)), sources)
     {
         StaticHybridMatch::Matches
     } else {
