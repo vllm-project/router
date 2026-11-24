@@ -8,9 +8,8 @@ use super::output_length::PendingOutputPrediction;
 use super::prediction_profile::PredictionProfileStore;
 use super::return_time::PendingReturnPrediction;
 use super::{
-    ContextTokens, ProgramBindingStrategy, ProgramBindings, ProgramRef, ProgramRuntime,
-    ProgramSchedulingEnableKey, ProgramTarget, ProgressTtlConfig, ProgressTtlFactors,
-    TokenCountMode, TokenizerFingerprint,
+    ContextTokens, ProgramBindingStrategy, ProgramRef, ProgramRuntime, ProgramSchedulingEnableKey,
+    ProgramTarget, ProgressTtlConfig, ProgressTtlFactors, TokenCountMode, TokenizerFingerprint,
 };
 use crate::config::types::PredictionProfileConfig;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -46,6 +45,7 @@ pub struct ProgramSchedulerConfig {
     pub enable_key: ProgramSchedulingEnableKey,
     /// Preserve Program identity and binding but bypass Router admission.
     pub binding_only: bool,
+    pub enable_acting_ttl: bool,
     /// Permit paused reasoning Programs to resume on another target.
     pub global_queue: bool,
     /// Ordinary resume order after force-resume, priority, and one-shot yield.
@@ -99,6 +99,7 @@ impl Default for ProgramSchedulerConfig {
             pd_prefill_kv_window: Duration::from_secs(10),
             enable_key: ProgramSchedulingEnableKey::default(),
             binding_only: false,
+            enable_acting_ttl: true,
             global_queue: false,
             resume_order: ProgramResumeOrder::default(),
             cross_rank_headroom_ratio: 1.2,
@@ -176,6 +177,7 @@ impl ProgramSchedulerConfig {
             pd_prefill_kv_window: Duration::from_secs_f64(config.pd.prefill_kv_window_seconds),
             enable_key: config.enable_key,
             binding_only: config.binding_only,
+            enable_acting_ttl: config.enable_acting_ttl,
             global_queue: config.global_queue,
             resume_order: config.resume_order,
             cross_rank_headroom_ratio: config.cross_rank_headroom_ratio,
@@ -218,6 +220,7 @@ impl ProgramSchedulerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProgramPauseReason {
     TtlExpired,
+    ActingRetentionDisabled,
     CapacityRepair,
     MaxSegmentYield,
     RequestFailed,
@@ -228,6 +231,7 @@ impl ProgramPauseReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::TtlExpired => "ttl_expired",
+            Self::ActingRetentionDisabled => "acting_retention_disabled",
             Self::CapacityRepair => "capacity_repair",
             Self::MaxSegmentYield => "max_segment_yield",
             Self::RequestFailed => "request_failed",
@@ -462,7 +466,7 @@ impl CapacityAccountingSource {
 #[derive(Debug)]
 pub(crate) struct ProgramSchedulerState {
     pub(crate) runtime: ProgramRuntime,
-    pub(crate) bindings: ProgramBindings,
+    pub(crate) bindings: super::binding::BindingTable,
     pub(crate) decisions: HashMap<ProgramRef, ProgramDecisionState>,
     pub(crate) targets: BTreeMap<String, ProgramTarget>,
     pub(crate) model_targets: HashMap<String, BTreeSet<String>>,
@@ -525,7 +529,7 @@ impl ProgramSchedulerState {
     pub(crate) fn new(config: &ProgramSchedulerConfig) -> Self {
         Self {
             runtime: ProgramRuntime::default(),
-            bindings: ProgramBindings::new(config.binding_strategy, config.hash_virtual_nodes),
+            bindings: super::binding::BindingTable::default(),
             decisions: HashMap::new(),
             targets: BTreeMap::new(),
             model_targets: HashMap::new(),

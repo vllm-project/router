@@ -7,7 +7,7 @@ use super::ProgramIdentity;
 use super::ProgramRef;
 use crate::policies::{CacheAwareCandidate, CacheAwarePolicy, ConsistentHashPolicy};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 
 /// Initial binding algorithm selected for Program generations.
@@ -62,95 +62,105 @@ pub trait ProgramBindingPolicy: Send + Sync + Debug {
     fn remove_target(&self, _model_pool: &str, _target_id: &str) {}
 }
 
-/// Stable Program binding table plus one selected initial-binding policy.
-///
-/// ProgramScheduler serializes calls to this object with its state lock. The
-/// table records home affinity only; it does not record runtime placement.
+/// Construct the binding algorithm separately from admission state.
+pub(crate) fn make_binding_policy(
+    strategy: ProgramBindingStrategy,
+    hash_virtual_nodes: u32,
+) -> Box<dyn ProgramBindingPolicy> {
+    match strategy {
+        ProgramBindingStrategy::ConsistentHash => {
+            Box::new(ConsistentHashBinding::new(hash_virtual_nodes))
+        }
+        ProgramBindingStrategy::ProgramRoundRobin => Box::new(RoundRobinBinding::default()),
+        ProgramBindingStrategy::LeastProgramCount => Box::new(LeastProgramCountBinding),
+        ProgramBindingStrategy::ReasoningTokenBalance => Box::new(ReasoningTokenBalanceBinding),
+        ProgramBindingStrategy::CacheAware => Box::new(CacheAwareBinding::default()),
+    }
+}
+
+/// Model-pool scoped home bindings. Actual runtime placement lives in the scheduler.
+#[derive(Debug, Default)]
+pub(crate) struct BindingTable {
+    entries: HashMap<ProgramBindingKey, String>,
+}
+
+impl BindingTable {
+    pub(crate) fn binding(&self, identity: &ProgramIdentity) -> Option<&str> {
+        self.entries
+            .get(&ProgramBindingKey::from(identity))
+            .map(String::as_str)
+    }
+
+    pub(crate) fn commit(&mut self, identity: &ProgramIdentity, target: &str) {
+        self.entries
+            .insert(ProgramBindingKey::from(identity), target.to_owned());
+    }
+
+    pub(crate) fn release_program(&mut self, program: &ProgramRef) {
+        self.entries.remove(&ProgramBindingKey {
+            model_pool: program.model_pool().to_owned(),
+            program_id: program.program_id().to_owned(),
+        });
+    }
+
+    pub(crate) fn remove_target(&mut self, model_pool: &str, target: &str) {
+        self.entries
+            .retain(|key, bound| key.model_pool != model_pool || bound != target);
+    }
+}
+
+/// Compatibility API for callers that bind directly. The Router uses a separate
+/// policy and binding table so admission can operate without a selector.
 #[derive(Debug)]
 pub struct ProgramBindings {
     policy: Box<dyn ProgramBindingPolicy>,
-    bindings: HashMap<ProgramBindingKey, String>,
+    table: BindingTable,
 }
 
 impl ProgramBindings {
-    /// Construct a binding table using one of the behavior-compatible policies.
     pub fn new(strategy: ProgramBindingStrategy, hash_virtual_nodes: u32) -> Self {
-        let policy: Box<dyn ProgramBindingPolicy> = match strategy {
-            ProgramBindingStrategy::ConsistentHash => {
-                Box::new(ConsistentHashBinding::new(hash_virtual_nodes))
-            }
-            ProgramBindingStrategy::ProgramRoundRobin => Box::new(RoundRobinBinding::default()),
-            ProgramBindingStrategy::LeastProgramCount => Box::new(LeastProgramCountBinding),
-            ProgramBindingStrategy::ReasoningTokenBalance => Box::new(ReasoningTokenBalanceBinding),
-            ProgramBindingStrategy::CacheAware => Box::new(CacheAwareBinding::default()),
-        };
         Self {
-            policy,
-            bindings: HashMap::new(),
+            policy: make_binding_policy(strategy, hash_virtual_nodes),
+            table: BindingTable::default(),
         }
     }
 
-    /// Return an existing binding, or establish one for a new generation.
     pub fn bind(
         &mut self,
         identity: &ProgramIdentity,
         candidates: &[ProgramBindingCandidate],
         routing_text: Option<&str>,
     ) -> Option<String> {
-        let key = ProgramBindingKey::from(identity);
-        let live_targets: BTreeSet<&str> = candidates
-            .iter()
-            .map(|candidate| candidate.target_id.as_str())
-            .collect();
-        if let Some(target_id) = self.bindings.get(&key) {
-            if live_targets.contains(target_id.as_str()) {
-                return Some(target_id.clone());
+        if let Some(bound) = self.binding(identity) {
+            if candidates.iter().any(|c| c.target_id == bound) {
+                return Some(bound.to_owned());
             }
         }
         let mut ordered = candidates.to_vec();
-        ordered.sort_by(|left, right| left.target_id.cmp(&right.target_id));
-        let target_id = self.policy.select(identity, &ordered, routing_text)?;
-        self.bindings.insert(key, target_id.clone());
-        Some(target_id)
+        ordered.sort_by(|a, b| a.target_id.cmp(&b.target_id));
+        let target = self.policy.select(identity, &ordered, routing_text)?;
+        self.table.commit(identity, &target);
+        Some(target)
     }
 
-    /// Look up the home backend without making a new policy decision.
     pub fn binding(&self, identity: &ProgramIdentity) -> Option<&str> {
-        self.bindings
-            .get(&ProgramBindingKey::from(identity))
-            .map(String::as_str)
+        self.table.binding(identity)
     }
-
-    /// Release the binding for one Program generation.
     pub fn release(&mut self, identity: &ProgramIdentity) -> Option<String> {
-        self.bindings.remove(&ProgramBindingKey::from(identity))
+        self.table
+            .entries
+            .remove(&ProgramBindingKey::from(identity))
+    }
+    pub fn remove_target(&mut self, target: &str) -> usize {
+        let previous = self.table.entries.len();
+        self.table.entries.retain(|_, bound| bound != target);
+        previous - self.table.entries.len()
     }
 
-    /// Release by exact runtime reference after lifecycle termination.
-    pub(crate) fn release_program(&mut self, program: &ProgramRef) -> Option<String> {
-        self.bindings.remove(&ProgramBindingKey {
-            model_pool: program.model_pool().to_string(),
-            program_id: program.program_id().to_string(),
-        })
-    }
-
-    /// Invalidate bindings whose backend disappeared from discovery.
-    ///
-    /// The scheduler may rebind the returned Programs using its normal target
-    /// synchronization path. This method never chooses a resume placement.
-    pub fn remove_target(&mut self, target_id: &str) -> usize {
-        let previous_len = self.bindings.len();
-        self.bindings.retain(|_, bound| bound != target_id);
-        previous_len - self.bindings.len()
-    }
-
-    pub(crate) fn commit_placement(&self, program: &ProgramRef, text: &str, target_id: &str) {
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    fn commit_placement(&self, program: &ProgramRef, text: &str, target_id: &str) {
         self.policy
             .commit_placement(program.model_pool(), text, target_id);
-    }
-
-    pub(crate) fn remove_affinity_target(&self, model_pool: &str, target_id: &str) {
-        self.policy.remove_target(model_pool, target_id);
     }
 }
 

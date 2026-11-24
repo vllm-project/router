@@ -4,17 +4,19 @@
 //! and capacity checks. Global Queue placement is implemented separately.
 
 use super::output_length;
+use super::prediction_profile::ReturnTimeKey;
+use super::scheduler::ProgramAdmission;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::{ProgramPauseReason, ProgramResumeOrder, ProgramSchedulerState};
 use super::ContextTokens;
 use super::{
     BatchGainInputs, ContinuitySample, ProgramDispatch, ProgramIdentity, ProgramRef,
-    ProgramRequestHandle, ProgramState, ProgramStatus, ProgramTarget, ScheduleError,
+    ProgramRequestHandle, ProgramState, ProgramStatus, ScheduleError,
 };
 use crate::config::types::PredictionMode;
 use crate::metrics::{AgentAwareAdmissionMetrics, RouterMetrics};
 use std::cmp::Ordering;
-use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info};
 
@@ -28,7 +30,7 @@ pub(crate) struct RankAdmissionPlan {
     pub(crate) batch_gain: bool,
 }
 
-impl ProgramScheduler {
+impl ProgramAdmission {
     /// Commit a new pre-output retry attempt with an atomic resource recheck.
     /// Existing q is counted once. Force deadlines never bypass this gate.
     pub fn restart_pd_attempt(&self, old: &ProgramDispatch) -> Option<ProgramDispatch> {
@@ -67,309 +69,244 @@ impl ProgramScheduler {
         state.runtime.restart_attempt(old, now)
     }
 
-    /// Retain one Program request until rank-local admission permits dispatch.
-    pub async fn acquire(
+    pub(super) fn register_attempt(
         &self,
-        identity: ProgramIdentity,
-        context: impl Into<ContextTokens>,
-        targets: &[ProgramTarget],
-        routing_text: Option<String>,
-    ) -> Result<ProgramDispatch, ScheduleError> {
-        self.sync_targets(identity.model_pool(), targets);
-        self.acquire_synced(identity, context.into(), targets, routing_text)
-            .await
-    }
-
-    /// Retain a request using a Router-cached immutable target snapshot.
-    pub async fn acquire_from_snapshot(
-        &self,
-        identity: ProgramIdentity,
+        state: &mut ProgramSchedulerState,
+        identity: &ProgramIdentity,
         context: ContextTokens,
-        targets: Arc<[ProgramTarget]>,
-        routing_text: Option<String>,
-    ) -> Result<ProgramDispatch, ScheduleError> {
-        self.sync_target_snapshot(identity.model_pool(), targets.clone());
-        self.acquire_synced(identity, context, targets.as_ref(), routing_text)
-            .await
-    }
-
-    async fn acquire_synced(
-        &self,
-        identity: ProgramIdentity,
-        context: ContextTokens,
-        targets: &[ProgramTarget],
-        routing_text: Option<String>,
-    ) -> Result<ProgramDispatch, ScheduleError> {
-        if targets.is_empty() {
-            return Err(ScheduleError::NoTargets);
-        }
-        let arrived_at = Instant::now();
-        let expected_resume = identity.expected_resume();
-        let (handle, pending_output_prediction, return_time_keys) = {
-            let mut state = self.state.lock();
-            // Resolution happens before acquiring this lock; a settlement may
-            // have revoked the fingerprint in the meantime.
-            let context = self.revalidate_context(&state, identity.model_pool(), context);
-            let handle = state.runtime.retain_request(
-                &identity,
-                context,
-                routing_text.as_deref(),
-                arrived_at,
-            );
-            let reference = handle.program().clone();
-            let continuity = state
-                .runtime
-                .view(&reference)
-                .filter(|runtime| runtime.in_flight_requests == 0)
-                .and_then(|_| {
-                    state.decisions.get(&reference).and_then(|decision| {
-                        decision.last_request_finished_at.map(|finished_at| {
-                            (
-                                decision.last_target.clone(),
-                                ContinuitySample {
-                                    interval_seconds: arrived_at
-                                        .saturating_duration_since(finished_at)
-                                        .as_secs_f64(),
-                                    cache_miss_impact_seconds: decision
-                                        .last_cache_miss_impact_seconds,
-                                },
-                                decision.pending_return_prediction.clone(),
-                            )
-                        })
+        routing_text: Option<&str>,
+        arrived_at: Instant,
+    ) -> (ProgramRequestHandle, ContextTokens) {
+        // Resolution happens before acquiring this lock; a settlement may
+        // have revoked the fingerprint in the meantime.
+        let context = self.revalidate_context(state, identity.model_pool(), context);
+        let handle = state
+            .runtime
+            .retain_request(identity, context, routing_text, arrived_at);
+        let reference = handle.program().clone();
+        let continuity = state
+            .runtime
+            .view(&reference)
+            .filter(|runtime| runtime.in_flight_requests == 0)
+            .and_then(|_| {
+                state.decisions.get(&reference).and_then(|decision| {
+                    decision.last_request_finished_at.map(|finished_at| {
+                        (
+                            decision.last_target.clone(),
+                            ContinuitySample {
+                                interval_seconds: arrived_at
+                                    .saturating_duration_since(finished_at)
+                                    .as_secs_f64(),
+                                cache_miss_impact_seconds: decision.last_cache_miss_impact_seconds,
+                            },
+                            decision.pending_return_prediction.clone(),
+                        )
                     })
-                });
-            if let Some((target_id, sample, pending_prediction)) = continuity {
-                if sample.interval_seconds.is_finite() && sample.interval_seconds >= 0.0 {
-                    if let Some(target_id) = target_id.as_deref() {
-                        let factors = state.rank_factors.entry(target_id.to_string()).or_default();
-                        debug!(
-                            event = "continuity_sample",
-                            program = %reference.redacted_id(),
-                            target = %target_id,
-                            interval_seconds = sample.interval_seconds,
-                            previous_cache_miss_impact_seconds = sample.cache_miss_impact_seconds,
-                            window_samples_before = factors.continuity_sample_count(),
-                            window_complete_before = factors.continuity_window_complete(
-                                self.config.progress_ttl.stats_window_size
-                            ),
-                            "Program scheduling diagnostic"
-                        );
-                        RouterMetrics::record_agent_aware_request_interval(
-                            target_id,
-                            sample.interval_seconds,
-                        );
-                        factors.push_continuity(sample, self.config.progress_ttl.stats_window_size);
-                    }
-                    if self.config.prediction_profile.mode != PredictionMode::Off {
-                        if let Some(pending) = pending_prediction {
-                            if let Some(target_id) = target_id.as_deref() {
-                                RouterMetrics::record_workflow_return_observation(
-                                    target_id,
-                                    sample.interval_seconds,
-                                    pending
-                                        .prediction
-                                        .as_ref()
-                                        .map(|prediction| prediction.probability),
-                                    self.config.prediction_profile.return_time_horizon_seconds,
-                                );
-                            }
-                            state
-                                .prediction_profiles
-                                .observe_return(&pending.keys, sample.interval_seconds);
-                            debug!(
-                                event = "return_time_observed",
-                                program = %reference.redacted_id(),
-                                actual_seconds = sample.interval_seconds,
-                                predicted_probability = pending
+                })
+            });
+        if let Some((target_id, sample, pending_prediction)) = continuity {
+            if sample.interval_seconds.is_finite() && sample.interval_seconds >= 0.0 {
+                if let Some(target_id) = target_id.as_deref() {
+                    let factors = state.rank_factors.entry(target_id.to_string()).or_default();
+                    debug!(
+                        event = "continuity_sample",
+                        program = %reference.redacted_id(),
+                        target = %target_id,
+                        interval_seconds = sample.interval_seconds,
+                        previous_cache_miss_impact_seconds = sample.cache_miss_impact_seconds,
+                        window_samples_before = factors.continuity_sample_count(),
+                        window_complete_before = factors.continuity_window_complete(
+                            self.config.progress_ttl.stats_window_size
+                        ),
+                        "Program scheduling diagnostic"
+                    );
+                    RouterMetrics::record_agent_aware_request_interval(
+                        target_id,
+                        sample.interval_seconds,
+                    );
+                    factors.push_continuity(sample, self.config.progress_ttl.stats_window_size);
+                }
+                if self.config.prediction_profile.mode != PredictionMode::Off {
+                    if let Some(pending) = pending_prediction {
+                        if let Some(target_id) = target_id.as_deref() {
+                            RouterMetrics::record_workflow_return_observation(
+                                target_id,
+                                sample.interval_seconds,
+                                pending
                                     .prediction
                                     .as_ref()
                                     .map(|prediction| prediction.probability),
-                                predicted_ttl_seconds = pending
-                                    .prediction
-                                    .as_ref()
-                                    .map(|prediction| prediction.suggested_ttl_seconds),
-                                "Workflow prediction shadow observation"
+                                self.config.prediction_profile.return_time_horizon_seconds,
                             );
                         }
+                        state
+                            .prediction_profiles
+                            .observe_return(&pending.keys, sample.interval_seconds);
+                        debug!(
+                            event = "return_time_observed",
+                            program = %reference.redacted_id(),
+                            actual_seconds = sample.interval_seconds,
+                            predicted_probability = pending
+                                .prediction
+                                .as_ref()
+                                .map(|prediction| prediction.probability),
+                            predicted_ttl_seconds = pending
+                                .prediction
+                                .as_ref()
+                                .map(|prediction| prediction.suggested_ttl_seconds),
+                            "Workflow prediction shadow observation"
+                        );
                     }
-                    if let Some(decision) = state.decisions.get_mut(&reference) {
-                        decision.pending_return_prediction = None;
-                        decision.last_return_actual_seconds = Some(sample.interval_seconds);
-                    }
-                }
-            }
-            let previous_tokens = state.decisions.get(&reference).map_or(0.0, |decision| {
-                decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
-            });
-            self.ensure_decision_state(
-                &mut state,
-                &identity,
-                reference.clone(),
-                context,
-                arrived_at,
-                routing_text.as_deref(),
-            );
-            // Snapshot after assigning the arrival's explicit or inferred step, while
-            // holding the lock. Queuing and later arrivals must not change these keys.
-            let return_time_keys = if self.config.prediction_profile.mode != PredictionMode::Off {
-                super::return_time::keys_for_decision(
-                    &state.decisions[&reference],
-                    identity.model_pool(),
-                    &self.config.prediction_profile,
-                )
-            } else {
-                Vec::new()
-            };
-            let mut pending_output_prediction = None;
-            if self.config.prediction_profile.mode != PredictionMode::Off {
-                let keys = output_length::keys_for_request(&identity);
-                let prediction = state.prediction_profiles.predict_output(
-                    &keys,
-                    self.config.prediction_profile.output_length_quantile,
-                    self.config.prediction_profile.output_length_min_support,
-                    self.config.prediction_profile.output_length_tail_samples,
-                    self.config.prediction_profile.prior_weight,
-                    self.config.prediction_profile.stability_window_size,
-                    self.config.prediction_profile.stability_tolerance,
-                );
-                debug!(
-                    event = "output_length_prediction",
-                    program = %reference.redacted_id(),
-                    predicted_tokens = prediction.as_ref().map(|value| value.tokens),
-                    support = prediction.as_ref().map(|value| value.support),
-                    mature = prediction.as_ref().is_some_and(|value| value.mature),
-                    backoff_level = prediction.as_ref().map(|value| value.backoff_level),
-                    source = prediction
-                        .as_ref()
-                        .map(|value| value.source.as_str())
-                        .unwrap_or("none"),
-                    "Workflow prediction shadow result"
-                );
-                if let (Some(target_id), Some(prediction)) = (
-                    state
-                        .decisions
-                        .get(&reference)
-                        .and_then(|decision| decision.last_target.as_deref()),
-                    prediction.as_ref(),
-                ) {
-                    RouterMetrics::record_workflow_output_prediction(
-                        target_id,
-                        prediction.source.as_str(),
-                        prediction.tokens,
-                        prediction.support,
-                        prediction.mature,
-                        prediction.backoff_level,
-                    );
-                }
-                let pending = output_length::PendingOutputPrediction { keys, prediction };
-                if let Some(decision) = state.decisions.get_mut(&reference) {
-                    decision.latest_output_prediction = Some(pending.clone());
-                }
-                pending_output_prediction = Some(pending);
-            }
-
-            // Shadow rollout samples the prepared counterfactual once the
-            // decision state reflects this arrival.
-            if let Some(shadow_tokens) = context.shadow_tokens() {
-                if let Some(target_id) = state
-                    .decisions
-                    .get(&reference)
-                    .and_then(|decision| decision.last_target.clone())
-                {
-                    self.record_shadow_admission(
-                        &state,
-                        &reference,
-                        &target_id,
-                        arrived_at,
-                        shadow_tokens,
-                    );
-                }
-            }
-            let current_tokens = state.decisions[&reference]
-                .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
-            if let Some(placement) = state
-                .runtime
-                .view(&reference)
-                .and_then(|program| program.placement)
-            {
-                let account_growth = state
-                    .decisions
-                    .get(&reference)
-                    .is_some_and(|decision| !decision.pause_when_idle);
-                if account_growth
-                    && (current_tokens > previous_tokens
-                        || (self.config.pd_mode && current_tokens < previous_tokens))
-                {
-                    Self::adjust_usage(&mut state, &placement, current_tokens - previous_tokens);
-                }
-            } else {
-                let target_id = state
-                    .decisions
-                    .get(&reference)
-                    .and_then(|decision| decision.last_target.clone())
-                    .ok_or(ScheduleError::NoTargets)?;
-                let queue = if self.config.global_queue {
-                    state
-                        .global_queues
-                        .entry(identity.model_pool().to_string())
-                        .or_default()
-                } else {
-                    state.rank_queues.entry(target_id.clone()).or_default()
-                };
-                if !queue.iter().any(|queued| queued == &reference) {
-                    queue.push_back(reference.clone());
                 }
                 if let Some(decision) = state.decisions.get_mut(&reference) {
-                    decision.queued_at.get_or_insert(arrived_at);
+                    decision.pending_return_prediction = None;
+                    decision.last_return_actual_seconds = Some(sample.interval_seconds);
                 }
-                self.set_force_resume_deadline(&mut state, &target_id, &reference, arrived_at);
-            }
-            if self.config.binding_only {
-                self.activate_binding_only(&mut state, &reference);
-            } else {
-                self.run_request_arrival_decisions(&mut state, arrived_at);
-            }
-            (handle, pending_output_prediction, return_time_keys)
-        };
-        let mut guard = AdmissionGuard::new(self, handle);
-        let mut pending_output_prediction = pending_output_prediction;
-        let mut return_time_keys = return_time_keys;
-        let deadline = arrived_at + self.config.queue_timeout;
-        loop {
-            let wait_handle = guard.handle().clone();
-            let notified = wait_handle.notified();
-            if let Some(mut dispatch) = self.claim_dispatch(guard.handle()) {
-                dispatch.attach_prediction_context(
-                    expected_resume,
-                    pending_output_prediction.take(),
-                    std::mem::take(&mut return_time_keys),
-                );
-                guard.disarm();
-                return Ok(dispatch);
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(ScheduleError::QueueTimeout);
-            }
-            let force_deadline = {
-                let state = self.state.lock();
-                state
-                    .decisions
-                    .get(guard.handle().program())
-                    .and_then(|decision| decision.force_resume_deadline)
-            };
-            let wake_at = force_deadline.filter(|force| *force > now).map_or(
-                (now + self.config.metrics_interval).min(deadline),
-                |force| force.min(deadline),
-            );
-            if tokio::time::timeout(wake_at.saturating_duration_since(now), notified)
-                .await
-                .is_err()
-            {
-                let mut state = self.state.lock();
-                self.run_request_arrival_decisions(&mut state, Instant::now());
             }
         }
+        (handle, context)
+    }
+
+    pub(super) fn finish_registration(
+        &self,
+        state: &mut ProgramSchedulerState,
+        identity: &ProgramIdentity,
+        reference: ProgramRef,
+        context: ContextTokens,
+        home_target: Option<String>,
+        arrived_at: Instant,
+    ) -> Result<(Option<output_length::PendingOutputPrediction>, Vec<ReturnTimeKey>), ScheduleError> {
+        let previous_tokens = state.decisions.get(&reference).map_or(0.0, |decision| {
+            decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+        });
+        self.update_program(
+            state,
+            identity,
+            reference.clone(),
+            context,
+            home_target,
+            arrived_at,
+        );
+        // Snapshot the request's step before a later arrival can update the Program.
+        let return_time_keys = if self.config.prediction_profile.mode != PredictionMode::Off {
+            super::return_time::keys_for_decision(
+                &state.decisions[&reference],
+                identity.model_pool(),
+                &self.config.prediction_profile,
+            )
+        } else {
+            Vec::new()
+        };
+        let mut pending_output_prediction = None;
+        if self.config.prediction_profile.mode != PredictionMode::Off {
+            let keys = output_length::keys_for_request(identity);
+            let prediction = state.prediction_profiles.predict_output(
+                &keys,
+                self.config.prediction_profile.output_length_quantile,
+                self.config.prediction_profile.output_length_min_support,
+                self.config.prediction_profile.output_length_tail_samples,
+                self.config.prediction_profile.prior_weight,
+                self.config.prediction_profile.stability_window_size,
+                self.config.prediction_profile.stability_tolerance,
+            );
+            debug!(
+                event = "output_length_prediction",
+                program = %reference.redacted_id(),
+                predicted_tokens = prediction.as_ref().map(|value| value.tokens),
+                support = prediction.as_ref().map(|value| value.support),
+                mature = prediction.as_ref().is_some_and(|value| value.mature),
+                backoff_level = prediction.as_ref().map(|value| value.backoff_level),
+                source = prediction
+                    .as_ref()
+                    .map(|value| value.source.as_str())
+                    .unwrap_or("none"),
+                "Workflow prediction shadow result"
+            );
+            if let (Some(target_id), Some(prediction)) = (
+                state
+                    .decisions
+                    .get(&reference)
+                    .and_then(|decision| decision.last_target.as_deref()),
+                prediction.as_ref(),
+            ) {
+                RouterMetrics::record_workflow_output_prediction(
+                    target_id,
+                    prediction.source.as_str(),
+                    prediction.tokens,
+                    prediction.support,
+                    prediction.mature,
+                    prediction.backoff_level,
+                );
+            }
+            let pending = output_length::PendingOutputPrediction { keys, prediction };
+            if let Some(decision) = state.decisions.get_mut(&reference) {
+                decision.latest_output_prediction = Some(pending.clone());
+            }
+            pending_output_prediction = Some(pending);
+        }
+
+        // Shadow rollout samples the prepared counterfactual once the
+        // decision state reflects this arrival.
+        if let Some(shadow_tokens) = context.shadow_tokens() {
+            if let Some(target_id) = state
+                .decisions
+                .get(&reference)
+                .and_then(|decision| decision.last_target.clone())
+            {
+                self.record_shadow_admission(
+                    state,
+                    &reference,
+                    &target_id,
+                    arrived_at,
+                    shadow_tokens,
+                );
+            }
+        }
+        let current_tokens = state.decisions[&reference]
+            .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+        if let Some(placement) = state
+            .runtime
+            .view(&reference)
+            .and_then(|program| program.placement)
+        {
+            let account_growth = state
+                .decisions
+                .get(&reference)
+                .is_some_and(|decision| !decision.pause_when_idle);
+            if account_growth
+                && (current_tokens > previous_tokens
+                    || (self.config.pd_mode && current_tokens < previous_tokens))
+            {
+                Self::adjust_usage(state, &placement, current_tokens - previous_tokens);
+            }
+        } else {
+            let target_id = state
+                .decisions
+                .get(&reference)
+                .and_then(|decision| decision.last_target.clone())
+                .ok_or(ScheduleError::NoTargets)?;
+            let queue = if self.config.global_queue {
+                state
+                    .global_queues
+                    .entry(identity.model_pool().to_string())
+                    .or_default()
+            } else {
+                state.rank_queues.entry(target_id.clone()).or_default()
+            };
+            if !queue.iter().any(|queued| queued == &reference) {
+                queue.push_back(reference.clone());
+            }
+            if let Some(decision) = state.decisions.get_mut(&reference) {
+                decision.queued_at.get_or_insert(arrived_at);
+            }
+            self.set_force_resume_deadline(state, &target_id, &reference, arrived_at);
+        }
+        if self.config.binding_only {
+            self.activate_binding_only(state, &reference);
+        } else {
+            self.run_request_arrival_decisions(state, arrived_at);
+        }
+        Ok((pending_output_prediction, return_time_keys))
     }
 
     fn activate_binding_only(&self, state: &mut ProgramSchedulerState, program: &ProgramRef) {
@@ -404,8 +341,11 @@ impl ProgramScheduler {
         );
     }
 
-    fn claim_dispatch(&self, handle: &ProgramRequestHandle) -> Option<ProgramDispatch> {
-        let mut state = self.state.lock();
+    pub(super) fn claim_dispatch(
+        &self,
+        state: &mut ProgramSchedulerState,
+        handle: &ProgramRequestHandle,
+    ) -> Option<ProgramDispatch> {
         if self.config.pd_mode && state.runtime.view(handle.program())?.in_flight_requests > 0 {
             return None;
         }
@@ -426,10 +366,10 @@ impl ProgramScheduler {
             {
                 return None;
             }
-            if self.target_usage(&state, &target, now) > low {
+            if self.target_usage(state, &target, now) > low {
                 // Returning turns must re-admit growth, without adding their q twice.
                 if self.pause_idle(
-                    &mut state,
+                    state,
                     handle.program(),
                     ProgramPauseReason::CapacityRepair,
                     now,
@@ -448,7 +388,7 @@ impl ProgramScheduler {
                     if let Some(decision) = state.decisions.get_mut(handle.program()) {
                         decision.queued_at = Some(now);
                     }
-                    self.set_force_resume_deadline(&mut state, &target, handle.program(), now);
+                    self.set_force_resume_deadline(state, &target, handle.program(), now);
                 }
                 return None;
             }
@@ -468,11 +408,6 @@ impl ProgramScheduler {
                 .dispatched_at()
                 .saturating_duration_since(dispatch.request_arrived_at()),
         );
-        if let Some(text) = dispatch.routing_text() {
-            state
-                .bindings
-                .commit_placement(dispatch.program(), text, &dispatch.target_id);
-        }
         debug!(
             event = "request_dispatch",
             program = %dispatch.redacted_program_id(),
@@ -1091,26 +1026,26 @@ impl ProgramScheduler {
     }
 }
 
-struct AdmissionGuard<'a> {
-    scheduler: &'a ProgramScheduler,
+pub(super) struct AdmissionGuard<'a> {
+    scheduler: &'a ProgramAdmission,
     handle: Option<ProgramRequestHandle>,
 }
 
 impl<'a> AdmissionGuard<'a> {
-    fn new(scheduler: &'a ProgramScheduler, handle: ProgramRequestHandle) -> Self {
+    pub(super) fn new(scheduler: &'a ProgramAdmission, handle: ProgramRequestHandle) -> Self {
         Self {
             scheduler,
             handle: Some(handle),
         }
     }
 
-    fn handle(&self) -> &ProgramRequestHandle {
+    pub(super) fn handle(&self) -> &ProgramRequestHandle {
         self.handle
             .as_ref()
             .expect("admission guard must remain armed while waiting")
     }
 
-    fn disarm(&mut self) {
+    pub(super) fn disarm(&mut self) {
         self.handle = None;
     }
 }
@@ -1128,6 +1063,7 @@ impl Drop for AdmissionGuard<'_> {
 mod tests {
     use super::*;
     use crate::program_scheduling::scheduler_state::RankObservationState;
+    use crate::program_scheduling::ProgramTarget;
     use crate::program_scheduling::{ProgramSchedulerConfig, ProgramUsageObservation};
     use serde_json::json;
     use std::time::Duration;
@@ -1329,7 +1265,7 @@ mod tests {
         assert!(prediction.mature);
         assert_eq!(decision.output_token_reservation, None);
         assert_eq!(
-            decision.private_tokens(scheduler.config.progress_ttl.decode_buffer_tokens),
+            decision.private_tokens(scheduler.admission.config.progress_ttl.decode_buffer_tokens),
             200.0
         );
     }
@@ -1697,7 +1633,7 @@ mod tests {
         ));
         drop(state);
         let dispatch = scheduler
-            .claim_dispatch(&first_handle)
+            .next_dispatch(&first_handle)
             .expect("the tail budget must not requeue the front turn");
         assert_eq!(
             scheduler.target_usage(&scheduler.state.lock(), "rank-0", now),
@@ -1800,7 +1736,7 @@ mod tests {
             (first_handle, second_handle)
         };
         let dispatch = scheduler
-            .claim_dispatch(&first_handle)
+            .next_dispatch(&first_handle)
             .expect("front turn dispatches");
         scheduler.complete(&dispatch, true, false, None, None);
         pd_observe(&scheduler, 0.0);
@@ -1827,7 +1763,7 @@ mod tests {
         }
         drop(state);
         let dispatch = scheduler
-            .claim_dispatch(&second_handle)
+            .next_dispatch(&second_handle)
             .expect("successor dispatches");
         assert_eq!(
             scheduler.state.lock().decisions[second_handle.program()]
@@ -1879,12 +1815,12 @@ mod tests {
             (first_handle, second_handle)
         };
         let dispatch = scheduler
-            .claim_dispatch(&first_handle)
+            .next_dispatch(&first_handle)
             .expect("front turn dispatches");
         scheduler.complete(&dispatch, true, false, None, None);
         pd_observe(&scheduler, 0.0);
         assert!(
-            scheduler.claim_dispatch(&second_handle).is_none(),
+            scheduler.next_dispatch(&second_handle).is_none(),
             "a 1,010-token successor must not dispatch on a 500-token rank"
         );
     }
@@ -1914,7 +1850,7 @@ mod tests {
         };
         pd_observe(&scheduler, 0.0);
         let first_dispatch = scheduler
-            .claim_dispatch(&first_handle)
+            .next_dispatch(&first_handle)
             .expect("first turn dispatches");
         scheduler.complete(&first_dispatch, true, false, None, None);
         pd_observe(&scheduler, 0.0);
@@ -1948,7 +1884,7 @@ mod tests {
             handle
         };
         assert!(
-            scheduler.claim_dispatch(&second_handle).is_some(),
+            scheduler.next_dispatch(&second_handle).is_some(),
             "the compacted turn must not be requeued using the old 800-token context"
         );
     }
@@ -1993,7 +1929,7 @@ mod tests {
         };
         pd_observe(&scheduler, 0.0);
         let first_dispatch = scheduler
-            .claim_dispatch(&first_handle)
+            .next_dispatch(&first_handle)
             .expect("first turn dispatches");
         scheduler.complete(&first_dispatch, true, false, None, None);
         pd_observe(&scheduler, 0.0);
@@ -2004,7 +1940,7 @@ mod tests {
             100
         );
         assert!(
-            scheduler.claim_dispatch(&second_handle).is_some(),
+            scheduler.next_dispatch(&second_handle).is_some(),
             "a queued compacted successor must not be requeued at 1,000 tokens"
         );
     }
@@ -2097,7 +2033,7 @@ mod tests {
             "cancellation must promote the retained front turn's context"
         );
         assert!(
-            scheduler.claim_dispatch(&second_handle).is_none(),
+            scheduler.next_dispatch(&second_handle).is_none(),
             "a 1,010-token successor must not dispatch on a 500-token rank"
         );
     }
@@ -2271,7 +2207,7 @@ mod tests {
     #[tokio::test]
     async fn pd_retry_rechecks_capacity_and_fences_old_completion() {
         let mut scheduler = pd_scheduler(100);
-        scheduler.config.progress_ttl.low_watermark_ratio = 0.9;
+        scheduler.admission.config.progress_ttl.low_watermark_ratio = 0.9;
         let first = scheduler
             .acquire(
                 identity_with_expected_resume("retry", false),
@@ -2427,7 +2363,7 @@ mod tests {
         let mut scheduler = pd_scheduler(1_000);
         // Additive accounting is now the explicit opt-out; the shipped default
         // is exclusive (see `pd_exclusive_accounting_keeps_native_occupancy_as_a_floor`).
-        scheduler.config.pd_exclusive_capacity_accounting = false;
+        scheduler.admission.config.pd_exclusive_capacity_accounting = false;
         pd_observe(&scheduler, 0.5);
         let first = scheduler
             .acquire(identity("prefilling"), 290, &[target()], None)
@@ -2450,7 +2386,7 @@ mod tests {
     #[tokio::test]
     async fn pd_exclusive_accounting_keeps_native_occupancy_as_a_floor() {
         let mut scheduler = pd_scheduler(1_000);
-        scheduler.config.pd_exclusive_capacity_accounting = true;
+        scheduler.admission.config.pd_exclusive_capacity_accounting = true;
         pd_observe(&scheduler, 0.5);
         let first = scheduler
             .acquire(identity("resident"), 290, &[target()], None)
@@ -2477,10 +2413,10 @@ mod tests {
     #[tokio::test]
     async fn pd_prefill_kv_pressure_tightens_the_count_cap_to_the_permits() {
         let mut scheduler = pd_scheduler(1_000);
-        scheduler.config.max_active_programs_per_target = 2;
-        scheduler.config.pd_prefill_permits = 1;
-        scheduler.config.pd_prefill_kv_high = 0.5;
-        scheduler.config.pd_prefill_kv_window = Duration::from_secs(10);
+        scheduler.admission.config.max_active_programs_per_target = 2;
+        scheduler.admission.config.pd_prefill_permits = 1;
+        scheduler.admission.config.pd_prefill_kv_high = 0.5;
+        scheduler.admission.config.pd_prefill_kv_window = Duration::from_secs(10);
         let first = scheduler
             .acquire(identity("first"), 100, &[target()], None)
             .await
@@ -2516,7 +2452,7 @@ mod tests {
     #[tokio::test]
     async fn pd_disabled_ttl_and_received_cache_never_grant_long_term_protection() {
         let mut scheduler = pd_scheduler(1000);
-        scheduler.config.pd_explicit_ttl = false;
+        scheduler.admission.config.pd_explicit_ttl = false;
         let request = ProgramIdentity::from_request(
             None,
             Some(&json!({"vllm_xargs":{"agentic_context":{
@@ -2551,7 +2487,7 @@ mod tests {
     #[tokio::test]
     async fn pd_explicit_ttl_is_clipped_to_deployment_maximum() {
         let mut scheduler = pd_scheduler(1000);
-        scheduler.config.progress_ttl.max_acting_ttl = Duration::from_millis(20);
+        scheduler.admission.config.progress_ttl.max_acting_ttl = Duration::from_millis(20);
         let request = ProgramIdentity::from_request(
             None,
             Some(&json!({"vllm_xargs":{"agentic_context":{

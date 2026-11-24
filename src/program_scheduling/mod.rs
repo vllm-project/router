@@ -17,6 +17,7 @@ mod policy;
 pub(crate) mod prediction_profile;
 mod request_pool;
 mod return_time;
+mod routing;
 mod runtime;
 mod scheduler;
 mod scheduler_admission;
@@ -50,8 +51,9 @@ pub use policy::{
     PrefillCostModel, ProgressTtlConfig, ProgressTtlPolicyMath,
 };
 pub use request_pool::ProgramRequestHandle;
+pub use routing::ProgramRouter;
 pub use runtime::ProgramRuntime;
-pub use scheduler::{BackendObservationEpoch, ProgramScheduler};
+pub use scheduler::{BackendObservationEpoch, ProgramAdmission, ProgramScheduler};
 pub use scheduler_state::{ProgramResumeOrder, ProgramSchedulerConfig};
 pub use token_facts::{
     resolve_context_tokens, ArrivalTokenFacts, ContextTokens, TokenCountMode, TokenFactFallback,

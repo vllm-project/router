@@ -3,6 +3,8 @@
 //! Snapshot construction is intentionally on demand and never runs on the
 //! request-admission or periodic scheduling hot paths.
 
+use super::scheduler::ProgramAdmission;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::ProgramSchedulerState;
 use super::{ProgramState, ProgramStatus};
@@ -156,6 +158,7 @@ pub struct RankDiagnostic {
 pub struct ProgramSchedulerDiagnostic {
     pub enabled: bool,
     pub binding_only: bool,
+    pub enable_acting_ttl: bool,
     pub global_queue: bool,
     pub resume_order: super::ProgramResumeOrder,
     pub cross_rank_headroom_ratio: f64,
@@ -182,7 +185,7 @@ pub struct ProgramSchedulerDiagnostic {
     pub ranks: Vec<RankDiagnostic>,
 }
 
-impl ProgramScheduler {
+impl ProgramAdmission {
     /// Refresh bounded-cardinality gauges only from the periodic tick path.
     pub(crate) fn publish_metrics(&self, state: &ProgramSchedulerState) {
         let now = Instant::now();
@@ -580,6 +583,7 @@ impl ProgramScheduler {
         ProgramSchedulerDiagnostic {
             enabled: true,
             binding_only: self.config.binding_only,
+            enable_acting_ttl: self.config.enable_acting_ttl,
             global_queue: self.config.global_queue,
             resume_order: self.config.resume_order,
             cross_rank_headroom_ratio: self.config.cross_rank_headroom_ratio,

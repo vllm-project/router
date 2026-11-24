@@ -404,6 +404,9 @@ pub struct ProgramSchedulingConfig {
     pub enable_key: ProgramSchedulingEnableKey,
     #[serde(default)]
     pub binding_only: bool,
+    /// Retain a mixed-pool Program's active seat across tool gaps, including request TTL hints.
+    #[serde(default = "default_program_enable_acting_ttl")]
+    pub enable_acting_ttl: bool,
     #[serde(default)]
     pub global_queue: bool,
     #[serde(default)]
@@ -630,6 +633,7 @@ impl Default for ProgramSchedulingConfig {
             pd: PdProgramSchedulingConfig::default(),
             enable_key: ProgramSchedulingEnableKey::default(),
             binding_only: false,
+            enable_acting_ttl: true,
             global_queue: false,
             resume_order: ProgramResumeOrder::default(),
             cross_rank_headroom_ratio: default_program_cross_rank_headroom_ratio(),
@@ -680,6 +684,8 @@ struct ProgramSchedulingConfigInput {
     enable_key: ProgramSchedulingEnableKey,
     #[serde(default)]
     binding_only: bool,
+    #[serde(default = "default_program_enable_acting_ttl")]
+    enable_acting_ttl: bool,
     #[serde(default)]
     global_queue: bool,
     #[serde(default)]
@@ -825,6 +831,7 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             pd: input.pd,
             enable_key: input.enable_key,
             binding_only: input.binding_only,
+            enable_acting_ttl: input.enable_acting_ttl,
             global_queue: input.global_queue,
             resume_order: input.resume_order,
             cross_rank_headroom_ratio: input.cross_rank_headroom_ratio,
@@ -912,6 +919,10 @@ fn default_program_shared_prefix_freshness_kv_turnovers() -> f64 {
 
 fn default_program_decode_buffer_tokens() -> usize {
     100
+}
+
+fn default_program_enable_acting_ttl() -> bool {
+    true
 }
 
 fn default_program_max_acting_ttl_seconds() -> f64 {

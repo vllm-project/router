@@ -5,6 +5,8 @@
 //! Resolution is intentionally cheap: one lock, no tokenizer work, and no
 //! additional encoding. Prepared counts arrive with the request.
 
+use super::scheduler::ProgramAdmission;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::{ProgramPauseReason, ProgramSchedulerState};
 use super::{ArrivalTokenFacts, ContextTokens, ProgramRef, TokenCountMode, TokenizerFingerprint};
@@ -26,7 +28,7 @@ const MAX_VERIFIED_FINGERPRINTS: usize = 1024;
 pub(super) const MAX_TOKEN_USAGE_MISSES: u8 = 3;
 const MAX_TOKEN_USAGE_POOLS: usize = 64;
 
-impl ProgramScheduler {
+impl ProgramAdmission {
     /// Record the active token-count mode once at startup.
     pub fn publish_token_count_mode(&self) {
         RouterMetrics::set_agent_aware_context_token_mode(self.config.token_count_mode.as_str());
@@ -455,7 +457,7 @@ impl ProgramScheduler {
 }
 
 /// Token-count mode of this scheduler, for diagnostics and startup logging.
-impl ProgramScheduler {
+impl ProgramAdmission {
     pub fn token_count_mode(&self) -> TokenCountMode {
         self.config.token_count_mode
     }
@@ -1171,7 +1173,7 @@ mod revocation_tests {
                 observed,
             );
         }
-        assert!(!ProgramScheduler::usage_unavailable(&state, "model"));
+        assert!(!ProgramAdmission::usage_unavailable(&state, "model"));
         for _ in 0..MAX_TOKEN_USAGE_MISSES {
             scheduler.reconcile_observed_prompt_tokens(
                 &mut state,

@@ -31,7 +31,7 @@ use crate::policies::{
     PolicyRegistry,
 };
 use crate::program_scheduling::{
-    ArrivalTokenFacts, BackendObservationProvider, ProgramIdentity, ProgramScheduler,
+    ArrivalTokenFacts, BackendObservationProvider, ProgramIdentity, ProgramRouter,
     ProgramSchedulerConfig, ProgramTarget, ScheduleError, TokenFacts,
     VllmMetricsObservationProvider,
 };
@@ -311,7 +311,7 @@ pub struct Router {
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     kv_index_supervisor: Option<Arc<crate::kv_index::KvIndexSupervisor>>,
     kv_reconcile_handle: Option<tokio::task::JoinHandle<()>>,
-    program_scheduler: Option<Arc<ProgramScheduler>>,
+    program_scheduler: Option<Arc<ProgramRouter>>,
     _program_observation_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     program_targets_cache: Mutex<HashMap<String, ProgramTargetCacheEntry>>,
     program_token_estimator: Arc<MomentumTokenEstimator>,
@@ -628,7 +628,7 @@ impl Router {
             .program_scheduling
             .as_ref()
             .map(ProgramSchedulerConfig::from)
-            .map(ProgramScheduler::new)
+            .map(ProgramRouter::new)
             .inspect(|scheduler| {
                 scheduler.publish_token_count_mode();
                 if scheduler.exact_text_enabled() {
@@ -957,14 +957,14 @@ impl Router {
 
     /// Refresh every tracked model pool from one revision-stable registry view.
     fn sync_program_targets_from_registry(
-        scheduler: &ProgramScheduler,
+        scheduler: &ProgramRouter,
         worker_registry: &WorkerRegistry,
     ) {
         Self::sync_program_targets_from_registry_with_hook(scheduler, worker_registry, || {});
     }
 
     fn sync_program_targets_from_registry_with_hook(
-        scheduler: &ProgramScheduler,
+        scheduler: &ProgramRouter,
         worker_registry: &WorkerRegistry,
         mut after_collection: impl FnMut(),
     ) {
@@ -1237,7 +1237,7 @@ impl Router {
 
     async fn acquire_program_completion_for_identity(
         &self,
-        scheduler: &Arc<ProgramScheduler>,
+        scheduler: &Arc<ProgramRouter>,
         identity: ProgramIdentity,
         model_pool: &ResolvedProgramModelPool,
         endpoint: &str,
@@ -4061,6 +4061,7 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use crate::backend::outcome::EngineUsage;
+    use crate::program_scheduling::ProgramScheduler;
     use crate::routers::http::program_adapter::MAX_SSE_LINE_BYTES;
     use std::collections::HashMap;
 
@@ -6723,6 +6724,64 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (address, server)
+    }
+
+    #[tokio::test]
+    async fn mixed_pool_http_routes_first_followup_and_failover_to_the_bound_worker() {
+        async fn backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move || async move {
+                Json(serde_json::json!({"served_by":address.to_string(),"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":1}}))
+            }));
+            (
+                address,
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+            )
+        }
+        async fn chat(router: &Router, program: &str) -> String {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model":"m", "messages":[{"role":"user","content":"test"}],
+                "vllm_xargs":{"agentic_context":{"program_id":program,"session_id":"same-chat","expected_resume":true,"kv_retention_ttl_seconds":60.0}}
+            })).unwrap();
+            let response = router
+                .route_typed_request(None, &request, "/v1/chat/completions", None)
+                .await;
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 65536).await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["served_by"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+        let (left, first) = backend().await;
+        let (right, second) = backend().await;
+        let mut router = router_pointing_at(left);
+        assert_eq!(chat(&router, "native").await, left.to_string());
+        assert!(router.scheduling_diagnostics().is_none());
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            format!("http://{right}"),
+            WorkerType::Regular,
+        )));
+        let scheduling = Arc::new(ProgramRouter::new(ProgramSchedulerConfig {
+            binding_strategy: crate::program_scheduling::ProgramBindingStrategy::ProgramRoundRobin,
+            enable_acting_ttl: false,
+            ..Default::default()
+        }));
+        router.program_scheduler = Some(scheduling.clone());
+        let a = chat(&router, "a").await;
+        assert_eq!(chat(&router, "a").await, a);
+        let b = chat(&router, "b").await;
+        assert_ne!(a, b);
+        assert!(router
+            .worker_registry
+            .remove_by_url(&format!("http://{a}"))
+            .is_some());
+        Router::sync_program_targets_from_registry(&scheduling, &router.worker_registry);
+        assert_eq!(chat(&router, "a").await, b);
+        first.abort();
+        second.abort();
     }
 
     fn router_pointing_at(address: std::net::SocketAddr) -> Router {

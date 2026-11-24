@@ -3,13 +3,15 @@
 //! Every cycle exhausts feasible cache-affine local resumes before considering
 //! relocation. Initial Program binding is never rerun by this module.
 
+use super::scheduler::ProgramAdmission;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 use super::scheduler::ProgramScheduler;
 use super::scheduler_admission::RankAdmissionPlan;
 use super::scheduler_state::ProgramSchedulerState;
 use super::{ProgramRef, ProgramState, ProgramStatus};
 use std::time::Instant;
 
-impl ProgramScheduler {
+impl ProgramAdmission {
     pub(crate) fn schedule_global_waiting(
         &self,
         state: &mut ProgramSchedulerState,
