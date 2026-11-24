@@ -156,8 +156,8 @@ impl PlacementEvidence {
             && self.lease.as_ref().is_none_or(SourceLease::is_active)
     }
 
-    pub(crate) fn is_current(&self) -> bool {
-        self.source_is_current() && self.layout.as_ref().is_none_or(LayoutGrant::is_current)
+    pub(crate) fn is_revoked(&self) -> bool {
+        !self.source_is_current() || self.layout.as_ref().is_some_and(LayoutGrant::is_revoked)
     }
 
     /// Hold the layout and source guards across reservation. Both acquisitions

@@ -85,11 +85,13 @@ impl LayoutGrant {
         self.lifecycle.trusted_at(state, || now) && self.stamp.covers(&self.lifecycle, state, now)
     }
 
-    pub(in crate::kv_index) fn is_current(&self) -> bool {
+    /// A busy grant remains eligible for scoring. The selected source must
+    /// still pin the grant or retry before reserving a slot.
+    pub(in crate::kv_index) fn is_revoked(&self) -> bool {
         self.lifecycle
             .state
             .try_lock()
-            .is_some_and(|state| self.valid(&state))
+            .is_some_and(|state| !self.valid(&state))
     }
 
     pub(in crate::kv_index) fn try_pin<'a>(
@@ -550,7 +552,12 @@ impl InstalledWorkers {
     }
 
     pub(super) fn retire_worker(&self, subs: WorkerSubs) {
-        subs.active.store(false, Ordering::Release);
+        {
+            // Serialize retirement with LayoutPin, then release it before
+            // shutting down subscribers or taking their source gates.
+            let _state = subs.provider.lifecycle.state.lock();
+            subs.active.store(false, Ordering::Release);
+        }
         for handle in &subs.handles {
             handle.shutdown();
         }

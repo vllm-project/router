@@ -2137,101 +2137,154 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
     task.abort();
 }
 
+struct LayoutReservation {
+    policy: crate::policies::KvAwarePolicy,
+    worker: Arc<dyn crate::core::Worker>,
+    source: Arc<crate::kv_index::SourceBinding>,
+    provider: Arc<LayoutWorkerProvider>,
+}
+
+impl LayoutReservation {
+    const PROMPT: [u32; 33] = [42; 33];
+
+    fn new() -> Self {
+        use crate::core::{BasicWorker, WorkerType};
+        use crate::kv_index::source::binding::SourceLease;
+        use crate::kv_index::source::test_support::{full_binding, warm_full};
+        use crate::kv_index::RoutableTarget;
+
+        let worker = Arc::new(BasicWorker::new(
+            "http://layout".into(),
+            WorkerType::Regular,
+        )) as Arc<dyn crate::core::Worker>;
+        let active = Arc::new(AtomicBool::new(true));
+        let target = RoutableTarget {
+            instance_id: worker.url().into(),
+            dp_rank: 0,
+        };
+        let source = Arc::new(full_binding(target, 16).with_source_binding(SourceLease {
+            gate: Arc::new(Mutex::new(())),
+            active: active.clone(),
+        }));
+        source.begin_empty(0);
+        warm_full(&source, 0, &Self::PROMPT[..32]);
+        let provider = Arc::new(LayoutWorkerProvider {
+            indexes: [(0, source.clone())].into_iter().collect(),
+            lifecycle: Arc::new(WorkerLifecycle::new(active, true, None)),
+        });
+        let fixture = Self {
+            policy: crate::policies::KvAwarePolicy::default(),
+            worker,
+            source,
+            provider,
+        };
+        fixture.register(fixture.provider.clone());
+        fixture
+    }
+
+    fn key() -> CacheKey {
+        CacheKey {
+            model: "layout".into(),
+            block_size: 16,
+        }
+    }
+
+    fn register(&self, provider: Arc<dyn crate::policies::TieredMatchProvider>) {
+        self.policy.register_target_with_cache_identity(
+            self.worker.url(),
+            self.source.target.clone(),
+            Self::key(),
+            provider,
+        );
+    }
+
+    fn assert_reservation(
+        &self,
+        workers: &[Arc<dyn crate::core::Worker>],
+        tokens: crate::policies::KvRequestTokens<'_>,
+        excluded: &[String],
+        expected: u64,
+    ) {
+        let receipt = self
+            .policy
+            .select_worker_with_inputs(workers, tokens, None, None, None, excluded)
+            .unwrap();
+        let manager = self.policy.slot_manager().unwrap();
+        assert_eq!(receipt.worker_index, 0);
+        assert_eq!(receipt.new_prefill_tokens, expected);
+        assert_eq!(
+            manager.sample(&self.source.target).active_prefill_tokens,
+            expected
+        );
+        receipt.slot.unwrap().release();
+        self.worker.decrement_load();
+        assert_eq!(
+            manager.sample(&self.source.target),
+            crate::policies::LoadSample::default()
+        );
+    }
+
+    fn evidence(&self) -> crate::kv_index::PlacementEvidence {
+        use crate::policies::TieredMatchProvider;
+        let mut cache = crate::kv_index::RequestHashCache::for_single_target();
+        cache.placement = Some(Vec::new());
+        assert!(!self
+            .provider
+            .matches_with_cache(&Self::PROMPT, 16, None, 0, &mut cache)
+            .is_empty());
+        cache.placement.unwrap().pop().unwrap()
+    }
+}
+
 #[test]
 fn regular_layout_reservation_rechecks_expired_grant() {
     use crate::core::{BasicWorker, Worker, WorkerType};
-    use crate::kv_index::source::test_support::{full_binding, warm_full};
     use crate::kv_index::{RoutableTarget, TierMatch};
-    use crate::policies::{KvAwarePolicy, TieredMatchProvider};
+    use crate::policies::{KvRequestTokens, TieredMatchProvider};
 
     struct ExpiringPeer(Arc<WorkerLifecycle>);
 
     impl TieredMatchProvider for ExpiringPeer {
         fn matches(&self, _: &[u32], _: u32, _: Option<&str>, _: u32) -> Vec<TierMatch> {
             self.0.state.lock().verified_at = Instant::now() - Duration::from_secs(6);
-            self.0.expire_if_needed();
+            assert!(self.0.expire_if_needed());
             Vec::new()
         }
     }
 
-    let life = Arc::new(WorkerLifecycle::new(
-        Arc::new(AtomicBool::new(true)),
-        true,
-        None,
-    ));
-    let workers: Vec<Arc<dyn Worker>> = ["http://layout", "http://peer"]
-        .into_iter()
-        .map(|url| {
-            Arc::new(BasicWorker::new(url.to_owned(), WorkerType::Regular)) as Arc<dyn Worker>
-        })
-        .collect();
-    let target = RoutableTarget {
-        instance_id: workers[0].url().into(),
-        dp_rank: 0,
-    };
-    let prompt = [42; 33];
-    let source = Arc::new(full_binding(target.clone(), 16));
-    source.begin_empty(0);
-    warm_full(&source, 0, &prompt[..32]);
-    let generation = source.control.generation();
-    let provider = Arc::new(LayoutWorkerProvider {
-        indexes: [(0, source.clone())].into_iter().collect(),
-        lifecycle: life.clone(),
-    });
-    let policy = KvAwarePolicy::default();
-    let key = CacheKey {
-        model: "layout".into(),
-        block_size: 16,
-    };
-    policy.register_target_with_cache_identity(
-        workers[0].url(),
-        target.clone(),
-        key.clone(),
-        provider,
-    );
-    policy.register_target_with_cache_identity(
-        workers[1].url(),
+    let fixture = LayoutReservation::new();
+    let lifecycle = &fixture.provider.lifecycle;
+    let generation = fixture.source.control.generation();
+    let peer: Arc<dyn Worker> =
+        Arc::new(BasicWorker::new("http://peer".into(), WorkerType::Regular));
+    fixture.policy.register_target_with_cache_identity(
+        peer.url(),
         RoutableTarget {
-            instance_id: workers[1].url().into(),
+            instance_id: peer.url().into(),
             dp_rank: 0,
         },
-        key,
-        Arc::new(ExpiringPeer(life.clone())),
+        LayoutReservation::key(),
+        Arc::new(ExpiringPeer(lifecycle.clone())),
     );
-    let receipt = policy
-        .select_worker_with_receipt(
-            &workers,
-            Some(&prompt),
-            None,
-            None,
-            None,
-            &[workers[1].url().to_owned()],
-        )
-        .unwrap();
-    assert_eq!(source.control.generation(), generation);
-    assert!(life.active.load(Ordering::Acquire));
-    assert_eq!(receipt.new_prefill_tokens, 33);
-    assert_eq!(
-        policy
-            .slot_manager()
-            .unwrap()
-            .sample(&target)
-            .active_prefill_tokens,
-        33
+    let excluded = [peer.url().to_owned()];
+    fixture.assert_reservation(
+        &[fixture.worker.clone(), peer],
+        KvRequestTokens::Shared(Some(&LayoutReservation::PROMPT)),
+        &excluded,
+        33,
     );
-    receipt.slot.unwrap().release();
-    workers[0].decrement_load();
+    assert_eq!(fixture.source.control.generation(), generation);
+    assert!(lifecycle.active.load(Ordering::Acquire));
 }
 
 #[test]
 fn regular_layout_reservation_uses_the_accepted_retry() {
-    use crate::core::{BasicWorker, Worker, WorkerType};
-    use crate::kv_index::source::test_support::{event_batch, full_binding, full_store, warm_full};
-    use crate::kv_index::{RequestHashCache, RoutableTarget, SourceBinding, TierMatch};
-    use crate::policies::{KvAwarePolicy, KvRequestTokens, TieredMatchProvider, WorkerTokenInputs};
+    use crate::kv_index::source::test_support::{event_batch, full_store};
+    use crate::kv_index::{RequestHashCache, SourceBinding, TierMatch};
+    use crate::policies::{KvRequestTokens, TieredMatchProvider, WorkerTokenInputs};
 
     struct RetryingSource {
-        source: SourceBinding,
+        source: Arc<SourceBinding>,
         lifecycle: Arc<WorkerLifecycle>,
         cleared: AtomicBool,
     }
@@ -2266,76 +2319,94 @@ fn regular_layout_reservation_uses_the_accepted_retry() {
         }
     }
 
-    let worker: Arc<dyn Worker> =
-        Arc::new(BasicWorker::new("http://retry".into(), WorkerType::Regular));
-    let target = RoutableTarget {
-        instance_id: worker.url().into(),
-        dp_rank: 0,
-    };
-    let prompt = [42; 33];
-    let source = full_binding(target.clone(), 16);
-    source.begin_empty(0);
-    warm_full(&source, 0, &prompt[..32]);
-    let policy = KvAwarePolicy::default();
-    policy.register_target_with_cache_identity(
-        worker.url(),
-        target.clone(),
-        CacheKey {
-            model: "layout".into(),
-            block_size: 16,
-        },
-        Arc::new(RetryingSource {
-            source,
-            lifecycle: Arc::new(WorkerLifecycle::new(
-                Arc::new(AtomicBool::new(true)),
-                true,
-                None,
-            )),
-            cleared: AtomicBool::new(false),
-        }),
-    );
-    let receipt = policy
-        .select_worker_with_receipt(
-            std::slice::from_ref(&worker),
-            Some(&prompt),
-            None,
-            None,
-            None,
-            &[],
-        )
-        .unwrap();
-    assert_eq!(receipt.new_prefill_tokens, 1);
-    assert_eq!(
-        policy
-            .slot_manager()
-            .unwrap()
-            .sample(&target)
-            .active_prefill_tokens,
-        1
-    );
-    receipt.slot.unwrap().release();
-    worker.decrement_load();
-
-    // Two distinct prompts share the same layout lock at reservation.
-    let mut second = prompt.to_vec();
+    let fixture = LayoutReservation::new();
+    fixture.register(Arc::new(RetryingSource {
+        source: fixture.source.clone(),
+        lifecycle: fixture.provider.lifecycle.clone(),
+        cleared: AtomicBool::new(false),
+    }));
+    // Each prompt reuses 32 tokens. The batch pins one layout grant.
+    let mut second = LayoutReservation::PROMPT.to_vec();
     second[32] += 1;
     let inputs = WorkerTokenInputs::from([(
-        worker.base_url().to_owned(),
-        Arc::from([prompt.to_vec(), second]),
+        fixture.worker.base_url().to_owned(),
+        Arc::from([LayoutReservation::PROMPT.to_vec(), second]),
     )]);
-    let receipt = policy
-        .select_worker_with_inputs(
-            std::slice::from_ref(&worker),
-            KvRequestTokens::PerWorker(&inputs),
-            None,
-            None,
-            None,
-            &[],
-        )
-        .unwrap();
-    assert_eq!(receipt.new_prefill_tokens, 2);
-    receipt.slot.unwrap().release();
-    worker.decrement_load();
+    fixture.assert_reservation(
+        std::slice::from_ref(&fixture.worker),
+        KvRequestTokens::PerWorker(&inputs),
+        &[],
+        2,
+    );
+}
+
+#[test]
+fn regular_layout_reservation_keeps_credit_while_grant_is_busy() {
+    use crate::kv_index::PlacementEvidence;
+    use crate::policies::KvRequestTokens;
+    let fixture = LayoutReservation::new();
+    let evidence = fixture.evidence();
+    let lock = fixture.provider.lifecycle.state.lock();
+    assert!(!evidence.is_revoked());
+    assert!(PlacementEvidence::try_pin_all(std::iter::once(&evidence)).is_none());
+    drop(lock);
+    fixture.assert_reservation(
+        std::slice::from_ref(&fixture.worker),
+        KvRequestTokens::Shared(Some(&LayoutReservation::PROMPT)),
+        &[],
+        1,
+    );
+}
+
+#[test]
+fn regular_layout_reservation_serializes_worker_retirement() {
+    use crate::kv_index::PlacementEvidence;
+    use crate::policies::KvRequestTokens;
+    let fixture = LayoutReservation::new();
+    let evidence = fixture.evidence();
+    let pins = PlacementEvidence::try_pin_all(std::iter::once(&evidence)).unwrap();
+    let active = fixture.provider.lifecycle.active.clone();
+    let subs = WorkerSubs {
+        active: active.clone(),
+        key: LayoutReservation::key(),
+        source_id: fixture.source.target.instance_id.clone(),
+        worker_origin: None,
+        replay_endpoints: Vec::new(),
+        live_sources: vec![LiveSource {
+            publisher: String::new(),
+            topic: String::new(),
+            rank: 0,
+            lease: fixture.source.binding.as_ref().unwrap().clone(),
+        }],
+        ranks: vec![0],
+        indexer: fixture.source.index.clone(),
+        provider: fixture.provider.clone(),
+        handles: Vec::new(),
+    };
+    let (started, start) = std::sync::mpsc::channel();
+    let (finished, finish) = std::sync::mpsc::channel();
+    let retirement = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        InstalledWorkers::default().retire_worker(subs);
+        finished.send(()).unwrap();
+    });
+    start.recv().unwrap();
+    let completion = finish.recv_timeout(Duration::from_millis(100));
+    let active_with_pins = active.load(Ordering::Acquire);
+    drop(pins);
+    retirement.join().unwrap();
+    assert!(matches!(
+        completion,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert!(active_with_pins);
+    assert!(!active.load(Ordering::Acquire));
+    fixture.assert_reservation(
+        std::slice::from_ref(&fixture.worker),
+        KvRequestTokens::Shared(Some(&LayoutReservation::PROMPT)),
+        &[],
+        33,
+    );
 }
 
 #[test]

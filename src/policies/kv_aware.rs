@@ -1066,10 +1066,7 @@ struct SelectionPlan {
 
 impl SelectionPlan {
     fn discard_revoked_credit(&mut self) {
-        for proof in &self.placement {
-            if proof.is_current() {
-                continue;
-            }
+        for proof in self.placement.iter().filter(|proof| proof.is_revoked()) {
             for (position, binding) in self.bindings.iter().enumerate() {
                 if proof.target() == &binding.target {
                     self.grouped[position].clear();
