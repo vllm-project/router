@@ -279,6 +279,8 @@ each prefill's `Control.GetKvEventSources`, or from
 `--pd-kv-events grpc://prefill:50051=tcp://prefill:5557` when the worker does
 not report them.
 
+See [KV-aware P/D routing](../load_balancing/kv_aware.md#pd-routing) for layout setup.
+
 ## Backend Modules
 
 | File | Role |

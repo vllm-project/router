@@ -29,6 +29,7 @@ tower-http = { version = "0.6", features = [
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 sha2 = "0.10"
+smallvec = "1"
 bytes = "1.8.0"
 rand = "0.9.2"
 reqwest = { version = "0.13", features = ["stream", "blocking", "json"] }
@@ -36,6 +37,7 @@ futures-util = "0.3"
 futures = "0.3"
 pyo3 = { version = "0.26", features = ["extension-module"] }
 dashmap = "6.1.0"
+scc = "3.8.8"
 http = "1.1.0"
 mime = "0.3"
 http-body = "1.0"
@@ -102,7 +104,9 @@ async-channel = "2"
 # tonic 0.12 copy for traces.
 tonic = { version = "0.14", features = ["transport"] }
 tonic-health = "0.14"
+tonic-prost = "0.14"
 vllm-proto = "0.2"
+prost = "0.14"
 # `kv_transfer_params` is a protobuf `Struct`.
 prost-types = "0.14"
 # Rust crates in the vLLM tree (not pip). Unpublished on crates.io; Cargo
@@ -208,22 +212,6 @@ path = "tests/rust/grpc_policy_routing.rs"
 [[test]]
 name = "grpc_vs_http_e2e"
 path = "tests/rust/grpc_vs_http_e2e.rs"
-
-[[test]]
-name = "kv_device_consumer"
-path = "tests/rust/kv_device_consumer.rs"
-
-[[test]]
-name = "kv_endpoint_worker_hosts"
-path = "tests/rust/kv_endpoint_worker_hosts.rs"
-
-[[test]]
-name = "kv_index_prefix_contiguity"
-path = "tests/rust/kv_index_prefix_contiguity.rs"
-
-[[test]]
-name = "kv_index_sequence_lifecycle"
-path = "tests/rust/kv_index_sequence_lifecycle.rs"
 
 [[test]]
 name = "otel_config_test"
