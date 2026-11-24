@@ -41,10 +41,12 @@ impl ProgramScheduler {
             return None;
         }
         let observation = state.observations.get(&old.target_id)?;
-        if !self.observation_is_fresh(observation, now) || observation.kv_cache_usage.is_none() {
+        if !self.observation_is_fresh(observation, now)
+            || observation.backend.kv_cache_usage.is_none()
+        {
             return None;
         }
-        let waiting = observation.waiting_requests?;
+        let waiting = observation.backend.waiting_requests?;
         if self.config.admission_waiting_request_threshold > 0
             && waiting >= self.config.admission_waiting_request_threshold
         {
@@ -276,6 +278,7 @@ impl ProgramScheduler {
             }
             let current_tokens = state.decisions[&reference]
                 .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+            self.recheck_idle_execution_capacity(&mut state, &reference, arrived_at);
             if let Some(placement) = state
                 .runtime
                 .view(&reference)
@@ -391,7 +394,16 @@ impl ProgramScheduler {
 
     fn claim_dispatch(&self, handle: &ProgramRequestHandle) -> Option<ProgramDispatch> {
         let mut state = self.state.lock();
-        if self.config.pd_mode && state.runtime.view(handle.program())?.in_flight_requests > 0 {
+        if state
+            .decisions
+            .get(handle.program())
+            .is_some_and(|decision| decision.terminate_when_idle)
+        {
+            return None;
+        }
+        if (self.config.pd_mode || self.uses_tao_admission())
+            && state.runtime.view(handle.program())?.in_flight_requests > 0
+        {
             return None;
         }
         let target = state.runtime.placement(handle.program())?.to_string();
@@ -403,8 +415,10 @@ impl ProgramScheduler {
                 .observations
                 .get(&target)
                 .filter(|o| self.observation_is_fresh(o, now))
-                .filter(|o| o.kv_cache_usage.is_some());
-            let waiting = fresh.and_then(|o| o.waiting_requests).unwrap_or(usize::MAX);
+                .filter(|o| o.backend.kv_cache_usage.is_some());
+            let waiting = fresh
+                .and_then(|o| o.backend.waiting_requests)
+                .unwrap_or(usize::MAX);
             if fresh.is_none()
                 || (self.config.admission_waiting_request_threshold > 0
                     && waiting >= self.config.admission_waiting_request_threshold)
@@ -485,6 +499,11 @@ impl ProgramScheduler {
             return;
         }
         let after = state.runtime.view(handle.program());
+        if self.uses_tao_admission() && after.as_ref().is_some_and(|v| v.in_flight_requests == 0) {
+            if let Some(d) = state.decisions.get_mut(handle.program()) {
+                d.tao_reserved_tokens = None;
+            }
+        }
         if self.config.pd_mode
             && after
                 .as_ref()
@@ -602,6 +621,9 @@ impl ProgramScheduler {
     }
 
     pub(crate) fn schedule_waiting(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {
+        if self.uses_tao_admission() {
+            return self.schedule_tao_admission(state, now);
+        }
         if self.config.global_queue {
             self.schedule_global_waiting(state, now)
         } else {
@@ -653,7 +675,7 @@ impl ProgramScheduler {
         });
     }
 
-    fn resume_tier_cmp(
+    pub(crate) fn resume_tier_cmp(
         &self,
         state: &ProgramSchedulerState,
         left: &ProgramRef,
@@ -681,7 +703,7 @@ impl ProgramScheduler {
             .then_with(|| right_priority.cmp(&left_priority))
     }
 
-    fn segment_yield_cmp(
+    pub(crate) fn segment_yield_cmp(
         &self,
         state: &ProgramSchedulerState,
         left: &ProgramRef,
@@ -702,7 +724,9 @@ impl ProgramScheduler {
         let left_state = &state.decisions[left];
         let right_state = &state.decisions[right];
         match self.config.resume_order {
-            ProgramResumeOrder::Fcfs => self.fcfs_resume_cmp(state, left, right),
+            ProgramResumeOrder::Fcfs | ProgramResumeOrder::DpAdmissionTAO => {
+                self.fcfs_resume_cmp(state, left, right)
+            }
             ProgramResumeOrder::Mru => right_state
                 .last_request_finished_at
                 .cmp(&left_state.last_request_finished_at)
@@ -762,7 +786,9 @@ impl ProgramScheduler {
                 .observations
                 .get(target_id)
                 .filter(|o| self.observation_is_fresh(o, now))
-                .is_some_and(|o| o.kv_cache_usage.is_some() && o.waiting_requests.is_some())
+                .is_some_and(|o| {
+                    o.backend.kv_cache_usage.is_some() && o.backend.waiting_requests.is_some()
+                })
         {
             return None;
         }
@@ -774,7 +800,7 @@ impl ProgramScheduler {
                 .observations
                 .get(target_id)
                 .filter(|observation| self.observation_is_fresh(observation, now))
-                .and_then(|observation| observation.waiting_requests)
+                .and_then(|observation| observation.backend.waiting_requests)
                 .is_some_and(|waiting| waiting >= self.config.admission_waiting_request_threshold)
         {
             return None;
@@ -806,7 +832,15 @@ impl ProgramScheduler {
             self.config.progress_ttl.decode_buffer_tokens,
             expected_output_tokens,
         );
-        let capacity = self.config.progress_ttl.token_capacity;
+        if !self.capacity_ready(state, target_id, now) {
+            return None;
+        }
+        if self.config.dynamic_token_capacity
+            && required_tokens > self.dynamic_headroom(state, target_id, now)?
+        {
+            return None;
+        }
+        let capacity = self.target_capacity(state, target_id, now);
         // P KV pressure tightens the cap back to the P prefill permits so the
         // shared prefill cache is not thrashed by exclusive D admission.
         let active_cap = self.effective_active_cap(state);
@@ -926,6 +960,10 @@ impl ProgramScheduler {
         let Some(current_tokens) = current_tokens else {
             return false;
         };
+        let resume_info = state
+            .decisions
+            .get(program)
+            .and_then(|d| d.last_pause_reason.map(|reason| (reason, d.paused_at)));
         // Account for the budget that `rank_admission_plan` actually checked.
         // A later queued turn can change the decision's reservation between
         // planning and committing; re-reading it here would admit against one
@@ -985,6 +1023,11 @@ impl ProgramScheduler {
             capacity_tokens = ?plan.capacity_tokens,
             "Program scheduling decision"
         );
+        if let Some((reason, paused_at)) = resume_info {
+            info!(event="program_resume", program=%program.redacted_id(), target=target_id,
+                reason=reason.as_str(), pause_elapsed_seconds=?paused_at.map(|t| now.saturating_duration_since(t).as_secs_f64()),
+                "Program resumed");
+        }
         if !self.config.binding_only {
             let observation = state.observations.get(target_id);
             RouterMetrics::record_agent_aware_admission(
@@ -994,11 +1037,14 @@ impl ProgramScheduler {
                     required_tokens: plan.required_tokens,
                     reserve_tokens: plan.reserve_tokens,
                     capacity_tokens: plan.capacity_tokens,
-                    backend_kv_usage_ratio: observation.and_then(|value| value.kv_cache_usage),
-                    backend_running_requests: observation.and_then(|value| value.running_requests),
-                    backend_waiting_requests: observation.and_then(|value| value.waiting_requests),
+                    backend_kv_usage_ratio: observation
+                        .and_then(|value| value.backend.kv_cache_usage),
+                    backend_running_requests: observation
+                        .and_then(|value| value.backend.running_requests),
+                    backend_waiting_requests: observation
+                        .and_then(|value| value.backend.waiting_requests),
                     observation_age: observation
-                        .and_then(|value| value.observed_at)
+                        .and_then(|value| value.backend.observed_at)
                         .map(|observed_at| now.saturating_duration_since(observed_at)),
                 },
             );
@@ -1112,7 +1158,9 @@ impl Drop for AdmissionGuard<'_> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::program_scheduling::scheduler_state::RankObservationState;
+    use crate::program_scheduling::scheduler_state::{
+        BackendCapacityObservation, RankObservationState,
+    };
     use crate::program_scheduling::{ProgramSchedulerConfig, ProgramUsageObservation};
     use serde_json::json;
     use std::time::Duration;
@@ -1186,6 +1234,25 @@ mod tests {
             base_url: "http://rank-0".into(),
             dp_rank: Some(0),
         }
+    }
+
+    #[tokio::test]
+    async fn terminating_completion_does_not_dispatch_a_retained_successor() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let first = scheduler
+            .acquire(identity("p"), 100, &[target()], None)
+            .await
+            .unwrap();
+        let successor = scheduler.state.lock().runtime.retain_request(
+            &identity("p"),
+            120,
+            None,
+            Instant::now(),
+        );
+        assert_eq!(successor.program(), first.program());
+        scheduler.complete(&first, true, true, None, None);
+        assert!(scheduler.claim_dispatch(&successor).is_none());
+        scheduler.cancel_retained_request(&successor);
     }
 
     #[tokio::test]
@@ -2157,8 +2224,11 @@ mod tests {
         state.observations.insert(
             "rank-0".into(),
             RankObservationState {
-                waiting_requests: Some(1),
-                observed_at: Some(now),
+                backend: BackendCapacityObservation {
+                    waiting_requests: Some(1),
+                    observed_at: Some(now),
+                    ..BackendCapacityObservation::default()
+                },
                 ..RankObservationState::default()
             },
         );
@@ -2191,6 +2261,7 @@ mod tests {
                 .observations
                 .get_mut("rank-0")
                 .unwrap()
+                .accounting
                 .active_program_token_delta = 100.0;
         }
         let second = scheduler
@@ -2204,7 +2275,9 @@ mod tests {
             .unwrap();
         let state = scheduler.state.lock();
         assert_eq!(
-            state.observations["rank-0"].active_program_token_delta,
+            state.observations["rank-0"]
+                .accounting
+                .active_program_token_delta,
             100.0
         );
         drop(state);
@@ -2245,6 +2318,8 @@ mod tests {
                     target_id: t.id,
                     base_url: t.base_url,
                     dp_rank: t.dp_rank,
+                    token_capacity: None,
+                    num_gpu_blocks: None,
                     kv_cache_usage: Some(usage),
                     running_requests: Some(0),
                     waiting_requests: Some(0),

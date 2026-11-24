@@ -4,6 +4,7 @@
 //! request routing, worker selection, or request forwarding.
 
 mod binding;
+mod capacity;
 mod contracts;
 mod diagnostics;
 mod domain;
@@ -16,6 +17,7 @@ pub mod pd_cost;
 mod policy;
 pub(crate) mod prediction_profile;
 mod request_pool;
+mod resume_dp;
 mod return_time;
 mod runtime;
 mod scheduler;
@@ -25,6 +27,7 @@ mod scheduler_global;
 mod scheduler_lifecycle;
 mod scheduler_state;
 mod scheduler_tokens;
+mod tao_admission;
 mod token_facts;
 
 pub use binding::{

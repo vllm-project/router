@@ -1,0 +1,6 @@
+{
+  "binding_strategy": "cache_aware",
+  "global_queue": true,
+  "dynamic_token_capacity": true,
+  "resume_order": "dp_admission_tao"
+}

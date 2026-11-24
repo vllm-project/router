@@ -1,5 +1,5 @@
 use super::*;
-use crate::program_scheduling::ProgramBindingStrategy;
+use crate::program_scheduling::{ProgramBindingStrategy, ProgramResumeOrder};
 
 /// Configuration validator
 pub struct ConfigValidator;
@@ -54,11 +54,39 @@ impl ConfigValidator {
     }
 
     fn validate_program_scheduling(config: &ProgramSchedulingConfig) -> ConfigResult<()> {
+        if matches!(config.resume_order, ProgramResumeOrder::DpAdmissionTAO)
+            && (config.binding_strategy != ProgramBindingStrategy::CacheAware
+                || !config.dynamic_token_capacity
+                || !config.global_queue)
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason:
+                    "dp_admission_tao requires cache_aware binding, dynamic_token_capacity=true and global_queue=true"
+                        .to_string(),
+            });
+        }
+        if config.resume_order == ProgramResumeOrder::DpAdmissionTAO && config.binding_only {
+            return Err(ConfigError::ValidationFailed {
+                reason: "dp_admission_tao cannot be combined with binding_only".to_string(),
+            });
+        }
         if config.binding_strategy == ProgramBindingStrategy::ReasoningTokenBalance
             && config.token_capacity_per_dp_rank.is_none()
         {
             return Err(ConfigError::ValidationFailed {
                 reason: "reasoning_token_balance requires token_capacity_per_dp_rank".to_string(),
+            });
+        }
+        if config.dp_capacity_quantum == 0 || config.dp_state_budget == Some(0) {
+            return Err(ConfigError::ValidationFailed {
+                reason: "dp_capacity_quantum and explicit dp_state_budget must be positive".into(),
+            });
+        }
+        if config.dynamic_token_capacity
+            && (config.token_capacity_per_dp_rank.is_some() || config.binding_only)
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "dynamic_token_capacity cannot be combined with a static capacity or binding_only".into(),
             });
         }
         let positive_finite = [
@@ -717,6 +745,16 @@ impl ConfigValidator {
                         .to_string(),
                 });
             }
+            if pd_mode
+                && (program.dynamic_token_capacity
+                    || program.resume_order
+                        == crate::program_scheduling::ProgramResumeOrder::DpAdmissionTAO)
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "TAO admission and dynamic capacity are supported only in regular mode"
+                        .into(),
+                });
+            }
             if pd_mode {
                 program
                     .pd
@@ -988,6 +1026,141 @@ fn strictly_increasing_usize(values: &[usize]) -> bool {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn solver_configuration_defaults_and_validation() {
+        let mut cfg: ProgramSchedulingConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.dp_capacity_quantum, 512);
+        assert_eq!(cfg.dp_state_budget, Some(50_000));
+        assert_eq!(
+            cfg.dp_state_budget,
+            ProgramSchedulingConfig::default().dp_state_budget
+        );
+        let unlimited: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"dp_state_budget":null}"#).unwrap();
+        assert_eq!(unlimited.dp_state_budget, None);
+        assert_eq!(
+            cfg.resume_solver_strategy,
+            crate::config::ResumeSolverStrategy::Dp
+        );
+        cfg.dp_capacity_quantum = 0;
+        assert!(ConfigValidator::validate_program_scheduling(&cfg).is_err());
+        cfg.dp_capacity_quantum = 512;
+        cfg.dp_state_budget = Some(0);
+        assert!(ConfigValidator::validate_program_scheduling(&cfg).is_err());
+        cfg.dp_state_budget = Some(1);
+        assert!(ConfigValidator::validate_program_scheduling(&cfg).is_ok());
+        let decoded: ProgramSchedulingConfig = serde_json::from_str(
+            r#"{"dp_capacity_quantum":512,"dp_state_budget":42,"resume_solver_strategy":"greedy"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.resume_solver_strategy,
+            crate::config::ResumeSolverStrategy::Greedy
+        );
+        assert_eq!(decoded.dp_state_budget, Some(42));
+        assert_eq!(
+            serde_json::from_value::<ProgramSchedulingConfig>(
+                serde_json::to_value(&decoded).unwrap()
+            )
+            .unwrap(),
+            decoded
+        );
+        assert!(serde_json::from_str::<ProgramSchedulingConfig>(
+            r#"{"resume_solver_strategy":"typo"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn tao_requires_global_dynamic_cache_aware_admission() {
+        let valid: ProgramSchedulingConfig = serde_json::from_str(include_str!(
+            "../../examples/configs/program_dynamic_dp_admission.json"
+        ))
+        .unwrap();
+        ConfigValidator::validate_program_scheduling(&valid).unwrap();
+        for invalid in [
+            ProgramSchedulingConfig {
+                global_queue: false,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                dynamic_token_capacity: false,
+                token_capacity_per_dp_rank: Some(1200),
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                token_capacity_per_dp_rank: Some(1200),
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                binding_only: true,
+                ..valid.clone()
+            },
+            ProgramSchedulingConfig {
+                binding_strategy: ProgramBindingStrategy::ConsistentHash,
+                ..valid
+            },
+        ] {
+            assert!(ConfigValidator::validate_program_scheduling(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn reasoning_token_balance_requires_static_capacity_even_in_dynamic_mode() {
+        for dynamic in [false, true] {
+            let mut config = RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec!["http://worker:8000".to_string()],
+                },
+                PolicyConfig::Random,
+            );
+            config.program_scheduling = Some(ProgramSchedulingConfig {
+                binding_strategy: ProgramBindingStrategy::ReasoningTokenBalance,
+                dynamic_token_capacity: dynamic,
+                token_capacity_per_dp_rank: None,
+                ..ProgramSchedulingConfig::default()
+            });
+            let error = ConfigValidator::validate(&config).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("reasoning_token_balance requires token_capacity_per_dp_rank"),
+                "{error}"
+            );
+
+            let program = config.program_scheduling.as_mut().unwrap();
+            program.dynamic_token_capacity = false;
+            program.token_capacity_per_dp_rank = Some(100_000);
+            ConfigValidator::validate(&config).unwrap();
+
+            let program = config.program_scheduling.as_mut().unwrap();
+            program.binding_strategy = ProgramBindingStrategy::CacheAware;
+            program.resume_order = ProgramResumeOrder::DpAdmissionTAO;
+            program.global_queue = true;
+            program.dynamic_token_capacity = true;
+            program.token_capacity_per_dp_rank = None;
+            ConfigValidator::validate(&config).unwrap();
+        }
+    }
+
+    #[test]
+    fn tao_resume_order_uses_only_its_canonical_wire_name() {
+        let config: ProgramSchedulingConfig =
+            serde_json::from_value(serde_json::json!({"resume_order": "dp_admission_tao"}))
+                .unwrap();
+        assert_eq!(config.resume_order, ProgramResumeOrder::DpAdmissionTAO);
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["resume_order"],
+            "dp_admission_tao"
+        );
+        for name in ["dp_admission", "dp"] {
+            assert!(serde_json::from_value::<ProgramSchedulingConfig>(
+                serde_json::json!({"resume_order": name}),
+            )
+            .is_err());
+        }
+    }
 
     #[test]
     fn session_affinity_ttl_is_optional_and_bounded() {
@@ -1587,6 +1760,29 @@ mod tests {
 
         let static_only = RouterConfig::new(pd_mode(None), PolicyConfig::Random);
         assert!(ConfigValidator::validate(&static_only).is_ok());
+    }
+
+    #[test]
+    fn tao_admission_and_dynamic_capacity_do_not_change_pd_scheduling() {
+        use crate::program_scheduling::ProgramResumeOrder;
+        for order in [ProgramResumeOrder::DpAdmissionTAO, ProgramResumeOrder::Mru] {
+            let mut config = pd_config_with_static_kv_sources();
+            config.program_scheduling = Some(ProgramSchedulingConfig {
+                token_capacity_per_dp_rank: None,
+                global_queue: true,
+                dynamic_token_capacity: true,
+                enable_batch_gain_admission: false,
+                ..ProgramSchedulingConfig::default()
+            });
+            let program = config.program_scheduling.as_mut().unwrap();
+            program.binding_strategy = ProgramBindingStrategy::CacheAware;
+            program.resume_order = order;
+            let error = ConfigValidator::validate(&config).unwrap_err();
+            assert!(
+                error.to_string().contains("only in regular mode"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
