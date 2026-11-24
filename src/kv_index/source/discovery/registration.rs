@@ -8,8 +8,8 @@ use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use super::lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
-use super::metrics_meta::runtime_hash_mismatch;
 use super::probe::{layout_model, server_instance_id, worker_descriptor};
+use super::reconcile::runtime_hash_mismatch;
 use super::{
     discovered_block_size, event_source_label, event_sources_for_worker, metadata_source_label,
     CacheKey, KvIndexSupervisor, LiveSource, ServerInfo, SourcesProbe, WorkerDiscovery,
@@ -165,24 +165,6 @@ impl KvIndexSupervisor {
         };
         let source_id: SourceId = Arc::from(instance_id.as_str());
         let mut event_sources = event_sources_for_worker(worker_url, &source_id, &sources, true)?;
-        let reported_ranks = event_sources.len();
-        event_sources.retain(|source| {
-            !runtime_hash_mismatch(
-                discovery.engine_cache_configs.as_ref(),
-                &capability,
-                worker_url,
-                source.dp_rank,
-            )
-        });
-        if reported_ranks != 0 && event_sources.is_empty() {
-            return Ok(WorkerKvInfo {
-                instance_id,
-                block_size: Some(block_size),
-                ranks: vec![],
-                cache_key: None,
-            });
-        }
-
         // Admit each rank on its own verified contract.
         let engine_model = layout_model(&server_info, &model_id, &capability);
         // With unknown connector metadata, price the shorter Prefill lookup.
@@ -194,7 +176,18 @@ impl KvIndexSupervisor {
         }
         .unwrap_or(true);
         let mut bindings = HashMap::new();
+        let reported_ranks = event_sources.len();
+        let mut rejected_hash = 0;
         event_sources.retain(|source| {
+            if runtime_hash_mismatch(
+                discovery.engine_cache_configs.as_ref(),
+                &capability,
+                worker_url,
+                source.dp_rank,
+            ) {
+                rejected_hash += 1;
+                return false;
+            }
             match capability
                 .bind_worker_source(source, engine_model, 1_000_000)
                 .and_then(|binding| binding.with_tail_proof_limit(server_info.vllm_version))
@@ -223,6 +216,13 @@ impl KvIndexSupervisor {
             }
         });
         if bindings.is_empty() {
+            if rejected_hash != 0 && rejected_hash == reported_ranks {
+                return Ok(WorkerKvInfo {
+                    instance_id,
+                    block_size: Some(block_size),
+                    ..Default::default()
+                });
+            }
             return Err("no KV event rank has a verified layout".into());
         }
 

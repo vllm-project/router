@@ -8,11 +8,10 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tracing::info;
 
-use super::metrics_meta::runtime_hash_mismatch;
 use super::probe::{probe_engine_cache_configs, WorkerDescriptor};
 use super::reconcile::{
-    native_sources_match, probe_keeps_trust, probe_renews_trust, static_hybrid_sources_match,
-    BoundSource, BoundSources, StaticHybridMatch,
+    has_new_publisher, observed_sources_match, probe_bound_sources, probe_keeps_trust,
+    probe_renews_trust, runtime_hash_mismatch, BoundSource, BoundSources, StaticHybridMatch,
 };
 use super::{CacheKey, InstalledWorkers, KvIndexSupervisor, WorkerKvInfo, WorkerSubs};
 use crate::kv_index::subscriber::EventSource;
@@ -157,6 +156,10 @@ impl WorkerLifecycle {
         let state = self.state.lock();
         !state.trusted
             && state
+                .info
+                .as_ref()
+                .is_none_or(|info| info.cache_key.is_none() || !info.ranks.is_empty())
+            && state
                 .checked
                 .is_none_or(|checked| checked.elapsed() >= CONTROL_TIMEOUT)
     }
@@ -167,9 +170,12 @@ impl WorkerLifecycle {
         state.checked = Some(Instant::now());
         match descriptor {
             Some(descriptor)
-                if state.info.is_some()
-                    && state.descriptor.as_ref() == Some(descriptor)
-                    && (!self.layout || self.trusted(&state)) =>
+                if state.descriptor.as_ref() == Some(descriptor)
+                    && state.info.as_ref().is_some_and(|info| {
+                        (info.cache_key.is_some() && info.ranks.is_empty())
+                            || !self.layout
+                            || self.trusted(&state)
+                    }) =>
             {
                 state.probe_failures = 0;
                 SourceAction::Keep
@@ -314,7 +320,7 @@ impl KvIndexSupervisor {
         assumed_plain_full: bool,
     ) {
         // Revalidate only publishers with an installed subscriber.
-        let mut bound: BoundSources = targets
+        let bound: BoundSources = targets
             .iter()
             .map(|(source, _, _)| {
                 (
@@ -358,32 +364,16 @@ impl KvIndexSupervisor {
                 if !provider.lifecycle.active.load(Ordering::Acquire) {
                     break;
                 }
-                if provider.lifecycle.expire_if_needed() {
+                if !targets.is_empty() && provider.lifecycle.expire_if_needed() {
                     invalidate(&targets);
                 }
-                let probe_sources = async {
-                    if let Some(config) = &static_config {
-                        static_hybrid_sources_match(
-                            &client,
-                            &worker,
-                            api_key.as_deref(),
-                            config,
-                            Some(&bound),
-                        )
-                        .await
-                    } else {
-                        native_sources_match(
-                            &client,
-                            &worker,
-                            api_key.as_deref(),
-                            (!assumed_plain_full).then_some(&capability),
-                            &bound,
-                        )
-                        .await
-                    }
-                };
-                let (outcome, configs) = tokio::join!(
-                    probe_sources,
+                let (observed, configs) = tokio::join!(
+                    probe_bound_sources(
+                        &client,
+                        &worker,
+                        api_key.as_deref(),
+                        static_config.is_some()
+                    ),
                     probe_engine_cache_configs(
                         &client,
                         super::split_worker_rank(&worker).0,
@@ -397,7 +387,7 @@ impl KvIndexSupervisor {
                     break;
                 }
                 // A probe may cross the deadline while it is in flight.
-                if provider.lifecycle.expire_if_needed() {
+                if !targets.is_empty() && provider.lifecycle.expire_if_needed() {
                     invalidate(&targets);
                 }
                 // A rejected rank stays fenced for this registration.
@@ -406,13 +396,31 @@ impl KvIndexSupervisor {
                     if !runtime_hash_mismatch(configs.as_ref(), &capability, &worker, rank) {
                         return true;
                     }
+                    let mut state = provider.lifecycle.state.lock();
+                    if let Some(info) = &mut state.info {
+                        info.ranks.retain(|&active_rank| active_rank != rank);
+                    }
                     handle.shutdown();
-                    bound.remove(&rank);
                     false
                 });
-                if targets.is_empty() {
-                    break;
-                }
+                let outcome = if targets.is_empty() {
+                    // Keep watching the old publisher identities to distinguish a
+                    // new registration from a corrected label on the same stream.
+                    if !observed.as_ref().is_ok_and(|(sources, _)| {
+                        has_new_publisher(&worker, &bound, sources, &capability, configs.as_ref())
+                    }) {
+                        continue;
+                    }
+                    StaticHybridMatch::Differs
+                } else {
+                    observed_sources_match(
+                        &worker,
+                        &bound,
+                        targets.iter().map(|(source, _, _)| source.dp_rank),
+                        (static_config.is_none() && !assumed_plain_full).then_some(&capability),
+                        observed,
+                    )
+                };
                 match provider.lifecycle.observe_layout(&outcome) {
                     SourceAction::Stop => {}
                     SourceAction::Recover => {

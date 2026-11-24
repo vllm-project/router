@@ -465,13 +465,32 @@ pub(super) async fn query_worker_metadata_and_models(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
+    check_runtime_hash: bool,
 ) -> Result<WorkerMetadata, String> {
-    let control_error = match query_worker_control_metadata(client, worker_url, api_key).await {
-        Ok(info) => return Ok((info, None, None)),
+    let (control, metrics) = tokio::join!(
+        query_worker_control_metadata(client, worker_url, api_key),
+        async {
+            if check_runtime_hash {
+                tokio::time::timeout(
+                    CONTROL_TIMEOUT / 4,
+                    query_engine_cache_configs(client, worker_url, api_key),
+                )
+                .await
+                .ok()
+            } else {
+                None
+            }
+        },
+    );
+    let control_error = match control {
+        Ok(info) => return Ok((info, None, metrics.and_then(Result::ok))),
         Err(error) => error,
     };
-
-    query_metrics_metadata(client, worker_url, api_key)
+    let engines = match metrics {
+        Some(scrape) => scrape,
+        None => query_engine_cache_configs(client, worker_url, api_key).await,
+    };
+    query_metrics_metadata(client, worker_url, api_key, engines)
         .await
         .and_then(|(info, models, configs)| {
             validate_worker_metadata(worker_url, "metrics", Ok(info))
@@ -570,8 +589,9 @@ async fn query_metrics_metadata(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
+    engines: Result<EngineCacheConfigs, String>,
 ) -> Result<WorkerMetadata, String> {
-    let engines = query_engine_cache_configs(client, worker_url, api_key).await?;
+    let engines = engines?;
     let hash_unit = metrics_meta::shared_hash_unit(&engines).map_err(|units| {
         format!("metrics: engines disagree on block size {units:?} — refusing to index")
     })?;

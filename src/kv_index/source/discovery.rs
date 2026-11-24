@@ -487,15 +487,22 @@ impl KvIndexSupervisor {
                 if discovery.sources.is_err() {
                     return discovery;
                 }
-                if let Err((probe, reason)) =
-                    self.verify_static_source(worker_url, &discovery).await
-                {
+                let (verification, configs) = tokio::join!(
+                    self.verify_static_source(worker_url, &discovery),
+                    probe::probe_engine_cache_configs(
+                        &self.client,
+                        split_worker_rank(worker_url).0,
+                        self.api_key.as_deref(),
+                    ),
+                );
+                if let Err((probe, reason)) = verification {
                     discovery.sources = Err(SourcesUnavailable {
                         probe,
                         detail: reason.into(),
                     });
                     return discovery;
                 }
+                discovery.engine_cache_configs = configs;
                 info!(worker_url, "using configured static KV event sources");
                 discovery
             }
@@ -544,11 +551,6 @@ impl KvIndexSupervisor {
                 .is_some_and(|groups| !groups.is_empty())
         });
         let (base, _) = split_worker_rank(worker_url);
-        if discovery.engine_cache_configs.is_none() && !crate::backend::is_grpc_url(base) {
-            discovery.engine_cache_configs =
-                probe::probe_engine_cache_configs(&self.client, base, self.api_key.as_deref())
-                    .await;
-        }
         if bounded_nixl || has_tail_drop {
             if let Some(info) = discovery
                 .server_info
@@ -605,8 +607,15 @@ impl KvIndexSupervisor {
         let (base, _) = split_worker_rank(worker_url);
         let api_key = self.api_key.as_deref();
         let grpc = crate::backend::is_grpc_url(base);
-        let (sources, (model, base_models)) =
-            tokio::join!(fetch_kv_event_sources(&self.client, base, api_key), async {
+        let requires_hash_size = discovery.hybrid.as_ref().is_some_and(|layout| {
+            layout
+                .ranks
+                .iter()
+                .any(|rank| rank.hash_block_size.is_none())
+        });
+        let (sources, (model, base_models), configs) = tokio::join!(
+            fetch_kv_event_sources(&self.client, base, api_key),
+            async {
                 if let Some(model) = discovery
                     .model_id
                     .as_ref()
@@ -632,7 +641,21 @@ impl KvIndexSupervisor {
                         Some(base_model_names(&models)),
                     )
                 }
-            },);
+            },
+            async {
+                if requires_hash_size {
+                    tokio::time::timeout(
+                        CONTROL_TIMEOUT,
+                        probe::query_engine_cache_configs(&self.client, base, api_key),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err("metrics probe timed out".into()))
+                    .map(Some)
+                } else {
+                    Ok(probe::probe_engine_cache_configs(&self.client, base, api_key).await)
+                }
+            }
+        );
         discovery.base_models = base_models;
         let Ok(sources) = sources else {
             discovery.sources = sources;
@@ -661,22 +684,16 @@ impl KvIndexSupervisor {
             info.model_id = Some(model.clone());
         }
         discovery.model_id = Ok(Some(model.clone()));
+        discovery.engine_cache_configs = match configs {
+            Ok(configs) => configs,
+            Err(reason) => return failed_hybrid_discovery(SourcesProbe::Failed, reason),
+        };
         if let Some(layout) = &mut discovery.hybrid {
-            if layout
-                .ranks
-                .iter()
-                .any(|rank| rank.hash_block_size.is_none())
-            {
-                let engines = match tokio::time::timeout(
-                    CONTROL_TIMEOUT,
-                    probe::query_engine_cache_configs(&self.client, base, api_key),
-                )
-                .await
-                .unwrap_or_else(|_| Err("metrics probe timed out".into()))
-                {
-                    Ok(engines) => engines,
-                    Err(reason) => return failed_hybrid_discovery(SourcesProbe::Failed, reason),
-                };
+            if requires_hash_size {
+                let engines = discovery
+                    .engine_cache_configs
+                    .as_ref()
+                    .expect("required metrics were collected");
                 for rank in &mut layout.ranks {
                     if !sources
                         .get(&rank.rank.to_string())
@@ -707,7 +724,6 @@ impl KvIndexSupervisor {
                 if let Ok(info) = &mut discovery.server_info {
                     info.kv_block_size = layout.ranks.iter().find_map(|rank| rank.hash_block_size);
                 }
-                discovery.engine_cache_configs = Some(engines);
             }
             for rank in &mut layout.ranks {
                 if rank.model.trim().is_empty() {
@@ -1021,7 +1037,7 @@ async fn discover_full_attention_http_worker(
     api_key: Option<&str>,
 ) -> WorkerDiscovery {
     let (server, (sources, layout)) = tokio::join!(
-        query_worker_metadata_and_models(client, worker_url, api_key),
+        query_worker_metadata_and_models(client, worker_url, api_key, true),
         fetch_native_sources(client, worker_url, api_key, CONTROL_TIMEOUT),
     );
     let (server_info, base_models, engine_cache_configs) = match server {

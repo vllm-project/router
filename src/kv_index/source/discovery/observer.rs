@@ -27,7 +27,7 @@ impl KvIndexSupervisor {
         let api_key = self.api_key.as_deref();
         let (sources, info) = tokio::join!(
             fetch_kv_event_sources(&self.client, worker_url, api_key),
-            query_worker_metadata_and_models(&self.client, worker_url, api_key),
+            query_worker_metadata_and_models(&self.client, worker_url, api_key, false),
         );
         let sources = match sources {
             Ok(sources) => sources,

@@ -1879,7 +1879,7 @@ async fn metrics_only_worker_supplies_cache_metadata() {
         spawn_metrics_only_worker(metrics_and_models_router(move || metrics.to_owned())).await;
 
     let (info, models, _) =
-        query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None)
+        query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None, true)
             .await
             .unwrap();
     assert_eq!(info.kv_block_size, Some(16));
@@ -1962,14 +1962,26 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
     }
 }
 
+fn hash_metadata_router(
+    metrics: Arc<Mutex<String>>,
+    sources: Arc<Mutex<serde_json::Value>>,
+) -> axum::Router {
+    metrics_and_models_router(move || metrics.lock().clone()).route(
+        "/kv_event_sources",
+        axum::routing::get(move || {
+            let data = sources.lock().clone();
+            async move { axum::Json(data) }
+        }),
+    )
+}
+
 #[tokio::test]
 async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
     use crate::kv_index::request_hash::BlockKeyGenerator;
     use crate::kv_index::wire::ExternalBlockHash;
-    use axum::{routing::get, Json};
 
     let endpoints: Vec<_> = (0..3).map(|_| layout_endpoints()).collect();
-    let sources = serde_json::Value::Object(
+    let sources = Arc::new(Mutex::new(serde_json::Value::Object(
         endpoints
             .iter()
             .enumerate()
@@ -1985,7 +1997,7 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
                 )
             })
             .collect(),
-    );
+    )));
     let metrics = |first, second| {
         format!(
             "vllm:cache_config_info{{block_size=\"16\",engine=\"0\",prefix_caching_hash_algo=\"{first}\"}} 1.0\n\
@@ -1994,17 +2006,7 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
         )
     };
     let reported = Arc::new(Mutex::new(metrics("sha256_cbor", "xxhash")));
-    let router = metrics_and_models_router({
-        let reported = reported.clone();
-        move || reported.lock().clone()
-    })
-    .route(
-        "/kv_event_sources",
-        get(move || {
-            let sources = sources.clone();
-            async move { Json(sources) }
-        }),
-    );
+    let router = hash_metadata_router(reported.clone(), sources.clone());
     let (worker, server) = spawn_metrics_only_worker(router).await;
     let (supervisor, _signals) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
     let info = supervisor.on_worker_added(&worker).await.unwrap();
@@ -2017,29 +2019,39 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
     let prompt = [7; 17];
     let generator = BlockKeyGenerator::from_seed(16, "vllm-none-hash");
     let hits = |rank| !provider.matches(&prompt, 16, None, rank).is_empty();
+    let mut store = full_store(&prompt[..16], 16, None);
+    store.block_hashes = generator
+        .generate_block_keys(&prompt[..16])
+        .into_iter()
+        .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
+        .collect();
+    let event = KVEvent::BlockStored(store);
     for rank in [0, 2] {
         let (_, _, publisher, replay) = &endpoints[rank];
-        let mut store = full_store(&prompt[..16], 16, None);
-        store.block_hashes = generator
-            .generate_block_keys(&prompt[..16])
-            .into_iter()
-            .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
-            .collect();
         boundary_subscription(publisher, "kv/hash-probe", true).await;
         finish_empty_startup_replay(replay).await;
-        let payload = event_payload(1.0, &[KVEvent::BlockStored(store)], Some(rank as u32));
+        let payload = event_payload(1.0, std::slice::from_ref(&event), Some(rank as u32));
         live_frame(publisher, b"kv/hash-probe", 0, &payload);
         wait_for(|| hits(rank as u32)).await;
     }
-    assert!(!hits(1));
+    let has_binding =
+        |rank| supervisor.workers_have_cache_bindings([(worker.as_str(), rank)].into_iter());
+    assert!(has_binding(0) && has_binding(2));
+    assert!(!has_binding(1));
 
     *reported.lock() = metrics("xxhash", "sha256_cbor");
-    wait_for(|| !hits(0)).await;
+    sources.lock()["0"]["topic"] = serde_json::json!("kv/changed");
+    wait_for(|| !has_binding(0)).await;
+    assert!(!hits(0));
+    assert!(has_binding(2));
     assert!(
         hits(2),
         "healthy rank lost credit during hash reconciliation"
     );
-    assert!(!hits(1), "a rank rejected at discovery gained credit");
+    assert!(
+        !has_binding(1),
+        "a rank rejected at discovery gained a binding"
+    );
     assert_eq!(
         supervisor.worker_registrations()[&worker].revision,
         revision
@@ -2049,10 +2061,96 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
 }
 
 #[tokio::test]
+async fn last_hash_fenced_rank_rebinds_only_to_a_new_publisher() {
+    let (endpoint, replay_endpoint, publisher, _replay) = layout_endpoints();
+    let sources = Arc::new(Mutex::new(serde_json::json!({"0": {
+        "endpoint": endpoint, "replay_endpoint": replay_endpoint,
+        "topic": "kv/old", "publisher": "zmq"
+    }})));
+    let metrics = Arc::new(Mutex::new(METRICS_ONLY.to_owned()));
+    let router = hash_metadata_router(metrics.clone(), sources.clone());
+    let (worker, server) = spawn_metrics_only_worker(router).await;
+    let (supervisor, _signals) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
+    assert_eq!(
+        supervisor.on_worker_added(&worker).await.unwrap().ranks,
+        [0]
+    );
+    let old = supervisor.installed.workers.lock()[&worker]
+        .provider
+        .clone();
+    boundary_subscription(&publisher, "kv/old", true).await;
+    *metrics.lock() = METRICS_ONLY.replace("sha256_cbor", "sha256");
+    let has_binding = || supervisor.workers_have_cache_bindings([(worker.as_str(), 0)].into_iter());
+    wait_for(|| !has_binding()).await;
+    *metrics.lock() = METRICS_ONLY.to_owned();
+    assert!(supervisor.refresh_discovered_workers().await.is_empty());
+    assert!(!has_binding());
+    let (endpoint, replay_endpoint, replacement_publisher, _replacement_replay) =
+        layout_endpoints();
+    sources.lock()["0"] = serde_json::json!({
+        "endpoint": endpoint, "replay_endpoint": replay_endpoint,
+        "topic": "kv/new", "publisher": "zmq"
+    });
+    wait_for(|| !old.lifecycle.active.load(Ordering::Acquire)).await;
+
+    let refreshed = supervisor.refresh_discovered_workers().await;
+    assert!(refreshed[&worker].provider.is_some());
+    assert!(has_binding());
+    boundary_subscription(&replacement_publisher, "kv/new", true).await;
+    supervisor.shutdown();
+    server.abort();
+}
+
+#[tokio::test]
+async fn slow_optional_metrics_does_not_exhaust_pd_registration_budget() {
+    use axum::{routing::get, Json};
+    let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
+    let sources = serde_json::json!({"0": {
+        "endpoint": endpoint, "replay_endpoint": replay_endpoint,
+        "topic": "kv/slow-metrics", "publisher": "zmq"
+    }});
+    let router = axum::Router::new()
+        .route(
+            "/metrics",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                METRICS_ONLY
+            }),
+        )
+        .route(
+            "/get_server_info",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(2500)).await;
+                Json(serde_json::json!({"model_id": "mock-model", "kv_block_size": 16}))
+            }),
+        )
+        .route(
+            "/kv_event_sources",
+            get(move || {
+                let sources = sources.clone();
+                async move { Json(sources) }
+            }),
+        );
+    let (worker, server) = spawn_metrics_only_worker(router).await;
+    let (supervisor, _signals) = KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMap::new());
+    let registered = supervisor
+        .refresh_workers(
+            &HashSet::from([worker.clone()]),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .await;
+    assert!(registered[&worker].provider.is_some());
+    assert!(supervisor.workers_have_cache_bindings([(worker.as_str(), 0)].into_iter()));
+    supervisor.shutdown();
+    server.abort();
+}
+
+#[tokio::test]
 async fn worker_without_metadata_names_every_source() {
     let (worker, server) = spawn_metrics_only_worker(axum::Router::new()).await;
 
-    let error = query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None)
+    let error = query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None, true)
         .await
         .unwrap_err();
     assert!(error.contains("get_server_info"), "{error}");
