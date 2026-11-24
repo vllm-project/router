@@ -103,7 +103,7 @@ async-channel = "2"
 tonic = { version = "0.14", features = ["transport"] }
 tonic-health = "0.14"
 tonic-prost = "0.14"
-vllm-proto = "0.2"
+vllm-proto = { git = "https://github.com/KaisennHu/vllm-proto", rev = "16c9a069ea7fff1909e9782a6dfb34fde8b0f5e1" }
 prost = "0.14"
 # `kv_transfer_params` is a protobuf `Struct`.
 prost-types = "0.14"
