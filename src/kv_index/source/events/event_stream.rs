@@ -21,6 +21,13 @@ use crate::metrics::RouterMetrics;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamLease(pub(crate) u64);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchMode {
+    Continuous,
+    FreshLive,
+    ReplayClear,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamError {
     StaleLease,
@@ -121,7 +128,17 @@ impl EventStream {
         seq: u64,
         payload: &[u8],
     ) -> Result<bool, StreamError> {
-        self.apply_payload_at(lease, seq, payload, false)
+        self.apply_payload_at(lease, seq, payload, BatchMode::Continuous)
+    }
+
+    /// Rebase a hidden replay on a validated clear from the same source and lease.
+    pub(super) fn rebase_replay(
+        &self,
+        lease: StreamLease,
+        seq: u64,
+        payload: &[u8],
+    ) -> Result<bool, StreamError> {
+        self.apply_payload_at(lease, seq, payload, BatchMode::ReplayClear)
     }
 
     /// Start from a fresh SUB connection after the replay budget is exhausted.
@@ -132,7 +149,7 @@ impl EventStream {
         seq: u64,
         payload: &[u8],
     ) -> Result<bool, StreamError> {
-        self.apply_payload_at(lease, seq, payload, true)
+        self.apply_payload_at(lease, seq, payload, BatchMode::FreshLive)
     }
 
     fn apply_payload_at(
@@ -140,7 +157,7 @@ impl EventStream {
         lease: StreamLease,
         seq: u64,
         payload: &[u8],
-        fresh: bool,
+        mode: BatchMode,
     ) -> Result<bool, StreamError> {
         let batch = crate::kv_index::decode_batch(payload);
         let prepared = batch
@@ -160,11 +177,14 @@ impl EventStream {
                     .iter()
                     .any(|event| matches!(event, KVEvent::AllBlocksCleared(_)))
             });
-            if fresh {
+            if mode != BatchMode::Continuous {
                 if batch.is_err() {
                     return Err(StreamError::Index(SourceError::InvalidBatch));
                 }
-                if self.strict_recovery && !cleared {
+                if (mode == BatchMode::ReplayClear
+                    && (state.phase != Phase::Replaying || !cleared))
+                    || (mode == BatchMode::FreshLive && self.strict_recovery && !cleared)
+                {
                     return Err(StreamError::InvalidState);
                 }
                 self.index.reset_stream(state, tx, Some(seq), false);
@@ -212,7 +232,7 @@ impl EventStream {
                 state.phase = Phase::Replaying;
                 return Err(StreamError::Index(error));
             }
-            if fresh {
+            if mode == BatchMode::FreshLive {
                 self.index
                     .publish_stream(state, tx, seq + 1)
                     .map_err(StreamError::Index)?;
@@ -228,7 +248,7 @@ impl EventStream {
             if state.visible() {
                 if cleared {
                     self.record_recovery(Reason::ClearBarrier);
-                } else if fresh {
+                } else if mode == BatchMode::FreshLive {
                     self.record_recovery(Reason::FreshObservation);
                 } else if seq == 0 {
                     self.record_recovery(Reason::InitialSequence);
@@ -461,6 +481,18 @@ mod tests {
                     b"epoch",
                     &1_i64.to_be_bytes(),
                     &payload,
+                ],
+                0,
+            )
+            .unwrap();
+        replay
+            .send_multipart(
+                [
+                    request[0].as_slice(),
+                    &[],
+                    &[],
+                    &(-1_i64).to_be_bytes(),
+                    &[],
                 ],
                 0,
             )
@@ -893,30 +925,8 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(request[2], 0_u64.to_be_bytes());
+        assert_eq!(request[2], 7_u64.to_be_bytes());
         assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 0);
-        for (seq, event) in [
-            (0_i64, payload.as_slice()),
-            (1, clear.as_slice()),
-            (2, payload.as_slice()),
-            (3, clear.as_slice()),
-            (4, payload.as_slice()),
-            (5, missed_remove.as_slice()),
-            (6, payload.as_slice()),
-        ] {
-            replay
-                .send_multipart(
-                    [
-                        request[0].as_slice(),
-                        &[],
-                        b"epoch-quiet",
-                        &seq.to_be_bytes(),
-                        event,
-                    ],
-                    0,
-                )
-                .unwrap();
-        }
         replay
             .send_multipart(
                 [

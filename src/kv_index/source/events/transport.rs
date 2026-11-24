@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
 pub(super) const IDLE_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
@@ -127,6 +128,7 @@ mod tests {
         }
         let mut receiver = ReadableSocket::new(receiver);
         let mut pending = PendingLive::default();
+        let overlap = ReplayOverlap::default();
         let replay = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
             Some(0)
@@ -138,6 +140,7 @@ mod tests {
             &mut receiver,
             &mut pending,
             b"topic",
+            &overlap,
         )
         .await
         .unwrap();
@@ -444,23 +447,43 @@ impl PendingLive {
         self.bytes = 0;
         through
     }
+
+    /// Check buffered duplicates before the replayed index is made visible.
+    pub(super) fn verifies_overlap(
+        &self,
+        topic: &[u8],
+        through: i64,
+        replayed: &ReplayOverlap,
+    ) -> bool {
+        self.frames
+            .iter()
+            .all(|frames| match live_sequence(frames, topic) {
+                Ok(Some(seq)) if !(0..i64::MAX).contains(&seq) => false,
+                Ok(Some(seq)) if (0..=through).contains(&seq) => {
+                    replayed.matches(seq as u64, &frames[2])
+                }
+                Ok(_) => true,
+                Err(()) => false,
+            })
+    }
 }
 
-pub(super) enum ReplayPoll {
-    Finished(Option<i64>),
+pub(super) enum ReplayPoll<T> {
+    Finished(T),
     Disconnected,
     BufferFull,
 }
 
 /// Watch the connection and drain the live socket while replay is in progress.
-pub(super) async fn while_connected(
+pub(super) async fn while_connected<T>(
     connection: &mut ConnectionMonitor,
-    replay: impl std::future::Future<Output = Option<i64>>,
+    replay: impl std::future::Future<Output = T>,
     watch: bool,
     sub: &mut ReadableSocket,
     pending: &mut PendingLive,
     topic: &[u8],
-) -> io::Result<ReplayPoll> {
+    overlap: &ReplayOverlap,
+) -> io::Result<ReplayPoll<T>> {
     tokio::pin!(replay);
     loop {
         tokio::select! {
@@ -481,6 +504,11 @@ pub(super) async fn while_connected(
                     };
                     if frames.first().is_some_and(|frame| frame.as_slice() != topic) {
                         continue;
+                    }
+                    if let Ok(Some(seq)) = live_sequence(&frames, topic) {
+                        if (0..i64::MAX).contains(&seq) {
+                            overlap.track_live(seq as u64);
+                        }
                     }
                     pending.bytes += frames.iter().map(Vec::len).sum::<usize>();
                     pending.frames.push_back(frames);
@@ -560,19 +588,63 @@ mod frame_tests {
     }
 }
 
-pub(super) type ReplayOverlap = HashMap<u64, [u8; 32]>;
+/// Recent replay proofs and proofs pinned by the bounded pending live queue.
+/// Both halves of the replay poll may record evidence for the same sequence.
+#[derive(Default)]
+pub(super) struct ReplayOverlap(Mutex<OverlapEvidence>);
 
-pub(super) fn remember_replay(replayed: &mut ReplayOverlap, seq: u64, payload: &[u8]) {
-    // Verify the payload as well as the sequence without buffering entire batches.
-    replayed.insert(seq, Sha256::digest(payload).into());
-    if replayed.len() > 4096 {
-        let floor = seq.saturating_sub(2048);
-        replayed.retain(|known, _| *known >= floor);
+#[derive(Default)]
+struct OverlapEvidence {
+    recent: HashMap<u64, [u8; 32]>,
+    buffered: HashMap<u64, Option<[u8; 32]>>,
+}
+
+impl OverlapEvidence {
+    fn fingerprint(&self, seq: u64) -> Option<[u8; 32]> {
+        self.buffered
+            .get(&seq)
+            .copied()
+            .flatten()
+            .or_else(|| self.recent.get(&seq).copied())
     }
 }
 
-pub(super) fn replay_overlap(replayed: &ReplayOverlap, seq: u64, payload: &[u8]) -> bool {
-    replayed
-        .get(&seq)
-        .is_some_and(|known| *known == <[u8; 32]>::from(Sha256::digest(payload)))
+impl ReplayOverlap {
+    fn track_live(&self, seq: u64) {
+        let mut evidence = self.0.lock();
+        let fingerprint = evidence.recent.get(&seq).copied();
+        evidence.buffered.entry(seq).or_insert(fingerprint);
+    }
+
+    pub(super) fn record(&self, seq: u64, payload: &[u8]) -> Result<(), ()> {
+        let fingerprint = Sha256::digest(payload).into();
+        let mut evidence = self.0.lock();
+        if evidence
+            .fingerprint(seq)
+            .is_some_and(|known| known != fingerprint)
+        {
+            return Err(());
+        }
+        if let Some(buffered) = evidence.buffered.get_mut(&seq) {
+            *buffered = Some(fingerprint);
+        }
+        evidence.recent.insert(seq, fingerprint);
+        // Keep late arrivals within the normal publisher history window.
+        // Long replays still keep proofs for sequences already in the queue.
+        const RECENT_LIMIT: usize = 16_384;
+        if evidence.recent.len() > RECENT_LIMIT {
+            let floor = seq.saturating_sub((RECENT_LIMIT / 2) as u64);
+            evidence.recent.retain(|known, _| *known >= floor);
+        }
+        Ok(())
+    }
+
+    pub(super) fn matches(&self, seq: u64, payload: &[u8]) -> bool {
+        let fingerprint = self.0.lock().fingerprint(seq);
+        fingerprint.is_some_and(|known| known == <[u8; 32]>::from(Sha256::digest(payload)))
+    }
+
+    pub(super) fn clear(&mut self) {
+        *self.0.get_mut() = OverlapEvidence::default();
+    }
 }
