@@ -492,6 +492,7 @@ impl KvIndexSupervisor {
                             &self.client,
                             split_worker_rank(worker_url).0,
                             self.api_key.as_deref(),
+                            CONTROL_TIMEOUT / 4,
                         )
                         .await
                     },);
@@ -659,7 +660,13 @@ impl KvIndexSupervisor {
                     .unwrap_or_else(|_| Err("metrics probe timed out".into()))
                     .map(Some)
                 } else {
-                    Ok(probe::probe_engine_cache_configs(&self.client, base, api_key).await)
+                    Ok(probe::probe_engine_cache_configs(
+                        &self.client,
+                        base,
+                        api_key,
+                        CONTROL_TIMEOUT / 4,
+                    )
+                    .await)
                 }
             }
         );
@@ -697,10 +704,12 @@ impl KvIndexSupervisor {
         };
         if let Some(layout) = &mut discovery.hybrid {
             if requires_hash_size {
-                let engines = discovery
-                    .engine_cache_configs
-                    .as_ref()
-                    .expect("required metrics were collected");
+                let Some(engines) = discovery.engine_cache_configs.as_ref() else {
+                    return failed_hybrid_discovery(
+                        SourcesProbe::Failed,
+                        "worker metrics are required to discover hash_block_size".into(),
+                    );
+                };
                 for rank in &mut layout.ranks {
                     if !sources
                         .get(&rank.rank.to_string())

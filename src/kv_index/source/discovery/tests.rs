@@ -1992,6 +1992,8 @@ fn hash_metadata_router(
 
 #[tokio::test]
 async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
+    use std::sync::atomic::AtomicUsize;
+
     use crate::kv_index::request_hash::BlockKeyGenerator;
     use crate::kv_index::wire::ExternalBlockHash;
 
@@ -2029,10 +2031,15 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
         .map(|(rank, topic)| plain_full_rank(rank as u32, "mock-model".into(), (*topic).into(), 16))
         .collect();
     let native = Arc::new(Mutex::new(automatic_layout(native)));
+    let scrapes = Arc::new(AtomicUsize::new(0));
     let router = hash_metadata_router(
         {
             let reported = reported.clone();
-            move || reported.lock().clone()
+            let scrapes = scrapes.clone();
+            move || {
+                scrapes.fetch_add(1, Ordering::Relaxed);
+                reported.lock().clone()
+            }
         },
         sources.clone(),
     )
@@ -2084,8 +2091,10 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
 
     // The rank rejected at admission is outside native layout validation.
     let verified_at = lifecycle.state.lock().verified_at;
+    let scrapes_before_layout_poll = scrapes.load(Ordering::Relaxed);
     native.lock()["ranks"][1]["publisher_topic"] = serde_json::json!("kv/changed/1");
     wait_for(|| lifecycle.state.lock().verified_at > verified_at).await;
+    assert_eq!(scrapes.load(Ordering::Relaxed), scrapes_before_layout_poll);
     lifecycle.state.lock().checked = None;
     assert_eq!(refresh().await[&worker].revision, revision);
     assert!(hits(2));
@@ -2120,7 +2129,7 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
 
 #[tokio::test]
 async fn last_hash_fenced_rank_rebinds_only_to_a_new_publisher() {
-    use std::sync::atomic::AtomicUsize;
+    use super::lifecycle::REFRESH_INTERVAL;
 
     for initially_fenced in [false, true] {
         let (endpoint, replay_endpoint, publisher, _replay) = layout_endpoints();
@@ -2134,16 +2143,10 @@ async fn last_hash_fenced_rank_rebinds_only_to_a_new_publisher() {
         } else {
             METRICS_ONLY.to_owned()
         }));
-        let polls = Arc::new(AtomicUsize::new(0));
         let router = hash_metadata_router(
             {
                 let metrics = metrics.clone();
-                let polls = polls.clone();
-                move || {
-                    let snapshot = metrics.lock().clone();
-                    polls.fetch_add(1, Ordering::Release);
-                    snapshot
-                }
+                move || metrics.lock().clone()
             },
             sources.clone(),
         );
@@ -2154,6 +2157,11 @@ async fn last_hash_fenced_rank_rebinds_only_to_a_new_publisher() {
         let old = supervisor.lifecycle_for_worker(&worker);
         let has_binding =
             || supervisor.workers_have_cache_bindings([(worker.as_str(), 0)].into_iter());
+        let make_hash_probe_due = || {
+            let due = Instant::now() - REFRESH_INTERVAL;
+            old.state.lock().hash_checked = due;
+            due
+        };
         if initially_fenced {
             assert!(info.ranks.is_empty());
             assert!(supervisor.match_provider_for_worker(&worker).is_none());
@@ -2161,13 +2169,13 @@ async fn last_hash_fenced_rank_rebinds_only_to_a_new_publisher() {
             assert_eq!(info.ranks, [0]);
             boundary_subscription(&publisher, "kv/old", true).await;
             *metrics.lock() = incompatible;
+            make_hash_probe_due();
             wait_for(|| !has_binding()).await;
         }
 
         *metrics.lock() = METRICS_ONLY.to_owned();
-        let corrected_at = polls.load(Ordering::Acquire);
-        // Starting the second poll confirms the preceding corrected snapshot was processed.
-        wait_for(|| polls.load(Ordering::Acquire) >= corrected_at + 2).await;
+        let due = make_hash_probe_due();
+        wait_for(|| old.state.lock().hash_checked > due).await;
         {
             let mut state = old.state.lock();
             state.checked = None;

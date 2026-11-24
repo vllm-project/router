@@ -542,13 +542,7 @@ pub(super) async fn query_worker_metadata_and_models(
         query_worker_control_metadata(client, worker_url, api_key),
         async {
             if check_runtime_hash {
-                tokio::time::timeout(
-                    CONTROL_TIMEOUT / 4,
-                    query_engine_cache_configs(client, worker_url, api_key),
-                )
-                .await
-                .ok()
-                .and_then(Result::ok)
+                probe_engine_cache_configs(client, worker_url, api_key, CONTROL_TIMEOUT / 4).await
             } else {
                 None
             }
@@ -704,17 +698,31 @@ pub(super) async fn probe_engine_cache_configs(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
+    budget: Duration,
 ) -> Option<EngineCacheConfigs> {
     if crate::backend::is_grpc_url(worker_url) {
         return None;
     }
-    tokio::time::timeout(
-        CONTROL_TIMEOUT / 4,
+    match tokio::time::timeout(
+        budget,
         query_engine_cache_configs(client, worker_url, api_key),
     )
     .await
-    .ok()
-    .and_then(Result::ok)
+    {
+        Ok(Ok(configs)) => Some(configs),
+        Ok(Err(error)) => {
+            tracing::debug!(worker_url, %error, "optional worker cache metrics probe failed");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(
+                worker_url,
+                ?budget,
+                "optional worker cache metrics probe timed out"
+            );
+            None
+        }
+    }
 }
 
 pub(super) async fn query_model_list(

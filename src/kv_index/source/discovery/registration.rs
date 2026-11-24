@@ -241,7 +241,7 @@ impl KvIndexSupervisor {
                 }
             }
         });
-        let all_fenced = rejected_hash != 0 && rejected_hash == reported_ranks;
+        let all_fenced = reported_ranks != 0 && rejected_hash == reported_ranks;
         if bindings.is_empty() && !all_fenced {
             return Err("no KV event rank has a verified layout".into());
         }

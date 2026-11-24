@@ -348,6 +348,13 @@ pub(super) fn runtime_hash_mismatch(
     let expected = capability
         .rank_capability(rank)
         .map(|contract| contract.hash_algorithm.as_str());
+    if configs.is_some() && reported.is_none() && expected.is_some() {
+        tracing::debug!(
+            worker_url,
+            rank,
+            "worker cache metrics omit the prefix hash algorithm"
+        );
+    }
     if let (Some(reported), Some(expected)) = (reported, expected) {
         if reported != expected {
             tracing::warn!(
@@ -369,11 +376,11 @@ pub(super) fn observed_sources_match<'a>(
     mut active: impl Iterator<Item = &'a EventSource>,
     fences: &BoundSources,
     expected: Option<&CacheCapabilities>,
-    observed: Result<(KvEventSourcesResponse, Option<CacheCapabilities>), SourcesProbe>,
+    observed: &Result<(KvEventSourcesResponse, Option<CacheCapabilities>), SourcesProbe>,
 ) -> StaticHybridMatch {
     let (sources, layout) = match observed {
         Ok(snapshot) => snapshot,
-        Err(probe) => return StaticHybridMatch::Unavailable(probe),
+        Err(probe) => return StaticHybridMatch::Unavailable(*probe),
     };
     let Some(host) = worker_host(split_worker_rank(worker).0) else {
         return StaticHybridMatch::Differs;

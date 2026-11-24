@@ -25,6 +25,7 @@ pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 pub(super) const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 pub(super) const MAX_PROBE_FAILURES: u8 = 3;
 const LAYOUT_FRESHNESS: Duration = Duration::from_secs(5);
+const HASH_PROBE_BUDGET: Duration = Duration::from_secs(2);
 
 /// A read-only registration. Providers and policy bindings share its revision.
 #[derive(Clone)]
@@ -48,6 +49,7 @@ pub(super) struct LifecycleState {
     pub(super) base_models: HashSet<String>,
     pub(super) descriptor: Option<WorkerDescriptor>,
     pub(super) hash_fences: BoundSources,
+    pub(super) hash_checked: Instant,
     pub(super) subscriptions: Vec<Subscription>,
     // None schedules immediate descriptor discovery after a layout change.
     pub(super) checked: Option<Instant>,
@@ -79,6 +81,7 @@ impl WorkerLifecycle {
                 base_models: HashSet::new(),
                 descriptor,
                 hash_fences: BoundSources::new(),
+                hash_checked: Instant::now(),
                 subscriptions: Vec::new(),
                 checked: Some(Instant::now()),
                 probe_failures: 0,
@@ -180,6 +183,9 @@ impl WorkerLifecycle {
     ) -> SourceAction {
         let mut state = self.state.lock();
         state.checked = Some(Instant::now());
+        if configs.is_some() {
+            state.hash_checked = Instant::now();
+        }
         state.fence_incompatible_ranks(worker, configs);
         let keep = descriptor.is_some_and(|descriptor| {
             if self.watching_fenced_publishers(&state) {
@@ -385,12 +391,13 @@ impl KvIndexSupervisor {
                     );
                 }
             };
+            let mut checked_replacement = false;
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let Some(lifecycle) = lifecycle.upgrade() else {
                     break;
                 };
-                {
+                let hash_due = {
                     let mut state = lifecycle.state.lock();
                     if !lifecycle.active.load(Ordering::Acquire) || state.info.is_none() {
                         break;
@@ -398,20 +405,69 @@ impl KvIndexSupervisor {
                     if !state.subscriptions.is_empty() && lifecycle.expire_if_needed(&mut state) {
                         invalidate(&state.subscriptions);
                     }
-                }
-                let (observed, configs) = tokio::join!(
+                    state.hash_checked.elapsed() >= REFRESH_INTERVAL
+                };
+                let probe_hash = || {
+                    probe_engine_cache_configs(
+                        &client,
+                        super::split_worker_rank(&worker).0,
+                        api_key.as_deref(),
+                        HASH_PROBE_BUDGET,
+                    )
+                };
+                let (observed, mut configs) = tokio::join!(
                     probe_bound_sources(
                         &client,
                         &worker,
                         api_key.as_deref(),
                         static_config.is_some()
                     ),
-                    probe_engine_cache_configs(
-                        &client,
-                        super::split_worker_rank(&worker).0,
-                        api_key.as_deref()
-                    ),
+                    async {
+                        if hash_due {
+                            probe_hash().await
+                        } else {
+                            None
+                        }
+                    },
                 );
+                let matches_active = |state: &LifecycleState| {
+                    observed_sources_match(
+                        &worker,
+                        state.subscriptions.iter().map(|(source, _, _)| source),
+                        &state.hash_fences,
+                        (static_config.is_none() && !assumed_plain_full).then_some(&capability),
+                        &observed,
+                    )
+                };
+                let replacement = |state: &LifecycleState, configs: Option<&EngineCacheConfigs>| {
+                    observed.as_ref().is_ok_and(|(sources, layout)| {
+                        has_new_publisher(
+                            &worker,
+                            &state.hash_fences,
+                            sources,
+                            layout.as_ref().unwrap_or(&capability),
+                            configs,
+                        )
+                    })
+                };
+                // Take an extra sample before acting on a publisher change.
+                // A dormant candidate that stays incompatible goes back to the slow cadence.
+                let publisher_changed = {
+                    let state = lifecycle.state.lock();
+                    if !lifecycle.active.load(Ordering::Acquire) || state.info.is_none() {
+                        break;
+                    }
+                    if state.subscriptions.is_empty() {
+                        let candidate = replacement(&state, None);
+                        let previous = std::mem::replace(&mut checked_replacement, candidate);
+                        candidate && !previous
+                    } else {
+                        matches_active(&state) == StaticHybridMatch::Differs
+                    }
+                };
+                if publisher_changed && !hash_due {
+                    configs = probe_hash().await;
+                }
                 let mut state = lifecycle.state.lock();
                 if !lifecycle.active.load(Ordering::Acquire) || state.info.is_none() {
                     break;
@@ -420,28 +476,18 @@ impl KvIndexSupervisor {
                 if !state.subscriptions.is_empty() && lifecycle.expire_if_needed(&mut state) {
                     invalidate(&state.subscriptions);
                 }
+                let hash_checked = hash_due || publisher_changed;
+                if hash_checked {
+                    state.hash_checked = Instant::now();
+                }
                 state.fence_incompatible_ranks(&worker, configs.as_ref());
                 let outcome = if state.subscriptions.is_empty() {
-                    if !observed.as_ref().is_ok_and(|(sources, layout)| {
-                        has_new_publisher(
-                            &worker,
-                            &state.hash_fences,
-                            sources,
-                            layout.as_ref().unwrap_or(&capability),
-                            configs.as_ref(),
-                        )
-                    }) {
+                    if !hash_checked || !replacement(&state, configs.as_ref()) {
                         continue;
                     }
                     StaticHybridMatch::Differs
                 } else {
-                    observed_sources_match(
-                        &worker,
-                        state.subscriptions.iter().map(|(source, _, _)| source),
-                        &state.hash_fences,
-                        (static_config.is_none() && !assumed_plain_full).then_some(&capability),
-                        observed,
-                    )
+                    matches_active(&state)
                 };
                 match lifecycle.observe_layout(&mut state, &outcome) {
                     SourceAction::Stop => {}
