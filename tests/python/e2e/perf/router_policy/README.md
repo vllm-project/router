@@ -1,4 +1,4 @@
-# router_policy — TraceLab cold replay, router policy × concurrency
+# router_policy — TraceLab and AgentX cold replay, router policy × concurrency
 
 Each **scenario JSON** under `cases/` is one routing scenario. `benchmark_params.max-concurrency` lists 8, 16, and 32; pytest expands those into cells `pd_merge_cache_aware/c16` and so on:
 
@@ -71,6 +71,9 @@ cells have separate output files.
 
 Result JSON includes `scenario`, `topology`, and `router_policy`. The existing
 `arm` field also identifies the routing policy for historical consumers.
+Publication requires a nonempty string `scenario`. Calibration files with a
+missing or invalid scenario stay in the cell directory and are not copied to
+the results directory. The routing policy is never used as a scenario fallback.
 The dashboard uses policy and topology to retain historical merged series and
 match each disaggregated policy with a disaggregated cache-aware baseline.
 
@@ -79,6 +82,10 @@ before it publishes a result. Every metric needs finite, nonnegative mean,
 p50, p95, and p99 values. A known sample count must be positive. Precomputed
 JCT aggregates with an unknown count (`n: null`) remain supported. Failed
 measurement checks are recorded in `missing_latency_metrics` and fail the cell.
+These checks apply to both merged and disaggregated cells. A replay with all
+requests successful still fails if no valid TPOT samples remain (for example,
+all outputs have at most one token) or JCT durations are unavailable. Its
+`calibration.json` is retained for diagnosis.
 
 ## Buildkite nightly (L3)
 
@@ -92,16 +99,25 @@ run on `l4_4` (four L4 GPUs).
 The PD cases use two prefill workers and two decode workers, each on its own
 GPU, with Rust gRPC frontends and NIXL KV transfer. Set `workers.prefill_count`
 to the number of prefill workers. The remaining workers decode. Merged cases
-use the default `prefill_count=0`. All cases reserve 12 GiB GPU KV per worker,
-use no CPU offload, and set `max_model_len=32768`.
+use the default `prefill_count=0`. All cases reserve 12 GiB GPU KV per worker
+and use no CPU offload. Merged cases use `max_model_len=32768`; PD cases use
+`max_model_len=65536` for the pinned AgentX requests (maximum input plus output
+65,339 tokens). For the configured BF16 Qwen3-4B model, one full 64K sequence
+uses 9 GiB of KV, within the per-worker KV allocation.
 
 The CI image supplies `agentinfer==0.2.0`, vLLM 0.30.0, NIXL, and the Rust
-router. The trace is `data/tracelab-ci-uniform-28.jsonl`
-with eight sessions and 28 requests. The shared cell launcher calls
-`prepare_trace()` before starting workers. It checks the case's local trace file
-or downloads optional `TRACELAB_JSONL_URL` into the cell directory as
-`trace.jsonl`. Downloads replace the cell's trace atomically, and failures stop
-the cell before GPU processes start. Local pytest runs use the same setup.
+router. Merged cases use `data/tracelab-ci-uniform-28.jsonl` (eight sessions,
+28 requests). The two PD cases share `data/agentx-ci-8x8.jsonl` (eight sessions,
+eight turns each, 64 requests) with `trace_type=agentX`, `/v1/completions`,
+and `gap_scale=0.002`. AgentInfer's `replay_agentX.yaml` supplies the matching
+token-ID replay settings. See [data provenance and reproduction](data/README.md).
+
+The shared cell launcher calls `prepare_trace()` before starting workers.
+AgentX cases verify `runtime.trace_sha256` against the bundled slice. TraceLab
+cases check the local file or download optional `TRACELAB_JSONL_URL` into the
+cell directory as `trace.jsonl`; this override applies only to TraceLab.
+Downloads replace the cell's trace atomically, and failures stop the cell
+before GPU processes start. Local pytest runs use the same setup.
 
 Run the two PD scenarios in an environment with four supported CUDA GPUs.
 

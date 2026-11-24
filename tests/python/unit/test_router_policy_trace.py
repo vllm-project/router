@@ -1,5 +1,6 @@
-"""CPU checks for TraceLab input preparation before GPU startup."""
+"""CPU checks for replay input preparation before GPU startup."""
 
+import hashlib
 import io
 from urllib.error import HTTPError
 
@@ -72,3 +73,38 @@ def test_http_error_fails_trace_preparation(tmp_path, monkeypatch):
     with pytest.raises(HTTPError, match="404"):
         case_loader.prepare_trace(tmp_path / "default.jsonl", out_dir=out)
     assert not list(out.iterdir())
+
+
+def test_agentx_trace_is_pinned_and_ignores_tracelab_override(tmp_path, monkeypatch):
+    trace = tmp_path / "agentx.jsonl"
+    trace.write_bytes(b"pinned AgentX data\n")
+    expected = hashlib.sha256(trace.read_bytes()).hexdigest()
+    monkeypatch.setenv("TRACELAB_JSONL_URL", "https://example.test/tracelab.jsonl")
+
+    def unexpected_download(*args, **kwargs):
+        pytest.fail("AgentX must not use the TraceLab URL override")
+
+    monkeypatch.setattr(case_loader, "urlopen", unexpected_download)
+    assert (
+        case_loader.prepare_trace(
+            trace,
+            out_dir=tmp_path / "run",
+            trace_type="agentX",
+            expected_sha256=expected,
+        )
+        == trace
+    )
+
+
+@pytest.mark.parametrize("expected", ["", "0" * 64], ids=["missing_hash", "wrong_hash"])
+def test_agentx_trace_requires_a_matching_hash(tmp_path, expected):
+    trace = tmp_path / "agentx.jsonl"
+    trace.write_bytes(b"changed AgentX data\n")
+    with pytest.raises(ValueError, match="trace_sha256|SHA256 mismatch"):
+        case_loader.prepare_trace(
+            trace,
+            out_dir=tmp_path / "run",
+            trace_type="agentX",
+            expected_sha256=expected,
+        )
+    assert not (tmp_path / "run").exists()

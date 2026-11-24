@@ -146,9 +146,9 @@ steps:
           - "tests/python/e2e/results/perf/grpc/**/*.json"
 
       # ============================================================================
-      # L3 router_policy TraceLab replay — PD merge and PD disaggregated scenarios at c16.
+      # L3 router_policy replay — merged TraceLab and disaggregated AgentX at c16.
       # 4× vllm-rs + router per cell (12GiB GPU KV/worker, no CPU offload) → L4×4.
-      # Optional: TRACELAB_JSONL_URL overrides the case trace during test setup.
+      # TRACELAB_JSONL_URL overrides merged traces; PD uses a SHA256-pinned slice.
       # ============================================================================
       - label: ":bar_chart: Perf · PD Merge Router Policy (c16) Test"
         key: "router-policy-perf-e2e"

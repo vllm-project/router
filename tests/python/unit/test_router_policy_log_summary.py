@@ -116,6 +116,7 @@ def calibration_run(tmp_path, monkeypatch):
     return SimpleNamespace(case=case, out=tmp_path)
 
 
+@pytest.mark.parametrize("prefill_count", [0, 2], ids=["pd_merge", "pd_disagg"])
 @pytest.mark.parametrize(
     "missing,expected",
     [
@@ -127,9 +128,12 @@ def calibration_run(tmp_path, monkeypatch):
     ],
 )
 def test_invalid_measurements_fail_before_publication(
-    summary_module, calibration_run, missing, expected
+    summary_module, calibration_run, prefill_count, missing, expected, capsys
 ):
     run = calibration_run
+    run.case.prefill_count = prefill_count
+    prefix = "pd_disagg" if prefill_count else "pd_merge"
+    run.case.scenario = f"{prefix}_kv_aware_affinity"
     row = dict(
         status="success",
         ttft_seconds=0.1,
@@ -148,6 +152,8 @@ def test_invalid_measurements_fail_before_publication(
     contents = "" if missing == "empty" else json.dumps(row) + "\n"
     result = run.out / "result"
     (result / "requests.jsonl").write_text(contents, encoding="utf-8")
+    if missing == "jct":
+        (result / "summary.json").write_text("{}\n", encoding="utf-8")
 
     with pytest.raises(SystemExit, match="1"):
         summary_module.write_calibration(
@@ -156,8 +162,72 @@ def test_invalid_measurements_fail_before_publication(
 
     stats = json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
     assert stats["ok"] is False
+    assert stats["requests"] == stats["success"] == (0 if missing == "empty" else 1)
+    assert stats["scenario"] == run.case.scenario
+    assert stats["topology"] == ("pd_disaggregated" if prefill_count else "pd_merged")
     assert stats["missing_latency_metrics"] == expected
+    assert (
+        "DIAGNOSTIC missing latency measurements: " + ", ".join(expected)
+        in capsys.readouterr().out
+    )
     assert not list((run.out / "published").rglob("*.json"))
+
+
+@pytest.mark.parametrize("topology", ["pd_merged", "pd_disaggregated"])
+@pytest.mark.parametrize(
+    "scenario_metadata",
+    [{}, {"scenario": None}, {"scenario": ""}, {"scenario": " \t"}, {"scenario": 1}],
+    ids=["missing", "null", "empty", "whitespace", "non_string"],
+)
+def test_publication_requires_scenario(
+    summary_module, calibration_run, topology, scenario_metadata
+):
+    run = calibration_run
+    stats = dict(
+        ok=True,
+        router_policy="cache_aware",
+        topology=topology,
+        concurrency=16,
+        task_num=8,
+        **scenario_metadata,
+    )
+    (run.out / "calibration.json").write_text(json.dumps(stats), encoding="utf-8")
+
+    assert summary_module._write_results_summary_from_calibration(run.out) == []
+    assert not list((run.out / "published").rglob("*.json"))
+    assert (
+        json.loads((run.out / "calibration.json").read_text(encoding="utf-8")) == stats
+    )
+
+
+def test_same_policy_topologies_publish_separate_results(
+    summary_module, calibration_run
+):
+    run = calibration_run
+    published = []
+    for prefix, topology in [
+        ("pd_merge", "pd_merged"),
+        ("pd_disagg", "pd_disaggregated"),
+    ]:
+        stats = dict(
+            ok=True,
+            scenario=f"{prefix}_cache_aware",
+            router_policy="cache_aware",
+            topology=topology,
+            concurrency=16,
+            task_num=8,
+        )
+        (run.out / "calibration.json").write_text(json.dumps(stats), encoding="utf-8")
+        artifacts = summary_module._write_results_summary_from_calibration(run.out)
+        expected = case_loader.router_policy_result_path(
+            stats["scenario"], 16, 8, "unit_test"
+        )
+        assert artifacts == [("results_json", expected)]
+        published.append((expected, stats))
+
+    assert published[0][0] != published[1][0]
+    for path, stats in published:
+        assert json.loads(path.read_text(encoding="utf-8")) == stats
 
 
 @pytest.mark.parametrize("prefill_count", [0, 2])
@@ -220,7 +290,9 @@ def test_loaded_scenario_keeps_its_name_across_concurrency(
     )
     monkeypatch.setattr(case_loader, "_vllm_rs_bin", lambda: "vllm-rs")
     monkeypatch.setattr(
-        case_loader, "packaged_replay_agentx_yaml", lambda: tmp_path / "replay.yaml"
+        case_loader,
+        "packaged_replay_agentx_yaml",
+        lambda trace_type: tmp_path / "replay.yaml",
     )
     cases = [case_loader.load_router_policy_case(path, concurrency=c) for c in (8, 16)]
     assert [case.scenario for case in cases] == [scenario, scenario]

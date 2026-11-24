@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -89,8 +90,13 @@ def _resolve_python(case_value: str, repo: Path) -> str:
     return found if found else val
 
 
-def packaged_replay_agentx_yaml() -> Path:
-    """TraceLab replay template from pip-installed ``agentinfer``."""
+def packaged_replay_agentx_yaml(trace_type: str = "tracelab") -> Path:
+    """Replay template for the selected adapter in pip-installed ``agentinfer``."""
+
+    templates = {"tracelab": "replay_tracelab.yaml", "agentX": "replay_agentX.yaml"}
+    if trace_type not in templates:
+        raise ValueError(f"unsupported router policy trace type: {trace_type}")
+    filename = templates[trace_type]
 
     try:
         import agentinfer
@@ -103,14 +109,14 @@ def packaged_replay_agentx_yaml() -> Path:
 
     package_root = Path(agentinfer.__file__).resolve().parent
     for relative in (
-        Path("agentbench/configs/replay_tracelab.yaml"),
-        Path("agentinfer/agentbench/configs/replay_tracelab.yaml"),
+        Path("agentbench/configs") / filename,
+        Path("agentinfer/agentbench/configs") / filename,
     ):
         candidate = package_root / relative
         if candidate.is_file():
             return candidate
     raise FileNotFoundError(
-        f"replay_tracelab.yaml not found under installed agentinfer ({package_root})"
+        f"{filename} not found under installed agentinfer ({package_root})"
     )
 
 
@@ -121,15 +127,28 @@ def load_case(case_file: Path) -> dict[str, Any]:
     return case
 
 
-def prepare_trace(trace_path: Path, *, out_dir: Path) -> Path:
-    """Resolve the case trace, saving a URL override in the cell directory."""
+def prepare_trace(
+    trace_path: Path,
+    *,
+    out_dir: Path,
+    trace_type: str = "tracelab",
+    expected_sha256: str = "",
+) -> Path:
+    """Verify pinned AgentX data or resolve a TraceLab URL override."""
 
-    url = _env_first("TRACELAB_JSONL_URL")
+    url = _env_first("TRACELAB_JSONL_URL") if trace_type == "tracelab" else ""
     if not url:
         if not trace_path.is_file():
-            raise FileNotFoundError(
-                f"TraceLab replay file does not exist: {trace_path}"
-            )
+            label = "AgentX" if trace_type == "agentX" else "TraceLab"
+            raise FileNotFoundError(f"{label} replay file does not exist: {trace_path}")
+        if trace_type == "agentX":
+            if not expected_sha256:
+                raise ValueError("AgentX replay requires runtime.trace_sha256")
+            actual = hashlib.sha256(trace_path.read_bytes()).hexdigest()
+            if actual != expected_sha256:
+                raise ValueError(
+                    f"AgentX trace SHA256 mismatch: expected {expected_sha256}, got {actual}"
+                )
         return trace_path
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -208,6 +227,7 @@ class RouterPolicyCase:
     perf_work_root: Path
     trace_path: Path
     trace_type: str
+    trace_sha256: str
     endpoint: str
     replay_config: Path
     agent_infer: Path | None
@@ -277,6 +297,7 @@ def load_router_policy_case(
     case_id = str(raw["id"])
     policy = str(router.get("policy") or raw.get("router_policy") or raw["scenario"])
     replay_path = str(runtime.get("replay_config_path") or "").strip()
+    trace_type = str(runtime.get("trace_type") or "tracelab")
     agent_infer = str(runtime.get("agent_infer") or "").strip()
     worker_count = int(workers.get("count", 4))
     prefill_count = int(workers.get("prefill_count", 0))
@@ -300,11 +321,15 @@ def load_router_policy_case(
         router_bin=runtime["router_binary"],
         perf_work_root=PERF_RUN_DIR,
         trace_path=Path(runtime["trace_path"]),
-        trace_type=str(runtime.get("trace_type") or "tracelab"),
-        endpoint=str(runtime.get("endpoint") or "/v1/chat/completions"),
+        trace_type=trace_type,
+        trace_sha256=str(runtime.get("trace_sha256") or ""),
+        endpoint=str(
+            runtime.get("endpoint")
+            or ("/v1/completions" if trace_type == "agentX" else "/v1/chat/completions")
+        ),
         replay_config=Path(replay_path)
         if replay_path
-        else packaged_replay_agentx_yaml(),
+        else packaged_replay_agentx_yaml(trace_type),
         agent_infer=Path(agent_infer) if agent_infer else None,
         openssl_lib_dir=str(runtime.get("openssl_lib_dir") or ""),
         policy=policy,

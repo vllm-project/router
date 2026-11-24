@@ -400,11 +400,11 @@ def runtime_config(run: RouterPolicyStack):
         "trace_same_agent_gap_offset_seconds": 0.0,
         "interval_mode": "trace",
         "max_inflight_requests": case.max_inflight,
+        "sample_seed": 0,
         "request_timeout_seconds": 3600,
     }
     if case.trace_type == "tracelab":
         replay_fields.update(
-            sample_seed=0,
             context_adjustment_mode="strict",
             context_micro_trim_max_tokens=64,
             context_micro_trim_max_ratio=0.005,
@@ -591,7 +591,15 @@ def run_router_policy_cell(
         if out_dir is not None
         else case.perf_work_root / f"{case.id}-{run_suffix}"
     )
-    case = replace(case, trace_path=prepare_trace(case.trace_path, out_dir=trace_dir))
+    case = replace(
+        case,
+        trace_path=prepare_trace(
+            case.trace_path,
+            out_dir=trace_dir,
+            trace_type=case.trace_type,
+            expected_sha256=case.trace_sha256,
+        ),
+    )
     run = open_cell(case, out_dir=out_dir)
     _active = run
     try:
