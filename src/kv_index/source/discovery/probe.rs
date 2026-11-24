@@ -11,8 +11,9 @@ use tonic_prost::ProstCodec;
 use tracing::{info, warn};
 
 use super::lifecycle::WorkerLifecycle;
+use super::reconcile::{has_new_publisher, layouts_match, BoundSources};
 use super::{
-    discovered_block_size, metrics_meta, CacheCapabilities, KvEventSourceEntry,
+    discovered_block_size, metrics_meta, split_worker_rank, CacheCapabilities, KvEventSourceEntry,
     KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe, SourcesUnavailable,
     WorkerDiscovery, CONTROL_TIMEOUT,
 };
@@ -37,6 +38,52 @@ pub(super) struct WorkerDescriptor {
 }
 
 impl WorkerDescriptor {
+    pub(super) fn layout(&self) -> Option<&CacheCapabilities> {
+        self.hybrid.as_ref()
+    }
+
+    pub(super) fn has_new_publisher(
+        &self,
+        worker: &str,
+        fences: &BoundSources,
+        configs: Option<&EngineCacheConfigs>,
+    ) -> bool {
+        self.sources
+            .as_ref()
+            .zip(self.layout())
+            .is_some_and(|(sources, layout)| {
+                has_new_publisher(worker, fences, sources, layout, configs)
+            })
+    }
+
+    pub(super) fn matches_unfenced(&self, other: &Self, fences: &BoundSources) -> bool {
+        if fences.is_empty() {
+            return self == other;
+        }
+        let sources_match = match (&self.sources, &other.sources) {
+            (Some(left), Some(right)) => {
+                let retained = |rank: &str| {
+                    rank.parse::<u32>()
+                        .ok()
+                        .is_none_or(|rank| !fences.contains_key(&rank))
+                };
+                left.iter()
+                    .all(|(rank, entry)| !retained(rank) || right.get(rank) == Some(entry))
+                    && right
+                        .keys()
+                        .all(|rank| !retained(rank) || left.contains_key(rank))
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        sources_match
+            && self.server_info == other.server_info
+            && self.model_id == other.model_id
+            && self.assumed_plain_full == other.assumed_plain_full
+            && self.connector == other.connector
+            && layouts_match(self.layout(), other.layout(), fences)
+    }
+
     pub(super) fn has_nonplain_layout(&self) -> bool {
         self.hybrid
             .as_ref()
@@ -88,7 +135,9 @@ impl KvIndexSupervisor {
             let cached = {
                 let state = lifecycle.state.lock();
                 (state.info.is_some()
-                    && state.descriptor.as_ref() == Some(&descriptor)
+                    && state.descriptor.as_ref().is_some_and(|previous| {
+                        previous.matches_unfenced(&descriptor, &state.hash_fences)
+                    })
                     && (descriptor
                         .server_info
                         .instance_id
@@ -264,6 +313,32 @@ pub(super) async fn fetch_kv_event_sources(
         probe: SourcesProbe::Failed,
         detail: format!("kv_event_sources {url} parse: {error}"),
     })
+}
+
+/// Fetch the source snapshot before deciding which ranks are still bound.
+pub(super) async fn probe_bound_sources(
+    client: &reqwest::Client,
+    worker: &str,
+    api_key: Option<&str>,
+    static_source: bool,
+) -> Result<(KvEventSourcesResponse, Option<CacheCapabilities>), SourcesProbe> {
+    let (base, _) = split_worker_rank(worker);
+    let timeout = Duration::from_secs(2);
+    tokio::time::timeout(timeout, async {
+        if static_source {
+            return fetch_kv_event_sources(client, base, api_key)
+                .await
+                .map(|sources| (sources, None))
+                .map_err(|unavailable| unavailable.probe);
+        }
+        let (sources, layout) = fetch_native_sources(client, base, api_key, timeout).await;
+        Ok((
+            sources.map_err(|_| SourcesProbe::Failed)?,
+            layout.map_err(|_| SourcesProbe::Failed)?,
+        ))
+    })
+    .await
+    .unwrap_or(Err(SourcesProbe::Failed))
 }
 
 /// Read the source list and its automatically published cache contract.
@@ -454,13 +529,9 @@ pub(super) type WorkerMetadata = (
     Option<EngineCacheConfigs>,
 );
 
-/// Worker cache metadata, tried in the order a deployment is likely to answer it:
-/// the multi-backend control contract, the engine config endpoint, then the
-/// always-on `/metrics` scrape.
-///
-/// Every source is optional; the error names what each one said, so an operator
-/// can tell a missing endpoint from an endpoint that answered without a block
-/// size.
+/// Prefer control metadata, with metrics as the fallback. For hash validation,
+/// start a bounded optional scrape alongside control and reuse a successful
+/// result if control metadata is unavailable.
 pub(super) async fn query_worker_metadata_and_models(
     client: &reqwest::Client,
     worker_url: &str,
@@ -477,17 +548,18 @@ pub(super) async fn query_worker_metadata_and_models(
                 )
                 .await
                 .ok()
+                .and_then(Result::ok)
             } else {
                 None
             }
         },
     );
     let control_error = match control {
-        Ok(info) => return Ok((info, None, metrics.and_then(Result::ok))),
+        Ok(info) => return Ok((info, None, metrics)),
         Err(error) => error,
     };
     let engines = match metrics {
-        Some(scrape) => scrape,
+        Some(scrape) => Ok(scrape),
         None => query_engine_cache_configs(client, worker_url, api_key).await,
     };
     query_metrics_metadata(client, worker_url, api_key, engines)

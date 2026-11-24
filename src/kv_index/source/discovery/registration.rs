@@ -1,7 +1,7 @@
 //! Admit and install one worker and its event sources.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use super::lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
 use super::probe::{layout_model, server_instance_id, worker_descriptor};
-use super::reconcile::runtime_hash_mismatch;
+use super::reconcile::{runtime_hash_mismatch, BoundSource, BoundSources};
 use super::{
     discovered_block_size, event_source_label, event_sources_for_worker, metadata_source_label,
     CacheKey, KvIndexSupervisor, LiveSource, ServerInfo, SourcesProbe, WorkerDiscovery,
@@ -175,16 +175,41 @@ impl KvIndexSupervisor {
             _ => None,
         }
         .unwrap_or(true);
+        // Admission and publication share the source-owner lock.
+        let mut workers = self.installed.workers.lock();
+        let previous = self.lifecycles.lock().get(worker_url).cloned();
+        let unchanged = match (observed.as_ref(), workers.get(worker_url)) {
+            (Some(observed), Some(current)) => Arc::ptr_eq(observed, &current.active),
+            (None, None) => true,
+            _ => false,
+        };
+        let lifecycle_unchanged = expected_lifecycle.as_ref().is_none_or(|expected| {
+            previous
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(expected, current))
+        });
+        if !unchanged || !lifecycle_unchanged {
+            return Err("KV worker was registered while discovery was pending".into());
+        }
+        let previous_state = previous.as_ref().map(|previous| previous.state.lock());
         let mut bindings = HashMap::new();
         let reported_ranks = event_sources.len();
+        let mut hash_fences = previous_state
+            .as_ref()
+            .map_or_else(BoundSources::new, |state| state.hash_fences.clone());
         let mut rejected_hash = 0;
         event_sources.retain(|source| {
-            if runtime_hash_mismatch(
-                discovery.engine_cache_configs.as_ref(),
-                &capability,
-                worker_url,
-                source.dp_rank,
-            ) {
+            let rank = source.dp_rank;
+            let identity = BoundSource::from(source);
+            if hash_fences.get(&rank) == Some(&identity)
+                || runtime_hash_mismatch(
+                    discovery.engine_cache_configs.as_ref(),
+                    &capability,
+                    worker_url,
+                    rank,
+                )
+            {
+                hash_fences.insert(rank, identity);
                 rejected_hash += 1;
                 return false;
             }
@@ -193,6 +218,7 @@ impl KvIndexSupervisor {
                 .and_then(|binding| binding.with_tail_proof_limit(server_info.vllm_version))
             {
                 Ok(binding) => {
+                    hash_fences.remove(&rank);
                     let binding = if assumed_plain_full {
                         binding.require_root_proof()
                     } else {
@@ -215,43 +241,20 @@ impl KvIndexSupervisor {
                 }
             }
         });
-        if bindings.is_empty() {
-            if rejected_hash != 0 && rejected_hash == reported_ranks {
-                return Ok(WorkerKvInfo {
-                    instance_id,
-                    block_size: Some(block_size),
-                    ..Default::default()
-                });
-            }
+        let all_fenced = rejected_hash != 0 && rejected_hash == reported_ranks;
+        if bindings.is_empty() && !all_fenced {
             return Err("no KV event rank has a verified layout".into());
         }
 
         // Full-attention HTTP bindings require plain origins. Generic discovery retains
         // its backend-specific URI scope, including HTTP base paths.
-        let worker_origin = if full_attention_http {
+        let worker_origin = if full_attention_http && !all_fenced {
             Some(crate::kv_index::source::endpoints::canonical_worker(
                 worker_url,
             )?)
         } else {
             None
         };
-        // Admission and publication share the existing source-owner lock. Two
-        // concurrent discoveries must not both accept an ambiguous binding.
-        let mut workers = self.installed.workers.lock();
-        let unchanged = match (observed.as_ref(), workers.get(worker_url)) {
-            (Some(observed), Some(current)) => Arc::ptr_eq(observed, &current.active),
-            (None, None) => true,
-            _ => false,
-        };
-        let lifecycle_unchanged = expected_lifecycle.as_ref().is_none_or(|observed| {
-            self.lifecycles
-                .lock()
-                .get(worker_url)
-                .is_some_and(|current| Arc::ptr_eq(observed, current))
-        });
-        if !unchanged || !lifecycle_unchanged {
-            return Err("KV worker was registered while discovery was pending".into());
-        }
         if worker_origin.as_ref().is_some_and(|origin| {
             workers.iter().any(|(url, worker)| {
                 url != worker_url && worker.worker_origin.as_ref() == Some(origin)
@@ -295,12 +298,26 @@ impl KvIndexSupervisor {
         // Publish the new registration while holding the source-owner lock.
         let active = Arc::new(AtomicBool::new(true));
         let lifecycle = Arc::new(WorkerLifecycle::new(active.clone(), true, descriptor));
+        lifecycle.state.lock().hash_fences = hash_fences;
+        if let Some(previous) = &previous {
+            previous.active.store(false, Ordering::Release);
+        }
+        drop(previous_state);
         if let Some(previous) = workers.remove(worker_url) {
             self.installed.retire_worker(previous);
         }
+        if all_fenced {
+            let info = WorkerKvInfo {
+                instance_id,
+                block_size: Some(block_size),
+                ..Default::default()
+            };
+            self.publish_registration(worker_url, &lifecycle, &info, discovery.base_models);
+            self.monitor_hybrid_source(&lifecycle, worker_url, capability, assumed_plain_full);
+            return Ok(info);
+        }
         let indexer = self.installed.acquire_identity(&key);
         let mut ranks = Vec::with_capacity(event_sources.len());
-        let mut handles = Vec::with_capacity(event_sources.len());
         let mut live_sources = Vec::with_capacity(event_sources.len());
         let mut replay_endpoints = Vec::new();
         let mut targets = Vec::new();
@@ -340,8 +357,6 @@ impl KvIndexSupervisor {
                 lease,
             });
             replay_endpoints.extend(ev.replay_endpoint.clone());
-            let handle = Arc::new(handle);
-            handles.push(handle.clone());
             targets.push((ev, index.clone(), handle));
             indexes.insert(rank, index);
             info!(
@@ -359,14 +374,6 @@ impl KvIndexSupervisor {
             indexes,
             lifecycle: lifecycle.clone(),
         });
-        self.monitor_hybrid_source(
-            &provider,
-            worker_url,
-            targets,
-            capability,
-            assumed_plain_full,
-        );
-
         workers.insert(
             worker_url.to_string(),
             WorkerSubs {
@@ -378,7 +385,6 @@ impl KvIndexSupervisor {
                 live_sources,
                 ranks: ranks.clone(),
                 indexer,
-                handles,
                 provider,
             },
         );
@@ -388,15 +394,27 @@ impl KvIndexSupervisor {
             ranks,
             cache_key: Some(key),
         };
+        lifecycle.state.lock().subscriptions = targets;
+        self.publish_registration(worker_url, &lifecycle, &info, discovery.base_models);
+        self.monitor_hybrid_source(&lifecycle, worker_url, capability, assumed_plain_full);
+        self.check_block_size(worker_url, Some(block_size));
+        Ok(info)
+    }
+
+    fn publish_registration(
+        &self,
+        worker_url: &str,
+        lifecycle: &Arc<WorkerLifecycle>,
+        info: &WorkerKvInfo,
+        base_models: Option<HashSet<String>>,
+    ) {
         {
             let mut state = lifecycle.state.lock();
             state.info = Some(info.clone());
-            state.base_models = discovery.base_models.unwrap_or_default();
+            state.base_models = base_models.unwrap_or_default();
         }
         self.lifecycles
             .lock()
-            .insert(worker_url.to_owned(), lifecycle);
-        self.check_block_size(worker_url, Some(block_size));
-        Ok(info)
+            .insert(worker_url.to_owned(), lifecycle.clone());
     }
 }

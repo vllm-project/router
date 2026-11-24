@@ -3,16 +3,16 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::lifecycle::{SourceAction, WorkerLifecycle, WorkerRegistration, CONTROL_TIMEOUT};
 use super::metrics_meta::EngineCacheConfigs;
-use super::probe::{fetch_kv_event_sources, fetch_native_sources, worker_serves_base_model};
+use super::probe::{probe_bound_sources, worker_serves_base_model};
 use super::{
     events_enabled, resolve_endpoint, split_worker_rank, worker_host, KvEventSourceEntry,
     KvEventSourcesResponse, KvIndexSupervisor, SourcesProbe, WorkerDiscovery,
 };
 use crate::core::{worker::UNLABELED_WORKER_MODEL_ID, Worker};
+use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::CacheCapabilities;
 
 impl KvIndexSupervisor {
@@ -259,8 +259,13 @@ impl KvIndexSupervisor {
             {
                 continue;
             }
-            let action =
-                lifecycle.observe_descriptor(probe.as_ref().map(|probe| &probe.descriptor));
+            let action = lifecycle.observe_descriptor(
+                &base,
+                probe.as_ref().map(|probe| &probe.descriptor),
+                probe
+                    .as_ref()
+                    .and_then(|probe| probe.worker.engine_cache_configs.as_ref()),
+            );
             match action {
                 SourceAction::Keep => {
                     if let Some(probe) = probe {
@@ -311,15 +316,24 @@ pub(super) enum StaticHybridMatch {
     Unavailable(SourcesProbe),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BoundSource {
     pub(super) endpoint: String,
     pub(super) replay_endpoint: Option<String>,
     pub(super) topic: String,
 }
 
-/// The publisher endpoints a worker's hybrid subscribers are attached to, by
-/// rank. Used to notice a publisher that moved while keeping its identity.
+impl From<&EventSource> for BoundSource {
+    fn from(source: &EventSource) -> Self {
+        Self {
+            endpoint: source.pub_endpoint.clone(),
+            replay_endpoint: source.replay_endpoint.clone(),
+            topic: source.topic.clone(),
+        }
+    }
+}
+
+/// Publisher identities by rank, including publishers fenced before subscription.
 pub(super) type BoundSources = HashMap<u32, BoundSource>;
 
 pub(super) fn runtime_hash_mismatch(
@@ -349,37 +363,11 @@ pub(super) fn runtime_hash_mismatch(
     false
 }
 
-/// Fetch the source snapshot before deciding which ranks are still bound.
-pub(super) async fn probe_bound_sources(
-    client: &reqwest::Client,
-    worker: &str,
-    api_key: Option<&str>,
-    static_source: bool,
-) -> Result<(KvEventSourcesResponse, Option<CacheCapabilities>), SourcesProbe> {
-    let (base, _) = split_worker_rank(worker);
-    let timeout = Duration::from_secs(2);
-    tokio::time::timeout(timeout, async {
-        if static_source {
-            return fetch_kv_event_sources(client, base, api_key)
-                .await
-                .map(|sources| (sources, None))
-                .map_err(|unavailable| unavailable.probe);
-        }
-        let (sources, layout) = fetch_native_sources(client, base, api_key, timeout).await;
-        Ok((
-            sources.map_err(|_| SourcesProbe::Failed)?,
-            layout.map_err(|_| SourcesProbe::Failed)?,
-        ))
-    })
-    .await
-    .unwrap_or(Err(SourcesProbe::Failed))
-}
-
 /// Check the surviving publisher set against the same source snapshot.
-pub(super) fn observed_sources_match(
+pub(super) fn observed_sources_match<'a>(
     worker: &str,
-    bound: &BoundSources,
-    active: impl Iterator<Item = u32> + Clone,
+    mut active: impl Iterator<Item = &'a EventSource>,
+    fences: &BoundSources,
     expected: Option<&CacheCapabilities>,
     observed: Result<(KvEventSourcesResponse, Option<CacheCapabilities>), SourcesProbe>,
 ) -> StaticHybridMatch {
@@ -390,27 +378,45 @@ pub(super) fn observed_sources_match(
     let Some(host) = worker_host(split_worker_rank(worker).0) else {
         return StaticHybridMatch::Differs;
     };
-    let layout_matches = match (expected, layout.as_ref()) {
-        (Some(expected), Some(layout)) => {
-            let retained =
-                |rank| !bound.contains_key(&rank) || active.clone().any(|active| active == rank);
-            expected.schema_version == layout.schema_version
-                && expected.adapters == layout.adapters
-                && expected
-                    .ranks
-                    .iter()
-                    .filter(|rank| retained(rank.rank))
-                    .eq(layout.ranks.iter().filter(|rank| retained(rank.rank)))
-        }
-        (None, None) => true,
-        _ => false,
-    };
-    if layout_matches
-        && bound_sources_match(&host, active.map(|rank| (rank, &bound[&rank])), &sources)
+    if layouts_match(expected, layout.as_ref(), fences)
+        && active.all(|source| {
+            sources
+                .get(&source.dp_rank.to_string())
+                .is_some_and(|actual| {
+                    source_matches(
+                        &host,
+                        actual,
+                        &source.pub_endpoint,
+                        source.replay_endpoint.as_deref(),
+                        &source.topic,
+                    )
+                })
+        })
     {
         StaticHybridMatch::Matches
     } else {
         StaticHybridMatch::Differs
+    }
+}
+
+pub(super) fn layouts_match(
+    expected: Option<&CacheCapabilities>,
+    observed: Option<&CacheCapabilities>,
+    fences: &BoundSources,
+) -> bool {
+    match (expected, observed) {
+        (Some(expected), Some(observed)) => {
+            let retained = |rank| !fences.contains_key(&rank);
+            expected.schema_version == observed.schema_version
+                && expected.adapters == observed.adapters
+                && expected
+                    .ranks
+                    .iter()
+                    .filter(|rank| retained(rank.rank))
+                    .eq(observed.ranks.iter().filter(|rank| retained(rank.rank)))
+        }
+        (None, None) => true,
+        _ => false,
     }
 }
 

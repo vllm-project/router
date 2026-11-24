@@ -15,7 +15,6 @@ use tracing::{debug, info, warn};
 use crate::config::{KvConnector, StaticKvEventSources};
 use crate::kv_index::storage::KvBlockIndexer;
 use crate::kv_index::subscriber::EventSource;
-use crate::kv_index::EventSubscriberHandle;
 use crate::kv_index::{CacheCapabilities, GroupCapability, RankCapability};
 use crate::kv_index::{IngestionSignal, SourceId};
 
@@ -28,7 +27,7 @@ mod registration;
 pub(crate) use lifecycle::CONTROL_TIMEOUT;
 use lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
 use observer::WorkerObservation;
-use reconcile::{static_hybrid_sources_match, StaticHybridMatch};
+use reconcile::{bound_source_moved, static_hybrid_sources_match, BoundSources, StaticHybridMatch};
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 pub(crate) use probe::worker_serves_base_model;
@@ -203,7 +202,6 @@ struct WorkerSubs {
     ranks: Vec<u32>,
     indexer: Arc<KvBlockIndexer>,
     provider: Arc<LayoutWorkerProvider>,
-    handles: Vec<Arc<EventSubscriberHandle>>,
 }
 
 struct LiveSource {
@@ -487,14 +485,16 @@ impl KvIndexSupervisor {
                 if discovery.sources.is_err() {
                     return discovery;
                 }
-                let (verification, configs) = tokio::join!(
-                    self.verify_static_source(worker_url, &discovery),
-                    probe::probe_engine_cache_configs(
-                        &self.client,
-                        split_worker_rank(worker_url).0,
-                        self.api_key.as_deref(),
-                    ),
-                );
+                let (verification, configs) =
+                    tokio::join!(self.verify_static_source(worker_url, &discovery), async {
+                        discovery.hybrid.as_ref()?;
+                        probe::probe_engine_cache_configs(
+                            &self.client,
+                            split_worker_rank(worker_url).0,
+                            self.api_key.as_deref(),
+                        )
+                        .await
+                    },);
                 if let Err((probe, reason)) = verification {
                     discovery.sources = Err(SourcesUnavailable {
                         probe,
@@ -507,11 +507,18 @@ impl KvIndexSupervisor {
                 discovery
             }
             None => {
+                let hash_fences = self
+                    .lifecycles
+                    .lock()
+                    .get(worker_url)
+                    .map(|lifecycle| lifecycle.state.lock().hash_fences.clone())
+                    .unwrap_or_default();
                 let mut discovery = discover_worker(
                     &self.client,
                     worker_url,
                     self.http_pd || self.full_attention_http,
                     self.api_key.as_deref(),
+                    &hash_fences,
                 )
                 .await;
                 if discovery.assumed_plain_full
@@ -858,6 +865,7 @@ async fn discover_worker(
     worker_url: &str,
     http_pd: bool,
     api_key: Option<&str>,
+    hash_fences: &BoundSources,
 ) -> WorkerDiscovery {
     if crate::backend::is_grpc_url(worker_url) {
         let timeout = Duration::from_secs(10);
@@ -883,8 +891,14 @@ async fn discover_worker(
             .into_iter()
             .flat_map(|id| id.iter().cloned())
             .collect();
-        let mut discovery =
-            native_worker_discovery(worker_url, server_info, sources, model_id, layout);
+        let mut discovery = native_worker_discovery(
+            worker_url,
+            server_info,
+            sources,
+            model_id,
+            layout,
+            hash_fences,
+        );
         discovery.base_models = Some(base_models);
         return discovery;
     }
@@ -902,7 +916,7 @@ async fn discover_worker(
             engine_cache_configs: None,
         };
     }
-    discover_full_attention_http_worker(client, worker_url, api_key).await
+    discover_full_attention_http_worker(client, worker_url, api_key, hash_fences).await
 }
 
 /// Split a pinned data-parallel rank, as in `http://host:8000@3`.
@@ -1035,6 +1049,7 @@ async fn discover_full_attention_http_worker(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
+    hash_fences: &BoundSources,
 ) -> WorkerDiscovery {
     let (server, (sources, layout)) = tokio::join!(
         query_worker_metadata_and_models(client, worker_url, api_key, true),
@@ -1050,7 +1065,14 @@ async fn discover_full_attention_http_worker(
         .as_ref()
         .map(|info| Some(server_model_id(info).unwrap_or_else(|| worker_url.to_string())))
         .map_err(Clone::clone);
-    let mut discovery = native_worker_discovery(worker_url, server_info, sources, model_id, layout);
+    let mut discovery = native_worker_discovery(
+        worker_url,
+        server_info,
+        sources,
+        model_id,
+        layout,
+        hash_fences,
+    );
     discovery.base_models = base_models;
     discovery.engine_cache_configs = engine_cache_configs;
     discovery
@@ -1062,10 +1084,24 @@ fn native_worker_discovery(
     sources: Result<KvEventSourcesResponse, SourcesUnavailable>,
     model_id: Result<Option<String>, String>,
     layout: Result<Option<CacheCapabilities>, String>,
+    hash_fences: &BoundSources,
 ) -> WorkerDiscovery {
     let (hybrid, assumed_plain_full) = match (&server_info, &sources, &model_id, layout) {
         (Ok(info), Ok(sources), Ok(Some(model)), Ok(Some(layout))) => {
-            match validate_native_publishers(&layout, sources, info, model) {
+            let host = worker_host(split_worker_rank(worker_url).0);
+            // The same fenced publisher stays ineligible even if its layout row
+            // changed. A replacement publisher still needs full validation.
+            let fenced = |rank: u32| {
+                hash_fences.get(&rank).is_some_and(|fence| {
+                    sources.get(&rank.to_string()).is_none_or(|source| {
+                        !events_enabled(source)
+                            || host
+                                .as_ref()
+                                .is_some_and(|host| !bound_source_moved(host, fence, source))
+                    })
+                })
+            };
+            match validate_native_publishers(&layout, sources, info, model, fenced) {
                 Ok(()) => {
                     info!(worker_url, "using the worker's discovered KV cache layout");
                     (Some(layout), false)
@@ -1130,9 +1166,23 @@ fn validate_native_publishers(
     sources: &KvEventSourcesResponse,
     info: &ServerInfo,
     model: &str,
+    fenced: impl Fn(u32) -> bool,
 ) -> Result<(), String> {
-    let active = sources.iter().filter(|(_, source)| events_enabled(source));
-    if active.clone().count() != layout.ranks.len() {
+    let active = sources.iter().filter(|(rank, source)| {
+        events_enabled(source)
+            && !rank
+                .parse::<u32>()
+                .ok()
+                .filter(|parsed| **rank == parsed.to_string())
+                .is_some_and(&fenced)
+    });
+    if active.clone().count()
+        != layout
+            .ranks
+            .iter()
+            .filter(|rank| !fenced(rank.rank))
+            .count()
+    {
         return Err(
             "the reported layouts and enabled event sources have different rank counts".into(),
         );
