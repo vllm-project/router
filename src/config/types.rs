@@ -1452,8 +1452,8 @@ impl RouterConfig {
         }
     }
 
-    /// Budget for HTTP workers to prepare a request's token IDs.
-    pub fn prefix_preparation_budget(&self) -> std::time::Duration {
+    /// Time HTTP workers get to prepare a request's token IDs.
+    pub fn prefix_preparation_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.prefix_preparation_timeout_ms)
     }
 

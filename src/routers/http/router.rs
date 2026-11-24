@@ -305,7 +305,7 @@ pub struct Router {
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
     kv_aware_session_affinity_ttl_secs: Option<u64>,
-    prefix_preparation_budget: Duration,
+    prefix_preparation_timeout: Duration,
     health_config: HealthConfig,
     frontend: crate::backend::EngineFrontend,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
@@ -799,7 +799,7 @@ impl Router {
             kv_aware_session_affinity_ttl_secs: ctx
                 .router_config
                 .kv_aware_session_affinity_ttl_secs,
-            prefix_preparation_budget: ctx.router_config.prefix_preparation_budget(),
+            prefix_preparation_timeout: ctx.router_config.prefix_preparation_timeout(),
             health_config,
             frontend,
             _worker_loads: worker_loads,
@@ -2068,7 +2068,7 @@ impl Router {
                                         &body,
                                         route,
                                         self.api_key.as_deref(),
-                                        self.prefix_preparation_budget,
+                                        self.prefix_preparation_timeout,
                                     )
                                     .await,
                                 ),
@@ -3677,7 +3677,7 @@ impl RouterTrait for Router {
                     &body,
                     path,
                     self.api_key.as_deref(),
-                    self.prefix_preparation_budget,
+                    self.prefix_preparation_timeout,
                 )
                 .await,
             )
@@ -6087,7 +6087,7 @@ mod tests {
         workers[0].increment_load();
         // With a budget shorter than the slow render, worker 0 has no tokens,
         // so its cached prefix cannot be compared and load decides.
-        router.prefix_preparation_budget = Duration::from_millis(100);
+        router.prefix_preparation_timeout = Duration::from_millis(100);
         assert_eq!(
             selected_http_worker(
                 router
@@ -6098,7 +6098,7 @@ mod tests {
             1
         );
         // A budget that covers the slow render restores the prefix placement.
-        router.prefix_preparation_budget = Duration::from_secs(2);
+        router.prefix_preparation_timeout = Duration::from_secs(2);
         assert_eq!(
             selected_http_worker(
                 router
@@ -6383,7 +6383,7 @@ mod tests {
             kv_index_supervisor: None,
             kv_reconcile_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
-            prefix_preparation_budget: Duration::from_secs(1),
+            prefix_preparation_timeout: Duration::from_secs(1),
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -6419,7 +6419,7 @@ mod tests {
             kv_index_supervisor: None,
             kv_reconcile_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
-            prefix_preparation_budget: Duration::from_secs(1),
+            prefix_preparation_timeout: Duration::from_secs(1),
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -8074,7 +8074,7 @@ mod tests {
             kv_index_supervisor: None,
             kv_reconcile_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
-            prefix_preparation_budget: Duration::from_secs(1),
+            prefix_preparation_timeout: Duration::from_secs(1),
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),

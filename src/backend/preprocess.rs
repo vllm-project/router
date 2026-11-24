@@ -512,6 +512,9 @@ async fn http_input_json(
     } else if let Some(value) = headers.and_then(|headers| headers.get("authorization")) {
         request = request.header("authorization", value);
     }
+    // The per-request timeout starts after the caller's shared deadline, but
+    // both can land on the same timer tick, and `timeout_at` polls the probes
+    // before its own deadline, so a request timeout here does surface.
     let response = request.send().await.map_err(|error| {
         if error.is_timeout() {
             "preparation_timeout"
@@ -697,7 +700,7 @@ pub(crate) async fn prepare_http_kv_inputs(
             }
             Err(reason) => {
                 RouterMetrics::record_kv_routing_input("http", reason);
-                debug!(worker = %url, reason, "Prefix input preparation unavailable");
+                debug!(worker = %url, reason, "Prefix input preparation failed");
             }
         }
     }

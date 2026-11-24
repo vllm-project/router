@@ -1031,7 +1031,7 @@ mod tests {
             PolicyConfig::Random,
         );
         assert_eq!(
-            config.prefix_preparation_budget(),
+            config.prefix_preparation_timeout(),
             std::time::Duration::from_secs(1)
         );
         for ms in [1, 2500, 60_000] {
