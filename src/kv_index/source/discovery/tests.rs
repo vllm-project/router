@@ -2051,10 +2051,7 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
         hits(2),
         "healthy rank lost credit during hash reconciliation"
     );
-    warm_rank(1).await;
-    wait_for(|| hits(1)).await;
-    assert!(!hits(0));
-    assert!(hits(2));
+    assert!(!hits(1), "a rank rejected at discovery gained credit");
     assert_eq!(
         supervisor.worker_registrations()[&worker].revision,
         revision

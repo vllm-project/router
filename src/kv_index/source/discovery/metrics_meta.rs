@@ -7,12 +7,40 @@
 
 use std::collections::BTreeMap;
 
+use crate::kv_index::CacheCapabilities;
 use crate::protocols::prometheus_text::for_each_sample;
 
 /// The metric family that carries one engine's `CacheConfig`.
 pub(crate) const CACHE_CONFIG_INFO: &str = "vllm:cache_config_info";
 
 pub(super) type EngineCacheConfigs = BTreeMap<u32, EngineCacheConfig>;
+
+pub(super) fn runtime_hash_mismatch(
+    configs: Option<&EngineCacheConfigs>,
+    capability: &CacheCapabilities,
+    worker_url: &str,
+    rank: u32,
+) -> bool {
+    let reported = configs
+        .and_then(|engines| engines.get(&rank))
+        .and_then(|engine| engine.prefix_caching_hash_algo.as_deref());
+    let expected = capability
+        .rank_capability(rank)
+        .map(|contract| contract.hash_algorithm.as_str());
+    if let (Some(reported), Some(expected)) = (reported, expected) {
+        if reported != expected {
+            tracing::warn!(
+                worker_url,
+                rank,
+                reported,
+                expected,
+                "KV credit disabled for incompatible worker prefix hash algorithm"
+            );
+            return true;
+        }
+    }
+    false
+}
 
 /// The parts of one engine's `CacheConfig` the KV index needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

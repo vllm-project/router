@@ -7,7 +7,8 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
-use super::lifecycle::{LayoutWorkerProvider, MonitoredRank, WorkerLifecycle};
+use super::lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
+use super::metrics_meta::runtime_hash_mismatch;
 use super::probe::{layout_model, server_instance_id, worker_descriptor};
 use super::{
     discovered_block_size, event_source_label, event_sources_for_worker, metadata_source_label,
@@ -15,7 +16,7 @@ use super::{
     WorkerKvInfo, WorkerSubs,
 };
 use crate::config::KvConnector;
-use crate::kv_index::SourceId;
+use crate::kv_index::{EventStream, SourceId};
 
 impl KvIndexSupervisor {
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -164,6 +165,23 @@ impl KvIndexSupervisor {
         };
         let source_id: SourceId = Arc::from(instance_id.as_str());
         let mut event_sources = event_sources_for_worker(worker_url, &source_id, &sources, true)?;
+        let reported_ranks = event_sources.len();
+        event_sources.retain(|source| {
+            !runtime_hash_mismatch(
+                discovery.engine_cache_configs.as_ref(),
+                &capability,
+                worker_url,
+                source.dp_rank,
+            )
+        });
+        if reported_ranks != 0 && event_sources.is_empty() {
+            return Ok(WorkerKvInfo {
+                instance_id,
+                block_size: Some(block_size),
+                ranks: vec![],
+                cache_key: None,
+            });
+        }
 
         // Admit each rank on its own verified contract.
         let engine_model = layout_model(&server_info, &model_id, &capability);
@@ -282,7 +300,7 @@ impl KvIndexSupervisor {
         }
         let indexer = self.installed.acquire_identity(&key);
         let mut ranks = Vec::with_capacity(event_sources.len());
-        let mut handles = Vec::with_capacity(event_sources.len());
+        let mut handles = HashMap::with_capacity(event_sources.len());
         let mut live_sources = Vec::with_capacity(event_sources.len());
         let mut replay_endpoints = Vec::new();
         let mut targets = Vec::new();
@@ -300,46 +318,35 @@ impl KvIndexSupervisor {
                     .with_shared_index(indexer.clone())
                     .with_source_binding(lease.clone()),
             );
-            let mut target = MonitoredRank {
-                expected_hash_algorithm: capability
-                    .ranks
-                    .iter()
-                    .find(|entry| entry.rank == rank)
-                    .expect("admitted rank has a cache contract")
-                    .hash_algorithm
-                    .clone(),
-                source: ev,
-                index,
-                handle: None,
-                hash_mismatch: false,
-            };
-            target.observe_hash(worker_url, discovery.engine_cache_configs.as_ref());
-            if !target.hash_mismatch {
-                if let Err(error) = target.start(
-                    self.ctx.clone(),
-                    Some(self.signal_tx.clone()),
-                    self.strict_recovery,
-                ) {
+            let stream = Arc::new(
+                EventStream::new(index.clone()).with_strict_recovery(self.strict_recovery),
+            );
+            let handle = match super::super::events::event_stream::spawn_zmq_with_signals(
+                ev.clone(),
+                stream,
+                self.ctx.clone(),
+                Some(self.signal_tx.clone()),
+            ) {
+                Ok(handle) => handle,
+                Err(error) => {
                     warn!(worker_url, rank, error, "KV event subscription rejected");
                     continue;
                 }
-            }
+            };
             live_sources.push(LiveSource {
-                publisher: target.source.pub_endpoint.clone(),
-                topic: target.source.topic.clone(),
+                publisher: ev.pub_endpoint.clone(),
+                topic: ev.topic.clone(),
                 rank,
                 lease,
             });
-            replay_endpoints.extend(target.source.replay_endpoint.clone());
-            indexes.insert(rank, target.index.clone());
-            if let Some(handle) = &target.handle {
-                handles.push(handle.clone());
-                info!(
-                    "kv_index {}: spawned subscriber rank{} (instance {})",
-                    worker_url, rank, instance_id
-                );
-            }
-            targets.push(target);
+            replay_endpoints.extend(ev.replay_endpoint.clone());
+            targets.push((ev, index.clone()));
+            indexes.insert(rank, index);
+            handles.insert(rank, Arc::new(handle));
+            info!(
+                "kv_index {}: spawned subscriber rank{} (instance {})",
+                worker_url, rank, instance_id
+            );
             ranks.push(rank);
         }
         if ranks.is_empty() {
@@ -354,6 +361,7 @@ impl KvIndexSupervisor {
         self.monitor_hybrid_source(
             &provider,
             worker_url,
+            handles.clone(),
             targets,
             capability,
             assumed_plain_full,
@@ -370,7 +378,7 @@ impl KvIndexSupervisor {
                 live_sources,
                 ranks: ranks.clone(),
                 indexer,
-                handles,
+                handles: handles.into_values().collect(),
                 provider,
             },
         );
