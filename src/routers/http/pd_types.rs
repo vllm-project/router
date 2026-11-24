@@ -655,8 +655,6 @@ impl PdAttempt {
     }
 
     /// Committed decode endpoint, or `None` while the commitment is deferred.
-    #[cfg(test)]
-    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn decode_endpoint(&self) -> Option<PdEndpoint> {
         self.0.state.lock().decode_endpoint.clone()
     }

@@ -289,6 +289,18 @@ name = "test_pd_warm_remote"
 path = "tests/rust/test_pd_warm_remote.rs"
 
 [[test]]
+name = "test_pd_compatibility"
+path = "tests/rust/test_pd_compatibility.rs"
+
+[[test]]
+name = "test_pd_error_observability"
+path = "tests/rust/test_pd_error_observability.rs"
+
+[[test]]
+name = "test_pd_error_passthrough"
+path = "tests/rust/test_pd_error_passthrough.rs"
+
+[[test]]
 name = "test_pd_program_scheduling"
 path = "tests/rust/test_pd_program_scheduling.rs"
 

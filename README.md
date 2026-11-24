@@ -106,6 +106,10 @@ v0.1 resource / fail-closed defaults on attached routes (not configurable via CL
 Prometheus metrics for the WASM runtime are deferred to a later revision.
 
 #### Prefill-Decode Disaggregation
+
+See [P/D error responses](docs/pd_error_handling.md) for upstream-to-client status
+mapping, error fields, and streaming failure behavior.
+
 ```bash
 # When vLLM runs the NIXL connector, prefill/decode URLs are required.
 # See a working example in scripts/llama3.1/ folder.

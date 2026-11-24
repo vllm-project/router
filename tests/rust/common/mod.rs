@@ -8,6 +8,7 @@ pub mod http;
 pub mod mock_openai_server;
 pub mod mock_vllm_rs;
 pub mod mock_worker;
+pub mod pd_mock;
 pub mod routing_edge;
 pub mod test_app;
 
