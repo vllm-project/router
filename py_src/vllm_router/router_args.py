@@ -36,6 +36,9 @@ class RouterArgs:
     kv_event_block_size: int = 16
     kv_event_model: Optional[str] = None
     kv_event_strict_recovery: bool = False
+    kv_hybrid_layout: Optional[str] = None
+    kv_event_topic: List[str] = dataclasses.field(default_factory=list)
+    pd_pair: List[str] = dataclasses.field(default_factory=list)
     worker_startup_timeout_secs: int = 600
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
@@ -268,6 +271,25 @@ class RouterArgs:
             type=str,
             default=None,
             help="Shared model identity for workers with static event sources",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-hybrid-layout",
+            type=str,
+            help="KV cache layout JSON keyed by worker URL.",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-event-topic",
+            action="append",
+            default=[],
+            metavar="WORKER_URL=TOPIC[,TOPIC...]",
+            help="Topics for static KV event publishers in DP-rank order.",
+        )
+        parser.add_argument(
+            f"--{prefix}pd-pair",
+            action="append",
+            default=[],
+            metavar="PREFILL=DECODE[,DECODE...]",
+            help="Explicit pairs for a mixed P/D pool.",
         )
         # PD-specific arguments
         parser.add_argument(
