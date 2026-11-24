@@ -86,6 +86,7 @@ pub(in crate::kv_index::source) fn spawn_observer(
 
 struct Subscriber {
     source: EventSource,
+    // Production uses REPLAY_IDLE_TIMEOUT. Tests can inject a shorter timeout.
     replay_idle_timeout: Duration,
     binding: Option<(Arc<EventStream>, StreamLease)>,
     signals: Option<mpsc::Sender<IngestionSignal>>,
