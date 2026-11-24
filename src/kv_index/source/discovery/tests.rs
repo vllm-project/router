@@ -2138,6 +2138,207 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
 }
 
 #[test]
+fn regular_layout_reservation_rechecks_expired_grant() {
+    use crate::core::{BasicWorker, Worker, WorkerType};
+    use crate::kv_index::source::test_support::{full_binding, warm_full};
+    use crate::kv_index::{RoutableTarget, TierMatch};
+    use crate::policies::{KvAwarePolicy, TieredMatchProvider};
+
+    struct ExpiringPeer(Arc<WorkerLifecycle>);
+
+    impl TieredMatchProvider for ExpiringPeer {
+        fn matches(&self, _: &[u32], _: u32, _: Option<&str>, _: u32) -> Vec<TierMatch> {
+            self.0.state.lock().verified_at = Instant::now() - Duration::from_secs(6);
+            self.0.expire_if_needed();
+            Vec::new()
+        }
+    }
+
+    let life = Arc::new(WorkerLifecycle::new(
+        Arc::new(AtomicBool::new(true)),
+        true,
+        None,
+    ));
+    let workers: Vec<Arc<dyn Worker>> = ["http://layout", "http://peer"]
+        .into_iter()
+        .map(|url| {
+            Arc::new(BasicWorker::new(url.to_owned(), WorkerType::Regular)) as Arc<dyn Worker>
+        })
+        .collect();
+    let target = RoutableTarget {
+        instance_id: workers[0].url().into(),
+        dp_rank: 0,
+    };
+    let prompt = [42; 33];
+    let source = Arc::new(full_binding(target.clone(), 16));
+    source.begin_empty(0);
+    warm_full(&source, 0, &prompt[..32]);
+    let generation = source.control.generation();
+    let provider = Arc::new(LayoutWorkerProvider {
+        indexes: [(0, source.clone())].into_iter().collect(),
+        lifecycle: life.clone(),
+    });
+    let policy = KvAwarePolicy::default();
+    let key = CacheKey {
+        model: "layout".into(),
+        block_size: 16,
+    };
+    policy.register_target_with_cache_identity(
+        workers[0].url(),
+        target.clone(),
+        key.clone(),
+        provider,
+    );
+    policy.register_target_with_cache_identity(
+        workers[1].url(),
+        RoutableTarget {
+            instance_id: workers[1].url().into(),
+            dp_rank: 0,
+        },
+        key,
+        Arc::new(ExpiringPeer(life.clone())),
+    );
+    let receipt = policy
+        .select_worker_with_receipt(
+            &workers,
+            Some(&prompt),
+            None,
+            None,
+            None,
+            &[workers[1].url().to_owned()],
+        )
+        .unwrap();
+    assert_eq!(source.control.generation(), generation);
+    assert!(life.active.load(Ordering::Acquire));
+    assert_eq!(receipt.new_prefill_tokens, 33);
+    assert_eq!(
+        policy
+            .slot_manager()
+            .unwrap()
+            .sample(&target)
+            .active_prefill_tokens,
+        33
+    );
+    receipt.slot.unwrap().release();
+    workers[0].decrement_load();
+}
+
+#[test]
+fn regular_layout_reservation_uses_the_accepted_retry() {
+    use crate::core::{BasicWorker, Worker, WorkerType};
+    use crate::kv_index::source::test_support::{event_batch, full_binding, full_store, warm_full};
+    use crate::kv_index::{RequestHashCache, RoutableTarget, SourceBinding, TierMatch};
+    use crate::policies::{KvAwarePolicy, KvRequestTokens, TieredMatchProvider, WorkerTokenInputs};
+
+    struct RetryingSource {
+        source: SourceBinding,
+        lifecycle: Arc<WorkerLifecycle>,
+        cleared: AtomicBool,
+    }
+
+    impl TieredMatchProvider for RetryingSource {
+        fn matches_with_cache<'a>(
+            &self,
+            tokens: &'a [u32],
+            block_size: u32,
+            lora: Option<&str>,
+            rank: u32,
+            cache: &mut RequestHashCache<'a>,
+        ) -> Vec<TierMatch> {
+            self.lifecycle.match_rank(&self.source, cache, |cache| {
+                let hits = self
+                    .source
+                    .lookup_placement(tokens, block_size, lora, rank, cache);
+                if !self.cleared.swap(true, Ordering::Relaxed) {
+                    assert!(hits.is_some());
+                    self.source
+                        .apply_batch(
+                            1,
+                            &event_batch(vec![
+                                KVEvent::AllBlocksCleared(Default::default()),
+                                KVEvent::BlockStored(full_store(&tokens[..32], block_size, None)),
+                            ]),
+                        )
+                        .unwrap();
+                }
+                hits
+            })
+        }
+    }
+
+    let worker: Arc<dyn Worker> =
+        Arc::new(BasicWorker::new("http://retry".into(), WorkerType::Regular));
+    let target = RoutableTarget {
+        instance_id: worker.url().into(),
+        dp_rank: 0,
+    };
+    let prompt = [42; 33];
+    let source = full_binding(target.clone(), 16);
+    source.begin_empty(0);
+    warm_full(&source, 0, &prompt[..32]);
+    let policy = KvAwarePolicy::default();
+    policy.register_target_with_cache_identity(
+        worker.url(),
+        target.clone(),
+        CacheKey {
+            model: "layout".into(),
+            block_size: 16,
+        },
+        Arc::new(RetryingSource {
+            source,
+            lifecycle: Arc::new(WorkerLifecycle::new(
+                Arc::new(AtomicBool::new(true)),
+                true,
+                None,
+            )),
+            cleared: AtomicBool::new(false),
+        }),
+    );
+    let receipt = policy
+        .select_worker_with_receipt(
+            std::slice::from_ref(&worker),
+            Some(&prompt),
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(receipt.new_prefill_tokens, 1);
+    assert_eq!(
+        policy
+            .slot_manager()
+            .unwrap()
+            .sample(&target)
+            .active_prefill_tokens,
+        1
+    );
+    receipt.slot.unwrap().release();
+    worker.decrement_load();
+
+    // Two distinct prompts share the same layout lock at reservation.
+    let mut second = prompt.to_vec();
+    second[32] += 1;
+    let inputs = WorkerTokenInputs::from([(
+        worker.base_url().to_owned(),
+        Arc::from([prompt.to_vec(), second]),
+    )]);
+    let receipt = policy
+        .select_worker_with_inputs(
+            std::slice::from_ref(&worker),
+            KvRequestTokens::PerWorker(&inputs),
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(receipt.new_prefill_tokens, 2);
+    receipt.slot.unwrap().release();
+    worker.decrement_load();
+}
+
+#[test]
 fn rank_credit_does_not_cross_revocation_and_empty_replay() {
     use crate::kv_index::source::test_support::{full_binding, warm_full};
     use crate::policies::TieredMatchProvider;
@@ -2171,9 +2372,9 @@ fn rank_credit_does_not_cross_revocation_and_empty_replay() {
             stream.finish_replay(lease, 0).unwrap();
             lifecycle.state.lock().trusted = true;
         }
-        scores
+        (!scores.is_empty()).then_some(scores)
     });
-    assert!(scored.is_empty());
+    assert!(scored.is_none());
     assert_eq!(calls, 2);
 }
 
@@ -2181,7 +2382,6 @@ fn rank_credit_does_not_cross_revocation_and_empty_replay() {
 fn renewed_grants_do_not_price_pages_seen_only_after_expiry() {
     use crate::kv_index::source::test_support::{event_batch, full_binding, full_store, warm_full};
     use crate::kv_index::{BlockRemoved, KVEvent, RequestHashCache, RoutableTarget};
-    use crate::policies::TieredMatchProvider;
     use std::cell::Cell;
     for repeat in [false, true] {
         let life = WorkerLifecycle::new(Arc::new(AtomicBool::new(true)), true, None);
@@ -2205,14 +2405,14 @@ fn renewed_grants_do_not_price_pages_seen_only_after_expiry() {
             || {
                 calls += 1;
                 if calls == 2 && !repeat {
-                    return source.matches_with_cache(&tokens, 16, None, 0, &mut cache);
+                    return source.lookup_placement(&tokens, 16, None, 0, &mut cache);
                 }
                 clock.set(clock.get() + Duration::from_secs(6));
                 assert!(!life.trusted_at(&life.state.lock(), || clock.get()));
                 let seq = 2 * (calls - 1);
                 warm_full(&source, seq, &tokens[..16]);
-                let hits = source.matches_with_cache(&tokens, 16, None, 0, &mut cache);
-                assert_eq!(hits[0].segments, [(0, 1)]);
+                let hits = source.lookup_placement(&tokens, 16, None, 0, &mut cache);
+                assert!(hits.is_some());
                 let removed = KVEvent::BlockRemoved(BlockRemoved {
                     block_hashes: full_store(&tokens[..16], 16, None).block_hashes,
                     medium: Some("GPU".into()),
@@ -2232,7 +2432,7 @@ fn renewed_grants_do_not_price_pages_seen_only_after_expiry() {
                 hits
             },
         );
-        assert!(result.is_empty());
+        assert!(result.is_none());
         assert_eq!(calls, 2);
     }
 }

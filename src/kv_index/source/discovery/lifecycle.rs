@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
+use smallvec::SmallVec;
 use tracing::info;
 
 use super::probe::WorkerDescriptor;
@@ -14,10 +15,11 @@ use super::reconcile::{
     BoundSource, BoundSources, StaticHybridMatch,
 };
 use super::{CacheKey, InstalledWorkers, KvIndexSupervisor, WorkerKvInfo, WorkerSubs};
+use crate::kv_index::routing_provider::PlacementMatch;
 use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::{
     CacheCapabilities, EventStream, EventSubscriberHandle, IngestionSignal, KvBlockIndexer,
-    SourceBinding,
+    RequestHashCache, SourceBinding, TierMatch,
 };
 
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -51,6 +53,67 @@ pub(super) struct LifecycleState {
     pub(super) probe_failures: u8,
     pub(super) trusted: bool,
     pub(super) verified_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TrustStamp {
+    revision: u64,
+    verified_at: Instant,
+}
+
+impl TrustStamp {
+    fn covers(&self, lifecycle: &WorkerLifecycle, state: &LifecycleState, now: Instant) -> bool {
+        self.revision == state.revision
+            && (!lifecycle.layout
+                || now.saturating_duration_since(self.verified_at) <= LAYOUT_FRESHNESS)
+    }
+}
+
+pub(in crate::kv_index) struct LayoutGrant {
+    lifecycle: Arc<WorkerLifecycle>,
+    stamp: TrustStamp,
+}
+
+pub(in crate::kv_index) struct LayoutPin<'a> {
+    lifecycle: &'a WorkerLifecycle,
+    state: MutexGuard<'a, LifecycleState>,
+}
+
+impl LayoutGrant {
+    fn valid(&self, state: &LifecycleState) -> bool {
+        let now = Instant::now();
+        self.lifecycle.trusted_at(state, || now) && self.stamp.covers(&self.lifecycle, state, now)
+    }
+
+    pub(in crate::kv_index) fn is_current(&self) -> bool {
+        self.lifecycle
+            .state
+            .try_lock()
+            .is_some_and(|state| self.valid(&state))
+    }
+
+    pub(in crate::kv_index) fn try_pin<'a>(
+        &'a self,
+        pins: &mut SmallVec<[LayoutPin<'a>; 1]>,
+    ) -> bool {
+        if let Some(pin) = pins
+            .iter()
+            .find(|pin| std::ptr::eq(pin.lifecycle, self.lifecycle.as_ref()))
+        {
+            return self.valid(&pin.state);
+        }
+        let Some(state) = self.lifecycle.state.try_lock() else {
+            return false;
+        };
+        if !self.valid(&state) {
+            return false;
+        }
+        pins.push(LayoutPin {
+            lifecycle: &self.lifecycle,
+            state,
+        });
+        true
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -98,8 +161,8 @@ impl WorkerLifecycle {
         rank: &SourceBinding,
         mut first_trust_check: Option<Instant>,
         now: impl Fn() -> Instant,
-        mut query: impl FnMut() -> Vec<T>,
-    ) -> Vec<T> {
+        mut query: impl FnMut() -> Option<T>,
+    ) -> Option<(T, TrustStamp)> {
         for _ in 0..2 {
             let generation = rank.control.generation();
             let initial = {
@@ -107,29 +170,50 @@ impl WorkerLifecycle {
                 if generation == 0
                     || !self.trusted_at(&state, || first_trust_check.take().unwrap_or_else(&now))
                 {
-                    return Vec::new();
+                    return None;
                 }
-                state.verified_at
+                TrustStamp {
+                    revision: state.revision,
+                    verified_at: state.verified_at,
+                }
             };
-            let hits = query();
-            if hits.is_empty() {
-                return hits;
-            }
+            let hits = query()?;
             let state = self.state.lock();
             let end = now();
             if !self.trusted_at(&state, || end) {
-                return Vec::new();
+                return None;
             }
             // The same source and the original grant must cover the observation.
             // Renewal alone cannot certify pages observed during an expiry gap.
-            if rank.control.generation() == generation
-                && (!self.layout || end.saturating_duration_since(initial) <= LAYOUT_FRESHNESS)
-            {
-                return hits;
+            if rank.control.generation() == generation && initial.covers(self, &state, end) {
+                return Some((hits, initial));
             }
         }
-        Vec::new()
+        None
     }
+
+    pub(super) fn match_rank<'a>(
+        self: &Arc<Self>,
+        index: &SourceBinding,
+        cache: &mut RequestHashCache<'a>,
+        mut query: impl FnMut(&mut RequestHashCache<'a>) -> Option<PlacementMatch>,
+    ) -> Vec<TierMatch> {
+        let first_trust_check = self
+            .layout
+            .then(|| *cache.first_trust_check.get_or_insert_with(Instant::now));
+        // Only the accepted attempt can publish evidence for the reservation.
+        let Some((hit, stamp)) =
+            self.read_rank(index, first_trust_check, Instant::now, || query(cache))
+        else {
+            return Vec::new();
+        };
+        let grant = cache.placement.is_some().then(|| LayoutGrant {
+            lifecycle: self.clone(),
+            stamp,
+        });
+        hit.publish(index, cache, grant)
+    }
+
     pub(super) fn expire_if_needed(&self) -> bool {
         let mut state = self.state.lock();
         self.layout
@@ -283,21 +367,9 @@ impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
         let Some(index) = self.indexes.get(&dp_rank) else {
             return Vec::new();
         };
-        let first_trust_check = self
-            .lifecycle
-            .layout
-            .then(|| *cache.first_trust_check.get_or_insert_with(Instant::now));
-        self.lifecycle
-            .read_rank(index, first_trust_check, Instant::now, || {
-                crate::policies::TieredMatchProvider::matches_with_cache(
-                    index.as_ref(),
-                    tokens,
-                    block_size,
-                    lora,
-                    dp_rank,
-                    cache,
-                )
-            })
+        self.lifecycle.match_rank(index, cache, |cache| {
+            index.lookup_placement(tokens, block_size, lora, dp_rank, cache)
+        })
     }
 }
 

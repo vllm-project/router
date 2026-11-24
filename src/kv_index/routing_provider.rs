@@ -3,6 +3,7 @@
 use crate::kv_index::layout::align_down;
 use crate::kv_index::request_hash::{BlockKeyGenerator, SequenceHash};
 use crate::kv_index::source::binding::SourceLease;
+use crate::kv_index::source::discovery::{LayoutGrant, LayoutPin};
 use crate::kv_index::storage::source_transaction::StreamControl;
 use crate::kv_index::storage::{GroupPages, PageQuery, SourceReadGuard, SourceVersion};
 use crate::kv_index::SourceBinding;
@@ -12,6 +13,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use foldhash::fast::RandomState;
+use smallvec::SmallVec;
 
 /// Read-only placement provider for the routing policy.
 ///
@@ -99,26 +101,32 @@ impl SourceBinding {
             && self.replay_tokens == 0
             && self.tail_drop_group.is_none()
     }
+}
 
-    /// Validate the lookup snapshot and carry its evidence when requested.
-    pub(in crate::kv_index) fn record_placement_if_current(
-        &self,
+/// Keep the hit and its source snapshot together until the provider accepts it.
+pub(in crate::kv_index) struct PlacementMatch {
+    hits: Vec<TierMatch>,
+    source: SourceVersion,
+    generation: u64,
+}
+
+impl PlacementMatch {
+    pub(in crate::kv_index) fn publish(
+        self,
+        binding: &SourceBinding,
         cache: &mut RequestHashCache<'_>,
-        source: SourceVersion,
-        generation: u64,
-    ) -> bool {
-        if !self.snapshot_is_current(&source, generation) {
-            return false;
-        }
+        layout: Option<LayoutGrant>,
+    ) -> Vec<TierMatch> {
         if let Some(placement) = &mut cache.placement {
             placement.push(PlacementEvidence {
-                source,
-                generation,
-                control: self.control.clone(),
-                lease: self.binding.clone(),
+                source: self.source,
+                generation: self.generation,
+                control: binding.control.clone(),
+                lease: binding.binding.clone(),
+                layout,
             });
         }
-        true
+        self.hits
     }
 }
 
@@ -128,6 +136,13 @@ pub(crate) struct PlacementEvidence {
     generation: u64,
     control: Arc<StreamControl>,
     lease: Option<SourceLease>,
+    layout: Option<LayoutGrant>,
+}
+
+#[derive(Default)]
+pub(crate) struct PlacementPins<'a> {
+    sources: SmallVec<[SourceReadGuard<'a>; 1]>,
+    layouts: SmallVec<[LayoutPin<'a>; 1]>,
 }
 
 impl PlacementEvidence {
@@ -135,17 +150,34 @@ impl PlacementEvidence {
         self.source.target()
     }
 
-    pub(crate) fn is_current(&self) -> bool {
+    fn source_is_current(&self) -> bool {
         self.control.generation() == self.generation
             && self.source.is_current()
             && self.lease.as_ref().is_none_or(SourceLease::is_active)
     }
 
-    /// Keep source mutations outside the reservation without waiting on a
-    /// publisher while the policy holds its selection lock.
-    pub(crate) fn try_pin(&self) -> Option<SourceReadGuard<'_>> {
-        let guard = self.source.try_read()?;
-        self.is_current().then_some(guard)
+    pub(crate) fn is_current(&self) -> bool {
+        self.source_is_current() && self.layout.as_ref().is_none_or(LayoutGrant::is_current)
+    }
+
+    /// Hold the layout and source guards across reservation. Both acquisitions
+    /// are nonblocking while the policy holds its selection lock.
+    pub(crate) fn try_pin_all<'a>(
+        evidence: impl Iterator<Item = &'a Self>,
+    ) -> Option<PlacementPins<'a>> {
+        let mut pins = PlacementPins::default();
+        for proof in evidence {
+            if let Some(layout) = &proof.layout {
+                if !layout.try_pin(&mut pins.layouts) {
+                    return None;
+                }
+            }
+            pins.sources.push(proof.source.try_read()?);
+            if !proof.source_is_current() {
+                return None;
+            }
+        }
+        (!pins.sources.is_empty()).then_some(pins)
     }
 }
 
@@ -189,21 +221,30 @@ impl crate::policies::TieredMatchProvider for SourceBinding {
         dp_rank: u32,
         cache: &mut RequestHashCache<'a>,
     ) -> Vec<TierMatch> {
+        self.lookup_placement(tokens, block_size, lora_name, dp_rank, cache)
+            .map_or_else(Vec::new, |hit| hit.publish(self, cache, None))
+    }
+}
+
+impl SourceBinding {
+    pub(in crate::kv_index) fn lookup_placement<'a>(
+        &self,
+        tokens: &'a [u32],
+        block_size: u32,
+        lora_name: Option<&str>,
+        dp_rank: u32,
+        cache: &mut RequestHashCache<'a>,
+    ) -> Option<PlacementMatch> {
         // Events, ownership and history are bound to one rank. A hit computed
         // from another rank's stream is never evidence for this one.
         let prompt_cap = self.reusable_prompt_cap(tokens.len());
         if block_size == 0 || dp_rank != self.target.dp_rank || prompt_cap < block_size as usize {
-            return Vec::new();
+            return None;
         }
         if self.plain_attention_match() {
-            let Some((mut claims, version, generation)) =
-                self.page_snapshot(lora_name, tokens, cache.stop_at_gap, cache)
-            else {
-                return Vec::new();
-            };
-            let Some(group_claims) = claims.pop() else {
-                return Vec::new();
-            };
+            let (mut claims, source, generation) =
+                self.page_snapshot(lora_name, tokens, cache.stop_at_gap, cache)?;
+            let group_claims = claims.pop()?;
             let hits = crate::kv_index::layout::full_attention_matches(
                 &self.target,
                 &self.groups[0],
@@ -212,34 +253,36 @@ impl crate::policies::TieredMatchProvider for SourceBinding {
                 block_size,
                 prompt_cap as u64,
             );
-            // Release the snapshot's cache borrow before recording evidence.
-            drop(claims);
-            if !hits.is_empty() && !self.record_placement_if_current(cache, version, generation) {
-                return Vec::new();
+            if hits.is_empty() || !self.snapshot_is_current(&source, generation) {
+                return None;
             }
-            return hits;
+            return Some(PlacementMatch {
+                hits,
+                source,
+                generation,
+            });
         }
         // The policy's page size can be coarser than the hash granularity: the
         // engine restores the aligned prefix, so round down instead of dropping
         // a recoverable hit.
-        let (tokens, credit) = self.credit_parts(lora_name, tokens, usize::MAX, cache);
+        let (tokens, tier, source, generation) =
+            self.credit_parts(lora_name, tokens, usize::MAX, cache)?;
         let tokens = align_down(tokens, block_size);
         if tokens == 0 {
-            return Vec::new();
+            return None;
         }
-        let Ok(blocks) = u32::try_from(tokens / u64::from(block_size)) else {
-            return Vec::new();
-        };
+        let blocks = u32::try_from(tokens / u64::from(block_size)).ok()?;
         // The engine restores at the tier that completes the boundary; the policy
         // weighs that tier by its transfer credit.
-        let Some(credit) = credit else {
-            return Vec::new();
-        };
-        vec![TierMatch {
-            target: self.target.clone(),
-            tier: credit,
-            segments: vec![(0, blocks)],
-        }]
+        Some(PlacementMatch {
+            hits: vec![TierMatch {
+                target: self.target.clone(),
+                tier,
+                segments: vec![(0, blocks)],
+            }],
+            source,
+            generation,
+        })
     }
 }
 

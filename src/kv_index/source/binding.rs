@@ -543,22 +543,19 @@ impl SourceBinding {
         tokens: &'a [u32],
         max_reusable_tokens: usize,
         cache: &mut RequestHashCache<'a>,
-    ) -> (u64, Option<StorageTier>) {
+    ) -> Option<(u64, StorageTier, SourceVersion, u64)> {
         let replay_tokens = if cache.count_replay_pages {
             0
         } else {
             self.replay_tokens
         };
-        let Some((claims, version, reset_generation)) =
-            self.page_snapshot(namespace, tokens, true, cache)
-        else {
-            return (0, None);
-        };
+        let (claims, version, reset_generation) =
+            self.page_snapshot(namespace, tokens, true, cache)?;
         if claims
             .iter()
             .all(|pages| pages.prefix_len == 0 && pages.tail.is_empty())
         {
-            return (0, None);
+            return None;
         }
         let (credited, tier) = crate::kv_index::layout::credit_from_pages(
             &self.groups,
@@ -575,15 +572,13 @@ impl SourceBinding {
                 dense_lookups: &self.dense_lookups,
             },
         );
-        if tier.is_none() || u32::try_from(credited / self.keys.block_size() as u64).is_err() {
-            return (0, None);
+        let tier = tier?;
+        if u32::try_from(credited / self.keys.block_size() as u64).is_err()
+            || !self.snapshot_is_current(&version, reset_generation)
+        {
+            return None;
         }
-        // Release the snapshot's cache borrow before recording evidence.
-        drop(claims);
-        if !self.record_placement_if_current(cache, version, reset_generation) {
-            return (0, None);
-        }
-        (credited, tier)
+        Some((credited, tier, version, reset_generation))
     }
     pub(in crate::kv_index) fn snapshot_is_current(
         &self,

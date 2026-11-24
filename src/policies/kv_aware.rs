@@ -12,7 +12,6 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use rand::Rng;
 use sha2::{Digest as _, Sha256};
-use smallvec::SmallVec;
 
 use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
@@ -1018,7 +1017,6 @@ pub struct PromptHashes<'a> {
     // Each stage scores a single adapter identity for the entire request.
     matches: HashMap<(MatchScope, PromptKey<'a>), Vec<TierMatch>, foldhash::fast::RandomState>,
     hashes: RequestHashCache<'a>,
-    require_placement_evidence: bool,
 }
 
 impl PromptHashes<'_> {
@@ -1272,7 +1270,6 @@ impl KvAwarePolicy {
     ) -> Cow<'a, [TierMatch]> {
         let tokens = cache.hashes.canonical_prompt(tokens);
         let scoped = binding.matches.target_scoped();
-        let require_evidence = cache.require_placement_evidence;
         let mut lookup = |hashes: &mut RequestHashCache<'tokens>| {
             if let Some(reason) = fallback {
                 lookups.record(reason);
@@ -1281,8 +1278,7 @@ impl KvAwarePolicy {
             if tokens.is_empty() {
                 return Vec::new();
             }
-            let evidence_start =
-                require_evidence.then(|| hashes.placement.as_ref().map_or(0, Vec::len));
+            let evidence_start = hashes.placement.as_ref().map(Vec::len);
             let mut hits = binding.matches.matches_with_cache(
                 tokens,
                 binding.block_size,
@@ -1358,7 +1354,7 @@ impl KvAwarePolicy {
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
     ) -> Option<(usize, CostDecision)> {
-        let mut plan = self.prepare_selection(
+        let plan = self.prepare_selection(
             workers,
             QualifiedKvInput {
                 tokens: KvRequestTokens::Shared(token_ids),
@@ -1368,7 +1364,6 @@ impl KvAwarePolicy {
             cache_salt,
             false,
         )?;
-        plan.discard_revoked_credit();
         let candidates = self.candidate_views(workers, &plan);
         let (costs, components) = self.score_candidates(&plan, &candidates)?;
         let position = self.pick_position(plan.has_tokens, &costs, &components, None)?;
@@ -1433,6 +1428,7 @@ impl KvAwarePolicy {
         excluded_workers: &[String],
     ) -> Option<KvSelectionReceipt> {
         let digest = affinity_key.map(|key| key.scoped_digest(lora_name, cache_salt));
+        let reserve_prefill = self.slot_manager.is_some();
         // After three stale placement snapshots, score live load and full input
         // work without querying the index or granting KV credit.
         for attempt in 0..=3 {
@@ -1463,7 +1459,7 @@ impl KvAwarePolicy {
                     has_tokens: max_known_input > 0,
                 }
             } else {
-                self.prepare_selection(workers, input, lora_name, cache_salt, true)?
+                self.prepare_selection(workers, input, lora_name, cache_salt, reserve_prefill)?
             };
             let guard = fallback_guard.unwrap_or_else(|| self.selection_lock.lock());
             let stale = plan
@@ -1522,24 +1518,23 @@ impl KvAwarePolicy {
             let target = binding.target.clone();
             let (worker_index, new_prefill_tokens, decision) =
                 self.decision_for_position(&plan, &candidates, &costs, &components, position);
-            let _placement_pins = if !plan.grouped[position].is_empty()
-                || new_prefill_tokens < plan.input_tokens[position] as u64
+            let _placement_pins = if reserve_prefill
+                && (!plan.grouped[position].is_empty()
+                    || new_prefill_tokens < plan.input_tokens[position] as u64)
             {
-                let pins = plan
+                let evidence = plan
                     .placement
                     .iter()
-                    .filter(|proof| proof.target() == &target)
-                    .map(PlacementEvidence::try_pin)
-                    .collect::<Option<SmallVec<[_; 1]>>>();
-                let Some(pins) = pins.filter(|pins| !pins.is_empty()) else {
+                    .filter(|proof| proof.target() == &target);
+                let Some(pins) = PlacementEvidence::try_pin_all(evidence) else {
                     if let Some(record) = record {
                         record.release_ref();
                     }
                     continue;
                 };
-                pins
+                Some(pins)
             } else {
-                SmallVec::new()
+                None
             };
             // Retry exclusions preserve a valid binding. Bind a new target
             // only once the selected placement is ready to commit.
@@ -1671,7 +1666,7 @@ impl KvAwarePolicy {
         input: QualifiedKvInput<'_>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
-        require_placement_evidence: bool,
+        reserve_prefill: bool,
     ) -> Option<SelectionPlan> {
         let (healthy, bindings) = {
             let _guard = self.selection_lock.lock();
@@ -1698,11 +1693,8 @@ impl KvAwarePolicy {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("missing_tokens");
         }
         let mut lookups = crate::metrics::PlacementLookups::default();
-        let mut query_cache = PromptHashes {
-            require_placement_evidence,
-            ..PromptHashes::default()
-        };
-        query_cache.hashes.placement = Some(Vec::new());
+        let mut query_cache = PromptHashes::default();
+        query_cache.hashes.placement = reserve_prefill.then(Vec::new);
         query_cache.hashes.stop_at_gap = self.prefix_scoring;
         query_cache.hashes.single_target = healthy
             .iter()
@@ -2423,10 +2415,58 @@ impl KvAwareOps for KvAwarePolicy {
 mod tests {
     use super::*;
 
-    use crate::kv_index::source::test_support::WithPlacementEvidence;
     use crate::request_identity::{resolve_affinity_identity, IdentityFields};
     use http::HeaderMap;
     use serde_json::Value as JsonValue;
+
+    struct WithPlacementEvidence<P> {
+        inner: Arc<P>,
+        sources: Mutex<HashMap<RoutableTarget, SourceBinding>>,
+    }
+
+    impl<P: TieredMatchProvider> WithPlacementEvidence<P> {
+        fn new(inner: Arc<P>) -> Self {
+            Self {
+                inner,
+                sources: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl<P: TieredMatchProvider> TieredMatchProvider for WithPlacementEvidence<P> {
+        fn target_scoped(&self) -> bool {
+            self.inner.target_scoped()
+        }
+
+        fn matches_with_cache<'a>(
+            &self,
+            tokens: &'a [u32],
+            block_size: u32,
+            lora: Option<&str>,
+            rank: u32,
+            cache: &mut RequestHashCache<'a>,
+        ) -> Vec<TierMatch> {
+            const PROOF_PROMPT: [u32; 17] = [42; 17];
+            let hits = self
+                .inner
+                .matches_with_cache(tokens, block_size, lora, rank, cache);
+            if cache.placement.is_some() {
+                let mut sources = self.sources.lock();
+                for hit in &hits {
+                    let source = sources.entry(hit.target.clone()).or_insert_with(|| {
+                        let source = full_binding(hit.target.clone(), 16);
+                        source.begin_empty(0);
+                        warm_full(&source, 0, &PROOF_PROMPT[..16]);
+                        source
+                    });
+                    assert!(!source
+                        .matches_with_cache(&PROOF_PROMPT, 16, None, hit.target.dp_rank, cache)
+                        .is_empty());
+                }
+            }
+            hits
+        }
+    }
 
     #[test]
     fn duplicate_workers_and_prompts_share_one_metric_per_registration() {
@@ -2797,7 +2837,7 @@ mod tests {
                     model: Arc::from("model"),
                     block_size: 16,
                 },
-                Arc::new(WithPlacementEvidence(provider.clone())),
+                Arc::new(WithPlacementEvidence::new(provider.clone())),
             );
             let ids: Vec<u32> = (0..65).collect();
             for (allowed, prefill) in [(true, 1), (false, 65)] {
@@ -2965,7 +3005,7 @@ mod tests {
                 model: Arc::from("engine-cache-identity"),
                 block_size,
             };
-            let evidenced = Arc::new(WithPlacementEvidence(provider.clone()));
+            let evidenced = Arc::new(WithPlacementEvidence::new(provider.clone()));
             for worker in &workers {
                 policy.register_target_with_cache_identity(
                     worker.url(),
@@ -4434,8 +4474,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let first_provider = Arc::new(WithPlacementEvidence(first.clone()));
-        let second_provider = Arc::new(WithPlacementEvidence(second.clone()));
+        let first_provider = Arc::new(WithPlacementEvidence::new(first.clone()));
+        let second_provider = Arc::new(WithPlacementEvidence::new(second.clone()));
         for (worker, provider) in workers.iter().zip([
             first_provider.clone() as Arc<dyn TieredMatchProvider>,
             second_provider.clone(),
@@ -4607,7 +4647,7 @@ mod tests {
             }
         }
 
-        let policy = KvAwarePolicy::default();
+        let mut policy = KvAwarePolicy::default();
         let workers = decode_pool(&["http://mixed-evidence"]);
         let target = target(workers[0].url(), 0);
         let index = full_binding(target.clone(), 16);
@@ -4627,12 +4667,14 @@ mod tests {
         );
 
         let manager = policy.slot_manager().unwrap();
-        for (prompts, expected) in [
-            (vec![vec![8; 33]], 33),
-            (vec![vec![7; 33], vec![8; 33]], 34),
-        ] {
-            let inputs =
-                WorkerTokenInputs::from([(workers[0].base_url().to_owned(), Arc::from(prompts))]);
+        let inputs = WorkerTokenInputs::from([(
+            workers[0].base_url().to_owned(),
+            Arc::from([vec![7; 33], vec![8; 33]]),
+        )]);
+        for (reserve_prefill, expected) in [(true, 34), (false, 2)] {
+            if !reserve_prefill {
+                policy.slot_manager = None;
+            }
             let receipt = policy
                 .select_worker_with_inputs(
                     &workers,
@@ -4644,7 +4686,11 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(receipt.new_prefill_tokens, expected);
-            assert_eq!(manager.sample(&target).active_prefill_tokens, expected);
+            assert_eq!(receipt.slot.is_some(), reserve_prefill);
+            assert_eq!(
+                manager.sample(&target).active_prefill_tokens,
+                if reserve_prefill { expected } else { 0 }
+            );
             release_receipt(&workers, &receipt);
             assert_eq!(manager.sample(&target), LoadSample::default());
         }

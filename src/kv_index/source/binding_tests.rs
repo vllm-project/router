@@ -31,7 +31,7 @@ impl SourceBinding {
             max_reusable_tokens,
             &mut RequestHashCache::for_single_target(),
         )
-        .0
+        .map_or(0, |(credited, _, _, _)| credited)
     }
 }
 
@@ -1943,8 +1943,10 @@ fn bounded_replay_credits_one_window_below_the_engine() {
         let mut cache = crate::kv_index::RequestHashCache::for_single_target();
         cache.count_replay_pages = true;
         assert_eq!(
-            index.credit_parts(None, &tokens, usize::MAX, &mut cache),
-            (896, Some(crate::kv_index::StorageTier::Device))
+            index
+                .credit_parts(None, &tokens, usize::MAX, &mut cache)
+                .map(|(tokens, tier, _, _)| (tokens, tier)),
+            Some((896, crate::kv_index::StorageTier::Device))
         );
     }
 }
