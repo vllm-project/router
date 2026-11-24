@@ -598,9 +598,6 @@ Transfer credits are fractions of reusable tokens counted as work avoided. `0` i
 | `--kv-event-replay-idle-timeout-secs` | Integer from `1` to `4294967295` seconds | `5` | Retry when KV event replay makes no progress for this long. The timer restarts after each replay batch. Applies to Regular and P/D routing. |
 | `--kv-event-strict-recovery` | Flag | Off | After loss of event history, require complete recovery or a worker KV cache clear before restoring cache credit. Requests continue routing by load during recovery. |
 
-For example, pass `--kv-event-replay-idle-timeout-secs 8` if your publisher
-can pause for several seconds between batches during replay.
-
 ### Verification
 
 | Option | Value | Default | Purpose |
