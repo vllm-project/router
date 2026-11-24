@@ -40,6 +40,8 @@ dashmap = "6.1.0"
 scc = "3.8.8"
 http = "1.1.0"
 mime = "0.3"
+http-body = "1.0"
+http-body-util = "0.1"
 tokio = { version = "1.42.0", features = ["full"] }
 async-trait = "0.1"
 tracing = "0.1"
@@ -127,7 +129,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_
 libc = "0.2"
 criterion = { version = "0.5", features = ["html_reports"] }
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
 portpicker = "0.1"
 tempfile = "3.8"
 lazy_static = "1.4"
@@ -342,3 +343,7 @@ codegen-units = 1
 [profile.dev-opt]
 inherits = "dev"
 opt-level = 1
+
+[[test]]
+name = "test_concurrency_limit"
+path = "tests/rust/test_concurrency_limit.rs"

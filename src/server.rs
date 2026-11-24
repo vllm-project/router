@@ -4,7 +4,7 @@ use crate::{
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
-    middleware::{self, QueuedRequest, TokenBucket},
+    middleware::{self, ConcurrencyQueueSender, TokenBucket},
     policies::PolicyRegistry,
     protocols::{
         spec::{
@@ -41,7 +41,7 @@ use std::{
 use tokio::{
     net::{TcpListener, TcpStream},
     signal, spawn,
-    sync::RwLock,
+    sync::{RwLock, Semaphore},
 };
 use tracing::{error, info, warn, Level};
 
@@ -50,6 +50,7 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
+    pub concurrency_semaphore: Arc<Semaphore>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
@@ -77,6 +78,7 @@ impl AppContext {
         }
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
+        let concurrency_semaphore = Arc::new(Semaphore::new(max_concurrent_requests));
 
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new_with_affinity_ttl(
@@ -98,6 +100,7 @@ impl AppContext {
             client,
             router_config,
             rate_limiter,
+            concurrency_semaphore,
             worker_registry,
             policy_registry,
             router_manager,
@@ -112,7 +115,7 @@ impl AppContext {
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
-    pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
+    pub concurrency_queue_tx: Option<ConcurrencyQueueSender>,
     pub router_manager: Option<Arc<RouterManager>>,
 }
 
@@ -1140,6 +1143,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // Set up concurrency limiter with queue if configured
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
         app_context.rate_limiter.clone(),
+        app_context.concurrency_semaphore.clone(),
         config.router_config.queue_size,
         Duration::from_secs(config.router_config.queue_timeout_secs),
     );
