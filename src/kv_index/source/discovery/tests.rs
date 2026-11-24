@@ -2090,7 +2090,11 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
     assert!(!has_binding(1));
 
     // The rank rejected at admission is outside native layout validation.
-    let verified_at = lifecycle.state.lock().verified_at;
+    let verified_at = {
+        let mut state = lifecycle.state.lock();
+        state.hash_checked = Instant::now() - super::lifecycle::REFRESH_INTERVAL;
+        state.verified_at
+    };
     let scrapes_before_layout_poll = scrapes.load(Ordering::Relaxed);
     native.lock()["ranks"][1]["publisher_topic"] = serde_json::json!("kv/changed/1");
     wait_for(|| lifecycle.state.lock().verified_at > verified_at).await;

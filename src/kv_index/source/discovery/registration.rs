@@ -191,12 +191,14 @@ impl KvIndexSupervisor {
         if !unchanged || !lifecycle_unchanged {
             return Err("KV worker was registered while discovery was pending".into());
         }
-        let previous_state = previous.as_ref().map(|previous| previous.state.lock());
+        let previous_fences = previous
+            .as_ref()
+            .map_or_else(BoundSources::new, |previous| {
+                previous.state.lock().hash_fences.clone()
+            });
         let mut bindings = HashMap::new();
         let reported_ranks = event_sources.len();
-        let mut hash_fences = previous_state
-            .as_ref()
-            .map_or_else(BoundSources::new, |state| state.hash_fences.clone());
+        let mut hash_fences = previous_fences.clone();
         let mut rejected_hash = 0;
         event_sources.retain(|source| {
             let rank = source.dp_rank;
@@ -300,9 +302,12 @@ impl KvIndexSupervisor {
         let lifecycle = Arc::new(WorkerLifecycle::new(active.clone(), true, descriptor));
         lifecycle.state.lock().hash_fences = hash_fences;
         if let Some(previous) = &previous {
+            let state = previous.state.lock();
+            if state.hash_fences != previous_fences {
+                return Err("KV publisher eligibility changed while discovery was pending".into());
+            }
             previous.active.store(false, Ordering::Release);
         }
-        drop(previous_state);
         if let Some(previous) = workers.remove(worker_url) {
             self.installed.retire_worker(previous);
         }
@@ -356,7 +361,7 @@ impl KvIndexSupervisor {
                 lease,
             });
             replay_endpoints.extend(ev.replay_endpoint.clone());
-            targets.push((ev, index.clone(), handle));
+            targets.push((ev, index.clone(), Some(handle)));
             indexes.insert(rank, index);
             info!(
                 "kv_index {}: spawned subscriber rank{} (instance {})",
