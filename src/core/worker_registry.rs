@@ -113,6 +113,7 @@ impl WorkerRegistry {
         // finish before the new instance publishes its initial/current load.
         if let Some(previous) = self.workers.get(&worker_id) {
             previous.set_load_metrics_enabled(false);
+            self.remove_secondary_indexes(&worker_id, previous.as_ref());
         }
         worker.set_load_metrics_enabled(true);
 
@@ -158,6 +159,33 @@ impl WorkerRegistry {
         worker_id
     }
 
+    /// Caller must hold mutation_lock while changing the secondary indexes.
+    fn remove_secondary_indexes(&self, worker_id: &WorkerId, worker: &dyn Worker) {
+        // Remove from model index (both ID-based and optimized)
+        if let Some(mut model_workers) = self.model_workers.get_mut(worker.model_id()) {
+            model_workers.retain(|id| id != worker_id);
+        }
+
+        // Remove from optimized model index
+        if let Some(model_index_entry) = self.model_index.get(worker.model_id()) {
+            let worker_url = worker.url();
+            model_index_entry
+                .write()
+                .expect("RwLock for model_index is poisoned")
+                .retain(|w| w.url() != worker_url);
+        }
+
+        // Remove from type index
+        if let Some(mut type_workers) = self.type_workers.get_mut(&worker.worker_type()) {
+            type_workers.retain(|id| id != worker_id);
+        }
+
+        // Remove from connection mode index
+        if let Some(mut conn_workers) = self.connection_workers.get_mut(&worker.connection_mode()) {
+            conn_workers.retain(|id| id != worker_id);
+        }
+    }
+
     /// Remove a worker by ID
     pub fn remove(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
         let _mutation = self.mutation_lock.lock();
@@ -171,35 +199,11 @@ impl WorkerRegistry {
             // Remove from URL mapping
             self.url_to_id.remove(worker.url());
 
-            // Remove from model index (both ID-based and optimized)
-            if let Some(mut model_workers) = self.model_workers.get_mut(worker.model_id()) {
-                model_workers.retain(|id| id != worker_id);
-            }
-
-            // Remove from optimized model index
-            if let Some(model_index_entry) = self.model_index.get(worker.model_id()) {
-                let worker_url = worker.url();
-                model_index_entry
-                    .write()
-                    .expect("RwLock for model_index is poisoned")
-                    .retain(|w| w.url() != worker_url);
-            }
-
-            // Remove from type index
-            if let Some(mut type_workers) = self.type_workers.get_mut(&worker.worker_type()) {
-                type_workers.retain(|id| id != worker_id);
-            }
+            self.remove_secondary_indexes(worker_id, worker.as_ref());
             self.registration_order
                 .write()
                 .expect("RwLock for registration_order is poisoned")
                 .retain(|id| id != worker_id);
-
-            // Remove from connection mode index
-            if let Some(mut conn_workers) =
-                self.connection_workers.get_mut(&worker.connection_mode())
-            {
-                conn_workers.retain(|id| id != worker_id);
-            }
 
             self.notify_worker_state_change();
             Some(worker)
@@ -490,6 +494,69 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorker, CircuitBreakerConfig, WorkerFactory};
     use std::collections::HashMap;
+
+    #[test]
+    fn replacement_model_lookup_returns_only_the_current_worker() {
+        let registry = WorkerRegistry::new();
+        let old: Arc<dyn Worker> = Arc::new(
+            BasicWorker::new("http://replacement:8000".into(), WorkerType::Regular)
+                .with_labels(HashMap::from([("model_id".into(), "model".into())])),
+        );
+        let current: Arc<dyn Worker> = Arc::new(
+            BasicWorker::new(old.url().into(), WorkerType::Regular)
+                .with_labels(HashMap::from([("model_id".into(), "model".into())])),
+        );
+        let id = registry.register(old);
+        assert_eq!(registry.register(current.clone()), id);
+        // Registering the same live object must not duplicate any index entry.
+        registry.register(current.clone());
+        for indexed in [
+            registry.get_by_model_fast("model"),
+            registry.get_by_model("model"),
+            registry.get_by_type(&WorkerType::Regular),
+            registry.get_by_connection(&ConnectionMode::Http),
+        ] {
+            assert_eq!(indexed.len(), 1);
+            assert!(Arc::ptr_eq(&indexed[0], &current));
+        }
+    }
+
+    #[test]
+    fn replacement_moves_worker_out_of_old_metadata_indexes() {
+        let registry = WorkerRegistry::new();
+        let old: Arc<dyn Worker> = Arc::new(
+            BasicWorker::new("http://replacement:8000".into(), WorkerType::Regular)
+                .with_labels(HashMap::from([("model_id".into(), "old-model".into())])),
+        );
+        let current: Arc<dyn Worker> = Arc::new(
+            BasicWorker::with_connection_mode(
+                old.url().into(),
+                WorkerType::Decode,
+                ConnectionMode::Grpc,
+            )
+            .with_labels(HashMap::from([("model_id".into(), "new-model".into())])),
+        );
+        let id = registry.register(old);
+        assert_eq!(registry.register(current.clone()), id);
+        assert!(!registry.has_model("old-model"));
+        assert!(registry.get_by_model_fast("old-model").is_empty());
+        assert!(registry.get_by_model("old-model").is_empty());
+        assert!(registry.get_by_type(&WorkerType::Regular).is_empty());
+        assert!(registry.get_by_connection(&ConnectionMode::Http).is_empty());
+        for indexed in [
+            registry.get_by_model_fast("new-model"),
+            registry.get_by_model("new-model"),
+            registry.get_by_type(&WorkerType::Decode),
+            registry.get_by_connection(&ConnectionMode::Grpc),
+        ] {
+            assert_eq!(indexed.len(), 1);
+            assert!(Arc::ptr_eq(&indexed[0], &current));
+        }
+        registry.remove(&id);
+        assert!(registry.get_by_model_fast("new-model").is_empty());
+        assert!(registry.get_by_type(&WorkerType::Decode).is_empty());
+        assert!(registry.get_by_connection(&ConnectionMode::Grpc).is_empty());
+    }
 
     fn assert_load_sample(handle: &metrics_exporter_prometheus::PrometheusHandle, load: usize) {
         let sample = handle
