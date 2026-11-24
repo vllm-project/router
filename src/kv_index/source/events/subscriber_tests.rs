@@ -571,6 +571,31 @@ async fn invalid_queued_live_sequence_is_rejected_only_once() {
 }
 
 #[tokio::test]
+async fn failed_handoff_preserves_live_frames_for_the_next_replay() {
+    let tcp = TcpReplay::new();
+    let index = Arc::new(full_binding(target("failed-handoff"), BLOCK_SIZE));
+    let _handle = tcp.start_with_recovery(index.clone(), None, true);
+    let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
+    let clear = batch_payload(&[KVEvent::AllBlocksCleared(Default::default())]);
+    let empty = batch_payload(&[]);
+    tcp.subscribed().await;
+    let request = tcp.request(0).await;
+    tcp.live(9, &store);
+    tcp.live(i64::MAX, &empty);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    tcp.history(&request, &[(10, &clear), (11, &store)]);
+
+    let conflicting = tcp.request(0).await;
+    assert_eq!(credit(&index), 0);
+    tcp.history(&conflicting, &[(9, &empty), (10, &clear), (11, &store)]);
+
+    let matching = tcp.request(0).await;
+    assert_eq!(credit(&index), 0);
+    tcp.history(&matching, &[(9, &store), (10, &clear), (11, &store)]);
+    wait_until(|| credit(&index) == 4).await;
+}
+
+#[tokio::test]
 async fn long_replay_verifies_the_oldest_buffered_live_frame() {
     let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
     let empty = batch_payload(&[]);

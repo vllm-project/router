@@ -485,7 +485,7 @@ impl PendingLive {
         through
     }
 
-    /// Check buffered duplicates before publication and remove superseded or invalid frames.
+    /// Remove invalid frames immediately and superseded frames only after verification.
     pub(super) fn verifies_overlap(
         &mut self,
         topic: &[u8],
@@ -495,27 +495,29 @@ impl PendingLive {
     ) -> bool {
         let mut verified = true;
         self.frames.retain(|frames| {
-            match buffered_sequence(frames, topic) {
-                Some(seq) => {
-                    let superseded = baseline.is_some_and(|first| seq < first);
-                    if seq <= through
-                        && !replayed
-                            .compare(seq as u64, &frames[2])
-                            .unwrap_or(superseded)
-                    {
-                        verified = false;
-                        return true;
-                    }
-                    if !superseded {
-                        return true;
-                    }
-                    replayed.release_live(seq as u64);
-                }
-                None => verified = false,
+            if let Some(seq) = buffered_sequence(frames, topic) {
+                let superseded = baseline.is_some_and(|first| seq < first);
+                verified &= seq > through
+                    || replayed
+                        .compare(seq as u64, &frames[2])
+                        .unwrap_or(superseded);
+                return true;
             }
+            verified = false;
             self.bytes -= frames.iter().map(Vec::len).sum::<usize>();
             false
         });
+        if let Some(first) = baseline.filter(|_| verified) {
+            self.frames.retain(|frames| {
+                let seq = buffered_sequence(frames, topic).expect("validated live frame");
+                if seq >= first {
+                    return true;
+                }
+                replayed.release_live(seq as u64);
+                self.bytes -= frames.iter().map(Vec::len).sum::<usize>();
+                false
+            });
+        }
         verified
     }
 }
