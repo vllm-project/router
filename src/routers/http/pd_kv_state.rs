@@ -39,7 +39,7 @@ pub(super) struct PdKvState {
     decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
     // Serializes updates to the target bindings in both policies.
     targets: Mutex<HashMap<String, TargetRegistration>>,
-    hybrid_pairs: Option<HashMap<String, HashSet<String>>>,
+    worker_pairs: Option<HashMap<String, HashSet<String>>>,
     allow_hybrid_layouts: bool,
     nixl_decode_replay: bool,
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -61,6 +61,7 @@ impl PdKvState {
         api_key: Option<String>,
         sources: HashMap<String, crate::config::types::PdKvEventSources>,
         connector: KvConnector,
+        pairs: HashMap<String, Vec<String>>,
         registry: Arc<WorkerRegistry>,
         prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
         decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
@@ -68,6 +69,12 @@ impl PdKvState {
         allow_hybrid_layouts: bool,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
+        state.worker_pairs = (!pairs.is_empty()).then(|| {
+            pairs
+                .into_iter()
+                .map(|(prefill, decodes)| (prefill, decodes.into_iter().collect()))
+                .collect()
+        });
         state.api_key = api_key;
         state.allow_hybrid_layouts = allow_hybrid_layouts;
         state.nixl_decode_replay = connector == KvConnector::Nixl;
@@ -107,16 +114,6 @@ impl PdKvState {
         client: reqwest::Client,
         static_sources: HashMap<String, crate::config::types::PdKvEventSources>,
     ) -> Self {
-        let pairs: HashMap<_, _> = static_sources
-            .iter()
-            .filter(|(_, source)| !source.compatible_decode_urls.is_empty())
-            .map(|(prefill, source)| {
-                (
-                    prefill.clone(),
-                    source.compatible_decode_urls.iter().cloned().collect(),
-                )
-            })
-            .collect();
         let (supervisor, signals) = KvIndexSupervisor::new_pd(client.clone(), static_sources);
         drop(signals);
         Self {
@@ -127,7 +124,7 @@ impl PdKvState {
             prefill_policy: None,
             decode_policy: None,
             targets: Mutex::new(HashMap::new()),
-            hybrid_pairs: (!pairs.is_empty()).then_some(pairs),
+            worker_pairs: None,
             allow_hybrid_layouts: true,
             nixl_decode_replay: false,
             #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -135,23 +132,20 @@ impl PdKvState {
         }
     }
 
-    /// Match declared hybrid sources only with their compatible Decode workers.
-    /// Other Prefill workers can use Decode workers outside the hybrid pairs.
-    pub(super) fn compatible_hybrid_pairs(
+    /// Match Prefill workers with their configured Decode workers.
+    pub(super) fn allowed_worker_pairs(
         &self,
         prefill: &[Arc<dyn Worker>],
         decode: &[Arc<dyn Worker>],
     ) -> Option<HashSet<(PdEndpoint, PdEndpoint)>> {
-        let configured = self.hybrid_pairs.as_ref()?;
-        let hybrid_decodes: HashSet<_> =
-            configured.values().flatten().map(String::as_str).collect();
+        let configured = self.worker_pairs.as_ref()?;
         let mut allowed = HashSet::new();
         for p in prefill {
             for d in decode {
-                if configured.get(p.base_url()).map_or_else(
-                    || !hybrid_decodes.contains(d.base_url()),
-                    |decodes| decodes.contains(d.base_url()),
-                ) {
+                if configured
+                    .get(p.base_url())
+                    .is_some_and(|decodes| decodes.contains(d.base_url()))
+                {
                     allowed.insert((
                         PdEndpoint::for_worker(p.as_ref()),
                         PdEndpoint::for_worker(d.as_ref()),
@@ -205,22 +199,20 @@ impl PdKvState {
             .flat_map(|(workers, _)| workers.iter().map(|worker| worker.base_url().to_owned()))
             .collect();
         let (prefill, prefill_policy) = pools[0];
+        let prefill_bases = prefill
+            .iter()
+            .filter(|_| prefill_policy.is_some())
+            .map(|worker| worker.base_url().to_owned())
+            .collect();
         let plain_only = if self.allow_hybrid_layouts {
-            prefill
-                .iter()
-                .filter(|worker| {
-                    prefill_policy.is_some()
-                        && self
-                            .hybrid_pairs
-                            .as_ref()
-                            .is_none_or(|pairs| !pairs.contains_key(worker.base_url()))
-                })
-                .map(|worker| worker.base_url().to_owned())
-                .collect()
+            HashSet::new()
         } else {
             bases.clone()
         };
-        let registrations = self.supervisor.refresh_workers(&bases, &plain_only).await;
+        let registrations = self
+            .supervisor
+            .refresh_workers(&bases, &plain_only, &prefill_bases)
+            .await;
 
         let mut targets = self.targets.lock().await;
         // A source probe may outlive the worker it started for.
@@ -368,7 +360,7 @@ impl PdKvState {
         // always falls back - after paying for the slowest render. Require the whole set.
         // Decode pricing also never renders on non-gRPC pools: only gRPC router_prompts
         // and direct token-id prompts price without a `/render` fan-out.
-        let decode_expected = (!defer_decode || self.hybrid_pairs.is_some())
+        let decode_expected = (!defer_decode || self.worker_pairs.is_some())
             && kv_aware_ops(decode_policy.as_ref()).is_some();
         let decode_requires_render =
             router_prompts.is_none() && http_input_requires_render(request, route);
@@ -677,23 +669,12 @@ mod kv_input_tests {
     }
 
     #[tokio::test]
-    async fn configured_hybrid_pairs_restrict_hybrid_and_preserve_full_workers() {
-        let source = crate::config::PdKvEventSources {
-            endpoints: vec!["tcp://127.0.0.1:5557".into()],
-            replay_endpoints: Some(vec!["tcp://127.0.0.1:5558".into()]),
-            block_size: 16,
-            model: Some("model".into()),
-            hybrid: Some(crate::kv_index::CacheCapabilities {
-                schema_version: 1,
-                adapters: vec![],
-                ranks: vec![],
-            }),
-            compatible_decode_urls: vec!["http://d0".into()],
-        };
-        let state = PdKvState::new_with_statics(
-            Client::new(),
-            HashMap::from([("http://p0".into(), source)]),
-        );
+    async fn configured_worker_pairs_restrict_hybrid_and_preserve_full_workers() {
+        let mut state = PdKvState::new(Client::new());
+        state.worker_pairs = Some(HashMap::from([
+            ("http://p0".into(), HashSet::from(["http://d0".into()])),
+            ("http://p1".into(), HashSet::from(["http://d1".into()])),
+        ]));
         let workers = |prefix: &str| -> Vec<Arc<dyn Worker>> {
             (0..2)
                 .map(|i| {
@@ -706,7 +687,7 @@ mod kv_input_tests {
         };
         let p = workers("p");
         let d = workers("d");
-        let pairs = state.compatible_hybrid_pairs(&p, &d).unwrap();
+        let pairs = state.allowed_worker_pairs(&p, &d).unwrap();
         assert_eq!(
             pairs,
             HashSet::from([
@@ -908,7 +889,6 @@ mod kv_input_tests {
                 block_size: 16,
                 model: Some(model.into()),
                 hybrid: Some(serde_json::from_value(self.layout(model)).unwrap()),
-                compatible_decode_urls: Vec::new(),
             }
         }
 
@@ -1200,6 +1180,7 @@ mod kv_input_tests {
                 (d_base.clone(), decode_publisher.static_source("m")),
             ]),
             KvConnector::Nixl,
+            HashMap::new(),
             registry.clone(),
             Some(prefill_policy.clone()),
             Some(decode_policy.clone()),

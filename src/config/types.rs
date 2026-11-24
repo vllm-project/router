@@ -21,6 +21,9 @@ pub struct RouterConfig {
     /// Workers listed here skip HTTP control-plane discovery and probing.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pd_kv_event_sources: HashMap<String, PdKvEventSources>,
+    /// Explicit routing pairs by Prefill base URL for a heterogeneous P/D pool.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pd_worker_pairs: HashMap<String, Vec<String>>,
     /// Opt in to hiding KV placement until a complete authoritative recovery.
     #[serde(default)]
     pub kv_event_strict_recovery: bool,
@@ -1369,6 +1372,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             pd_kv_event_sources: HashMap::new(),
+            pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
@@ -1647,7 +1651,6 @@ mod tests {
                 block_size: 32,
                 model: Some("m".to_string()),
                 hybrid: None,
-                compatible_decode_urls: Vec::new(),
             },
         );
         let json = serde_json::to_string(&config).unwrap();
@@ -2245,6 +2248,7 @@ mod tests {
                 discovery_address: None,
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
             policy: PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 30,
@@ -2312,6 +2316,7 @@ mod tests {
                 ],
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
             policy: PolicyConfig::CacheAware {
                 cache_threshold: 0.9,
@@ -2380,6 +2385,7 @@ mod tests {
                 worker_urls: vec!["http://worker1".to_string()],
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
             policy: PolicyConfig::RoundRobin,
             host: "::1".to_string(), // IPv6

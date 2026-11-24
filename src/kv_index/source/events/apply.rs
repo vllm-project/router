@@ -153,6 +153,8 @@ impl SourceBinding {
                     let Some(tier) = tier_or_warn(remove.medium.as_deref()) else {
                         continue;
                     };
+                    // The wire decoder accepts an absent group for older publishers.
+                    // Admission requires a proven group before changing cache residency.
                     if self.requires_root_proof && remove.group_idx != Some(0) {
                         return Err(SourceError::InvalidBatch);
                     }

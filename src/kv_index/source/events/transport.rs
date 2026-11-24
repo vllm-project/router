@@ -397,6 +397,7 @@ impl ConnectionMonitor {
         hwm: Option<i32>,
     ) -> Result<(ReadableSocket, Self), zmq::Error> {
         let sub = ctx.socket(zmq::SUB)?;
+        sub.set_maxmsgsize(super::MAX_KV_EVENT_BYTES as i64)?;
         sub.set_linger(0)?;
         if let Some(hwm) = hwm {
             sub.set_rcvhwm(hwm)?;
@@ -460,7 +461,6 @@ pub(super) async fn while_connected(
     pending: &mut PendingLive,
     topic: &[u8],
 ) -> io::Result<ReplayPoll> {
-    const MAX_BYTES: usize = 64 * 1024 * 1024;
     tokio::pin!(replay);
     loop {
         tokio::select! {
@@ -484,7 +484,7 @@ pub(super) async fn while_connected(
                     }
                     pending.bytes += frames.iter().map(Vec::len).sum::<usize>();
                     pending.frames.push_back(frames);
-                    if pending.frames.len() >= MAX_PENDING_LIVE_FRAMES || pending.bytes >= MAX_BYTES
+                    if pending.frames.len() >= MAX_PENDING_LIVE_FRAMES || pending.bytes >= super::MAX_KV_EVENT_BYTES
                     {
                         return Ok(ReplayPoll::BufferFull);
                     }

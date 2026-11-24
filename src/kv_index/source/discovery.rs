@@ -335,14 +335,6 @@ impl KvIndexSupervisor {
         self.pd_connector = Some(connector);
     }
 
-    fn prefill_connector(&self, worker_url: &str) -> Option<KvConnector> {
-        self.pd_connector.filter(|_| {
-            self.static_pd_sources
-                .get(worker_url)
-                .is_some_and(|source| !source.compatible_decode_urls.is_empty())
-        })
-    }
-
     pub(crate) fn set_strict_recovery(&mut self, enabled: bool) {
         self.strict_recovery = enabled;
     }
@@ -462,12 +454,20 @@ impl KvIndexSupervisor {
         let discovery = self.discover(worker_url).await;
         let models = discovery.base_models.clone();
         let info =
-            self.install_observed_worker(worker_url, discovery, observed, Some(lifecycle))?;
+            self.install_observed_worker(worker_url, discovery, observed, Some(lifecycle), None)?;
         Ok((info, models))
     }
 
     /// Prepare metadata once; P/D refresh fingerprints and installs this same snapshot.
     pub(crate) async fn discover(&self, worker_url: &str) -> WorkerDiscovery {
+        self.discover_for_role(worker_url, None).await
+    }
+
+    async fn discover_for_role(
+        &self,
+        worker_url: &str,
+        prefill_connector: Option<KvConnector>,
+    ) -> WorkerDiscovery {
         let static_source = if self.http_pd {
             self.static_pd_sources
                 .get(worker_url)
@@ -507,25 +507,20 @@ impl KvIndexSupervisor {
                 )
                 .await;
                 if discovery.assumed_plain_full
-                    && (self
-                        .static_pd_sources
+                    && self
+                        .lifecycles
+                        .lock()
                         .get(worker_url)
-                        .is_some_and(|source| !source.compatible_decode_urls.is_empty())
-                        || self
-                            .lifecycles
-                            .lock()
-                            .get(worker_url)
-                            .is_some_and(|lifecycle| {
-                                lifecycle
-                                    .state
-                                    .lock()
-                                    .descriptor
-                                    .as_ref()
-                                    .is_some_and(probe::WorkerDescriptor::has_nonplain_layout)
-                            }))
+                        .is_some_and(|lifecycle| {
+                            lifecycle
+                                .state
+                                .lock()
+                                .descriptor
+                                .as_ref()
+                                .is_some_and(probe::WorkerDescriptor::has_nonplain_layout)
+                        })
                 {
-                    // Do not assume a plain layout for a known hybrid worker
-                    // or for a pairing-only entry waiting for its report.
+                    // Do not assume a plain layout for a previously observed hybrid worker.
                     discovery.hybrid = None;
                     discovery.assumed_plain_full = false;
                 }
@@ -535,7 +530,7 @@ impl KvIndexSupervisor {
         let Some(layout) = discovery.hybrid.as_ref() else {
             return discovery;
         };
-        let connector = self.prefill_connector(worker_url);
+        let connector = prefill_connector;
         let bounded_nixl = connector == Some(KvConnector::Nixl)
             && layout.ranks.iter().any(|rank| {
                 rank.groups
@@ -966,7 +961,10 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         model_id: Ok(Some(model)),
         base_models: None,
         hybrid: config.hybrid.clone(),
-        assumed_plain_full: false,
+        assumed_plain_full: config
+            .hybrid
+            .as_ref()
+            .is_some_and(CacheCapabilities::is_plain_full_attention),
     }
 }
 
@@ -1159,37 +1157,12 @@ fn synthesize_plain_full_layout(
             {
                 return None;
             }
-            Some(RankCapability {
+            Some(plain_full_rank(
                 rank,
-                declared_groups: Some(1),
-                model: model.to_owned(),
-                weight_version: "default".into(),
-                publisher_topic: Some(source.topic.clone()),
-                instance_topic: true,
-                hash_algorithm: "sha256_cbor".into(),
-                root_hash: None,
-                hash_seed: Some("vllm-none-hash".into()),
-                full_hashes: true,
-                hash_block_size: Some(size),
-                partial_hash_hits: false,
-                hash_lookahead_tokens: 0,
-                speculative_tokens: 0,
-                tail_drop_groups: None,
-                dense_lookup_groups: None,
-                prefix_caching: true,
-                groups: vec![GroupCapability {
-                    group_idx: 0,
-                    kind: "full_attention".into(),
-                    spec_type: "FullAttentionSpec".into(),
-                    block_size: size,
-                    sliding_window: None,
-                    prefix_cacheable: true,
-                    prefix_replay_tokens: 0,
-                    mamba_cache_mode: None,
-                    tokens_per_state: None,
-                    cache_role: None,
-                }],
-            })
+                model.to_owned(),
+                source.topic.clone(),
+                size,
+            ))
         })
         .collect::<Option<Vec<_>>>()?;
     if ranks.is_empty() {
@@ -1201,6 +1174,45 @@ fn synthesize_plain_full_layout(
         adapters: Vec::new(),
         ranks,
     })
+}
+
+pub(in crate::kv_index) fn plain_full_rank(
+    rank: u32,
+    model: String,
+    topic: String,
+    size: u32,
+) -> RankCapability {
+    RankCapability {
+        rank,
+        declared_groups: Some(1),
+        model,
+        weight_version: "default".into(),
+        publisher_topic: Some(topic),
+        instance_topic: true,
+        hash_algorithm: "sha256_cbor".into(),
+        root_hash: None,
+        hash_seed: Some("vllm-none-hash".into()),
+        full_hashes: true,
+        hash_block_size: Some(size),
+        partial_hash_hits: false,
+        hash_lookahead_tokens: 0,
+        speculative_tokens: 0,
+        tail_drop_groups: None,
+        dense_lookup_groups: None,
+        prefix_caching: true,
+        groups: vec![GroupCapability {
+            group_idx: 0,
+            kind: "full_attention".into(),
+            spec_type: "FullAttentionSpec".into(),
+            block_size: size,
+            sliding_window: None,
+            prefix_cacheable: true,
+            prefix_replay_tokens: 0,
+            mamba_cache_mode: None,
+            tokens_per_state: None,
+            cache_role: None,
+        }],
+    }
 }
 
 fn pd_static_source(

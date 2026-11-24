@@ -144,7 +144,7 @@ async fn registration_probe_reuses_aliases_until_the_worker_changes() {
     let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
     let lifecycle = supervisor.lifecycle_for_worker(&worker);
     let first = supervisor
-        .probe_registration(&worker, false, &lifecycle)
+        .probe_registration(&worker, false, None, &lifecycle)
         .await
         .unwrap();
     {
@@ -154,7 +154,7 @@ async fn registration_probe_reuses_aliases_until_the_worker_changes() {
         state.base_models = first.worker.base_models.unwrap();
     }
     let repeated = supervisor
-        .probe_registration(&worker, false, &lifecycle)
+        .probe_registration(&worker, false, None, &lifecycle)
         .await
         .unwrap();
     assert_eq!(
@@ -165,7 +165,7 @@ async fn registration_probe_reuses_aliases_until_the_worker_changes() {
 
     instance.store(2, Ordering::Relaxed);
     let replaced = supervisor
-        .probe_registration(&worker, false, &lifecycle)
+        .probe_registration(&worker, false, None, &lifecycle)
         .await
         .unwrap();
     assert_eq!(
@@ -952,7 +952,6 @@ async fn exercise_static_hybrid(pd: bool) {
             block_size: config.block_size,
             model: Some(config.model),
             hybrid: config.hybrid,
-            compatible_decode_urls: vec!["http://decode".into()],
         };
         KvIndexSupervisor::new_pd(
             reqwest::Client::new(),
@@ -1029,7 +1028,11 @@ async fn exercise_static_hybrid(pd: bool) {
         let revision = supervisor.worker_registrations()[&worker_url].revision;
         hybrid.lifecycle.state.lock().checked = Some(Instant::now() - Duration::from_secs(30));
         let refreshed = supervisor
-            .refresh_workers(&HashSet::from([worker_url.clone()]), &HashSet::new())
+            .refresh_workers(
+                &HashSet::from([worker_url.clone()]),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
             .await;
         assert_eq!(
             refreshed[&worker_url].revision, revision,
@@ -1489,7 +1492,6 @@ fn static_pd_discovery_builds_one_source_per_rank() {
         block_size: 32,
         model: Some("m".into()),
         hybrid: None,
-        compatible_decode_urls: Vec::new(),
     };
     let discovery = static_pd_discovery("http://10.0.0.5:8000", &config);
 
@@ -1531,7 +1533,6 @@ fn static_pd_discovery_falls_back_to_worker_url_as_model() {
         block_size: 16,
         model: None,
         hybrid: None,
-        compatible_decode_urls: Vec::new(),
     };
     let discovery = static_pd_discovery("http://127.0.0.1:8000", &config);
     assert_eq!(discovery.model_id, Ok(Some("http://127.0.0.1:8000".into())));
@@ -1559,7 +1560,6 @@ async fn static_sources_skip_http_discovery() {
             block_size: 16,
             model: Some(model.into()),
             hybrid: Some(plain_full_layout(model, "pd-static", 16)),
-            compatible_decode_urls: vec!["http://decode".into()],
         },
     ))
     .collect();
@@ -1730,14 +1730,17 @@ async fn hybrid_discovery_uses_reported_fields_in_colocated_and_pd_modes() {
     regular.shutdown();
 
     let (pd, _) = KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMap::new());
-    assert!(pd.refresh_workers(&bases, &HashSet::new()).await[&worker]
+    assert!(pd
+        .refresh_workers(&bases, &HashSet::new(), &HashSet::new())
+        .await[&worker]
         .provider
         .is_some());
-    // A worker moving from Decode to Prefill must stop receiving hybrid credit
-    // until a compatible Decode target has been configured.
-    assert!(pd.refresh_workers(&bases, &bases).await[&worker]
-        .provider
-        .is_none());
+    // Disabling hybrid layouts retires the previously installed provider.
+    assert!(
+        pd.refresh_workers(&bases, &bases, &HashSet::new()).await[&worker]
+            .provider
+            .is_none()
+    );
     assert!(pd.match_provider_for_worker(&worker).is_none());
     pd.shutdown();
 
@@ -1747,13 +1750,11 @@ async fn hybrid_discovery_uses_reported_fields_in_colocated_and_pd_modes() {
         block_size: 16,
         model: None,
         hybrid: None,
-        compatible_decode_urls: vec!["http://decode".into()],
     };
-    let (pd, _) = KvIndexSupervisor::new_pd(
-        reqwest::Client::new(),
-        HashMap::from([(worker.clone(), source.clone())]),
-    );
-    assert!(pd.refresh_workers(&bases, &HashSet::new()).await[&worker]
+    let (pd, _) = KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMap::new());
+    assert!(pd
+        .refresh_workers(&bases, &HashSet::new(), &HashSet::new())
+        .await[&worker]
         .provider
         .is_some());
     reported.lock().take();
@@ -1779,7 +1780,9 @@ async fn hybrid_discovery_uses_reported_fields_in_colocated_and_pd_modes() {
         discovered.ranks[0].publisher_topic.as_deref(),
         Some("boot-1")
     );
-    assert!(pd.refresh_workers(&bases, &HashSet::new()).await[&worker]
+    assert!(pd
+        .refresh_workers(&bases, &HashSet::new(), &HashSet::new())
+        .await[&worker]
         .provider
         .is_some());
     server.abort();
@@ -2065,7 +2068,9 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
         supervisor.lifecycles.lock()[&base].state.lock().checked =
             Some(Instant::now() - REFRESH_INTERVAL - CONTROL_TIMEOUT);
     };
-    let initial = supervisor.refresh_workers(&bases, &HashSet::new()).await;
+    let initial = supervisor
+        .refresh_workers(&bases, &HashSet::new(), &HashSet::new())
+        .await;
     assert!(initial[&base].info.is_some());
     let provider = initial[&base].provider.as_ref().unwrap();
     boundary_subscription(&publisher, "kv/boot", false).await;
@@ -2076,21 +2081,27 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
     let valid = metadata.lock()["0"].clone();
     *metadata.lock() = serde_json::json!({"not-a-rank": valid.clone()});
     rewind();
-    let rejected = supervisor.refresh_workers(&bases, &HashSet::new()).await;
+    let rejected = supervisor
+        .refresh_workers(&bases, &HashSet::new(), &HashSet::new())
+        .await;
     assert!(rejected[&base].info.is_none());
     assert!(rejected[&base].provider.is_none());
     assert!(hits().is_empty());
     assert!(!supervisor.installed.workers.lock().contains_key(&base));
     *metadata.lock() = serde_json::json!({"0": valid});
     rewind();
-    let restored = supervisor.refresh_workers(&bases, &HashSet::new()).await;
+    let restored = supervisor
+        .refresh_workers(&bases, &HashSet::new(), &HashSet::new())
+        .await;
     assert!(restored[&base].info.is_some());
     assert_ne!(restored[&base].revision, initial[&base].revision);
 
     healthy.store(false, Ordering::Relaxed);
     for failures in 1..MAX_PROBE_FAILURES {
         rewind();
-        let registration = supervisor.refresh_workers(&bases, &HashSet::new()).await;
+        let registration = supervisor
+            .refresh_workers(&bases, &HashSet::new(), &HashSet::new())
+            .await;
         assert!(registration[&base].info.is_some());
         assert!(supervisor.worker_model_eligibility(std::slice::from_ref(&base), Some("m"))[&base]);
         assert_eq!(
@@ -2102,7 +2113,9 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
         );
     }
     rewind();
-    let retired = supervisor.refresh_workers(&bases, &HashSet::new()).await;
+    let retired = supervisor
+        .refresh_workers(&bases, &HashSet::new(), &HashSet::new())
+        .await;
     assert!(retired[&base].info.is_none());
     assert!(retired[&base].provider.is_none());
     assert!(!supervisor.worker_model_eligibility(std::slice::from_ref(&base), Some("m"))[&base]);
@@ -2115,7 +2128,9 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
     );
     healthy.store(true, Ordering::Relaxed);
     rewind();
-    let recovered = supervisor.refresh_workers(&bases, &HashSet::new()).await;
+    let recovered = supervisor
+        .refresh_workers(&bases, &HashSet::new(), &HashSet::new())
+        .await;
     assert!(recovered[&base].info.is_some());
     assert_ne!(recovered[&base].revision, retired[&base].revision);
     supervisor.shutdown();
@@ -2267,6 +2282,18 @@ fn kv_event_discovery_accepts_both_wire_responses() {
         GetKvEventSourcesResponse::decode(payload.as_slice()).unwrap(),
         legacy
     );
+}
+
+#[test]
+fn wildcard_event_endpoints_preserve_ipv6_and_reject_zero_ports() {
+    let host = worker_host("http://[2001:db8::1]:8000@3").unwrap();
+    for input in ["tcp://*:5557", "tcp://[::]:5557", "tcp://0.0.0.0:5557"] {
+        assert_eq!(
+            resolve_endpoint(input, &host).unwrap(),
+            "tcp://[2001:db8::1]:5557"
+        );
+    }
+    assert!(resolve_endpoint("tcp://*:0", &host).is_err());
 }
 
 #[test]

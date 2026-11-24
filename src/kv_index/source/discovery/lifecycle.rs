@@ -175,6 +175,7 @@ impl WorkerLifecycle {
             }
             Some(_) => {
                 state.info = None;
+                state.base_models.clear();
                 state.trusted = false;
                 state.revision = crate::kv_index::next_owner_incarnation();
                 SourceAction::Rebuild

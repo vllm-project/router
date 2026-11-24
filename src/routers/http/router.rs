@@ -2018,7 +2018,7 @@ impl Router {
                 let kv_ops = kv_aware_ops(policy.as_ref());
                 let workers = self.available_workers(model_id);
                 let lora_name = declared_lora.or_else(|| {
-                    if pool == Some(crate::backend::WorkerPoolKind::Grpc) {
+                    if kv_ops.is_none() || pool == Some(crate::backend::WorkerPoolKind::Grpc) {
                         return None;
                     }
                     inferred_lora_name(&workers, typed_req.get_model()?)

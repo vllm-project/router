@@ -160,6 +160,9 @@ impl Subscriber {
             Some(socket) => socket,
             None => {
                 let socket = ctx.socket(zmq::DEALER).ok()?;
+                socket
+                    .set_maxmsgsize(super::MAX_KV_EVENT_BYTES as i64)
+                    .ok()?;
                 socket.set_linger(0).ok()?;
                 socket
                     .connect(self.source.replay_endpoint.as_deref()?)
@@ -174,7 +177,8 @@ impl Subscriber {
             warn!(%topic, %error, "KV replay request failed");
             return None;
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let idle_timeout = Duration::from_secs(5);
+        let mut deadline = tokio::time::Instant::now() + idle_timeout;
         let mut next = start;
         while tokio::time::Instant::now() < deadline
             && shutdown.is_empty()
@@ -226,6 +230,8 @@ impl Subscriber {
                     super::transport::remember_replay(replayed, seq, payload);
                     last = wire_seq;
                     next = seq + 1;
+                    deadline = tokio::time::Instant::now() + idle_timeout;
+                    tokio::task::yield_now().await;
                 }
                 Err(zmq::Error::EAGAIN) => tokio::time::sleep(Duration::from_millis(1)).await,
                 Err(error) => {
@@ -235,7 +241,7 @@ impl Subscriber {
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            warn!(%topic, "KV replay timed out");
+            warn!(%topic, "KV replay made no progress before the idle timeout");
         }
         None
     }

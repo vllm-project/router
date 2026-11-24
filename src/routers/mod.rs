@@ -223,6 +223,7 @@ mod tests {
         request: Arc<CompletionRequest>,
         calls: AtomicUsize,
         monitored: bool,
+        worker_urls: Vec<String>,
         check_identity: bool,
         pd: bool,
     }
@@ -234,7 +235,7 @@ mod tests {
         }
         fn remove_worker(&self, _: &str) {}
         fn get_worker_urls(&self) -> Vec<String> {
-            vec![]
+            self.worker_urls.clone()
         }
     }
 
@@ -380,6 +381,7 @@ mod tests {
             request: typed.clone(),
             calls: AtomicUsize::new(0),
             monitored: false,
+            worker_urls: vec!["http://shared:8000@2".into()],
             check_identity: false,
             pd: false,
         });
@@ -387,6 +389,7 @@ mod tests {
             request: typed.clone(),
             calls: AtomicUsize::new(0),
             monitored: true,
+            worker_urls: vec!["http://shared:8000@1".into()],
             check_identity: false,
             pd: true,
         });
@@ -443,6 +446,24 @@ mod tests {
         assert_eq!(regular.calls.load(Ordering::Relaxed), 0);
         assert_eq!(pd.calls.load(Ordering::Relaxed), 0);
 
+        let disjoint = manager();
+        disjoint.register_router(
+            RouterId::new("regular".into()),
+            Arc::new(LegacyRouter {
+                request: typed.clone(),
+                calls: AtomicUsize::new(0),
+                monitored: false,
+                worker_urls: vec!["http://non-kv:8000".into()],
+                check_identity: false,
+                pd: false,
+            }),
+        );
+        disjoint.register_router(RouterId::new("pd".into()), pd.clone());
+        assert_eq!(
+            disjoint.route_completion(None, &typed, None).await.status(),
+            StatusCode::ACCEPTED
+        );
+
         let unmonitored = manager();
         unmonitored.register_router(RouterId::new("regular".into()), regular.clone());
         assert_eq!(
@@ -488,6 +509,7 @@ mod tests {
             request: request.clone(),
             calls: AtomicUsize::new(0),
             monitored: false,
+            worker_urls: vec!["http://shared:8000@2".into()],
             check_identity: true,
             pd: false,
         });

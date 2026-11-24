@@ -143,6 +143,19 @@ pub(crate) fn completion_cache_read_fallback(request: &CompletionRequest) -> Opt
                 "return_token_ids" => value.is_boolean() || value.is_null(),
                 "session_id" => value.is_string() || value.is_null(),
                 "lora_path" => value.is_null(),
+                "extra_body" | "sampling_params" | "sampling_parameters" => {
+                    value.is_null()
+                        || value.as_object().is_some_and(|fields| {
+                            fields.iter().all(|(field, _)| {
+                                matches!(
+                                    field.as_str(),
+                                    "prompt_logprobs"
+                                        | "skip_reading_prefix_cache"
+                                        | "skip_reading_external_kv"
+                                )
+                            })
+                        })
+                }
                 "vllm_xargs" => {
                     value.is_null()
                         || value.as_object().is_some_and(|args| {
@@ -177,6 +190,20 @@ fn completion_credit_accepts_null_lora_path() {
         .insert("lora_path".into(), serde_json::Value::Null);
     assert_eq!(completion_cache_read_fallback(&request), None);
     request.other.remove("lora_path");
+    request.other.insert(
+        "extra_body".into(),
+        serde_json::json!({"skip_reading_prefix_cache": false}),
+    );
+    assert_eq!(completion_cache_read_fallback(&request), None);
+    request.other.insert(
+        "extra_body".into(),
+        serde_json::json!({"truncate_prompt_tokens": 1}),
+    );
+    assert_eq!(
+        completion_cache_read_fallback(&request),
+        Some("unsupported_cache_identity")
+    );
+    request.other.remove("extra_body");
     request.lora_path = Some(LoRAPath::Single(Some("adapter".into())));
     assert_eq!(
         completion_cache_read_fallback(&request),
@@ -204,13 +231,14 @@ fn cache_read_fallback(
             Some(serde_json::Value::Bool(true)) => return Some("skip_external_kv"),
             Some(_) => return Some("unsupported_cache_read"),
         }
-        if [
-            "prompt_logprobs",
-            "prompt_logprob_token_ids",
-            "prompt_logprob_start",
-        ]
-        .iter()
-        .any(|name| fields.get(*name).is_some_and(|value| !value.is_null()))
+        if fields.get("prompt_logprobs").is_some_and(|value| {
+            !matches!(
+                value,
+                serde_json::Value::Null | serde_json::Value::Bool(false)
+            )
+        }) || ["prompt_logprob_token_ids", "prompt_logprob_start"]
+            .iter()
+            .any(|name| fields.get(*name).is_some_and(|value| !value.is_null()))
         {
             return Some("unsupported_prompt_scoring");
         }
@@ -219,9 +247,14 @@ fn cache_read_fallback(
             Some(serde_json::Value::Bool(true)) => *echo = true,
             Some(_) => return Some("unsupported_cache_read"),
         }
-        *logprobs |= ["logprobs", "top_logprobs"]
-            .iter()
-            .any(|name| fields.get(*name).is_some_and(|value| !value.is_null()));
+        *logprobs |= ["logprobs", "top_logprobs"].iter().any(|name| {
+            fields.get(*name).is_some_and(|value| {
+                !matches!(
+                    value,
+                    serde_json::Value::Null | serde_json::Value::Bool(false)
+                )
+            })
+        });
         match fields.get("cache_salt") {
             None | Some(serde_json::Value::Null) => {}
             Some(serde_json::Value::String(salt)) if salt.is_empty() => {}
@@ -1263,6 +1296,10 @@ mod tests {
                 Some("unsupported_prompt_scoring"),
             ),
             (json!({"echo":false,"logprobs":0}), None),
+            (
+                json!({"echo":true,"logprobs":false,"prompt_logprobs":false}),
+                None,
+            ),
             (
                 json!({"echo":1,"logprobs":0}),
                 Some("unsupported_cache_read"),

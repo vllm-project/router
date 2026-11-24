@@ -147,14 +147,11 @@ fn loads_one_kv_layout_for_both_pd_stages() {
         ("http://prefill:8000", "http://decode:8000"),
         ("grpc://prefill:50051", "grpc://decode:50051"),
     ] {
-        let source = |host: &str| {
+        let layout = || {
             serde_json::json!({
                 "schema_version": 1,
-                "endpoints": [format!("tcp://{host}:5557")],
-                "replay_endpoints": [format!("tcp://{host}:5558")],
                 "ranks": [{
                     "rank": 0, "model": "model", "weight_version": "v1",
-                    "publisher_topic": format!("boot-{host}"), "instance_topic": true,
                     "hash_algorithm": "sha256_cbor", "hash_seed": "0", "full_hashes": true,
                     "hash_block_size": 16, "hash_lookahead_tokens": 0, "declared_groups": 1,
                     "speculative_tokens": 0, "prefix_caching": true,
@@ -168,8 +165,8 @@ fn loads_one_kv_layout_for_both_pd_stages() {
         std::fs::write(
             &path,
             serde_json::to_vec(&serde_json::json!({
-                (prefill): source("prefill"),
-                (decode): source("decode")
+                (prefill): layout(),
+                (decode): layout()
             }))
             .unwrap(),
         )
@@ -207,18 +204,14 @@ fn loads_one_kv_layout_for_both_pd_stages() {
             .unwrap(),
         )
         .unwrap();
-        config.pd_kv_event_sources.clear();
-        apply_kv_layout_file(
-            &path,
-            &config.mode,
-            &mut HashMap::new(),
-            &mut config.pd_kv_event_sources,
-        )
-        .unwrap();
-        config.validate().unwrap();
-        let source = &config.pd_kv_event_sources[prefill];
-        assert_eq!(source.compatible_decode_urls, [decode]);
-        assert!(source.hybrid.is_none());
+        let mut sources = HashMap::new();
+        assert!(
+            apply_kv_layout_file(&path, &config.mode, &mut HashMap::new(), &mut sources)
+                .unwrap_err()
+                .to_string()
+                .contains("belongs in the KV event source or P/D routing options")
+        );
+        assert!(sources.is_empty());
     }
 }
 

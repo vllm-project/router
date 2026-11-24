@@ -1238,7 +1238,7 @@ impl VllmPDRouter {
         // cache matches can be recomputed against the tree at dispatch.
         let decode_cache = decode_cache.map(Arc::new);
         let context = PdRequestContext {
-            hybrid_pairs: None,
+            worker_pairs: None,
             prefill_inputs: prefill_inputs.as_ref(),
             model_id,
             legacy_policy_input: text.as_deref(),
@@ -1427,7 +1427,7 @@ impl VllmPDRouter {
         candidates = self.live_decode_candidates(input.pool);
         Self::retain_commit_candidates(&mut candidates, input.model_id.as_deref(), pin);
         let context = PdRequestContext {
-            hybrid_pairs: None,
+            worker_pairs: None,
             prefill_inputs: None,
             model_id: input.model_id.as_deref(),
             legacy_policy_input: None,
@@ -3892,6 +3892,7 @@ mod tests {
                 None,
                 HashMap::new(),
                 router.kv_connector,
+                HashMap::new(),
                 router.pd_router.worker_registry.clone(),
                 Some(Arc::new(crate::policies::KvAwarePolicy::default())),
                 None,
@@ -6000,7 +6001,6 @@ mod tests {
                     block_size: 16,
                     model: Some("m".to_owned()),
                     hybrid: None,
-                    compatible_decode_urls: Vec::new(),
                 },
             )]),
             worker_startup_timeout_secs: 5,
@@ -6126,7 +6126,6 @@ mod tests {
                     block_size: 16,
                     model: Some("m".to_owned()),
                     hybrid: None,
-                    compatible_decode_urls: Vec::new(),
                 },
             )]),
             worker_startup_timeout_secs: 5,

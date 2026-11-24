@@ -114,6 +114,7 @@ async fn pd_router_with_kv_sources(
         },
         policy: PolicyConfig::RoundRobin,
         pd_kv_event_sources,
+        pd_worker_pairs: Default::default(),
         kv_connector: KvConnector::Nixl,
         worker_startup_timeout_secs: 5,
         intra_node_data_parallel_size: dp_size,
@@ -748,7 +749,6 @@ async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
                         block_size: 16,
                         model: Some("mock-model".into()),
                         hybrid: Some(publisher.layout("mock-model", 16)),
-                        compatible_decode_urls: vec![decode.grpc_url.clone()],
                     },
                 )
             })

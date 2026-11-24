@@ -4,7 +4,7 @@
 
 ## Versions
 
-Pair `vllm-rs` with the same vLLM release as its Python engine. Use the Rust `vllm-router` binary for the examples below.
+Pair `vllm-rs` with the same vLLM release as its Python engine. The examples use the `vllm-router` CLI.
 
 | vLLM | Worker setup | Cache reuse support | vLLM Ascend |
 | --- | --- | --- | --- |
@@ -20,11 +20,11 @@ Use the [model layout reference](#model-layout-reference) to choose a layout for
 | --- | --- |
 | Ordinary single-group full attention with event discovery, the default hash seed, and no sliding window or speculation | Worker URLs. Router derives the single-group layout and checks the hash contract against worker events. |
 | Colocated worker that reports its complete layout | Worker URLs. Router discovers the layout and event addresses. |
-| Hybrid P/D with worker-reported layouts | Worker URLs and a [pairing-only file](#hybrid-pd-pairing). |
-| Worker with event discovery that needs a layout declaration | A [layout file](#layout-template) for the missing group and hash information. Router discovers the served model, publisher topic and event addresses. Add Prefill-to-Decode pairs for hybrid P/D. |
-| Worker without event discovery, such as stock HTTP vLLM 0.30.0 | [Static event addresses and a layout](#static-event-endpoints). |
+| Hybrid P/D with worker-reported layouts | Worker URLs. Use [explicit pairs](#pd-worker-pairs) for a mixed P/D pool. |
+| Worker with event discovery that needs a layout declaration | A [layout file](#layout-template) for the missing group and hash information. Router discovers the served model, publisher topic and event addresses. |
+| Worker without event discovery, such as stock HTTP vLLM 0.30.0 | [Static event options](#static-event-endpoints). Supply a layout if the cache has multiple groups or specialized reuse rules. |
 
-A manual layout describes the worker's cache groups, hashing and reuse rules. With event discovery, leave live and replay addresses, publisher topic and model ID out of the file.
+A manual layout describes the worker's cache groups, hashing and reuse rules. Router discovers the served model and event publisher when the worker reports them.
 
 ## Configure the workers
 
@@ -36,6 +36,9 @@ A manual layout describes the worker's cache groups, hashing and reuse rules. Wi
 | Hash algorithm | Pass `--prefix-caching-hash-algo sha256_cbor` so Router and vLLM compute the same block keys. |
 | Event hashes | Set `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` to publish the full 32-byte hashes. |
 | KV events | Enable events through `--kv-events-config` and keep incremental reporting. Router uses live events to track cache changes and replay to recover missed events. |
+| HTTP text and chat | KV scoring uses the worker's render endpoint. Simple text completions can use `/tokenize`. If preparation is unavailable, the request still routes using load and keeps its original body. Explicit token ID prompts can be scored directly. |
+
+Worker retries can reuse prepared inputs. If preparation fails, Router sends the original request body and skips cache scoring for that worker.
 
 ### Set the event ports
 
@@ -126,7 +129,7 @@ export VLLM_NIXL_SIDE_CHANNEL_PORT=5601
 KV_ARGS=()
 ```
 
-In the Router terminal, use `LAYOUT_ARGS=(--kv-hybrid-layout layout.json)` when using [hybrid P/D](#hybrid-pd-pairing) or a manual layout and `LAYOUT_ARGS=()` otherwise.
+In the Router terminal, set `LAYOUT_ARGS=(--kv-hybrid-layout layout.json)` if a scored worker needs a manual layout. Otherwise use `LAYOUT_ARGS=()`. Leave Program scheduling disabled for hybrid P/D.
 
 #### HTTP P/D
 
@@ -162,29 +165,20 @@ vllm-router --vllm-pd-disaggregation \
 
 For KV-aware Decode, add `--decode-policy kv_aware` and run the event setup on Decode with separate ports. Include its layout if needed. HTTP Decode scoring requires explicit prompt token IDs.
 
-#### Hybrid P/D pairing
+#### P/D worker pairs
 
-`--prefill` and `--decode` register the worker pools. For hybrid KV transfer, add `compatible_decode_urls` under each Prefill URL in the file passed to `--kv-hybrid-layout`. Router selects only the declared pairs. Use the worker URLs from the command, without DP-rank suffixes.
+`--prefill` and `--decode` define a pool of mutually compatible workers. Use `--pd-pair` when one Router serves more than one transfer-compatible group. Supply an entry for each Prefill, using base URLs without DP-rank suffixes.
 
-If a scored worker cannot report its cache layout, add its [cache groups](#layout-template) to the same file. Leave Program scheduling disabled for hybrid P/D.
-
-If each scored worker reports its layout, the file only needs the Prefill-to-Decode pairs.
-
-```json
-{
-  "http://127.0.0.1:8000": {
-    "compatible_decode_urls": [
-      "http://127.0.0.1:8001"
-    ]
-  }
-}
+```bash
+--pd-pair 'http://p1:8000=http://d1:8000,http://d2:8000' \
+--pd-pair 'http://p2:8000=http://d3:8000'
 ```
 
 ## Layout files
 
 ### Layout template
 
-Save the layout as `layout.json` and pass `--kv-hybrid-layout layout.json`. Use your worker's HTTP or gRPC URL as the key. For hybrid P/D, add the [pairing fields](#hybrid-pd-pairing).
+Save the layout as `layout.json` and pass `--kv-hybrid-layout layout.json`. Use your worker's HTTP or gRPC URL as the key.
 
 Add one `ranks` entry per DP rank to score. Use `rank: 0` for one rank. Put the cache groups in `groups` and set `speculative_tokens: 0` when speculation is off. For a manual layout with a single full-attention group, add `"declared_groups": 1` to that rank.
 
@@ -519,41 +513,17 @@ For Ascend Qwen4Exp with speculation off, use one Full group and four Mamba grou
 
 ## Static event endpoints
 
-Use this fallback only if the worker cannot report event sources, such as stock HTTP vLLM 0.30.0. In colocated mode, `--kv-event-source` and `--kv-event-replay-source` can supply the addresses. The static setup also needs the publisher topic and hash contract, which the example supplies in the same file. Supply each address once.
-
-<details>
-<summary>Static event source for a single full-attention worker</summary>
-
-Replace `SERVED_MODEL_ID` with the worker's `id` from `/v1/models` and `replace-with-KV_TOPIC` with its current event topic. Use the worker's actual event addresses and block size.
-
-```json
-{
-  "http://127.0.0.1:8000": {
-    "endpoints": ["tcp://127.0.0.1:5557"],
-    "replay_endpoints": ["tcp://127.0.0.1:5558"],
-    "ranks": [
-      {
-        "rank": 0,
-        "model": "SERVED_MODEL_ID",
-        "publisher_topic": "replace-with-KV_TOPIC",
-        "hash_block_size": 16,
-        "speculative_tokens": 0,
-        "declared_groups": 1,
-        "groups": [
-          {"kind": "full_attention", "block_size": 16}
-        ]
-      }
-    ]
-  }
-}
-```
+Use static event options when a worker cannot report its event sources, such as stock HTTP vLLM 0.30.0. This single-group example uses the default hash seed. Set `KV_TOPIC` to the current worker topic, `SERVED_MODEL` to its served model ID and the block size to its actual value.
 
 ```bash
 vllm-router --policy kv_aware --worker-urls http://127.0.0.1:8000 \
-  --kv-hybrid-layout layout.json
+  --kv-event-source 'http://127.0.0.1:8000=tcp://127.0.0.1:5557' \
+  --kv-event-replay-source 'http://127.0.0.1:8000=tcp://127.0.0.1:5558' \
+  --kv-event-topic "http://127.0.0.1:8000=$KV_TOPIC" \
+  --kv-event-model "$SERVED_MODEL" --kv-event-block-size 16
 ```
 
-</details>
+In P/D, use `--pd-kv-events` for the live address. List publishers, replay addresses and topics in DP-rank order. Add a [layout file](#layout-template) only for group or hash rules the Router cannot derive.
 
 ## Check cache reuse
 
@@ -587,7 +557,9 @@ done
 | `--policy kv_aware` | Policy name | Score reuse in a colocated pool. |
 | `--prefill-policy kv_aware` | Policy name | Score Prefill reuse in P/D. |
 | `--decode-policy kv_aware` | Policy name | Score Decode reuse in P/D when Decode publishes KV events. |
-| `--kv-hybrid-layout` | JSON file path | Supply missing layout data, static event addresses or hybrid P/D pairs. |
+| `--kv-hybrid-layout` | JSON file path | Supply missing cache groups, hashing and reuse rules. |
+| `--pd-pair` | Repeatable `PREFILL=DECODE[,DECODE...]` | Limit routing to specified transfer-compatible pairs. |
+| `--kv-event-topic` | Repeatable `WORKER_URL=TOPIC[,TOPIC...]` | Declare topics for static publishers in DP-rank order. |
 
 See the [CLI reference](../cli_reference.md#routing-policies) for the full option list.
 
@@ -598,5 +570,5 @@ See the [CLI reference](../cli_reference.md#routing-policies) for the full optio
 | Worker reports reuse and Router stays at zero | Check that the worker publishes events and Router can reach both event ports. For a static source, confirm the model ID and publisher topic. |
 | Router rejects the layout | Use `--log-level debug` and inspect `worker-reported KV layout rejected`. Match the JSON to the actual model, rank, groups and speculation settings. |
 | Worker reports `Address already in use` | Check HTTP, gRPC, event and connector ports. Reserve separate ranges for DP ranks. |
-| Worker restarted | Generate a new publisher topic. Update a static layout that pins the topic. A Router restart uses the available replay history. |
+| Worker restarted | Generate a new publisher topic. Update `--kv-event-topic` for a static source. A Router restart uses the available replay history. |
 | Decode has no remote read | Check whether the prompt was already cached on Decode, the connector and role settings, and Decode's transfer log. |

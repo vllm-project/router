@@ -41,7 +41,7 @@ fn decode_policy_can_defer(
     policy: &dyn LoadBalancingPolicy,
     context: &PdRequestContext<'_>,
 ) -> bool {
-    context.hybrid_pairs.is_none()
+    context.worker_pairs.is_none()
         && policy.can_redecide_at_dispatch(context.decode_cache.is_some())
 }
 
@@ -117,7 +117,7 @@ pub(super) fn select_pd_pair(
     let (prefill_endpoints, mut prefill_indices) =
         eligibility.pool(Stage::Prefill, prefill_workers);
     let (decode_endpoints, mut decode_indices) = eligibility.pool(Stage::Decode, decode_workers);
-    if let Some(pairs) = context.hybrid_pairs {
+    if let Some(pairs) = context.worker_pairs {
         prefill_indices.retain(|&p| {
             decode_indices.iter().any(|&d| {
                 pairs.contains(&(prefill_endpoints[p].clone(), decode_endpoints[d].clone()))
@@ -136,7 +136,7 @@ pub(super) fn select_pd_pair(
         prefill_policy,
         context,
     )?;
-    if let Some(pairs) = context.hybrid_pairs {
+    if let Some(pairs) = context.worker_pairs {
         decode_indices
             .retain(|&d| pairs.contains(&(prefill.endpoint.clone(), decode_endpoints[d].clone())));
     }
@@ -759,9 +759,9 @@ impl PdRouterBase {
         let pairs = self
             .kv_state
             .as_ref()
-            .and_then(|state| state.compatible_hybrid_pairs(prefill_workers, decode_workers));
+            .and_then(|state| state.allowed_worker_pairs(prefill_workers, decode_workers));
         let mut context = context.clone();
-        context.hybrid_pairs = pairs.as_ref();
+        context.worker_pairs = pairs.as_ref();
         // Deferred selection has no prefill pair. When any hybrid pairs are
         // configured, commit decode at admission for the entire pool.
         let defer = defer_decode && decode_policy_can_defer(decode_policy.as_ref(), &context);
@@ -1383,6 +1383,7 @@ impl PdRouterBase {
                     ctx.router_config.api_key.clone(),
                     ctx.router_config.pd_kv_event_sources.clone(),
                     ctx.router_config.kv_connector,
+                    ctx.router_config.pd_worker_pairs.clone(),
                     Arc::clone(&ctx.worker_registry),
                     kv_aware_ops(prefill_policy.as_ref())
                         .is_some()
@@ -1592,7 +1593,7 @@ impl PdRouterBase {
         decode_workers: &[Arc<dyn Worker>],
     ) -> Response {
         let context = PdRequestContext {
-            hybrid_pairs: None,
+            worker_pairs: None,
             prefill_inputs: None,
             model_id: None,
             legacy_policy_input: None,
@@ -2126,7 +2127,7 @@ mod tests {
         let prefill_workers = router.worker_registry.get_prefill_workers();
         let decode_workers = router.worker_registry.get_decode_workers();
         let context = PdRequestContext {
-            hybrid_pairs: None,
+            worker_pairs: None,
             prefill_inputs: None,
             model_id: None,
             legacy_policy_input: None,
@@ -2158,7 +2159,7 @@ mod tests {
 
         let empty: Vec<Arc<dyn Worker>> = Vec::new();
         let context = PdRequestContext {
-            hybrid_pairs: None,
+            worker_pairs: None,
             prefill_inputs: None,
             model_id: None,
             legacy_policy_input: None,
@@ -2993,7 +2994,7 @@ mod admission_tests {
 
     fn context() -> PdRequestContext<'static> {
         PdRequestContext {
-            hybrid_pairs: None,
+            worker_pairs: None,
             prefill_inputs: None,
             model_id: None,
             legacy_policy_input: Some("original request"),
@@ -3018,7 +3019,7 @@ mod admission_tests {
             PdEndpoint::for_worker(d[0].as_ref()),
         )]);
         let mut context = context();
-        context.hybrid_pairs = Some(&allowed);
+        context.worker_pairs = Some(&allowed);
         let policy = KvAwarePolicy::default();
         assert!(!decode_policy_can_defer(&policy, &context));
         let selected =
@@ -3026,7 +3027,7 @@ mod admission_tests {
         assert_eq!(selected.prefill.worker_index, 1);
         assert_eq!(selected.decode.worker_index, 0);
         let empty = HashSet::new();
-        context.hybrid_pairs = Some(&empty);
+        context.worker_pairs = Some(&empty);
         assert!(select_pd_pair(&Loads::new(), &p, &d, &policy, &policy, &context, true).is_none());
     }
 
@@ -3082,7 +3083,7 @@ mod admission_tests {
 
     fn context_with_session(session: &str) -> PdRequestContext<'static> {
         PdRequestContext {
-            hybrid_pairs: None,
+            worker_pairs: None,
             prefill_inputs: None,
             model_id: None,
             legacy_policy_input: Some("original request"),
@@ -3836,7 +3837,7 @@ mod admission_tests {
         };
         fn ctx(model: &str) -> PdRequestContext<'_> {
             PdRequestContext {
-                hybrid_pairs: None,
+                worker_pairs: None,
                 prefill_inputs: None,
                 model_id: Some(model),
                 legacy_policy_input: Some("original request"),

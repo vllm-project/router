@@ -846,6 +846,7 @@ impl ConfigValidator {
         }
 
         crate::kv_index::config::validate_pd_sources(config)?;
+        validate_pd_worker_pairs(config)?;
 
         Ok(())
     }
@@ -921,6 +922,60 @@ fn strictly_increasing_f64(values: &[f64]) -> bool {
     !values.is_empty()
         && values.iter().all(|value| value.is_finite() && *value > 0.0)
         && values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn validate_pd_worker_pairs(config: &RouterConfig) -> ConfigResult<()> {
+    if config.pd_worker_pairs.is_empty() {
+        return Ok(());
+    }
+    let invalid = |reason| ConfigError::IncompatibleConfig { reason };
+    let RoutingMode::VllmPrefillDecode {
+        prefill_urls,
+        decode_urls,
+        ..
+    } = &config.mode
+    else {
+        return Err(invalid("--pd-pair requires P/D disaggregation".into()));
+    };
+    if config.program_scheduling.is_some()
+        || !matches!(
+            config.mode.get_prefill_policy(&config.policy),
+            PolicyConfig::KvAware { .. }
+        )
+    {
+        return Err(invalid(
+            "--pd-pair requires a KV-aware Prefill policy with Program scheduling disabled".into(),
+        ));
+    }
+    let base_url = crate::backend::strip_dp_suffix;
+    if prefill_urls
+        .iter()
+        .any(|(url, _)| !config.pd_worker_pairs.contains_key(base_url(url)))
+    {
+        return Err(invalid(
+            "--pd-pair requires an entry for each configured Prefill".into(),
+        ));
+    }
+    for (prefill, decodes) in &config.pd_worker_pairs {
+        if !prefill_urls
+            .iter()
+            .any(|(url, _)| base_url(url) == *prefill)
+        {
+            return Err(invalid(format!(
+                "--pd-pair Prefill '{prefill}' is not a configured Prefill base URL"
+            )));
+        }
+        if decodes.is_empty()
+            || decodes
+                .iter()
+                .any(|decode| !decode_urls.iter().any(|url| base_url(url) == *decode))
+        {
+            return Err(invalid(format!(
+                "--pd-pair for '{prefill}' requires configured Decode base URLs"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn strictly_increasing_usize(values: &[usize]) -> bool {
@@ -1583,7 +1638,6 @@ mod tests {
                 block_size: 16,
                 model: None,
                 hybrid: None,
-                compatible_decode_urls: Vec::new(),
             },
         );
         config
@@ -1595,7 +1649,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_pd_requires_known_pair_and_replay() {
+    fn hybrid_pd_checks_static_replay_independently_of_worker_pairs() {
         let mut config = pd_config_with_static_kv_sources();
         let source = config
             .pd_kv_event_sources
@@ -1603,7 +1657,6 @@ mod tests {
             .unwrap();
         source.model = Some("model".into());
         source.replay_endpoints = Some(vec!["tcp://prefill:5558".into()]);
-        source.compatible_decode_urls = vec!["http://decode:8000".into()];
         source.hybrid = Some(serde_json::from_value(serde_json::json!({"schema_version":1,"ranks":[{
             "rank":0,"model":"model","weight_version":"v1","publisher_topic":"boot-1",
             "instance_topic":true,"hash_algorithm":"sha256_cbor","full_hashes":true,
@@ -1617,6 +1670,20 @@ mod tests {
             ]
         }]})).unwrap());
         assert!(ConfigValidator::validate(&config).is_ok());
+        config.pd_worker_pairs.insert(
+            "http://prefill:8000".into(),
+            vec!["http://decode:8000".into()],
+        );
+        assert!(ConfigValidator::validate(&config).is_ok());
+        let mut bad_pair = config.clone();
+        bad_pair
+            .pd_worker_pairs
+            .get_mut("http://prefill:8000")
+            .unwrap()[0] = "http://unlisted:8000".into();
+        assert!(ConfigValidator::validate(&bad_pair)
+            .unwrap_err()
+            .to_string()
+            .contains("configured Decode base URLs"));
         let mut decode_layout = config.clone();
         let source = decode_layout
             .pd_kv_event_sources
@@ -1625,19 +1692,6 @@ mod tests {
         decode_layout
             .pd_kv_event_sources
             .insert("http://decode:8000".into(), source);
-        let error = ConfigValidator::validate(&decode_layout)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("compatible decode URLs require a KV-aware prefill worker"),
-            "{error}"
-        );
-        decode_layout
-            .pd_kv_event_sources
-            .get_mut("http://decode:8000")
-            .unwrap()
-            .compatible_decode_urls
-            .clear();
         assert!(ConfigValidator::validate(&decode_layout).is_ok());
         if let RoutingMode::VllmPrefillDecode { decode_policy, .. } = &mut decode_layout.mode {
             *decode_policy = Some(PolicyConfig::RoundRobin);
@@ -1647,7 +1701,6 @@ mod tests {
             .to_string()
             .contains("whose policy is not kv_aware"));
         for (case, expected) in [
-            ("decode", "not a configured decode base URL"),
             ("replay", "one replay endpoint per rank"),
             ("model", "model must not be empty"),
             ("rank", "rank 0: missing rank capability"),
@@ -1664,7 +1717,6 @@ mod tests {
                 .get_mut("http://prefill:8000")
                 .unwrap();
             match case {
-                "decode" => source.compatible_decode_urls = vec!["http://unlisted:8000".into()],
                 "replay" => source.replay_endpoints = None,
                 "model" => source.model = None,
                 "rank" => source.hybrid.as_mut().unwrap().ranks[0].rank = 1,
@@ -1806,7 +1858,6 @@ mod tests {
                 block_size: 16,
                 model: Some("m".to_string()),
                 hybrid: None,
-                compatible_decode_urls: Vec::new(),
             },
         );
         ConfigValidator::validate(&config).unwrap();

@@ -135,6 +135,7 @@ impl KvIndexSupervisor {
         &self,
         bases: &HashSet<String>,
         plain_only: &HashSet<String>,
+        prefill_bases: &HashSet<String>,
     ) -> HashMap<String, WorkerRegistration> {
         let _refresh = self.refresh_lock.lock().await;
         let removed: Vec<_> = self
@@ -173,7 +174,8 @@ impl KvIndexSupervisor {
                 })
                 .collect()
         };
-        self.refresh_registrations(refresh, plain_only).await;
+        self.refresh_registrations(refresh, plain_only, prefill_bases)
+            .await;
         self.worker_registrations()
     }
 
@@ -207,7 +209,9 @@ impl KvIndexSupervisor {
                 })
                 .collect()
         };
-        let changed = self.refresh_registrations(refresh, &HashSet::new()).await;
+        let changed = self
+            .refresh_registrations(refresh, &HashSet::new(), &HashSet::new())
+            .await;
         if changed.is_empty() {
             return HashMap::new();
         }
@@ -220,25 +224,32 @@ impl KvIndexSupervisor {
         &self,
         refresh: Vec<(String, Arc<WorkerLifecycle>, Option<Arc<AtomicBool>>)>,
         plain_only: &HashSet<String>,
+        prefill_bases: &HashSet<String>,
     ) -> HashSet<String> {
         use futures_util::{stream, StreamExt};
         let probes: Vec<_> = stream::iter(refresh.into_iter().map(
             |(base, lifecycle, owner)| async move {
+                let connector = self.pd_connector.filter(|_| prefill_bases.contains(&base));
                 let probe = tokio::time::timeout(
                     CONTROL_TIMEOUT,
-                    self.probe_registration(&base, plain_only.contains(&base), &lifecycle),
+                    self.probe_registration(
+                        &base,
+                        plain_only.contains(&base),
+                        connector,
+                        &lifecycle,
+                    ),
                 )
                 .await
                 .ok()
                 .and_then(Result::ok);
-                (base, lifecycle, owner, probe)
+                (base, lifecycle, owner, connector, probe)
             },
         ))
         .buffer_unordered(8)
         .collect()
         .await;
         let mut changed = HashSet::new();
-        for (base, lifecycle, owner, probe) in probes {
+        for (base, lifecycle, owner, connector, probe) in probes {
             if !self
                 .lifecycles
                 .lock()
@@ -267,6 +278,7 @@ impl KvIndexSupervisor {
                         probe.worker,
                         owner,
                         Some(lifecycle.clone()),
+                        connector,
                     );
                     if !installation.is_ok_and(|info| info.cache_key.is_some()) {
                         self.installed.retire_if_current(&base, &lifecycle);

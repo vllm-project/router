@@ -31,7 +31,7 @@ impl KvIndexSupervisor {
             .lock()
             .get(worker_url)
             .map(|worker| worker.active.clone());
-        self.install_observed_worker(worker_url, discovery, observed, None)
+        self.install_observed_worker(worker_url, discovery, observed, None, None)
     }
 
     pub(super) fn install_observed_worker(
@@ -40,8 +40,12 @@ impl KvIndexSupervisor {
         discovery: WorkerDiscovery,
         observed: Option<Arc<AtomicBool>>,
         expected_lifecycle: Option<Arc<WorkerLifecycle>>,
+        connector: Option<KvConnector>,
     ) -> Result<WorkerKvInfo, String> {
-        let descriptor = worker_descriptor(&discovery).ok();
+        let descriptor = worker_descriptor(&discovery).ok().map(|mut descriptor| {
+            descriptor.connector = connector;
+            descriptor
+        });
         let assumed_plain_full = discovery.assumed_plain_full;
         let grpc = crate::backend::is_grpc_url(worker_url);
         let full_attention_http =
@@ -141,7 +145,8 @@ impl KvIndexSupervisor {
         };
         // Policy intervals use this unit to translate hits back into tokens.
         // A hybrid hash boundary can lie inside the physical attention page.
-        // Use a common divisor when ranks declare different granularities.
+        // A common divisor is used for scores only. Each binding addresses
+        // pages using the hash unit from its own rank contract.
         let block_size = capability
             .ranks
             .iter()
@@ -162,8 +167,6 @@ impl KvIndexSupervisor {
 
         // Admit each rank on its own verified contract.
         let engine_model = layout_model(&server_info, &model_id, &capability);
-        // Only Prefill declares compatible Decode targets.
-        let connector = self.prefill_connector(worker_url);
         // With unknown connector metadata, price the shorter Prefill lookup.
         let truncates = match connector {
             // NIXL started trimming bounded-replay layouts in vLLM 0.32.

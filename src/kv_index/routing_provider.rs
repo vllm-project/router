@@ -344,6 +344,28 @@ impl<'a> RequestHashCache<'a> {
 mod tests {
     use super::*;
     #[test]
+    fn ranks_hash_with_their_own_units_when_scored_at_a_common_unit() {
+        use crate::kv_index::source::test_support::{full_binding, warm_full};
+        use crate::kv_index::RoutableTarget;
+
+        let prompt: Vec<u32> = (0..49).collect();
+        let mut cache = RequestHashCache::default();
+        for (rank, unit) in [(0, 16), (1, 24)] {
+            let target = RoutableTarget {
+                instance_id: "worker".into(),
+                dp_rank: rank,
+            };
+            let binding = full_binding(target.clone(), unit);
+            binding.begin_empty(0);
+            warm_full(&binding, 0, &prompt[..48]);
+            let hits = binding.matches_with_cache(&prompt, 8, None, rank, &mut cache);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].target, target);
+            assert_eq!(hits[0].segments, [(0, 6)]);
+        }
+    }
+
+    #[test]
     fn request_chains_share_only_identical_tokens_and_contracts() {
         let tokens: Vec<_> = (0..65).collect();
         assert!(PromptKey(&tokens[..64]) != PromptKey(&tokens));

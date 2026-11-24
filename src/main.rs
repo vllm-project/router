@@ -4,10 +4,9 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
+    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
     ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
-use vllm_router_rs::kv_index::apply_kv_layout_file;
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
 use vllm_router_rs::service_discovery::ServiceDiscoveryConfig;
@@ -151,11 +150,14 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
 
+    /// Restrict a Prefill worker to its compatible Decode workers in a mixed P/D pool.
+    #[arg(long = "pd-pair", action = ArgAction::Append, value_name = "PREFILL=DECODE[,DECODE...]")]
+    pd_pair: Vec<String>,
+
     /// Static KV event publishers for KV-aware prefill or decode workers.
     /// Specify "URL=ZMQ_PUB_ENDPOINT[,ENDPOINT...]" once per worker in DP-rank
     /// order. Block size defaults to 16.
-    /// Replay endpoints, block size, and model are only configurable via the
-    /// YAML/JSON config file.
+    /// Use the shared KV event replay, block size and model options for static sources.
     #[arg(
         long = "pd-kv-events",
         action = ArgAction::Append,
@@ -213,6 +215,9 @@ struct CliArgs {
     /// Optional ZMQ replay endpoints, one per DP rank, keyed by worker URL.
     #[arg(long = "kv-event-replay-source", action = ArgAction::Append, value_name = "WORKER_URL=ENDPOINT[,ENDPOINT...]")]
     kv_event_replay_source: Vec<String>,
+    /// Topics for static KV event publishers in DP-rank order.
+    #[arg(long, action = ArgAction::Append, value_name = "WORKER_URL=TOPIC[,TOPIC...]")]
+    kv_event_topic: Vec<String>,
     /// KV cache block size for static event publishers.
     #[arg(long, default_value_t = 16)]
     kv_event_block_size: u32,
@@ -478,7 +483,11 @@ impl CliArgs {
         }
     }
 
-    fn parse_pd_kv_events(specs: &[String]) -> ConfigResult<HashMap<String, PdKvEventSources>> {
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn parse_pd_kv_events(
+        specs: &[String],
+    ) -> ConfigResult<HashMap<String, vllm_router_rs::config::PdKvEventSources>> {
         vllm_router_rs::config::parse_pd_kv_events(specs)
     }
 
@@ -487,12 +496,6 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
-        let mut static_kv_event_sources = vllm_router_rs::config::parse_static_kv_event_sources(
-            &self.kv_event_source,
-            &self.kv_event_replay_source,
-            self.kv_event_block_size,
-            self.kv_event_model.as_deref(),
-        )?;
         // Determine routing mode
         let mode = if self.enable_igw {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
@@ -571,15 +574,16 @@ impl CliArgs {
             }
         };
 
-        let mut pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
-        if let Some(path) = &self.kv_hybrid_layout {
-            apply_kv_layout_file(
-                path,
-                &mode,
-                &mut static_kv_event_sources,
-                &mut pd_kv_event_sources,
-            )?;
+        let kv_sources = vllm_router_rs::config::KvSourceOptions {
+            layout: self.kv_hybrid_layout.as_deref(),
+            publishers: &self.kv_event_source,
+            pd_publishers: &self.pd_kv_events,
+            replay: &self.kv_event_replay_source,
+            topics: &self.kv_event_topic,
+            block_size: self.kv_event_block_size,
+            model: self.kv_event_model.as_deref(),
         }
+        .load(&mode)?;
 
         // Main policy
         let mut policy = self.parse_policy(&self.policy);
@@ -588,8 +592,8 @@ impl CliArgs {
             ..
         } = &mut policy
         {
-            **configured = static_kv_event_sources;
-        } else if !static_kv_event_sources.is_empty() {
+            **configured = kv_sources.regular;
+        } else if !kv_sources.regular.is_empty() {
             return Err(ConfigError::IncompatibleConfig {
                 reason: "--kv-event-source and --kv-hybrid-layout require --policy kv_aware in regular mode".to_string(),
             });
@@ -647,7 +651,8 @@ impl CliArgs {
                     reason: format!("Invalid --epd-config: {e}"),
                 })?,
             mode,
-            pd_kv_event_sources,
+            pd_kv_event_sources: kv_sources.pd,
+            pd_worker_pairs: vllm_router_rs::config::parse_pd_worker_pairs(&self.pd_pair)?,
             kv_event_strict_recovery: self.kv_event_strict_recovery,
             policy,
             connection_mode,
@@ -877,23 +882,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("layout.json");
         let worker = "http://127.0.0.1:8000";
-        let mut coverage = [false; 3];
-        for block in guide.split("\n```json\n").skip(1) {
-            let (example, _) = block.split_once("\n```").expect("unclosed JSON example");
-            let value: serde_json::Value =
-                serde_json::from_str(example).expect("invalid JSON example");
-            let Some(layout) = value.get(worker) else {
-                continue;
-            };
-            let is_pd = layout.get("compatible_decode_urls").is_some();
-            let example_kind = if is_pd {
-                2
-            } else if layout.get("endpoints").is_some() {
-                1
-            } else {
-                0
-            };
-            std::fs::write(&path, example).unwrap();
+        let example = guide
+            .split("\n```json\n")
+            .skip(1)
+            .map(|block| block.split_once("\n```").expect("unclosed JSON example").0)
+            .find(|example| {
+                serde_json::from_str::<serde_json::Value>(example)
+                    .expect("invalid JSON example")
+                    .get(worker)
+                    .is_some_and(|layout| layout.get("ranks").is_some())
+            })
+            .expect("missing worker layout example");
+        std::fs::write(&path, example).unwrap();
+        for pd in [false, true] {
             let mut cli = vec![
                 "vllm-router",
                 "--policy",
@@ -901,7 +902,7 @@ mod tests {
                 "--kv-hybrid-layout",
                 path.to_str().unwrap(),
             ];
-            let prefill = if is_pd {
+            let prefill = if pd {
                 cli.extend([
                     "--vllm-pd-disaggregation",
                     "--decode",
@@ -919,12 +920,75 @@ mod tests {
             config.validate().unwrap_or_else(|error| {
                 panic!("invalid worker layout example: {error}\n{example}")
             });
-            coverage[example_kind] = true;
+            assert!(config.pd_worker_pairs.is_empty());
         }
-        assert_eq!(
-            coverage, [true; 3],
-            "expected colocated, static and P/D examples"
-        );
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--vllm-pd-disaggregation",
+            "--prefill-policy",
+            "kv_aware",
+            "--decode",
+            "http://127.0.0.1:8001",
+            "--pd-pair",
+            "http://127.0.0.1:8000=http://127.0.0.1:8001",
+        ])
+        .unwrap();
+        let config = args
+            .to_router_config(vec![(worker.to_owned(), None)])
+            .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.pd_worker_pairs[worker], ["http://127.0.0.1:8001"]);
+        assert!(config.pd_kv_event_sources.is_empty());
+    }
+
+    #[test]
+    fn static_event_options_admit_plain_attention_without_layout() {
+        let worker = "http://127.0.0.1:8000";
+        for pd in [false, true] {
+            let mut cli = vec![
+                "vllm-router",
+                "--policy",
+                "kv_aware",
+                "--kv-event-topic",
+                "http://127.0.0.1:8000=boot-1",
+                "--kv-event-replay-source",
+                "http://127.0.0.1:8000=tcp://127.0.0.1:5558",
+                "--kv-event-model",
+                "qwen3",
+            ];
+            let prefill = if pd {
+                cli.extend([
+                    "--vllm-pd-disaggregation",
+                    "--decode",
+                    "http://127.0.0.1:8001",
+                    "--pd-kv-events",
+                ]);
+                vec![(worker.to_owned(), None)]
+            } else {
+                cli.extend(["--worker-urls", worker, "--kv-event-source"]);
+                Vec::new()
+            };
+            cli.push("http://127.0.0.1:8000=tcp://127.0.0.1:5557");
+            let config = CliArgs::try_parse_from(cli)
+                .unwrap()
+                .to_router_config(prefill)
+                .unwrap();
+            config.validate().unwrap();
+            let layout = if pd {
+                config.pd_kv_event_sources[worker].hybrid.as_ref().unwrap()
+            } else {
+                let PolicyConfig::KvAware {
+                    static_kv_event_sources,
+                    ..
+                } = &config.policy
+                else {
+                    unreachable!()
+                };
+                static_kv_event_sources[worker].hybrid.as_ref().unwrap()
+            };
+            assert_eq!(layout.ranks[0].publisher_topic.as_deref(), Some("boot-1"));
+            assert_eq!(layout.ranks[0].groups[0].block_size, 16);
+        }
     }
 
     #[test]

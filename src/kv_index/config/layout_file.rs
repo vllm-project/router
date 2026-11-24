@@ -6,17 +6,6 @@ use super::{PdKvEventSources, StaticKvEventSources};
 use crate::config::{ConfigError, ConfigResult, RoutingMode};
 use crate::kv_index::CacheCapabilities;
 
-#[derive(serde::Deserialize)]
-struct WorkerKvLayout {
-    #[serde(flatten)]
-    layout: serde_json::Map<String, serde_json::Value>,
-    #[serde(default)]
-    endpoints: Vec<String>,
-    replay_endpoints: Option<Vec<String>>,
-    #[serde(default)]
-    compatible_decode_urls: Vec<String>,
-}
-
 /// Fill defaults for operator-supplied layouts. Worker reports use the strict wire schema.
 fn parse_kv_layout(
     mut layout: serde_json::Map<String, serde_json::Value>,
@@ -38,8 +27,16 @@ fn parse_kv_layout(
             if !rank.contains_key("root_hash") {
                 rank.entry("hash_seed").or_insert(json!("vllm-none-hash"));
             }
-            if rank.get("speculative_tokens").and_then(Value::as_u64) == Some(0) {
-                rank.entry("hash_lookahead_tokens").or_insert(json!(0));
+            match rank.get("speculative_tokens").and_then(Value::as_u64) {
+                Some(0) => {
+                    rank.entry("hash_lookahead_tokens").or_insert(json!(0));
+                }
+                Some(_) if !rank.contains_key("hash_lookahead_tokens") => {
+                    return Err(serde::de::Error::custom(
+                        "set hash_lookahead_tokens to the worker's block hash lookahead when speculation is enabled",
+                    ));
+                }
+                _ => {}
             }
             if let Some(groups) = rank.get_mut("groups").and_then(Value::as_array_mut) {
                 for (idx, group) in groups.iter_mut().enumerate() {
@@ -75,7 +72,9 @@ fn parse_kv_layout(
     serde_json::from_value(Value::Object(layout))
 }
 
-fn read_layout_file(path: &Path) -> ConfigResult<HashMap<String, WorkerKvLayout>> {
+fn read_layout_file(
+    path: &Path,
+) -> ConfigResult<HashMap<String, serde_json::Map<String, serde_json::Value>>> {
     let data = std::fs::read(path).map_err(|error| ConfigError::ValidationFailed {
         reason: format!("cannot read KV cache layout {}: {error}", path.display()),
     })?;
@@ -94,85 +93,78 @@ pub fn apply_kv_layout_file(
 ) -> ConfigResult<()> {
     let layouts = read_layout_file(path)?;
     let pd = matches!(mode, RoutingMode::VllmPrefillDecode { .. });
-    for (worker, config) in layouts {
-        let WorkerKvLayout {
-            layout,
-            endpoints,
-            replay_endpoints,
-            compatible_decode_urls,
-        } = config;
-        let layout: Option<CacheCapabilities> =
-            if pd && !compatible_decode_urls.is_empty() && layout.is_empty() {
-                None
-            } else {
-                let layout =
-                    parse_kv_layout(layout).map_err(|error| ConfigError::ValidationFailed {
-                        reason: format!("invalid KV cache layout for '{worker}': {error}"),
-                    })?;
-                if layout.ranks.is_empty() {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: format!(
-                            "KV cache layout for '{worker}' must declare at least one rank"
-                        ),
-                    });
-                }
-                Some(layout)
-            };
-        let rank = layout.as_ref().and_then(|layout| {
-            if let Some(rank) = crate::backend::parse_dp_rank(&worker) {
-                layout.rank_capability(rank)
-            } else {
-                layout.ranks.iter().min_by_key(|rank| rank.rank)
+    for (worker, fields) in layouts {
+        for field in ["endpoints", "replay_endpoints", "compatible_decode_urls"] {
+            if fields.contains_key(field) {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!("'{field}' for '{worker}' belongs in the KV event source or P/D routing options, not the cache layout"),
+                });
             }
-        });
-        let block_size = rank
-            .and_then(|rank| rank.hash_block_size)
-            .or_else(|| {
-                layout
-                    .as_ref()?
-                    .ranks
-                    .iter()
-                    .find_map(|rank| rank.hash_block_size)
+        }
+        if fields
+            .get("ranks")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|ranks| {
+                ranks.iter().any(|rank| {
+                    rank.get("publisher_topic").is_some() || rank.get("instance_topic").is_some()
+                })
             })
-            .unwrap_or(16);
-        let model = rank
-            .map(|rank| rank.model.clone())
-            .filter(|model| !model.is_empty());
-        if pd {
-            let source = PdKvEventSources {
-                endpoints,
-                replay_endpoints,
-                block_size,
-                model,
-                hybrid: layout,
-                compatible_decode_urls,
-            };
-            if pd_kv_event_sources.insert(worker.clone(), source).is_some() {
-                return Err(ConfigError::ValidationFailed {
-                    reason: format!("duplicate PD KV event source for '{worker}'"),
-                });
-            }
-        } else if let Some(source) = static_kv_event_sources.get_mut(&worker) {
-            if !endpoints.is_empty() || replay_endpoints.is_some() {
-                return Err(ConfigError::ValidationFailed {
-                    reason: format!("duplicate KV event endpoints for '{worker}'"),
-                });
-            }
-            source.hybrid = layout;
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: format!("publisher topics for '{worker}' belong in --kv-event-topic or worker discovery"),
+            });
+        }
+        let layout = parse_kv_layout(fields).map_err(|error| ConfigError::ValidationFailed {
+            reason: format!("invalid KV cache layout for '{worker}': {error}"),
+        })?;
+        let rank = if let Some(rank) = crate::backend::parse_dp_rank(&worker) {
+            layout.rank_capability(rank)
         } else {
-            static_kv_event_sources.insert(
-                worker,
-                StaticKvEventSources {
-                    endpoints,
-                    replay_endpoints,
-                    topic: rank
-                        .and_then(|rank| rank.publisher_topic.clone())
-                        .unwrap_or_default(),
-                    block_size,
-                    model: model.unwrap_or_default(),
-                    hybrid: layout,
-                },
-            );
+            layout.ranks.iter().min_by_key(|rank| rank.rank)
+        }
+        .ok_or_else(|| ConfigError::ValidationFailed {
+            reason: format!("KV cache layout for '{worker}' must declare at least one rank"),
+        })?;
+        let block_size = rank
+            .hash_block_size
+            .or_else(|| layout.ranks.iter().find_map(|rank| rank.hash_block_size));
+        let model = (!rank.model.is_empty()).then(|| rank.model.clone());
+        if pd {
+            let source = pd_kv_event_sources
+                .entry(worker)
+                .or_insert(PdKvEventSources {
+                    endpoints: Vec::new(),
+                    replay_endpoints: None,
+                    block_size: 16,
+                    model: None,
+                    hybrid: None,
+                });
+            if let Some(size) = block_size {
+                source.block_size = size;
+            }
+            if model.is_some() {
+                source.model = model;
+            }
+            source.hybrid = Some(layout);
+        } else {
+            let source =
+                static_kv_event_sources
+                    .entry(worker)
+                    .or_insert_with(|| StaticKvEventSources {
+                        endpoints: Vec::new(),
+                        replay_endpoints: None,
+                        topic: String::new(),
+                        block_size: 16,
+                        model: String::new(),
+                        hybrid: None,
+                    });
+            if let Some(size) = block_size {
+                source.block_size = size;
+            }
+            if let Some(model) = model {
+                source.model = model;
+            }
+            source.hybrid = Some(layout);
         }
     }
     Ok(())

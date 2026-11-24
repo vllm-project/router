@@ -7,7 +7,9 @@ use serde::Deserialize;
 
 /// Decode atomically without conflating structural validity with device admission.
 pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
-    // Publishers must be trusted: live batches have no per-frame size limit.
+    if payload.len() > super::MAX_KV_EVENT_BYTES {
+        return Err("KV event payload exceeds 64 MiB".into());
+    }
     // rmpv accepts Reserved as nil; rmp-serde can turn invalid strings into
     // bytes. Use it only for syntax, then retain rmpv's wire type fidelity.
     let mut syntax = rmp_serde::Deserializer::new(Cursor::new(payload));
@@ -546,6 +548,15 @@ mod tests {
         ]);
         let batch = decode_batch(&encode(vec![removed; 4712], Value::from(0))).unwrap();
         assert_eq!(batch.events.len(), 4712);
+    }
+
+    #[test]
+    fn oversized_payload_is_rejected_before_decoding() {
+        let payload = vec![0; super::super::MAX_KV_EVENT_BYTES + 1];
+        assert_eq!(
+            decode_batch(&payload).unwrap_err(),
+            "KV event payload exceeds 64 MiB"
+        );
     }
 
     #[test]

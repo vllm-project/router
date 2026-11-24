@@ -584,7 +584,7 @@ impl DPAwareWorker {
     /// Copy the served-model labels of the base URL onto every DP rank: the
     /// ranks share one engine, so they serve the same names.
     pub fn with_labels(mut self, labels: std::collections::HashMap<String, String>) -> Self {
-        self.base_worker = self.base_worker.with_labels(labels);
+        self.base_worker.metadata.labels.extend(labels);
         self
     }
 }
@@ -2030,7 +2030,12 @@ mod tests {
         labels.insert("model_id".to_string(), "Qwen3.5-4B".to_string());
         labels.insert("served_model_aliases".to_string(), "qwen".to_string());
         let worker = DPAwareWorker::new("http://host:8000".to_string(), 1, 2, WorkerType::Regular)
+            .with_labels(std::collections::HashMap::from([(
+                "pool".into(),
+                "test".into(),
+            )]))
             .with_labels(labels);
+        assert_eq!(worker.metadata().labels["pool"], "test");
 
         assert_eq!(worker.model_id(), "Qwen3.5-4B");
         assert_eq!(worker.metadata().labels["served_model_aliases"], "qwen");

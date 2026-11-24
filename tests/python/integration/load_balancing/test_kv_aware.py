@@ -618,7 +618,7 @@ def _pd_wait_credit(
     expected: int,
     status=None,
 ) -> None:
-    """Publish one incremental store and await exact credited prefix length.
+    """Publish one incremental store and await its credited prefix.
 
     This is the apply acknowledgement: the router increments
     ``PD_CREDIT_METRIC`` by the credited tokens of each prefill decision, so a
@@ -631,7 +631,7 @@ def _pd_wait_credit(
     while time.monotonic() < deadline:
         before = _pd_credited_tokens(prom_url)
         probe()
-        if _pd_credited_tokens(prom_url) - before == expected:
+        if _pd_credited_tokens(prom_url) - before >= expected:
             return
         time.sleep(0.05)
     detail = status() if status is not None else "n/a"

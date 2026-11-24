@@ -31,6 +31,7 @@ pub(super) struct WorkerDescriptor {
     model_id: Result<Option<String>, String>,
     hybrid: Option<CacheCapabilities>,
     assumed_plain_full: bool,
+    pub(super) connector: Option<crate::config::KvConnector>,
 }
 
 impl WorkerDescriptor {
@@ -54,6 +55,7 @@ pub(super) fn worker_descriptor(worker: &WorkerDiscovery) -> Result<WorkerDescri
         model_id: worker.model_id.clone(),
         hybrid: worker.hybrid.clone(),
         assumed_plain_full: worker.assumed_plain_full,
+        connector: None,
     })
 }
 
@@ -62,9 +64,10 @@ impl KvIndexSupervisor {
         &self,
         base: &str,
         plain_only: bool,
+        connector: Option<crate::config::KvConnector>,
         lifecycle: &WorkerLifecycle,
     ) -> Result<RegistrationProbe, String> {
-        let mut worker = self.discover(base).await;
+        let mut worker = self.discover_for_role(base, connector).await;
         if plain_only
             && worker
                 .hybrid
@@ -77,7 +80,8 @@ impl KvIndexSupervisor {
             );
             worker.hybrid = None;
         }
-        let descriptor = worker_descriptor(&worker)?;
+        let mut descriptor = worker_descriptor(&worker)?;
+        descriptor.connector = connector;
         if worker.base_models.is_none() {
             let cached = {
                 let state = lifecycle.state.lock();
@@ -292,7 +296,10 @@ pub(super) async fn fetch_native_sources(
 
     let (sources, layout) = tokio::join!(
         fetch_kv_event_sources(client, worker_url, api_key),
-        tokio::time::timeout(timeout, fetch_http_layout(client, worker_url, api_key)),
+        tokio::time::timeout(
+            timeout,
+            fetch_http_layout(client, worker_url, api_key, timeout / 3)
+        ),
     );
     (
         sources,
@@ -304,14 +311,20 @@ async fn fetch_http_layout(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
+    attempt_timeout: Duration,
 ) -> Result<Option<CacheCapabilities>, String> {
     let url = format!(
         "{}/kv_routing_capabilities",
         worker_url.trim_end_matches('/')
     );
-    let response = worker_get(client, &url, api_key)
-        .send()
-        .await
+    let fetch = || tokio::time::timeout(attempt_timeout, worker_get(client, &url, api_key).send());
+    let mut response = fetch().await;
+    if !matches!(&response, Ok(Ok(response)) if !response.status().is_server_error()) {
+        // Retry a transient probe failure before deciding the worker's cache shape.
+        response = fetch().await;
+    }
+    let response = response
+        .map_err(|_| format!("kv_routing_capabilities {url} timed out"))?
         .map_err(|error| format!("kv_routing_capabilities {url}: {error}"))?;
     let status = response.status();
     if matches!(status.as_u16(), 404 | 405) {
@@ -660,19 +673,22 @@ fn served_base_model_ids(body: &serde_json::Value) -> impl Iterator<Item = &str>
 
 /// Names this worker serves as base models: the model it registered plus
 /// the `--served-model-name` aliases the engine reported, when known.
-fn worker_base_model_names(worker: &dyn Worker) -> Vec<&str> {
-    let mut served = vec![worker.model_id()];
-    if let Some(aliases) = worker.metadata().labels.get("served_model_aliases") {
-        served.extend(aliases.split(',').filter(|alias| !alias.is_empty()));
-    }
-    served
+fn worker_base_model_names(worker: &dyn Worker) -> impl Iterator<Item = &str> {
+    std::iter::once(worker.model_id()).chain(
+        worker
+            .metadata()
+            .labels
+            .get("served_model_aliases")
+            .into_iter()
+            .flat_map(|aliases| aliases.split(',').filter(|alias| !alias.is_empty())),
+    )
 }
 
 /// Whether `name` selects this worker's base model rather than one of its
 /// adapters. vLLM selects an adapter through the request's `model`, and an
 /// adapter name is neither the model id nor a served alias.
 pub(crate) fn worker_serves_base_model(worker: &dyn Worker, name: &str) -> bool {
-    worker_base_model_names(worker).contains(&name)
+    worker_base_model_names(worker).any(|model| model == name)
 }
 
 pub(crate) fn inferred_lora_name<'a>(
@@ -683,11 +699,14 @@ pub(crate) fn inferred_lora_name<'a>(
     // aliases leaves the identity unclassified.
     (!workers.is_empty()
         && workers.iter().all(|worker| {
-            let served = worker_base_model_names(worker.as_ref());
-            served
-                .iter()
-                .any(|name| !name.is_empty() && *name != UNLABELED_WORKER_MODEL_ID)
-                && !served.contains(&requested)
+            let mut known_base = false;
+            for name in worker_base_model_names(worker.as_ref()) {
+                if name == requested {
+                    return false;
+                }
+                known_base |= !name.is_empty() && name != UNLABELED_WORKER_MODEL_ID;
+            }
+            known_base
         }))
     .then_some(requested)
 }
@@ -714,6 +733,38 @@ pub(super) fn served_model(models: &serde_json::Value) -> Option<(String, Option
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn layout_discovery_retries_transient_http_failure() {
+        use axum::{http::StatusCode, routing::get, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/kv_routing_capabilities",
+            get({
+                let requests = requests.clone();
+                move || {
+                    let attempt = requests.fetch_add(1, Ordering::Relaxed);
+                    async move {
+                        if attempt == 0 {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::NOT_FOUND
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let report = fetch_http_layout(&reqwest::Client::new(), &url, None, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(report.is_none());
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        server.abort();
+    }
 
     #[test]
     fn grpc_model_id_preserves_errors_and_rejects_empty_ids() {

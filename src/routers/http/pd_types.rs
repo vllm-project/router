@@ -178,7 +178,7 @@ pub struct PdPrefillInput {
 /// effective input, so different tokenizer/template configurations never mix.
 #[derive(Clone)]
 pub struct PdRequestContext<'a> {
-    pub hybrid_pairs: Option<&'a HashSet<(PdEndpoint, PdEndpoint)>>,
+    pub worker_pairs: Option<&'a HashSet<(PdEndpoint, PdEndpoint)>>,
     pub prefill_inputs: Option<&'a HashMap<String, PdPrefillInput>>,
     pub model_id: Option<&'a str>,
     pub legacy_policy_input: Option<&'a str>,

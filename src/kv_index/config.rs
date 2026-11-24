@@ -1,4 +1,4 @@
-//! KV event-source configuration, including CLI layouts and routing compatibility.
+//! KV event-source configuration and cache layouts.
 
 use crate::config::{ConfigError, ConfigResult, PolicyConfig, RouterConfig, RoutingMode};
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ pub use layout_file::apply_kv_layout_file;
 /// OpenAI-compatible frontends never serve it. On v0.29/v0.30 a deployment
 /// must declare its sources here (or use the gRPC Control RPC).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PdKvEventSources {
     /// ZMQ PUB endpoints, one per data-parallel rank (index = rank).
     pub endpoints: Vec<String>,
@@ -30,9 +31,6 @@ pub struct PdKvEventSources {
     /// Router-managed cache layout for this prefill or decode worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hybrid: Option<crate::kv_index::CacheCapabilities>,
-    /// Decode base URLs explicitly verified for this hybrid prefill worker.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub compatible_decode_urls: Vec<String>,
 }
 
 fn default_pd_kv_block_size() -> u32 {
@@ -61,6 +59,131 @@ pub struct StaticKvEventSources {
     /// Router-managed hybrid layout and per-rank publisher identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hybrid: Option<crate::kv_index::CacheCapabilities>,
+}
+
+/// Launch-time inputs for KV event sources and the worker cache layouts.
+#[doc(hidden)]
+pub struct KvSourceOptions<'a> {
+    pub layout: Option<&'a std::path::Path>,
+    pub publishers: &'a [String],
+    pub pd_publishers: &'a [String],
+    pub replay: &'a [String],
+    pub topics: &'a [String],
+    pub model: Option<&'a str>,
+    pub block_size: u32,
+}
+
+#[doc(hidden)]
+pub struct ConfiguredKvSources {
+    pub regular: std::collections::HashMap<String, StaticKvEventSources>,
+    pub pd: std::collections::HashMap<String, PdKvEventSources>,
+}
+
+impl KvSourceOptions<'_> {
+    pub fn load(&self, mode: &RoutingMode) -> ConfigResult<ConfiguredKvSources> {
+        let is_pd = matches!(mode, RoutingMode::VllmPrefillDecode { .. });
+        let mut regular = parse_static_kv_event_sources(
+            self.publishers,
+            if is_pd { &[] } else { self.replay },
+            self.block_size,
+            self.model,
+        )?;
+        let mut pd = parse_pd_kv_events(self.pd_publishers)?;
+        for source in pd.values_mut() {
+            source.block_size = self.block_size;
+            source.model = self.model.map(str::to_owned);
+        }
+        if is_pd {
+            for spec in self.replay {
+                let (worker, endpoints) = parse_event_source_spec(spec, "kv-event-replay-source")?;
+                let source = pd
+                    .get_mut(worker)
+                    .ok_or_else(|| ConfigError::ValidationFailed {
+                        reason: format!(
+                            "--kv-event-replay-source for '{worker}' requires --pd-kv-events"
+                        ),
+                    })?;
+                if source.replay_endpoints.replace(endpoints).is_some() {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: format!("duplicate --kv-event-replay-source worker URL '{worker}'"),
+                    });
+                }
+            }
+        }
+        if let Some(path) = self.layout {
+            apply_kv_layout_file(path, mode, &mut regular, &mut pd)?;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for spec in self.topics {
+            let (worker, topics) = parse_event_source_spec(spec, "kv-event-topic")?;
+            if !seen.insert(worker) {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!("duplicate --kv-event-topic worker URL '{worker}'"),
+                });
+            }
+            let missing = || ConfigError::ValidationFailed {
+                reason: format!(
+                    "--kv-event-topic for '{worker}' requires a static event publisher"
+                ),
+            };
+            let (layout, model, size, ranks) = if is_pd {
+                let source = pd.get_mut(worker).ok_or_else(missing)?;
+                (
+                    &mut source.hybrid,
+                    source.model.as_deref().unwrap_or_default(),
+                    source.block_size,
+                    source.endpoints.len(),
+                )
+            } else {
+                let source = regular.get_mut(worker).ok_or_else(missing)?;
+                (
+                    &mut source.hybrid,
+                    source.model.as_str(),
+                    source.block_size,
+                    source.endpoints.len(),
+                )
+            };
+            if ranks == 0 || topics.len() != ranks || model.trim().is_empty() {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!("static event source '{worker}' needs --kv-event-model and one topic per publisher"),
+                });
+            }
+            let pinned_rank = crate::backend::parse_dp_rank(worker);
+            let ranked = topics
+                .into_iter()
+                .enumerate()
+                .map(|(index, topic)| (pinned_rank.unwrap_or(index as u32), topic));
+            let layout = layout.get_or_insert_with(|| crate::kv_index::CacheCapabilities {
+                schema_version: 1,
+                adapters: Vec::new(),
+                ranks: ranked
+                    .clone()
+                    .map(|(rank, topic)| {
+                        crate::kv_index::discovery::plain_full_rank(
+                            rank,
+                            model.to_owned(),
+                            topic,
+                            size,
+                        )
+                    })
+                    .collect(),
+            });
+            for (dp_rank, topic) in ranked {
+                let Some(rank) = layout.ranks.iter_mut().find(|rank| rank.rank == dp_rank) else {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: format!(
+                            "static KV event source '{worker}' has no layout for DP rank {dp_rank}"
+                        ),
+                    });
+                };
+                if rank.model.is_empty() {
+                    rank.model = model.to_owned();
+                }
+                rank.publisher_topic = Some(topic);
+            }
+        }
+        Ok(ConfiguredKvSources { regular, pd })
+    }
 }
 
 /// Parse repeatable `WORKER_URL=ENDPOINT[,ENDPOINT...]` KV event sources.
@@ -135,7 +258,6 @@ pub fn parse_pd_kv_events(
                     block_size: 16,
                     model: None,
                     hybrid: None,
-                    compatible_decode_urls: Vec::new(),
                 },
             )
             .is_some()
@@ -164,6 +286,12 @@ fn parse_event_source_spec<'a>(spec: &'a str, flag: &str) -> ConfigResult<(&'a s
     if worker.is_empty() || endpoints.is_empty() {
         return Err(ConfigError::ValidationFailed {
             reason: format!("--{flag} needs a worker URL and at least one endpoint, got '{spec}'"),
+        });
+    }
+    let (base, _) = crate::kv_index::discovery::split_worker_rank(worker);
+    if url::Url::parse(base).is_ok_and(|url| url.port() == Some(0)) {
+        return Err(ConfigError::ValidationFailed {
+            reason: format!("--{flag} worker URL '{worker}' must use a nonzero port"),
         });
     }
     Ok((worker, endpoints))
@@ -353,8 +481,7 @@ pub(crate) fn validate_pd_sources(config: &RouterConfig) -> ConfigResult<()> {
                         ),
                     });
                 }
-                let has_pairs = !sources.compatible_decode_urls.is_empty();
-                if sources.endpoints.is_empty() && sources.hybrid.is_none() && !has_pairs {
+                if sources.endpoints.is_empty() && sources.hybrid.is_none() {
                     return Err(ConfigError::IncompatibleConfig {
                         reason: format!("pd_kv_event_sources['{url}'] has no endpoints"),
                     });
@@ -371,27 +498,10 @@ pub(crate) fn validate_pd_sources(config: &RouterConfig) -> ConfigResult<()> {
                     .hybrid
                     .as_ref()
                     .is_some_and(|layout| !layout.is_plain_full_attention());
-                if has_pairs && !prefill_kv {
-                    return Err(invalid(
-                        "compatible decode URLs require a KV-aware prefill worker",
-                    ));
-                }
-                if (hybrid_layout || has_pairs) && config.program_scheduling.is_some() {
+                if hybrid_layout && config.program_scheduling.is_some() {
                     return Err(invalid(
                         "hybrid PD sources do not support Program scheduling",
                     ));
-                }
-                if hybrid_layout && prefill_keyed && !has_pairs {
-                    return Err(invalid("requires at least one compatible decode URL"));
-                }
-                if let Some(decode) = sources.compatible_decode_urls.iter().find(|url| {
-                    !decode_urls
-                        .iter()
-                        .any(|decode| base_url_without_rank(decode) == *url)
-                }) {
-                    return Err(invalid(&format!(
-                        "decode URL '{decode}' is not a configured decode base URL"
-                    )));
                 }
                 if let Some(layout) = &sources.hybrid {
                     let discover =
@@ -427,10 +537,6 @@ pub(crate) fn validate_pd_sources(config: &RouterConfig) -> ConfigResult<()> {
                                 })?;
                         }
                     }
-                } else if has_pairs
-                    && (!sources.endpoints.is_empty() || sources.replay_endpoints.is_some())
-                {
-                    return Err(invalid("static publishers require an explicit rank layout"));
                 }
                 for endpoint in sources
                     .endpoints

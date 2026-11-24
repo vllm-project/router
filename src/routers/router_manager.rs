@@ -97,22 +97,43 @@ impl RouterManager {
         }
     }
 
-    // A publisher may be shared by routers with different policies. Reject
-    // explicit full reports across this manager if any router monitors events.
+    // A publisher may be shared by routers with different policies. Treat
+    // unknown membership conservatively and compare registered worker bases.
+    fn monitors_shared_publishers(&self, selected: &dyn RouterTrait) -> bool {
+        if selected.monitors_kv_events() {
+            return true;
+        }
+        let selected = selected.get_worker_urls();
+        self.routers
+            .iter()
+            .filter(|router| router.monitors_kv_events())
+            .any(|router| {
+                let monitored = router.get_worker_urls();
+                selected.is_empty()
+                    || monitored.is_empty()
+                    || selected.iter().any(|url| {
+                        let base = crate::backend::strip_dp_suffix(url);
+                        monitored.iter().any(|other| {
+                            let other = crate::backend::strip_dp_suffix(other);
+                            base == other
+                                || match (url::Url::parse(base), url::Url::parse(other)) {
+                                    (Ok(base), Ok(other)) => base == other,
+                                    _ => false,
+                                }
+                        })
+                    })
+            })
+    }
+
     fn reject_shared_full_report(
         &self,
+        router: &dyn RouterTrait,
         vllm_xargs: Option<&serde_json::Value>,
     ) -> Option<Response> {
-        // Only explicit full reports require checking subscriber ownership.
         if !is_full_report(vllm_xargs) {
             return None;
         }
-        reject_full_report(
-            self.routers
-                .iter()
-                .any(|router| router.monitors_kv_events()),
-            vllm_xargs,
-        )
+        reject_full_report(self.monitors_shared_publishers(router), vllm_xargs)
     }
 
     /// Set the default router
@@ -679,12 +700,14 @@ impl RouterTrait for RouterManager {
         body: &InferenceGenerateRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        if let Some(response) = self.reject_shared_full_report(body.other.get("vllm_xargs")) {
-            return response;
-        }
         let router = self.select_router_for_request(headers, None);
 
         if let Some(router) = router {
+            if let Some(response) =
+                self.reject_shared_full_report(router.as_ref(), body.other.get("vllm_xargs"))
+            {
+                return response;
+            }
             router.route_inference_generate(headers, body, None).await
         } else {
             (
@@ -702,9 +725,6 @@ impl RouterTrait for RouterManager {
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        if let Some(response) = self.reject_shared_full_report(body.other.get("vllm_xargs")) {
-            return response;
-        }
         // Select router based on headers and model.
         // When model is None, select_router_for_request considers all registered
         // routers (including PD routers), so a single-model deployment will still
@@ -713,6 +733,11 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
+            if let Some(response) =
+                self.reject_shared_full_report(router.as_ref(), body.other.get("vllm_xargs"))
+            {
+                return response;
+            }
             router.route_chat(headers, body, model_id).await
         } else {
             let msg = match model_id {
@@ -730,9 +755,6 @@ impl RouterTrait for RouterManager {
         body: &CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        if let Some(response) = self.reject_shared_full_report(body.other.get("vllm_xargs")) {
-            return response;
-        }
         // Select router based on headers and model.
         // When model is None, select_router_for_request considers all registered
         // routers (including PD routers), so a single-model deployment will still
@@ -741,6 +763,11 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
+            if let Some(response) =
+                self.reject_shared_full_report(router.as_ref(), body.other.get("vllm_xargs"))
+            {
+                return response;
+            }
             router.route_completion(headers, body, model_id).await
         } else {
             let msg = match model_id {
@@ -760,21 +787,21 @@ impl RouterTrait for RouterManager {
     ) -> Response {
         // A library caller can provide raw bytes different from its typed
         // request, so check the bytes that the selected router may forward.
-        if self
-            .routers
-            .iter()
-            .any(|router| router.monitors_kv_events())
-        {
-            let actual = serde_json::from_slice::<serde_json::Value>(&raw).ok();
-            if let Some(response) = reject_full_report(
-                true,
-                actual.as_ref().and_then(|body| body.get("vllm_xargs")),
-            ) {
-                return response;
-            }
-        }
         let model_id = body.model.clone();
         if let Some(router) = self.select_router_for_request(headers, model_id.as_deref()) {
+            if self
+                .routers
+                .iter()
+                .any(|router| router.monitors_kv_events())
+            {
+                let actual = serde_json::from_slice::<serde_json::Value>(&raw).ok();
+                if let Some(response) = self.reject_shared_full_report(
+                    router.as_ref(),
+                    actual.as_ref().and_then(|body| body.get("vllm_xargs")),
+                ) {
+                    return response;
+                }
+            }
             router
                 .route_completion_raw(headers, body, raw, model_id.as_deref())
                 .await
@@ -952,13 +979,15 @@ impl RouterTrait for RouterManager {
         method: &Method,
         body: serde_json::Value,
     ) -> Response {
-        if let Some(response) = self.reject_shared_full_report(body.get("vllm_xargs")) {
-            return response;
-        }
         // Select router based on headers (no model info available for transparent proxy)
         let router = self.select_router_for_request(headers, None);
 
         if let Some(router) = router {
+            if let Some(response) =
+                self.reject_shared_full_report(router.as_ref(), body.get("vllm_xargs"))
+            {
+                return response;
+            }
             router.route_transparent(headers, path, method, body).await
         } else {
             // Return 404 when no router is available
