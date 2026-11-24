@@ -1,6 +1,6 @@
 //! Shared event transport, frame parsing and connection readiness.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::io;
 use std::time::Duration;
 
@@ -179,6 +179,34 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(receiver.socket().recv_bytes(zmq::DONTWAIT).unwrap(), [n]);
+        }
+    }
+
+    #[test]
+    fn consumed_frames_release_only_their_buffered_proofs() {
+        let mut overlap = ReplayOverlap::default();
+        overlap.track_live(0);
+        overlap.track_live(0);
+        overlap.record(0, b"old replay").unwrap();
+
+        // A replay reset invalidates proofs while leaving both frames queued.
+        overlap.clear();
+        assert!(!overlap.matches(0, b"old replay"));
+        overlap.record(0, b"new replay").unwrap();
+        overlap.0.lock().recent.remove(&0);
+
+        overlap.release_live(0);
+        assert!(overlap.matches(0, b"new replay"));
+        overlap.release_live(0);
+        assert!(!overlap.matches(0, b"new replay"));
+
+        // Consecutive catch-ups can drain completely without resetting the view.
+        for seq in 1..=(MAX_PENDING_LIVE_FRAMES as u64 + 1) {
+            overlap.track_live(seq);
+            overlap.record(seq, b"replay").unwrap();
+            overlap.release_live(seq);
+            assert!(overlap.matches(seq, b"replay"));
+            assert!(overlap.0.lock().buffered.is_empty());
         }
     }
 
@@ -596,15 +624,19 @@ pub(super) struct ReplayOverlap(Mutex<OverlapEvidence>);
 #[derive(Default)]
 struct OverlapEvidence {
     recent: HashMap<u64, [u8; 32]>,
-    buffered: HashMap<u64, Option<[u8; 32]>>,
+    buffered: HashMap<u64, BufferedProof>,
+}
+
+struct BufferedProof {
+    frames: usize,
+    fingerprint: Option<[u8; 32]>,
 }
 
 impl OverlapEvidence {
     fn fingerprint(&self, seq: u64) -> Option<[u8; 32]> {
         self.buffered
             .get(&seq)
-            .copied()
-            .flatten()
+            .and_then(|proof| proof.fingerprint)
             .or_else(|| self.recent.get(&seq).copied())
     }
 }
@@ -613,7 +645,21 @@ impl ReplayOverlap {
     fn track_live(&self, seq: u64) {
         let mut evidence = self.0.lock();
         let fingerprint = evidence.recent.get(&seq).copied();
-        evidence.buffered.entry(seq).or_insert(fingerprint);
+        let proof = evidence.buffered.entry(seq).or_insert(BufferedProof {
+            frames: 0,
+            fingerprint,
+        });
+        proof.frames += 1;
+    }
+
+    pub(super) fn release_live(&self, seq: u64) {
+        if let Entry::Occupied(mut entry) = self.0.lock().buffered.entry(seq) {
+            let proof = entry.get_mut();
+            proof.frames -= 1;
+            if proof.frames == 0 {
+                entry.remove();
+            }
+        }
     }
 
     pub(super) fn record(&self, seq: u64, payload: &[u8]) -> Result<(), ()> {
@@ -626,7 +672,7 @@ impl ReplayOverlap {
             return Err(());
         }
         if let Some(buffered) = evidence.buffered.get_mut(&seq) {
-            *buffered = Some(fingerprint);
+            buffered.fingerprint = Some(fingerprint);
         }
         evidence.recent.insert(seq, fingerprint);
         // Keep late arrivals within the normal publisher history window.
@@ -645,6 +691,13 @@ impl ReplayOverlap {
     }
 
     pub(super) fn clear(&mut self) {
-        *self.0.get_mut() = OverlapEvidence::default();
+        let evidence = self.0.get_mut();
+        if !evidence.recent.is_empty() {
+            evidence.recent = HashMap::new();
+            // End this proof window while keeping any queued frame counts.
+            for proof in evidence.buffered.values_mut() {
+                proof.fingerprint = None;
+            }
+        }
     }
 }

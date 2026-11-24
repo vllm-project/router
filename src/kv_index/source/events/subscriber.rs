@@ -409,7 +409,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     bootstrap = false;
                     idle_reconcile = false;
                     allow_overlap = false;
-                    replayed.clear();
+                    replayed = ReplayOverlap::default();
                     replay_socket = None;
                     pending_live = PendingLive::default();
                 }
@@ -571,7 +571,11 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         }
                         last_seq = -1;
                         suspended = true;
-                        replayed.clear();
+                        if overflow || exhausted {
+                            replayed = ReplayOverlap::default();
+                        } else {
+                            replayed.clear();
+                        }
                         if !overflow {
                             gap_batch = None;
                         }
@@ -610,8 +614,9 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     continue;
                 }
                 let (through, overlap, restart_from) = 'live_batch: {
-                    let received = pending_live
-                        .pop()
+                    let pending_frame = pending_live.pop();
+                    let was_buffered = pending_frame.is_some();
+                    let received = pending_frame
                         .map_or_else(|| sub.socket().recv_multipart(zmq::DONTWAIT), Ok);
                     match received {
                         Ok(mut frames) => {
@@ -638,6 +643,12 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                     break 'live_batch (None, true, -1);
                                 }
                             };
+                            let matches_replay = allow_overlap
+                                && seq <= last_seq
+                                && replayed.matches(seq as u64, &frames[2]);
+                            if was_buffered {
+                                replayed.release_live(seq as u64);
+                            }
                             next_idle_replay = tokio::time::Instant::now() + IDLE_REPLAY_INTERVAL;
                             if replay_failures == MAX_REPLAY_FAILURES {
                                 if subscriber.apply(seq as u64, &frames[2], true).is_ok() {
@@ -648,10 +659,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                 tokio::task::yield_now().await;
                                 continue 'live;
                             }
-                            if allow_overlap
-                                && seq <= last_seq
-                                && replayed.matches(seq as u64, &frames[2])
-                            {
+                            if matches_replay {
                                 bootstrap = false;
                                 replay_socket = None;
                                 continue 'live;

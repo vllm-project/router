@@ -490,6 +490,9 @@ async fn long_replay_verifies_the_oldest_buffered_live_frame() {
         tcp.subscribed().await;
         let request = tcp.request(0).await;
         tcp.live(0, if matches_replay { &store } else { &empty });
+        if matches_replay {
+            tcp.live(0, &store);
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
         tcp.reply(&request, 0, &store);
         for seq in 1..=last {
