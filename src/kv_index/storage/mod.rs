@@ -80,6 +80,7 @@ impl SourceVersion {
 
     pub(crate) fn try_read(&self) -> Option<SourceReadGuard<'_>> {
         Some(SourceReadGuard {
+            // Batched prompts can pin the same source while already holding its read guard.
             _read: self.source.access.try_read_recursive()?,
         })
     }

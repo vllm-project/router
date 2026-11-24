@@ -17,6 +17,9 @@ use foldhash::fast::RandomState;
 ///
 /// Hashes prompts using the verified source contract and reports the prefix
 /// that the cache layout can restore.
+/// A hit used for a Regular Prefill reservation must carry evidence for that
+/// lookup. Event-backed providers should delegate to a source binding through
+/// `matches_with_cache` so the policy can revalidate the hit.
 pub trait TieredMatchProvider: Send + Sync {
     /// Match the prompt using the provider's complete restore rules.
     fn matches(
@@ -97,7 +100,8 @@ impl SourceBinding {
             && self.tail_drop_group.is_none()
     }
 
-    pub(in crate::kv_index) fn record_placement(
+    /// Validate the lookup snapshot and carry its evidence when requested.
+    pub(in crate::kv_index) fn record_placement_if_current(
         &self,
         cache: &mut RequestHashCache<'_>,
         source: SourceVersion,
@@ -107,7 +111,7 @@ impl SourceBinding {
             return false;
         }
         if let Some(placement) = &mut cache.placement {
-            placement.push(PlacementVersion {
+            placement.push(PlacementEvidence {
                 source,
                 generation,
                 control: self.control.clone(),
@@ -119,14 +123,14 @@ impl SourceBinding {
 }
 
 /// Trust evidence for a hit, carried to the Regular reservation boundary.
-pub(crate) struct PlacementVersion {
+pub(crate) struct PlacementEvidence {
     source: SourceVersion,
     generation: u64,
     control: Arc<StreamControl>,
     lease: Option<SourceLease>,
 }
 
-impl PlacementVersion {
+impl PlacementEvidence {
     pub(crate) fn target(&self) -> &RoutableTarget {
         self.source.target()
     }
@@ -208,8 +212,9 @@ impl crate::policies::TieredMatchProvider for SourceBinding {
                 block_size,
                 prompt_cap as u64,
             );
+            // Release the snapshot's cache borrow before recording evidence.
             drop(claims);
-            if !hits.is_empty() && !self.record_placement(cache, version, generation) {
+            if !hits.is_empty() && !self.record_placement_if_current(cache, version, generation) {
                 return Vec::new();
             }
             return hits;
@@ -261,7 +266,7 @@ impl Hash for PromptKey<'_> {
 /// Prepared engine hashes shared across candidates in one routing selection.
 #[derive(Default)]
 pub struct RequestHashCache<'a> {
-    pub(crate) placement: Option<Vec<PlacementVersion>>,
+    pub(crate) placement: Option<Vec<PlacementEvidence>>,
     /// Lower bound used only for the initial trust check within this routing stage.
     pub(crate) first_trust_check: Option<std::time::Instant>,
     /// A single candidate reads its own source snapshot without collecting other ranks.

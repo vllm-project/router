@@ -578,8 +578,9 @@ impl SourceBinding {
         if tier.is_none() || u32::try_from(credited / self.keys.block_size() as u64).is_err() {
             return (0, None);
         }
+        // Release the snapshot's cache borrow before recording evidence.
         drop(claims);
-        if !self.record_placement(cache, version, reset_generation) {
+        if !self.record_placement_if_current(cache, version, reset_generation) {
             return (0, None);
         }
         (credited, tier)

@@ -1,7 +1,49 @@
 //! Shared event fixtures; callers set model and residency-specific fields.
 
 use super::events::wire::{BlockRemoved, BlockStored, ExternalBlockHash, KVEvent, KVEventBatch};
-use crate::kv_index::{CacheGroup, GroupRule, RoutableTarget, SourceBinding};
+use crate::kv_index::{
+    CacheGroup, GroupRule, RequestHashCache, RoutableTarget, SourceBinding, TierMatch,
+    TieredMatchProvider,
+};
+use std::sync::Arc;
+
+/// Attach stable source snapshots to synthetic policy hits.
+pub(crate) struct WithPlacementEvidence<P>(pub(crate) Arc<P>);
+
+impl<P: TieredMatchProvider> TieredMatchProvider for WithPlacementEvidence<P> {
+    fn target_scoped(&self) -> bool {
+        self.0.target_scoped()
+    }
+
+    fn matches_with_cache<'a>(
+        &self,
+        tokens: &'a [u32],
+        block_size: u32,
+        lora: Option<&str>,
+        rank: u32,
+        cache: &mut RequestHashCache<'a>,
+    ) -> Vec<TierMatch> {
+        let hits = self
+            .0
+            .matches_with_cache(tokens, block_size, lora, rank, cache);
+        if cache.placement.is_some() {
+            for hit in &hits {
+                let binding = full_binding(hit.target.clone(), block_size);
+                binding.begin_empty(0);
+                let version = binding
+                    .index
+                    .with_source_snapshot(&hit.target, |view| view.source_version())
+                    .unwrap();
+                assert!(binding.record_placement_if_current(
+                    cache,
+                    version,
+                    binding.control.generation()
+                ));
+            }
+        }
+        hits
+    }
+}
 
 pub(crate) fn full_binding(target: RoutableTarget, block_size: u32) -> SourceBinding {
     SourceBinding::new(
