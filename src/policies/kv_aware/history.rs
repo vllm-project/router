@@ -310,11 +310,20 @@ mod tests {
     #[test]
     fn completion_history_requires_named_identity_and_one_reported_rank() {
         use crate::core::{BasicWorker, Worker, WorkerType};
-        use crate::kv_index::{CacheKey, HashMode, KvBlockIndexer, WorkerKvInfo};
+        use crate::kv_index::source::test_support::full_binding;
+        use crate::kv_index::{CacheKey, RoutableTarget, WorkerKvInfo};
         use crate::policies::{KvAwareOps, KvAwarePolicy};
         let kv = KvAwarePolicy::default();
         let worker: Arc<dyn Worker> =
             Arc::new(BasicWorker::new("http://w".into(), WorkerType::Regular));
+        let provider = Arc::new(full_binding(
+            RoutableTarget {
+                instance_id: worker.base_url().into(),
+                dp_rank: 0,
+            },
+            16,
+        ));
+        provider.begin_empty(0);
         for (model, ranks, expected) in [
             ("model", vec![0], true),
             ("http://w", vec![0], false),
@@ -327,12 +336,11 @@ mod tests {
                     ranks,
                     cache_key: Some(CacheKey {
                         model: Arc::from(model),
-                        hash_mode: HashMode::Sha256,
                         block_size: 16,
                     }),
                     ..Default::default()
                 }),
-                Some(Arc::new(KvBlockIndexer::new())),
+                Some(provider.clone()),
             );
             let captured = kv
                 .capture_completion_history(std::slice::from_ref(&worker), model)

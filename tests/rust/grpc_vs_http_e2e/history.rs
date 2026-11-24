@@ -1,5 +1,9 @@
 use super::*;
 
+#[path = "../common/grpc_kv_fixture.rs"]
+mod kv_fixture;
+use kv_fixture::{KvPublisher, TOPIC};
+
 /// Startup uses real static source configuration and the normal gRPC health
 /// probe. No fixture-only policy registration stands in for discovery.
 async fn history_app(
@@ -8,7 +12,7 @@ async fn history_app(
     Vec<MockVllmRsServer>,
     Arc<vllm_router_rs::server::AppContext>,
     AxumRouter,
-    Vec<zmq::Socket>,
+    Vec<KvPublisher>,
 ) {
     let mut workers = Vec::new();
     let mut publishers = Vec::new();
@@ -16,16 +20,19 @@ async fn history_app(
     for _ in 0..2 {
         let worker = MockVllmRsServer::spawn_with_state(MockVllmRs {
             captured: Default::default(),
+            kv_block_size: 16,
             ..state.clone()
         })
         .await;
-        let publisher = zmq::Context::new().socket(zmq::XPUB).unwrap();
-        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let publisher = KvPublisher::bind();
         sources.insert(
             worker.grpc_url.clone(),
             json!({
-                "endpoints": [publisher.get_last_endpoint().unwrap().unwrap()],
-                "block_size": 16, "model": "test-model"
+                "endpoints": [publisher.endpoint],
+                "replay_endpoints": [publisher.replay_endpoint],
+                "topic": TOPIC,
+                "block_size": 16, "model": "test-model",
+                "hybrid": publisher.layout("test-model", 16)
             }),
         );
         workers.push(worker);
@@ -44,6 +51,10 @@ async fn history_app(
     .unwrap();
     let ctx = create_test_context(config.clone());
     let router = Router::new(urls, &ctx).await.unwrap();
+    for publisher in &publishers {
+        // Prove the source contract without warming the request used below.
+        publisher.restore(&[7; 16], 16).await;
+    }
     router.pin_test_token_ids(vec![42; 33]);
     let app = create_test_app(Arc::new(router), reqwest::Client::new(), &config);
     (workers, ctx, app, publishers)

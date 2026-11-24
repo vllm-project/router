@@ -3,8 +3,56 @@
 //! Inputs are immutable decision facts. The module never mutates Program
 //! lifecycle state, queues, target placement, or backend observations.
 
-use super::ProgressTtlFactors;
+use super::{ProgramStatus, ProgressTtlFactors};
 use std::time::Duration;
+
+/// Victim ordering used when logical occupancy exceeds the repair watermark.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityRepairPolicy {
+    /// Preserve the original Progress-TTL age/context ordering.
+    #[default]
+    Legacy,
+    /// Release the least valuable applied TTL protection first.
+    RetentionValue,
+}
+
+/// Pure retention facts used for ordering and diagnostic logs.
+pub(crate) struct CapacityRepairValue {
+    pub value: Option<f64>,
+    pub ttl_seconds: f64,
+    pub cache_miss_impact_seconds: f64,
+}
+
+impl CapacityRepairPolicy {
+    /// Unknown first-turn protection is not a measured zero-value reservation.
+    /// Such victims sort after observed candidates, then use legacy ordering.
+    pub(crate) fn victim_value(
+        status: ProgramStatus,
+        completed_requests: usize,
+        remaining_ttl: Duration,
+        last_applied_ttl: Duration,
+        cache_miss_impact_seconds: f64,
+    ) -> CapacityRepairValue {
+        let ttl_seconds = match status {
+            ProgramStatus::Acting => remaining_ttl,
+            ProgramStatus::Reasoning => last_applied_ttl,
+        }
+        .as_secs_f64();
+        let cache_miss_impact_seconds = cache_miss_impact_seconds.max(0.0);
+        CapacityRepairValue {
+            value: (completed_requests > 0).then_some(ttl_seconds * cache_miss_impact_seconds),
+            ttl_seconds,
+            cache_miss_impact_seconds,
+        }
+    }
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::RetentionValue => "retention_value",
+        }
+    }
+}
 
 /// Offline-calibrated cold-prefill cost model.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -66,6 +114,8 @@ pub struct ProgressTtlConfig {
     pub high_watermark_ratio: f64,
     /// Admission and resume capacity ratio.
     pub low_watermark_ratio: f64,
+    /// Victim ordering used by capacity repair.
+    pub capacity_repair_policy: CapacityRepairPolicy,
     /// Maximum cache-continuous service rounds before pressure may yield.
     pub max_segment_rounds: usize,
     /// Fixed sample count required before rolling estimates are active.
@@ -86,6 +136,7 @@ impl Default for ProgressTtlConfig {
             max_acting_ttl: Duration::from_secs(10),
             high_watermark_ratio: 1.0,
             low_watermark_ratio: 1.0,
+            capacity_repair_policy: CapacityRepairPolicy::default(),
             max_segment_rounds: 14,
             stats_window_size: 100,
             enable_batch_gain_admission: true,
@@ -421,5 +472,29 @@ mod tests {
         assert_eq!(policy.cache_miss_impact_seconds(0), 0.0);
         assert!(policy.cache_miss_impact_seconds(100_000) > 0.0);
         assert!(policy.decode_throughput(8, 190_000).is_finite());
+    }
+    #[test]
+    fn retention_value_distinguishes_unobserved_from_observed_zero() {
+        let value = |status, completed, remaining, last, cost| {
+            CapacityRepairPolicy::victim_value(
+                status,
+                completed,
+                Duration::from_secs(remaining),
+                Duration::from_secs(last),
+                cost,
+            )
+        };
+        assert_eq!(value(ProgramStatus::Reasoning, 0, 0, 0, 0.0).value, None);
+        assert_eq!(value(ProgramStatus::Reasoning, 0, 0, 0, 100.0).value, None);
+        assert_eq!(
+            value(ProgramStatus::Reasoning, 1, 0, 0, 100.0).value,
+            Some(0.0)
+        );
+        assert_eq!(value(ProgramStatus::Acting, 1, 2, 10, 3.0).value, Some(6.0));
+        assert_eq!(
+            value(ProgramStatus::Reasoning, 1, 2, 10, 3.0).value,
+            Some(30.0)
+        );
+        assert_eq!(value(ProgramStatus::Acting, 1, 0, 10, 3.0).value, Some(0.0));
     }
 }
