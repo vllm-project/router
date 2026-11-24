@@ -170,8 +170,26 @@ Full GSM8K stays in `test-nightly.yml`. Both include forks.
 **Key features:**
 - Requires 4 GPUs (runs on `l4-k8s`)
 - 60 minute timeout
-- Automatic retry (up to 2 attempts) for flaky failures
-- Manual retry option available
+- Shared retry policy from `ci_mirror_hardwares.yml`
+- Manual retry available after successful jobs
+
+### Shared hardware retry
+
+The `x-hardware-retry` block in
+[`ci_mirror_hardwares.yml`](ci_mirror_hardwares.yml) controls all six CUDA and
+ROCm hardware presets. The uploader expands `retry: *hardware_retry` into each
+job together with its agents and plugins. Update that block to change the
+policy across the ready, merge, and nightly test pipelines.
+
+The policy follows
+[vLLM-Omni](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/ci_mirror_hardwares.yml).
+It permits manual retries after a successful job and retries exit statuses
+`-1` and `128`, or signal reasons `agent_stop` and `agent_refused`, once per
+matching rule. Test failures (exit `1`) and process OOM (exit `137`) require
+manual retries.
+
+An explicit step-level `retry` replaces the complete shared policy. For
+example, an automatic-only override also replaces the shared manual settings.
 
 ### ROCm MoRI coverage
 

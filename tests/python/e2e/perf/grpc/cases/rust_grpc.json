@@ -1,5 +1,6 @@
 {
   "backend": "rust_grpc",
+  "model": "Qwen/Qwen3.8-27B",
   "env": {
     "host": "127.0.0.1"
   },

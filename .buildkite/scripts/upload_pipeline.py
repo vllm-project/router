@@ -2,11 +2,12 @@
 """Expand ``mirror_hardwares`` presets and optionally upload the pipeline.
 
 An explicit name such as ``mirror_hardwares: l4_4`` is replaced with that
-entry from ``ci_mirror_hardwares.yml`` (``agents`` and, when present,
-``plugins``). A step-level ``retry`` is kept. A preset that injects
-``VLLM_CI_HF_TOKEN`` also gets a shell export of ``HF_TOKEN`` from that
-value. A build-level ``HF_TOKEN`` would override a pod env entry of the
-same name, so the secret stays under the alias until the job shell runs.
+entry from ``ci_mirror_hardwares.yml`` (``agents``, ``plugins``, and the shared
+hardware ``retry``). A step-level ``retry`` replaces the complete preset policy.
+A preset that injects ``VLLM_CI_HF_TOKEN`` also gets a shell export of
+``HF_TOKEN`` from that value. A build-level ``HF_TOKEN`` would override a pod
+env entry of the same name, so the secret stays under the alias until the job
+shell runs.
 This is the router-sized slice of vllm-omni's uploader: no ``MIRROR_HW``
 switch and no inference from pytest marks.
 

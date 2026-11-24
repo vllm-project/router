@@ -26,7 +26,7 @@ import socket
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,7 @@ from case_loader import (  # noqa: E402
     RouterPolicyCase,
     cell_run_suffix,
     load_router_policy_case,
+    prepare_trace,
 )
 from tests.python.e2e.perf.binaries import preflight_router_bin  # noqa: E402
 from log_summary import (  # noqa: E402
@@ -585,6 +586,12 @@ def run_router_policy_cell(
         run_suffix = cell_run_suffix()
     os.environ["AGENTX_RUN_SUFFIX"] = run_suffix
     case = load_router_policy_case(case_path, concurrency=concurrency)
+    trace_dir = (
+        out_dir
+        if out_dir is not None
+        else case.perf_work_root / f"{case.id}-{run_suffix}"
+    )
+    case = replace(case, trace_path=prepare_trace(case.trace_path, out_dir=trace_dir))
     run = open_cell(case, out_dir=out_dir)
     _active = run
     try:

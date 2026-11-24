@@ -154,7 +154,6 @@ steps:
       - "test-python-wheel-aarch64"
       - "smoke-test-binary-x86_64"
     if: build.tag =~ /^v.*/
-    soft_fail: false
     agents:
       queue: "cpu_queue_release"
 
@@ -173,7 +172,7 @@ steps:
         agents:
           queue: cpu_queue_release
         commands:
-          - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-x86_64 --progress plain -f docker/Dockerfile.router ."
+          - "docker build --tag vllm/vllm-router:nightly-x86_64 --progress plain -f docker/Dockerfile.router ."
           - "docker push vllm/vllm-router:nightly-x86_64"
         secrets:
           RELEASE_DOCKERHUB_TOKEN: ROUTER_DOCKERHUB_TOKEN
@@ -190,7 +189,7 @@ steps:
         agents:
           queue: arm64_cpu_queue_release
         commands:
-          - "DOCKER_BUILDKIT=1 docker build --tag vllm/vllm-router:nightly-aarch64 --progress plain -f docker/Dockerfile.router ."
+          - "docker build --tag vllm/vllm-router:nightly-aarch64 --progress plain -f docker/Dockerfile.router ."
           - "docker push vllm/vllm-router:nightly-aarch64"
         secrets:
           RELEASE_DOCKERHUB_TOKEN: ROUTER_DOCKERHUB_TOKEN
@@ -263,7 +262,7 @@ steps:
             exit 1
           fi
           echo "Building vllm/vllm-router:v$${RELEASE_VERSION}-x86_64"
-          DOCKER_BUILDKIT=1 docker build \
+          docker build \
             --tag "vllm/vllm-router:v$${RELEASE_VERSION}-x86_64" \
             --progress plain \
             -f docker/Dockerfile.router .
@@ -290,7 +289,7 @@ steps:
             exit 1
           fi
           echo "Building vllm/vllm-router:v$${RELEASE_VERSION}-aarch64"
-          DOCKER_BUILDKIT=1 docker build \
+          docker build \
             --tag "vllm/vllm-router:v$${RELEASE_VERSION}-aarch64" \
             --progress plain \
             -f docker/Dockerfile.router .

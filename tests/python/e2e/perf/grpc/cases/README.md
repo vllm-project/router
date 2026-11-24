@@ -15,9 +15,9 @@ Use the stem (`rust_grpc`) in CI/docs for bundled cases.
 
 ## Model
 
-Optional **`model`** in JSON (HF id or local path). For perf runs, set **`export MODEL=...`**
-(**env overrides JSON**). Do not commit placeholder paths; with no `MODEL`, tests skip until
-you set the env var or add a real `model` in your local case file.
+Optional **`model`** in JSON (HF id or local path). The `rust_grpc` and `python_http`
+cases default to `Qwen/Qwen3.8-27B`. Set **`export MODEL=...`** to override the JSON.
+Tests skip when neither the environment nor the case file supplies a model.
 
 ## Binaries (`router.bin`, `worker.bin`)
 

@@ -33,11 +33,11 @@ pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -sv -
 Performance JSON and the run directory are separate. The nightly dashboard copies `tests/python/e2e/results` only.
 
 - `tests/python/e2e/results/perf/router_policy/<scenario>_<run_suffix>/c<concurrency>_t<task_num>.json` — copy of `calibration.json` when the cell is ok. One directory per scenario and session; one file per concurrency. The `concurrency` / `task_num` fields match the file name.
-- `tests/python/e2e/run/perf/router_policy/<case_id>-<run_suffix>/` — cell files. Nightly uploads `result/summary.json`, `result/manifest.json`, `router.log`, `engineN.log`, `replay.log`, `replay_entry.py`, `runtime-replay.yaml`, and `*.command.json`. Prometheus snapshots, `requests.jsonl`, `ports.json`, and `calibration.json` stay on the agent. The generated replay wrapper (`replay_entry.py`, including compatibility and stagger patches) is retained beside its command and logs after cleanup and uploaded for diagnosis and reproduction. Model caches stay under `tests/python/e2e/run/perf/router_policy/cache/` (shared across cells in this work root, excluded from nightly uploads). The same stdout is also printed (`[engineN]`, `[vllm-router]`, `[replay]`).
+- `tests/python/e2e/run/perf/router_policy/<case_id>-<run_suffix>/` — cell files. Nightly uploads the complete cell directories matched by `run/perf/router_policy/c*-*/**/*`, including replay results, logs, Prometheus snapshots, and command files. The generated replay wrapper (`replay_entry.py`, including compatibility and stagger patches) is retained beside its command and logs after cleanup and uploaded for diagnosis and reproduction. Model caches stay under `tests/python/e2e/run/perf/router_policy/cache/` (shared across cells in this work root, excluded from nightly uploads). The same stdout is also printed (`[engineN]`, `[vllm-router]`, `[replay]`).
 
 `<run_suffix>` is local time `YYYYMMDD_HHMMSS` (same format as grpc and l1_encode) unless you set **`AGENTX_RUN_SUFFIX`** (same suffix for all cells in one matrix, e.g. `export AGENTX_RUN_SUFFIX=20251029_171300`). The run directory is generated automatically from the case ID and run suffix.
 
-Prometheus snapshots are saved under `before/`, `after/`, and `metrics/<elapsed_seconds>/` (approximately every 60 seconds during replay). They remain in the run directory for local diagnosis and are not uploaded. Replay logging uses the shared process stdout tee; cleanup joins the reader thread before closing the log.
+Prometheus snapshots are saved under `before/`, `after/`, and `metrics/<elapsed_seconds>/` (approximately every 60 seconds during replay). They are uploaded with the cell directory for diagnosis. Replay logging uses the shared process stdout tee; cleanup joins the reader thread before closing the log.
 
 Before replay, the cell runner **removes `result/`** if it already exists. The cell **fails if replay exit code ≠ 0**.
 
@@ -87,8 +87,7 @@ run on `l4_4` (four L4 GPUs).
 
 - `router-policy-perf-e2e` selects `pd_merge and c16` and runs the three merged scenarios.
 - `router-policy-pd-disagg-perf-e2e` selects `pd_disagg and c16` and runs the two
-  disaggregated scenarios. It uses `soft_fail: true` while four-GPU validation
-  is pending, allowing merged performance results to be collected independently.
+  disaggregated scenarios. Failures in either step fail the Buildkite build.
 
 The PD cases use two prefill workers and two decode workers, each on its own
 GPU, with Rust gRPC frontends and NIXL KV transfer. Set `workers.prefill_count`
@@ -96,10 +95,13 @@ to the number of prefill workers. The remaining workers decode. Merged cases
 use the default `prefill_count=0`. All cases reserve 12 GiB GPU KV per worker,
 use no CPU offload, and set `max_model_len=32768`.
 
-Both steps install `agentinfer==0.2.0`. The CI image supplies vLLM 0.30.0,
-NIXL, and the Rust router. The trace is `data/tracelab-ci-uniform-28.jsonl`
-with eight sessions and 28 requests. Optional `TRACELAB_JSONL_URL` replaces
-that file.
+The CI image supplies `agentinfer==0.2.0`, vLLM 0.30.0, NIXL, and the Rust
+router. The trace is `data/tracelab-ci-uniform-28.jsonl`
+with eight sessions and 28 requests. The shared cell launcher calls
+`prepare_trace()` before starting workers. It checks the case's local trace file
+or downloads optional `TRACELAB_JSONL_URL` into the cell directory as
+`trace.jsonl`. Downloads replace the cell's trace atomically, and failures stop
+the cell before GPU processes start. Local pytest runs use the same setup.
 
 Run the two PD scenarios in an environment with four supported CUDA GPUs.
 

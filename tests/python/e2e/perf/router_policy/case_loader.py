@@ -6,10 +6,12 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.request import urlopen
 
 from tests.python.e2e.perf.path import get_perf_results_dir, get_perf_run_dir
 
@@ -117,6 +119,32 @@ def load_case(case_file: Path) -> dict[str, Any]:
     if not isinstance(case, dict):
         raise ValueError(f"case root must be an object: {case_file}")
     return case
+
+
+def prepare_trace(trace_path: Path, *, out_dir: Path) -> Path:
+    """Resolve the case trace, saving a URL override in the cell directory."""
+
+    url = _env_first("TRACELAB_JSONL_URL")
+    if not url:
+        if not trace_path.is_file():
+            raise FileNotFoundError(
+                f"TraceLab replay file does not exist: {trace_path}"
+            )
+        return trace_path
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    destination = out_dir / "trace.jsonl"
+    with tempfile.NamedTemporaryFile(
+        dir=out_dir, suffix=".download", delete=False
+    ) as temp:
+        temporary = Path(temp.name)
+    try:
+        with urlopen(url, timeout=60) as response, temporary.open("wb") as output:
+            shutil.copyfileobj(response, output)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
 
 
 def resolve_runtime(case: dict[str, Any]) -> dict[str, Any]:
