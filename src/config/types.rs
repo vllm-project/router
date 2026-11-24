@@ -1,11 +1,12 @@
 use super::ConfigResult;
 use crate::config::validation::ConfigValidator;
+pub use crate::kv_index::config::{PdKvEventSources, StaticKvEventSources};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::program_scheduling::{
-    DecodeThroughputModel, PrefillCostModel, ProgramBindingStrategy, ProgramResumeOrder,
-    ProgramSchedulingEnableKey, TokenCountMode,
+    CapacityRepairPolicy, DecodeThroughputModel, PrefillCostModel, ProgramBindingStrategy,
+    ProgramResumeOrder, ProgramSchedulingEnableKey, TokenCountMode,
 };
 
 /// Main router configuration
@@ -20,6 +21,9 @@ pub struct RouterConfig {
     /// Workers listed here skip HTTP control-plane discovery and probing.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pd_kv_event_sources: HashMap<String, PdKvEventSources>,
+    /// Explicit routing pairs by Prefill base URL for a heterogeneous P/D pool.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pd_worker_pairs: HashMap<String, Vec<String>>,
     /// Opt in to hiding KV placement until a complete authoritative recovery.
     #[serde(default)]
     pub kv_event_strict_recovery: bool,
@@ -153,9 +157,20 @@ pub enum PredictionMode {
     /// Collect and evaluate predictions without changing scheduling decisions.
     #[default]
     Shadow,
+    /// Use mature return-time predictions for regular-HTTP acting TTL decisions.
+    ///
+    /// Output-length prediction remains observational in this mode.
+    Active,
 }
 
-/// Shared configuration for workflow-profile shadow predictors.
+impl PredictionMode {
+    /// Only Active predictions may alter acting TTLs, and only outside PD mode.
+    pub(crate) fn applies_acting_ttl(self, pd_mode: bool) -> bool {
+        self == Self::Active && !pd_mode
+    }
+}
+
+/// Shared configuration for workflow-profile predictors.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PredictionProfileConfig {
     #[serde(default)]
@@ -477,6 +492,8 @@ pub struct ProgramSchedulingConfig {
     pub high_watermark_ratio: f64,
     #[serde(default = "default_program_low_watermark_ratio")]
     pub low_watermark_ratio: f64,
+    #[serde(default)]
+    pub capacity_repair_policy: CapacityRepairPolicy,
     #[serde(default = "default_program_max_segment_rounds")]
     pub max_segment_rounds: usize,
     #[serde(default = "default_program_stats_window_size")]
@@ -651,6 +668,7 @@ impl Default for ProgramSchedulingConfig {
             max_acting_ttl_seconds: default_program_max_acting_ttl_seconds(),
             high_watermark_ratio: default_program_high_watermark_ratio(),
             low_watermark_ratio: default_program_low_watermark_ratio(),
+            capacity_repair_policy: CapacityRepairPolicy::default(),
             max_segment_rounds: default_program_max_segment_rounds(),
             stats_window_size: default_program_stats_window_size(),
             enable_batch_gain_admission: default_program_enable_batch_gain_admission(),
@@ -720,6 +738,8 @@ struct ProgramSchedulingConfigInput {
     high_watermark_ratio: f64,
     #[serde(default = "default_program_low_watermark_ratio")]
     low_watermark_ratio: f64,
+    #[serde(default)]
+    capacity_repair_policy: CapacityRepairPolicy,
     #[serde(default = "default_program_max_segment_rounds")]
     max_segment_rounds: usize,
     #[serde(default = "default_program_stats_window_size")]
@@ -840,6 +860,7 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             max_acting_ttl_seconds: input.max_acting_ttl_seconds,
             high_watermark_ratio: input.high_watermark_ratio,
             low_watermark_ratio: input.low_watermark_ratio,
+            capacity_repair_policy: input.capacity_repair_policy,
             max_segment_rounds: input.max_segment_rounds,
             stats_window_size: input.stats_window_size,
             enable_batch_gain_admission: input.enable_batch_gain_admission,
@@ -1021,30 +1042,6 @@ pub enum ConnectionMode {
     Grpc,
 }
 
-/// Statically configured KV event sources for one prefill worker, used when
-/// the engine's HTTP control plane does not serve `/server_info` or
-/// `/kv_event_sources` (e.g. the `vllm-rs serve` frontend).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PdKvEventSources {
-    /// ZMQ PUB endpoints, one per data-parallel rank (index = rank).
-    pub endpoints: Vec<String>,
-    /// Optional ZMQ ROUTER (replay) endpoints, same ordering as `endpoints`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replay_endpoints: Option<Vec<String>>,
-    /// KV cache block size of the engine. Must match the engine's
-    /// `--block-size` (vLLM default: 16).
-    #[serde(default = "default_pd_kv_block_size")]
-    pub block_size: u32,
-    /// Model identity for the cache key. Defaults to the worker URL; the
-    /// served-model check then relies on `/v1/models`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-}
-
-fn default_pd_kv_block_size() -> u32 {
-    16
-}
-
 /// Routing mode configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -1187,27 +1184,6 @@ pub enum PolicyConfig {
 
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
-}
-
-/// Manually configured KV event publishers for one regular-mode worker.
-///
-/// Rust struct literals must supply `topic: String::new()` to retain the
-/// previous empty subscription topic. Serde defaults preserve old JSON
-/// configurations, but do not provide Rust source compatibility.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct StaticKvEventSources {
-    /// One externally reachable ZMQ PUB endpoint per DP rank.
-    pub endpoints: Vec<String>,
-    /// Optional replay ROUTER endpoint per DP rank for loss recovery.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replay_endpoints: Option<Vec<String>>,
-    /// Exact ZMQ subscription topic shared by these ranks.
-    #[serde(default)]
-    pub topic: String,
-    /// KV cache block size used to calculate prefix placement.
-    pub block_size: u32,
-    /// Shared model identity across workers that serve the same model.
-    pub model: String,
 }
 
 impl PolicyConfig {
@@ -1425,6 +1401,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             pd_kv_event_sources: HashMap::new(),
+            pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
@@ -1708,6 +1685,7 @@ mod tests {
                 replay_endpoints: Some(vec!["tcp://prefill:5558".to_string()]),
                 block_size: 32,
                 model: Some("m".to_string()),
+                hybrid: None,
             },
         );
         let json = serde_json::to_string(&config).unwrap();
@@ -1825,6 +1803,26 @@ mod tests {
         let serialized = serde_json::to_value(legacy).unwrap();
         assert_eq!(serialized["token_capacity_per_dp_rank"], 456);
         assert!(serialized.get("token_capacity_per_target").is_none());
+    }
+
+    #[test]
+    fn program_scheduling_capacity_repair_policy_is_opt_in() {
+        let defaults: ProgramSchedulingConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            defaults.capacity_repair_policy,
+            CapacityRepairPolicy::Legacy
+        );
+
+        let configured: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"capacity_repair_policy":"retention_value"}"#).unwrap();
+        assert_eq!(
+            configured.capacity_repair_policy,
+            CapacityRepairPolicy::RetentionValue
+        );
+        assert_eq!(
+            serde_json::to_value(configured).unwrap()["capacity_repair_policy"],
+            "retention_value"
+        );
     }
 
     #[test]
@@ -2305,6 +2303,7 @@ mod tests {
                 discovery_address: None,
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
             policy: PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 30,
@@ -2373,6 +2372,7 @@ mod tests {
                 ],
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
             policy: PolicyConfig::CacheAware {
                 cache_threshold: 0.9,
@@ -2442,6 +2442,7 @@ mod tests {
                 worker_urls: vec!["http://worker1".to_string()],
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
             policy: PolicyConfig::RoundRobin,
             host: "::1".to_string(), // IPv6

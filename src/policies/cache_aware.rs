@@ -302,7 +302,7 @@ impl CacheAwarePolicy {
                 continue;
             }
             let keys: Vec<_> = prompts
-                .into_iter()
+                .iter()
                 .map(|ids| {
                     encoded
                         .entry(ids)
