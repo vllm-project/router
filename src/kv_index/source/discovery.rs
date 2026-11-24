@@ -272,7 +272,7 @@ impl KvIndexSupervisor {
             pd_connector: None,
             strict_recovery: false,
             replay_idle_timeout: Duration::from_secs(
-                crate::config::default_kv_event_replay_idle_timeout_secs().into(),
+                crate::config::DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS.into(),
             ),
             static_sources: HashMap::new(),
             static_pd_sources: HashMap::new(),

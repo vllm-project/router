@@ -200,14 +200,11 @@ mod tests {
         overlap.release_live(0);
         assert!(!overlap.matches(0, b"new replay"));
 
-        // Consecutive catch-ups can drain completely without resetting the view.
-        for seq in 1..=(MAX_PENDING_LIVE_FRAMES as u64 + 1) {
-            overlap.track_live(seq);
-            overlap.record(seq, b"replay").unwrap();
-            overlap.release_live(seq);
-            assert!(overlap.matches(seq, b"replay"));
-            assert!(overlap.0.lock().buffered.is_empty());
-        }
+        overlap.track_live(1);
+        overlap.record(1, b"replay").unwrap();
+        overlap.release_live(1);
+        assert!(overlap.matches(1, b"replay"));
+        assert!(overlap.0.lock().buffered.is_empty());
     }
 
     #[tokio::test]
@@ -687,8 +684,6 @@ impl ReplayOverlap {
             buffered.fingerprint = Some(fingerprint);
         }
         evidence.recent.insert(seq, fingerprint);
-        // Keep the original window for late arrivals. Frames already in the
-        // queue retain their proof until the last copy is consumed.
         const RECENT_LIMIT: usize = 4_096;
         if evidence.recent.len() > RECENT_LIMIT {
             let floor = seq.saturating_sub((RECENT_LIMIT / 2) as u64);

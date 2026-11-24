@@ -3898,7 +3898,7 @@ mod tests {
                 None,
                 false,
                 std::time::Duration::from_secs(
-                    crate::config::default_kv_event_replay_idle_timeout_secs().into(),
+                    crate::config::DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS.into(),
                 ),
                 true,
             )

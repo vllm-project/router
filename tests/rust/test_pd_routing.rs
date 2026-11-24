@@ -800,7 +800,7 @@ mod test_pd_routing {
                 pd_worker_pairs: Default::default(),
                 kv_event_strict_recovery: false,
                 kv_event_replay_idle_timeout_secs:
-                    vllm_router_rs::config::default_kv_event_replay_idle_timeout_secs(),
+                    vllm_router_rs::config::DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS,
                 policy,
                 host: "127.0.0.1".to_string(),
                 port: 3001,

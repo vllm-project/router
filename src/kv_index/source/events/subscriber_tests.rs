@@ -111,7 +111,7 @@ impl TcpReplay {
             index,
             signals,
             strict,
-            Duration::from_secs(crate::config::default_kv_event_replay_idle_timeout_secs().into()),
+            Duration::from_secs(crate::config::DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS.into()),
         )
     }
 
@@ -862,7 +862,7 @@ fn monitor_failure_fences_only_active_source_and_respects_stale_lease() {
     }
     let subscriber = |lease| Subscriber {
         replay_idle_timeout: Duration::from_secs(
-            crate::config::default_kv_event_replay_idle_timeout_secs().into(),
+            crate::config::DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS.into(),
         ),
         source: EventSource {
             source: active.target.instance_id.clone(),

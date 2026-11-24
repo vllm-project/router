@@ -1189,7 +1189,7 @@ mod kv_input_tests {
             Some(prefill_policy.clone()),
             Some(decode_policy.clone()),
             false,
-            Duration::from_secs(crate::config::default_kv_event_replay_idle_timeout_secs().into()),
+            Duration::from_secs(crate::config::DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS.into()),
             true,
         )
         .await;

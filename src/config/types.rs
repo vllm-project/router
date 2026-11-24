@@ -9,8 +9,10 @@ use crate::program_scheduling::{
     ProgramSchedulingEnableKey, TokenCountMode,
 };
 
-pub const fn default_kv_event_replay_idle_timeout_secs() -> u32 {
-    5
+pub const DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS: u32 = 5;
+
+fn default_kv_event_replay_idle_timeout_secs() -> u32 {
+    DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS
 }
 
 /// Main router configuration
@@ -1381,7 +1383,7 @@ impl Default for RouterConfig {
             pd_kv_event_sources: HashMap::new(),
             pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
-            kv_event_replay_idle_timeout_secs: default_kv_event_replay_idle_timeout_secs(),
+            kv_event_replay_idle_timeout_secs: DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3001,
@@ -2277,7 +2279,7 @@ mod tests {
             pd_kv_event_sources: Default::default(),
             pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
-            kv_event_replay_idle_timeout_secs: default_kv_event_replay_idle_timeout_secs(),
+            kv_event_replay_idle_timeout_secs: DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS,
             policy: PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 30,
             },
@@ -2346,7 +2348,7 @@ mod tests {
             pd_kv_event_sources: Default::default(),
             pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
-            kv_event_replay_idle_timeout_secs: default_kv_event_replay_idle_timeout_secs(),
+            kv_event_replay_idle_timeout_secs: DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS,
             policy: PolicyConfig::CacheAware {
                 cache_threshold: 0.9,
                 balance_abs_threshold: 5,
@@ -2416,7 +2418,7 @@ mod tests {
             pd_kv_event_sources: Default::default(),
             pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
-            kv_event_replay_idle_timeout_secs: default_kv_event_replay_idle_timeout_secs(),
+            kv_event_replay_idle_timeout_secs: DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS,
             policy: PolicyConfig::RoundRobin,
             host: "::1".to_string(), // IPv6
             port: 8888,

@@ -392,7 +392,7 @@ fn spawn_zmq(
         stream,
         ctx,
         None,
-        Duration::from_secs(crate::config::default_kv_event_replay_idle_timeout_secs().into()),
+        Duration::from_secs(crate::config::DEFAULT_KV_EVENT_REPLAY_IDLE_TIMEOUT_SECS.into()),
     )
 }
 
