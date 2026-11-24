@@ -1840,11 +1840,19 @@ const METRICS_ONLY: &str = "\
 vllm:cache_config_info{block_size=\"16\",effective_attention_block_size=\"16\",enable_prefix_caching=\"True\",prefix_caching_hash_algo=\"sha256_cbor\",hash_block_size=\"None\",kv_cache_layout=\"None\",engine=\"0\"} 1.0
 ";
 
-fn metrics_and_models_router(metrics: &'static str) -> axum::Router {
+fn metrics_and_models_router(
+    metrics: impl Fn() -> String + Clone + Send + Sync + 'static,
+) -> axum::Router {
     use axum::{routing::get, Router};
 
     Router::new()
-        .route("/metrics", get(move || async move { metrics }))
+        .route(
+            "/metrics",
+            get(move || {
+                let body = metrics();
+                async move { body }
+            }),
+        )
         .route(
             "/v1/models",
             get(|| async {
@@ -1867,7 +1875,8 @@ async fn spawn_metrics_only_worker(router: axum::Router) -> (String, tokio::task
 async fn metrics_only_worker_supplies_cache_metadata() {
     let metrics = "vllm:cache_config_info{engine=\"0\"} 1.0\n\
         vllm:cache_config_info{block_size=\"8\",effective_attention_block_size=\"16\",engine=\"1\"} 1.0\n";
-    let (worker, server) = spawn_metrics_only_worker(metrics_and_models_router(metrics)).await;
+    let (worker, server) =
+        spawn_metrics_only_worker(metrics_and_models_router(move || metrics.to_owned())).await;
 
     let (info, models, _) =
         query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None)
@@ -1903,7 +1912,7 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
             "topic": "kv/metrics-only",
             "publisher": "zmq"
         }});
-        let router = metrics_and_models_router(METRICS_ONLY)
+        let router = metrics_and_models_router(|| METRICS_ONLY.to_owned())
             .route(
                 "/kv_event_sources",
                 get(move || {
@@ -1957,7 +1966,7 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
 async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
     use crate::kv_index::request_hash::BlockKeyGenerator;
     use crate::kv_index::wire::ExternalBlockHash;
-    use axum::{routing::get, Json, Router};
+    use axum::{routing::get, Json};
 
     let endpoints: Vec<_> = (0..3).map(|_| layout_endpoints()).collect();
     let sources = serde_json::Value::Object(
@@ -1985,41 +1994,30 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
         )
     };
     let reported = Arc::new(Mutex::new(metrics("sha256_cbor", "xxhash")));
-    let router = Router::new()
-        .route(
-            "/metrics",
-            get({
-                let reported = reported.clone();
-                move || {
-                    let body = reported.lock().clone();
-                    async move { body }
-                }
-            }),
-        )
-        .route(
-            "/v1/models",
-            get(|| async { Json(serde_json::json!({"data": [{"id": "mock-model"}]})) }),
-        )
-        .route(
-            "/kv_event_sources",
-            get(move || {
-                let sources = sources.clone();
-                async move { Json(sources) }
-            }),
-        );
+    let router = metrics_and_models_router({
+        let reported = reported.clone();
+        move || reported.lock().clone()
+    })
+    .route(
+        "/kv_event_sources",
+        get(move || {
+            let sources = sources.clone();
+            async move { Json(sources) }
+        }),
+    );
     let (worker, server) = spawn_metrics_only_worker(router).await;
     let (supervisor, _signals) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-    assert!(supervisor
-        .on_worker_added(&worker)
-        .await
-        .unwrap()
-        .cache_key
-        .is_some());
+    let info = supervisor.on_worker_added(&worker).await.unwrap();
+    assert_eq!(
+        info.ranks.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([0, 2])
+    );
     let provider = supervisor.match_provider_for_worker(&worker).unwrap();
     let revision = supervisor.worker_registrations()[&worker].revision;
     let prompt = [7; 17];
     let generator = BlockKeyGenerator::from_seed(16, "vllm-none-hash");
-    let warm_rank = |rank: usize| {
+    let hits = |rank| !provider.matches(&prompt, 16, None, rank).is_empty();
+    for rank in [0, 2] {
         let (_, _, publisher, replay) = &endpoints[rank];
         let mut store = full_store(&prompt[..16], 16, None);
         store.block_hashes = generator
@@ -2027,23 +2025,13 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
             .into_iter()
             .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
             .collect();
-        async move {
-            boundary_subscription(publisher, "kv/hash-probe", true).await;
-            finish_empty_startup_replay(replay).await;
-            let payload = event_payload(1.0, &[KVEvent::BlockStored(store)], Some(rank as u32));
-            live_frame(publisher, b"kv/hash-probe", 0, &payload);
-        }
-    };
-    let hits = |rank| !provider.matches(&prompt, 16, None, rank).is_empty();
-    for rank in [0, 2] {
-        warm_rank(rank).await;
+        boundary_subscription(publisher, "kv/hash-probe", true).await;
+        finish_empty_startup_replay(replay).await;
+        let payload = event_payload(1.0, &[KVEvent::BlockStored(store)], Some(rank as u32));
+        live_frame(publisher, b"kv/hash-probe", 0, &payload);
         wait_for(|| hits(rank as u32)).await;
     }
     assert!(!hits(1));
-    assert_eq!(
-        supervisor.installed.workers.lock()[&worker].handles.len(),
-        2
-    );
 
     *reported.lock() = metrics("xxhash", "sha256_cbor");
     wait_for(|| !hits(0)).await;

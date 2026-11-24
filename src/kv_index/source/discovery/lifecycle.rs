@@ -302,20 +302,21 @@ impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
     }
 }
 
+type Subscription = (EventSource, Arc<SourceBinding>, Arc<EventSubscriberHandle>);
+
 impl KvIndexSupervisor {
     pub(super) fn monitor_hybrid_source(
         &self,
         provider: &Arc<LayoutWorkerProvider>,
         worker_url: &str,
-        mut handles: HashMap<u32, Arc<EventSubscriberHandle>>,
-        mut targets: Vec<(EventSource, Arc<SourceBinding>)>,
+        mut targets: Vec<Subscription>,
         capability: CacheCapabilities,
         assumed_plain_full: bool,
     ) {
         // Revalidate only publishers with an installed subscriber.
         let mut bound: BoundSources = targets
             .iter()
-            .map(|(source, _)| {
+            .map(|(source, _, _)| {
                 (
                     source.dp_rank,
                     BoundSource {
@@ -336,23 +337,19 @@ impl KvIndexSupervisor {
         let installed = Arc::downgrade(&self.installed);
         let strict_recovery = self.strict_recovery;
         tokio::spawn(async move {
-            let invalidate =
-                |handles: &HashMap<u32, Arc<EventSubscriberHandle>>,
-                 targets: &[(EventSource, Arc<SourceBinding>)]| {
-                    for handle in handles.values() {
-                        handle.shutdown();
-                    }
-                    for (source, _) in targets {
-                        crate::kv_index::subscriber::emit(
-                            &signals,
-                            IngestionSignal::Invalidated {
-                                source: source.source.clone(),
-                                dp_rank: source.dp_rank,
-                                reason: "cache_contract",
-                            },
-                        );
-                    }
-                };
+            let invalidate = |targets: &[Subscription]| {
+                for (source, _, handle) in targets {
+                    handle.shutdown();
+                    crate::kv_index::subscriber::emit(
+                        &signals,
+                        IngestionSignal::Invalidated {
+                            source: source.source.clone(),
+                            dp_rank: source.dp_rank,
+                            reason: "cache_contract",
+                        },
+                    );
+                }
+            };
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let Some(provider) = provider.upgrade() else {
@@ -362,7 +359,7 @@ impl KvIndexSupervisor {
                     break;
                 }
                 if provider.lifecycle.expire_if_needed() {
-                    invalidate(&handles, &targets);
+                    invalidate(&targets);
                 }
                 let probe_sources = async {
                     if let Some(config) = &static_config {
@@ -394,24 +391,22 @@ impl KvIndexSupervisor {
                     ),
                 );
                 if !provider.lifecycle.active.load(Ordering::Acquire) {
-                    for handle in handles.values() {
+                    for (_, _, handle) in &targets {
                         handle.shutdown();
                     }
                     break;
                 }
                 // A probe may cross the deadline while it is in flight.
                 if provider.lifecycle.expire_if_needed() {
-                    invalidate(&handles, &targets);
+                    invalidate(&targets);
                 }
                 // A rejected rank stays fenced for this registration.
-                targets.retain(|(source, _)| {
+                targets.retain(|(source, _, handle)| {
                     let rank = source.dp_rank;
                     if !runtime_hash_mismatch(configs.as_ref(), &capability, &worker, rank) {
                         return true;
                     }
-                    if let Some(handle) = handles.remove(&rank) {
-                        handle.shutdown();
-                    }
+                    handle.shutdown();
                     bound.remove(&rank);
                     false
                 });
@@ -421,9 +416,8 @@ impl KvIndexSupervisor {
                 match provider.lifecycle.observe_layout(&outcome) {
                     SourceAction::Stop => {}
                     SourceAction::Recover => {
-                        handles.clear();
                         let mut recovered = true;
-                        for (ev, index) in &targets {
+                        for (ev, index, current) in &mut targets {
                             let stream = Arc::new(
                                 EventStream::new(index.clone())
                                     .with_strict_recovery(strict_recovery),
@@ -434,9 +428,7 @@ impl KvIndexSupervisor {
                                 probe_ctx.clone(),
                                 signals.clone(),
                             ) {
-                                Ok(handle) => {
-                                    handles.insert(ev.dp_rank, Arc::new(handle));
-                                }
+                                Ok(handle) => *current = Arc::new(handle),
                                 Err(_) => recovered = false,
                             }
                         }
@@ -451,7 +443,7 @@ impl KvIndexSupervisor {
                         unreachable!("layout probe cannot install a descriptor")
                     }
                 }
-                invalidate(&handles, &targets);
+                invalidate(&targets);
                 if let Some(installed) = installed.upgrade() {
                     installed.retire_if_current(&worker, &provider.lifecycle);
                 }

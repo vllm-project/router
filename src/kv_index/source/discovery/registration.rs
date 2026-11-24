@@ -300,7 +300,7 @@ impl KvIndexSupervisor {
         }
         let indexer = self.installed.acquire_identity(&key);
         let mut ranks = Vec::with_capacity(event_sources.len());
-        let mut handles = HashMap::with_capacity(event_sources.len());
+        let mut handles = Vec::with_capacity(event_sources.len());
         let mut live_sources = Vec::with_capacity(event_sources.len());
         let mut replay_endpoints = Vec::new();
         let mut targets = Vec::new();
@@ -340,9 +340,10 @@ impl KvIndexSupervisor {
                 lease,
             });
             replay_endpoints.extend(ev.replay_endpoint.clone());
-            targets.push((ev, index.clone()));
+            let handle = Arc::new(handle);
+            handles.push(handle.clone());
+            targets.push((ev, index.clone(), handle));
             indexes.insert(rank, index);
-            handles.insert(rank, Arc::new(handle));
             info!(
                 "kv_index {}: spawned subscriber rank{} (instance {})",
                 worker_url, rank, instance_id
@@ -361,7 +362,6 @@ impl KvIndexSupervisor {
         self.monitor_hybrid_source(
             &provider,
             worker_url,
-            handles.clone(),
             targets,
             capability,
             assumed_plain_full,
@@ -378,7 +378,7 @@ impl KvIndexSupervisor {
                 live_sources,
                 ranks: ranks.clone(),
                 indexer,
-                handles: handles.into_values().collect(),
+                handles,
                 provider,
             },
         );
