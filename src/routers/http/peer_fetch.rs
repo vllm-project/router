@@ -53,24 +53,28 @@ fn peer_fetch_params(source: &PeerEndpoint) -> Value {
     })
 }
 
-/// Whether the client set `prompt_logprobs` (an explicit `null` counts as
-/// absent). The engine then computes every prompt token and reads no external
-/// KV, so planning a fetch for the request would only hold a source permit.
+/// Request fields that make the engine score the prompt. It then computes every
+/// prompt token and reads no external KV.
+const PROMPT_LOGPROB_FIELDS: [&str; 2] = ["prompt_logprobs", "prompt_logprob_token_ids"];
+
+/// Whether the client set `prompt_logprobs` or `prompt_logprob_token_ids` (an
+/// explicit `null` counts as absent). The engine reads no external KV for
+/// these, so planning a fetch for the request would only hold a source permit.
 pub(super) fn wants_prompt_logprobs(request: Option<GrpcRequestRef<'_>>) -> bool {
     let other = match request {
         Some(GrpcRequestRef::Chat(request)) => &request.other,
         Some(GrpcRequestRef::Completion(request)) => &request.other,
         None => return false,
     };
-    other
-        .get("prompt_logprobs")
-        .is_some_and(|value| !value.is_null())
+    PROMPT_LOGPROB_FIELDS
+        .iter()
+        .any(|field| other.get(*field).is_some_and(|value| !value.is_null()))
 }
 
 /// Add `kv_transfer_params` for a fetch from `source` to `body`, unless the
 /// client supplied its own (an explicit `null` counts as absent, as it does for
-/// the engine) or asked for `prompt_logprobs` (also an explicit `null` counts as
-/// absent). Pure: callers pass a fresh copy of the client's body for each
+/// the engine) or asked for `prompt_logprobs` or `prompt_logprob_token_ids`
+/// (also an explicit `null` counts as absent). Pure: callers pass a fresh copy of the client's body for each
 /// attempt, so a retry never inherits another destination's params.
 pub(super) fn apply_peer_fetch(body: &mut Value, source: &PeerEndpoint) -> PeerFetchApply {
     let Some(object): Option<&mut Map<String, Value>> = body.as_object_mut() else {
@@ -82,9 +86,9 @@ pub(super) fn apply_peer_fetch(body: &mut Value, source: &PeerEndpoint) -> PeerF
     {
         return PeerFetchApply::ClientParamsPresent;
     }
-    if object
-        .get("prompt_logprobs")
-        .is_some_and(|logprobs| !logprobs.is_null())
+    if PROMPT_LOGPROB_FIELDS
+        .iter()
+        .any(|field| object.get(*field).is_some_and(|value| !value.is_null()))
     {
         return PeerFetchApply::PromptLogprobs;
     }
@@ -162,8 +166,13 @@ mod tests {
     #[test]
     fn prompt_logprobs_requests_are_left_alone() {
         // Zero is a real request for prompt logprobs, so only null is absent.
-        for logprobs in [json!(0), json!(5)] {
-            let original = json!({"prompt": "hi", "prompt_logprobs": logprobs});
+        for (field, value) in [
+            ("prompt_logprobs", json!(0)),
+            ("prompt_logprobs", json!(5)),
+            ("prompt_logprob_token_ids", json!([1, 2])),
+            ("prompt_logprob_token_ids", json!([])),
+        ] {
+            let original = json!({"prompt": "hi", field: value});
             let mut body = original.clone();
             assert_eq!(
                 apply_peer_fetch(&mut body, &endpoint()),
@@ -176,11 +185,13 @@ mod tests {
 
     #[test]
     fn null_prompt_logprobs_count_as_absent() {
-        let mut body = json!({"prompt": "hi", "prompt_logprobs": null});
-        assert_eq!(
-            apply_peer_fetch(&mut body, &endpoint()),
-            PeerFetchApply::Applied
-        );
+        for field in ["prompt_logprobs", "prompt_logprob_token_ids"] {
+            let mut body = json!({"prompt": "hi", field: null});
+            assert_eq!(
+                apply_peer_fetch(&mut body, &endpoint()),
+                PeerFetchApply::Applied
+            );
+        }
     }
 
     #[test]
@@ -205,6 +216,8 @@ mod tests {
         for (extra, expected) in [
             (json!({"prompt_logprobs": 1}), true),
             (json!({"prompt_logprobs": 0}), true),
+            (json!({"prompt_logprob_token_ids": [1, 2]}), true),
+            (json!({"prompt_logprob_token_ids": null}), false),
             (json!({"prompt_logprobs": null}), false),
             (json!({}), false),
         ] {

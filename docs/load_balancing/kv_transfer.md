@@ -52,7 +52,7 @@ Checks run in this order. The first one that fails gives the outcome label.
 |---|---|
 | The pick came from a session binding | `session_binding` |
 | The request has no token ids to match | `missing_tokens` |
-| The client set `prompt_logprobs` (the engine computes every prompt token for these, so it reads no external KV; the request still gets its KV-aware worker but takes no source permit) | `prompt_logprobs` |
+| The client set `prompt_logprobs` or `prompt_logprob_token_ids` (the engine computes every prompt token for these, so it reads no external KV; the request still gets its KV-aware worker but takes no source permit) | `prompt_logprobs` |
 
 **Planner, request level (`plan_transfer`, `kv_transfer.rs`):**
 
@@ -142,7 +142,7 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 | Source has no engine-reported peer address | `no_peer_endpoint` |
 | Source already has `max_inflight_per_source` fetches in flight | `inflight_cap` |
 | Client sent its own `kv_transfer_params` | `client_params_present` |
-| Client set `prompt_logprobs` on a path that did not skip planning (the proxy path); the normal path skips earlier, see above | `prompt_logprobs` |
+| Client set `prompt_logprobs` or `prompt_logprob_token_ids` on a path that did not skip planning (the proxy path); the normal path skips earlier, see above | `prompt_logprobs` |
 | Body is not a JSON object | `invalid_body` |
 | Otherwise | `sent` |
 
