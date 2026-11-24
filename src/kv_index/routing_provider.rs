@@ -2,9 +2,11 @@
 
 use crate::kv_index::layout::align_down;
 use crate::kv_index::request_hash::{BlockKeyGenerator, SequenceHash};
-use crate::kv_index::storage::{GroupPages, PageQuery};
+use crate::kv_index::source::binding::SourceLease;
+use crate::kv_index::storage::source_transaction::StreamControl;
+use crate::kv_index::storage::{GroupPages, PageQuery, SourceReadGuard, SourceVersion};
 use crate::kv_index::SourceBinding;
-use crate::kv_index::{KvBlockIndexer, TierMatch};
+use crate::kv_index::{KvBlockIndexer, RoutableTarget, TierMatch};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -94,6 +96,53 @@ impl SourceBinding {
             && self.replay_tokens == 0
             && self.tail_drop_group.is_none()
     }
+
+    pub(in crate::kv_index) fn record_placement(
+        &self,
+        cache: &mut RequestHashCache<'_>,
+        source: SourceVersion,
+        generation: u64,
+    ) -> bool {
+        if !self.snapshot_is_current(&source, generation) {
+            return false;
+        }
+        if let Some(placement) = &mut cache.placement {
+            placement.push(PlacementVersion {
+                source,
+                generation,
+                control: self.control.clone(),
+                lease: self.binding.clone(),
+            });
+        }
+        true
+    }
+}
+
+/// Trust evidence for a hit, carried to the Regular reservation boundary.
+pub(crate) struct PlacementVersion {
+    source: SourceVersion,
+    generation: u64,
+    control: Arc<StreamControl>,
+    lease: Option<SourceLease>,
+}
+
+impl PlacementVersion {
+    pub(crate) fn target(&self) -> &RoutableTarget {
+        self.source.target()
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self.control.generation() == self.generation
+            && self.source.is_current()
+            && self.lease.as_ref().is_none_or(SourceLease::is_active)
+    }
+
+    /// Keep source mutations outside the reservation without waiting on a
+    /// publisher while the policy holds its selection lock.
+    pub(crate) fn try_pin(&self) -> Option<SourceReadGuard<'_>> {
+        let guard = self.source.try_read()?;
+        self.is_current().then_some(guard)
+    }
 }
 
 impl crate::policies::TieredMatchProvider for SourceBinding {
@@ -159,7 +208,8 @@ impl crate::policies::TieredMatchProvider for SourceBinding {
                 block_size,
                 prompt_cap as u64,
             );
-            if !self.snapshot_is_current(&version, generation) {
+            drop(claims);
+            if !hits.is_empty() && !self.record_placement(cache, version, generation) {
                 return Vec::new();
             }
             return hits;
@@ -211,6 +261,7 @@ impl Hash for PromptKey<'_> {
 /// Prepared engine hashes shared across candidates in one routing selection.
 #[derive(Default)]
 pub struct RequestHashCache<'a> {
+    pub(crate) placement: Option<Vec<PlacementVersion>>,
     /// Lower bound used only for the initial trust check within this routing stage.
     pub(crate) first_trust_check: Option<std::time::Instant>,
     /// A single candidate reads its own source snapshot without collecting other ranks.

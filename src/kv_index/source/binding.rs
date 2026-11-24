@@ -549,8 +549,9 @@ impl SourceBinding {
         } else {
             self.replay_tokens
         };
-        let snapshot = self.page_snapshot(namespace, tokens, true, cache);
-        let Some((claims, version, reset_generation)) = snapshot else {
+        let Some((claims, version, reset_generation)) =
+            self.page_snapshot(namespace, tokens, true, cache)
+        else {
             return (0, None);
         };
         if claims
@@ -577,7 +578,8 @@ impl SourceBinding {
         if tier.is_none() || u32::try_from(credited / self.keys.block_size() as u64).is_err() {
             return (0, None);
         }
-        if !self.snapshot_is_current(&version, reset_generation) {
+        drop(claims);
+        if !self.record_placement(cache, version, reset_generation) {
             return (0, None);
         }
         (credited, tier)

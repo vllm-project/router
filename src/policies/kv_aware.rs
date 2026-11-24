@@ -12,12 +12,13 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use rand::Rng;
 use sha2::{Digest as _, Sha256};
+use smallvec::SmallVec;
 
 use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::kv_index::{
-    CacheKey, PromptKey, RequestHashCache, RoutableTarget, SharedPrefixLookup, StorageTier,
-    TierMatch, WorkerKvInfo,
+    CacheKey, PlacementVersion, PromptKey, RequestHashCache, RoutableTarget, SharedPrefixLookup,
+    StorageTier, TierMatch, WorkerKvInfo,
 };
 use crate::request_identity::StableIdentity;
 
@@ -1060,7 +1061,24 @@ struct SelectionPlan {
     grouped: Vec<Vec<TierMatch>>,
     input_tokens: Vec<usize>,
     prefill_tokens: Vec<Option<u64>>,
+    placement: Vec<PlacementVersion>,
     has_tokens: bool,
+}
+
+impl SelectionPlan {
+    fn discard_revoked_credit(&mut self) {
+        for proof in &self.placement {
+            if proof.is_current() {
+                continue;
+            }
+            for (position, binding) in self.bindings.iter().enumerate() {
+                if proof.target() == &binding.target {
+                    self.grouped[position].clear();
+                    self.prefill_tokens[position] = None;
+                }
+            }
+        }
+    }
 }
 
 /// Registered `kv_aware` policy. Discovery binds each worker target to the
@@ -1327,7 +1345,7 @@ impl KvAwarePolicy {
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
     ) -> Option<(usize, CostDecision)> {
-        let plan = self.prepare_selection(
+        let mut plan = self.prepare_selection(
             workers,
             QualifiedKvInput {
                 tokens: KvRequestTokens::Shared(token_ids),
@@ -1336,6 +1354,7 @@ impl KvAwarePolicy {
             lora_name,
             cache_salt,
         )?;
+        plan.discard_revoked_credit();
         let candidates = self.candidate_views(workers, &plan);
         let (costs, components) = self.score_candidates(&plan, &candidates)?;
         let position = self.pick_position(plan.has_tokens, &costs, &components, None)?;
@@ -1404,7 +1423,7 @@ impl KvAwarePolicy {
         // work without querying the index or granting KV credit.
         for attempt in 0..=3 {
             let fallback_guard = (attempt == 3).then(|| self.selection_lock.lock());
-            let plan = if fallback_guard.is_some() {
+            let mut plan = if fallback_guard.is_some() {
                 let (healthy, bindings) = self.selection_targets(workers)?;
                 let count = healthy.len();
                 let input_tokens: Vec<_> = healthy
@@ -1426,17 +1445,12 @@ impl KvAwarePolicy {
                         .map(|tokens| tokens.unwrap_or(max_known_input))
                         .collect(),
                     prefill_tokens: vec![None; count],
+                    placement: Vec::new(),
                     has_tokens: max_known_input > 0,
                 }
             } else {
                 self.prepare_selection(workers, input, lora_name, cache_salt)?
             };
-            let excluded = |position: usize| {
-                excluded_workers
-                    .iter()
-                    .any(|url| workers[plan.healthy[position]].url() == url.as_str())
-            };
-
             let guard = fallback_guard.unwrap_or_else(|| self.selection_lock.lock());
             let stale = plan
                 .healthy
@@ -1455,6 +1469,12 @@ impl KvAwarePolicy {
                 drop(guard);
                 continue;
             }
+            plan.discard_revoked_credit();
+            let excluded = |position: usize| {
+                excluded_workers
+                    .iter()
+                    .any(|url| workers[plan.healthy[position]].url() == url.as_str())
+            };
             let candidates = self.candidate_views(workers, &plan);
             let (costs, components) = self.score_candidates(&plan, &candidates)?;
 
@@ -1463,16 +1483,14 @@ impl KvAwarePolicy {
             let acquired = digest
                 .as_ref()
                 .and_then(|digest| self.affinity.acquire(digest));
-            let used_binding = acquired
+            let affinity_position = acquired
                 .as_ref()
-                .and_then(|record| self.affinity_position(&plan, record))
-                .is_some_and(|position| !excluded(position));
-            let (position, mut record) = match acquired
-                .as_ref()
-                .and_then(|record| self.affinity_position(&plan, record))
-            {
-                Some(position) if !excluded(position) => (position, acquired),
-                valid => {
+                .and_then(|record| self.affinity_position(&plan, record));
+            let bound_position = affinity_position.filter(|&position| !excluded(position));
+            let used_binding = bound_position.is_some();
+            let (position, mut record) = match bound_position {
+                Some(position) => (position, acquired),
+                None => {
                     if let Some(record) = acquired {
                         record.release_ref();
                     }
@@ -1483,21 +1501,40 @@ impl KvAwarePolicy {
                         &components,
                         eligible.as_deref(),
                     )?;
-                    let binding = &plan.bindings[position];
-                    // Retry exclusions preserve a valid binding; unregistered
-                    // targets cannot establish one without a generation.
-                    let record = digest
-                        .filter(|_| valid.is_none() && binding.generation != 0)
-                        .and_then(|digest| {
-                            self.affinity
-                                .bind(digest, binding.target.clone(), binding.generation)
-                        });
-                    (position, record)
+                    (position, None)
                 }
             };
-            let target = plan.bindings[position].target.clone();
+            let binding = &plan.bindings[position];
+            let target = binding.target.clone();
             let (worker_index, new_prefill_tokens, decision) =
                 self.decision_for_position(&plan, &candidates, &costs, &components, position);
+            let _placement_pins = if !plan.grouped[position].is_empty()
+                || new_prefill_tokens < plan.input_tokens[position] as u64
+            {
+                let pins = plan
+                    .placement
+                    .iter()
+                    .filter(|proof| proof.target() == &target)
+                    .map(PlacementVersion::try_pin)
+                    .collect::<Option<SmallVec<[_; 1]>>>();
+                let Some(pins) = pins else {
+                    if let Some(record) = record {
+                        record.release_ref();
+                    }
+                    continue;
+                };
+                pins
+            } else {
+                SmallVec::new()
+            };
+            // Retry exclusions preserve a valid binding. Bind a new target
+            // only once the selected placement is ready to commit.
+            if affinity_position.is_none() && binding.generation != 0 {
+                record = digest.and_then(|digest| {
+                    self.affinity
+                        .bind(digest, target.clone(), binding.generation)
+                });
+            }
             let outcome = if used_binding {
                 "sticky_hit"
             } else if attempt == 3 {
@@ -1647,6 +1684,7 @@ impl KvAwarePolicy {
         }
         let mut lookups = crate::metrics::PlacementLookups::default();
         let mut query_cache = PromptHashes::default();
+        query_cache.hashes.placement = Some(Vec::new());
         query_cache.hashes.stop_at_gap = self.prefix_scoring;
         query_cache.hashes.single_target = healthy
             .iter()
@@ -1701,6 +1739,7 @@ impl KvAwarePolicy {
                 grouped: vec![Vec::new(); size],
                 input_tokens: vec![tokens.len(); size],
                 prefill_tokens: vec![None; size],
+                placement: Vec::new(),
                 has_tokens,
             });
         }
@@ -1767,6 +1806,7 @@ impl KvAwarePolicy {
             grouped,
             input_tokens,
             prefill_tokens,
+            placement: query_cache.hashes.placement.unwrap_or_default(),
             has_tokens,
         })
     }
@@ -4506,6 +4546,155 @@ mod tests {
                 .collect::<Vec<_>>(),
             [false, true, true, true, true]
         );
+    }
+
+    #[test]
+    fn regular_reservation_rechecks_revoked_kv_credit() {
+        use crate::kv_index::source::test_support::{
+            event_batch, full_binding, full_store, warm_full,
+        };
+        use crate::kv_index::{KVEvent, SourceBinding};
+
+        type Mutation = Mutex<Option<Box<dyn FnMut() + Send>>>;
+
+        struct Peer {
+            index: Arc<SourceBinding>,
+            before_lookup: Mutation,
+        }
+
+        impl TieredMatchProvider for Peer {
+            fn target_scoped(&self) -> bool {
+                true
+            }
+
+            fn matches_with_cache<'a>(
+                &self,
+                tokens: &'a [u32],
+                block_size: u32,
+                lora: Option<&str>,
+                rank: u32,
+                cache: &mut RequestHashCache<'a>,
+            ) -> Vec<TierMatch> {
+                if let Some(action) = self.before_lookup.lock().as_mut() {
+                    action();
+                }
+                self.index
+                    .matches_with_cache(tokens, block_size, lora, rank, cache)
+            }
+        }
+
+        struct RevokingLoad {
+            slots: Arc<dyn SlotManager>,
+            trigger: RoutableTarget,
+            after_lookup: Mutation,
+            revocations: AtomicUsize,
+        }
+
+        impl LoadProvider for RevokingLoad {
+            fn sample(&self, target: &RoutableTarget) -> LoadSample {
+                if *target == self.trigger {
+                    if let Some(action) = self.after_lookup.lock().as_mut() {
+                        action();
+                        self.revocations.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                self.slots.sample(target)
+            }
+        }
+
+        let mut policy = KvAwarePolicy::default();
+        let workers = registered_worker_pair(&policy);
+        let targets = [target("first", 0), target("peer", 0)];
+        let manager = policy.slot_manager().unwrap();
+        let load = Arc::new(RevokingLoad {
+            slots: manager.clone(),
+            trigger: targets[1].clone(),
+            after_lookup: Mutex::new(None),
+            revocations: AtomicUsize::new(0),
+        });
+        policy.load = load.clone();
+        let first = Arc::new(full_binding(targets[0].clone(), 16));
+        let peer = Arc::new(Peer {
+            index: Arc::new(full_binding(targets[1].clone(), 16)),
+            before_lookup: Mutex::new(None),
+        });
+        let key = CacheKey {
+            model: Arc::from("model"),
+            block_size: 16,
+        };
+        policy.register_target_with_cache_identity(
+            workers[0].url(),
+            targets[0].clone(),
+            key.clone(),
+            first.clone(),
+        );
+        policy.register_target_with_cache_identity(
+            workers[1].url(),
+            targets[1].clone(),
+            key,
+            peer.clone(),
+        );
+
+        let prompt = [7; 33];
+        for index in [&first, &peer.index] {
+            index.begin_empty(0);
+            warm_full(index, 0, &prompt[..32]);
+        }
+        let select = |expected_worker: usize, expected_prefill| {
+            let excluded = [workers[1 - expected_worker].url().to_owned()];
+            let receipt = policy
+                .select_worker_with_receipt(&workers, Some(&prompt), None, None, None, &excluded)
+                .unwrap();
+            assert_eq!(receipt.worker_index, expected_worker);
+            assert_eq!(receipt.new_prefill_tokens, expected_prefill);
+            assert_eq!(
+                manager
+                    .sample(&targets[expected_worker])
+                    .active_prefill_tokens,
+                expected_prefill
+            );
+            release_receipt(&workers, &receipt);
+            assert_eq!(
+                manager.sample(&targets[expected_worker]),
+                LoadSample::default()
+            );
+            assert_eq!(workers[expected_worker].load(), 0);
+        };
+
+        select(0, 1);
+
+        let clear = event_batch(vec![KVEvent::AllBlocksCleared(Default::default())]);
+        let mut clear_seq = Some(1);
+        *peer.before_lookup.lock() = Some(Box::new({
+            let first = first.clone();
+            move || {
+                if let Some(seq) = clear_seq.take() {
+                    first.apply_batch(seq, &clear).unwrap();
+                }
+            }
+        }));
+        select(0, 33);
+
+        // Revoke the first rank on every lookup, while giving the peer an
+        // uninterrupted generation and keeping the first rank queryable.
+        warm_full(&first, 2, &prompt[..32]);
+        let replace = event_batch(vec![
+            KVEvent::AllBlocksCleared(Default::default()),
+            KVEvent::BlockStored(full_store(&prompt[..32], 16, None)),
+        ]);
+        let mut seq = 3;
+        *peer.before_lookup.lock() = Some(Box::new(move || {
+            first.apply_batch(seq, &replace).unwrap();
+            seq += 1;
+        }));
+        select(1, 1);
+        select(0, 33);
+
+        // Invalidate after the initial plan check on every scored attempt.
+        // The existing final attempt reserves full input without a KV query.
+        *load.after_lookup.lock() = peer.before_lookup.lock().take();
+        select(0, 33);
+        assert_eq!(load.revocations.load(Ordering::Relaxed), 4);
     }
 
     #[test]

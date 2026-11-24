@@ -64,6 +64,27 @@ pub(crate) struct SourceVersion {
     generation: u64,
 }
 
+pub(crate) struct SourceReadGuard<'a> {
+    _read: parking_lot::RwLockReadGuard<'a, SourceData>,
+}
+
+impl SourceVersion {
+    pub(crate) fn target(&self) -> &RoutableTarget {
+        &self.source.target
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self.generation.is_multiple_of(2)
+            && self.source.generation.load(Ordering::Acquire) == self.generation
+    }
+
+    pub(crate) fn try_read(&self) -> Option<SourceReadGuard<'_>> {
+        Some(SourceReadGuard {
+            _read: self.source.access.try_read_recursive()?,
+        })
+    }
+}
+
 impl SourceLock {
     fn new(target: RoutableTarget, committed: u64) -> Self {
         Self {
@@ -132,8 +153,7 @@ impl KvBlockIndexer {
     /// valid snapshot transition; suspension, resume, or retirement invalidates
     /// the result. This does not reserve engine blocks.
     pub(crate) fn source_version_is_current(&self, version: &SourceVersion) -> bool {
-        version.generation.is_multiple_of(2)
-            && version.source.generation.load(Ordering::Acquire) == version.generation
+        version.is_current()
     }
 
     /// Hide a source while contiguous replay repairs its observations.

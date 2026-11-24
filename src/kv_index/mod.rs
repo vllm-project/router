@@ -4,8 +4,8 @@ pub(crate) mod config;
 pub use config::apply_kv_layout_file;
 pub mod request_hash;
 mod routing_provider;
-pub(crate) use routing_provider::PromptKey;
 pub use routing_provider::TieredMatchProvider;
+pub(crate) use routing_provider::{PlacementVersion, PromptKey};
 #[doc(hidden)]
 pub use routing_provider::{RequestHashCache, SharedPrefixLookup};
 pub(crate) mod source;
