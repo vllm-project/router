@@ -162,6 +162,7 @@ impl ProgramRuntime {
         replacement.attach_prediction_context(
             old.expected_resume(),
             old.pending_output_prediction().cloned(),
+            old.return_time_keys().to_vec(),
         );
         Some(replacement)
     }

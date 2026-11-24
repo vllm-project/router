@@ -90,8 +90,9 @@ pub struct BlockStored {
     pub locality: Option<String>,
     #[serde(default)]
     pub ownership: Option<String>,
-    #[serde(default)]
-    pub session_id: Option<String>,
+    /// Tokens hashed past each stored block's boundary, in hash order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookahead_token_ids: Option<Vec<Vec<u32>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,45 +111,11 @@ pub struct BlockRemoved {
 pub struct AllBlocksCleared {}
 
 /// A batch of events: a positional array `[ts, events, (data_parallel_rank)?]`
-/// (`array_like=True`); `seq` rides in its own ZMQ frame. Derived `Deserialize`
-/// reads maps, so a custom positional impl is required. `Serialize` is
-/// intentionally absent — inbound-only, and a derived `Serialize` would emit
-/// a map, not the positional array.
+/// decoded by `decode_batch`. The sequence is in its own ZMQ frame.
 #[derive(Debug, Clone)]
 pub struct KVEventBatch {
-    pub ts: f64,
     pub events: Vec<KVEvent>,
     pub data_parallel_rank: Option<u32>,
-}
-
-impl<'de> Deserialize<'de> for KVEventBatch {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::{self, SeqAccess, Visitor};
-        use std::fmt;
-
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = KVEventBatch;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a 2- or 3-element array [ts, events, (rank)?]")
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let ts: f64 = seq
-                    .next_element()?
-                    .ok_or_else(|| de::Error::custom("missing ts"))?;
-                let events: Vec<KVEvent> = seq
-                    .next_element()?
-                    .ok_or_else(|| de::Error::custom("missing events"))?;
-                let data_parallel_rank: Option<u32> = seq.next_element()?;
-                Ok(KVEventBatch {
-                    ts,
-                    events,
-                    data_parallel_rank,
-                })
-            }
-        }
-        deserializer.deserialize_seq(V)
-    }
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -173,7 +140,7 @@ mod tests {
             kv_cache_spec_sliding_window: None,
             locality: Some("LOCAL".into()),
             ownership: None,
-            session_id: None,
+            lookahead_token_ids: None,
         });
         let buf = to_vec(&ev).unwrap();
         match from_slice::<KVEvent>(&buf).unwrap() {
@@ -203,7 +170,7 @@ mod tests {
             kv_cache_spec_sliding_window: None,
             locality: None,
             ownership: None,
-            session_id: None,
+            lookahead_token_ids: None,
         });
         let buf = to_vec(&ev).unwrap();
         match from_slice::<KVEvent>(&buf).unwrap() {
@@ -250,22 +217,5 @@ mod tests {
             from_slice::<KVEvent>(&buf).unwrap(),
             KVEvent::AllBlocksCleared(_)
         ));
-    }
-
-    #[test]
-    fn batch_decodes_two_element_array() {
-        let buf = to_vec(&(1.5f64, Vec::<KVEvent>::new())).unwrap();
-        let back: KVEventBatch = from_slice(&buf).unwrap();
-        assert_eq!(back.ts, 1.5);
-        assert!(back.events.is_empty());
-        assert!(back.data_parallel_rank.is_none());
-    }
-
-    #[test]
-    fn batch_decodes_three_element_array() {
-        let buf = to_vec(&(2.5f64, Vec::<KVEvent>::new(), 1u32)).unwrap();
-        let back: KVEventBatch = from_slice(&buf).unwrap();
-        assert_eq!(back.ts, 2.5);
-        assert_eq!(back.data_parallel_rank, Some(1));
     }
 }

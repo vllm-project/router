@@ -83,13 +83,9 @@ pub fn init_metrics() {
         "vllm_router_kv_placement_lookups_total",
         "KV-aware placement lookups and reasons for skipping them"
     );
-    describe_gauge!(
-        "vllm_router_kv_source_recovery_state",
-        "Current number of registered KV event sources by recovery state and reason"
-    );
     describe_counter!(
-        "vllm_router_kv_source_recovery_transitions_total",
-        "KV event source recovery transitions aggregated by state and reason"
+        "vllm_router_kv_source_recovery_events_total",
+        "KV event source recovery events by mode and reason"
     );
     describe_counter!(
         "vllm_router_kv_replay_outcomes_total",
@@ -114,6 +110,10 @@ pub fn init_metrics() {
     describe_counter!(
         "vllm_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
+    );
+    describe_counter!(
+        "vllm_router_prefix_routing_decisions_total",
+        "Prefix routing decisions by policy, stage and outcome"
     );
     describe_counter!("vllm_router_cache_hits_total", "Total cache hits");
     describe_counter!("vllm_router_cache_misses_total", "Total cache misses");
@@ -319,6 +319,30 @@ pub fn init_metrics() {
         "vllm_router_pd_request_duration_seconds",
         "PD request duration by route"
     );
+    for (name, help) in [
+        (
+            "vllm_router_pd_prefill_decisions_total",
+            "Prefill routing decisions by fallback reason",
+        ),
+        (
+            "vllm_router_pd_credited_prefix_tokens_total",
+            "Prefix tokens credited by Prefill routing",
+        ),
+        (
+            "vllm_router_pd_affinity_decisions_total",
+            "P/D affinity decisions by stage and outcome",
+        ),
+        (
+            "vllm_router_pd_decode_commit_total",
+            "Decode commitment outcomes after Prefill",
+        ),
+    ] {
+        describe_counter!(name, help);
+    }
+    describe_histogram!(
+        "vllm_router_pd_new_prefill_tokens",
+        "Uncached prompt tokens estimated at Prefill admission"
+    );
 
     // Service discovery metrics
     describe_counter!(
@@ -512,9 +536,6 @@ pub fn init_metrics() {
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
-    // Initialize metric descriptions
-    init_metrics();
-
     let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
     let duration_bucket = [
         0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
@@ -536,6 +557,7 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .expect("failed to set duration bucket")
         .install()
         .expect("failed to install Prometheus metrics exporter");
+    init_metrics();
 }
 
 fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuilder {
@@ -600,6 +622,7 @@ fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuild
         "vllm_router_kv_predicted_cached_tokens",
         "vllm_router_kv_actual_cached_tokens",
         "vllm_router_kv_cached_token_absolute_error",
+        "vllm_router_pd_new_prefill_tokens",
     ] {
         builder = set(builder, name, TOKEN_BUCKETS);
     }
@@ -634,6 +657,32 @@ pub(crate) struct AgentAwareAdmissionMetrics {
     pub(crate) observation_age: Option<Duration>,
 }
 
+/// Keep each lookup result bound to the current stage's recorder.
+#[derive(Default)]
+pub(crate) struct PlacementLookups {
+    counters: smallvec::SmallVec<[(&'static str, metrics::Counter); 2]>,
+}
+
+impl PlacementLookups {
+    pub(crate) fn record(&mut self, result: &'static str) {
+        self.record_count(result, 1);
+    }
+
+    pub(crate) fn record_count(&mut self, result: &'static str, count: u64) {
+        if let Some((_, counter)) = self.counters.iter().find(|(label, _)| *label == result) {
+            counter.increment(count);
+        } else {
+            let counter = kv_placement_lookup_counter(result);
+            counter.increment(count);
+            self.counters.push((result, counter));
+        }
+    }
+}
+
+fn kv_placement_lookup_counter(result: &'static str) -> metrics::Counter {
+    counter!("vllm_router_kv_placement_lookups_total", "result" => result)
+}
+
 pub struct RouterMetrics;
 
 pub struct TokenizerMetrics;
@@ -651,7 +700,7 @@ impl RouterMetrics {
     }
 
     pub fn record_kv_placement_lookup(result: &'static str) {
-        counter!("vllm_router_kv_placement_lookups_total", "result" => result).increment(1);
+        kv_placement_lookup_counter(result).increment(1);
     }
 
     pub fn record_kv_route_outcome(
@@ -688,37 +737,10 @@ impl RouterMetrics {
             .record(absolute_error as f64);
     }
 
-    pub fn record_kv_source_recovery_transition(
-        previous: Option<(&'static str, &'static str)>,
-        state: &'static str,
-        reason: &'static str,
-    ) {
-        if let Some((previous_state, previous_reason)) = previous {
-            gauge!("vllm_router_kv_source_recovery_state",
-                "state" => previous_state,
-                "reason" => previous_reason)
-            .decrement(1.0);
-        }
-        gauge!("vllm_router_kv_source_recovery_state",
-            "state" => state,
+    pub(crate) fn record_kv_source_recovery(strict: bool, reason: &'static str) {
+        counter!("vllm_router_kv_source_recovery_events_total",
+            "mode" => if strict { "strict" } else { "compatible" },
             "reason" => reason)
-        .increment(1.0);
-        counter!("vllm_router_kv_source_recovery_transitions_total",
-            "from" => previous.map_or("unregistered", |(state, _)| state),
-            "to" => state,
-            "reason" => reason)
-        .increment(1);
-    }
-
-    pub fn clear_kv_source_recovery_state(state: &'static str, reason: &'static str) {
-        gauge!("vllm_router_kv_source_recovery_state",
-            "state" => state,
-            "reason" => reason)
-        .decrement(1.0);
-        counter!("vllm_router_kv_source_recovery_transitions_total",
-            "from" => state,
-            "to" => "forgotten",
-            "reason" => "source_retired")
         .increment(1);
     }
 
@@ -1608,6 +1630,27 @@ impl TokenizerMetrics {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn publishes_routing_metric_descriptions_and_buckets() {
+        let recorder = set_program_scheduling_buckets(PrometheusBuilder::new()).build_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            init_metrics();
+            RouterMetrics::record_prefix_routing_decision("kv_aware", "regular", "hit");
+            RouterMetrics::record_pd_kv_decision(Some(256), Some(16), None);
+        });
+        let rendered = recorder.handle().render();
+        for name in [
+            "vllm_router_prefix_routing_decisions_total",
+            "vllm_router_pd_credited_prefix_tokens_total",
+        ] {
+            assert!(rendered.contains(&format!("# HELP {name} ")), "{rendered}");
+        }
+        assert!(
+            rendered.contains("vllm_router_pd_new_prefill_tokens_bucket"),
+            "{rendered}"
+        );
+    }
 
     // ============= PrometheusConfig Tests =============
 
