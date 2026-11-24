@@ -1,6 +1,8 @@
 //! Read worker model metadata and KV event source endpoints.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
+
+use super::metrics_meta::EngineCacheConfigs;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -446,6 +448,12 @@ pub(super) fn parse_vllm_version(version: &str) -> Option<(u32, u32)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
+pub(super) type WorkerMetadata = (
+    ServerInfo,
+    Option<HashSet<String>>,
+    Option<EngineCacheConfigs>,
+);
+
 /// Worker cache metadata, tried in the order a deployment is likely to answer it:
 /// the multi-backend control contract, the engine config endpoint, then the
 /// always-on `/metrics` scrape.
@@ -457,16 +465,17 @@ pub(super) async fn query_worker_metadata_and_models(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-) -> Result<(ServerInfo, Option<HashSet<String>>), String> {
+) -> Result<WorkerMetadata, String> {
     let control_error = match query_worker_control_metadata(client, worker_url, api_key).await {
-        Ok(info) => return Ok((info, None)),
+        Ok(info) => return Ok((info, None, None)),
         Err(error) => error,
     };
 
     query_metrics_metadata(client, worker_url, api_key)
         .await
-        .and_then(|(info, models)| {
-            validate_worker_metadata(worker_url, "metrics", Ok(info)).map(|info| (info, models))
+        .and_then(|(info, models, configs)| {
+            validate_worker_metadata(worker_url, "metrics", Ok(info))
+                .map(|info| (info, models, configs))
         })
         .map_err(|error| format!("{control_error}; {error}"))
 }
@@ -561,7 +570,7 @@ async fn query_metrics_metadata(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-) -> Result<(ServerInfo, Option<HashSet<String>>), String> {
+) -> Result<WorkerMetadata, String> {
     let engines = query_engine_cache_configs(client, worker_url, api_key).await?;
     let hash_unit = metrics_meta::shared_hash_unit(&engines).map_err(|units| {
         format!("metrics: engines disagree on block size {units:?} — refusing to index")
@@ -583,20 +592,37 @@ async fn query_metrics_metadata(
         kv_block_size: hash_unit,
         ..Default::default()
     };
-    Ok((info, models.as_ref().map(base_model_names)))
+    Ok((info, models.as_ref().map(base_model_names), Some(engines)))
 }
 
 pub(super) async fn query_engine_cache_configs(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-) -> Result<BTreeMap<u32, metrics_meta::EngineCacheConfig>, String> {
+) -> Result<EngineCacheConfigs, String> {
     let text = query_worker_text(client, worker_url, "metrics", true, api_key).await?;
     let engines = metrics_meta::parse_cache_config_info(&text);
     if engines.is_empty() {
         return Err("metrics: no vllm:cache_config_info series".to_string());
     }
     Ok(engines)
+}
+
+pub(super) async fn probe_engine_cache_configs(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+) -> Option<EngineCacheConfigs> {
+    if crate::backend::is_grpc_url(worker_url) {
+        return None;
+    }
+    tokio::time::timeout(
+        CONTROL_TIMEOUT / 4,
+        query_engine_cache_configs(client, worker_url, api_key),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
 }
 
 pub(super) async fn query_model_list(

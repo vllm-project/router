@@ -12,6 +12,8 @@ use crate::protocols::prometheus_text::for_each_sample;
 /// The metric family that carries one engine's `CacheConfig`.
 pub(crate) const CACHE_CONFIG_INFO: &str = "vllm:cache_config_info";
 
+pub(super) type EngineCacheConfigs = BTreeMap<u32, EngineCacheConfig>;
+
 /// The parts of one engine's `CacheConfig` the KV index needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EngineCacheConfig {
@@ -21,6 +23,8 @@ pub(crate) struct EngineCacheConfig {
     pub(crate) effective_attention_block_size: Option<u32>,
     /// Resolved hash granularity. Older engines may leave it unset.
     pub(crate) hash_block_size: Option<u32>,
+    /// Prefix-cache hash algorithm reported by this engine.
+    pub(crate) prefix_caching_hash_algo: Option<String>,
     /// Engine-declared cache layout, once vLLM populates it.
     pub(crate) kv_cache_layout: Option<String>,
 }
@@ -73,6 +77,10 @@ pub(crate) fn parse_cache_config_info(text: &str) -> BTreeMap<u32, EngineCacheCo
             .get("hash_block_size")
             .and_then(|value| value.parse().ok())
             .filter(|size| *size > 0);
+        entry.prefix_caching_hash_algo = labels
+            .get("prefix_caching_hash_algo")
+            .filter(|algorithm| !is_unset(algorithm))
+            .cloned();
         entry.kv_cache_layout = labels
             .get("kv_cache_layout")
             .filter(|layout| !is_unset(layout))
@@ -107,6 +115,10 @@ mod tests {
         assert_eq!(engine.block_size, Some(16));
         assert_eq!(engine.effective_attention_block_size, Some(16));
         assert_eq!(engine.kv_cache_layout, None);
+        assert_eq!(
+            engine.prefix_caching_hash_algo.as_deref(),
+            Some("sha256_cbor")
+        );
         assert_eq!(engine.hash_unit(), Some(16));
     }
 

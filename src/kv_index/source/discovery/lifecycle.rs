@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
-use super::probe::WorkerDescriptor;
+use super::metrics_meta::EngineCacheConfigs;
+use super::probe::{probe_engine_cache_configs, WorkerDescriptor};
 use super::reconcile::{
     native_sources_match, probe_keeps_trust, probe_renews_trust, static_hybrid_sources_match,
     BoundSource, BoundSources, StaticHybridMatch,
@@ -301,20 +302,76 @@ impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
     }
 }
 
+pub(super) struct MonitoredRank {
+    pub(super) source: EventSource,
+    pub(super) index: Arc<SourceBinding>,
+    pub(super) handle: Option<Arc<EventSubscriberHandle>>,
+    pub(super) expected_hash_algorithm: String,
+    pub(super) hash_mismatch: bool,
+}
+
+impl MonitoredRank {
+    pub(super) fn observe_hash(&mut self, worker_url: &str, configs: Option<&EngineCacheConfigs>) {
+        let rank = self.source.dp_rank;
+        let Some(reported) = configs
+            .and_then(|engines| engines.get(&rank))
+            .and_then(|engine| engine.prefix_caching_hash_algo.as_deref())
+        else {
+            return;
+        };
+        let mismatched = reported != self.expected_hash_algorithm;
+        if mismatched && !self.hash_mismatch {
+            warn!(
+                worker_url,
+                rank,
+                reported,
+                expected = self.expected_hash_algorithm,
+                "KV credit disabled for incompatible worker prefix hash algorithm"
+            );
+            self.stop();
+        }
+        self.hash_mismatch = mismatched;
+    }
+
+    pub(super) fn start(
+        &mut self,
+        ctx: Arc<zmq::Context>,
+        signals: Option<tokio::sync::mpsc::Sender<IngestionSignal>>,
+        strict_recovery: bool,
+    ) -> Result<(), &'static str> {
+        let stream =
+            Arc::new(EventStream::new(self.index.clone()).with_strict_recovery(strict_recovery));
+        let handle = super::super::events::event_stream::spawn_zmq_with_signals(
+            self.source.clone(),
+            stream,
+            ctx,
+            signals,
+        )?;
+        self.handle = Some(Arc::new(handle));
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.shutdown();
+        }
+    }
+}
+
 impl KvIndexSupervisor {
     pub(super) fn monitor_hybrid_source(
         &self,
         provider: &Arc<LayoutWorkerProvider>,
         worker_url: &str,
-        mut handles: Vec<Arc<EventSubscriberHandle>>,
-        targets: Vec<(EventSource, Arc<SourceBinding>)>,
+        mut targets: Vec<MonitoredRank>,
         capability: CacheCapabilities,
         assumed_plain_full: bool,
     ) {
         // Revalidate only publishers with an installed subscriber.
         let bound: BoundSources = targets
             .iter()
-            .map(|(source, _)| {
+            .map(|target| {
+                let source = &target.source;
                 (
                     source.dp_rank,
                     BoundSource {
@@ -335,11 +392,10 @@ impl KvIndexSupervisor {
         let installed = Arc::downgrade(&self.installed);
         let strict_recovery = self.strict_recovery;
         tokio::spawn(async move {
-            let invalidate = |handles: &[Arc<EventSubscriberHandle>]| {
-                for handle in handles {
-                    handle.shutdown();
-                }
-                for (source, _) in &targets {
+            let invalidate = |targets: &mut [MonitoredRank]| {
+                for target in targets {
+                    target.stop();
+                    let source = &target.source;
                     crate::kv_index::subscriber::emit(
                         &signals,
                         IngestionSignal::Invalidated {
@@ -359,69 +415,79 @@ impl KvIndexSupervisor {
                     break;
                 }
                 if provider.lifecycle.expire_if_needed() {
-                    invalidate(&handles);
+                    invalidate(&mut targets);
                 }
-                let outcome = if let Some(config) = &static_config {
-                    static_hybrid_sources_match(
-                        &client,
-                        &worker,
-                        api_key.as_deref(),
-                        config,
-                        Some(&bound),
-                    )
-                    .await
-                } else {
-                    native_sources_match(
-                        &client,
-                        &worker,
-                        api_key.as_deref(),
-                        (!assumed_plain_full).then_some(&capability),
-                        &bound,
-                    )
-                    .await
+                let probe_sources = async {
+                    if let Some(config) = &static_config {
+                        static_hybrid_sources_match(
+                            &client,
+                            &worker,
+                            api_key.as_deref(),
+                            config,
+                            Some(&bound),
+                        )
+                        .await
+                    } else {
+                        native_sources_match(
+                            &client,
+                            &worker,
+                            api_key.as_deref(),
+                            (!assumed_plain_full).then_some(&capability),
+                            &bound,
+                        )
+                        .await
+                    }
                 };
+                let (outcome, configs) = tokio::join!(
+                    probe_sources,
+                    probe_engine_cache_configs(
+                        &client,
+                        super::split_worker_rank(&worker).0,
+                        api_key.as_deref()
+                    ),
+                );
                 if !provider.lifecycle.active.load(Ordering::Acquire) {
-                    for handle in &handles {
-                        handle.shutdown();
+                    for target in &mut targets {
+                        target.stop();
                     }
                     break;
                 }
                 // A probe may cross the deadline while it is in flight.
                 if provider.lifecycle.expire_if_needed() {
-                    invalidate(&handles);
+                    invalidate(&mut targets);
                 }
-                match provider.lifecycle.observe_layout(&outcome) {
-                    SourceAction::Stop => {}
-                    SourceAction::Recover => {
-                        handles.clear();
-                        let mut recovered = true;
-                        for (ev, index) in &targets {
-                            let stream = Arc::new(
-                                EventStream::new(index.clone())
-                                    .with_strict_recovery(strict_recovery),
-                            );
-                            match super::super::events::event_stream::spawn_zmq_with_signals(
-                                ev.clone(),
-                                stream,
-                                probe_ctx.clone(),
-                                signals.clone(),
-                            ) {
-                                Ok(handle) => handles.push(Arc::new(handle)),
-                                Err(_) => recovered = false,
+                for target in &mut targets {
+                    target.observe_hash(&worker, configs.as_ref());
+                }
+                let action = provider.lifecycle.observe_layout(&outcome);
+                if matches!(action, SourceAction::Recover | SourceAction::Keep)
+                    && probe_renews_trust(&outcome)
+                {
+                    let mut recovered = true;
+                    for target in &mut targets {
+                        if target.handle.is_none() && !target.hash_mismatch {
+                            if let Err(error) =
+                                target.start(probe_ctx.clone(), signals.clone(), strict_recovery)
+                            {
+                                warn!(
+                                    worker,
+                                    rank = target.source.dp_rank,
+                                    error,
+                                    "KV event subscription rejected"
+                                );
+                                recovered = false;
                             }
                         }
-                        // Retirement can race the awaited probe and the new
-                        // subscriptions. Never make it active again.
-                        if provider.lifecycle.finish_layout_recovery(recovered) {
-                            continue;
-                        }
                     }
-                    SourceAction::Keep => continue,
-                    SourceAction::Rebuild => {
-                        unreachable!("layout probe cannot install a descriptor")
+                    if action == SourceAction::Keep
+                        || provider.lifecycle.finish_layout_recovery(recovered)
+                    {
+                        continue;
                     }
+                } else if action == SourceAction::Keep {
+                    continue;
                 }
-                invalidate(&handles);
+                invalidate(&mut targets);
                 if let Some(installed) = installed.upgrade() {
                     installed.retire_if_current(&worker, &provider.lifecycle);
                 }
