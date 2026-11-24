@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
+use vllm_router_rs::backend::control::KvEventSourcesResponse;
 use vllm_router_rs::backend::convert::{json_to_proto_struct, proto_struct_to_json};
 use vllm_router_rs::backend::pb::{
     self,
@@ -106,6 +107,7 @@ pub struct MockVllmRs {
     pub authorization: AuthorizationCheck,
     /// Discovery RPC name and whether its metadata matched the credential gate.
     pub(crate) control_calls: Arc<Mutex<Vec<(&'static str, bool)>>>,
+    pub kv_block_size: u32,
 }
 
 /// Blocks requests after the first `hold_after` ones until [`HoldGate::release`].
@@ -170,6 +172,7 @@ impl Default for MockVllmRs {
             hold: None,
             authorization: AuthorizationCheck::default(),
             control_calls: Default::default(),
+            kv_block_size: 0,
         }
     }
 }
@@ -231,6 +234,27 @@ impl MockVllmRsServer {
     }
 
     pub async fn spawn_with_state(state: MockVllmRs) -> Self {
+        Self::spawn_with_control(state, None).await
+    }
+
+    pub async fn spawn_with_kv_event_sources(
+        kv_block_size: u32,
+        sources: KvEventSourcesResponse,
+    ) -> Self {
+        Self::spawn_with_control(
+            MockVllmRs {
+                kv_block_size,
+                ..Default::default()
+            },
+            Some(sources),
+        )
+        .await
+    }
+
+    async fn spawn_with_control(
+        state: MockVllmRs,
+        kv_event_sources: Option<KvEventSourcesResponse>,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
@@ -238,11 +262,38 @@ impl MockVllmRsServer {
             tonic_health::pb::health_server::HealthServer::new(AuthHealth(state.clone()));
         let svc = InferenceServer::new(state.clone());
         let control = ControlServer::new(state.clone());
+        let routes = tonic::service::Routes::new(health_service)
+            .add_service(svc)
+            .add_service(control);
+        let routes = if let Some(sources) = kv_event_sources {
+            // Keep the stock Control services. Override only the additive RPC
+            // response while the published protobuf still has the old fields.
+            routes
+                .into_axum_router()
+                .route(
+                    "/vllm.Control/GetKvEventSources",
+                    axum::routing::post(move |request: http::Request<axum::body::Body>| {
+                        let sources = sources.clone();
+                        async move {
+                            let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::<
+                                KvEventSourcesResponse,
+                                pb::GetKvEventSourcesRequest,
+                            >::default(
+                            ));
+                            let describe = tower::service_fn(move |_| {
+                                std::future::ready(Ok::<_, Status>(Response::new(sources.clone())))
+                            });
+                            grpc.unary(describe, request).await
+                        }
+                    }),
+                )
+                .into()
+        } else {
+            routes
+        };
         let handle = tokio::spawn(async move {
             Server::builder()
-                .add_service(health_service)
-                .add_service(svc)
-                .add_service(control)
+                .add_routes(routes)
                 .serve_with_incoming(incoming)
                 .await
                 .unwrap();
@@ -493,6 +544,7 @@ macro_rules! mock_control {
                 self.verify_control("GetServerInfo", &request)?;
                 Ok(Response::new(pb::ServerInfo {
                     engine_version: "mock".into(),
+                    kv_block_size: self.kv_block_size,
                     ..Default::default()
                 }))
             }

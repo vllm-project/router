@@ -15,6 +15,7 @@ use crate::protocols::worker_spec::{
     WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse, WorkerInfo, WorkerListResponse,
     WorkerStats, WorkerTypeStats,
 };
+use crate::routers::http::completion_route::{is_full_report, reject_full_report};
 use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -94,6 +95,45 @@ impl RouterManager {
             *default_router = Some(id.clone());
             info!("Set default router to {}", id.as_str());
         }
+    }
+
+    // A publisher may be shared by routers with different policies. Treat
+    // unknown membership conservatively and compare registered worker bases.
+    fn monitors_shared_publishers(&self, selected: &dyn RouterTrait) -> bool {
+        if selected.monitors_kv_events() {
+            return true;
+        }
+        let selected = selected.get_worker_urls();
+        self.routers
+            .iter()
+            .filter(|router| router.monitors_kv_events())
+            .any(|router| {
+                let monitored = router.get_worker_urls();
+                selected.is_empty()
+                    || monitored.is_empty()
+                    || selected.iter().any(|url| {
+                        let base = crate::backend::strip_dp_suffix(url);
+                        monitored.iter().any(|other| {
+                            let other = crate::backend::strip_dp_suffix(other);
+                            base == other
+                                || match (url::Url::parse(base), url::Url::parse(other)) {
+                                    (Ok(base), Ok(other)) => base == other,
+                                    _ => false,
+                                }
+                        })
+                    })
+            })
+    }
+
+    fn reject_shared_full_report(
+        &self,
+        router: &dyn RouterTrait,
+        vllm_xargs: Option<&serde_json::Value>,
+    ) -> Option<Response> {
+        if !is_full_report(vllm_xargs) {
+            return None;
+        }
+        reject_full_report(self.monitors_shared_publishers(router), vllm_xargs)
     }
 
     /// Set the default router
@@ -176,6 +216,29 @@ impl RouterManager {
         // Add configuration to labels
         labels.insert("model_id".to_string(), model_id.clone());
 
+        // vLLM selects adapters through the request's `model`, so record which
+        // other names are base-model aliases: the remaining names are adapters,
+        // whose blocks the engine caches under a separate identity.
+        let default_policy = self.policy_registry.get_default_policy();
+        let model_policy = self.policy_registry.get_policy(&model_id);
+        let uses_kv = kv_aware_ops(default_policy.as_ref()).is_some()
+            || model_policy
+                .as_ref()
+                .is_some_and(|policy| kv_aware_ops(policy.as_ref()).is_some())
+            || labels.get("policy").is_some_and(|hint| hint == "kv_aware");
+        if uses_kv && !labels.contains_key("served_model_aliases") {
+            labels.extend(
+                crate::kv_index::discovery::served_model_labels(
+                    &self.client,
+                    &config.url,
+                    None,
+                    None,
+                    Some(Default::default()),
+                )
+                .await,
+            );
+        }
+
         if let Some(priority) = config.priority {
             labels.insert("priority".to_string(), priority.to_string());
         }
@@ -212,13 +275,35 @@ impl RouterManager {
         let policy_hint = labels.get("policy").map(|s| s.as_str());
         let policy = self.policy_registry.on_worker_added(&model_id, policy_hint);
         if worker_arc.worker_type() == WorkerType::Regular {
-            if let Some(kv) = kv_aware_ops(policy.as_ref()) {
-                kv.register_worker(worker_arc.as_ref(), None, None);
-            }
-            let default = self.policy_registry.get_default_policy();
-            if !Arc::ptr_eq(&policy, &default) {
-                if let Some(kv) = kv_aware_ops(default.as_ref()) {
+            let regular = self
+                .routers
+                .get(&RouterId::new("http-regular".into()))
+                .map(|router| router.clone());
+            if let Some(router) = regular.as_ref().and_then(|router| {
+                router
+                    .as_any()
+                    .downcast_ref::<crate::routers::router::Router>()
+            }) {
+                let info = router.discover_kv_worker(worker_arc.base_url()).await;
+                if self
+                    .worker_registry
+                    .get_by_url(worker_arc.url())
+                    .is_some_and(|current| Arc::ptr_eq(&current, &worker_arc))
+                {
+                    router.register_kv_target(
+                        worker_arc.as_ref(),
+                        info.as_ref().map(|(info, _)| info),
+                    );
+                }
+            } else {
+                if let Some(kv) = kv_aware_ops(policy.as_ref()) {
                     kv.register_worker(worker_arc.as_ref(), None, None);
+                }
+                let default = self.policy_registry.get_default_policy();
+                if !Arc::ptr_eq(&policy, &default) {
+                    if let Some(kv) = kv_aware_ops(default.as_ref()) {
+                        kv.register_worker(worker_arc.as_ref(), None, None);
+                    }
                 }
             }
         }
@@ -259,17 +344,22 @@ impl RouterManager {
     ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
         if let Some(worker) = self.worker_registry.remove_by_url(url) {
             if worker.worker_type() == WorkerType::Regular {
-                let policy = self
-                    .policy_registry
-                    .get_policy_or_default(worker.model_id());
-                if let Some(kv) = kv_aware_ops(policy.as_ref()) {
-                    kv.unregister_worker(url);
-                }
-                let default = self.policy_registry.get_default_policy();
-                if !Arc::ptr_eq(&policy, &default) {
-                    if let Some(kv) = kv_aware_ops(default.as_ref()) {
-                        kv.unregister_worker(url);
-                    }
+                let regular = self
+                    .routers
+                    .get(&RouterId::new("http-regular".into()))
+                    .map(|router| router.clone());
+                let regular = regular.as_ref().and_then(|router| {
+                    router
+                        .as_any()
+                        .downcast_ref::<crate::routers::router::Router>()
+                });
+                if let Some(router) = regular {
+                    router.remove_kv_workers(std::slice::from_ref(&worker));
+                } else {
+                    crate::routers::router::Router::unregister_kv_target(
+                        &self.policy_registry,
+                        worker.as_ref(),
+                    );
                 }
             }
             self.policy_registry.on_worker_removed(worker.model_id());
@@ -614,6 +704,11 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, None);
 
         if let Some(router) = router {
+            if let Some(response) =
+                self.reject_shared_full_report(router.as_ref(), body.other.get("vllm_xargs"))
+            {
+                return response;
+            }
             router.route_inference_generate(headers, body, None).await
         } else {
             (
@@ -639,6 +734,11 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
+            if let Some(response) =
+                self.reject_shared_full_report(router.as_ref(), body.other.get("vllm_xargs"))
+            {
+                return response;
+            }
             router.route_chat(headers, body, model_id).await
         } else {
             let msg = match model_id {
@@ -664,6 +764,11 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
+            if let Some(response) =
+                self.reject_shared_full_report(router.as_ref(), body.other.get("vllm_xargs"))
+            {
+                return response;
+            }
             router.route_completion(headers, body, model_id).await
         } else {
             let msg = match model_id {
@@ -681,8 +786,23 @@ impl RouterTrait for RouterManager {
         raw: axum::body::Bytes,
         _model_id: Option<&str>,
     ) -> Response {
+        // A library caller can provide raw bytes different from its typed
+        // request, so check the bytes that the selected router may forward.
         let model_id = body.model.clone();
         if let Some(router) = self.select_router_for_request(headers, model_id.as_deref()) {
+            if self
+                .routers
+                .iter()
+                .any(|router| router.monitors_kv_events())
+            {
+                let actual = serde_json::from_slice::<serde_json::Value>(&raw).ok();
+                if let Some(response) = self.reject_shared_full_report(
+                    router.as_ref(),
+                    actual.as_ref().and_then(|body| body.get("vllm_xargs")),
+                ) {
+                    return response;
+                }
+            }
             router
                 .route_completion_raw(headers, body, raw, model_id.as_deref())
                 .await
@@ -864,6 +984,11 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, None);
 
         if let Some(router) = router {
+            if let Some(response) =
+                self.reject_shared_full_report(router.as_ref(), body.get("vllm_xargs"))
+            {
+                return response;
+            }
             router.route_transparent(headers, path, method, body).await
         } else {
             // Return 404 when no router is available
@@ -886,5 +1011,76 @@ impl std::fmt::Debug for RouterManager {
             .field("workers_count", &self.worker_registry.get_all().len())
             .field("default_router", &*self.default_router.read().unwrap())
             .finish()
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod tests {
+    use super::*;
+    use crate::config::PolicyConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn alias_probe_only_runs_when_kv_policy_can_use_it() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let captured = requests.clone();
+        let app = axum::Router::new().fallback(axum::routing::get(move || {
+            let captured = captured.clone();
+            async move {
+                captured.fetch_add(1, Ordering::Relaxed);
+                axum::Json(serde_json::json!({
+                    "kv_block_size": 16, "served_model_aliases": ["base-alias"]
+                }))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        for (existing_kv, hint, expected_probe) in [
+            (false, None, false),
+            (false, Some("kv_aware"), true),
+            (true, None, true),
+        ] {
+            requests.store(0, Ordering::Relaxed);
+            let registry = Arc::new(WorkerRegistry::new());
+            let policies = Arc::new(crate::policies::PolicyRegistry::new(
+                PolicyConfig::RoundRobin,
+            ));
+            if existing_kv {
+                policies.on_worker_added("model", Some("kv_aware"));
+            }
+            let manager = RouterManager::new(
+                RouterConfig::default(),
+                reqwest::Client::new(),
+                registry.clone(),
+                policies,
+            );
+            let labels = hint.map_or_else(Default::default, |value| {
+                [("policy".to_string(), value.to_string())]
+                    .into_iter()
+                    .collect()
+            });
+            manager
+                .add_worker(WorkerConfigRequest {
+                    url: url.clone(),
+                    model_id: Some("model".into()),
+                    priority: None,
+                    cost: None,
+                    worker_type: None,
+                    bootstrap_port: None,
+                    labels,
+                })
+                .await
+                .unwrap();
+            let worker = registry.get_by_url(&url).unwrap();
+            assert_eq!(requests.load(Ordering::Relaxed) > 0, expected_probe);
+            assert_eq!(
+                crate::kv_index::discovery::worker_serves_base_model(worker.as_ref(), "base-alias"),
+                expected_probe
+            );
+        }
+        server.abort();
     }
 }

@@ -9,18 +9,21 @@ use serde_json::{json, Value};
 use tonic::service::{interceptor::InterceptedService, Interceptor};
 use tonic::transport::Channel;
 
+pub use crate::kv_index::discovery::{
+    get_grpc_kv_event_sources, GrpcKvEventSourcesResponse as KvEventSourcesResponse,
+};
+
 use super::detect::grpc_connect_uri;
 use super::pb::{
-    control_client::ControlClient, GetKvEventSourcesRequest, GetKvEventSourcesResponse,
-    GetModelInfoRequest, GetServerInfoRequest, ModelInfo, ServerInfo,
+    control_client::ControlClient, GetModelInfoRequest, GetServerInfoRequest, ModelInfo, ServerInfo,
 };
 use super::set_bearer_auth;
 
-async fn control_client<'a>(
+pub(crate) async fn control_channel<'a>(
     worker_url: &str,
     api_key: Option<&'a str>,
     timeout: Duration,
-) -> Result<ControlClient<InterceptedService<Channel, impl Interceptor + 'a>>, String> {
+) -> Result<InterceptedService<Channel, impl Interceptor + 'a>, String> {
     let uri = grpc_connect_uri(worker_url)?;
     let channel = Channel::from_shared(uri.clone())
         .map_err(|e| format!("invalid grpc uri {uri}: {e}"))?
@@ -29,9 +32,9 @@ async fn control_client<'a>(
         .connect()
         .await
         .map_err(|e| format!("grpc control connect {uri}: {e}"))?;
-    Ok(ControlClient::with_interceptor(
+    Ok(InterceptedService::new(
         channel,
-        move |mut request| {
+        move |mut request: tonic::Request<()>| {
             set_bearer_auth(&mut request, api_key).map_err(tonic::Status::invalid_argument)?;
             Ok(request)
         },
@@ -48,7 +51,7 @@ pub(crate) async fn get_grpc_model_info_with_auth(
     timeout: Duration,
 ) -> Result<ModelInfo, String> {
     let uri = grpc_connect_uri(worker_url)?;
-    let mut client = control_client(worker_url, api_key, timeout).await?;
+    let mut client = ControlClient::new(control_channel(worker_url, api_key, timeout).await?);
     tokio::time::timeout(timeout, client.get_model_info(GetModelInfoRequest {}))
         .await
         .map_err(|_| format!("grpc GetModelInfo timeout {uri}"))?
@@ -69,36 +72,12 @@ pub(crate) async fn get_grpc_server_info_with_auth(
     timeout: Duration,
 ) -> Result<ServerInfo, String> {
     let uri = grpc_connect_uri(worker_url)?;
-    let mut client = control_client(worker_url, api_key, timeout).await?;
+    let mut client = ControlClient::new(control_channel(worker_url, api_key, timeout).await?);
     tokio::time::timeout(timeout, client.get_server_info(GetServerInfoRequest {}))
         .await
         .map_err(|_| format!("grpc GetServerInfo timeout {uri}"))?
         .map_err(|e| format!("grpc GetServerInfo {uri}: {e}"))
         .map(|response| response.into_inner())
-}
-
-pub async fn get_grpc_kv_event_sources(
-    worker_url: &str,
-    timeout: Duration,
-) -> Result<GetKvEventSourcesResponse, String> {
-    get_grpc_kv_event_sources_with_auth(worker_url, None, timeout).await
-}
-
-pub(crate) async fn get_grpc_kv_event_sources_with_auth(
-    worker_url: &str,
-    api_key: Option<&str>,
-    timeout: Duration,
-) -> Result<GetKvEventSourcesResponse, String> {
-    let uri = grpc_connect_uri(worker_url)?;
-    let mut client = control_client(worker_url, api_key, timeout).await?;
-    tokio::time::timeout(
-        timeout,
-        client.get_kv_event_sources(GetKvEventSourcesRequest {}),
-    )
-    .await
-    .map_err(|_| format!("grpc GetKvEventSources timeout {uri}"))?
-    .map_err(|e| format!("grpc GetKvEventSources {uri}: {e}"))
-    .map(|response| response.into_inner())
 }
 
 pub fn model_info_json(info: &ModelInfo) -> Value {
