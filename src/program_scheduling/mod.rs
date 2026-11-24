@@ -16,6 +16,7 @@ pub mod pd_cost;
 mod policy;
 pub(crate) mod prediction_profile;
 mod request_pool;
+mod retention;
 mod return_time;
 mod runtime;
 mod scheduler;
@@ -50,6 +51,7 @@ pub use policy::{
     PrefillCostModel, ProgressTtlConfig, ProgressTtlPolicyMath,
 };
 pub use request_pool::ProgramRequestHandle;
+pub use retention::ReturnTimeUtilityDiagnostic;
 pub use runtime::ProgramRuntime;
 pub use scheduler::{BackendObservationEpoch, ProgramScheduler};
 pub use scheduler_state::{ProgramResumeOrder, ProgramSchedulerConfig};

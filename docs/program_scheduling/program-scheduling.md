@@ -434,6 +434,65 @@ unavailable or insufficiently supported return prediction falls back to the
 existing fitted TTL. Output-length prediction remains observational in this
 branch. vLLM PD mode accepts only `off` or `shadow`.
 
+### Return-time utility observations
+
+For a sufficiently supported return prediction, each Program diagnostic may
+include `return_prediction_utility`. It decomposes the existing histogram
+objective at `predicted_ttl_seconds`:
+
+```text
+modeled_cache_benefit_seconds =
+    cache_miss_impact_seconds * return_probability_within_ttl
+modeled_utility_seconds =
+    modeled_cache_benefit_seconds - expected_retention_seconds
+```
+
+For example, a profile with 60% of its mass returning at 0.1s, 20% at 0.5s,
+and 20% explicitly not returning, with a modeled miss impact of 0.6s, selects
+0.1s and reports approximately:
+
+```json
+{
+  "return_prediction_utility": {
+    "ttl_seconds": 0.1,
+    "cache_miss_impact_seconds": 0.6,
+    "return_probability_within_ttl": 0.6,
+    "no_return_probability": 0.2,
+    "expected_retention_seconds": 0.1,
+    "modeled_cache_benefit_seconds": 0.36,
+    "modeled_utility_seconds": 0.26
+  }
+}
+```
+
+`return_probability_within_ttl` uses the suggested TTL, unlike the existing
+return probability, which uses the configured diagnostic horizon and elapsed
+time. Terminal mass pays the full TTL. An overflow bucket without a known
+finite upper bound receives no finite-TTL hit credit, but still pays retention
+cost. The object is omitted when no supported prediction/evaluation is
+available; a supported zero-TTL decision instead reports zero benefit and
+utility.
+
+These are **legacy model terms**, not measured latency savings, physical KV
+survival probabilities, or incremental keep-versus-release benefits. The
+legacy objective prices one second of expected retention as one second of
+cost. No residency, re-admission, criticality, or queue-externality estimate is
+introduced by these observations.
+
+The object describes the **suggested** TTL even in Shadow mode or when an
+explicit request TTL overrides it. It does not assert that the Program was
+retained for that duration. In `return_time_prediction` debug logs,
+`modeled_return_probability_within_ttl`, `modeled_expected_retention_seconds`,
+`modeled_cache_benefit_seconds`, and `modeled_utility_seconds` expose the same
+terms. Use the existing `prediction_ttl_applied` field and the new `ttl_armed`
+boolean to distinguish a prediction from an armed decision. A completion-time
+capacity pause has `ttl_armed=false`; later repair/expiration still needs to be
+joined with the actual next return to measure sustained coverage.
+
+No new configuration is needed. Prediction mode `off` does not collect these
+terms, and the existing TTL objective, cost cap, request override precedence,
+admission, and capacity-repair policies remain unchanged.
+
 ## PD Program scheduling
 
 Program-scoped PD scheduling and warm remote KV reuse with automatic TTL are documented in

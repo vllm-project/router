@@ -5,7 +5,7 @@
 
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::ProgramSchedulerState;
-use super::{ProgramState, ProgramStatus};
+use super::{ProgramState, ProgramStatus, ReturnTimeUtilityDiagnostic};
 use crate::config::types::PredictionMode;
 use crate::metrics::RouterMetrics;
 use serde::Serialize;
@@ -76,6 +76,9 @@ pub struct ProgramDiagnostic {
     pub force_resume_request_throughput_per_second: f64,
     pub predicted_return_probability: Option<f64>,
     pub predicted_ttl_seconds: Option<f64>,
+    /// Legacy model terms for the suggested TTL; not measured or incremental KV benefit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_prediction_utility: Option<ReturnTimeUtilityDiagnostic>,
     pub return_prediction_support: Option<usize>,
     pub return_prediction_online_support: Option<usize>,
     pub return_prediction_backoff_level: Option<usize>,
@@ -362,6 +365,11 @@ impl ProgramScheduler {
                         .as_ref()
                         .and_then(|pending| pending.prediction.as_ref())
                         .map(|prediction| prediction.suggested_ttl_seconds),
+                    return_prediction_utility: decision
+                        .pending_return_prediction
+                        .as_ref()
+                        .and_then(|pending| pending.prediction.as_ref())
+                        .and_then(|prediction| prediction.utility),
                     return_prediction_support: decision
                         .pending_return_prediction
                         .as_ref()
@@ -662,6 +670,9 @@ mod tests {
         // The serialized snapshot keeps the legacy key for compatibility.
         let serialized = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(serialized["ranks"][0]["programs"][0]["context_tokens"], 123);
+        assert!(serialized["ranks"][0]["programs"][0]
+            .get("return_prediction_utility")
+            .is_none());
         assert_eq!(
             serialized["ranks"][0]["programs"][0]["estimated_context_tokens"],
             123

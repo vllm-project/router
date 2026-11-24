@@ -554,6 +554,19 @@ impl ProgramScheduler {
                     source = prediction
                         .map(|value| value.source.as_str())
                         .unwrap_or("none"),
+                    modeled_return_probability_within_ttl = prediction
+                        .and_then(|value| value.utility)
+                        .map(|value| value.return_probability_within_ttl),
+                    modeled_expected_retention_seconds = prediction
+                        .and_then(|value| value.utility)
+                        .map(|value| value.expected_retention_seconds),
+                    modeled_cache_benefit_seconds = prediction
+                        .and_then(|value| value.utility)
+                        .map(|value| value.modeled_cache_benefit_seconds),
+                    modeled_utility_seconds = prediction
+                        .and_then(|value| value.utility)
+                        .map(|value| value.modeled_utility_seconds),
+                    ttl_armed = completion_action == Some(CompletionAction::StartActingTtl),
                     baseline_ttl_seconds = policy_acting_ttl.as_secs_f64(),
                     applied_ttl_seconds = acting_ttl.as_secs_f64(),
                     prediction_ttl_applied,
@@ -1963,5 +1976,86 @@ mod tests {
         assert!(scheduler.repair_capacity(&mut state, now));
         assert!(state.decisions[first.program()].pause_when_idle);
         assert!(!state.decisions[second.program()].pause_when_idle);
+    }
+
+    #[tokio::test]
+    async fn utility_snapshot_is_observational_in_shadow_active_and_override_paths() {
+        use crate::program_scheduling::prediction_profile::ReturnTimeKey;
+        for mode in [PredictionMode::Shadow, PredictionMode::Active] {
+            for override_ttl in [None, Some(7.0)] {
+                let mut config = ProgramSchedulerConfig::default();
+                config.prediction_profile.mode = mode;
+                config.prediction_profile.return_time_min_support = 1;
+                let scheduler = ProgramScheduler::new(config);
+                let key = ReturnTimeKey {
+                    workflow_profile_id: None,
+                    profile_version: None,
+                    model_pool: None,
+                    agent_role: None,
+                    spawn_reason: None,
+                    blocks_parent: None,
+                    expected_resume: None,
+                    step_bucket: None,
+                };
+                scheduler
+                    .state
+                    .lock()
+                    .prediction_profiles
+                    .observe_return(&[key], 1.0);
+                let mut hints =
+                    serde_json::json!({"program_id":"utility-observation", "expected_resume":true});
+                if let Some(ttl) = override_ttl {
+                    hints["kv_retention_ttl_seconds"] = serde_json::json!(ttl);
+                }
+                let identity = ProgramIdentity::from_request(
+                    None,
+                    Some(&serde_json::json!({"vllm_xargs":{"agentic_context":hints}})),
+                    Some("model"),
+                )
+                .unwrap()
+                .unwrap();
+                let target = ProgramTarget {
+                    id: "rank-0".into(),
+                    base_url: "http://rank-0".into(),
+                    dp_rank: Some(0),
+                };
+                let dispatch = scheduler
+                    .acquire(identity, 50_000, &[target], None)
+                    .await
+                    .unwrap();
+                scheduler.complete(
+                    &dispatch,
+                    true,
+                    false,
+                    ProgramUsageObservation {
+                        prompt_tokens: Some(50_000),
+                        completion_tokens: Some(10),
+                        cached_prompt_tokens: Some(0),
+                    },
+                    Some(0.1),
+                );
+                let snapshot = scheduler.diagnostics();
+                let program = &snapshot.ranks[0].programs[0];
+                let utility = program.return_prediction_utility.unwrap();
+                assert_eq!(program.predicted_ttl_seconds, Some(1.0));
+                assert_eq!(utility.ttl_seconds, 1.0);
+                assert_eq!(utility.return_probability_within_ttl, 1.0);
+                assert_eq!(utility.expected_retention_seconds, 1.0);
+                assert_eq!(
+                    utility.modeled_utility_seconds,
+                    utility.modeled_cache_benefit_seconds - 1.0
+                );
+                let state = scheduler.state.lock();
+                let decision = &state.decisions[dispatch.program()];
+                let applied = override_ttl.unwrap_or(if mode == PredictionMode::Active {
+                    1.0
+                } else {
+                    0.0
+                });
+                assert_eq!(decision.last_applied_acting_ttl.as_secs_f64(), applied);
+                let serialized = serde_json::to_value(program).unwrap();
+                assert_eq!(serialized["return_prediction_utility"]["ttl_seconds"], 1.0);
+            }
+        }
     }
 }
