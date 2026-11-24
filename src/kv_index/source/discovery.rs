@@ -26,7 +26,6 @@ mod reconcile;
 mod registration;
 
 pub(crate) use lifecycle::CONTROL_TIMEOUT;
-pub(in crate::kv_index) use lifecycle::{LayoutGrant, LayoutPin};
 use lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
 use observer::WorkerObservation;
 use reconcile::{static_hybrid_sources_match, StaticHybridMatch};

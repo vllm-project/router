@@ -5,8 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::{Mutex, MutexGuard};
-use smallvec::SmallVec;
+use parking_lot::Mutex;
 use tracing::info;
 
 use super::probe::WorkerDescriptor;
@@ -55,70 +54,6 @@ pub(super) struct LifecycleState {
     pub(super) verified_at: Instant,
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct TrustStamp {
-    revision: u64,
-    verified_at: Instant,
-}
-
-impl TrustStamp {
-    fn covers(&self, lifecycle: &WorkerLifecycle, state: &LifecycleState, now: Instant) -> bool {
-        self.revision == state.revision
-            && (!lifecycle.layout
-                || now.saturating_duration_since(self.verified_at) <= LAYOUT_FRESHNESS)
-    }
-}
-
-pub(in crate::kv_index) struct LayoutGrant {
-    lifecycle: Arc<WorkerLifecycle>,
-    stamp: TrustStamp,
-}
-
-pub(in crate::kv_index) struct LayoutPin<'a> {
-    lifecycle: &'a WorkerLifecycle,
-    state: MutexGuard<'a, LifecycleState>,
-}
-
-impl LayoutGrant {
-    fn valid(&self, state: &LifecycleState) -> bool {
-        let now = Instant::now();
-        self.lifecycle.trusted_at(state, || now) && self.stamp.covers(&self.lifecycle, state, now)
-    }
-
-    /// A busy grant remains eligible for scoring. The selected source must
-    /// still pin the grant or retry before reserving a slot.
-    pub(in crate::kv_index) fn is_revoked(&self) -> bool {
-        self.lifecycle
-            .state
-            .try_lock()
-            .is_some_and(|state| !self.valid(&state))
-    }
-
-    pub(in crate::kv_index) fn try_pin<'a>(
-        &'a self,
-        pins: &mut SmallVec<[LayoutPin<'a>; 1]>,
-    ) -> bool {
-        if let Some(pin) = pins
-            .iter()
-            .find(|pin| std::ptr::eq(pin.lifecycle, self.lifecycle.as_ref()))
-        {
-            // Each hit validates its own grant against the shared locked state.
-            return self.valid(&pin.state);
-        }
-        let Some(state) = self.lifecycle.state.try_lock() else {
-            return false;
-        };
-        if !self.valid(&state) {
-            return false;
-        }
-        pins.push(LayoutPin {
-            lifecycle: &self.lifecycle,
-            state,
-        });
-        true
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SourceAction {
     Keep,
@@ -165,7 +100,7 @@ impl WorkerLifecycle {
         mut first_trust_check: Option<Instant>,
         now: impl Fn() -> Instant,
         mut query: impl FnMut() -> Option<T>,
-    ) -> Option<(T, TrustStamp)> {
+    ) -> Option<T> {
         for _ in 0..2 {
             let generation = rank.control.generation();
             let initial = {
@@ -175,10 +110,7 @@ impl WorkerLifecycle {
                 {
                     return None;
                 }
-                TrustStamp {
-                    revision: state.revision,
-                    verified_at: state.verified_at,
-                }
+                state.verified_at
             };
             let hits = query()?;
             let state = self.state.lock();
@@ -188,15 +120,17 @@ impl WorkerLifecycle {
             }
             // The same source and the original grant must cover the observation.
             // Renewal alone cannot certify pages observed during an expiry gap.
-            if rank.control.generation() == generation && initial.covers(self, &state, end) {
-                return Some((hits, initial));
+            if rank.control.generation() == generation
+                && (!self.layout || end.saturating_duration_since(initial) <= LAYOUT_FRESHNESS)
+            {
+                return Some(hits);
             }
         }
         None
     }
 
     pub(super) fn match_rank<'a>(
-        self: &Arc<Self>,
+        &self,
         index: &SourceBinding,
         cache: &mut RequestHashCache<'a>,
         mut query: impl FnMut(&mut RequestHashCache<'a>) -> Option<PlacementMatch>,
@@ -205,16 +139,8 @@ impl WorkerLifecycle {
             .layout
             .then(|| *cache.first_trust_check.get_or_insert_with(Instant::now));
         // Only the accepted attempt can publish evidence for the reservation.
-        let Some((hit, stamp)) =
-            self.read_rank(index, first_trust_check, Instant::now, || query(cache))
-        else {
-            return Vec::new();
-        };
-        let grant = cache.placement.is_some().then(|| LayoutGrant {
-            lifecycle: self.clone(),
-            stamp,
-        });
-        hit.publish(index, cache, grant)
+        self.read_rank(index, first_trust_check, Instant::now, || query(cache))
+            .map_or_else(Vec::new, |hit| hit.publish(index, cache))
     }
 
     pub(super) fn expire_if_needed(&self) -> bool {
@@ -553,12 +479,7 @@ impl InstalledWorkers {
     }
 
     pub(super) fn retire_worker(&self, subs: WorkerSubs) {
-        {
-            // Serialize retirement with LayoutPin, then release it before
-            // shutting down subscribers or taking their source gates.
-            let _state = subs.provider.lifecycle.state.lock();
-            subs.active.store(false, Ordering::Release);
-        }
+        subs.active.store(false, Ordering::Release);
         for handle in &subs.handles {
             handle.shutdown();
         }

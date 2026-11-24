@@ -3,7 +3,6 @@
 use crate::kv_index::layout::align_down;
 use crate::kv_index::request_hash::{BlockKeyGenerator, SequenceHash};
 use crate::kv_index::source::binding::SourceLease;
-use crate::kv_index::source::discovery::{LayoutGrant, LayoutPin};
 use crate::kv_index::storage::source_transaction::StreamControl;
 use crate::kv_index::storage::{GroupPages, PageQuery, SourceReadGuard, SourceVersion};
 use crate::kv_index::SourceBinding;
@@ -118,7 +117,6 @@ impl PlacementMatch {
         self,
         binding: &SourceBinding,
         cache: &mut RequestHashCache<'_>,
-        layout: Option<LayoutGrant>,
     ) -> Vec<TierMatch> {
         if let Some(placement) = &mut cache.placement {
             placement.push(PlacementEvidence {
@@ -126,7 +124,6 @@ impl PlacementMatch {
                 generation: self.generation,
                 control: binding.control.clone(),
                 lease: binding.binding.clone(),
-                layout,
             });
         }
         self.hits
@@ -139,15 +136,6 @@ pub(crate) struct PlacementEvidence {
     generation: u64,
     control: Arc<StreamControl>,
     lease: Option<SourceLease>,
-    // Discovery-backed hits pin their grant to serialize worker retirement.
-    // Standalone bindings rely on the source generation and read guard.
-    layout: Option<LayoutGrant>,
-}
-
-#[derive(Default)]
-pub(crate) struct PlacementPins<'a> {
-    sources: SmallVec<[SourceReadGuard<'a>; 1]>,
-    layouts: SmallVec<[LayoutPin<'a>; 1]>,
 }
 
 impl PlacementEvidence {
@@ -155,34 +143,25 @@ impl PlacementEvidence {
         self.source.target()
     }
 
-    fn source_is_current(&self) -> bool {
-        self.control.generation() == self.generation
-            && self.source.is_current()
-            && self.lease.as_ref().is_none_or(SourceLease::is_active)
-    }
-
     pub(crate) fn is_revoked(&self) -> bool {
-        !self.source_is_current() || self.layout.as_ref().is_some_and(LayoutGrant::is_revoked)
+        self.control.generation() != self.generation
+            || !self.source.is_current()
+            || self.lease.as_ref().is_some_and(|lease| !lease.is_active())
     }
 
-    /// Hold the layout and source guards across reservation. Both acquisitions
-    /// are nonblocking while the policy holds its selection lock.
+    /// Try the source guards without waiting under the policy's selection lock.
     pub(crate) fn try_pin_all<'a>(
         evidence: impl Iterator<Item = &'a Self>,
-    ) -> Option<PlacementPins<'a>> {
-        let mut pins = PlacementPins::default();
+    ) -> Option<SmallVec<[SourceReadGuard<'a>; 1]>> {
+        let mut pins = SmallVec::new();
         for proof in evidence {
-            if let Some(layout) = &proof.layout {
-                if !layout.try_pin(&mut pins.layouts) {
-                    return None;
-                }
-            }
-            pins.sources.push(proof.source.try_read()?);
-            if !proof.source_is_current() {
+            let guard = proof.source.try_read()?;
+            if proof.is_revoked() {
                 return None;
             }
+            pins.push(guard);
         }
-        (!pins.sources.is_empty()).then_some(pins)
+        (!pins.is_empty()).then_some(pins)
     }
 }
 
@@ -227,7 +206,7 @@ impl crate::policies::TieredMatchProvider for SourceBinding {
         cache: &mut RequestHashCache<'a>,
     ) -> Vec<TierMatch> {
         self.lookup_placement(tokens, block_size, lora_name, dp_rank, cache)
-            .map_or_else(Vec::new, |hit| hit.publish(self, cache, None))
+            .map_or_else(Vec::new, |hit| hit.publish(self, cache))
     }
 }
 
