@@ -127,6 +127,25 @@ pub(super) fn select_pd_pair(
     if prefill_indices.is_empty() || decode_indices.is_empty() {
         return None;
     }
+    let threshold = context.prefill_max_inflight_per_rank;
+    if threshold > 0 {
+        let below_threshold: Vec<_> = prefill_indices
+            .iter()
+            .copied()
+            .filter(|&index| {
+                let endpoint = &prefill_endpoints[index];
+                endpoint.dp_rank.is_none()
+                    || loads
+                        .get(&(Stage::Prefill, endpoint.clone()))
+                        .is_none_or(|load| load.prefill_requests < threshold)
+            })
+            .collect();
+        // The local threshold is a preference. Keep the original pool
+        // when every candidate has reached it.
+        if !below_threshold.is_empty() {
+            prefill_indices = below_threshold;
+        }
+    }
     let prefill = select_stage(
         loads,
         Stage::Prefill,
@@ -609,6 +628,7 @@ pub struct PdRouterBase {
     pub(super) capacity: Arc<crate::routers::http::pd_capacity::CapacityTable>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub(super) pd_load: Arc<PdLoadManager>,
+    prefill_max_inflight_per_rank: usize,
     pub policy_registry: Arc<PolicyRegistry>,
     pub worker_startup_timeout_secs: u64,
     pub worker_startup_check_interval_secs: u64,
@@ -803,6 +823,7 @@ impl PdRouterBase {
             .and_then(|state| state.allowed_worker_pairs(prefill_workers, decode_workers));
         let mut context = context.clone();
         context.worker_pairs = pairs.as_ref();
+        context.prefill_max_inflight_per_rank = self.prefill_max_inflight_per_rank;
         // Deferred selection has no prefill pair. When any hybrid pairs are
         // configured, commit decode at admission for the entire pool.
         let defer = defer_decode && decode_policy_can_defer(decode_policy.as_ref(), &context);
@@ -1443,6 +1464,7 @@ impl PdRouterBase {
         Ok(PdRouterBase {
             kv_state,
             pd_load: Arc::new(PdLoadManager::default()),
+            prefill_max_inflight_per_rank: ctx.router_config.pd_prefill_max_inflight_per_rank,
             capacity: Arc::new(crate::routers::http::pd_capacity::CapacityTable::new(
                 crate::kv_index::capacity::DEFAULT_MAX_KV_USAGE,
             )),
@@ -1639,6 +1661,7 @@ impl PdRouterBase {
         let context = PdRequestContext {
             worker_pairs: None,
             prefill_inputs: None,
+            prefill_max_inflight_per_rank: 0,
             model_id: None,
             legacy_policy_input: None,
             prefill_cache: None,
@@ -1983,6 +2006,7 @@ mod tests {
         PdRouterBase {
             kv_state: None,
             pd_load: Arc::new(PdLoadManager::default()),
+            prefill_max_inflight_per_rank: 0,
             capacity: Arc::new(crate::routers::http::pd_capacity::CapacityTable::new(
                 crate::kv_index::capacity::DEFAULT_MAX_KV_USAGE,
             )),
@@ -2007,6 +2031,7 @@ mod tests {
         PdRouterBase {
             kv_state: None,
             pd_load: Arc::new(PdLoadManager::default()),
+            prefill_max_inflight_per_rank: 0,
             capacity: Arc::new(crate::routers::http::pd_capacity::CapacityTable::new(
                 crate::kv_index::capacity::DEFAULT_MAX_KV_USAGE,
             )),
@@ -2182,6 +2207,7 @@ mod tests {
         let context = PdRequestContext {
             worker_pairs: None,
             prefill_inputs: None,
+            prefill_max_inflight_per_rank: 0,
             model_id: None,
             legacy_policy_input: None,
             prefill_cache: None,
@@ -2217,6 +2243,7 @@ mod tests {
         let context = PdRequestContext {
             worker_pairs: None,
             prefill_inputs: None,
+            prefill_max_inflight_per_rank: 0,
             model_id: None,
             legacy_policy_input: None,
             prefill_cache: None,
@@ -2910,6 +2937,96 @@ mod admission_tests {
     }
 
     #[test]
+    fn pd_prefill_rank_threshold_skips_warm_rank_and_falls_back_when_all_full() {
+        use super::super::pd_types::PdPrefillInput;
+        use crate::policies::PrefillWorkEstimate;
+
+        let manager = Arc::new(PdLoadManager::default());
+        let p: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|rank| {
+                Arc::new(DPAwareWorker::new(
+                    "http://p:8000".to_string(),
+                    rank,
+                    2,
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let d = pool("d", 1);
+        let policy = KvAwarePolicy::default();
+        let inputs = HashMap::from([(
+            p[0].base_url().to_owned(),
+            PdPrefillInput {
+                prompts: Some(Arc::from([vec![0; 33]])),
+                work_by_rank: HashMap::from([
+                    (
+                        Some(0),
+                        PrefillWorkEstimate {
+                            new_prefill_tokens: 33,
+                            placement_verified: true,
+                        },
+                    ),
+                    (
+                        Some(1),
+                        PrefillWorkEstimate {
+                            new_prefill_tokens: 1,
+                            placement_verified: true,
+                        },
+                    ),
+                ]),
+                allow_credit: true,
+                fallback_reason: None,
+            },
+        )]);
+        let disabled = PdRequestContext {
+            prefill_inputs: Some(&inputs),
+            ..context()
+        };
+        let limited = PdRequestContext {
+            prefill_max_inflight_per_rank: 1,
+            ..disabled.clone()
+        };
+        let admit = || {
+            manager
+                .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &limited, true))
+                .unwrap()
+        };
+        // Both attempts stay reserved until after both selections complete.
+        let mut admissions = std::thread::scope(|scope| {
+            let other = scope.spawn(admit);
+            [admit(), other.join().unwrap()]
+        });
+        admissions.sort_by_key(|(selection, _)| selection.prefill.worker_index);
+        let [(cold, cold_attempt), (warm, warm_attempt)] = admissions;
+        assert_eq!(cold.prefill.endpoint.dp_rank, Some(0));
+        assert_eq!(warm.prefill.endpoint.dp_rank, Some(1));
+
+        let unfiltered = select_pd_pair(
+            &manager.snapshot(),
+            &p,
+            &d,
+            &policy,
+            &policy,
+            &disabled,
+            true,
+        )
+        .unwrap();
+        assert_eq!(unfiltered.prefill.endpoint, warm.prefill.endpoint);
+        let (fallback, fallback_attempt) = admit();
+        assert_eq!(fallback.prefill.endpoint, unfiltered.prefill.endpoint);
+        drop(fallback_attempt);
+
+        warm_attempt.finish_prefill();
+        let (recovered, recovered_attempt) = admit();
+        assert_eq!(recovered.prefill.endpoint, warm.prefill.endpoint);
+
+        drop((cold_attempt, warm_attempt, recovered_attempt));
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
     fn dp_rank_decode_prices_are_matched_by_worker_url() {
         let p = pool("p", 1);
         let d: Vec<Arc<dyn Worker>> = (0..2)
@@ -3055,6 +3172,7 @@ mod admission_tests {
         PdRequestContext {
             worker_pairs: None,
             prefill_inputs: None,
+            prefill_max_inflight_per_rank: 0,
             model_id: None,
             legacy_policy_input: Some("original request"),
             prefill_cache: None,
@@ -3147,6 +3265,7 @@ mod admission_tests {
         PdRequestContext {
             worker_pairs: None,
             prefill_inputs: None,
+            prefill_max_inflight_per_rank: 0,
             model_id: None,
             legacy_policy_input: Some("original request"),
             prefill_cache: None,
@@ -3904,6 +4023,7 @@ mod admission_tests {
             PdRequestContext {
                 worker_pairs: None,
                 prefill_inputs: None,
+                prefill_max_inflight_per_rank: 0,
                 model_id: Some(model),
                 legacy_policy_input: Some("original request"),
                 prefill_cache: None,

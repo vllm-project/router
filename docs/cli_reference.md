@@ -138,6 +138,7 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--vllm-discovery-address` | `string` | `unset` | `string` | `unset` | ZMQ registration address for vLLM workers, e.g. `0.0.0.0:30001`. |
 | `--kv-connector` | `nixl, mooncake, moriio` | `nixl` | `nixl, mooncake, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. |
 | `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill or decode KV publishers as URL=ENDPOINT[,ENDPOINT...]; a source belongs to a stage whose policy is kv_aware. Endpoints follow DP-rank order; block size is 16. |
+| `--pd-prefill-max-inflight-per-rank` | `usize` | `0` | `integer` | `0` | Prefer native PD Prefill ranks below this Router-local in-flight request threshold. Zero disables it. If all candidates reach it, use the original candidate pool. |
 | `--pd-pair` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Restrict a mixed P/D pool to transfer-compatible pairs as `PREFILL=DECODE[,DECODE...]`. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes

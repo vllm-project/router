@@ -1265,6 +1265,7 @@ impl VllmPDRouter {
         let context = PdRequestContext {
             worker_pairs: None,
             prefill_inputs: prefill_inputs.as_ref(),
+            prefill_max_inflight_per_rank: 0,
             model_id,
             legacy_policy_input: text.as_deref(),
             prefill_cache: prefill_cache.as_ref(),
@@ -1457,6 +1458,7 @@ impl VllmPDRouter {
         let context = PdRequestContext {
             worker_pairs: None,
             prefill_inputs: None,
+            prefill_max_inflight_per_rank: 0,
             model_id: input.model_id.as_deref(),
             legacy_policy_input: None,
             prefill_cache: None,

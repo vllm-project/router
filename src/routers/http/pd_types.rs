@@ -180,6 +180,7 @@ pub struct PdPrefillInput {
 pub struct PdRequestContext<'a> {
     pub worker_pairs: Option<&'a HashSet<(PdEndpoint, PdEndpoint)>>,
     pub prefill_inputs: Option<&'a HashMap<String, PdPrefillInput>>,
+    pub(super) prefill_max_inflight_per_rank: usize,
     pub model_id: Option<&'a str>,
     pub legacy_policy_input: Option<&'a str>,
     pub(crate) prefill_cache: Option<&'a crate::policies::PreparedCacheSelection>,

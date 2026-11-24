@@ -78,6 +78,7 @@ class Router:
             If not specified, uses the main policy. Default: None
         decode_policy: Specific load balancing policy for decode nodes (PD mode only).
             If not specified, uses the main policy. Default: None
+        pd_prefill_max_inflight_per_rank: Prefer PD Prefill ranks below this in-flight threshold. Default: 0 (disabled)
         router_temperature: Softmax temperature for kv_aware. Default: 0.0
         kv_penalty_host: Host-tier transfer credit for kv_aware. Default: 0.8
         kv_penalty_external: External-tier transfer credit for kv_aware. Default: 0.6

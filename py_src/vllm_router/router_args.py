@@ -107,6 +107,7 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+    pd_prefill_max_inflight_per_rank: int = 0
 
     @staticmethod
     def add_cli_args(
@@ -211,6 +212,14 @@ class RouterArgs:
             help="Specific policy for decode nodes in PD mode. Defaults to --policy",
         )
 
+        parser.add_argument(
+            f"--{prefix}pd-prefill-max-inflight-per-rank",
+            type=int,
+            default=RouterArgs.pd_prefill_max_inflight_per_rank,
+            help="Prefer PD Prefill ranks below this Router-local in-flight request "
+            "threshold. Zero disables it. Use the original pool if all candidates "
+            "reach it.",
+        )
         parser.add_argument(
             f"--{prefix}router-temperature",
             type=float,
