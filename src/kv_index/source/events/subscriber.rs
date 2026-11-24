@@ -8,8 +8,8 @@ use tracing::{debug, info, warn};
 
 use super::event_stream::{EventStream, StreamLease};
 use super::transport::{
-    live_sequence, retry_backoff, ConnectionMonitor, PendingLive, ReplayError, ReplayOverlap,
-    ReplayPoll, IDLE_REPLAY_INTERVAL,
+    live_sequence, retry_backoff, ConnectionMonitor, PendingLive, ReplayOverlap, ReplayPoll,
+    IDLE_REPLAY_INTERVAL,
 };
 use crate::kv_index::types::SourceRecoveryReason as Reason;
 use crate::kv_index::IngestionSignal;
@@ -19,6 +19,11 @@ use crate::metrics::RouterMetrics;
 const END_SEQ: i64 = -1;
 const MAX_REPLAY_FAILURES: u32 = 3;
 const REPLAY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(super) enum ReplayError {
+    Retry(i64),
+    Invalid,
+}
 
 pub use crate::kv_index::source::endpoints::EventSource;
 
@@ -187,7 +192,8 @@ impl Subscriber {
         &self,
         ctx: &zmq::Context,
         mut last: i64,
-        through: Option<i64>,
+        through: &mut Option<i64>,
+        baseline: &mut Option<i64>,
         gap_batch: Option<&(u64, Vec<u8>)>,
         replayed: &ReplayOverlap,
         socket: &mut Option<zmq::Socket>,
@@ -217,10 +223,6 @@ impl Subscriber {
         };
         let start = u64::try_from(last.checked_add(1).ok_or(ReplayError::Invalid)?)
             .map_err(|_| ReplayError::Invalid)?;
-        let through = through
-            .map(u64::try_from)
-            .transpose()
-            .map_err(|_| ReplayError::Invalid)?;
         let topic = self.source.topic.clone();
         if let Err(error) = dealer.send_multipart([&[][..], &start.to_be_bytes()], zmq::DONTWAIT) {
             warn!(%topic, %error, "KV replay request failed");
@@ -245,7 +247,7 @@ impl Subscriber {
                         // The first live batch after a gap can finish a contiguous
                         // replay when the publisher has not buffered that batch yet.
                         if let Some((seq, payload)) = gap_batch.filter(|(seq, _)| {
-                            *seq == next && through.is_some_and(|required| *seq == required)
+                            *seq == next && through.is_some_and(|required| *seq as i64 == required)
                         }) {
                             self.apply(*seq, payload, false)
                                 .map_err(|_| ReplayError::Invalid)?;
@@ -255,7 +257,7 @@ impl Subscriber {
                             last = *seq as i64;
                             next += 1;
                         }
-                        if through.is_some_and(|required| next <= required) {
+                        if through.is_some_and(|required| next as i64 <= required) {
                             return Err(ReplayError::Retry(last));
                         }
                         *socket = Some(dealer);
@@ -287,7 +289,11 @@ impl Subscriber {
                         .record(seq, payload)
                         .map_err(|_| ReplayError::Invalid)?;
                     if awaiting_clear {
-                        awaiting_clear = !self.try_replay_clear(seq, payload)?;
+                        *through = (*through).max(Some(wire_seq));
+                        if self.try_replay_clear(seq, payload)? {
+                            *baseline = Some(wire_seq);
+                            awaiting_clear = false;
+                        }
                     } else {
                         self.apply(seq, payload, false)
                             .map_err(|_| ReplayError::Invalid)?;
@@ -375,6 +381,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
             let mut disconnected = false;
             let mut reconnect = false;
             let mut recovery_through = None;
+            let mut replay_baseline = None;
             let mut gap_batch = None;
             let mut replay_failures = 0;
             let mut monitor_error = None;
@@ -413,6 +420,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     }
                     disconnected = true;
                     recovery_through = None;
+                    replay_baseline = None;
                     gap_batch = None;
                     replay_failures = 0;
                     last_seq = -1;
@@ -465,7 +473,8 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         let replay = subscriber.replay(
                             &ctx,
                             last_seq,
-                            recovery_through,
+                            &mut recovery_through,
+                            &mut replay_baseline,
                             gap_batch.as_ref(),
                             &replayed,
                             &mut replay_socket,
@@ -509,6 +518,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         ReplayPoll::Finished(Ok(high))
                             if !pending_live.verifies_overlap(
                                 topic.as_bytes(),
+                                replay_baseline,
                                 high,
                                 &replayed,
                             ) =>
@@ -525,6 +535,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         let advanced = high != last_seq;
                         last_seq = high;
                         recovery_through = None;
+                        replay_baseline = None;
                         gap_batch = None;
                         if suspended || (idle_reconcile && advanced) {
                             if subscriber.resume(last_seq, Reason::ReplayApplied).is_err() {
@@ -548,8 +559,8 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         let overflow = matches!(result, ReplayPoll::BufferFull);
                         if overflow {
                             // The replay must cover any discarded live data.
-                            recovery_through =
-                                recovery_through.max(pending_live.discard(topic.as_bytes()));
+                            recovery_through = recovery_through
+                                .max(pending_live.discard(topic.as_bytes(), &replayed));
                         } else {
                             replay_failures += 1;
                         }
@@ -580,6 +591,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             break;
                         }
                         last_seq = -1;
+                        replay_baseline = None;
                         suspended = true;
                         if overflow || exhausted {
                             replayed = ReplayOverlap::default();
@@ -624,12 +636,24 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     continue;
                 }
                 let (through, overlap, restart_from) = 'live_batch: {
-                    let pending_frame = pending_live.pop();
-                    let was_buffered = pending_frame.is_some();
-                    let received = pending_frame
-                        .map_or_else(|| sub.socket().recv_multipart(zmq::DONTWAIT), Ok);
+                    let overlap_through = allow_overlap.then_some(last_seq);
+                    let received = pending_live
+                        .pop(topic.as_bytes(), overlap_through, &replayed)
+                        .map_or_else(
+                            || {
+                                sub.socket().recv_multipart(zmq::DONTWAIT).map(|frames| {
+                                    let matched = replayed.matches_live(
+                                        &frames,
+                                        topic.as_bytes(),
+                                        overlap_through,
+                                    );
+                                    (frames, matched)
+                                })
+                            },
+                            Ok,
+                        );
                     match received {
-                        Ok(mut frames) => {
+                        Ok((mut frames, matches_replay)) => {
                             let seq = match live_sequence(&frames, topic.as_bytes()) {
                                 Ok(Some(seq)) if (0..i64::MAX).contains(&seq) => seq,
                                 Ok(None) => {
@@ -653,12 +677,6 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                     break 'live_batch (None, true, -1);
                                 }
                             };
-                            let matches_replay = allow_overlap
-                                && seq <= last_seq
-                                && replayed.matches(seq as u64, &frames[2]);
-                            if was_buffered {
-                                replayed.release_live(seq as u64);
-                            }
                             next_idle_replay = tokio::time::Instant::now() + IDLE_REPLAY_INTERVAL;
                             if replay_failures == MAX_REPLAY_FAILURES {
                                 if subscriber.apply(seq as u64, &frames[2], true).is_ok() {

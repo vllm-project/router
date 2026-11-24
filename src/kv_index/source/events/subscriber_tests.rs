@@ -457,6 +457,33 @@ async fn replay_retry_keeps_the_verified_gap_cursor() {
 }
 
 #[tokio::test]
+async fn truncated_idle_replay_cannot_publish_on_an_empty_retry() {
+    let tcp = TcpReplay::new();
+    let index = Arc::new(full_binding(target("truncated-idle"), BLOCK_SIZE));
+    let (tx, mut signals) = mpsc::channel(8);
+    let _handle =
+        tcp.start_with_idle_timeout(index.clone(), Some(tx), true, Duration::from_secs(1));
+    let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
+    let empty = batch_payload(&[]);
+    tcp.subscribed().await;
+    tcp.history(&tcp.request(0).await, &[]);
+    tcp.live(0, &store);
+    wait_until(|| credit(&index) == 4).await;
+
+    let request = tcp.request(1).await;
+    tcp.reply(&request, 3, &empty);
+    assert!(matches!(
+        signal(&mut signals).await,
+        IngestionSignal::Invalidated { .. }
+    ));
+    tcp.history(&tcp.request(1).await, &[]);
+    let retry = tcp.request(1).await;
+    assert_eq!(credit(&index), 0);
+    tcp.history(&retry, &[(1, &empty), (2, &empty), (3, &empty)]);
+    wait_until(|| credit(&index) == 4).await;
+}
+
+#[tokio::test]
 async fn replay_can_restore_from_a_retained_clear() {
     let tcp = TcpReplay::new();
     let index = Arc::new(full_binding(target("retained-clear"), BLOCK_SIZE));
@@ -467,6 +494,8 @@ async fn replay_can_restore_from_a_retained_clear() {
 
     tcp.subscribed().await;
     let request = tcp.request(0).await;
+    tcp.live(8, &empty);
+    tokio::time::sleep(Duration::from_millis(20)).await;
     tcp.reply(&request, 9, &empty);
     tcp.reply(&request, 10, &clear);
     tcp.reply(&request, 11, &store);
@@ -474,6 +503,8 @@ async fn replay_can_restore_from_a_retained_clear() {
     assert_eq!(credit(&index), 0, "replay is still open");
     tcp.reply(&request, END_SEQ, &[]);
     wait_until(|| credit(&index) == 4).await;
+    tcp.live(12, &empty);
+    wait_until(|| next_seq(&index) == Some(13) && credit(&index) == 4).await;
 }
 
 #[tokio::test]
@@ -492,10 +523,29 @@ async fn replay_clear_does_not_hide_a_gap_in_the_new_baseline() {
 }
 
 #[tokio::test]
+async fn invalid_queued_live_sequence_is_rejected_only_once() {
+    let tcp = TcpReplay::new();
+    let index = Arc::new(full_binding(target("invalid-live-overlap"), BLOCK_SIZE));
+    let _handle = tcp.start_with_recovery(index.clone(), None, true);
+    let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
+    let empty = batch_payload(&[]);
+    tcp.subscribed().await;
+    let request = tcp.request(0).await;
+    tcp.live(i64::MAX, &empty);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    tcp.history(&request, &[(0, &store)]);
+
+    let retry = tcp.request(0).await;
+    assert_eq!(credit(&index), 0);
+    tcp.history(&retry, &[(0, &store)]);
+    wait_until(|| credit(&index) == 4).await;
+}
+
+#[tokio::test]
 async fn long_replay_verifies_the_oldest_buffered_live_frame() {
     let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
     let empty = batch_payload(&[]);
-    let last = 16_384;
+    let last = 4_096;
     for matches_replay in [true, false] {
         let tcp = TcpReplay::new();
         let index = Arc::new(full_binding(target("long-overlap"), BLOCK_SIZE));
@@ -527,6 +577,7 @@ async fn long_replay_verifies_the_oldest_buffered_live_frame() {
         } else {
             tcp.request(0).await;
             assert_eq!(credit(&index), 0);
+            assert!(signals.try_recv().is_err());
         }
     }
 }
@@ -665,10 +716,10 @@ async fn tcp_recovery(monitor_failure: bool) {
         tcp.reply(&retry, 0, &payload);
         wait_until(|| next_seq(&index) == Some(1)).await;
         assert_eq!(credit(), 0, "open replay exposed credit");
-        tcp.reply(&retry, END_SEQ, &[]);
+        tcp.history(&retry, &[(1, &empty), (2, &empty)]);
         wait_until(|| credit() == expected).await;
-        tcp.live(1, &empty);
-        wait_until(|| next_seq(&index) == Some(2)).await;
+        tcp.live(3, &empty);
+        wait_until(|| next_seq(&index) == Some(4)).await;
 
         handle.shutdown();
         wait_until(|| credit() == 0).await;

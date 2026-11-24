@@ -4,6 +4,7 @@ use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::io;
 use std::time::Duration;
 
+use super::subscriber::ReplayError;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
@@ -147,11 +148,11 @@ mod tests {
         assert!(matches!(result, ReplayPoll::Finished(Ok(0))));
         for seq in 0_i64..1025 {
             assert_eq!(
-                live_sequence(&pending.pop().unwrap(), b"topic"),
+                live_sequence(&pending.pop(b"topic", None, &overlap).unwrap().0, b"topic"),
                 Ok(Some(seq))
             );
         }
-        assert!(pending.pop().is_none());
+        assert!(pending.pop(b"topic", None, &overlap).is_none());
     }
 
     #[tokio::test]
@@ -452,50 +453,68 @@ pub(super) struct PendingLive {
 pub(super) const MAX_PENDING_LIVE_FRAMES: usize = 4096;
 
 impl PendingLive {
-    pub(super) fn pop(&mut self) -> Option<Vec<Vec<u8>>> {
-        let frames = self.frames.pop_front()?;
-        self.bytes -= frames.iter().map(Vec::len).sum::<usize>();
-        Some(frames)
+    fn push(&mut self, frames: Vec<Vec<u8>>, topic: &[u8], replayed: &ReplayOverlap) -> bool {
+        if let Some(seq) = buffered_sequence(&frames, topic) {
+            replayed.track_live(seq as u64);
+        }
+        self.bytes += frames.iter().map(Vec::len).sum::<usize>();
+        self.frames.push_back(frames);
+        self.frames.len() >= MAX_PENDING_LIVE_FRAMES || self.bytes >= super::MAX_KV_EVENT_BYTES
     }
 
-    pub(super) fn discard(&mut self, topic: &[u8]) -> Option<i64> {
-        let through = self
-            .frames
-            .drain(..)
-            .filter_map(|frames| {
-                live_sequence(&frames, topic)
-                    .ok()
-                    .flatten()
-                    .filter(|seq| (0..i64::MAX).contains(seq))
-            })
-            .max();
-        self.bytes = 0;
+    pub(super) fn pop(
+        &mut self,
+        topic: &[u8],
+        through: Option<i64>,
+        replayed: &ReplayOverlap,
+    ) -> Option<(Vec<Vec<u8>>, bool)> {
+        let frames = self.frames.pop_front()?;
+        let matched = replayed.matches_live(&frames, topic, through);
+        if let Some(seq) = buffered_sequence(&frames, topic) {
+            replayed.release_live(seq as u64);
+        }
+        self.bytes -= frames.iter().map(Vec::len).sum::<usize>();
+        Some((frames, matched))
+    }
+
+    pub(super) fn discard(&mut self, topic: &[u8], replayed: &ReplayOverlap) -> Option<i64> {
+        let mut through = None;
+        while let Some((frames, _)) = self.pop(topic, None, replayed) {
+            through = through.max(buffered_sequence(&frames, topic));
+        }
         through
     }
 
     /// Check buffered duplicates before the replayed index is made visible.
     pub(super) fn verifies_overlap(
-        &self,
+        &mut self,
         topic: &[u8],
+        baseline: Option<i64>,
         through: i64,
         replayed: &ReplayOverlap,
     ) -> bool {
-        self.frames
-            .iter()
-            .all(|frames| match live_sequence(frames, topic) {
-                Ok(Some(seq)) if !(0..i64::MAX).contains(&seq) => false,
-                Ok(Some(seq)) if (0..=through).contains(&seq) => {
-                    replayed.matches(seq as u64, &frames[2])
+        let mut verified = true;
+        self.frames.retain(|frames| {
+            match buffered_sequence(frames, topic) {
+                Some(seq) if baseline.is_none_or(|first| seq >= first) => {
+                    verified &= seq > through || replayed.matches(seq as u64, &frames[2]);
+                    return true;
                 }
-                Ok(_) => true,
-                Err(()) => false,
-            })
+                Some(seq) => replayed.release_live(seq as u64),
+                None => verified = false,
+            }
+            self.bytes -= frames.iter().map(Vec::len).sum::<usize>();
+            false
+        });
+        verified
     }
 }
 
-pub(super) enum ReplayError {
-    Retry(i64),
-    Invalid,
+fn buffered_sequence(frames: &[Vec<u8>], topic: &[u8]) -> Option<i64> {
+    live_sequence(frames, topic)
+        .ok()
+        .flatten()
+        .filter(|seq| (0..i64::MAX).contains(seq))
 }
 
 pub(super) enum ReplayPoll {
@@ -535,15 +554,7 @@ pub(super) async fn while_connected(
                     if frames.first().is_some_and(|frame| frame.as_slice() != topic) {
                         continue;
                     }
-                    if let Ok(Some(seq)) = live_sequence(&frames, topic) {
-                        if (0..i64::MAX).contains(&seq) {
-                            overlap.track_live(seq as u64);
-                        }
-                    }
-                    pending.bytes += frames.iter().map(Vec::len).sum::<usize>();
-                    pending.frames.push_back(frames);
-                    if pending.frames.len() >= MAX_PENDING_LIVE_FRAMES || pending.bytes >= super::MAX_KV_EVENT_BYTES
-                    {
+                    if pending.push(frames, topic, overlap) {
                         return Ok(ReplayPoll::BufferFull);
                     }
                 }
@@ -619,7 +630,7 @@ mod frame_tests {
 }
 
 /// Recent replay proofs and proofs pinned by the bounded pending live queue.
-/// Both halves of the replay poll may record evidence for the same sequence.
+/// A pinned fingerprint survives until the last queued copy is consumed.
 #[derive(Default)]
 pub(super) struct ReplayOverlap(Mutex<OverlapEvidence>);
 
@@ -657,7 +668,7 @@ impl ReplayOverlap {
         proof.frames += 1;
     }
 
-    pub(super) fn release_live(&self, seq: u64) {
+    fn release_live(&self, seq: u64) {
         if let Entry::Occupied(mut entry) = self.0.lock().buffered.entry(seq) {
             let proof = entry.get_mut();
             proof.frames -= 1;
@@ -692,7 +703,19 @@ impl ReplayOverlap {
         Ok(())
     }
 
-    pub(super) fn matches(&self, seq: u64, payload: &[u8]) -> bool {
+    pub(super) fn matches_live(
+        &self,
+        frames: &[Vec<u8>],
+        topic: &[u8],
+        through: Option<i64>,
+    ) -> bool {
+        through.is_some_and(|high| {
+            buffered_sequence(frames, topic)
+                .is_some_and(|seq| seq <= high && self.matches(seq as u64, &frames[2]))
+        })
+    }
+
+    fn matches(&self, seq: u64, payload: &[u8]) -> bool {
         let fingerprint = self.0.lock().fingerprint(seq);
         fingerprint.is_some_and(|known| known == <[u8; 32]>::from(Sha256::digest(payload)))
     }
