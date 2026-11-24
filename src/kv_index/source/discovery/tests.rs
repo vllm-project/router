@@ -2128,7 +2128,7 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
 }
 
 #[tokio::test]
-async fn last_hash_fenced_rank_rebinds_only_to_a_new_publisher() {
+async fn a_worker_with_all_ranks_hash_fenced_stays_load_only() {
     use super::lifecycle::REFRESH_INTERVAL;
 
     for initially_fenced in [false, true] {
@@ -2148,7 +2148,7 @@ async fn last_hash_fenced_rank_rebinds_only_to_a_new_publisher() {
                 let metrics = metrics.clone();
                 move || metrics.lock().clone()
             },
-            sources.clone(),
+            sources,
         );
         let (worker, server) = spawn_metrics_only_worker(router).await;
         let (supervisor, _signals) =
@@ -2157,11 +2157,6 @@ async fn last_hash_fenced_rank_rebinds_only_to_a_new_publisher() {
         let old = supervisor.lifecycle_for_worker(&worker);
         let has_binding =
             || supervisor.workers_have_cache_bindings([(worker.as_str(), 0)].into_iter());
-        let make_hash_probe_due = || {
-            let due = Instant::now() - REFRESH_INTERVAL;
-            old.state.lock().hash_checked = due;
-            due
-        };
         if initially_fenced {
             assert!(info.ranks.is_empty());
             assert!(supervisor.match_provider_for_worker(&worker).is_none());
@@ -2169,13 +2164,11 @@ async fn last_hash_fenced_rank_rebinds_only_to_a_new_publisher() {
             assert_eq!(info.ranks, [0]);
             boundary_subscription(&publisher, "kv/old", true).await;
             *metrics.lock() = incompatible;
-            make_hash_probe_due();
+            old.state.lock().hash_checked = Instant::now() - REFRESH_INTERVAL;
             wait_for(|| !has_binding()).await;
         }
 
         *metrics.lock() = METRICS_ONLY.to_owned();
-        let due = make_hash_probe_due();
-        wait_for(|| old.state.lock().hash_checked > due).await;
         {
             let mut state = old.state.lock();
             state.checked = None;
@@ -2183,19 +2176,15 @@ async fn last_hash_fenced_rank_rebinds_only_to_a_new_publisher() {
         }
         assert!(supervisor.refresh_discovered_workers().await.is_empty());
         assert!(!has_binding());
+        let refreshed = supervisor
+            .refresh_workers(
+                &HashSet::from([worker.clone()]),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .await;
+        assert!(refreshed[&worker].info.as_ref().unwrap().ranks.is_empty());
         assert!(old.active.load(Ordering::Acquire));
-        let (endpoint, replay_endpoint, replacement_publisher, _replacement_replay) =
-            layout_endpoints();
-        sources.lock()["0"] = serde_json::json!({
-            "endpoint": endpoint, "replay_endpoint": replay_endpoint,
-            "topic": "kv/new", "publisher": "zmq"
-        });
-        wait_for(|| !old.active.load(Ordering::Acquire)).await;
-
-        let refreshed = supervisor.refresh_discovered_workers().await;
-        assert!(refreshed[&worker].provider.is_some());
-        assert!(has_binding());
-        boundary_subscription(&replacement_publisher, "kv/new", true).await;
         supervisor.shutdown();
         server.abort();
     }

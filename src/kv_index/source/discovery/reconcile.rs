@@ -427,24 +427,6 @@ pub(super) fn layouts_match(
     }
 }
 
-pub(super) fn has_new_publisher(
-    worker: &str,
-    bound: &BoundSources,
-    sources: &KvEventSourcesResponse,
-    capability: &CacheCapabilities,
-    configs: Option<&EngineCacheConfigs>,
-) -> bool {
-    worker_host(split_worker_rank(worker).0).is_some_and(|host| {
-        bound.iter().any(|(&rank, installed)| {
-            sources.get(&rank.to_string()).is_some_and(|source| {
-                events_enabled(source)
-                    && bound_source_moved(&host, installed, source)
-                    && !runtime_hash_mismatch(configs, capability, worker, rank)
-            })
-        })
-    })
-}
-
 /// Whether a probe result keeps the provider alive. A transient failure is not
 /// a contradiction: the worker stays routable and only its credit expires.
 pub(super) fn probe_keeps_trust(outcome: &StaticHybridMatch) -> bool {

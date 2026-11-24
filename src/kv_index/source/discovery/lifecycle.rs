@@ -11,8 +11,8 @@ use tracing::info;
 use super::metrics_meta::EngineCacheConfigs;
 use super::probe::{probe_bound_sources, probe_engine_cache_configs, WorkerDescriptor};
 use super::reconcile::{
-    has_new_publisher, observed_sources_match, probe_keeps_trust, probe_renews_trust,
-    runtime_hash_mismatch, BoundSources, StaticHybridMatch,
+    observed_sources_match, probe_keeps_trust, probe_renews_trust, runtime_hash_mismatch,
+    BoundSources, StaticHybridMatch,
 };
 use super::{CacheKey, InstalledWorkers, KvIndexSupervisor, WorkerKvInfo, WorkerSubs};
 use crate::kv_index::subscriber::EventSource;
@@ -147,7 +147,9 @@ impl WorkerLifecycle {
     pub(super) fn refresh_due(&self) -> bool {
         let state = self.state.lock();
         state.checked.is_none_or(|checked| {
-            let interval = if state.info.is_some() && (!self.layout || self.trusted(&state)) {
+            let interval = if self.all_publishers_fenced(&state)
+                || (state.info.is_some() && (!self.layout || self.trusted(&state)))
+            {
                 REFRESH_INTERVAL
             } else {
                 CONTROL_TIMEOUT
@@ -162,13 +164,13 @@ impl WorkerLifecycle {
         }
         let state = self.state.lock();
         !state.trusted
-            && !self.watching_fenced_publishers(&state)
+            && !self.all_publishers_fenced(&state)
             && state
                 .checked
                 .is_none_or(|checked| checked.elapsed() >= CONTROL_TIMEOUT)
     }
 
-    fn watching_fenced_publishers(&self, state: &LifecycleState) -> bool {
+    fn all_publishers_fenced(&self, state: &LifecycleState) -> bool {
         self.active.load(Ordering::Acquire)
             && state.subscriptions.is_empty()
             && !state.hash_fences.is_empty()
@@ -188,8 +190,8 @@ impl WorkerLifecycle {
         }
         state.fence_incompatible_ranks(worker, configs);
         let keep = descriptor.is_some_and(|descriptor| {
-            if self.watching_fenced_publishers(&state) {
-                return !descriptor.has_new_publisher(worker, &state.hash_fences, configs);
+            if self.all_publishers_fenced(&state) {
+                return true;
             }
             // The layout monitor owns replay recovery for surviving ranks.
             let has_fence = self.active.load(Ordering::Acquire) && !state.hash_fences.is_empty();
@@ -391,7 +393,6 @@ impl KvIndexSupervisor {
                     );
                 }
             };
-            let mut checked_replacement = false;
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let Some(lifecycle) = lifecycle.upgrade() else {
@@ -399,10 +400,13 @@ impl KvIndexSupervisor {
                 };
                 let hash_due = {
                     let mut state = lifecycle.state.lock();
-                    if !lifecycle.active.load(Ordering::Acquire) || state.info.is_none() {
+                    if !lifecycle.active.load(Ordering::Acquire)
+                        || state.info.is_none()
+                        || state.subscriptions.is_empty()
+                    {
                         break;
                     }
-                    if !state.subscriptions.is_empty() && lifecycle.expire_if_needed(&mut state) {
+                    if lifecycle.expire_if_needed(&mut state) {
                         invalidate(&state.subscriptions);
                     }
                     state.hash_checked.elapsed() >= REFRESH_INTERVAL
@@ -439,56 +443,34 @@ impl KvIndexSupervisor {
                         &observed,
                     )
                 };
-                let replacement = |state: &LifecycleState, configs: Option<&EngineCacheConfigs>| {
-                    observed.as_ref().is_ok_and(|(sources, layout)| {
-                        has_new_publisher(
-                            &worker,
-                            &state.hash_fences,
-                            sources,
-                            layout.as_ref().unwrap_or(&capability),
-                            configs,
-                        )
-                    })
-                };
-                // Take an extra sample before acting on a publisher change.
-                // A dormant candidate that stays incompatible goes back to the slow cadence.
-                let publisher_changed = {
+                // Check for a hash mismatch before retiring the layout on a source change.
+                let probe_changed_source = !hash_due && {
                     let state = lifecycle.state.lock();
-                    if !lifecycle.active.load(Ordering::Acquire) || state.info.is_none() {
-                        break;
-                    }
-                    if state.subscriptions.is_empty() {
-                        let candidate = replacement(&state, None);
-                        let previous = std::mem::replace(&mut checked_replacement, candidate);
-                        candidate && !previous
-                    } else {
-                        matches_active(&state) == StaticHybridMatch::Differs
-                    }
+                    !state.subscriptions.is_empty()
+                        && matches_active(&state) == StaticHybridMatch::Differs
                 };
-                if publisher_changed && !hash_due {
+                if probe_changed_source {
                     configs = probe_hash().await;
                 }
                 let mut state = lifecycle.state.lock();
-                if !lifecycle.active.load(Ordering::Acquire) || state.info.is_none() {
+                if !lifecycle.active.load(Ordering::Acquire)
+                    || state.info.is_none()
+                    || state.subscriptions.is_empty()
+                {
                     break;
                 }
                 // A probe may cross the deadline while it is in flight.
-                if !state.subscriptions.is_empty() && lifecycle.expire_if_needed(&mut state) {
+                if lifecycle.expire_if_needed(&mut state) {
                     invalidate(&state.subscriptions);
                 }
-                let hash_checked = hash_due || publisher_changed;
-                if hash_checked {
+                if hash_due || probe_changed_source {
                     state.hash_checked = Instant::now();
                 }
                 state.fence_incompatible_ranks(&worker, configs.as_ref());
-                let outcome = if state.subscriptions.is_empty() {
-                    if !hash_checked || !replacement(&state, configs.as_ref()) {
-                        continue;
-                    }
-                    StaticHybridMatch::Differs
-                } else {
-                    matches_active(&state)
-                };
+                if state.subscriptions.is_empty() {
+                    break;
+                }
+                let outcome = matches_active(&state);
                 match lifecycle.observe_layout(&mut state, &outcome) {
                     SourceAction::Stop => {}
                     SourceAction::Recover => {

@@ -313,7 +313,6 @@ impl KvIndexSupervisor {
                 ..Default::default()
             };
             self.publish_registration(worker_url, &lifecycle, &info, discovery.base_models);
-            self.monitor_hybrid_source(&lifecycle, worker_url, capability, assumed_plain_full);
             return Ok(info);
         }
         let indexer = self.installed.acquire_identity(&key);

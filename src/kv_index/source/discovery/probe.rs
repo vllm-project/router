@@ -11,7 +11,7 @@ use tonic_prost::ProstCodec;
 use tracing::{info, warn};
 
 use super::lifecycle::WorkerLifecycle;
-use super::reconcile::{has_new_publisher, layouts_match, BoundSources};
+use super::reconcile::{layouts_match, BoundSources};
 use super::{
     discovered_block_size, metrics_meta, split_worker_rank, CacheCapabilities, KvEventSourceEntry,
     KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe, SourcesUnavailable,
@@ -40,20 +40,6 @@ pub(super) struct WorkerDescriptor {
 impl WorkerDescriptor {
     pub(super) fn layout(&self) -> Option<&CacheCapabilities> {
         self.hybrid.as_ref()
-    }
-
-    pub(super) fn has_new_publisher(
-        &self,
-        worker: &str,
-        fences: &BoundSources,
-        configs: Option<&EngineCacheConfigs>,
-    ) -> bool {
-        self.sources
-            .as_ref()
-            .zip(self.layout())
-            .is_some_and(|(sources, layout)| {
-                has_new_publisher(worker, fences, sources, layout, configs)
-            })
     }
 
     pub(super) fn matches_unfenced(&self, other: &Self, fences: &BoundSources) -> bool {
