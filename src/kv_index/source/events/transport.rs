@@ -485,7 +485,7 @@ impl PendingLive {
         through
     }
 
-    /// Check buffered duplicates before the replayed index is made visible.
+    /// Check buffered duplicates before publication and remove superseded or invalid frames.
     pub(super) fn verifies_overlap(
         &mut self,
         topic: &[u8],
@@ -496,11 +496,21 @@ impl PendingLive {
         let mut verified = true;
         self.frames.retain(|frames| {
             match buffered_sequence(frames, topic) {
-                Some(seq) if baseline.is_none_or(|first| seq >= first) => {
-                    verified &= seq > through || replayed.matches(seq as u64, &frames[2]);
-                    return true;
+                Some(seq) => {
+                    let superseded = baseline.is_some_and(|first| seq < first);
+                    if seq <= through
+                        && !replayed
+                            .compare(seq as u64, &frames[2])
+                            .unwrap_or(superseded)
+                    {
+                        verified = false;
+                        return true;
+                    }
+                    if !superseded {
+                        return true;
+                    }
+                    replayed.release_live(seq as u64);
                 }
-                Some(seq) => replayed.release_live(seq as u64),
                 None => verified = false,
             }
             self.bytes -= frames.iter().map(Vec::len).sum::<usize>();
@@ -716,8 +726,12 @@ impl ReplayOverlap {
     }
 
     fn matches(&self, seq: u64, payload: &[u8]) -> bool {
-        let fingerprint = self.0.lock().fingerprint(seq);
-        fingerprint.is_some_and(|known| known == <[u8; 32]>::from(Sha256::digest(payload)))
+        self.compare(seq, payload) == Some(true)
+    }
+
+    fn compare(&self, seq: u64, payload: &[u8]) -> Option<bool> {
+        let fingerprint = self.0.lock().fingerprint(seq)?;
+        Some(fingerprint == <[u8; 32]>::from(Sha256::digest(payload)))
     }
 
     pub(super) fn clear(&mut self) {

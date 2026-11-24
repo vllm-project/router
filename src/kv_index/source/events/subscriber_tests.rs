@@ -508,18 +508,43 @@ async fn replay_can_restore_from_a_retained_clear() {
 }
 
 #[tokio::test]
+async fn retained_clear_does_not_hide_a_buffered_payload_conflict() {
+    let tcp = TcpReplay::new();
+    let index = Arc::new(full_binding(target("clear-conflict"), BLOCK_SIZE));
+    let _handle = tcp.start_with_recovery(index.clone(), None, true);
+    let empty = batch_payload(&[]);
+    let clear = batch_payload(&[KVEvent::AllBlocksCleared(Default::default())]);
+    let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
+    tcp.subscribed().await;
+    let request = tcp.request(0).await;
+    tcp.live(9, &store);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    tcp.history(&request, &[(9, &empty), (10, &clear), (11, &store)]);
+
+    let retry = tcp.request(0).await;
+    assert_eq!(credit(&index), 0);
+    tcp.history(&retry, &[(9, &store), (10, &clear), (11, &store)]);
+    wait_until(|| credit(&index) == 4).await;
+}
+
+#[tokio::test]
 async fn replay_clear_does_not_hide_a_gap_in_the_new_baseline() {
     let tcp = TcpReplay::new();
     let index = Arc::new(full_binding(target("clear-gap"), BLOCK_SIZE));
     let _handle = tcp.start_with_recovery(index.clone(), None, true);
     let clear = batch_payload(&[KVEvent::AllBlocksCleared(Default::default())]);
     let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
+    let empty = batch_payload(&[]);
 
     tcp.subscribed().await;
     let request = tcp.request(0).await;
     tcp.history(&request, &[(10, &clear), (11, &store), (13, &clear)]);
-    tcp.request(0).await;
+    let short_retry = tcp.request(0).await;
+    tcp.history(&short_retry, &[(10, &clear), (11, &store)]);
+    let retry = tcp.request(12).await;
     assert_eq!(credit(&index), 0);
+    tcp.history(&retry, &[(12, &empty), (13, &clear), (14, &store)]);
+    wait_until(|| next_seq(&index) == Some(15) && credit(&index) == 4).await;
 }
 
 #[tokio::test]
@@ -528,17 +553,21 @@ async fn invalid_queued_live_sequence_is_rejected_only_once() {
     let index = Arc::new(full_binding(target("invalid-live-overlap"), BLOCK_SIZE));
     let _handle = tcp.start_with_recovery(index.clone(), None, true);
     let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
+    let clear = batch_payload(&[KVEvent::AllBlocksCleared(Default::default())]);
     let empty = batch_payload(&[]);
     tcp.subscribed().await;
     let request = tcp.request(0).await;
     tcp.live(i64::MAX, &empty);
     tokio::time::sleep(Duration::from_millis(20)).await;
-    tcp.history(&request, &[(0, &store)]);
+    tcp.history(&request, &[(0, &store), (1, &clear)]);
 
     let retry = tcp.request(0).await;
     assert_eq!(credit(&index), 0);
     tcp.history(&retry, &[(0, &store)]);
-    wait_until(|| credit(&index) == 4).await;
+    let retry = tcp.request(1).await;
+    assert_eq!(credit(&index), 0);
+    tcp.history(&retry, &[(1, &clear), (2, &store)]);
+    wait_until(|| next_seq(&index) == Some(3) && credit(&index) == 4).await;
 }
 
 #[tokio::test]
@@ -661,7 +690,8 @@ async fn replay_requires_continuous_history_and_valid_topic_rank_and_payload() {
         tcp.reply(&retry, 0, &store);
         wait_until(|| next_seq(&index) == Some(1)).await;
         assert_eq!(credit(&index), 0, "open replay exposed credit: {failure}");
-        tcp.history(&retry, &[(1, &empty), (2, &empty)]);
+        let tail = [(1, empty.as_slice()), (2, &empty), (3, &empty)];
+        tcp.history(&retry, &tail[..if failure == "middle_gap" { 3 } else { 2 }]);
         wait_until(|| credit(&index) == 4).await;
     }
 }

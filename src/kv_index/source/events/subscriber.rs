@@ -266,6 +266,7 @@ impl Subscriber {
                     if !(0..i64::MAX).contains(&wire_seq) || frame_topic != topic.as_bytes() {
                         return Err(ReplayError::Invalid);
                     }
+                    *through = (*through).max(Some(wire_seq));
                     let seq = wire_seq as u64;
                     if seq != next {
                         if next != start || seq < start {
@@ -289,7 +290,6 @@ impl Subscriber {
                         .record(seq, payload)
                         .map_err(|_| ReplayError::Invalid)?;
                     if awaiting_clear {
-                        *through = (*through).max(Some(wire_seq));
                         if self.try_replay_clear(seq, payload)? {
                             *baseline = Some(wire_seq);
                             awaiting_clear = false;
