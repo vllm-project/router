@@ -68,30 +68,34 @@ def test_merge_power_of_two_skews_to_faster_worker(router_manager, mock_worker_m
     )
     time.sleep(1)
 
-    stop_background_load = False
+    stop_background_load = threading.Event()
 
     def _background_load():
         i = 0
-        while not stop_background_load:
+        while not stop_background_load.is_set():
             completion(slow_url, f"bg-{i}", timeout=10, ignore_errors=True)
             i += 1
 
-    bg_threads = [
-        threading.Thread(target=_background_load, daemon=True) for _ in range(4)
-    ]
-    for thread in bg_threads:
-        thread.start()
-    time.sleep(3)
+    bg_threads = []
+    try:
+        for _ in range(4):
+            thread = threading.Thread(target=_background_load)
+            thread.start()
+            bg_threads.append(thread)
+        time.sleep(3)
 
-    counts = collections.Counter(
-        completion(
-            rh.url,
-            prompts=(f"p{i}" for i in range(200)),
-            max_workers=32,
-            timeout=10,
+        counts = collections.Counter(
+            completion(
+                rh.url,
+                prompts=(f"p{i}" for i in range(200)),
+                max_workers=32,
+                timeout=10,
+            )
         )
-    )
-    stop_background_load = True
+    finally:
+        stop_background_load.set()
+        for thread in bg_threads:
+            thread.join()
 
     assert counts[fast_id] > counts[slow_id], counts
     assert counts[fast_id] >= counts[slow_id] * 1.2, counts
