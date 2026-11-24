@@ -2664,9 +2664,11 @@ pub trait GenerationRequest: Send + Sync {
         (None, None)
     }
 
-    /// Body level session affinity key, used only when no session header is
-    /// present (for example anthropic `metadata.user_id`).
-    fn affinity_user_key(&self) -> Option<&str> {
+    /// Body level key for header keyed session affinity policies, used only
+    /// when no session header is present (for example Anthropic
+    /// `metadata.user_id`). KV-aware and Program identity use
+    /// [`Self::affinity_identity`] instead.
+    fn session_affinity_key(&self) -> Option<&str> {
         None
     }
 }

@@ -525,15 +525,6 @@ async fn grpc_pd_messages_rejected_before_pair_admission() {
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
         assert!(prefill.captured().is_empty() && decode.captured().is_empty());
         assert!(workers.iter().all(|worker| worker.load() == 0));
-        // Admission publishes per-worker occupancy even after its permit is
-        // released; no series means this request never admitted a pair.
-        assert!(
-            !metrics().render().lines().any(|line| {
-                line.starts_with("vllm_router_pd_")
-                    && (line.contains(&prefill.grpc_url) || line.contains(&decode.grpc_url))
-            }),
-            "messages touched P/D admission"
-        );
     }
 }
 

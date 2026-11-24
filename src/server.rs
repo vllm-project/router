@@ -16,7 +16,7 @@ use crate::{
     },
     routers::{
         router_manager::{RouterId, RouterManager},
-        RouterFactory, RouterTrait, UpstreamResponse,
+        RouterFactory, RouterTrait, WorkerResponse,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
 };
@@ -419,11 +419,11 @@ fn router_error_message(bytes: &[u8]) -> String {
 }
 
 /// Rewrite router generated errors on `/v1/messages` into the anthropic
-/// error shape. Worker responses carry [`UpstreamResponse`] and pass through
+/// error shape. Worker responses carry [`WorkerResponse`] and pass through
 /// unchanged whatever their content type, as do successful responses.
 async fn anthropic_error_response(response: Response) -> Response {
     let status = response.status();
-    if status.is_success() || response.extensions().get::<UpstreamResponse>().is_some() {
+    if status.is_success() || response.extensions().get::<WorkerResponse>().is_some() {
         return response;
     }
     let (mut parts, body) = response.into_parts();
@@ -457,18 +457,13 @@ async fn v1_messages(
         Ok(Json(body)) => body,
         Err(rejection) => {
             // Size limits keep their own status; every other body problem
-            // is an invalid request.
-            let status = match rejection.status() {
-                StatusCode::PAYLOAD_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
-                _ => StatusCode::BAD_REQUEST,
+            // is an invalid request. `anthropic_error_middleware` shapes it.
+            let status = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
             };
-            let mut out = Json(anthropic_error_body(
-                status.as_u16(),
-                &rejection.body_text(),
-            ))
-            .into_response();
-            *out.status_mut() = status;
-            return out;
+            return (status, rejection.body_text()).into_response();
         }
     };
     state
@@ -477,14 +472,15 @@ async fn v1_messages(
         .await
 }
 
-/// Sits outside the body limit layer: rewrites router generated
-/// errors on `/v1/messages` (including body limit, concurrency limit and wasm rejects)
-/// into the anthropic error shape. Other routes pass through untouched.
-async fn anthropic_error_layer(
+/// Sits outside the body limit layer: rewrites router generated errors on
+/// `/v1/messages` (including invalid bodies, body limit, concurrency limit
+/// and wasm rejects) into the Anthropic error shape. A trailing slash counts
+/// as the same path. Other routes pass through untouched.
+async fn anthropic_error_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let is_messages = req.uri().path() == "/v1/messages";
+    let is_messages = req.uri().path().trim_end_matches('/') == "/v1/messages";
     let response = next.run(req).await;
     if is_messages {
         anthropic_error_response(response).await
@@ -1055,8 +1051,8 @@ pub fn build_app_with_wasm_middleware(
             max_payload_size,
         ))
         // Wraps the body limit so oversized `/v1/messages` requests still get
-        // the anthropic error shape. Other paths pass through untouched.
-        .layer(axum::middleware::from_fn(anthropic_error_layer));
+        // the Anthropic error shape. Other paths pass through untouched.
+        .layer(axum::middleware::from_fn(anthropic_error_middleware));
 
     let base_app = if enable_request_tracing {
         base_app.layer(middleware::create_logging_layer())

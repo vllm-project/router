@@ -1655,15 +1655,15 @@ impl Router {
         }
     }
 
-    /// Add a body level affinity key (for example anthropic
+    /// Add a body level session key (for example Anthropic
     /// `metadata.user_id`) to the policy view of the headers, only when no
     /// session header is present. Headers always win, and nothing is added
     /// to the headers forwarded to the worker.
-    fn apply_affinity_key(
+    fn apply_session_key(
         request_headers: Option<crate::policies::RequestHeaders>,
-        affinity_key: Option<&str>,
+        session_key: Option<&str>,
     ) -> Option<crate::policies::RequestHeaders> {
-        let Some(key) = affinity_key else {
+        let Some(key) = session_key else {
             return request_headers;
         };
         let mut map = request_headers.unwrap_or_default();
@@ -1706,9 +1706,10 @@ impl Router {
         supervisor.cache_eligible_workers(workers, model)
     }
 
-    /// Select worker for a specific model considering circuit breaker state
-    #[cfg(test)]
-    #[cfg_attr(coverage_nightly, coverage(off))]
+    /// Select worker for a specific model considering circuit breaker state.
+    /// `session_key` is a body level key for header keyed policies (for
+    /// example Anthropic `metadata.user_id`); `affinity_key` is KV-aware
+    /// session affinity.
     #[allow(clippy::too_many_arguments)]
     fn select_worker_for_model(
         &self,
@@ -1722,38 +1723,7 @@ impl Router {
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
-    ) -> Option<SelectedWorker> {
-        self.select_worker_for_model_with_affinity(
-            model_id,
-            available,
-            text,
-            headers,
-            token_ids,
-            eligibility,
-            lora_name,
-            cache_salt,
-            affinity_key,
-            excluded_workers,
-            None,
-        )
-    }
-
-    /// Like `select_worker_for_model`, plus a body level affinity key (for
-    /// example anthropic `metadata.user_id`) for header based policies.
-    #[allow(clippy::too_many_arguments)]
-    fn select_worker_for_model_with_affinity(
-        &self,
-        model_id: Option<&str>,
-        available: &[Arc<dyn Worker>],
-        text: Option<&str>,
-        headers: Option<&HeaderMap>,
-        token_ids: KvRequestTokens<'_>,
-        eligibility: Option<&[bool]>,
-        lora_name: Option<&str>,
-        cache_salt: Option<&str>,
-        affinity_key: Option<&AffinityKey>,
-        excluded_workers: &[String],
-        body_affinity_key: Option<&str>,
+        session_key: Option<&str>,
     ) -> Option<SelectedWorker> {
         if available.is_empty() {
             return None;
@@ -1763,7 +1733,7 @@ impl Router {
 
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers =
-            Self::apply_affinity_key(Self::headers_to_request_headers(headers), body_affinity_key);
+            Self::apply_session_key(Self::headers_to_request_headers(headers), session_key);
 
         if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
             // The policy sees the full list: a retry exclusion must not
@@ -2194,7 +2164,7 @@ impl Router {
                         lora_name,
                         cache_read_fallback.is_some(),
                     ));
-                    self.select_worker_for_model_with_affinity(
+                    self.select_worker_for_model(
                         model_id,
                         &workers,
                         Some(if policy.needs_cache_routing_key() {
@@ -2209,7 +2179,7 @@ impl Router {
                         cache_salt,
                         affinity_key.as_ref(),
                         &excluded_workers,
-                        typed_req.affinity_user_key(),
+                        typed_req.session_affinity_key(),
                     )
                 };
                 let SelectedWorker { worker, kv_receipt } = match selected_worker {
@@ -2660,7 +2630,7 @@ impl Router {
                     *response.headers_mut() = response_headers;
                     response
                         .extensions_mut()
-                        .insert(crate::routers::UpstreamResponse);
+                        .insert(crate::routers::WorkerResponse);
                     response
                 }
                 Err(e) => {
@@ -8379,6 +8349,7 @@ mod tests {
                     None,
                     None,
                     &[],
+                    None,
                 )
                 .expect("Should select a worker");
             selected_urls.push(worker.worker.url().to_string());
@@ -8420,6 +8391,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             )
             .expect("Should select the remaining healthy worker");
 
@@ -8452,6 +8424,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
         assert!(
             result.is_none(),
@@ -8475,6 +8448,7 @@ mod tests {
                     None,
                     None,
                     excluded,
+                    None,
                 )
                 .expect("Should select a worker")
                 .worker
@@ -8507,6 +8481,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             ) {
                 worker_urls_seen.insert(worker.worker.url().to_string());
             }

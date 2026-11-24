@@ -72,9 +72,10 @@ pub(crate) const NAMED_LORA_FIELD: &str = "lora_name";
 pub(crate) const ADAPTER_FIELDS: [&str; 3] =
     [NAMED_LORA_FIELD, "lora_path", "prompt_adapter_request"];
 
-/// Messages blocks other than images and documents render to text, so they
-/// keep their cache identity; a tool_result can nest image blocks.
-fn text_only_part(part: &serde_json::Value, route: &str) -> bool {
+/// Whether this route's cache index can model the part's tokens. Text always
+/// can; on `/v1/messages` tool, thinking and tool_result blocks render to
+/// text too, unless a tool_result nests an image or document.
+fn cache_indexable_part(part: &serde_json::Value, route: &str) -> bool {
     match part.get("type").and_then(serde_json::Value::as_str) {
         Some("text") => true,
         Some("tool_use" | "thinking" | "redacted_thinking") => route == "/v1/messages",
@@ -83,7 +84,7 @@ fn text_only_part(part: &serde_json::Value, route: &str) -> bool {
                 && part
                     .get("content")
                     .and_then(serde_json::Value::as_array)
-                    .is_none_or(|nested| nested.iter().all(|p| text_only_part(p, route)))
+                    .is_none_or(|nested| nested.iter().all(|p| cache_indexable_part(p, route)))
         }
         _ => false,
     }
@@ -113,7 +114,7 @@ fn http_cache_identity(
     if let Some(messages) = fields.get("messages").and_then(serde_json::Value::as_array) {
         for message in messages {
             if let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) {
-                if parts.iter().any(|part| !text_only_part(part, route)) {
+                if parts.iter().any(|part| !cache_indexable_part(part, route)) {
                     return Err("multimodal_input");
                 }
             }

@@ -4,20 +4,21 @@
 //! `system`, `messages`, `max_tokens`, `tools`, `metadata`). Every other field
 //! is kept in a flattened map, and optional typed fields keep an explicit
 //! `null`, so the body forwarded to the worker carries the same json as the
-//! client sent. `model`, `max_tokens` and `messages` are required. The router never translates this request to
-//! chat completions; engines that speak `/v1/messages` natively get it as is.
+//! client sent. `model`, `max_tokens` and `messages` are required. The router
+//! never translates this request to chat completions; engines that speak
+//! `/v1/messages` natively get it as is.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::spec::GenerationRequest;
 
-/// Optional typed field that keeps an explicit `null`. Outer `None` means the
-/// key was absent, `Some(None)` means the client sent `null`, so the
-/// forwarded body round trips exactly.
-pub type Nullable<T> = Option<Option<T>>;
+/// Optional typed field with three states: absent (`None`), sent as `null`
+/// (`Some(None)`) or sent with a value, so the forwarded body round trips
+/// exactly.
+pub type TriState<T> = Option<Option<T>>;
 
-fn nullable<'de, D, T>(deserializer: D) -> Result<Nullable<T>, D::Error>
+fn tri_state<'de, D, T>(deserializer: D) -> Result<TriState<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
@@ -25,14 +26,16 @@ where
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
-fn present<T>(field: &Nullable<T>) -> Option<&T> {
+/// The value of a field that was sent and is not `null`.
+fn value<T>(field: &TriState<T>) -> Option<&T> {
     field.as_ref().and_then(Option::as_ref)
 }
 
 /// `POST /v1/messages` request body.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MessagesRequest {
-    /// Required by the Messages API; a missing field is a 400 from the router.
+    /// Required and nonempty; invalid bodies are rejected before routing.
+    #[serde(deserialize_with = "nonempty_model")]
     pub model: String,
 
     /// Required and nonempty; invalid bodies are rejected before routing.
@@ -45,36 +48,47 @@ pub struct MessagesRequest {
 
     #[serde(
         default,
-        deserialize_with = "nullable",
+        deserialize_with = "tri_state",
         skip_serializing_if = "Option::is_none"
     )]
-    pub stream: Nullable<bool>,
+    pub stream: TriState<bool>,
 
     /// Top level system prompt, a string or a list of text blocks.
     #[serde(
         default,
-        deserialize_with = "nullable",
+        deserialize_with = "tri_state",
         skip_serializing_if = "Option::is_none"
     )]
-    pub system: Nullable<MessageContent>,
+    pub system: TriState<MessageContent>,
 
     #[serde(
         default,
-        deserialize_with = "nullable",
+        deserialize_with = "tri_state",
         skip_serializing_if = "Option::is_none"
     )]
-    pub tools: Nullable<Vec<AnthropicTool>>,
+    pub tools: TriState<Vec<AnthropicTool>>,
 
     #[serde(
         default,
-        deserialize_with = "nullable",
+        deserialize_with = "tri_state",
         skip_serializing_if = "Option::is_none"
     )]
-    pub metadata: Nullable<MessagesMetadata>,
+    pub metadata: TriState<MessagesMetadata>,
 
     /// Fields the router does not read, forwarded unchanged.
     #[serde(flatten)]
     pub other: Map<String, Value>,
+}
+
+fn nonempty_model<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let model = String::deserialize(deserializer)?;
+    if model.is_empty() {
+        return Err(serde::de::Error::custom("model must not be empty"));
+    }
+    Ok(model)
 }
 
 fn nonempty_messages<'de, D>(deserializer: D) -> Result<Vec<AnthropicMessage>, D::Error>
@@ -125,16 +139,16 @@ pub struct ContentBlock {
     pub block_type: String,
     #[serde(
         default,
-        deserialize_with = "nullable",
+        deserialize_with = "tri_state",
         skip_serializing_if = "Option::is_none"
     )]
-    pub text: Nullable<String>,
+    pub text: TriState<String>,
     #[serde(
         default,
-        deserialize_with = "nullable",
+        deserialize_with = "tri_state",
         skip_serializing_if = "Option::is_none"
     )]
-    pub name: Nullable<String>,
+    pub name: TriState<String>,
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
@@ -143,16 +157,16 @@ pub struct ContentBlock {
 pub struct AnthropicTool {
     #[serde(
         default,
-        deserialize_with = "nullable",
+        deserialize_with = "tri_state",
         skip_serializing_if = "Option::is_none"
     )]
-    pub name: Nullable<String>,
+    pub name: TriState<String>,
     #[serde(
         default,
-        deserialize_with = "nullable",
+        deserialize_with = "tri_state",
         skip_serializing_if = "Option::is_none"
     )]
-    pub description: Nullable<String>,
+    pub description: TriState<String>,
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
@@ -161,10 +175,10 @@ pub struct AnthropicTool {
 pub struct MessagesMetadata {
     #[serde(
         default,
-        deserialize_with = "nullable",
+        deserialize_with = "tri_state",
         skip_serializing_if = "Option::is_none"
     )]
-    pub user_id: Nullable<String>,
+    pub user_id: TriState<String>,
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
@@ -189,13 +203,13 @@ impl ContentBlock {
     fn push_routing_text(&self, out: &mut Vec<String>) {
         match self.block_type.as_str() {
             "text" => {
-                if let Some(text) = present(&self.text) {
+                if let Some(text) = value(&self.text) {
                     out.push(text.clone());
                 }
             }
             "tool_use" => out.push(format!(
                 "[tool_use:{}]",
-                present(&self.name).map(String::as_str).unwrap_or_default()
+                value(&self.name).map(String::as_str).unwrap_or_default()
             )),
             other => out.push(format!("[{other}]")),
         }
@@ -205,8 +219,8 @@ impl ContentBlock {
 impl MessagesRequest {
     /// `metadata.user_id`, read from the nested field only.
     pub fn metadata_user_id(&self) -> Option<&str> {
-        present(&self.metadata)
-            .and_then(|m| present(&m.user_id))
+        value(&self.metadata)
+            .and_then(|m| value(&m.user_id))
             .map(String::as_str)
             .map(str::trim)
             .filter(|id| !id.is_empty())
@@ -215,7 +229,7 @@ impl MessagesRequest {
 
 impl GenerationRequest for MessagesRequest {
     fn is_stream(&self) -> bool {
-        present(&self.stream).copied().unwrap_or(false)
+        value(&self.stream).copied().unwrap_or(false)
     }
 
     fn get_model(&self) -> Option<&str> {
@@ -229,14 +243,14 @@ impl GenerationRequest for MessagesRequest {
     /// instead; see `backend::preprocess::http_kv_input`.
     fn extract_text_for_routing(&self) -> String {
         let mut parts = Vec::new();
-        if let Some(system) = present(&self.system) {
+        if let Some(system) = value(&self.system) {
             system.push_routing_text(&mut parts);
         }
-        for tool in present(&self.tools).into_iter().flatten() {
-            if let Some(name) = present(&tool.name) {
+        for tool in value(&self.tools).into_iter().flatten() {
+            if let Some(name) = value(&tool.name) {
                 parts.push(name.clone());
             }
-            if let Some(description) = present(&tool.description) {
+            if let Some(description) = value(&tool.description) {
                 parts.push(description.clone());
             }
         }
@@ -246,8 +260,14 @@ impl GenerationRequest for MessagesRequest {
         parts.join("\n")
     }
 
-    fn affinity_user_key(&self) -> Option<&str> {
+    fn session_affinity_key(&self) -> Option<&str> {
         self.metadata_user_id()
+    }
+
+    // vLLM reports prompt usage on /v1/messages, so the router never injects
+    // stream_options.
+    fn settlement_reports_usage(&self) -> bool {
+        true
     }
 
     /// Program identity fields (`vllm_xargs`, `agent_hint`, `session_params`,
@@ -425,15 +445,15 @@ mod tests {
             "tools": [{"name": "t", "input_schema": {"properties": {"user_id": "schema"}}}],
             "messages": [{"role": "user", "content": "hi"}]
         }));
-        assert_eq!(req.affinity_user_key(), None);
+        assert_eq!(req.session_affinity_key(), None);
         let req = parse_with_required(
             &json!({"metadata": {"user_id": " u1 "}, "messages": [{"role": "user", "content": "hi"}]}),
         );
-        assert_eq!(req.affinity_user_key(), Some("u1"));
+        assert_eq!(req.session_affinity_key(), Some("u1"));
         let req = parse_with_required(
             &json!({"metadata": {"user_id": ""}, "messages": [{"role": "user", "content": "hi"}]}),
         );
-        assert_eq!(req.affinity_user_key(), None);
+        assert_eq!(req.session_affinity_key(), None);
     }
 
     #[test]
@@ -450,10 +470,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_messages_and_zero_max_tokens_are_rejected() {
+    fn empty_model_empty_messages_and_zero_max_tokens_are_rejected() {
         let valid = json!({"model": "m", "max_tokens": 1,
             "messages": [{"role": "user", "content": "hi"}]});
-        for (field, invalid) in [("messages", json!([])), ("max_tokens", json!(0))] {
+        for (field, invalid) in [
+            ("model", json!("")),
+            ("messages", json!([])),
+            ("max_tokens", json!(0)),
+        ] {
             let mut body = valid.clone();
             body[field] = invalid;
             let err = serde_json::from_value::<MessagesRequest>(body).unwrap_err();
@@ -474,7 +498,7 @@ mod tests {
         });
         let req = parse(&body);
         assert!(!req.is_stream());
-        assert_eq!(req.affinity_user_key(), None);
+        assert_eq!(req.session_affinity_key(), None);
         assert_eq!(serde_json::to_value(&req).unwrap(), body);
         let body = json!({"model": "m", "max_tokens": 8, "metadata": null, "tools": null, "messages": [{"role": "user", "content": "hi"}]});
         assert_eq!(serde_json::to_value(parse(&body)).unwrap(), body);

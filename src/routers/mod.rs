@@ -29,7 +29,7 @@ pub use http::{openai_router, pd_router, pd_types, router};
 /// into the anthropic error shape, so worker errors always pass through as
 /// sent, whatever their content type or size.
 #[derive(Debug, Clone, Copy)]
-pub struct UpstreamResponse;
+pub struct WorkerResponse;
 
 /// Worker management trait for administrative operations
 ///
@@ -196,7 +196,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
                 let mut response = self
                     .route_transparent(headers, "/v1/messages", &Method::POST, value)
                     .await;
-                response.extensions_mut().insert(UpstreamResponse);
+                response.extensions_mut().insert(WorkerResponse);
                 response
             }
             Err(e) => (

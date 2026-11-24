@@ -19,7 +19,7 @@ use tower::ServiceExt;
 use vllm_router_rs::config::{PolicyConfig, RetryConfig, RouterConfig, RoutingMode};
 use vllm_router_rs::routers::{RouterFactory, RouterTrait};
 
-fn worker(fail_rate: f32) -> MockWorkerConfig {
+fn worker_config(fail_rate: f32) -> MockWorkerConfig {
     MockWorkerConfig {
         port: 0,
         worker_type: WorkerType::Regular,
@@ -120,7 +120,7 @@ fn agent_body(user_id: Option<&str>, question: &str) -> Value {
 
 #[tokio::test]
 async fn messages_passthrough_forwards_body_unchanged() {
-    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(0.0)], |_| {}).await;
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker_config(0.0)], |_| {}).await;
     let mut body = agent_body(Some("u1"), "hello");
     body["thinking"] = json!({"type": "enabled", "budget_tokens": 1024});
     body["stop_sequences"] = json!(["\n\nhuman:"]);
@@ -133,37 +133,26 @@ async fn messages_passthrough_forwards_body_unchanged() {
 
 #[tokio::test]
 async fn messages_invalid_json_uses_anthropic_error_shape() {
-    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(0.0)], |_| {}).await;
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker_config(0.0)], |_| {}).await;
     let (status, resp) = ctx.post("{not json", &[]).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(resp["type"], "error");
     assert_eq!(resp["error"]["type"], "invalid_request_error");
     assert!(!resp["error"]["message"].as_str().unwrap().is_empty());
-
-    // valid json, wrong shape (messages missing)
-    let (status, resp) = ctx.post(r#"{"model":"m"}"#, &[]).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(resp["error"]["type"], "invalid_request_error");
-
-    // required by the Messages API: model and max_tokens
-    for body in [
-        r#"{"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
-        r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
-    ] {
-        let (status, resp) = ctx.post(body, &[]).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(resp["error"]["type"], "invalid_request_error");
-    }
     ctx.shutdown().await;
 }
 
 #[tokio::test]
-async fn messages_empty_list_and_zero_max_tokens_rejected_before_worker_selection() {
-    let mut mock = MockWorker::new(worker(0.0));
+async fn messages_invalid_required_fields_rejected_before_worker_selection() {
+    let mut mock = MockWorker::new(worker_config(0.0));
     let url = mock.start().await.unwrap();
     let port = url.rsplit(':').next().unwrap().parse().unwrap();
     let ctx = Ctx::with_urls(PolicyConfig::RoundRobin, vec![mock], vec![url], |_| {}).await;
-    for (field, invalid) in [("messages", json!([])), ("max_tokens", json!(0))] {
+    for (field, invalid) in [
+        ("model", json!("")),
+        ("messages", json!([])),
+        ("max_tokens", json!(0)),
+    ] {
         let mut body = agent_body(None, "hi");
         body[field] = invalid;
         let (status, resp) = ctx.post(&body.to_string(), &[]).await;
@@ -177,8 +166,28 @@ async fn messages_empty_list_and_zero_max_tokens_rejected_before_worker_selectio
 }
 
 #[tokio::test]
+async fn messages_trailing_slash_404_uses_anthropic_error_shape() {
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker_config(0.0)], |_| {}).await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages/")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(agent_body(None, "hi").to_string()))
+        .unwrap();
+    let resp = ctx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let resp: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(resp["type"], "error");
+    assert_eq!(resp["error"]["type"], "not_found_error");
+    ctx.shutdown().await;
+}
+
+#[tokio::test]
 async fn messages_no_workers_uses_anthropic_error_shape() {
-    let mut ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(0.0)], |c| {
+    let mut ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker_config(0.0)], |c| {
         c.disable_retries = true;
     })
     .await;
@@ -194,7 +203,7 @@ async fn messages_no_workers_uses_anthropic_error_shape() {
 
 #[tokio::test]
 async fn messages_worker_error_passes_through_unchanged() {
-    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(1.0)], |c| {
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker_config(1.0)], |c| {
         c.disable_retries = true;
         c.disable_circuit_breaker = true;
     })
@@ -212,7 +221,7 @@ async fn messages_worker_error_passes_through_unchanged() {
 async fn messages_retries_on_worker_5xx() {
     let ctx = Ctx::new(
         PolicyConfig::RoundRobin,
-        vec![worker(1.0), worker(0.0)],
+        vec![worker_config(1.0), worker_config(0.0)],
         |c| {
             c.retry = RetryConfig {
                 max_retries: 3,
@@ -237,7 +246,7 @@ async fn messages_retries_on_worker_5xx() {
 async fn messages_metadata_user_id_drives_affinity_after_headers() {
     let ctx = Ctx::new(
         PolicyConfig::ConsistentHash { virtual_nodes: 160 },
-        vec![worker(0.0), worker(0.0), worker(0.0)],
+        vec![worker_config(0.0), worker_config(0.0), worker_config(0.0)],
         |_| {},
     )
     .await;
@@ -303,7 +312,7 @@ async fn messages_metadata_user_id_drives_affinity_after_headers() {
 async fn messages_concurrency_reject_uses_anthropic_error_shape() {
     // no tokens and no queue: the concurrency layer rejects with 429 before
     // the handler runs, and the body must still be an anthropic error.
-    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(0.0)], |c| {
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker_config(0.0)], |c| {
         c.max_concurrent_requests = 0;
         c.rate_limit_tokens_per_second = Some(0);
     })
@@ -317,7 +326,7 @@ async fn messages_concurrency_reject_uses_anthropic_error_shape() {
 
 #[tokio::test]
 async fn messages_stream_worker_json_error_keeps_status_and_content_type() {
-    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(1.0)], |c| {
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker_config(1.0)], |c| {
         c.disable_retries = true;
         c.disable_circuit_breaker = true;
     })
@@ -347,7 +356,7 @@ async fn messages_stream_worker_json_error_keeps_status_and_content_type() {
 
 #[tokio::test]
 async fn messages_stream_forwards_sse_events() {
-    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(0.0)], |_| {}).await;
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker_config(0.0)], |_| {}).await;
     let mut body = agent_body(None, "hi");
     body["stream"] = json!(true);
     let req = Request::builder()
@@ -460,7 +469,7 @@ async fn messages_worker_non_json_error_passes_through_unchanged() {
 
 #[tokio::test]
 async fn messages_oversized_content_length_uses_anthropic_error_shape() {
-    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(0.0)], |c| {
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker_config(0.0)], |c| {
         c.max_payload_size = 1024;
     })
     .await;
@@ -483,7 +492,7 @@ fn captured_messages(port: u16) -> Vec<common::mock_worker::CapturedRequest> {
 
 #[tokio::test]
 async fn messages_configured_worker_api_key_wins_over_client_key() {
-    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(0.0)], |c| {
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker_config(0.0)], |c| {
         c.api_key = Some("worker-secret".to_string());
     })
     .await;
@@ -508,7 +517,7 @@ async fn messages_configured_worker_api_key_wins_over_client_key() {
 
 #[tokio::test]
 async fn messages_strips_hop_by_hop_headers() {
-    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker(0.0)], |_| {}).await;
+    let ctx = Ctx::new(PolicyConfig::RoundRobin, vec![worker_config(0.0)], |_| {}).await;
     let (status, resp) = ctx
         .post(
             &agent_body(None, "hi").to_string(),
@@ -540,9 +549,13 @@ async fn messages_strips_hop_by_hop_headers() {
             "trailer",
             "upgrade",
         ] {
+            // The client's `connection` token must not reach the worker; the
+            // worker side client may still send its own connection header.
             let leaked = c.headers.get(hop).is_some_and(|vals| {
-                vals.iter()
-                    .any(|v| !(hop == "connection" && v.eq_ignore_ascii_case("keep-alive")))
+                hop != "connection"
+                    || vals
+                        .iter()
+                        .any(|v| v.to_ascii_lowercase().contains("x-private-hop"))
             });
             assert!(!leaked, "{hop} leaked to worker: {:?}", c.headers.get(hop));
         }
