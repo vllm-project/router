@@ -1,108 +1,49 @@
-//! P/D prefill KV discovery, refresh, and request-input preparation.
+//! P/D KV source registration and request-input preparation.
 
-use super::pd_types::PdPrefillInput;
-use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs};
-use crate::core::Worker;
-use crate::kv_index::discovery::{worker_get, WorkerDiscovery};
-use crate::kv_index::{HashMode, KvIndexSupervisor, WorkerKvInfo};
-use crate::policies::{kv_aware_ops, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy};
+use super::pd_types::{PdEndpoint, PdPrefillInput};
+use crate::backend::preprocess::{
+    http_cache_read_fallback, http_input_requires_render, prepare_http_token_inputs,
+    router_token_inputs,
+};
+use crate::config::KvConnector;
+use crate::core::{Worker, WorkerRegistry};
+use crate::kv_index::discovery::CONTROL_TIMEOUT;
+use crate::kv_index::KvIndexSupervisor;
+use crate::policies::{
+    kv_aware_ops, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy, PrefillWorkEstimate, PromptHashes,
+};
 use axum::http::HeaderMap;
-use futures_util::{stream, StreamExt};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-// HTTP prefill inputs and event bindings are prepared before admission.
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
-const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-/// Background reconcile cadence. bind() itself throttles per-base probes
-/// (REFRESH_INTERVAL when healthy, CONTROL_TIMEOUT while a binding is
-/// missing), so the tick only bounds how quickly pool changes and recovery
-/// are noticed.
+// The supervisor owns the refresh and recovery deadlines for each source.
 const REFRESH_TICK: Duration = Duration::from_secs(1);
 
-#[derive(Clone)]
-struct Binding {
-    signature: String,
-    checked: Instant,
-    info: Option<WorkerKvInfo>,
-    base_models: HashSet<String>,
-    probe_failures: u8,
-}
+type StagePool<'a> = (&'a [Arc<dyn Worker>], Option<&'a dyn KvAwareOps>);
 
-/// Metadata and served models from one successful refresh probe.
-struct Discovery {
-    signature: String,
-    base_models: HashSet<String>,
-    worker: WorkerDiscovery,
-}
-
-/// The most recent P pool and effective policy seen on the request path.
-/// The background refresh loop binds from it; recording it is a few Arc
-/// clones, so requests never wait for control-plane probes.
-#[derive(Clone, Default)]
-struct RefreshInputs {
-    workers: Arc<[Arc<dyn Worker>]>,
-    policy: Option<Arc<dyn LoadBalancingPolicy>>,
-}
-
-/// Consecutive failed probes before a previously healthy binding is treated as
-/// gone. One dropped control-plane round trip must not wipe a P engine's KV
-/// index; ~MAX_PROBE_FAILURES refresh intervals of unreachability may.
-const MAX_PROBE_FAILURES: u8 = 3;
-
-/// What bind() should do with a base after a refresh probe.
-#[derive(Debug, PartialEq, Eq)]
-enum ProbeOutcome {
-    /// Same healthy incarnation: only the check timestamp and models move.
-    Unchanged,
-    /// Probe failed: keep whatever binding exists (possibly none) and retry.
-    Keep,
-    /// New or changed incarnation: tear down and re-add the subscriber.
-    Rebuild,
-    /// Healthy binding unreachable for too long: drop it and the index.
-    Evict,
-}
-
-fn probe_outcome(existing: Option<&Binding>, signature: Option<&str>) -> ProbeOutcome {
-    match (existing, signature) {
-        (Some(binding), Some(signature))
-            if binding.info.is_some() && binding.signature == signature =>
-        {
-            ProbeOutcome::Unchanged
-        }
-        // A failed probe never evicts a healthy binding or wipes its index;
-        // retry after the normal refresh interval instead.
-        (Some(binding), None) => {
-            if binding.info.is_some() && binding.probe_failures + 1 >= MAX_PROBE_FAILURES {
-                ProbeOutcome::Evict
-            } else {
-                ProbeOutcome::Keep
-            }
-        }
-        // New or changed incarnation, and first success for an untracked base.
-        (_, Some(_)) => ProbeOutcome::Rebuild,
-        // Untracked base whose probe failed: record an empty binding so the
-        // short CONTROL_TIMEOUT retry cadence applies.
-        (None, None) => ProbeOutcome::Keep,
-    }
+#[derive(PartialEq, Eq)]
+struct TargetRegistration {
+    revision: u64,
+    decode: bool,
 }
 
 pub(super) struct PdKvState {
     client: reqwest::Client,
     api_key: Option<String>,
     supervisor: KvIndexSupervisor,
-    bindings: Mutex<HashMap<String, Binding>>,
-    targets: Mutex<HashMap<String, String>>,
-    // Serializes bind() runs. Discovery and subscriber handshakes run outside
-    // the map locks, so a slow P engine can only delay its own refresh —
-    // never the request path's short binding reads.
-    bind_lock: Mutex<()>,
-    // The background refresh loop's latest view of the P pool and policy.
-    refresh_inputs: Mutex<RefreshInputs>,
-    signals: tokio::task::JoinHandle<()>,
+    registry: Option<Arc<WorkerRegistry>>,
+    prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
+    decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
+    // Serializes updates to the target bindings in both policies.
+    targets: Mutex<HashMap<String, TargetRegistration>>,
+    worker_pairs: Option<HashMap<String, HashSet<String>>>,
+    allow_hybrid_layouts: bool,
+    nixl_decode_replay: bool,
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    credit_gate: Mutex<()>,
 }
 
 impl std::fmt::Debug for PdKvState {
@@ -114,67 +55,109 @@ impl std::fmt::Debug for PdKvState {
 }
 
 impl PdKvState {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn start(
         client: reqwest::Client,
         api_key: Option<String>,
         sources: HashMap<String, crate::config::types::PdKvEventSources>,
-        workers: Vec<Arc<dyn Worker>>,
-        policy: Arc<dyn LoadBalancingPolicy>,
+        connector: KvConnector,
+        pairs: HashMap<String, Vec<String>>,
+        registry: Arc<WorkerRegistry>,
+        prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
+        decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
+        strict_recovery: bool,
+        allow_hybrid_layouts: bool,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
-        state.api_key = api_key;
-        state.supervisor.set_api_key(state.api_key.clone());
-        state.refresh_inputs = Mutex::new(RefreshInputs {
-            workers: workers.iter().cloned().collect(),
-            policy: Some(policy.clone()),
+        state.worker_pairs = (!pairs.is_empty()).then(|| {
+            pairs
+                .into_iter()
+                .map(|(prefill, decodes)| (prefill, decodes.into_iter().collect()))
+                .collect()
         });
+        state.api_key = api_key;
+        state.allow_hybrid_layouts = allow_hybrid_layouts;
+        state.nixl_decode_replay = connector == KvConnector::Nixl;
+        state.supervisor.set_api_key(state.api_key.clone());
+        state.supervisor.set_strict_recovery(strict_recovery);
+        state.supervisor.set_pd_connector(connector);
+        state.registry = Some(registry);
+        state.prefill_policy = prefill_policy;
+        state.decode_policy = decode_policy;
         let state = Arc::new(state);
-        // Bind during startup; unavailable metadata falls back to load until refresh.
-        if let Some(kv) = kv_aware_ops(policy.as_ref()) {
-            if !workers.is_empty()
-                && tokio::time::timeout(CONTROL_TIMEOUT, state.bind(&workers, kv))
-                    .await
-                    .is_err()
-            {
-                tracing::warn!(
-                    "Initial PD KV binding timed out; using no-credit fallback until refresh"
-                );
-            }
+        if tokio::time::timeout(CONTROL_TIMEOUT, state.bind_refresh())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "Initial PD KV binding timed out; using no-credit fallback until refresh"
+            );
         }
         state.spawn_refresh();
         state
     }
 
-    /// Test-only constructor; production always passes the configured
-    /// `pd_kv_event_sources` via `new_with_statics`.
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn new(client: reqwest::Client) -> Self {
         Self::new_with_statics(client, HashMap::new())
+    }
+
+    /// Pause credit preparation so a commit test can remove a Decode worker.
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(super) async fn lock_bindings_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.credit_gate.lock().await
     }
 
     fn new_with_statics(
         client: reqwest::Client,
         static_sources: HashMap<String, crate::config::types::PdKvEventSources>,
     ) -> Self {
-        let (supervisor, mut signals) =
-            KvIndexSupervisor::new_pd(client.clone(), HashMode::Sha256, static_sources);
+        let (supervisor, signals) = KvIndexSupervisor::new_pd(client.clone(), static_sources);
+        drop(signals);
         Self {
             client,
-            supervisor,
             api_key: None,
-            bindings: Mutex::new(HashMap::new()),
+            supervisor,
+            registry: None,
+            prefill_policy: None,
+            decode_policy: None,
             targets: Mutex::new(HashMap::new()),
-            bind_lock: Mutex::new(()),
-            refresh_inputs: Mutex::new(RefreshInputs::default()),
-            // Subscribers enforce trust by suspending/clearing affected sources.
-            signals: tokio::spawn(async move { while signals.recv().await.is_some() {} }),
+            worker_pairs: None,
+            allow_hybrid_layouts: true,
+            nixl_decode_replay: false,
+            #[cfg(all(test, feature = "cpu", feature = "ready"))]
+            credit_gate: Mutex::new(()),
         }
     }
 
-    /// Reconcile bindings off the request path. Requests only record their
-    /// pool and policy; they never wait for control-plane probes, so one
-    /// hung P endpoint can no longer delay admission. Until the first
-    /// successful bind, requests see no binding and route with no KV credit.
+    /// Match Prefill workers with their configured Decode workers.
+    pub(super) fn allowed_worker_pairs(
+        &self,
+        prefill: &[Arc<dyn Worker>],
+        decode: &[Arc<dyn Worker>],
+    ) -> Option<HashSet<(PdEndpoint, PdEndpoint)>> {
+        let configured = self.worker_pairs.as_ref()?;
+        let mut allowed = HashSet::new();
+        for p in prefill {
+            for d in decode {
+                if configured
+                    .get(p.base_url())
+                    .is_some_and(|decodes| decodes.contains(d.base_url()))
+                {
+                    allowed.insert((
+                        PdEndpoint::for_worker(p.as_ref()),
+                        PdEndpoint::for_worker(d.as_ref()),
+                    ));
+                }
+            }
+        }
+        Some(allowed)
+    }
+
+    /// Refresh both stages together so one stage cannot retire a source
+    /// still used by the other.
     fn spawn_refresh(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
@@ -182,273 +165,264 @@ impl PdKvState {
             loop {
                 interval.tick().await;
                 let Some(state) = weak.upgrade() else { break };
-                let inputs = state.refresh_inputs.lock().await.clone();
-                let Some(policy) = inputs.policy else {
-                    continue;
-                };
-                let Some(kv) = kv_aware_ops(policy.as_ref()) else {
-                    continue;
-                };
-                if !inputs.workers.is_empty() {
-                    state.bind(&inputs.workers, kv).await;
-                }
+                state.bind_refresh().await;
             }
         });
     }
 
-    /// Reconcile static/discovered P pools, including incarnation and publisher
-    /// changes. Binds serialize on `bind_lock`; refresh probes and subscriber
-    /// handshakes run outside every map lock so an unresponsive P engine can
-    /// only delay its own refresh, never the request path. Never hold the
-    /// admission load lock.
+    async fn bind_refresh(&self) {
+        let Some(registry) = &self.registry else {
+            return;
+        };
+        let prefill_policy = self.prefill_policy.as_deref().and_then(kv_aware_ops);
+        let decode_policy = self.decode_policy.as_deref().and_then(kv_aware_ops);
+        let prefill = registry.get_prefill_workers();
+        let decode = registry.get_decode_workers();
+        self.bind_pools([
+            (prefill.as_slice(), prefill_policy),
+            (decode.as_slice(), decode_policy),
+        ])
+        .await;
+    }
+
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     async fn bind(&self, workers: &[Arc<dyn Worker>], policy: &dyn KvAwareOps) {
-        let _bind_guard = self.bind_lock.lock().await;
-        let bases: HashSet<_> = workers
+        self.bind_pools([(workers, Some(policy)), (&[], None)])
+            .await;
+    }
+
+    async fn bind_pools(&self, pools: [StagePool<'_>; 2]) {
+        let bases: HashSet<String> = pools
             .iter()
+            .filter(|(_, policy)| policy.is_some())
+            .flat_map(|(workers, _)| workers.iter().map(|worker| worker.base_url().to_owned()))
+            .collect();
+        let (prefill, prefill_policy) = pools[0];
+        let prefill_bases = prefill
+            .iter()
+            .filter(|_| prefill_policy.is_some())
             .map(|worker| worker.base_url().to_owned())
             .collect();
-        let refresh: Vec<String> = {
-            let mut bindings = self.bindings.lock().await;
-            bindings.retain(|base, _| {
-                if bases.contains(base) {
-                    return true;
-                }
-                self.supervisor.on_worker_removed(base);
-                false
-            });
-            bases
-                .iter()
-                .filter(|base| {
-                    bindings.get(*base).is_none_or(|binding| {
-                        binding.checked.elapsed()
-                            >= if binding.info.is_some() {
-                                REFRESH_INTERVAL
-                            } else {
-                                CONTROL_TIMEOUT
-                            }
-                    })
-                })
-                .cloned()
-                .collect()
+        let plain_only = if self.allow_hybrid_layouts {
+            HashSet::new()
+        } else {
+            bases.clone()
         };
-        {
-            let mut targets = self.targets.lock().await;
-            let current: HashSet<_> = workers
-                .iter()
-                .map(|worker| worker.url().to_owned())
-                .collect();
-            targets.retain(|target, _| {
-                if current.contains(target) {
-                    return true;
-                }
-                policy.unregister_worker(target);
-                false
-            });
-        }
-        // Probe refresh candidates without holding any map lock.
-        let probes: Vec<(String, Option<Discovery>)> =
-            stream::iter(refresh.into_iter().map(|base| async move {
-                let discovery = tokio::time::timeout(CONTROL_TIMEOUT, self.probe_base(&base))
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
-                (base, discovery)
-            }))
-            .buffer_unordered(8)
-            .collect()
+        let registrations = self
+            .supervisor
+            .refresh_workers(&bases, &plain_only, &prefill_bases)
             .await;
-        for (base, discovery) in probes {
-            let existing = {
-                let bindings = self.bindings.lock().await;
-                bindings.get(&base).cloned()
-            };
-            let outcome = probe_outcome(
-                existing.as_ref(),
-                discovery
-                    .as_ref()
-                    .map(|snapshot| snapshot.signature.as_str()),
-            );
-            match outcome {
-                ProbeOutcome::Unchanged => {
-                    let mut bindings = self.bindings.lock().await;
-                    if let Some(binding) = bindings.get_mut(&base) {
-                        binding.checked = Instant::now();
-                        binding.probe_failures = 0;
-                        binding.base_models = discovery
-                            .map(|snapshot| snapshot.base_models)
-                            .unwrap_or_default();
-                    }
-                }
-                ProbeOutcome::Keep | ProbeOutcome::Evict => {
-                    let mut bindings = self.bindings.lock().await;
-                    if outcome == ProbeOutcome::Evict {
-                        bindings.remove(&base);
-                    }
-                    bindings
-                        .entry(base.clone())
-                        .and_modify(|binding| {
-                            binding.checked = Instant::now();
-                            binding.probe_failures = binding.probe_failures.saturating_add(1);
-                        })
-                        .or_insert_with(|| Binding {
-                            signature: String::new(),
-                            checked: Instant::now(),
-                            info: None,
-                            base_models: HashSet::new(),
-                            probe_failures: 0,
-                        });
-                    drop(bindings);
-                    if outcome == ProbeOutcome::Evict {
-                        self.supervisor.on_worker_removed(&base);
-                    }
-                }
-                ProbeOutcome::Rebuild => {
-                    {
-                        let mut bindings = self.bindings.lock().await;
-                        bindings.remove(&base);
-                    }
-                    // The subscriber handshake runs without the map locks; a
-                    // concurrent prepare() sees no binding and denies credit
-                    // until the rebuild completes.
-                    let snapshot = discovery.expect("successful discovery probe");
-                    let info = self
-                        .supervisor
-                        .install_worker(&base, snapshot.worker)
-                        .ok()
-                        .filter(|info| info.cache_key.is_some() && !info.ranks.is_empty());
-                    let mut bindings = self.bindings.lock().await;
-                    bindings.insert(
-                        base,
-                        Binding {
-                            signature: snapshot.signature,
-                            checked: Instant::now(),
-                            info,
-                            base_models: snapshot.base_models,
-                            probe_failures: 0,
-                        },
-                    );
-                }
-            }
-        }
-        let bindings = self.bindings.lock().await;
+
         let mut targets = self.targets.lock().await;
-        for worker in workers {
-            let binding = bindings.get(worker.base_url());
-            let signature = binding
-                .map(|binding| format!("{}:{:?}", binding.signature, binding.info))
-                .unwrap_or_default();
-            if targets.get(worker.url()) == Some(&signature) {
-                continue;
-            }
-            policy.unregister_worker(worker.url());
-            let info = binding.and_then(|binding| binding.info.as_ref());
-            // Keep a load-only registration when discovery has no info: the
-            // occupancy fallback (affinity off, cache_salt/tools, health
-            // probes) shares this table, and KvAwarePolicy::prepare_selection
-            // drops every unregistered worker once any target is registered.
-            let matches = info.and_then(|info| {
-                let rank = worker.dp_rank().unwrap_or(0) as u32;
-                info.ranks
-                    .contains(&rank)
-                    .then(|| self.supervisor.match_provider_for_worker(worker.base_url()))
-                    .flatten()
-            });
-            policy.register_worker(worker.as_ref(), info, matches);
-            targets.insert(worker.url().to_owned(), signature);
-        }
-    }
-
-    /// One refresh probe: control-plane discovery plus the served base models.
-    /// `Ok` carries `(signature, base_models)`; any failure is an `Err`.
-    /// Statically configured workers skip the control-plane queries and
-    /// derive the signature from their configuration.
-    async fn probe_base(&self, base: &str) -> Result<Discovery, String> {
-        let worker = self.supervisor.discover(base).await;
-        let info = worker.server_info.as_ref().map_err(Clone::clone)?;
-        let sources = worker.sources.as_ref().map_err(Clone::clone)?;
-        let mut sources: Vec<_> = sources.iter().collect();
-        sources.sort_by(|left, right| left.0.cmp(right.0));
-        let signature = format!("{info:?}:{sources:?}");
-        // gRPC workers serve no HTTP /v1/models; Control.GetModelInfo names
-        // the served model, including for statically configured sources.
-        if crate::backend::is_grpc_url(base) {
-            let base_models = crate::backend::control::get_grpc_model_info(base, CONTROL_TIMEOUT)
-                .await
-                .ok()
-                .map(|info| info.model_id)
-                .filter(|model| !model.trim().is_empty())
-                .into_iter()
-                .collect();
-            return Ok(Discovery {
-                signature,
-                base_models,
-                worker,
-            });
-        }
-        let models_request = worker_get(
-            &self.client,
-            &format!("{}/v1/models", base.trim_end_matches('/')),
-            self.api_key.as_deref(),
-        );
-        let models = match models_request.send().await {
-            Ok(response) if response.status().is_success() => response.json::<Value>().await.ok(),
-            _ => None,
+        // A source probe may outlive the worker it started for.
+        let is_current = |worker: &Arc<dyn Worker>| {
+            self.registry.as_ref().is_none_or(|registry| {
+                registry
+                    .get_by_url(worker.url())
+                    .is_some_and(|current| Arc::ptr_eq(worker, &current))
+            })
         };
-        let base_models: HashSet<String> = models
-            .as_ref()
-            .and_then(|models| models.get("data"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|model| model.get("parent").is_none_or(Value::is_null))
-            .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_owned))
-            .collect();
-        Ok(Discovery {
-            signature,
-            base_models,
-            worker,
-        })
+        targets.retain(|url, target| {
+            let (workers, policy) = pools[usize::from(target.decode)];
+            if let Some(policy) = policy {
+                let still_registered = match &self.registry {
+                    Some(registry) => registry.get_by_url(url).is_some_and(|worker| {
+                        if target.decode {
+                            worker.worker_type() == crate::core::WorkerType::Decode
+                        } else {
+                            matches!(
+                                worker.worker_type(),
+                                crate::core::WorkerType::Prefill { .. }
+                            )
+                        }
+                    }),
+                    None => workers.iter().any(|worker| worker.url() == url),
+                };
+                if still_registered {
+                    return true;
+                }
+                policy.unregister_worker(url);
+            }
+            false
+        });
+        for (stage, (workers, policy)) in pools.into_iter().enumerate() {
+            let Some(policy) = policy else { continue };
+            for worker in workers.iter().filter(|worker| is_current(worker)) {
+                let registration = registrations.get(worker.base_url());
+                let target = TargetRegistration {
+                    revision: registration.map_or(0, |registration| registration.revision),
+                    decode: stage == 1,
+                };
+                if targets.get(worker.url()) == Some(&target) {
+                    continue;
+                }
+                policy.unregister_worker(worker.url());
+                let info = registration.and_then(|registration| registration.info.as_ref());
+                let provider = info
+                    .filter(|info| info.ranks.contains(&(worker.dp_rank().unwrap_or(0) as u32)))
+                    .and_then(|_| {
+                        registration.and_then(|registration| registration.provider.clone())
+                    });
+                policy.register_worker(worker.as_ref(), info, provider);
+                targets.insert(worker.url().to_owned(), target);
+            }
+        }
     }
 
-    /// `router_prompts` are the router's own token ids for `grpc://` pools;
-    /// HTTP pools pass `None` and render through each backend.
-    pub(super) async fn prepare(
+    /// Each remaining Decode candidate needs both an eligible model and a
+    /// registered index for its rank before any of them receive a KV price.
+    fn all_priceable(
         &self,
         workers: &[Arc<dyn Worker>],
-        policy: &Arc<dyn LoadBalancingPolicy>,
+        request: &Value,
+        allow_credit: &HashMap<String, bool>,
+    ) -> bool {
+        KvAwarePolicy::all_candidates_priceable(
+            http_cache_read_fallback(request).is_none(),
+            request.get("cache_salt").and_then(Value::as_str),
+            workers.iter().map(|worker| {
+                allow_credit
+                    .get(worker.base_url())
+                    .copied()
+                    .unwrap_or(false)
+            }),
+        ) && self.supervisor.workers_have_cache_bindings(
+            workers
+                .iter()
+                .map(|worker| (worker.base_url(), worker.dp_rank().unwrap_or(0) as u32)),
+        )
+    }
+
+    pub(super) async fn unregister_worker(&self, url: &str, policy: &dyn KvAwareOps) {
+        let mut targets = self.targets.lock().await;
+        policy.unregister_worker(url);
+        targets.remove(url);
+        let base = super::dp_utils::parse_worker_url(url).0;
+        let base_still_live = self.registry.as_ref().is_some_and(|registry| {
+            registry
+                .get_prefill_workers()
+                .iter()
+                .chain(registry.get_decode_workers().iter())
+                .any(|worker| worker.base_url() == base)
+        });
+        if !base_still_live {
+            self.supervisor.on_worker_removed(&base);
+        }
+    }
+
+    async fn credit_by_base(&self, bases: &[String], request: &Value) -> HashMap<String, bool> {
+        #[cfg(all(test, feature = "cpu", feature = "ready"))]
+        let _wait = self.credit_gate.lock().await;
+        self.supervisor
+            .worker_model_eligibility(bases, request.get("model").and_then(Value::as_str))
+    }
+
+    /// Prepare both stages for one request.
+    ///
+    /// Render both pools concurrently, then share the local hash cache and credit decision.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn prepare_stages(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        prefill_policy: &Arc<dyn LoadBalancingPolicy>,
+        decode_workers: &[Arc<dyn Worker>],
+        decode_policy: &Arc<dyn LoadBalancingPolicy>,
         request: &Value,
         route: &str,
         headers: Option<&HeaderMap>,
         router_prompts: Option<&Arc<[Vec<u32>]>>,
-    ) -> HashMap<String, PdPrefillInput> {
+        defer_decode: bool,
+    ) -> (
+        HashMap<String, PdPrefillInput>,
+        Option<HashMap<String, u64>>,
+    ) {
         let started = Instant::now();
-        *self.refresh_inputs.lock().await = RefreshInputs {
-            workers: workers.iter().cloned().collect(),
-            policy: Some(policy.clone()),
+        let bases = |workers: &[Arc<dyn Worker>]| -> Vec<String> {
+            workers
+                .iter()
+                .map(|worker| worker.base_url().to_owned())
+                .collect()
         };
-        let bases: Vec<_> = workers
-            .iter()
-            .map(|worker| worker.base_url().to_owned())
-            .collect();
-        let allow_credit: HashMap<_, _> = self
-            .bindings
-            .lock()
-            .await
-            .iter()
-            .map(|(base, binding)| {
-                let model = request.get("model").and_then(Value::as_str);
-                let allowed = model.is_some_and(|model| {
-                    binding.base_models.contains(model)
-                        || binding
-                            .info
-                            .as_ref()
-                            .and_then(|info| info.cache_key.as_ref())
-                            .is_some_and(|key| key.model.as_ref() == model)
-                });
-                (base.clone(), allowed)
-            })
-            .collect();
-        let results = match router_prompts {
+        let prefill_bases = bases(prefill_workers);
+        let decode_bases = bases(decode_workers);
+        let mut all_bases = prefill_bases.clone();
+        all_bases.extend(decode_bases.iter().cloned());
+        let allow_credit = self.credit_by_base(&all_bases, request).await;
+        // Decide whether any Decode candidate can be credited *before* rendering: a salted
+        // request, an unverified identity or a pool that publishes no events all end with
+        // the rendered result discarded, and the render is the slow part.
+        // A deferred decision only picks a provisional worker here and re-prices at commit,
+        // so rendering and pricing Decode now would be discarded - and could stall admission
+        // on a slow backend for nothing.
+        // A candidate can only be priced when its base is creditable. `decode_context_from_
+        // results` needs an estimate for every candidate, so pricing with a partial set
+        // always falls back - after paying for the slowest render. Require the whole set.
+        // Decode pricing also never renders on non-gRPC pools: only gRPC router_prompts
+        // and direct token-id prompts price without a `/render` fan-out.
+        let decode_expected = (!defer_decode || self.worker_pairs.is_some())
+            && kv_aware_ops(decode_policy.as_ref()).is_some();
+        let decode_requires_render =
+            router_prompts.is_none() && http_input_requires_render(request, route);
+        let decode_priced_here = decode_expected
+            && !decode_requires_render
+            && self.all_priceable(decode_workers, request, &allow_credit);
+        let (prefill_results, decode_results) = tokio::join!(
+            self.tokenize(prefill_bases, request, route, headers, router_prompts),
+            async {
+                if decode_priced_here {
+                    self.tokenize(decode_bases, request, route, headers, router_prompts)
+                        .await
+                } else {
+                    HashMap::new()
+                }
+            },
+        );
+        let mut prepared = Self::build_prefill_inputs(request, &allow_credit, prefill_results);
+        let mut hashes = PromptHashes::new();
+        let prefill_work = kv_aware_ops(prefill_policy.as_ref())
+            .map(|kv| Self::prefill_work(kv, prefill_workers, &prepared, &mut hashes));
+        let decode_context = if decode_priced_here {
+            let kv = kv_aware_ops(decode_policy.as_ref()).expect("priced decode policy");
+            self.decode_context_from_results(
+                kv,
+                decode_workers,
+                &allow_credit,
+                &decode_results,
+                &mut hashes,
+            )
+        } else {
+            if decode_expected {
+                crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
+            }
+            None
+        };
+
+        // The cache borrows tokens from prepared. Release it before recording
+        // either stage's estimates.
+        drop(hashes);
+        if let Some(work) = prefill_work {
+            for (base, rank, estimate) in work {
+                if let Some(input) = prepared.get_mut(&base) {
+                    input.work_by_rank.insert(rank, estimate);
+                }
+            }
+        }
+        metrics::histogram!("vllm_router_pd_kv_prepare_seconds")
+            .record(started.elapsed().as_secs_f64());
+        (prepared, decode_context)
+    }
+
+    /// Render the request against each base, or reuse the router's own ids.
+    async fn tokenize(
+        &self,
+        bases: Vec<String>,
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
+    ) -> HashMap<String, Result<crate::backend::preprocess::HttpTokenInput, &'static str>> {
+        match router_prompts {
             Some(prompts) => router_token_inputs(bases, request, prompts),
             None => {
                 prepare_http_token_inputs(
@@ -462,13 +436,23 @@ impl PdKvState {
                 )
                 .await
             }
-        };
-        let mut prepared = HashMap::new();
+        }
+    }
+
+    /// Pure: rendered prompts plus credit eligibility become `PdPrefillInput`s.
+    fn build_prefill_inputs(
+        request: &Value,
+        allow_credit: &HashMap<String, bool>,
+        results: HashMap<String, Result<crate::backend::preprocess::HttpTokenInput, &'static str>>,
+    ) -> HashMap<String, PdPrefillInput> {
+        let mut prepared = HashMap::with_capacity(results.len());
         for (base, result) in results {
-            let fallback = KvAwarePolicy::credit_fallback(
-                request.get("cache_salt").and_then(Value::as_str),
-                allow_credit.get(&base).copied().unwrap_or(false),
-            );
+            let fallback = http_cache_read_fallback(request).or_else(|| {
+                KvAwarePolicy::credit_fallback(
+                    request.get("cache_salt").and_then(Value::as_str),
+                    allow_credit.get(&base).copied().unwrap_or(false),
+                )
+            });
             let (prompts, fallback_reason, source) = match result {
                 Ok(input) => (Some(input.prompts), fallback, input.source),
                 Err(reason) => (None, Some(reason), reason),
@@ -484,56 +468,240 @@ impl PdKvState {
                 .set(if input.allow_credit { 1.0 } else { 0.0 });
             prepared.insert(base, input);
         }
-        if let Some(kv) = kv_aware_ops(policy.as_ref()) {
-            let inputs: Vec<_> = workers
-                .iter()
-                .filter_map(|worker| {
-                    let input = prepared.get(worker.base_url())?;
-                    Some((
-                        worker.as_ref(),
-                        input.prompts.as_deref()?,
-                        input.allow_credit,
-                    ))
-                })
-                .collect();
-            let work: Vec<_> = inputs
-                .iter()
-                .zip(kv.estimate_prefill_work(&inputs))
-                .map(|((worker, _, _), estimate)| {
-                    (worker.base_url().to_owned(), worker.dp_rank(), estimate)
-                })
-                .collect();
-            for (base, rank, work) in work {
-                prepared
-                    .get_mut(&base)
-                    .unwrap()
-                    .work_by_rank
-                    .insert(rank, work);
-            }
-        }
-        metrics::histogram!("vllm_router_pd_kv_prepare_seconds")
-            .record(started.elapsed().as_secs_f64());
         prepared
     }
-}
 
-impl Drop for PdKvState {
-    fn drop(&mut self) {
-        self.supervisor.shutdown();
-        self.signals.abort();
+    fn prefill_work<'tokens>(
+        kv: &dyn KvAwareOps,
+        workers: &[Arc<dyn Worker>],
+        prepared: &'tokens HashMap<String, PdPrefillInput>,
+        hashes: &mut PromptHashes<'tokens>,
+    ) -> Vec<(String, Option<usize>, PrefillWorkEstimate)> {
+        let inputs: Vec<_> = workers
+            .iter()
+            .filter_map(|worker| {
+                let input = prepared.get(worker.base_url())?;
+                Some((
+                    worker.as_ref(),
+                    input.prompts.as_deref()?,
+                    input.allow_credit,
+                ))
+            })
+            .collect();
+        inputs
+            .iter()
+            .zip(kv.estimate_prefill_work(&inputs, hashes))
+            .map(|((worker, _, _), estimate)| {
+                (worker.base_url().to_owned(), worker.dp_rank(), estimate)
+            })
+            .collect()
+    }
+
+    /// Pure: the Decode estimate over already-rendered prompts.
+    ///
+    /// Returns `None` when any candidate is unpriced, because one credited
+    /// figure beside a full-price one would compare different units across the
+    /// pool.
+    fn decode_context_from_results<'tokens>(
+        &self,
+        kv: &dyn KvAwareOps,
+        workers: &[Arc<dyn Worker>],
+        allow_credit: &HashMap<String, bool>,
+        results: &'tokens HashMap<
+            String,
+            Result<crate::backend::preprocess::HttpTokenInput, &'static str>,
+        >,
+        hashes: &mut PromptHashes<'tokens>,
+    ) -> Option<HashMap<String, u64>> {
+        let inputs: Vec<_> = workers
+            .iter()
+            .filter_map(|worker| {
+                let result = results.get(worker.base_url())?;
+                match result {
+                    Ok(input) => Some((
+                        worker.as_ref(),
+                        input.prompts.as_ref(),
+                        allow_credit
+                            .get(worker.base_url())
+                            .copied()
+                            .unwrap_or(false),
+                    )),
+                    Err(reason) => {
+                        crate::metrics::RouterMetrics::record_kv_routing_input("pd_decode", reason);
+                        None
+                    }
+                }
+            })
+            .collect();
+        if inputs.len() != workers.len() {
+            crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unpriced");
+            return None;
+        }
+        let work = kv.estimate_decode_work_with_transfer(&inputs, hashes, self.nixl_decode_replay);
+        let mut context = HashMap::with_capacity(work.len());
+        for ((worker, _, _), estimate) in inputs.iter().zip(work) {
+            context.insert(worker.url().to_owned(), estimate.additional_tokens?);
+        }
+        Some(context)
+    }
+
+    /// Marginal Decode context per candidate, priced against the KV index.
+    /// `hashes` is the caller's cache: the admission path shares it with the
+    /// Prefill estimate, while the deferred commit starts a fresh one because it
+    /// prices against the index as it stands at commit time.
+    pub(super) async fn prepare_decode_context(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
+    ) -> Option<HashMap<String, u64>> {
+        // The only caller is the deferred commit, which prices against the index as it
+        // stands now, so this owns its cache. The admission path shares one cache across both
+        // stages through `prepare_stages`.
+        let kv = kv_aware_ops(policy.as_ref())?;
+        // Same no-render rule as admission: the commit path must not pay a
+        // second fan-out for ids that cannot have changed.
+        if router_prompts.is_none() && http_input_requires_render(request, route) {
+            crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
+            return None;
+        }
+        let bases: Vec<_> = workers
+            .iter()
+            .map(|worker| worker.base_url().to_owned())
+            .collect();
+        let allow_credit = self.credit_by_base(&bases, request).await;
+        if !self.all_priceable(workers, request, &allow_credit) {
+            crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
+            return None;
+        }
+        let results = self
+            .tokenize(bases, request, route, headers, router_prompts)
+            .await;
+        self.decode_context_from_results(
+            kv,
+            workers,
+            &allow_credit,
+            &results,
+            &mut PromptHashes::new(),
+        )
     }
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod kv_input_tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
-    use crate::policies::{kv_aware_ops, KvAwarePolicy};
+    use crate::policies::{kv_aware_ops, KvAwarePolicy, PromptHashes};
     use axum::extract::Request;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use reqwest::Client;
     use serde_json::json;
+
+    /// Exercise the same preparation entry point as the request path. Decode is
+    /// deferred so these prefill-only tests need no Decode pool.
+    async fn prepare_prefill(
+        state: &PdKvState,
+        workers: &[Arc<dyn Worker>],
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+    ) -> HashMap<String, PdPrefillInput> {
+        state
+            .prepare_stages(
+                workers,
+                policy,
+                &[],
+                policy,
+                request,
+                route,
+                headers,
+                None,
+                true,
+            )
+            .await
+            .0
+    }
+    #[tokio::test]
+    async fn prompt_scoring_keeps_prefill_tokens_but_disables_pd_credit() {
+        let state = PdKvState::new(Client::new());
+        let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://worker".into(),
+            WorkerType::Regular,
+        ));
+        let prompt: Vec<u32> = (0..65).collect();
+        for (field, expected) in [
+            (
+                json!({"skip_reading_prefix_cache":true}),
+                "skip_prefix_cache",
+            ),
+            (json!({"prompt_logprobs":0}), "unsupported_prompt_scoring"),
+            (
+                json!({"skip_reading_prefix_cache":false,"prompt_logprob_start":32}),
+                "unsupported_prompt_scoring",
+            ),
+        ] {
+            let mut body = json!({"model":"m","prompt":prompt});
+            body.as_object_mut()
+                .unwrap()
+                .extend(field.as_object().unwrap().clone());
+            let result = prepare_prefill(
+                &state,
+                std::slice::from_ref(&worker),
+                &policy,
+                &body,
+                "/v1/completions",
+                None,
+            )
+            .await;
+            let input = &result[worker.base_url()];
+            assert_eq!(input.fallback_reason, Some(expected));
+            assert!(!input.allow_credit);
+            assert_eq!(input.prompts.as_ref().unwrap()[0].len(), 65);
+            assert_eq!(input.work_by_rank[&worker.dp_rank()].new_prefill_tokens, 65);
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_worker_pairs_restrict_hybrid_and_preserve_full_workers() {
+        let mut state = PdKvState::new(Client::new());
+        state.worker_pairs = Some(HashMap::from([
+            ("http://p0".into(), HashSet::from(["http://d0".into()])),
+            ("http://p1".into(), HashSet::from(["http://d1".into()])),
+        ]));
+        let workers = |prefix: &str| -> Vec<Arc<dyn Worker>> {
+            (0..2)
+                .map(|i| {
+                    Arc::new(BasicWorker::new(
+                        format!("http://{prefix}{i}"),
+                        WorkerType::Regular,
+                    )) as Arc<dyn Worker>
+                })
+                .collect()
+        };
+        let p = workers("p");
+        let d = workers("d");
+        let pairs = state.allowed_worker_pairs(&p, &d).unwrap();
+        assert_eq!(
+            pairs,
+            HashSet::from([
+                (
+                    PdEndpoint::for_worker(p[0].as_ref()),
+                    PdEndpoint::for_worker(d[0].as_ref())
+                ),
+                (
+                    PdEndpoint::for_worker(p[1].as_ref()),
+                    PdEndpoint::for_worker(d[1].as_ref())
+                )
+            ])
+        );
+    }
 
     #[tokio::test]
     async fn unsupported_inputs_fall_back_without_control_or_tokenization_requests() {
@@ -570,9 +738,7 @@ mod kv_input_tests {
                 json!({"model":"m","input":"hello","previous_response_id":"resp_1"}),
             ),
         ] {
-            let prepared = state
-                .prepare(&workers, &policy, &request, route, None, None)
-                .await;
+            let prepared = prepare_prefill(&state, &workers, &policy, &request, route, None).await;
             let input = &prepared[&base];
             assert!(input.prompts.is_none());
             assert!(input.work_by_rank.is_empty());
@@ -643,59 +809,181 @@ mod kv_input_tests {
             state
                 .bind(&workers, kv_aware_ops(policy.as_ref()).unwrap())
                 .await;
-            let inputs = state
-                .prepare(
-                    &workers,
-                    &policy,
-                    &json!({"model":"m","prompt":"hello"}),
-                    "/v1/completions",
-                    Some(&headers),
-                    None,
-                )
-                .await;
+            let inputs = prepare_prefill(
+                &state,
+                &workers,
+                &policy,
+                &json!({"model":"m","prompt":"hello"}),
+                "/v1/completions",
+                Some(&headers),
+            )
+            .await;
             assert_eq!(
                 inputs[&base].prompts.as_deref(),
                 Some([vec![7, 8, 9]].as_slice())
             );
             let work = kv_aware_ops(policy.as_ref())
                 .unwrap()
-                .estimate_prefill_work(&[(workers[0].as_ref(), &[vec![7, 8, 9]], true)])[0];
+                .estimate_prefill_work(
+                    &[(workers[0].as_ref(), &[vec![7, 8, 9]], true)],
+                    &mut PromptHashes::new(),
+                )[0];
             assert_eq!(work.new_prefill_tokens, 3);
             assert!(!work.placement_verified); // No event source: exact tokens, zero fabricated credit.
             task.abort();
         }
     }
 
+    struct TestPublisher {
+        live: zmq::Socket,
+        replay: zmq::Socket,
+        topic: &'static str,
+    }
+
+    impl TestPublisher {
+        fn new(topic: &'static str) -> Self {
+            let context = zmq::Context::new();
+            let bound = |kind| {
+                let socket = context.socket(kind).unwrap();
+                socket.set_linger(0).unwrap();
+                socket.bind("tcp://127.0.0.1:*").unwrap();
+                socket
+            };
+            Self {
+                live: bound(zmq::XPUB),
+                replay: bound(zmq::ROUTER),
+                topic,
+            }
+        }
+
+        fn endpoints(&self) -> (String, String) {
+            (
+                self.live.get_last_endpoint().unwrap().unwrap(),
+                self.replay.get_last_endpoint().unwrap().unwrap(),
+            )
+        }
+
+        fn layout(&self, model: &str) -> Value {
+            json!({
+                "schema_version": 1,
+                "adapters": [],
+                "ranks": [{
+                    "rank": 0, "model": model, "weight_version": "default",
+                    "publisher_topic": self.topic, "instance_topic": true,
+                    "hash_algorithm": "sha256_cbor", "full_hashes": true, "hash_seed": "0",
+                    "hash_block_size": 16, "hash_lookahead_tokens": 0, "speculative_tokens": 0,
+                    "prefix_caching": true, "declared_groups": 1, "transfer": null,
+                    "groups": [{
+                        "group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec",
+                        "block_size": 16, "prefix_cacheable": true, "prefix_replay_tokens": 0
+                    }]
+                }]
+            })
+        }
+
+        fn static_source(&self, model: &str) -> crate::config::PdKvEventSources {
+            let (live, replay) = self.endpoints();
+            crate::config::PdKvEventSources {
+                endpoints: vec![live],
+                replay_endpoints: Some(vec![replay]),
+                block_size: 16,
+                model: Some(model.into()),
+                hybrid: Some(serde_json::from_value(self.layout(model)).unwrap()),
+            }
+        }
+
+        async fn replay_empty_and_publish(&self, events: &[crate::kv_index::KVEvent]) {
+            async fn receive(socket: &zmq::Socket) -> Vec<Vec<u8>> {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        match socket.recv_multipart(zmq::DONTWAIT) {
+                            Ok(frames) => return frames,
+                            Err(zmq::Error::EAGAIN) => {
+                                tokio::time::sleep(Duration::from_millis(2)).await
+                            }
+                            Err(error) => panic!("KV test publisher receive: {error}"),
+                        }
+                    }
+                })
+                .await
+                .expect("subscriber did not connect")
+            }
+
+            let subscribed = receive(&self.live).await;
+            assert_eq!(
+                subscribed[0],
+                [b"\x01".as_slice(), self.topic.as_bytes()].concat()
+            );
+            let request = receive(&self.replay).await;
+            assert_eq!(request.last().unwrap(), &0_u64.to_be_bytes());
+            self.replay
+                .send_multipart(
+                    [
+                        request[0].as_slice(),
+                        &[],
+                        &[],
+                        &(-1_i64).to_be_bytes(),
+                        &[],
+                    ],
+                    0,
+                )
+                .unwrap();
+            let payload =
+                crate::kv_index::source::test_support::event_payload(1.0, events, Some(0));
+            self.live
+                .send_multipart([self.topic.as_bytes(), &0_i64.to_be_bytes(), &payload], 0)
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn discovered_and_static_sources_enable_real_prefix_credit() {
+        use crate::kv_index::source::test_support::full_store;
+        use crate::kv_index::KVEvent;
         use axum::{routing::get, Json, Router};
         use std::sync::atomic::{AtomicUsize, Ordering};
+
         for static_source in [false, true] {
+            let publisher = TestPublisher::new("kv/boot");
+            let (endpoint, replay_endpoint) = publisher.endpoints();
             let probes = Arc::new(AtomicUsize::new(0));
-            let info_probes = probes.clone();
-            let source_probes = probes.clone();
-            let publisher_context = zmq::Context::new();
-            let publisher = publisher_context.socket(zmq::PUB).unwrap();
-            publisher.bind("tcp://127.0.0.1:*").unwrap();
-            let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-            let source_metadata = Arc::new(parking_lot::Mutex::new(json!({"0": {
-                "publisher": "zmq", "endpoint": endpoint, "enable_kv_cache_events": true
-            }})));
             let mut app = Router::new().route(
                 "/v1/models",
-                get(|| async { Json(json!({"data":[{"id":"m", "parent":null}]})) }),
+                get(|| async { Json(json!({"data":[{"id":"m","parent":null}]})) }),
             );
             if !static_source {
-                app = app.route("/server_info", get(move || {
-            let probes = info_probes.clone();
-            async move { probes.fetch_add(1, Ordering::Relaxed);
-                Json(json!({"vllm_config":{"model_config":{"model":"engine-model"},"cache_config":{"block_size":16}}}))
-            }}))
-            .route("/kv_event_sources", get({ let sources = source_metadata.clone(); move || {
-                let sources = sources.lock().clone();
-                let probes = source_probes.clone();
-                async move { probes.fetch_add(1, Ordering::Relaxed); Json(sources) }
-            }}));
+                let info_probes = probes.clone();
+                let source_probes = probes.clone();
+                let layout_probes = probes.clone();
+                let sources = json!({"0": {
+                    "publisher": "zmq", "endpoint": endpoint, "replay_endpoint": replay_endpoint,
+                    "topic": publisher.topic, "enable_kv_cache_events": true
+                }});
+                let layout = publisher.layout("engine-model");
+                app = app
+                    .route("/server_info", get(move || {
+                        let probes = info_probes.clone();
+                        async move {
+                            probes.fetch_add(1, Ordering::Relaxed);
+                            Json(json!({"vllm_config":{
+                                "model_config":{"model":"engine-model"}, "cache_config":{"block_size":16}
+                            }}))
+                        }
+                    }))
+                    .route("/kv_event_sources", get(move || {
+                        let (probes, sources) = (source_probes.clone(), sources.clone());
+                        async move {
+                            probes.fetch_add(1, Ordering::Relaxed);
+                            Json(sources)
+                        }
+                    }))
+                    .route("/kv_routing_capabilities", get(move || {
+                        let (probes, layout) = (layout_probes.clone(), layout.clone());
+                        async move {
+                            probes.fetch_add(1, Ordering::Relaxed);
+                            Json(layout)
+                        }
+                    }));
             }
             let app = app.layer(axum::middleware::from_fn(
                 |request: Request, next: axum::middleware::Next| async move {
@@ -712,20 +1000,9 @@ mod kv_input_tests {
             ));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
-            let task = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let sources = if static_source {
-                std::iter::once((
-                    base.clone(),
-                    crate::config::types::PdKvEventSources {
-                        endpoints: vec![endpoint],
-                        replay_endpoints: None,
-                        block_size: 16,
-                        model: None,
-                    },
-                ))
-                .collect()
+                HashMap::from([(base.clone(), publisher.static_source("m"))])
             } else {
                 HashMap::new()
             };
@@ -743,223 +1020,351 @@ mod kv_input_tests {
             state.bind(&workers, ops).await;
             assert_eq!(
                 probes.load(Ordering::Relaxed),
-                if static_source { 0 } else { 2 }
+                if static_source { 0 } else { 3 }
             );
-            let initial = state
-                .prepare(&workers, &policy, &request, "/v1/completions", None, None)
-                .await;
+
+            let initial =
+                prepare_prefill(&state, &workers, &policy, &request, "/v1/completions", None).await;
             assert_eq!(initial[&base].work_by_rank[&None].new_prefill_tokens, 33);
             assert!(initial[&base].work_by_rank[&None].placement_verified);
-            let payload = rmp_serde::to_vec(&(
-                1.0,
-                vec![json!({
-                    "type":"BlockStored", "block_hashes":[1,2], "parent_block_hash":null,
-                    "token_ids":(0..32).collect::<Vec<u32>>(), "block_size":16,
-                    "lora_id":null, "lora_name":null, "medium":"GPU"
-                })],
-                0_u32,
-            ))
-            .unwrap();
-            let seq = 0_u64.to_be_bytes();
+
+            publisher
+                .replay_empty_and_publish(&[KVEvent::BlockStored(full_store(
+                    &tokens[..32],
+                    16,
+                    None,
+                ))])
+                .await;
             tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
-                    publisher
-                        .send_multipart([b"".as_slice(), seq.as_slice(), payload.as_slice()], 0)
-                        .unwrap();
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    let work = ops.estimate_prefill_work(&[(
-                        workers[0].as_ref(),
-                        std::slice::from_ref(&tokens),
-                        true,
-                    )])[0];
+                    let work = ops.estimate_prefill_work(
+                        &[(workers[0].as_ref(), std::slice::from_ref(&tokens), true)],
+                        &mut PromptHashes::new(),
+                    )[0];
                     if work.new_prefill_tokens == 1 {
                         break;
                     }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
                 }
             })
             .await
             .expect("subscriber should ingest the warm prefix");
-            let warm = state
-                .prepare(&workers, &policy, &request, "/v1/completions", None, None)
-                .await;
+
+            let warm =
+                prepare_prefill(&state, &workers, &policy, &request, "/v1/completions", None).await;
             assert_eq!(warm[&base].work_by_rank[&None].new_prefill_tokens, 1);
             assert!(warm[&base].work_by_rank[&None].placement_verified);
-            if !static_source {
-                use crate::kv_index::{MatchQuery, StorageTier};
-
-                let provider = state.supervisor.match_provider_for_worker(&base).unwrap();
-                let query = MatchQuery {
-                    group_idx: 0,
-                    local_hashes: crate::kv_index::local_block_hash_strings(&tokens, 16, None),
-                    tiers_of_interest: vec![StorageTier::Device],
-                };
-                assert_eq!(provider.find_tiered_matches(&query).len(), 1);
-                let valid = source_metadata.lock()["0"].clone();
-                *source_metadata.lock() = json!({"not-a-rank": valid});
-                state.bindings.lock().await.get_mut(&base).unwrap().checked =
-                    Instant::now() - REFRESH_INTERVAL;
-                state.bind(&workers, ops).await;
-                // Installation rejects the complete new snapshot before
-                // retiring the old subscriber, but the changed PD binding
-                // itself falls back without granting that old credit.
-                assert!(state.supervisor.match_provider_for_worker(&base).is_some());
-                assert_eq!(provider.find_tiered_matches(&query).len(), 1);
-                assert!(state.bindings.lock().await[&base].info.is_none());
-                let fallback = state
-                    .prepare(&workers, &policy, &request, "/v1/completions", None, None)
-                    .await;
-                assert_eq!(fallback[&base].work_by_rank[&None].new_prefill_tokens, 33);
-                assert!(!fallback[&base].work_by_rank[&None].placement_verified);
-                assert_eq!(probes.load(Ordering::Relaxed), 4);
-            }
             drop(state);
             task.abort();
         }
     }
 
-    fn healthy_binding(signature: &str, probe_failures: u8) -> Binding {
-        Binding {
-            signature: signature.to_owned(),
-            checked: Instant::now(),
-            info: Some(WorkerKvInfo::default()),
-            base_models: HashSet::new(),
-            probe_failures,
-        }
-    }
-
-    #[test]
-    fn probe_outcomes_cover_identity_changes_and_failure_threshold() {
-        let healthy = healthy_binding("sig", 0);
-        let failing = healthy_binding("sig", MAX_PROBE_FAILURES - 1);
-        let unverified = Binding {
-            info: None,
-            ..failing.clone()
-        };
-        for (binding, signature, expected) in [
-            (Some(&healthy), Some("sig"), ProbeOutcome::Unchanged),
-            (Some(&healthy), Some("other"), ProbeOutcome::Rebuild),
-            (Some(&unverified), Some("sig"), ProbeOutcome::Rebuild),
-            (Some(&failing), None, ProbeOutcome::Evict),
-            (Some(&unverified), None, ProbeOutcome::Keep),
-            (None, Some("sig"), ProbeOutcome::Rebuild),
-            (None, None, ProbeOutcome::Keep),
-        ] {
-            assert_eq!(probe_outcome(binding, signature), expected);
-        }
-        for failures in 0..MAX_PROBE_FAILURES - 1 {
-            let binding = healthy_binding("sig", failures);
-            assert_eq!(probe_outcome(Some(&binding), None), ProbeOutcome::Keep);
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_refresh_probes_keep_healthy_binding_until_consecutive_limit() {
+    async fn models_server() -> (String, tokio::task::JoinHandle<()>) {
         use axum::{routing::get, Json, Router};
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        // Rewind the binding's check timestamp so the next bind must re-probe.
-        async fn rewind(state: &PdKvState, base: &str) {
-            let mut bindings = state.bindings.lock().await;
-            if let Some(binding) = bindings.get_mut(base) {
-                binding.checked = Instant::now() - REFRESH_INTERVAL - CONTROL_TIMEOUT;
-            }
-        }
-
-        let healthy = Arc::new(AtomicBool::new(true));
-        let publisher_context = zmq::Context::new();
-        let publisher = publisher_context.socket(zmq::PUB).unwrap();
-        publisher.bind("tcp://127.0.0.1:*").unwrap();
-        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let models = || async { Json(json!({"data":[{"id":"m","parent":null}]})) };
         let app = Router::new()
-            .route(
-                "/server_info",
-                get({
-                    let healthy = healthy.clone();
-                    move || {
-                        let healthy = healthy.clone();
-                        async move {
-                            if healthy.load(Ordering::Relaxed) {
-                                (
-                                    StatusCode::OK,
-                                    Json(json!({"vllm_config":{"model_config":{"model":"m"},"cache_config":{"block_size":16}}})),
-                                )
-                            } else {
-                                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({})))
-                            }
-                        }
-                    }
-                }),
-            )
-            .route(
-                "/v1/models",
-                get(|| async { Json(json!({"data":[{"id":"m","parent":null}]})) }),
-            )
-            .route("/kv_event_sources", get(move || {
-                let endpoint = endpoint.clone();
-                async move {
-                    Json(json!({"0":{"publisher":"zmq","endpoint":endpoint,"enable_kv_cache_events":true}}))
-                }
-            }));
+            .route("/p/v1/models", get(models))
+            .route("/d/v1/models", get(models));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let state = PdKvState::new(reqwest::Client::new());
-        let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
-        let ops = kv_aware_ops(policy.as_ref()).unwrap();
-        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
-            base.clone(),
-            WorkerType::Regular,
-        ))];
-        let request = json!({"model":"m","prompt":(0..8).collect::<Vec<u32>>()});
+        (base, task)
+    }
 
-        // First bind: discovery succeeds and installs a binding with info.
-        state.bind(&workers, ops).await;
-        let inputs = state
-            .prepare(&workers, &policy, &request, "/v1/completions", None, None)
-            .await;
-        assert!(inputs[&base].allow_credit);
-        {
-            let bindings = state.bindings.lock().await;
-            let binding = bindings.get(&base).expect("binding after first discovery");
-            assert!(binding.info.is_some());
-            assert_eq!(binding.probe_failures, 0);
+    #[tokio::test]
+    async fn worker_removal_does_not_wait_for_source_discovery() {
+        for replace in [false, true] {
+            check_worker_removal_during_probe(replace).await;
         }
+    }
 
-        // Transient failures keep the healthy binding and its credit authority.
-        healthy.store(false, Ordering::Relaxed);
-        for expected_failures in 1..MAX_PROBE_FAILURES {
-            rewind(&state, &base).await;
-            state.bind(&workers, ops).await;
-            let inputs = state
-                .prepare(&workers, &policy, &request, "/v1/completions", None, None)
-                .await;
-            assert!(
-                inputs[&base].allow_credit,
-                "retained binding keeps credit authority"
+    async fn check_worker_removal_during_probe(replace: bool) {
+        use axum::{routing::get, Json, Router};
+        use tokio::sync::Notify;
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let app = Router::new().route(
+            "/get_server_info",
+            get({
+                let (entered, release) = (entered.clone(), release.clone());
+                move || {
+                    let (entered, release) = (entered.clone(), release.clone());
+                    async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        Json(json!({"model_id": "m", "kv_block_size": 16}))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(Arc::new(BasicWorker::new(url.clone(), WorkerType::Decode)));
+        let policy = Arc::new(KvAwarePolicy::default());
+        let mut state = PdKvState::new(Client::new());
+        state.registry = Some(registry.clone());
+        state.decode_policy = Some(policy.clone());
+        let state = Arc::new(state);
+        let refresh = {
+            let state = state.clone();
+            tokio::spawn(async move { state.bind_refresh().await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("source probe did not start");
+        registry.remove_by_url(&url).unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            state.unregister_worker(&url, policy.as_ref()),
+        )
+        .await
+        .expect("worker removal must finish while the source probe is blocked");
+        if replace {
+            let worker = Arc::new(BasicWorker::new(url.clone(), WorkerType::Decode));
+            registry.register(worker.clone());
+            policy.register_worker(worker.as_ref(), None, None);
+            state.targets.lock().await.insert(
+                url.clone(),
+                TargetRegistration {
+                    revision: 1,
+                    decode: true,
+                },
             );
-            let bindings = state.bindings.lock().await;
-            let binding = bindings
-                .get(&base)
-                .expect("binding retained after transient failure");
-            assert!(binding.info.is_some(), "index identity must survive");
-            assert_eq!(binding.probe_failures, expected_failures);
         }
+        release.notify_one();
+        refresh.await.unwrap();
+        assert_eq!(
+            state
+                .targets
+                .lock()
+                .await
+                .get(&url)
+                .map(|binding| binding.revision),
+            replace.then_some(1),
+        );
+        server.abort();
+    }
 
-        // The consecutive-failure limit replaces the binding with an empty one
-        // and tears the subscriber down.
-        rewind(&state, &base).await;
-        state.bind(&workers, ops).await;
-        let inputs = state
-            .prepare(&workers, &policy, &request, "/v1/completions", None, None)
+    #[tokio::test]
+    async fn start_registers_and_prices_both_pools_before_any_request() {
+        // Lazy request-path binding would leave a burst unpriced for one tick.
+        let (base, server) = models_server().await;
+        let p_base = format!("{base}/p");
+        let d_base = format!("{base}/d");
+        let prefill_publisher = TestPublisher::new("kv/prefill");
+        let decode_publisher = TestPublisher::new("kv/decode");
+        let prefill_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
+        let decode_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
+        let prefill: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            p_base.clone(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ))];
+        let decode: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            d_base.clone(),
+            WorkerType::Decode,
+        ))];
+        let registry = Arc::new(crate::core::WorkerRegistry::new());
+        for worker in prefill.iter().chain(decode.iter()) {
+            registry.register(worker.clone());
+        }
+        let state = PdKvState::start(
+            reqwest::Client::new(),
+            None,
+            HashMap::from([
+                (p_base.clone(), prefill_publisher.static_source("m")),
+                (d_base.clone(), decode_publisher.static_source("m")),
+            ]),
+            KvConnector::Nixl,
+            HashMap::new(),
+            registry.clone(),
+            Some(prefill_policy.clone()),
+            Some(decode_policy.clone()),
+            false,
+            true,
+        )
+        .await;
+        tokio::join!(
+            prefill_publisher.replay_empty_and_publish(&[]),
+            decode_publisher.replay_empty_and_publish(&[]),
+        );
+        let request = json!({"model":"m","prompt":[1,2,3]});
+        let credit = state
+            .credit_by_base(&[p_base.clone(), d_base.clone()], &request)
             .await;
-        assert!(!inputs[&base].allow_credit);
-        let bindings = state.bindings.lock().await;
-        let binding = bindings
-            .get(&base)
-            .expect("empty binding re-recorded for retry cadence");
-        assert!(binding.info.is_none());
-        assert_eq!(binding.probe_failures, 0);
-
-        task.abort();
+        assert_eq!(credit.get(&p_base), Some(&true));
+        assert_eq!(credit.get(&d_base), Some(&true));
+        assert!(state.all_priceable(&prefill, &request, &credit));
+        let unbound: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://unbound".to_owned(),
+            WorkerType::Decode,
+        ));
+        let mixed = [decode[0].clone(), unbound.clone()];
+        let mut mixed_credit = credit.clone();
+        mixed_credit.insert(unbound.base_url().to_owned(), true);
+        assert!(!state.all_priceable(&mixed, &request, &mixed_credit));
+        let prompts: Arc<[Vec<u32>]> = Arc::from(vec![vec![1, 2, 3]]);
+        assert!(
+            state
+                .prepare_decode_context(
+                    &decode,
+                    &decode_policy,
+                    &request,
+                    "/v1/completions",
+                    None,
+                    Some(&prompts),
+                )
+                .await
+                .is_some(),
+            "Decode must be priced before the first request"
+        );
+        // HTTP prices Decode only from free ids: a token-id prompt prices, a string falls back.
+        assert!(
+            state
+                .prepare_decode_context(
+                    &decode,
+                    &decode_policy,
+                    &request,
+                    "/v1/completions",
+                    None,
+                    None,
+                )
+                .await
+                .is_some(),
+            "an HTTP direct token-id prompt prices without rendering"
+        );
+        for (extra, eligible) in [
+            (json!({}), true),
+            (json!({"cache_salt": "tenant"}), false),
+            (json!({"skip_reading_prefix_cache": true}), false),
+        ] {
+            let mut request = request.clone();
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let (_, admission) = state
+                .prepare_stages(
+                    &prefill,
+                    &prefill_policy,
+                    &decode,
+                    &decode_policy,
+                    &request,
+                    "/v1/completions",
+                    None,
+                    Some(&prompts),
+                    false,
+                )
+                .await;
+            let commit = state
+                .prepare_decode_context(
+                    &decode,
+                    &decode_policy,
+                    &request,
+                    "/v1/completions",
+                    None,
+                    Some(&prompts),
+                )
+                .await;
+            assert_eq!(admission.is_some(), eligible, "admission: {extra}");
+            assert_eq!(commit.is_some(), eligible, "commit: {extra}");
+        }
+        assert!(
+            state
+                .prepare_decode_context(
+                    &decode,
+                    &decode_policy,
+                    &json!({"model":"m","prompt":"hello"}),
+                    "/v1/completions",
+                    None,
+                    None,
+                )
+                .await
+                .is_none(),
+            "an HTTP string body must not render Decode for pricing"
+        );
+        // The same URL changes role before the next refresh. The cached
+        // signature matches, but the owner changed, so the Decode policy must
+        // be registered rather than skipped.
+        let prefill_kv = kv_aware_ops(prefill_policy.as_ref()).unwrap();
+        let decode_kv = kv_aware_ops(decode_policy.as_ref()).unwrap();
+        let old_prefill = prefill[0].clone();
+        registry.remove_by_url(old_prefill.url());
+        let decode_role: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new(p_base.clone(), WorkerType::Decode));
+        registry.register(decode_role.clone());
+        state.bind_refresh().await;
+        assert!(
+            decode_kv.estimate_decode_work(
+                &[(decode_role.as_ref(), &[vec![1, 2, 3]], true)],
+                &mut PromptHashes::new(),
+            )[0]
+            .additional_tokens
+            .is_some(),
+            "a role change must register the new owning policy"
+        );
+        assert_eq!(
+            prefill_kv.estimate_decode_work(
+                &[(decode_role.as_ref(), &[vec![1, 2, 3]], true)],
+                &mut PromptHashes::new(),
+            )[0]
+            .additional_tokens,
+            None,
+            "the old Prefill policy target must be removed"
+        );
+        // Refresh removes a deleted Decode worker from its owning policy.
+        let removed = decode[0].clone();
+        registry.remove_by_url(removed.url());
+        state.bind_refresh().await;
+        assert_eq!(
+            decode_kv.estimate_decode_work(
+                &[(removed.as_ref(), &[vec![1, 2, 3]], true)],
+                &mut PromptHashes::new(),
+            )[0]
+            .additional_tokens,
+            None,
+            "Prefill refresh must unregister the Decode target through Decode policy"
+        );
+        registry.register(removed.clone());
+        state.bind_refresh().await;
+        // A stale refresh snapshot must not revive the removed worker.
+        registry.remove_by_url(removed.url());
+        state.unregister_worker(removed.url(), decode_kv).await;
+        state.bind_refresh().await;
+        assert!(
+            state
+                .prepare_decode_context(
+                    &decode,
+                    &decode_policy,
+                    &request,
+                    "/v1/completions",
+                    None,
+                    Some(&prompts),
+                )
+                .await
+                .is_none(),
+            "a stale refresh must not re-register a removed Decode worker"
+        );
+        registry.register(decode[0].clone());
+        state.bind_refresh().await;
+        assert!(
+            state
+                .prepare_decode_context(
+                    &decode,
+                    &decode_policy,
+                    &request,
+                    "/v1/completions",
+                    None,
+                    Some(&prompts),
+                )
+                .await
+                .is_some(),
+            "re-added Decode worker must be registered and priceable again"
+        );
+        server.abort();
     }
 }
