@@ -457,6 +457,29 @@ async fn replay_retry_keeps_the_verified_gap_cursor() {
 }
 
 #[tokio::test]
+async fn observed_replay_watermark_does_not_block_the_buffered_gap_batch() {
+    let tcp = TcpReplay::new();
+    let index = Arc::new(full_binding(target("observed-watermark"), BLOCK_SIZE));
+    let _handle = tcp.start_with_idle_timeout(index.clone(), None, true, Duration::from_secs(1));
+    let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
+    let empty = batch_payload(&[]);
+    tcp.subscribed().await;
+    tcp.history(&tcp.request(0).await, &[]);
+    tcp.live(0, &store);
+    wait_until(|| credit(&index) == 4).await;
+    tcp.live(2, &empty);
+
+    let request = tcp.request(1).await;
+    tcp.reply(&request, 3, &empty);
+    let retry = tcp.request(1).await;
+    tcp.history(&retry, &[(1, &empty)]);
+    let retry = tcp.request(3).await;
+    assert_eq!(credit(&index), 0);
+    tcp.history(&retry, &[(3, &empty)]);
+    wait_until(|| next_seq(&index) == Some(4) && credit(&index) == 4).await;
+}
+
+#[tokio::test]
 async fn truncated_idle_replay_cannot_publish_on_an_empty_retry() {
     let tcp = TcpReplay::new();
     let index = Arc::new(full_binding(target("truncated-idle"), BLOCK_SIZE));
@@ -529,6 +552,9 @@ async fn retained_clear_does_not_hide_a_buffered_payload_conflict() {
 
 #[tokio::test]
 async fn replay_clear_does_not_hide_a_gap_in_the_new_baseline() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
     let tcp = TcpReplay::new();
     let index = Arc::new(full_binding(target("clear-gap"), BLOCK_SIZE));
     let _handle = tcp.start_with_recovery(index.clone(), None, true);
@@ -543,8 +569,14 @@ async fn replay_clear_does_not_hide_a_gap_in_the_new_baseline() {
     tcp.history(&short_retry, &[(10, &clear), (11, &store)]);
     let retry = tcp.request(12).await;
     assert_eq!(credit(&index), 0);
+    assert!(!metrics.render().contains("reason=\"clear_barrier\""));
     tcp.history(&retry, &[(12, &empty), (13, &clear), (14, &store)]);
     wait_until(|| next_seq(&index) == Some(15) && credit(&index) == 4).await;
+    assert!(metrics.render().lines().any(|line| {
+        line.starts_with("vllm_router_kv_source_recovery_events_total{")
+            && line.contains("reason=\"clear_barrier\"")
+            && line.ends_with(" 1")
+    }));
 }
 
 #[tokio::test]

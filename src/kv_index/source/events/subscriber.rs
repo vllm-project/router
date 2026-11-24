@@ -193,7 +193,8 @@ impl Subscriber {
         &self,
         ctx: &zmq::Context,
         mut last: i64,
-        required_through: &mut Option<i64>,
+        required_through: Option<i64>,
+        observed_through: &mut Option<i64>,
         baseline: &mut Option<i64>,
         gap_batch: Option<&(u64, Vec<u8>)>,
         replayed: &ReplayOverlap,
@@ -259,7 +260,10 @@ impl Subscriber {
                             last = *seq as i64;
                             next += 1;
                         }
-                        if required_through.is_some_and(|required| next as i64 <= required) {
+                        if required_through
+                            .max(*observed_through)
+                            .is_some_and(|required| next as i64 <= required)
+                        {
                             return Err(ReplayError::Retry(last));
                         }
                         *socket = Some(dealer);
@@ -269,7 +273,7 @@ impl Subscriber {
                         return Err(ReplayError::Invalid);
                     }
                     // A rejected reply can still reveal a sequence the next replay must cover.
-                    *required_through = (*required_through).max(Some(wire_seq));
+                    *observed_through = (*observed_through).max(Some(wire_seq));
                     let seq = wire_seq as u64;
                     if seq != next {
                         if next != start || seq < start {
@@ -384,6 +388,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
             let mut disconnected = false;
             let mut reconnect = false;
             let mut recovery_through = None;
+            let mut observed_through = None;
             let mut replay_baseline = None;
             let mut gap_batch = None;
             let mut replay_failures = 0;
@@ -423,6 +428,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     }
                     disconnected = true;
                     recovery_through = None;
+                    observed_through = None;
                     replay_baseline = None;
                     gap_batch = None;
                     replay_failures = 0;
@@ -476,7 +482,8 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         let replay = subscriber.replay(
                             &ctx,
                             last_seq,
-                            &mut recovery_through,
+                            recovery_through,
+                            &mut observed_through,
                             &mut replay_baseline,
                             gap_batch.as_ref(),
                             &replayed,
@@ -538,10 +545,15 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         let advanced = high != last_seq;
                         last_seq = high;
                         recovery_through = None;
-                        replay_baseline = None;
+                        observed_through = None;
+                        let reason = if replay_baseline.take().is_some() {
+                            Reason::ClearBarrier
+                        } else {
+                            Reason::ReplayApplied
+                        };
                         gap_batch = None;
                         if suspended || (idle_reconcile && advanced) {
-                            if subscriber.resume(last_seq, Reason::ReplayApplied).is_err() {
+                            if subscriber.resume(last_seq, reason).is_err() {
                                 break;
                             }
                             suspended = false;
@@ -624,6 +636,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             bootstrap = false;
                             allow_overlap = false;
                             recovery_through = None;
+                            observed_through = None;
                             pending_live = PendingLive::default();
                             continue;
                         }
@@ -821,6 +834,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                 }
                 last_seq = restart_from;
                 recovery_through = through;
+                observed_through = None;
                 bootstrap = true;
                 next_catchup = tokio::time::Instant::now();
                 allow_overlap = overlap;
