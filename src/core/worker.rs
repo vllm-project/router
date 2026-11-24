@@ -15,6 +15,8 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to create worker HTTP client")
 });
 
+pub(crate) const UNLABELED_WORKER_MODEL_ID: &str = "unknown";
+
 /// Attach the router's API key as a bearer token when one is configured.
 pub(crate) fn worker_request(
     request: reqwest::RequestBuilder,
@@ -233,7 +235,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .labels
             .get("model_id")
             .map(|s| s.as_str())
-            .unwrap_or("unknown")
+            .unwrap_or(UNLABELED_WORKER_MODEL_ID)
     }
 
     /// Get the priority of this worker (higher value = higher priority)
@@ -620,6 +622,13 @@ impl DPAwareWorker {
     /// Set the API key sent as a bearer token on this worker's HTTP health checks.
     pub fn with_worker_api_key(mut self, api_key: Option<Arc<str>>) -> Self {
         self.base_worker = self.base_worker.with_worker_api_key(api_key);
+        self
+    }
+
+    /// Copy the served-model labels of the base URL onto every DP rank: the
+    /// ranks share one engine, so they serve the same names.
+    pub fn with_labels(mut self, labels: std::collections::HashMap<String, String>) -> Self {
+        self.base_worker.metadata.labels.extend(labels);
         self
     }
 }
@@ -2053,5 +2062,26 @@ mod tests {
             }
         );
         assert_eq!(workers[5].worker_type(), WorkerType::Decode);
+    }
+
+    #[test]
+    fn dp_aware_workers_keep_their_served_model_labels() {
+        // Every rank of a DP endpoint answers for the same engine, so the
+        // served-model labels probed from the base URL must survive onto each
+        // rank. Without them model_id stays "unknown" and an adapter name in
+        // `model` is mistaken for the base model.
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("model_id".to_string(), "Qwen3.5-4B".to_string());
+        labels.insert("served_model_aliases".to_string(), "qwen".to_string());
+        let worker = DPAwareWorker::new("http://host:8000".to_string(), 1, 2, WorkerType::Regular)
+            .with_labels(std::collections::HashMap::from([(
+                "pool".into(),
+                "test".into(),
+            )]))
+            .with_labels(labels);
+        assert_eq!(worker.metadata().labels["pool"], "test");
+
+        assert_eq!(worker.model_id(), "Qwen3.5-4B");
+        assert_eq!(worker.metadata().labels["served_model_aliases"], "qwen");
     }
 }

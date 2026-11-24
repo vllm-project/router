@@ -1,5 +1,6 @@
 use super::ConfigResult;
 use crate::config::validation::ConfigValidator;
+pub use crate::kv_index::config::{PdKvEventSources, StaticKvEventSources};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -20,6 +21,9 @@ pub struct RouterConfig {
     /// Workers listed here skip HTTP control-plane discovery and probing.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pd_kv_event_sources: HashMap<String, PdKvEventSources>,
+    /// Explicit routing pairs by Prefill base URL for a heterogeneous P/D pool.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pd_worker_pairs: HashMap<String, Vec<String>>,
     /// Opt in to hiding KV placement until a complete authoritative recovery.
     #[serde(default)]
     pub kv_event_strict_recovery: bool,
@@ -1009,30 +1013,6 @@ pub enum ConnectionMode {
     Grpc,
 }
 
-/// Statically configured KV event sources for one prefill worker, used when
-/// the engine's HTTP control plane does not serve `/server_info` or
-/// `/kv_event_sources` (e.g. the `vllm-rs serve` frontend).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PdKvEventSources {
-    /// ZMQ PUB endpoints, one per data-parallel rank (index = rank).
-    pub endpoints: Vec<String>,
-    /// Optional ZMQ ROUTER (replay) endpoints, same ordering as `endpoints`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replay_endpoints: Option<Vec<String>>,
-    /// KV cache block size of the engine. Must match the engine's
-    /// `--block-size` (vLLM default: 16).
-    #[serde(default = "default_pd_kv_block_size")]
-    pub block_size: u32,
-    /// Model identity for the cache key. Defaults to the worker URL; the
-    /// served-model check then relies on `/v1/models`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-}
-
-fn default_pd_kv_block_size() -> u32 {
-    16
-}
-
 /// Routing mode configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -1175,27 +1155,6 @@ pub enum PolicyConfig {
 
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
-}
-
-/// Manually configured KV event publishers for one regular-mode worker.
-///
-/// Rust struct literals must supply `topic: String::new()` to retain the
-/// previous empty subscription topic. Serde defaults preserve old JSON
-/// configurations, but do not provide Rust source compatibility.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct StaticKvEventSources {
-    /// One externally reachable ZMQ PUB endpoint per DP rank.
-    pub endpoints: Vec<String>,
-    /// Optional replay ROUTER endpoint per DP rank for loss recovery.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replay_endpoints: Option<Vec<String>>,
-    /// Exact ZMQ subscription topic shared by these ranks.
-    #[serde(default)]
-    pub topic: String,
-    /// KV cache block size used to calculate prefix placement.
-    pub block_size: u32,
-    /// Shared model identity across workers that serve the same model.
-    pub model: String,
 }
 
 impl PolicyConfig {
@@ -1413,6 +1372,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             pd_kv_event_sources: HashMap::new(),
+            pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
@@ -1690,6 +1650,7 @@ mod tests {
                 replay_endpoints: Some(vec!["tcp://prefill:5558".to_string()]),
                 block_size: 32,
                 model: Some("m".to_string()),
+                hybrid: None,
             },
         );
         let json = serde_json::to_string(&config).unwrap();
@@ -2287,6 +2248,7 @@ mod tests {
                 discovery_address: None,
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
             policy: PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 30,
@@ -2354,6 +2316,7 @@ mod tests {
                 ],
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
             policy: PolicyConfig::CacheAware {
                 cache_threshold: 0.9,
@@ -2422,6 +2385,7 @@ mod tests {
                 worker_urls: vec!["http://worker1".to_string()],
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
             policy: PolicyConfig::RoundRobin,
             host: "::1".to_string(), // IPv6
