@@ -14,7 +14,7 @@ the policy is the same for `grpc://host:port`.
 | `consistent_hash` | Multi-turn conversations, KV cache reuse | Yes | No |
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
-| `kv_aware` | KV reuse and stage-aware load scoring | No | Yes |
+| `kv_aware` | KV reuse and stage-aware load scoring | Optional | Yes |
 
 ---
 
@@ -246,36 +246,13 @@ If several candidate workers have the same lowest load, the policy picks one of 
 
 ## KV Aware
 
-`kv_aware` uses KV cache reuse and worker load to route requests. It suits workloads with repeated prompt prefixes and supports HTTP, [gRPC](../backend/grpc.md), and P/D disaggregation over HTTP or gRPC.
+See the [KV-aware deployment guide](kv_aware.md) for worker requirements, routing modes and model recipes.
 
-HTTP Completion uses the existing [Direct/Worker input preparation](http_completion_kv.md), without local tokenizer assets. Unmodeled identities and unqualified targets stay routable without cache credit.
+### P/D decode load
 
-```bash
-vllm-router --policy kv_aware \
-  --worker-urls grpc://worker1:8000 grpc://worker2:8000
-```
+Decode ranks workers by logical context tokens, with request count as the fallback when prompt length is unknown. To credit pages already on the Decode GPU, enable KV events on Decode workers. If event discovery is unavailable, supply their addresses with `--pd-kv-events`.
 
-Enable KV events on the workers. HTTP text requests also need a render endpoint or, for simple prompts, `/tokenize`. Without usable KV information, routing falls back to load.
-
-For regular pools without event discovery, configure `--kv-event-source WORKER_URL=tcp://HOST:PORT` per worker, plus matching `--kv-event-model` and `--kv-event-block-size`.
-
-### P/D disaggregation
-
-```bash
-vllm-router --vllm-pd-disaggregation \
-  --prefill http://prefill:8000 --decode http://decode:8000 \
-  --prefill-policy kv_aware --decode-policy kv_aware
-```
-
-Prefill selection considers reusable KV and current work. Decode selection favors the least busy worker. Both stages inherit `--policy` unless overridden.
-
-Decode ranks candidates by logical context tokens, not by request count: a few long sequences and many short ones both look "busy" by count but differ in KV. A request whose prompt length the router could not measure keeps the whole pool on request counts.
-
-Configure the engines' P/D connector and enable prefix caching and KV events on prefill workers. For native Python vLLM metadata discovery, set `VLLM_SERVER_DEV_MODE=1`.
-
-If event discovery is unavailable, add `--pd-kv-events http://prefill:8000=tcp://prefill:5557` for each prefill worker.
-
-Decode is charged only for the context it newly allocates. To credit blocks a Decode engine already holds, enable KV events on Decode workers too (`--kv-events-config` with `enable_kv_cache_events`) and point `--pd-kv-events` at them. Marginal credit applies only when the prompt arrives as token IDs (gRPC, or an explicit token-id prompt); ordinary HTTP string or chat requests fall back to full context tokens, and the decision metric reports `context_tokens` rather than `context_tokens_marginal`.
+gRPC and HTTP token-ID prompts can receive this credit. HTTP text and chat requests use full context tokens. The decision metric reports `context_tokens_marginal` when the Router can price every candidate, and `context_tokens` when it uses full context tokens.
 
 ### Session affinity
 
@@ -326,6 +303,7 @@ Multiple router replicas need ingress stickiness to preserve affinity.
 | Batch inference with no state | `round_robin` |
 | Variable request complexity | `power_of_two` |
 | Repeated system prompts / few-shot | `cache_aware` |
+| Repeated prefixes with worker KV events | `kv_aware` |
 | Simple testing / development | `random` |
 
 ---

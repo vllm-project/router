@@ -22,7 +22,7 @@ def mock_workers(mock_worker_manager):
 
 @pytest.fixture(scope="session")
 def kv_st_runtime(tmp_path_factory):
-    """Generate Python wire bindings from the exact crate used by the binary.
+    """Generate Python wire bindings from the crate locked by the binary.
 
     Requires `cargo build --bin vllm-router` and `pip install -e '.[dev]'`.
     Missing prerequisites fail explicitly, including in CI; no silent skips or
@@ -82,6 +82,7 @@ def kv_st_runtime(tmp_path_factory):
     result = protoc.main(
         [
             "grpc_tools.protoc",
+            f"-I{output}",
             f"-I{proto_dir}",
             f"-I{Path(grpc_tools.__file__).parent / '_proto'}",
             f"--python_out={output}",
