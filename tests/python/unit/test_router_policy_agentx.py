@@ -45,7 +45,11 @@ def test_agentx_slice_matches_manifest_and_pd_cases():
     assert sum(r["in"] for r in requests) == manifest["input_tokens"]
     assert sum(r["out"] for r in requests) == manifest["output_tokens"]
     assert max(r["in"] + r["out"] for r in requests) == manifest["max_request_tokens"]
-    for filename in ("pd_disagg_cache_aware.json", "pd_disagg_kv_aware_affinity.json"):
+    for filename in (
+        "pd_disagg_cache_aware.json",
+        "pd_disagg_kv_aware.json",
+        "pd_disagg_kv_aware_affinity.json",
+    ):
         case = json.loads((SUITE / "cases" / filename).read_text(encoding="utf-8"))
         assert case["runtime"]["trace_type"] == "agentX"
         assert case["runtime"]["trace_sha256"] == manifest["trace_sha256"]
@@ -61,6 +65,12 @@ def test_agentx_slice_matches_manifest_and_pd_cases():
     [
         (
             "pd_disagg_cache_aware",
+            "agentX",
+            "/v1/completions",
+            "replay_agentX.yaml",
+        ),
+        (
+            "pd_disagg_kv_aware",
             "agentX",
             "/v1/completions",
             "replay_agentX.yaml",

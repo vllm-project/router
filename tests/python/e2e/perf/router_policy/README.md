@@ -67,6 +67,7 @@ cells have separate output files.
 | `pd_merge_kv_aware` | `kv_aware` | `pd_merged` |
 | `pd_merge_kv_aware_affinity` | `kv_aware_aff` | `pd_merged` |
 | `pd_disagg_cache_aware` | `cache_aware` | `pd_disaggregated` |
+| `pd_disagg_kv_aware` | `kv_aware` | `pd_disaggregated` |
 | `pd_disagg_kv_aware_affinity` | `kv_aware_aff` | `pd_disaggregated` |
 
 Result JSON includes `scenario`, `topology`, and `router_policy`. The existing
@@ -93,7 +94,7 @@ Two steps in [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nigh
 run on `l4_4` (four L4 GPUs).
 
 - `router-policy-perf-e2e` selects `pd_merge and c16` and runs the three merged scenarios.
-- `router-policy-pd-disagg-perf-e2e` selects `pd_disagg and c16` and runs the two
+- `router-policy-pd-disagg-perf-e2e` selects `pd_disagg and c16` and runs the three
   disaggregated scenarios. Failures in either step fail the Buildkite build.
 
 The PD cases use two prefill workers and two decode workers, each on its own
@@ -107,7 +108,7 @@ uses 9 GiB of KV, within the per-worker KV allocation.
 
 The CI image supplies `agentinfer==0.2.0`, vLLM 0.30.0, NIXL, and the Rust
 router. Merged cases use `data/tracelab-ci-uniform-28.jsonl` (eight sessions,
-28 requests). The two PD cases share `data/agentx-ci-8x8.jsonl` (eight sessions,
+28 requests). The three PD cases share `data/agentx-ci-8x8.jsonl` (eight sessions,
 eight turns each, 64 requests) with `trace_type=agentX`, `/v1/completions`,
 and `gap_scale=0.002`. AgentInfer's `replay_agentX.yaml` supplies the matching
 token-ID replay settings. See [data provenance and reproduction](data/README.md).
@@ -119,13 +120,14 @@ cell directory as `trace.jsonl`; this override applies only to TraceLab.
 Downloads replace the cell's trace atomically, and failures stop the cell
 before GPU processes start. Local pytest runs use the same setup.
 
-Run the two PD scenarios in an environment with four supported CUDA GPUs.
+Run the three PD scenarios in an environment with four supported CUDA GPUs.
 
 ```bash
 python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'pd_disagg and c16'
 ```
 
-Both scenarios passed a two-L20, one-prefill/one-decode replay with all 28
-requests successful. That run used the vLLM native sampler because FlashInfer
-CUDA compilation failed in the test container. Four-GPU, two-prefill/two-decode
-validation remains pending.
+Earlier TraceLab runs of cache-aware and KV-aware affinity passed on two L20
+GPUs with one prefill worker, one decode worker, and all 28 requests successful.
+Those runs used the vLLM native sampler because FlashInfer CUDA compilation
+failed in the test container. The current AgentX workload still needs GPU
+validation with four GPUs and two prefill/two decode workers.
