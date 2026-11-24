@@ -19,9 +19,12 @@ use smallvec::SmallVec;
 ///
 /// Hashes prompts using the verified source contract and reports the prefix
 /// that the cache layout can restore.
-/// A hit used for a Regular Prefill reservation must carry evidence for that
-/// lookup. Event-backed providers should delegate to a source binding through
-/// `matches_with_cache` so the policy can revalidate the hit.
+///
+/// Regular routing with a Prefill slot grants credit only for hits with
+/// evidence from that lookup. Hits from custom providers without evidence
+/// are scored as cache misses, and their workers remain eligible by load.
+/// To retain credit, forward `matches_with_cache` and its cache to the
+/// source provider that produced the hit.
 pub trait TieredMatchProvider: Send + Sync {
     /// Match the prompt using the provider's complete restore rules.
     fn matches(
@@ -136,6 +139,8 @@ pub(crate) struct PlacementEvidence {
     generation: u64,
     control: Arc<StreamControl>,
     lease: Option<SourceLease>,
+    // Discovery-backed hits pin their grant to serialize worker retirement.
+    // Standalone bindings rely on the source generation and read guard.
     layout: Option<LayoutGrant>,
 }
 

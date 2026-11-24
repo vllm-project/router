@@ -102,6 +102,7 @@ impl LayoutGrant {
             .iter()
             .find(|pin| std::ptr::eq(pin.lifecycle, self.lifecycle.as_ref()))
         {
+            // Each hit validates its own grant against the shared locked state.
             return self.valid(&pin.state);
         }
         let Some(state) = self.lifecycle.state.try_lock() else {
