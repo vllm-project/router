@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use pyo3::prelude::*;
 pub mod backend;
 pub mod config;
@@ -6,7 +8,6 @@ use std::collections::HashMap;
 
 pub mod core;
 pub mod data_connector;
-pub mod kv_hash;
 pub mod kv_index;
 pub mod metrics;
 pub mod middleware;
@@ -54,6 +55,10 @@ struct Router {
     kv_event_replay_source: Vec<String>,
     kv_event_block_size: u32,
     kv_event_model: Option<String>,
+    kv_event_strict_recovery: bool,
+    kv_hybrid_layout: Option<std::path::PathBuf>,
+    kv_event_topic: Vec<String>,
+    pd_pair: Vec<String>,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
     cache_threshold: f32,
@@ -182,19 +187,23 @@ impl Router {
 
         // Convert main policy and attach static regular-mode KV event sources.
         let mut policy = convert_policy(&self.policy);
-        let static_sources = config::parse_static_kv_event_sources(
-            &self.kv_event_source,
-            &self.kv_event_replay_source,
-            self.kv_event_block_size,
-            self.kv_event_model.as_deref(),
-        )?;
+        let sources = config::KvSourceOptions {
+            layout: self.kv_hybrid_layout.as_deref(),
+            publishers: &self.kv_event_source,
+            pd_publishers: &self.pd_kv_events,
+            replay: &self.kv_event_replay_source,
+            topics: &self.kv_event_topic,
+            block_size: self.kv_event_block_size,
+            model: self.kv_event_model.as_deref(),
+        }
+        .load(&mode)?;
         if let ConfigPolicyConfig::KvAware {
             static_kv_event_sources,
             ..
         } = &mut policy
         {
-            **static_kv_event_sources = static_sources;
-        } else if !static_sources.is_empty() {
+            **static_kv_event_sources = sources.regular;
+        } else if !sources.regular.is_empty() {
             return Err(config::ConfigError::IncompatibleConfig {
                 reason: "--kv-event-source requires the kv_aware policy".to_string(),
             });
@@ -228,7 +237,9 @@ impl Router {
         Ok(config::RouterConfig {
             epd: None,
             mode,
-            pd_kv_event_sources: config::parse_pd_kv_events(&self.pd_kv_events)?,
+            pd_kv_event_sources: sources.pd,
+            pd_worker_pairs: config::parse_pd_worker_pairs(&self.pd_pair)?,
+            kv_event_strict_recovery: self.kv_event_strict_recovery,
             policy,
             host: self.host.clone(),
             port: self.port,
@@ -382,6 +393,10 @@ impl Router {
         kv_event_replay_source = vec![],
         kv_event_block_size = 16,
         kv_event_model = None,
+        kv_event_strict_recovery = false,
+        kv_hybrid_layout = None,
+        kv_event_topic = vec![],
+        pd_pair = vec![]
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -459,6 +474,10 @@ impl Router {
         kv_event_replay_source: Vec<String>,
         kv_event_block_size: u32,
         kv_event_model: Option<String>,
+        kv_event_strict_recovery: bool,
+        kv_hybrid_layout: Option<std::path::PathBuf>,
+        kv_event_topic: Vec<String>,
+        pd_pair: Vec<String>,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -490,6 +509,10 @@ impl Router {
             kv_event_replay_source,
             kv_event_block_size,
             kv_event_model,
+            kv_event_strict_recovery,
+            kv_hybrid_layout,
+            kv_event_topic,
+            pd_pair,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
             cache_threshold,

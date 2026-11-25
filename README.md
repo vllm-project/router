@@ -237,6 +237,7 @@ The router supports multiple load balancing policies:
 | `sticky_least_loaded` | Assigns new sessions to the worker with the fewest active sessions | Yes | Multi-turn workloads with explicit session lifetimes |
 | `power_of_two` | Picks least loaded of two random workers | No | Load-sensitive workloads |
 | `cache_aware` | Optimizes for prefix cache hits | Yes | Repeated prompts, few-shot |
+| [`kv_aware`](docs/load_balancing/kv_aware.md) | Scores observed KV reuse and worker load | Optional | Full and hybrid attention in colocated and P/D deployments |
 
 ```bash
 # Example: Using consistent_hash with HTTP header for session affinity
@@ -253,6 +254,8 @@ For detailed configuration options, hash key priorities, and usage examples, see
 Use `--policy sticky_least_loaded` to keep each multi-turn session on its assigned worker. Send the same `X-Session-ID` on every turn, then release the reservation after the last request completes. See [Sticky least loaded](docs/load_balancing/README.md#sticky-least-loaded) for the release endpoint, supported session IDs, and idle timeout.
 
 For the optional agent metadata contract, scheduling enablement, request-scoped hints, and engine KV-control boundary, see [Program Scheduling](docs/program_scheduling/program-scheduling.md).
+
+For agent and harness integration with workflow-conditioned return-time TTL, see [Agent integration for workflow TTL prediction](docs/program_scheduling/agent-integration.md).
 
 For Program-scoped PD scheduling (D-rank affinity, admission, bounded prefill permits) and warm remote KV reuse with automatic TTL, see [PD Program Scheduling](docs/program_scheduling/pd-program-scheduling.md).
 

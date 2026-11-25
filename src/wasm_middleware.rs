@@ -781,6 +781,7 @@ pub fn ensure_example_component_artifact() -> Option<PathBuf> {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use axum::{body::Body, routing::post, Json, Router};

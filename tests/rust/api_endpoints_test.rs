@@ -34,6 +34,8 @@ impl TestContext {
                 worker_urls: vec![],
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3002,
@@ -525,10 +527,12 @@ mod generation_tests {
             .is_some());
 
         let diagnostics = ctx.router.scheduling_diagnostics().unwrap();
+        // The legacy key stays for compatibility; the new key is authoritative.
         assert_eq!(
             diagnostics["ranks"][0]["programs"][0]["estimated_context_tokens"],
             10
         );
+        assert_eq!(diagnostics["ranks"][0]["programs"][0]["context_tokens"], 10);
         assert_eq!(diagnostics["ranks"][0]["programs"][0]["state"], "paused");
         ctx.shutdown().await;
     }
@@ -1777,6 +1781,8 @@ mod error_tests {
                 worker_urls: vec![],
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3010,
@@ -2143,6 +2149,8 @@ mod pd_mode_tests {
                 discovery_address: None,
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3011,
@@ -2312,6 +2320,8 @@ mod request_id_tests {
                 worker_urls: vec![],
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3002,

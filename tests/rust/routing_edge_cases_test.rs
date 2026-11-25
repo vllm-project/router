@@ -12,7 +12,7 @@ use common::bench_corpus::{completion_text, seeded_text, Corpus, CorpusKind, LON
 use common::bench_mock::BenchMockWorker;
 use common::routing_edge::{
     ascii_fork, branch, cache_aware_cases, rendezvous_pair, session_headers, workers,
-    CacheAwareFixture, BASE_LOADS, FIRST_HEALTHY, MIN_LOAD, TENANT, WORKERS, WORKER_COUNTS,
+    CacheAwareFixture, BASE_LOADS, MIN_LOAD, TENANT, WORKERS, WORKER_COUNTS,
 };
 use tower::ServiceExt;
 use vllm_router_rs::config::{RouterConfig, RoutingMode};
@@ -58,24 +58,27 @@ fn cache_aware_cases_take_the_intended_branch() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
-/// An unhealthy tenant falls back to W0 and is removed from the tree.
-/// After it recovers, the old key must miss (W3), not hit W1 or fall back again.
+/// An unhealthy tenant falls back to the least-loaded worker (W3) and is
+/// removed from the tree. After it recovers, the old key must miss.
 #[test]
 fn stale_tenant_falls_back_and_is_forgotten() {
     let (warm, _) = ascii_fork(SEED, 2048, 2048);
     let fixture = CacheAwareFixture::new(vec![(TENANT, warm.clone())], &BASE_LOADS, &[TENANT]);
     assert_eq!(
         fixture.select(&warm),
-        Some(FIRST_HEALTHY),
+        Some(MIN_LOAD),
         "W1 down: {}",
-        branch(FIRST_HEALTHY)
+        branch(MIN_LOAD)
     );
     fixture.set_healthy(TENANT, true);
+    // W2 becomes the only least-loaded worker, so a hit on W1 or on the
+    // fallback worker W3 selects a different worker than a miss does.
+    let miss = 2;
+    fixture.set_loads(&[1, 1, 0, 1]);
     assert_eq!(
         fixture.select(&warm),
-        Some(MIN_LOAD),
-        "W1 back: {}",
-        branch(MIN_LOAD)
+        Some(miss),
+        "W1 back: the old key must miss and select W2"
     );
 }
 

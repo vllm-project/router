@@ -7,8 +7,8 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
 @pytest.mark.integration
-def test_random_distribution(mock_workers, router_manager):
-    procs, urls, ids = mock_workers(n=4)
+def test_random_distribution(mock_worker_manager, router_manager):
+    procs, urls, ids = mock_worker_manager.start_workers(n=4)
     rh = router_manager.start_router(worker_urls=urls, policy="random")
 
     counts = collections.Counter()
