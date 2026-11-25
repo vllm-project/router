@@ -109,7 +109,9 @@ impl KvIndexSupervisor {
                     .unwrap_or_default(),
             });
         }
-        if started.elapsed() < CONTROL_TIMEOUT - ADMISSION_HASH_TIMEOUT
+        // Failed source probes return above. Leave room for the optional
+        // admission scrape inside the existing refresh timeout.
+        if started.elapsed() < CONTROL_TIMEOUT.saturating_sub(ADMISSION_HASH_TIMEOUT)
             && !lifecycle.keeps_descriptor(&lifecycle.state.lock(), &descriptor)
         {
             self.probe_admission_hashes(base, &mut worker).await;
@@ -480,6 +482,12 @@ pub(super) fn parse_vllm_version(version: &str) -> Option<(u32, u32)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
+pub(super) type WorkerMetadata = (
+    ServerInfo,
+    Option<HashSet<String>>,
+    Option<EngineCacheConfigs>,
+);
+
 /// Worker cache metadata, tried in the order a deployment is likely to answer it:
 /// the multi-backend control contract, the engine config endpoint, then the
 /// always-on `/metrics` scrape.
@@ -487,12 +495,6 @@ pub(super) fn parse_vllm_version(version: &str) -> Option<(u32, u32)> {
 /// Every source is optional; the error names what each one said, so an operator
 /// can tell a missing endpoint from an endpoint that answered without a block
 /// size.
-pub(super) type WorkerMetadata = (
-    ServerInfo,
-    Option<HashSet<String>>,
-    Option<EngineCacheConfigs>,
-);
-
 pub(super) async fn query_worker_metadata_and_models(
     client: &reqwest::Client,
     worker_url: &str,

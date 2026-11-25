@@ -64,6 +64,7 @@ pub(crate) fn parse_cache_config_info(text: &str) -> BTreeMap<u32, EngineCacheCo
         let engine = match labels.get("engine") {
             Some(value) => {
                 let Ok(rank) = value.parse::<u32>() else {
+                    tracing::debug!(engine = ?value, "ignoring cache config sample with invalid engine rank");
                     return;
                 };
                 rank
@@ -158,6 +159,7 @@ mod tests {
             let malformed = format!(
                 r#"vllm:cache_config_info{{block_size="32",engine="{engine}",prefix_caching_hash_algo="sha256"}} 1.0"#
             );
+            assert!(parse_cache_config_info(&malformed).is_empty());
             assert_eq!(
                 parse_cache_config_info(&format!("{METRICS}\n{malformed}")),
                 valid,

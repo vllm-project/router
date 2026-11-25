@@ -1904,10 +1904,11 @@ async fn registration_checks_hashes_per_rank_and_replaces_old_bindings() {
             }
         }),
     );
+    let sources = Arc::new(Mutex::new(serde_json::Value::Object(sources)));
     let (worker, server) = source_boundary_worker_with_routes(
         app,
         json!({"model_id": "test", "instance_id": "boot", "kv_block_size": 16}),
-        Arc::new(Mutex::new(serde_json::Value::Object(sources))),
+        sources.clone(),
     )
     .await;
     let (supervisor, _signals) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
@@ -1918,7 +1919,31 @@ async fn registration_checks_hashes_per_rank_and_replaces_old_bindings() {
     );
     assert_eq!(requests.load(Ordering::Relaxed), 1);
 
+    let mut discovered = supervisor.discover(&worker).await;
+    assert!(discovered.hybrid.is_some());
+    assert!(discovered.engine_cache_configs.is_none());
+    let grpc_worker = worker.replacen("http://", "grpc://", 1);
+    supervisor
+        .probe_admission_hashes(&grpc_worker, &mut discovered)
+        .await;
+    assert!(discovered.engine_cache_configs.is_none());
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+
     let old = supervisor.lifecycle_for_worker(&worker);
+    let valid_sources = std::mem::replace(&mut *sources.lock(), json!([]));
+    old.state.lock().trusted = false;
+    assert!(supervisor
+        .probe_registration(&worker, false, None, &old)
+        .await
+        .is_err());
+    assert_eq!(
+        requests.load(Ordering::Relaxed),
+        1,
+        "source discovery failed"
+    );
+    *sources.lock() = valid_sources;
+    old.state.lock().trusted = true;
+
     *metrics.lock() = (0..3).map(|rank| {
         format!("vllm:cache_config_info{{engine=\"{rank}\",prefix_caching_hash_algo=\"sha256\"}} 1.0\n")
     }).collect();
@@ -1935,6 +1960,36 @@ async fn registration_checks_hashes_per_rank_and_replaces_old_bindings() {
     assert!(!old.active.load(Ordering::Acquire));
     assert!(supervisor.match_provider_for_worker(&worker).is_none());
     assert_eq!(requests.load(Ordering::Relaxed), 2);
+    let workers: Vec<Arc<dyn crate::core::Worker>> = vec![Arc::new(
+        crate::core::DPAwareWorker::new(worker.clone(), 0, 3, crate::core::WorkerType::Regular),
+    )];
+    assert_eq!(
+        supervisor.cache_eligible_workers(&workers, "test"),
+        Some(vec![true])
+    );
+    assert_eq!(
+        supervisor.cache_eligible_workers(&workers, "other"),
+        Some(vec![false])
+    );
+
+    *metrics.lock() = METRICS_ONLY.to_owned();
+    let load_only = supervisor.lifecycle_for_worker(&worker);
+    let probe = supervisor
+        .probe_registration(&worker, false, None, &load_only)
+        .await
+        .unwrap();
+    assert!(load_only.keeps_descriptor(&load_only.state.lock(), &probe.descriptor));
+    assert_eq!(
+        requests.load(Ordering::Relaxed),
+        2,
+        "hash-only changes do not register the worker"
+    );
+    let registered = supervisor.on_worker_added(&worker).await.unwrap();
+    assert_eq!(
+        registered.ranks.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([0, 1, 2])
+    );
+    assert_eq!(requests.load(Ordering::Relaxed), 3);
     supervisor.shutdown();
     server.abort();
 }
@@ -1973,6 +2028,7 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
     let replay_endpoint = replay.get_last_endpoint().unwrap().unwrap();
     for with_replay in [false, true] {
         let model_requests = Arc::new(AtomicUsize::new(0));
+        let metrics_requests = Arc::new(AtomicUsize::new(0));
         let sources = serde_json::json!({"0": {
             "endpoint": endpoint,
             "replay_endpoint": with_replay.then_some(&replay_endpoint),
@@ -1989,9 +2045,16 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
             )
             .layer(axum::middleware::from_fn({
                 let model_requests = model_requests.clone();
+                let metrics_requests = metrics_requests.clone();
                 move |request: axum::extract::Request, next: axum::middleware::Next| {
-                    if request.uri().path() == "/v1/models" {
-                        model_requests.fetch_add(1, Ordering::Relaxed);
+                    match request.uri().path() {
+                        "/v1/models" => {
+                            model_requests.fetch_add(1, Ordering::Relaxed);
+                        }
+                        "/metrics" => {
+                            metrics_requests.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {}
                     }
                     next.run(request)
                 }
@@ -2024,6 +2087,11 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
         .await;
         assert_eq!(labels["served_model_aliases"], "mock-alias,mock-model");
         assert_eq!(model_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics_requests.load(Ordering::Relaxed),
+            1,
+            "reuse the metadata scrape"
+        );
         supervisor.shutdown();
         server.abort();
     }

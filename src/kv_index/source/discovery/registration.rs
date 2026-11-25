@@ -312,7 +312,10 @@ impl KvIndexSupervisor {
                 block_size: Some(block_size),
                 ..Default::default()
             };
-            self.publish_registration(worker_url, lifecycle, &info, discovery.base_models);
+            // Preserve model eligibility even though this registration has no cache key.
+            let mut base_models = discovery.base_models.unwrap_or_default();
+            base_models.insert(model_id);
+            self.publish_registration(worker_url, lifecycle, &info, Some(base_models));
             return Ok(info);
         }
         let indexer = self.installed.acquire_identity(&key);
