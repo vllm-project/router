@@ -8,7 +8,7 @@ use tracing::{debug, info, warn};
 
 use super::event_stream::{EventStream, StreamLease};
 use super::transport::{
-    live_sequence, retry_backoff, ConnectionMonitor, PendingLive, ReplayOverlap, ReplayPoll,
+    live_sequence, retry_backoff, ConnectionMonitor, PendingLive, ReplayFingerprints, ReplayPoll,
     IDLE_REPLAY_INTERVAL,
 };
 use crate::kv_index::types::SourceRecoveryReason as Reason;
@@ -21,8 +21,8 @@ const MAX_REPLAY_FAILURES: u32 = 3;
 const REPLAY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) enum ReplayError {
-    Retry(i64),
-    Invalid,
+    Incomplete { last_applied_seq: i64 },
+    ResetIndex,
 }
 
 pub use crate::kv_index::source::endpoints::EventSource;
@@ -149,11 +149,11 @@ impl Subscriber {
 
     /// A retained suffix can start after the requested cursor. Discard earlier
     /// claims only if the suffix supplies a valid clear for this worker rank.
-    fn try_replay_clear(&self, seq: u64, payload: &[u8]) -> Result<bool, ReplayError> {
-        let batch = crate::kv_index::decode_batch(payload).map_err(|_| ReplayError::Invalid)?;
+    fn apply_replay_clear_if_present(&self, seq: u64, payload: &[u8]) -> Result<bool, ReplayError> {
+        let batch = crate::kv_index::decode_batch(payload).map_err(|_| ReplayError::ResetIndex)?;
         // The publisher stamps the batch rank, and the bound index requires it.
         if batch.data_parallel_rank != Some(self.source.dp_rank) {
-            return Err(ReplayError::Invalid);
+            return Err(ReplayError::ResetIndex);
         }
         if !batch
             .events
@@ -162,10 +162,10 @@ impl Subscriber {
         {
             return Ok(false);
         }
-        let (stream, lease) = self.binding.as_ref().ok_or(ReplayError::Invalid)?;
+        let (stream, lease) = self.binding.as_ref().ok_or(ReplayError::ResetIndex)?;
         stream
-            .rebase_replay(*lease, seq, batch)
-            .map_err(|_| ReplayError::Invalid)?;
+            .reset_index_from_replay_clear(*lease, seq, batch)
+            .map_err(|_| ReplayError::ResetIndex)?;
         self.invalidated("engine cleared KV cache");
         Ok(true)
     }
@@ -192,14 +192,14 @@ impl Subscriber {
     async fn replay(
         &self,
         ctx: &zmq::Context,
-        mut last: i64,
-        required_through: Option<i64>,
-        observed_through: &mut Option<i64>,
-        baseline: &mut Option<i64>,
-        gap_batch: Option<&(u64, Vec<u8>)>,
-        replayed: &ReplayOverlap,
+        mut last_applied_seq: i64,
+        required_live_seq: Option<i64>,
+        highest_seen_replay_seq: &mut Option<i64>,
+        replay_clear_seq: &mut Option<i64>,
+        buffered_live_after_gap: Option<&(u64, Vec<u8>)>,
+        replay_fingerprints: &ReplayFingerprints,
         socket: &mut Option<zmq::Socket>,
-        reconcile: bool,
+        idle_reconcile: bool,
         shutdown: &broadcast::Receiver<()>,
     ) -> Result<i64, ReplayError> {
         let dealer = match socket.take() {
@@ -207,32 +207,40 @@ impl Subscriber {
             None => {
                 let socket = ctx
                     .socket(zmq::DEALER)
-                    .map_err(|_| ReplayError::Retry(last))?;
+                    .map_err(|_| ReplayError::Incomplete { last_applied_seq })?;
                 socket
                     .set_maxmsgsize(super::MAX_KV_EVENT_BYTES as i64)
-                    .map_err(|_| ReplayError::Retry(last))?;
-                socket.set_linger(0).map_err(|_| ReplayError::Retry(last))?;
+                    .map_err(|_| ReplayError::Incomplete { last_applied_seq })?;
+                socket
+                    .set_linger(0)
+                    .map_err(|_| ReplayError::Incomplete { last_applied_seq })?;
                 socket
                     .connect(
                         self.source
                             .replay_endpoint
                             .as_deref()
-                            .ok_or(ReplayError::Invalid)?,
+                            .ok_or(ReplayError::ResetIndex)?,
                     )
-                    .map_err(|_| ReplayError::Retry(last))?;
+                    .map_err(|_| ReplayError::Incomplete { last_applied_seq })?;
                 socket
             }
         };
-        let start = u64::try_from(last.checked_add(1).ok_or(ReplayError::Invalid)?)
-            .map_err(|_| ReplayError::Invalid)?;
+        let requested_start_seq = u64::try_from(
+            last_applied_seq
+                .checked_add(1)
+                .ok_or(ReplayError::ResetIndex)?,
+        )
+        .map_err(|_| ReplayError::ResetIndex)?;
         let topic = self.source.topic.clone();
-        if let Err(error) = dealer.send_multipart([&[][..], &start.to_be_bytes()], zmq::DONTWAIT) {
+        if let Err(error) =
+            dealer.send_multipart([&[][..], &requested_start_seq.to_be_bytes()], zmq::DONTWAIT)
+        {
             warn!(%topic, %error, "KV replay request failed");
-            return Err(ReplayError::Retry(last));
+            return Err(ReplayError::Incomplete { last_applied_seq });
         }
         let mut deadline = tokio::time::Instant::now() + self.replay_idle_timeout;
-        let mut next = start;
-        let mut awaiting_clear = false;
+        let mut next_expected_seq = requested_start_seq;
+        let mut waiting_for_replay_clear = false;
         while tokio::time::Instant::now() < deadline
             && shutdown.is_empty()
             && !shutdown.is_closed()
@@ -241,88 +249,88 @@ impl Subscriber {
             match dealer.recv_multipart(zmq::DONTWAIT) {
                 Ok(frames) => {
                     let (wire_seq, frame_topic, payload) =
-                        super::transport::replay_frame(&frames).ok_or(ReplayError::Invalid)?;
+                        super::transport::replay_frame(&frames).ok_or(ReplayError::ResetIndex)?;
                     if wire_seq == END_SEQ && frame_topic.is_empty() && payload.is_empty() {
-                        if awaiting_clear {
-                            return Err(ReplayError::Invalid);
+                        if waiting_for_replay_clear {
+                            return Err(ReplayError::ResetIndex);
                         }
                         // The first live batch after a gap can finish a contiguous
                         // replay when the publisher has not buffered that batch yet.
-                        if let Some((seq, payload)) = gap_batch.filter(|(seq, _)| {
-                            *seq == next
-                                && required_through.is_some_and(|required| *seq as i64 == required)
+                        if let Some((seq, payload)) = buffered_live_after_gap.filter(|(seq, _)| {
+                            *seq == next_expected_seq
+                                && required_live_seq.is_some_and(|required| *seq as i64 == required)
                         }) {
                             self.apply(*seq, payload, false)
-                                .map_err(|_| ReplayError::Invalid)?;
-                            replayed
-                                .record(*seq, payload)
-                                .map_err(|_| ReplayError::Invalid)?;
-                            last = *seq as i64;
-                            next += 1;
+                                .map_err(|_| ReplayError::ResetIndex)?;
+                            replay_fingerprints
+                                .record_payload(*seq, payload)
+                                .map_err(|_| ReplayError::ResetIndex)?;
+                            last_applied_seq = *seq as i64;
+                            next_expected_seq += 1;
                         }
-                        if required_through
-                            .max(*observed_through)
-                            .is_some_and(|required| next as i64 <= required)
+                        if required_live_seq
+                            .max(*highest_seen_replay_seq)
+                            .is_some_and(|required| next_expected_seq as i64 <= required)
                         {
-                            return Err(ReplayError::Retry(last));
+                            return Err(ReplayError::Incomplete { last_applied_seq });
                         }
                         *socket = Some(dealer);
-                        return Ok(last);
+                        return Ok(last_applied_seq);
                     }
                     if !(0..i64::MAX).contains(&wire_seq) || frame_topic != topic.as_bytes() {
-                        return Err(ReplayError::Invalid);
+                        return Err(ReplayError::ResetIndex);
                     }
                     // A rejected reply can still reveal a sequence the next replay must cover.
-                    *observed_through = (*observed_through).max(Some(wire_seq));
+                    *highest_seen_replay_seq = (*highest_seen_replay_seq).max(Some(wire_seq));
                     let seq = wire_seq as u64;
-                    if seq != next {
-                        if next != start || seq < start {
-                            warn!(%topic, seq, expected = next, "KV replay sequence gap");
-                            return Err(ReplayError::Invalid);
+                    if seq != next_expected_seq {
+                        if next_expected_seq != requested_start_seq || seq < requested_start_seq {
+                            warn!(%topic, seq, expected = next_expected_seq, "KV replay sequence gap");
+                            return Err(ReplayError::ResetIndex);
                         }
-                        awaiting_clear = true;
+                        waiting_for_replay_clear = true;
                     }
-                    if gap_batch.is_some_and(|(live_seq, live_payload)| {
+                    if buffered_live_after_gap.is_some_and(|(live_seq, live_payload)| {
                         *live_seq == seq && live_payload.as_slice() != payload
                     }) {
                         warn!(%topic, seq, "KV replay conflicts with the buffered live batch");
-                        return Err(ReplayError::Invalid);
+                        return Err(ReplayError::ResetIndex);
                     }
-                    if reconcile && next == start {
+                    if idle_reconcile && next_expected_seq == requested_start_seq {
                         self.suspend(Reason::IdleCatchup)
-                            .map_err(|_| ReplayError::Invalid)?;
+                            .map_err(|_| ReplayError::ResetIndex)?;
                         self.invalidated("idle replay found unapplied events");
                     }
-                    replayed
-                        .record(seq, payload)
-                        .map_err(|_| ReplayError::Invalid)?;
-                    if awaiting_clear {
-                        if self.try_replay_clear(seq, payload)? {
-                            *baseline = Some(wire_seq);
-                            awaiting_clear = false;
+                    replay_fingerprints
+                        .record_payload(seq, payload)
+                        .map_err(|_| ReplayError::ResetIndex)?;
+                    if waiting_for_replay_clear {
+                        if self.apply_replay_clear_if_present(seq, payload)? {
+                            *replay_clear_seq = Some(wire_seq);
+                            waiting_for_replay_clear = false;
                         }
                     } else {
                         self.apply(seq, payload, false)
-                            .map_err(|_| ReplayError::Invalid)?;
+                            .map_err(|_| ReplayError::ResetIndex)?;
                     }
-                    if !awaiting_clear {
-                        last = wire_seq;
+                    if !waiting_for_replay_clear {
+                        last_applied_seq = wire_seq;
                     }
-                    next = seq + 1;
+                    next_expected_seq = seq + 1;
                     deadline = tokio::time::Instant::now() + self.replay_idle_timeout;
                     tokio::task::yield_now().await;
                 }
                 Err(zmq::Error::EAGAIN) => tokio::time::sleep(Duration::from_millis(1)).await,
                 Err(error) => {
                     warn!(%topic, %error, "KV replay receive failed");
-                    return Err(ReplayError::Retry(last));
+                    return Err(ReplayError::Incomplete { last_applied_seq });
                 }
             }
         }
         if tokio::time::Instant::now() >= deadline {
             warn!(%topic, "KV replay made no progress before the idle timeout");
         }
-        Err(ReplayError::Retry(last))
+        Err(ReplayError::Incomplete { last_applied_seq })
     }
 }
 
@@ -379,7 +387,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
             // Catch up by replay until a live frame confirms the SUB handoff.
             let mut bootstrap = can_replay;
             let mut allow_overlap = bootstrap;
-            let mut replayed = ReplayOverlap::default();
+            let mut replay_fingerprints = ReplayFingerprints::default();
             let mut replay_socket = None;
             let mut pending_live = PendingLive::default();
             let mut next_catchup = tokio::time::Instant::now();
@@ -387,10 +395,10 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
             let mut idle_reconcile = false;
             let mut disconnected = false;
             let mut reconnect = false;
-            let mut recovery_through = None;
-            let mut observed_through = None;
-            let mut replay_baseline = None;
-            let mut gap_batch = None;
+            let mut required_live_seq = None;
+            let mut highest_seen_replay_seq = None;
+            let mut replay_clear_seq = None;
+            let mut buffered_live_after_gap = None;
             let mut replay_failures = 0;
             let mut monitor_error = None;
 
@@ -427,16 +435,16 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         }
                     }
                     disconnected = true;
-                    recovery_through = None;
-                    observed_through = None;
-                    replay_baseline = None;
-                    gap_batch = None;
+                    required_live_seq = None;
+                    highest_seen_replay_seq = None;
+                    replay_clear_seq = None;
+                    buffered_live_after_gap = None;
                     replay_failures = 0;
                     last_seq = -1;
                     bootstrap = false;
                     idle_reconcile = false;
                     allow_overlap = false;
-                    replayed = ReplayOverlap::default();
+                    replay_fingerprints = ReplayFingerprints::default();
                     replay_socket = None;
                     pending_live = PendingLive::default();
                 }
@@ -482,11 +490,11 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         let replay = subscriber.replay(
                             &ctx,
                             last_seq,
-                            recovery_through,
-                            &mut observed_through,
-                            &mut replay_baseline,
-                            gap_batch.as_ref(),
-                            &replayed,
+                            required_live_seq,
+                            &mut highest_seen_replay_seq,
+                            &mut replay_clear_seq,
+                            buffered_live_after_gap.as_ref(),
+                            &replay_fingerprints,
                             &mut replay_socket,
                             idle_reconcile,
                             &shutdown_rx,
@@ -498,7 +506,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             &mut sub,
                             &mut pending_live,
                             topic.as_bytes(),
-                            &replayed,
+                            &replay_fingerprints,
                         )
                         .await
                         {
@@ -525,33 +533,33 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         continue;
                     }
                     let result = match result {
-                        ReplayPoll::Finished(Ok(high))
-                            if !pending_live.verifies_overlap(
+                        ReplayPoll::Finished(Ok(last_applied_seq))
+                            if !pending_live.validate_replay_handoff(
                                 topic.as_bytes(),
-                                replay_baseline,
-                                high,
-                                &replayed,
+                                replay_clear_seq,
+                                last_applied_seq,
+                                &replay_fingerprints,
                             ) =>
                         {
-                            warn!(%topic, high, "KV replay could not verify buffered live overlap");
+                            warn!(%topic, high = last_applied_seq, "KV replay could not verify buffered live overlap");
                             replay_socket = None;
-                            ReplayPoll::Finished(Err(ReplayError::Invalid))
+                            ReplayPoll::Finished(Err(ReplayError::ResetIndex))
                         }
                         result => result,
                     };
-                    if let ReplayPoll::Finished(Ok(high)) = result {
+                    if let ReplayPoll::Finished(Ok(last_applied_seq)) = result {
                         RouterMetrics::record_kv_replay_outcome("applied");
                         replay_failures = 0;
-                        let advanced = high != last_seq;
-                        last_seq = high;
-                        recovery_through = None;
-                        observed_through = None;
-                        let reason = if replay_baseline.take().is_some() {
+                        let advanced = last_applied_seq != last_seq;
+                        last_seq = last_applied_seq;
+                        required_live_seq = None;
+                        highest_seen_replay_seq = None;
+                        let reason = if replay_clear_seq.take().is_some() {
                             Reason::ClearBarrier
                         } else {
                             Reason::ReplayApplied
                         };
-                        gap_batch = None;
+                        buffered_live_after_gap = None;
                         if suspended || (idle_reconcile && advanced) {
                             if subscriber.resume(last_seq, reason).is_err() {
                                 break;
@@ -574,8 +582,9 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         let overflow = matches!(result, ReplayPoll::BufferFull);
                         if overflow {
                             // The replay must cover any discarded live data.
-                            recovery_through = recovery_through
-                                .max(pending_live.discard(topic.as_bytes(), &replayed));
+                            required_live_seq = required_live_seq.max(
+                                pending_live.discard_all(topic.as_bytes(), &replay_fingerprints),
+                            );
                         } else {
                             replay_failures += 1;
                         }
@@ -588,14 +597,17 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             (Reason::ReplayFailed, "failed")
                         };
                         RouterMetrics::record_kv_replay_outcome(outcome);
-                        if let ReplayPoll::Finished(Err(ReplayError::Retry(applied))) = result {
+                        if let ReplayPoll::Finished(Err(ReplayError::Incomplete {
+                            last_applied_seq,
+                        })) = result
+                        {
                             if !exhausted {
                                 // Leave the verified prefix hidden and retry only unapplied
-                                // batches. The gap watermark and its buffered frame still apply.
+                                // batches. Keep the live sequence requirement and its buffered frame.
                                 if subscriber.suspend(reason).is_err() {
                                     break;
                                 }
-                                last_seq = applied;
+                                last_seq = last_applied_seq;
                                 suspended = true;
                                 next_catchup =
                                     tokio::time::Instant::now() + Duration::from_millis(500);
@@ -606,15 +618,15 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             break;
                         }
                         last_seq = -1;
-                        replay_baseline = None;
+                        replay_clear_seq = None;
                         suspended = true;
                         if overflow || exhausted {
-                            replayed = ReplayOverlap::default();
+                            replay_fingerprints = ReplayFingerprints::default();
                         } else {
-                            replayed.clear();
+                            replay_fingerprints.clear_fingerprints();
                         }
                         if !overflow {
-                            gap_batch = None;
+                            buffered_live_after_gap = None;
                         }
                         if had_credit {
                             subscriber.invalidated("replay lost continuity");
@@ -635,8 +647,8 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             }
                             bootstrap = false;
                             allow_overlap = false;
-                            recovery_through = None;
-                            observed_through = None;
+                            required_live_seq = None;
+                            highest_seen_replay_seq = None;
                             pending_live = PendingLive::default();
                             continue;
                         }
@@ -652,24 +664,28 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     continue;
                 }
                 let (through, overlap, restart_from) = 'live_batch: {
-                    let overlap_through = allow_overlap.then_some(last_seq);
+                    let duplicate_check_through = allow_overlap.then_some(last_seq);
                     let received = pending_live
-                        .pop(topic.as_bytes(), overlap_through, &replayed)
+                        .pop(
+                            topic.as_bytes(),
+                            duplicate_check_through,
+                            &replay_fingerprints,
+                        )
                         .map_or_else(
                             || {
                                 sub.socket().recv_multipart(zmq::DONTWAIT).map(|frames| {
-                                    let matched = replayed.matches_live(
+                                    let is_duplicate = replay_fingerprints.is_replayed_duplicate(
                                         &frames,
                                         topic.as_bytes(),
-                                        overlap_through,
+                                        duplicate_check_through,
                                     );
-                                    (frames, matched)
+                                    (frames, is_duplicate)
                                 })
                             },
                             Ok,
                         );
                     match received {
-                        Ok((mut frames, matches_replay)) => {
+                        Ok((mut frames, is_replayed_duplicate)) => {
                             let seq = match live_sequence(&frames, topic.as_bytes()) {
                                 Ok(Some(seq)) if (0..i64::MAX).contains(&seq) => seq,
                                 Ok(None) => {
@@ -703,7 +719,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                 tokio::task::yield_now().await;
                                 continue 'live;
                             }
-                            if matches_replay {
+                            if is_replayed_duplicate {
                                 bootstrap = false;
                                 replay_socket = None;
                                 continue 'live;
@@ -764,7 +780,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                 );
                                 suspended = true;
                                 if can_replay {
-                                    gap_batch = Some((
+                                    buffered_live_after_gap = Some((
                                         seq as u64,
                                         frames.pop().expect("validated live payload"),
                                     ));
@@ -793,7 +809,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             bootstrap = false;
                             replay_socket = None;
                             allow_overlap = false;
-                            replayed.clear();
+                            replay_fingerprints.clear_fingerprints();
                             debug!(source = %source_id, rank = dp_rank, seq, "kv_index live sequence advanced");
                             // A sustained publisher starves EAGAIN; yield so this task
                             // can't monopolize the runtime worker.
@@ -833,12 +849,12 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     continue;
                 }
                 last_seq = restart_from;
-                recovery_through = through;
-                observed_through = None;
+                required_live_seq = through;
+                highest_seen_replay_seq = None;
                 bootstrap = true;
                 next_catchup = tokio::time::Instant::now();
                 allow_overlap = overlap;
-                replayed.clear();
+                replay_fingerprints.clear_fingerprints();
                 replay_socket = None;
             }
             if is_shutdown(&mut shutdown_rx) || !subscriber.active() {

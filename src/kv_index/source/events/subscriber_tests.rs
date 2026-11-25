@@ -421,7 +421,7 @@ async fn delayed_replay_applies_gap_batch_and_drains_the_live_queue() {
 }
 
 #[tokio::test]
-async fn replay_retry_keeps_the_verified_gap_cursor() {
+async fn replay_retries_from_the_first_unapplied_sequence() {
     for timed_out in [false, true] {
         let tcp = TcpReplay::new();
         let index = Arc::new(full_binding(target("retained-gap"), BLOCK_SIZE));
@@ -457,7 +457,7 @@ async fn replay_retry_keeps_the_verified_gap_cursor() {
 }
 
 #[tokio::test]
-async fn observed_replay_watermark_does_not_block_the_buffered_gap_batch() {
+async fn buffered_live_batch_can_fill_a_gap_before_a_higher_replay_sequence() {
     let tcp = TcpReplay::new();
     let index = Arc::new(full_binding(target("observed-watermark"), BLOCK_SIZE));
     let _handle = tcp.start_with_idle_timeout(index.clone(), None, true, Duration::from_secs(1));
@@ -551,7 +551,7 @@ async fn retained_clear_does_not_hide_a_buffered_payload_conflict() {
 }
 
 #[tokio::test]
-async fn replay_clear_does_not_hide_a_gap_in_the_new_baseline() {
+async fn replay_after_clear_must_fill_later_gaps_before_publishing() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let metrics = recorder.handle();
     let _recorder = metrics::set_default_local_recorder(&recorder);

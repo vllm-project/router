@@ -21,11 +21,9 @@ use crate::metrics::RouterMetrics;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamLease(pub(crate) u64);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StreamApplyMode {
-    Continue,
-    RebaseLive,
-    RebaseOnReplayClear,
+enum ResetIndexFrom {
+    LiveBatch,
+    ReplayClear,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,22 +126,17 @@ impl EventStream {
         seq: u64,
         payload: &[u8],
     ) -> Result<bool, StreamError> {
-        self.apply_batch_at(
-            lease,
-            seq,
-            crate::kv_index::decode_batch(payload),
-            StreamApplyMode::Continue,
-        )
+        self.apply_batch_at(lease, seq, crate::kv_index::decode_batch(payload), None)
     }
 
-    /// Rebase a hidden replay on a validated clear from the same source and lease.
-    pub(super) fn rebase_replay(
+    /// Reset the hidden index using a replayed clear from the same source and lease.
+    pub(super) fn reset_index_from_replay_clear(
         &self,
         lease: StreamLease,
         seq: u64,
         batch: KVEventBatch,
     ) -> Result<bool, StreamError> {
-        self.apply_batch_at(lease, seq, Ok(batch), StreamApplyMode::RebaseOnReplayClear)
+        self.apply_batch_at(lease, seq, Ok(batch), Some(ResetIndexFrom::ReplayClear))
     }
 
     /// Start from a fresh SUB connection after the replay budget is exhausted.
@@ -158,7 +151,7 @@ impl EventStream {
             lease,
             seq,
             crate::kv_index::decode_batch(payload),
-            StreamApplyMode::RebaseLive,
+            Some(ResetIndexFrom::LiveBatch),
         )
     }
 
@@ -167,8 +160,9 @@ impl EventStream {
         lease: StreamLease,
         seq: u64,
         batch: Result<KVEventBatch, String>,
-        mode: StreamApplyMode,
+        reset_index_from: Option<ResetIndexFrom>,
     ) -> Result<bool, StreamError> {
+        let reset_from_live = matches!(reset_index_from, Some(ResetIndexFrom::LiveBatch));
         let prepared = batch
             .as_ref()
             .ok()
@@ -186,14 +180,15 @@ impl EventStream {
                     .iter()
                     .any(|event| matches!(event, KVEvent::AllBlocksCleared(_)))
             });
-            if mode != StreamApplyMode::Continue {
+            if let Some(reset_index_from) = reset_index_from {
                 if batch.is_err() {
                     return Err(StreamError::Index(SourceError::InvalidBatch));
                 }
-                if (mode == StreamApplyMode::RebaseOnReplayClear
-                    && (state.phase != Phase::Replaying || !cleared))
-                    || (mode == StreamApplyMode::RebaseLive && self.strict_recovery && !cleared)
-                {
+                let can_reset = match reset_index_from {
+                    ResetIndexFrom::LiveBatch => !self.strict_recovery || cleared,
+                    ResetIndexFrom::ReplayClear => state.phase == Phase::Replaying && cleared,
+                };
+                if !can_reset {
                     return Err(StreamError::InvalidState);
                 }
                 self.index.reset_stream(state, tx, Some(seq), false);
@@ -241,7 +236,7 @@ impl EventStream {
                 state.phase = Phase::Replaying;
                 return Err(StreamError::Index(error));
             }
-            if mode == StreamApplyMode::RebaseLive {
+            if reset_from_live {
                 self.index
                     .publish_stream(state, tx, seq + 1)
                     .map_err(StreamError::Index)?;
@@ -257,7 +252,7 @@ impl EventStream {
             if state.visible() {
                 if cleared {
                     self.record_recovery(Reason::ClearBarrier);
-                } else if mode == StreamApplyMode::RebaseLive {
+                } else if reset_from_live {
                     self.record_recovery(Reason::FreshObservation);
                 } else if seq == 0 {
                     self.record_recovery(Reason::InitialSequence);
