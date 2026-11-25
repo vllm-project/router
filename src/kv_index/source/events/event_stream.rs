@@ -36,7 +36,7 @@ pub struct EventStream {
     strict_recovery: bool,
 }
 
-fn batch_contains_clear(batch: &KVEventBatch) -> bool {
+pub(super) fn batch_contains_clear(batch: &KVEventBatch) -> bool {
     batch
         .events
         .iter()
@@ -120,19 +120,20 @@ impl EventStream {
         seq: u64,
         payload: &[u8],
     ) -> Result<(), StreamError> {
-        self.apply_next_batch(lease, seq, payload).map(|_| ())
+        let batch = crate::kv_index::decode_batch(payload).ok();
+        self.apply_next_batch(lease, seq, batch.as_ref())
+            .map(|_| ())
     }
 
     pub(super) fn apply_next_batch(
         &self,
         lease: StreamLease,
         seq: u64,
-        payload: &[u8],
+        batch: Option<&KVEventBatch>,
     ) -> Result<bool, StreamError> {
-        let batch = crate::kv_index::decode_batch(payload).ok();
-        self.with_prepared_batch(lease, batch.as_ref(), |state, tx, prepared| {
-            self.apply_prepared_batch(state, tx, seq, batch.as_ref(), prepared)?;
-            let cleared = batch.as_ref().is_some_and(batch_contains_clear);
+        self.with_prepared_batch(lease, batch, |state, tx, prepared| {
+            self.apply_prepared_batch(state, tx, seq, batch, prepared)?;
+            let cleared = batch.is_some_and(batch_contains_clear);
             if state.visible() {
                 if cleared {
                     self.record_recovery(Reason::ClearBarrier);
@@ -148,14 +149,14 @@ impl EventStream {
         &self,
         lease: StreamLease,
         seq: u64,
-        batch: KVEventBatch,
+        batch: &KVEventBatch,
     ) -> Result<(), StreamError> {
-        self.with_prepared_batch(lease, Some(&batch), |state, tx, prepared| {
-            if state.phase != Phase::Replaying || !batch_contains_clear(&batch) {
+        self.with_prepared_batch(lease, Some(batch), |state, tx, prepared| {
+            if state.phase != Phase::Replaying || !batch_contains_clear(batch) {
                 return Err(StreamError::InvalidState);
             }
             self.index.reset_stream(state, tx, Some(seq), false);
-            self.apply_prepared_batch(state, tx, seq, Some(&batch), prepared)
+            self.apply_prepared_batch(state, tx, seq, Some(batch), prepared)
         })
     }
 
@@ -165,13 +166,9 @@ impl EventStream {
         &self,
         lease: StreamLease,
         seq: u64,
-        payload: &[u8],
+        batch: &KVEventBatch,
     ) -> Result<bool, StreamError> {
-        let batch = crate::kv_index::decode_batch(payload).ok();
-        self.with_prepared_batch(lease, batch.as_ref(), |state, tx, prepared| {
-            let batch = batch
-                .as_ref()
-                .ok_or(StreamError::Index(SourceError::InvalidBatch))?;
+        self.with_prepared_batch(lease, Some(batch), |state, tx, prepared| {
             let cleared = batch_contains_clear(batch);
             if self.strict_recovery && !cleared {
                 return Err(StreamError::InvalidState);
@@ -573,8 +570,15 @@ mod tests {
         let evicted = gpu_remove(Some(0), vec![suffix.block_hashes[1].clone()]);
         root.block_hashes.truncate(1);
         root.token_ids.truncate(16);
-        let root_payload = event_payload(1.0, &[KVEvent::BlockStored(root)], Some(0));
-        stream.apply_next_batch(lease, 0, &root_payload).unwrap();
+        let root_batch = crate::kv_index::decode_batch(&event_payload(
+            1.0,
+            &[KVEvent::BlockStored(root)],
+            Some(0),
+        ))
+        .unwrap();
+        stream
+            .apply_next_batch(lease, 0, Some(&root_batch))
+            .unwrap();
         stream.finish_replay(lease, 1).unwrap();
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 16);
         stream
@@ -585,15 +589,22 @@ mod tests {
             .reset_and_try_publish_from_live_batch(
                 lease,
                 20,
-                &event_payload(1.0, &[KVEvent::BlockStored(suffix)], Some(0)),
+                &crate::kv_index::decode_batch(&event_payload(
+                    1.0,
+                    &[KVEvent::BlockStored(suffix)],
+                    Some(0),
+                ))
+                .unwrap(),
             )
             .unwrap();
         assert_eq!(index.control.generation(), 0);
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 0);
         stream
-            .apply_next_batch(lease, 21, &event_payload(1.0, &[evicted], Some(0)))
+            .apply_payload(lease, 21, &event_payload(1.0, &[evicted], Some(0)))
             .unwrap();
-        stream.apply_next_batch(lease, 22, &root_payload).unwrap();
+        stream
+            .apply_next_batch(lease, 22, Some(&root_batch))
+            .unwrap();
         assert_ne!(index.control.generation(), 0);
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 32);
     }

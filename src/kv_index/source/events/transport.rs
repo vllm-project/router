@@ -1,12 +1,7 @@
 //! Shared event transport, frame parsing and connection readiness.
 
-use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::io;
 use std::time::Duration;
-
-use super::subscriber::ReplayError;
-use parking_lot::Mutex;
-use sha2::{Digest, Sha256};
 
 pub(super) const IDLE_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -128,31 +123,29 @@ mod tests {
                 .unwrap();
         }
         let mut receiver = ReadableSocket::new(receiver);
-        let mut pending = PendingLive::default();
-        let overlap = ReplayFingerprints::default();
+        let mut received = Vec::new();
         let replay = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            Ok(0)
+            0
         };
         let result = while_connected(
             &mut monitor,
             replay,
             false,
             &mut receiver,
-            &mut pending,
             b"topic",
-            &overlap,
+            |frames| {
+                received.push(frames);
+                false
+            },
         )
         .await
         .unwrap();
-        assert!(matches!(result, ReplayPoll::Finished(Ok(0))));
-        for seq in 0_i64..1025 {
-            assert_eq!(
-                live_sequence(&pending.pop(b"topic", None, &overlap).unwrap().0, b"topic"),
-                Ok(Some(seq))
-            );
+        assert!(matches!(result, ReplayPoll::Finished(0)));
+        assert_eq!(received.len(), 1025);
+        for (seq, frames) in (0_i64..).zip(received) {
+            assert_eq!(live_sequence(&frames, b"topic"), Ok(Some(seq)));
         }
-        assert!(pending.pop(b"topic", None, &overlap).is_none());
     }
 
     #[tokio::test]
@@ -181,31 +174,6 @@ mod tests {
                 .unwrap();
             assert_eq!(receiver.socket().recv_bytes(zmq::DONTWAIT).unwrap(), [n]);
         }
-    }
-
-    #[test]
-    fn replay_fingerprint_stays_until_last_queued_copy_leaves() {
-        let mut overlap = ReplayFingerprints::default();
-        overlap.track_queued_live_frame(0);
-        overlap.track_queued_live_frame(0);
-        overlap.record_payload(0, b"old replay").unwrap();
-
-        // A replay reset clears fingerprints while leaving both frames queued.
-        overlap.clear_fingerprints();
-        assert!(!overlap.matches_payload(0, b"old replay"));
-        overlap.record_payload(0, b"new replay").unwrap();
-        overlap.entries.lock().recent_by_seq.remove(&0);
-
-        overlap.release_queued_live_frame(0);
-        assert!(overlap.matches_payload(0, b"new replay"));
-        overlap.release_queued_live_frame(0);
-        assert!(!overlap.matches_payload(0, b"new replay"));
-
-        overlap.track_queued_live_frame(1);
-        overlap.record_payload(1, b"replay").unwrap();
-        overlap.release_queued_live_frame(1);
-        assert!(overlap.matches_payload(1, b"replay"));
-        assert!(overlap.entries.lock().queued_live_by_seq.is_empty());
     }
 
     #[tokio::test]
@@ -444,115 +412,21 @@ impl ConnectionMonitor {
     }
 }
 
-#[derive(Default)]
-pub(super) struct PendingLive {
-    frames: VecDeque<Vec<Vec<u8>>>,
-    bytes: usize,
-}
-
-pub(super) const MAX_PENDING_LIVE_FRAMES: usize = 4096;
-
-impl PendingLive {
-    fn push(
-        &mut self,
-        frames: Vec<Vec<u8>>,
-        topic: &[u8],
-        replay_fingerprints: &ReplayFingerprints,
-    ) -> bool {
-        if let Some(seq) = valid_live_seq(&frames, topic) {
-            replay_fingerprints.track_queued_live_frame(seq as u64);
-        }
-        self.bytes += frames.iter().map(Vec::len).sum::<usize>();
-        self.frames.push_back(frames);
-        self.frames.len() >= MAX_PENDING_LIVE_FRAMES || self.bytes >= super::MAX_KV_EVENT_BYTES
-    }
-
-    pub(super) fn pop(
-        &mut self,
-        topic: &[u8],
-        duplicate_check_through: Option<i64>,
-        replay_fingerprints: &ReplayFingerprints,
-    ) -> Option<(Vec<Vec<u8>>, bool)> {
-        let frames = self.frames.pop_front()?;
-        let is_duplicate =
-            replay_fingerprints.is_replayed_duplicate(&frames, topic, duplicate_check_through);
-        if let Some(seq) = valid_live_seq(&frames, topic) {
-            replay_fingerprints.release_queued_live_frame(seq as u64);
-        }
-        self.bytes -= frames.iter().map(Vec::len).sum::<usize>();
-        Some((frames, is_duplicate))
-    }
-
-    pub(super) fn discard_all(
-        &mut self,
-        topic: &[u8],
-        replay_fingerprints: &ReplayFingerprints,
-    ) -> Option<i64> {
-        let mut highest_discarded_seq = None;
-        while let Some((frames, _)) = self.pop(topic, None, replay_fingerprints) {
-            highest_discarded_seq = highest_discarded_seq.max(valid_live_seq(&frames, topic));
-        }
-        highest_discarded_seq
-    }
-
-    /// Remove invalid frames immediately and superseded frames only after verification.
-    pub(super) fn validate_replay_handoff(
-        &mut self,
-        topic: &[u8],
-        replay_clear_seq: Option<i64>,
-        last_applied_seq: i64,
-        replay_fingerprints: &ReplayFingerprints,
-    ) -> bool {
-        let mut verified = true;
-        self.frames.retain(|frames| {
-            if let Some(seq) = valid_live_seq(frames, topic) {
-                let superseded = replay_clear_seq.is_some_and(|first| seq < first);
-                verified &= seq > last_applied_seq
-                    || replay_fingerprints
-                        .verify_queued_payload(seq as u64, &frames[2], superseded);
-                return true;
-            }
-            verified = false;
-            self.bytes -= frames.iter().map(Vec::len).sum::<usize>();
-            false
-        });
-        if let Some(first) = replay_clear_seq.filter(|_| verified) {
-            self.frames.retain(|frames| {
-                let Some(seq) = valid_live_seq(frames, topic).filter(|&seq| seq < first) else {
-                    return true;
-                };
-                replay_fingerprints.release_queued_live_frame(seq as u64);
-                self.bytes -= frames.iter().map(Vec::len).sum::<usize>();
-                false
-            });
-        }
-        verified
-    }
-}
-
-fn valid_live_seq(frames: &[Vec<u8>], topic: &[u8]) -> Option<i64> {
-    live_sequence(frames, topic)
-        .ok()
-        .flatten()
-        .filter(|seq| (0..i64::MAX).contains(seq))
-}
-
-pub(super) enum ReplayPoll {
-    Finished(Result<i64, ReplayError>),
+pub(super) enum ReplayPoll<T> {
+    Finished(T),
     Disconnected,
     BufferFull,
 }
 
 /// Watch the connection and drain the live socket while replay is in progress.
-pub(super) async fn while_connected(
+pub(super) async fn while_connected<T>(
     connection: &mut ConnectionMonitor,
-    replay: impl std::future::Future<Output = Result<i64, ReplayError>>,
+    replay: impl std::future::Future<Output = T>,
     watch: bool,
     sub: &mut ReadableSocket,
-    pending: &mut PendingLive,
     topic: &[u8],
-    replay_fingerprints: &ReplayFingerprints,
-) -> io::Result<ReplayPoll> {
+    mut queue_live: impl FnMut(Vec<Vec<u8>>) -> bool,
+) -> io::Result<ReplayPoll<T>> {
     tokio::pin!(replay);
     loop {
         tokio::select! {
@@ -574,7 +448,7 @@ pub(super) async fn while_connected(
                     if frames.first().is_some_and(|frame| frame.as_slice() != topic) {
                         continue;
                     }
-                    if pending.push(frames, topic, replay_fingerprints) {
+                    if queue_live(frames) {
                         return Ok(ReplayPoll::BufferFull);
                     }
                 }
@@ -646,142 +520,5 @@ mod frame_tests {
         frames[0].clear();
         frames[2].pop();
         assert_eq!(replay_frame(&frames), None);
-    }
-}
-
-/// Recent replay payload fingerprints and fingerprints kept for queued live frames.
-/// A queued sequence keeps its fingerprint until its last live copy leaves the queue.
-#[derive(Default)]
-pub(super) struct ReplayFingerprints {
-    entries: Mutex<ReplayFingerprintEntries>,
-}
-
-#[derive(Default)]
-struct ReplayFingerprintEntries {
-    recent_by_seq: HashMap<u64, [u8; 32]>,
-    queued_live_by_seq: HashMap<u64, QueuedLiveSequence>,
-}
-
-struct QueuedLiveSequence {
-    frame_count: usize,
-    replay_fingerprint: Option<[u8; 32]>,
-    had_replay_conflict: bool,
-}
-
-impl ReplayFingerprintEntries {
-    fn fingerprint(&self, seq: u64) -> Option<[u8; 32]> {
-        self.queued_live_by_seq
-            .get(&seq)
-            .and_then(|queued| queued.replay_fingerprint)
-            .or_else(|| self.recent_by_seq.get(&seq).copied())
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct ConflictingReplayFingerprint;
-
-impl ReplayFingerprints {
-    fn track_queued_live_frame(&self, seq: u64) {
-        let mut entries = self.entries.lock();
-        let fingerprint = entries.recent_by_seq.get(&seq).copied();
-        let queued = entries
-            .queued_live_by_seq
-            .entry(seq)
-            .or_insert(QueuedLiveSequence {
-                frame_count: 0,
-                replay_fingerprint: fingerprint,
-                had_replay_conflict: false,
-            });
-        queued.frame_count += 1;
-    }
-
-    fn release_queued_live_frame(&self, seq: u64) {
-        if let Entry::Occupied(mut entry) = self.entries.lock().queued_live_by_seq.entry(seq) {
-            let queued = entry.get_mut();
-            queued.frame_count -= 1;
-            if queued.frame_count == 0 {
-                entry.remove();
-            }
-        }
-    }
-
-    pub(super) fn record_payload(
-        &self,
-        seq: u64,
-        payload: &[u8],
-    ) -> Result<(), ConflictingReplayFingerprint> {
-        let fingerprint = Sha256::digest(payload).into();
-        let mut entries = self.entries.lock();
-        if entries
-            .fingerprint(seq)
-            .is_some_and(|known| known != fingerprint)
-        {
-            return Err(ConflictingReplayFingerprint);
-        }
-        if let Some(queued) = entries.queued_live_by_seq.get_mut(&seq) {
-            queued.replay_fingerprint = Some(fingerprint);
-        }
-        entries.recent_by_seq.insert(seq, fingerprint);
-        const RECENT_FINGERPRINT_LIMIT: usize = 4_096;
-        if entries.recent_by_seq.len() > RECENT_FINGERPRINT_LIMIT {
-            let floor = seq.saturating_sub((RECENT_FINGERPRINT_LIMIT / 2) as u64);
-            entries.recent_by_seq.retain(|known, _| *known >= floor);
-        }
-        Ok(())
-    }
-
-    pub(super) fn is_replayed_duplicate(
-        &self,
-        frames: &[Vec<u8>],
-        topic: &[u8],
-        duplicate_check_through: Option<i64>,
-    ) -> bool {
-        duplicate_check_through.is_some_and(|last_applied_seq| {
-            valid_live_seq(frames, topic).is_some_and(|seq| {
-                seq <= last_applied_seq && self.matches_payload(seq as u64, &frames[2])
-            })
-        })
-    }
-
-    fn matches_payload(&self, seq: u64, payload: &[u8]) -> bool {
-        self.compare_payload(seq, payload) == Some(true)
-    }
-
-    /// Return `None` when no fingerprint exists for this sequence.
-    fn compare_payload(&self, seq: u64, payload: &[u8]) -> Option<bool> {
-        let fingerprint = self.entries.lock().fingerprint(seq)?;
-        Some(fingerprint == <[u8; 32]>::from(Sha256::digest(payload)))
-    }
-
-    fn verify_queued_payload(&self, seq: u64, payload: &[u8], superseded_by_clear: bool) -> bool {
-        match self.compare_payload(seq, payload) {
-            Some(true) => true,
-            Some(false) => {
-                if let Some(queued) = self.entries.lock().queued_live_by_seq.get_mut(&seq) {
-                    queued.had_replay_conflict = true;
-                }
-                false
-            }
-            None => {
-                superseded_by_clear
-                    && !self
-                        .entries
-                        .lock()
-                        .queued_live_by_seq
-                        .get(&seq)
-                        .is_some_and(|queued| queued.had_replay_conflict)
-            }
-        }
-    }
-
-    pub(super) fn clear_fingerprints(&mut self) {
-        let entries = self.entries.get_mut();
-        if !entries.recent_by_seq.is_empty() {
-            entries.recent_by_seq = HashMap::new();
-            // Keep live frame counts and known conflicts for the next replay.
-            for queued in entries.queued_live_by_seq.values_mut() {
-                queued.replay_fingerprint = None;
-            }
-        }
     }
 }
