@@ -13,7 +13,6 @@ ECR_REGION="us-west-2"
 DOCKER_TAG="vllm/vllm-openai"
 
 # SSH Configuration (REQUIRED - must be set via environment variables)
-SSH_KEY_FILE="${SSH_KEY_FILE}"
 SSH_USER="${SSH_USER:-congc}"
 # Function to get or generate ECR tag
 get_ecr_tag() {
@@ -34,13 +33,10 @@ save_ecr_tag() {
 ECR_TAG=${ECR_TAG:-$(get_ecr_tag)}
 
 # vLLM Configuration (REQUIRED - must be set via environment variables)
-HF_TOKEN="${HF_TOKEN}"
 GPU_ID="${GPU_ID:-0,1,2,3,4,5,6,7}"
 MODEL="${MODEL:-deepseek-ai/DeepSeek-V3-0324}"
 DECODE_PORT="20005"
-KV_PORT="22001"
 PREFILL_PORT="20003"
-PREFILL_KV_PORT="21001"
 TP_SIZE="${TP_SIZE:-8}"
 ENABLE_PROFILING="${ENABLE_PROFILING:-false}"
 PROFILING_DIR="${PROFILING_DIR:-/opt/dlami/nvme/vllm_profiles}"
@@ -247,20 +243,30 @@ build_docker() {
 
     cd vllm
 
-    BUILD_ARGS="--target vllm-openai --tag $DOCKER_TAG --build-arg torch_cuda_arch_list=\"\" --build-arg INSTALL_KV_CONNECTORS=true --file docker/Dockerfile"
+    local build_args=(
+        --target vllm-openai
+        --tag "$DOCKER_TAG"
+        --build-arg "torch_cuda_arch_list="
+        --build-arg INSTALL_KV_CONNECTORS=true
+        --file docker/Dockerfile
+    )
 
     if [ "$USE_PRECOMPILED" = "true" ]; then
-        BUILD_ARGS="$BUILD_ARGS --build-arg VLLM_USE_PRECOMPILED=1"
+        build_args+=(--build-arg VLLM_USE_PRECOMPILED=1)
         log "Building with precompiled binaries..."
     else
-        BUILD_ARGS="$BUILD_ARGS --build-arg max_jobs=$(($(nproc) * 2)) --build-arg nvcc_threads=3 --build-arg VLLM_MAX_SIZE_MB=2000"
+        build_args+=(
+            --build-arg "max_jobs=$(($(nproc) * 2))"
+            --build-arg nvcc_threads=3
+            --build-arg VLLM_MAX_SIZE_MB=2000
+        )
         log "Building from source (this will take a long time)..."
     fi
 
     if [ "$DRY_RUN" = "true" ]; then
-        echo "Would run: DOCKER_BUILDKIT=1 docker build . $BUILD_ARGS"
+        echo "Would run: DOCKER_BUILDKIT=1 docker build . ${build_args[*]}"
     else
-        DOCKER_BUILDKIT=1 docker build . $BUILD_ARGS
+        DOCKER_BUILDKIT=1 docker build . "${build_args[@]}"
         success "Docker image built successfully: $DOCKER_TAG"
     fi
 
@@ -271,7 +277,8 @@ build_docker() {
 get_largest_mount() {
     # Find the largest mount point by available space, excluding tmpfs, devtmpfs, and NFS
     # Works across AWS, GCP, Azure, and other cloud providers
-    local largest_mount=$(df -h | grep -vE 'tmpfs|devtmpfs|:/|loop|udev' | awk 'NR>1 {print $4, $6}' | sort -hr | head -1 | awk '{print $2}')
+    local largest_mount
+    largest_mount=$(df -h | grep -vE 'tmpfs|devtmpfs|:/|loop|udev' | awk 'NR>1 {print $4, $6}' | sort -hr | head -1 | awk '{print $2}')
 
     # Fallback to root if nothing found
     if [[ -z "$largest_mount" ]]; then
@@ -286,7 +293,8 @@ setup_docker_storage() {
     log "Configuring Docker to use largest available storage..." >&2
 
     # Detect largest mount point
-    local largest_mount=$(get_largest_mount)
+    local largest_mount
+    largest_mount=$(get_largest_mount)
     local docker_data_root="${largest_mount}/docker"
 
     log "Largest mount detected: $largest_mount" >&2
@@ -429,7 +437,8 @@ GDRCOPY_HELP_EOF
 # Function to get local IP address
 get_local_ip() {
     # Try to get the primary interface IP (not localhost)
-    local ip=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' | head -1)
+    local ip
+    ip=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' | head -1)
     if [[ -z "$ip" ]]; then
         # Fallback to hostname -I
         ip=$(hostname -I | awk '{print $1}')
@@ -444,7 +453,8 @@ get_local_ip() {
 # Function to get router container IP address for local deployments
 get_router_container_ip() {
     # Try to get the router container IP from docker inspect
-    local router_ip=$(docker inspect vllm-router-local 2>/dev/null | grep '"IPAddress":' | head -1 | grep -o '[0-9.]*[0-9]')
+    local router_ip
+    router_ip=$(docker inspect vllm-router-local 2>/dev/null | grep '"IPAddress":' | head -1 | grep -o '[0-9.]*[0-9]')
     if [[ -n "$router_ip" && "$router_ip" != "" ]]; then
         echo "$router_ip"
     else
@@ -652,8 +662,8 @@ upload_ecr() {
     log "Uploading image to ECR..."
 
     # Check if image already exists in ECR (skip if no permissions)
-    ECR_REPO_NAME=$(echo $ECR_REPO | cut -d'/' -f2)
-    if aws ecr describe-images --repository-name $ECR_REPO_NAME --image-ids imageTag=$ECR_TAG --region $ECR_REGION >/dev/null 2>&1; then
+    ECR_REPO_NAME=$(echo "$ECR_REPO" | cut -d'/' -f2)
+    if aws ecr describe-images --repository-name "$ECR_REPO_NAME" --image-ids imageTag="$ECR_TAG" --region "$ECR_REGION" >/dev/null 2>&1; then
         log "Image $ECR_REPO:$ECR_TAG already exists in ECR, skipping upload..."
         success "Image already uploaded to ECR: $ECR_REPO:$ECR_TAG"
         return 0
@@ -673,10 +683,10 @@ upload_ecr() {
         aws ecr get-login-password --region $ECR_REGION | docker login --username AWS --password-stdin $ECR_REPO
 
         log "Tagging image for ECR..."
-        docker tag $DOCKER_TAG $ECR_REPO:$ECR_TAG
+        docker tag "$DOCKER_TAG" "$ECR_REPO:$ECR_TAG"
 
         log "Pushing to ECR..."
-        docker push $ECR_REPO:$ECR_TAG
+        docker push "$ECR_REPO:$ECR_TAG"
 
         # Save the ECR tag for future use
         save_ecr_tag "$ECR_TAG"
@@ -696,7 +706,7 @@ deploy_local() {
         echo "  Tensor Parallel Size: $TP_SIZE"
     else
         # Generate and execute the vLLM run script locally
-        generate_vllm_run_script $(get_local_ip) | bash
+        generate_vllm_run_script "$(get_local_ip)" | bash
 
         sleep 3
         if docker ps | grep -q vllm-deepseek; then
@@ -727,30 +737,30 @@ deploy_remote_decode() {
             echo "Would deploy decode script to $host with external IP detection"
         else
             # First, setup Docker storage on the remote host (skip if already configured)
-            DOCKER_ROOT=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "docker info 2>/dev/null | grep 'Docker Root Dir' | grep -v '/var/lib/docker' || true")
+            DOCKER_ROOT=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "$host" "docker info 2>/dev/null | grep 'Docker Root Dir' | grep -v '/var/lib/docker' || true")
             if [ -z "$DOCKER_ROOT" ]; then
                 log "Setting up Docker storage on $host..." >&2
-                setup_docker_storage | ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "bash"
+                setup_docker_storage | ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "$host" "bash"
             else
                 log "Docker storage already configured on $host" >&2
             fi
 
             # Get the internal IP of the remote host for AWS VPC communication
-            INTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "ip route get 8.8.8.8 | grep -oP 'src \K\S+'")
+            INTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "$host" "ip route get 8.8.8.8 | grep -oP 'src \K\S+'")
             log "Internal IP for $host: $INTERNAL_IP"
 
             # Generate script with host-specific internal IP
-            generate_vllm_run_script $ROUTER_IP $INTERNAL_IP > /tmp/vllm_run_remote_${INTERNAL_IP}.sh
-            chmod +x /tmp/vllm_run_remote_${INTERNAL_IP}.sh
+            generate_vllm_run_script "$ROUTER_IP" "$INTERNAL_IP" > "/tmp/vllm_run_remote_${INTERNAL_IP}.sh"
+            chmod +x "/tmp/vllm_run_remote_${INTERNAL_IP}.sh"
 
             # Copy script to remote host
-            scp -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no /tmp/vllm_run_remote_${INTERNAL_IP}.sh $host:/tmp/vllm_run_remote.sh
+            scp -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "/tmp/vllm_run_remote_${INTERNAL_IP}.sh" "$host:/tmp/vllm_run_remote.sh"
 
             # Execute on remote host
-            ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "bash /tmp/vllm_run_remote.sh"
+            ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "$host" "bash /tmp/vllm_run_remote.sh"
 
             # Clean up host-specific temp file
-            rm -f /tmp/vllm_run_remote_${INTERNAL_IP}.sh
+            rm -f "/tmp/vllm_run_remote_${INTERNAL_IP}.sh"
 
             success "Decode deployed to $host (Internal IP: $INTERNAL_IP)"
         fi
@@ -773,30 +783,30 @@ deploy_remote_prefill() {
             echo "Would deploy prefill script to $host with external IP detection"
         else
             # First, setup Docker storage on the remote host (skip if already configured)
-            DOCKER_ROOT=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "docker info 2>/dev/null | grep 'Docker Root Dir' | grep -v '/var/lib/docker' || true")
+            DOCKER_ROOT=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "$host" "docker info 2>/dev/null | grep 'Docker Root Dir' | grep -v '/var/lib/docker' || true")
             if [ -z "$DOCKER_ROOT" ]; then
                 log "Setting up Docker storage on $host..." >&2
-                setup_docker_storage | ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "bash"
+                setup_docker_storage | ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "$host" "bash"
             else
                 log "Docker storage already configured on $host" >&2
             fi
 
             # Get the internal IP of the remote host for AWS VPC communication
-            INTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "ip route get 8.8.8.8 | grep -oP 'src \K\S+'")
+            INTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "$host" "ip route get 8.8.8.8 | grep -oP 'src \K\S+'")
             log "Internal IP for $host: $INTERNAL_IP"
 
             # Generate script with host-specific internal IP
-            generate_vllm_prefill_run_script $ROUTER_IP $INTERNAL_IP > /tmp/vllm_run_remote_prefill_${INTERNAL_IP}.sh
-            chmod +x /tmp/vllm_run_remote_prefill_${INTERNAL_IP}.sh
+            generate_vllm_prefill_run_script "$ROUTER_IP" "$INTERNAL_IP" > "/tmp/vllm_run_remote_prefill_${INTERNAL_IP}.sh"
+            chmod +x "/tmp/vllm_run_remote_prefill_${INTERNAL_IP}.sh"
 
             # Copy script to remote host
-            scp -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no /tmp/vllm_run_remote_prefill_${INTERNAL_IP}.sh $host:/tmp/vllm_run_remote_prefill.sh
+            scp -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "/tmp/vllm_run_remote_prefill_${INTERNAL_IP}.sh" "$host:/tmp/vllm_run_remote_prefill.sh"
 
             # Execute on remote host
-            ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "bash /tmp/vllm_run_remote_prefill.sh"
+            ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "$host" "bash /tmp/vllm_run_remote_prefill.sh"
 
             # Clean up host-specific temp file
-            rm -f /tmp/vllm_run_remote_prefill_${INTERNAL_IP}.sh
+            rm -f "/tmp/vllm_run_remote_prefill_${INTERNAL_IP}.sh"
 
             success "Prefill deployed to $host (Internal IP: $INTERNAL_IP)"
         fi
@@ -827,16 +837,12 @@ deploy_router() {
     log "Building router Docker image..."
     cd "$ROUTER_DIR"
 
-    if [ ! -f "Dockerfile" ] && [ ! -f "Dockerfile.router" ]; then
-        error "Dockerfile or Dockerfile.router not found in vllm-router directory"
+    if [ ! -f "docker/Dockerfile.router" ]; then
+        error "docker/Dockerfile.router not found in vllm-router directory"
         exit 1
     fi
 
-    # Use the correct Dockerfile name
-    DOCKERFILE_NAME="Dockerfile"
-    if [ -f "Dockerfile.router" ]; then
-        DOCKERFILE_NAME="Dockerfile.router"
-    fi
+    DOCKERFILE_NAME="docker/Dockerfile.router"
 
     ROUTER_DOCKER_TAG="vllm-router-service"
     ROUTER_ECR_TAG="router_$(whoami)_$(date +%Y%m%d_%H%M%S)"
@@ -859,10 +865,10 @@ deploy_router() {
         aws ecr get-login-password --region $ECR_REGION | docker login --username AWS --password-stdin $ECR_REPO
 
         # Tag for ECR
-        docker tag $ROUTER_DOCKER_TAG $ECR_REPO:$ROUTER_ECR_TAG
+        docker tag "$ROUTER_DOCKER_TAG" "$ECR_REPO:$ROUTER_ECR_TAG"
 
         # Push to ECR
-        docker push $ECR_REPO:$ROUTER_ECR_TAG
+        docker push "$ECR_REPO:$ROUTER_ECR_TAG"
         success "Router image uploaded to ECR: $ECR_REPO:$ROUTER_ECR_TAG"
     fi
 
@@ -908,10 +914,10 @@ EOF
             echo "Would copy router deployment script to $host and execute"
         else
             # Copy script to remote host
-            scp -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no /tmp/router_deploy.sh $host:/tmp/
+            scp -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no /tmp/router_deploy.sh "$host:/tmp/"
 
             # Execute on remote host
-            ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "bash /tmp/router_deploy.sh"
+            ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "$host" "bash /tmp/router_deploy.sh"
 
             success "Router deployed to $host"
         fi
@@ -940,16 +946,12 @@ deploy_router_local() {
     log "Building router Docker image..."
     cd "$ROUTER_DIR"
 
-    if [ ! -f "Dockerfile" ] && [ ! -f "Dockerfile.router" ]; then
-        error "Dockerfile or Dockerfile.router not found in vllm-router directory"
+    if [ ! -f "docker/Dockerfile.router" ]; then
+        error "docker/Dockerfile.router not found in vllm-router directory"
         exit 1
     fi
 
-    # Use the correct Dockerfile name
-    DOCKERFILE_NAME="Dockerfile"
-    if [ -f "Dockerfile.router" ]; then
-        DOCKERFILE_NAME="Dockerfile.router"
-    fi
+    DOCKERFILE_NAME="docker/Dockerfile.router"
 
     ROUTER_DOCKER_TAG="vllm-router-service"
 
@@ -972,46 +974,50 @@ deploy_router_local() {
 
     # Get internal IPs from all prefill and decode hosts
     log "Getting internal IP addresses from remote hosts..."
-    PREFILL_ARGS=""
-    DECODE_ARGS=""
+    PREFILL_ARGS=()
+    DECODE_ARGS=()
 
     # Build --prefill arguments for each prefill host
     for host in $PREFILL_REMOTE_HOSTS; do
-        INTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "hostname -I | awk '{print \$1}'" 2>/dev/null || echo "")
+        INTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "$host" "hostname -I | awk '{print \$1}'" 2>/dev/null || echo "")
         if [ -z "$INTERNAL_IP" ]; then
             error "Failed to get internal IP from prefill host: $host"
             exit 1
         fi
         log "Prefill host $host -> Internal IP: $INTERNAL_IP"
-        PREFILL_ARGS="$PREFILL_ARGS --prefill http://$INTERNAL_IP:$PREFILL_PORT"
+        PREFILL_ARGS+=(--prefill "http://$INTERNAL_IP:$PREFILL_PORT")
     done
 
     # Build --decode arguments for each decode host
     for host in $DECODE_REMOTE_HOSTS; do
-        INTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no $host "hostname -I | awk '{print \$1}'" 2>/dev/null || echo "")
+        INTERNAL_IP=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "$host" "hostname -I | awk '{print \$1}'" 2>/dev/null || echo "")
         if [ -z "$INTERNAL_IP" ]; then
             error "Failed to get internal IP from decode host: $host"
             exit 1
         fi
         log "Decode host $host -> Internal IP: $INTERNAL_IP"
-        DECODE_ARGS="$DECODE_ARGS --decode http://$INTERNAL_IP:$DECODE_PORT"
+        DECODE_ARGS+=(--decode "http://$INTERNAL_IP:$DECODE_PORT")
     done
 
     if [ "$DRY_RUN" = "true" ]; then
         echo "Would run router container with:"
-        echo "  Prefill args: $PREFILL_ARGS"
-        echo "  Decode args: $DECODE_ARGS"
+        echo "  Prefill args: ${PREFILL_ARGS[*]}"
+        echo "  Decode args: ${DECODE_ARGS[*]}"
     else
+        local profile_args=()
+        if [ "$ENABLE_PROFILING" = "true" ]; then
+            profile_args+=(--profile)
+        fi
         docker run -d \
             --name vllm-router-local \
             -p 10001:10001 \
             --restart unless-stopped \
-            $ROUTER_DOCKER_TAG \
+            "$ROUTER_DOCKER_TAG" \
             vllm-router --vllm-pd-disaggregation \
-            $PREFILL_ARGS \
-            $DECODE_ARGS \
+            "${PREFILL_ARGS[@]}" \
+            "${DECODE_ARGS[@]}" \
             --host 0.0.0.0 --port 10001 \
-            $(if [ "$ENABLE_PROFILING" = "true" ]; then echo "--profile"; fi)
+            "${profile_args[@]}"
 
         # Wait a moment and check if container started successfully
         sleep 2
@@ -1033,15 +1039,16 @@ deploy_prefill_local() {
     log "Deploying vLLM prefill server locally..."
 
     # Get router container IP for local deployment
-    local ROUTER_IP=$(get_router_container_ip)
+    local ROUTER_IP
+    ROUTER_IP=$(get_router_container_ip)
     log "Using router IP: $ROUTER_IP"
 
     # Generate and execute the prefill run script locally
     if [ "$DRY_RUN" = "true" ]; then
         echo "Would deploy prefill server with router IP: $ROUTER_IP"
-        generate_vllm_prefill_run_script $ROUTER_IP
+        generate_vllm_prefill_run_script "$ROUTER_IP"
     else
-        generate_vllm_prefill_run_script $ROUTER_IP | bash
+        generate_vllm_prefill_run_script "$ROUTER_IP" | bash
 
         sleep 3
         if docker ps | grep -q vllm-deepseek-prefill; then
@@ -1061,15 +1068,16 @@ deploy_decode_local() {
     log "Deploying vLLM decode server locally..."
 
     # Get router container IP for local deployment
-    local ROUTER_IP=$(get_router_container_ip)
+    local ROUTER_IP
+    ROUTER_IP=$(get_router_container_ip)
     log "Using router IP: $ROUTER_IP"
 
     # Generate and execute the decode run script locally
     if [ "$DRY_RUN" = "true" ]; then
         echo "Would deploy decode server with router IP: $ROUTER_IP"
-        generate_vllm_run_script $ROUTER_IP
+        generate_vllm_run_script "$ROUTER_IP"
     else
-        generate_vllm_run_script $ROUTER_IP | bash
+        generate_vllm_run_script "$ROUTER_IP" | bash
 
         sleep 3
         if docker ps | grep -q vllm-deepseek; then
@@ -1125,21 +1133,20 @@ benchmark() {
     else
         # Run the benchmark
         log "Starting benchmark (this may take a while)..."
-        docker exec $BENCHMARK_CONTAINER vllm bench serve \
+        if docker exec "$BENCHMARK_CONTAINER" vllm bench serve \
             --dataset-name random \
-            --num-prompts $NUM_PROMPTS \
+            --num-prompts "$NUM_PROMPTS" \
             --model "$MODEL" \
-            --random-input-len $INPUT_LEN \
-            --random-output-len $OUTPUT_LEN \
+            --random-input-len "$INPUT_LEN" \
+            --random-output-len "$OUTPUT_LEN" \
             --endpoint /v1/completions \
-            --max-concurrency $MAX_CONCURRENCY \
+            --max-concurrency "$MAX_CONCURRENCY" \
             --save-result \
             --ignore-eos \
             --served-model-name "$MODEL" \
-            --host $ROUTER_HOST \
-            --port $ROUTER_PORT
-
-        if [ $? -eq 0 ]; then
+            --host "$ROUTER_HOST" \
+            --port "$ROUTER_PORT"
+        then
             success "Benchmark completed successfully!"
             log "Results saved to benchmark output file"
         else
@@ -1182,7 +1189,8 @@ verify_environment() {
         fi
 
         # Test SSH connection to the first remote host
-        local first_host=$(echo $PREFILL_REMOTE_HOSTS | awk '{print $1}')
+        local first_host
+        first_host=$(echo "$PREFILL_REMOTE_HOSTS" | awk '{print $1}')
         if [ -n "$first_host" ]; then
             log "Testing SSH connection to $first_host..."
             if ssh -i "$SSH_KEY_FILE" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$first_host" "echo 'SSH connection successful'" 2>/dev/null; then
@@ -1197,7 +1205,7 @@ verify_environment() {
         log "Adding EC2 hosts to known_hosts..."
         for host_spec in $PREFILL_REMOTE_HOSTS $DECODE_REMOTE_HOSTS; do
             # Extract just the hostname part (remove username@)
-            local hostname=$(echo "$host_spec" | sed 's/.*@//')
+            local hostname=${host_spec##*@}
             ssh-keyscan -H "$hostname" >> ~/.ssh/known_hosts 2>/dev/null
         done
     fi

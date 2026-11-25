@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Skip Buildkite builds/tests for documentation-only changes.
+
+PRs and merge queues qualify. Default-branch pushes run full CI because the
+bootstrap has no verified pre-push SHA. Nightly and scheduled builds always
+run, as do unresolved diffs.
+Use a merge-base diff and disable rename detection so moving code into docs
+cannot hide the deletion of a source file.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+from typing import Mapping
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def git_raw(*args: str) -> bytes:
+    """Preserve path bytes, including CR/LF and non-UTF-8 filenames."""
+    return subprocess.check_output(["git", *args], cwd=ROOT)
+
+
+def git(*args: str) -> str:
+    """Read scalar git results, such as commit SHAs."""
+    return git_raw(*args).decode("utf-8").rstrip("\n")
+
+
+def is_doc(path: str) -> bool:
+    return path.startswith("docs/") or path.endswith(".md") or path == "mkdocs.yml"
+
+
+def docs_only_change(env: Mapping[str, str]) -> bool:
+    pr = env.get("BUILDKITE_PULL_REQUEST", "false")
+    base = env.get("BUILDKITE_PULL_REQUEST_BASE_BRANCH", "")
+    # Explicit nightly requests should still exercise the full pipeline.
+    if env.get("NIGHTLY") == "1" or env.get("BUILDKITE_SOURCE") == "schedule":
+        return False
+    try:
+        if env.get("BUILDKITE_MERGE_QUEUE_BASE_BRANCH"):
+            ancestor = env.get("BUILDKITE_MERGE_QUEUE_BASE_COMMIT", "")
+            if not ancestor:
+                return False
+            # Confirm the recorded queue base belongs to the proposed merge.
+            ancestor = git("rev-parse", "--verify", f"{ancestor}^{{commit}}")
+            git("merge-base", "--is-ancestor", ancestor, "HEAD")
+        elif pr.isdecimal() and base:
+            git("check-ref-format", "--branch", base)
+            # Always fetch the target: agent refs can be missing or stale.
+            git("fetch", "--no-tags", "origin", f"refs/heads/{base}")
+            ancestor = git("merge-base", "FETCH_HEAD", "HEAD")
+        else:
+            # HEAD^1 only covers the last commit, not necessarily the full push.
+            # Without a verified webhook `before` SHA, do not skip branch CI.
+            return False
+        changed = git_raw("diff", "--name-only", "--no-renames", "-z", ancestor, "HEAD")
+        files = [
+            path.decode("utf-8", errors="surrogateescape")
+            for path in changed.split(b"\0")
+            if path
+        ]
+        return bool(files) and all(is_doc(path) for path in files)
+    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        print(f"Cannot resolve change diff; running full CI: {exc}", flush=True)
+        return False
+
+
+def main() -> None:
+    if docs_only_change(os.environ):
+        print("Docs-only change: skipping Buildkite builds and tests.", flush=True)
+        return
+    subprocess.run(
+        [
+            "buildkite-agent",
+            "pipeline",
+            "upload",
+            str(ROOT / ".buildkite/bootstrap-upload-steps.yml"),
+        ],
+        check=True,
+    )
+
+
+if __name__ == "__main__":
+    main()

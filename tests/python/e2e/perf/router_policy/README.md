@@ -1,0 +1,66 @@
+# router_policy — TraceLab cold replay, router policy × concurrency
+
+Each **scenario JSON** under `cases/` is one policy. `benchmark_params.max-concurrency` lists 8, 16, and 32; pytest expands those into cells `cache_aware/c16` and so on:
+
+- **`runtime`** — paths **relative to vllm-router repo root** where applicable. **`MODEL`** overrides `runtime.model`. **`AGENTX_PYTHON`** (or `PYTHON`) overrides the pytest interpreter. The CI image runs `vllm-router` from `PATH` (`/usr/local/bin`) and `vllm-rs` from the installed `vllm` package.
+- **agentinfer** — install via **`pip install …whl`** (or `uv pip install …whl`) into the **same env as pytest** (no source checkout). Replay YAML is loaded from the installed package when a cell starts. Optional: `runtime.replay_config`; optional `runtime.agent_infer` for source dev.
+- **`workers`** — engine count and per-worker serve args (KV, max_model_len, optional `gpu_memory_utilization`, optional `kv_cache_metrics` / `kv_cache_metrics_sample` → vLLM `--kv-cache-metrics`, …)
+- **`router_params`** — policy, gRPC, penalties, balance thresholds
+- **`benchmark_params`** — `max-concurrency` (8, 16, 32), task-num, and the rest of the replay settings. pytest asserts **all** replay rows in `requests.jsonl` are `success` (no fixed request count)
+
+Example: [cases/kv_aware.json](cases/kv_aware.json).
+
+Worker and router processes use [`perf/process.py`](../process.py), the same launch path as `perf/grpc`.
+
+## Run
+
+```bash
+export MODEL=Qwen/Qwen3-4B-Instruct-2507   # or local model dir
+# optional if pytest’s python is not the CI image venv:
+# export AGENTX_PYTHON=/path/to/.venv/bin/python
+
+pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -v
+```
+
+One concurrency / policy. `-sv` shows worker, router, and replay lines on stderr:
+
+```bash
+pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -sv -k 'kv_aware/c16'
+```
+
+## Artifacts layout
+
+Performance JSON and the run directory are separate. The nightly dashboard copies `tests/python/e2e/results` only.
+
+- `tests/python/e2e/results/perf/router_policy/<policy>_<run_suffix>/c<concurrency>_t<task_num>.json` — copy of `calibration.json` when the cell is ok. One directory per policy and session; one file per concurrency. The `concurrency` / `task_num` fields match the file name.
+- `tests/python/e2e/run/perf/router_policy/<case_id>-<run_suffix>/` — cell files. Nightly uploads `result/summary.json`, `result/manifest.json`, `router.log`, `engineN.log`, `replay.log`, `replay_entry.py`, `runtime-replay.yaml`, and `*.command.json`. Prometheus snapshots, `requests.jsonl`, `ports.json`, and `calibration.json` stay on the agent. The generated replay wrapper (`replay_entry.py`, including compatibility and stagger patches) is retained beside its command and logs after cleanup and uploaded for diagnosis and reproduction. Model caches stay under `tests/python/e2e/run/perf/router_policy/cache/` (shared across cells in this work root, excluded from nightly uploads). The same stdout is also printed (`[engineN]`, `[vllm-router]`, `[replay]`).
+
+`<run_suffix>` is local time `YYYYMMDD_HHMMSS` (same format as grpc and l1_encode) unless you set **`AGENTX_RUN_SUFFIX`** (same suffix for all cells in one matrix, e.g. `export AGENTX_RUN_SUFFIX=20251029_171300`). The run directory is generated automatically from the case ID and run suffix.
+
+Prometheus snapshots are saved under `before/`, `after/`, and `metrics/<elapsed_seconds>/` (approximately every 60 seconds during replay). They remain in the run directory for local diagnosis and are not uploaded. Replay logging uses the shared process stdout tee; cleanup joins the reader thread before closing the log.
+
+Before replay, the cell runner **removes `result/`** if it already exists. The cell **fails if replay exit code ≠ 0**.
+
+**Ports**: HTTP, gRPC, and the router use OS-assigned ports held until that process starts. KV event PUB/replay use a free port in **25100–25299**, also held until that worker starts. This vLLM reports the configured endpoint unchanged, so `tcp://*:0` comes back as port 0 and the router rejects it. After each worker is healthy, the runner calls gRPC `Control.GetKvEventSources` and fails the cell if an advertised endpoint still uses port 0. Between pytest cells, default **`AGENTX_CELL_GAP_SEC=5`**; before allocate, **`AGENTX_PORT_SETTLE_SEC=2`**. Do not run multiple matrix jobs on one host in parallel.
+
+Worker and router processes are started with `perf/process.py` (`launch_worker` once per worker, then `launch_router`). Pytest hides the stderr stream unless the invocation uses **`-sv`**.
+
+When replay exits, [`log_summary.py`](log_summary.py) writes **`calibration.json`** (TTFT, TPOT, JCT, concurrency, task count, and the other cell stats); when the cell is ok, the same JSON is copied to `tests/python/e2e/results/perf/router_policy/<policy>_<run_suffix>/c<concurrency>_t<task_num>.json` and prints **`--- cell summary ---`**, **`STATS`**, and **`ARTIFACTS`** on stdout. Quantile blocks (`ttft_s`, `tpot_ms`, `jct_s`) include `n`, the actual number of samples used for that metric, which can differ from `success`. TTFT excludes missing timings; TPOT also excludes missing latency and outputs with at most one token. JCT counts the duration samples used; precomputed JCT preserves `n` or `count`, or reports `n: null` when unknown. Empty sample sets report `n: 0`. Cell-level request counts remain in `requests` and `success`. **`ARTIFACTS`** lists the run directory and the results JSON path (`results_json`). Workers and the router are stopped after that.
+
+Layout matches **`perf/grpc`**: case JSON + [`case_loader.py`](case_loader.py) + [`stack_launcher.py`](stack_launcher.py). [`log_summary.py`](log_summary.py) writes the stats and prints the cell summary.
+
+The sample-count regression tests run on CPU without model weights:
+
+```bash
+python -m pytest tests/python/unit/test_router_policy_log_summary.py -q
+```
+
+## Buildkite nightly (L3)
+
+Job **`router-policy-perf-e2e`** in [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml)
+runs **`cache_aware/c16`**, **`kv_aware/c16`**, **`kv_aware_aff/c16`** on **`l4_4`** (4× L4).
+Case JSON reserves 12 GiB GPU KV per worker, no CPU offload, and `max_model_len=32768`.
+
+Nightly step runs `pip install agentinfer==0.2.0` then one pytest invocation (`-k 'cache_aware/c16 or kv_aware/c16 or kv_aware_aff/c16'`).
+The trace is `data/tracelab-ci-uniform-28.jsonl` (8 sessions, 28 requests). Optional Buildkite env **`TRACELAB_JSONL_URL`** replaces that file when set.
+See [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml) (`router-policy-perf-e2e`).

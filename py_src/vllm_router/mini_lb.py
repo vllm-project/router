@@ -6,8 +6,8 @@ import asyncio
 import ipaddress
 import logging
 import random
-import urllib
 from http import HTTPStatus
+from urllib.parse import urlparse
 from itertools import chain
 from typing import Optional
 
@@ -100,7 +100,6 @@ class MiniLoadBalancer:
             prefill_response, decode_response = await asyncio.gather(*tasks)
 
             if "return_logprob" in modified_request:
-
                 prefill_json = await prefill_response.json()
                 ret_json = await decode_response.json()
 
@@ -182,6 +181,15 @@ class MiniLoadBalancer:
 
 app = FastAPI()
 lb: Optional[MiniLoadBalancer] = None
+
+
+def _require_lb() -> MiniLoadBalancer:
+    if lb is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            detail="Load balancer is not initialized",
+        )
+    return lb
 
 
 @app.get("/health")
@@ -288,10 +296,11 @@ async def get_model_info():
 
 @app.post("/generate")
 async def handle_generate_request(request_data: dict):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
+    balancer = _require_lb()
+    prefill_server, bootstrap_port, decode_server = balancer.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
-    parsed_url = urllib.parse.urlparse(prefill_server)
+    parsed_url = urlparse(prefill_server)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
     modified_request = request_data.copy()
 
@@ -316,20 +325,21 @@ async def handle_generate_request(request_data: dict):
         )
 
     if request_data.get("stream", False):
-        return await lb.generate_stream(
+        return await balancer.generate_stream(
             modified_request, prefill_server, decode_server, "generate"
         )
     else:
-        return await lb.generate(
+        return await balancer.generate(
             modified_request, prefill_server, decode_server, "generate"
         )
 
 
 async def _forward_to_backend(request_data: dict, endpoint_name: str):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
+    balancer = _require_lb()
+    prefill_server, bootstrap_port, decode_server = balancer.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
-    parsed_url = urllib.parse.urlparse(prefill_server)
+    parsed_url = urlparse(prefill_server)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
     modified_request = request_data.copy()
     modified_request.update(
@@ -341,14 +351,14 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
     )
 
     if request_data.get("stream", False):
-        return await lb.generate_stream(
+        return await balancer.generate_stream(
             modified_request,
             prefill_server,
             decode_server,
             endpoint=endpoint_name,
         )
     else:
-        return await lb.generate(
+        return await balancer.generate(
             modified_request,
             prefill_server,
             decode_server,

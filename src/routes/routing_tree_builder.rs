@@ -1,5 +1,5 @@
 use crate::routes::interface::RouteHandle;
-use crate::routes::{SingleServerRoute, round_robin_route::RoundRobinRoute};
+use crate::routes::{round_robin_route::RoundRobinRoute, SingleServerRoute};
 use crate::types::ConfigurationError;
 use crate::utils::json::RequireField;
 use serde_json::{Map, Value};
@@ -14,12 +14,13 @@ impl RoutingTreeBuilder {
     }
 
     pub fn from_file(config: &std::path::PathBuf) -> Result<Self, ConfigurationError> {
-        let json = std::fs::read_to_string(config)
-            .map_err(|e| ConfigurationError(format!(
+        let json = std::fs::read_to_string(config).map_err(|e| {
+            ConfigurationError(format!(
                 "Failed to read config file '{}': {}",
                 config.display(),
                 e
-            )))?;
+            ))
+        })?;
         Ok(RoutingTreeBuilder::new(json))
     }
 
@@ -27,10 +28,7 @@ impl RoutingTreeBuilder {
         self,
     ) -> Result<Box<dyn RouteHandle + Send + Sync>, ConfigurationError> {
         let json: Value = serde_json::from_str(&self.config)
-            .map_err(|e| ConfigurationError(format!(
-                "Invalid JSON config: {}",
-                e
-            )))?;
+            .map_err(|e| ConfigurationError(format!("Invalid JSON config: {}", e)))?;
         let route: &Map<String, Value> = json.require("route")?;
 
         let root: Box<dyn RouteHandle + Send + Sync> = match route.require::<&str>("type")? {

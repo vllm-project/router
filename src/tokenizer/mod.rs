@@ -19,7 +19,8 @@ pub mod huggingface;
 
 pub mod tiktoken;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests;
 
 // Re-exports

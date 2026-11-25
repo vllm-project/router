@@ -37,7 +37,7 @@ spec:
           - "10001"
           - --intra-node-data-parallel-size
           - "8"
-          - --policy 
+          - --policy
           - consistent_hash
           - --log-level
           - info
