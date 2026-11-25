@@ -532,7 +532,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             !suspended,
                             &mut sub,
                             topic.as_bytes(),
-                            |frames| live_events.push(frames, topic.as_bytes()),
+                            |frames, topic| live_events.push(frames, topic),
                         )
                         .await
                         {

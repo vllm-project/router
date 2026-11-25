@@ -134,7 +134,7 @@ mod tests {
             false,
             &mut receiver,
             b"topic",
-            |frames| {
+            |frames, _topic| {
                 received.push(frames);
                 false
             },
@@ -425,7 +425,7 @@ pub(super) async fn while_connected<T>(
     watch: bool,
     sub: &mut ReadableSocket,
     topic: &[u8],
-    mut queue_live: impl FnMut(Vec<Vec<u8>>) -> bool,
+    mut queue_live: impl FnMut(Vec<Vec<u8>>, &[u8]) -> bool,
 ) -> io::Result<ReplayPoll<T>> {
     tokio::pin!(replay);
     loop {
@@ -448,7 +448,7 @@ pub(super) async fn while_connected<T>(
                     if frames.first().is_some_and(|frame| frame.as_slice() != topic) {
                         continue;
                     }
-                    if queue_live(frames) {
+                    if queue_live(frames, topic) {
                         return Ok(ReplayPoll::BufferFull);
                     }
                 }

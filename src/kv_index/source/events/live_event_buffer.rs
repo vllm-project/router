@@ -21,6 +21,25 @@ pub(super) enum HandoffError {
     PayloadConflict { seq: i64 },
 }
 
+impl HandoffError {
+    fn priority(&self) -> u8 {
+        match self {
+            Self::InvalidLiveFrame => 0,
+            Self::MissingReplayPayload { .. } => 1,
+            Self::PayloadConflict { .. } => 2,
+        }
+    }
+
+    fn prefer(most_specific: &mut Option<Self>, error: Self) {
+        if most_specific
+            .as_ref()
+            .is_none_or(|previous| previous.priority() < error.priority())
+        {
+            *most_specific = Some(error);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct ConflictingReplayFingerprint;
 
@@ -31,10 +50,24 @@ pub(super) struct LiveEventBuffer {
 
 #[derive(Default)]
 struct LiveEventBufferState {
-    frames: VecDeque<Vec<Vec<u8>>>,
+    frames: VecDeque<QueuedLiveFrame>,
     bytes: usize,
     recent_by_seq: HashMap<i64, [u8; 32]>,
     queued_by_seq: HashMap<i64, QueuedSequence>,
+}
+
+struct QueuedLiveFrame {
+    frames: Vec<Vec<u8>>,
+    payload_fingerprint: Option<[u8; 32]>,
+}
+
+impl QueuedLiveFrame {
+    fn payload_fingerprint(&mut self) -> [u8; 32] {
+        let payload = &self.frames[2];
+        *self
+            .payload_fingerprint
+            .get_or_insert_with(|| Sha256::digest(payload).into())
+    }
 }
 
 struct QueuedSequence {
@@ -59,7 +92,10 @@ impl LiveEventBuffer {
                 .frame_count += 1;
         }
         state.bytes += frame_bytes(&frames);
-        state.frames.push_back(frames);
+        state.frames.push_back(QueuedLiveFrame {
+            frames,
+            payload_fingerprint: None,
+        });
         state.frames.len() >= MAX_PENDING_LIVE_FRAMES || state.bytes >= super::MAX_KV_EVENT_BYTES
     }
 
@@ -70,16 +106,19 @@ impl LiveEventBuffer {
         applied_seq: Option<i64>,
     ) -> Option<(Vec<Vec<u8>>, bool)> {
         let state = self.state.get_mut();
-        let frames = state.frames.pop_front()?;
+        let mut queued = state.frames.pop_front()?;
         let mut is_duplicate = false;
-        if let Some(seq) = valid_live_seq(&frames, topic) {
+        if let Some(seq) = valid_live_seq(&queued.frames, topic) {
             is_duplicate = applied_seq.is_some_and(|applied_seq| {
-                seq <= applied_seq && state.compare_payload(seq, &frames[2]) == Some(true)
+                seq <= applied_seq
+                    && state
+                        .fingerprint(seq)
+                        .is_some_and(|replay| replay == queued.payload_fingerprint())
             });
             release_frame(&mut state.queued_by_seq, seq);
         }
-        state.bytes -= frame_bytes(&frames);
-        Some((frames, is_duplicate))
+        state.bytes -= frame_bytes(&queued.frames);
+        Some((queued.frames, is_duplicate))
     }
 
     pub(super) fn reset(&mut self) {
@@ -93,7 +132,7 @@ impl LiveEventBuffer {
             .get_mut()
             .frames
             .iter()
-            .filter_map(|frames| valid_live_seq(frames, topic))
+            .filter_map(|queued| valid_live_seq(&queued.frames, topic))
             .max();
         self.reset();
         highest
@@ -137,7 +176,7 @@ impl LiveEventBuffer {
         })
     }
 
-    /// Keep queued frames and known conflicts when restarting a replay.
+    /// Clear replay fingerprints while keeping queued live frames and known conflicts.
     pub(super) fn clear_fingerprints(&mut self) {
         let state = self.state.get_mut();
         if !state.recent_by_seq.is_empty() {
@@ -158,10 +197,10 @@ impl LiveEventBuffer {
     ) -> Result<(), HandoffError> {
         let state = self.state.get_mut();
         let mut error = None;
-        state.frames.retain(|frames| {
-            let Some(seq) = valid_live_seq(frames, topic) else {
-                error.get_or_insert(HandoffError::InvalidLiveFrame);
-                state.bytes -= frame_bytes(frames);
+        state.frames.retain_mut(|live_frame| {
+            let Some(seq) = valid_live_seq(&live_frame.frames, topic) else {
+                HandoffError::prefer(&mut error, HandoffError::InvalidLiveFrame);
+                state.bytes -= frame_bytes(&live_frame.frames);
                 return false;
             };
             if seq <= applied_seq {
@@ -171,19 +210,21 @@ impl LiveEventBuffer {
                     .and_then(|entry| entry.replay_fingerprint)
                     .or_else(|| state.recent_by_seq.get(&seq).copied());
                 match fingerprint {
-                    Some(fingerprint)
-                        if fingerprint == <[u8; 32]>::from(Sha256::digest(&frames[2])) => {}
+                    Some(fingerprint) if fingerprint == live_frame.payload_fingerprint() => {}
                     Some(_) => {
                         if let Some(queued) = queued {
                             queued.had_replay_conflict = true;
                         }
-                        error.get_or_insert(HandoffError::PayloadConflict { seq });
+                        HandoffError::prefer(&mut error, HandoffError::PayloadConflict { seq });
                     }
                     None if queued.is_some_and(|queued| queued.had_replay_conflict) => {
-                        error.get_or_insert(HandoffError::PayloadConflict { seq });
+                        HandoffError::prefer(&mut error, HandoffError::PayloadConflict { seq });
                     }
                     None if clear_seq.is_none_or(|clear_seq| seq >= clear_seq) => {
-                        error.get_or_insert(HandoffError::MissingReplayPayload { seq });
+                        HandoffError::prefer(
+                            &mut error,
+                            HandoffError::MissingReplayPayload { seq },
+                        );
                     }
                     None => {}
                 }
@@ -194,12 +235,14 @@ impl LiveEventBuffer {
             return Err(error);
         }
         if let Some(clear_seq) = clear_seq {
-            state.frames.retain(|frames| {
-                let Some(seq) = valid_live_seq(frames, topic).filter(|&seq| seq < clear_seq) else {
+            state.frames.retain(|queued| {
+                let Some(seq) =
+                    valid_live_seq(&queued.frames, topic).filter(|&seq| seq < clear_seq)
+                else {
                     return true;
                 };
                 release_frame(&mut state.queued_by_seq, seq);
-                state.bytes -= frame_bytes(frames);
+                state.bytes -= frame_bytes(&queued.frames);
                 false
             });
         }
@@ -246,16 +289,38 @@ fn frame_bytes(frames: &[Vec<u8>]) -> usize {
 mod tests {
     use super::*;
 
+    fn frame(seq: i64, payload: &[u8]) -> Vec<Vec<u8>> {
+        vec![
+            b"topic".to_vec(),
+            seq.to_be_bytes().to_vec(),
+            payload.to_vec(),
+        ]
+    }
+
+    #[test]
+    fn handoff_reports_the_most_specific_error() {
+        let mut live_events = LiveEventBuffer::default();
+        live_events.push(Vec::new(), b"topic");
+        live_events.push(frame(1, b"live"), b"topic");
+
+        assert!(matches!(
+            live_events.validate_handoff(b"topic", 1, None),
+            Err(HandoffError::MissingReplayPayload { seq: 1 })
+        ));
+
+        live_events.push(frame(2, b"live"), b"topic");
+        live_events
+            .record_replay_payload(2, b"conflicting")
+            .unwrap();
+        assert!(matches!(
+            live_events.validate_handoff(b"topic", 2, None),
+            Err(HandoffError::PayloadConflict { seq: 2 })
+        ));
+    }
+
     #[test]
     fn replay_fingerprint_stays_until_last_queued_copy_leaves() {
         let mut live_events = LiveEventBuffer::default();
-        let frame = |seq: i64, payload: &[u8]| {
-            vec![
-                b"topic".to_vec(),
-                seq.to_be_bytes().to_vec(),
-                payload.to_vec(),
-            ]
-        };
         live_events.push(frame(0, b"new replay"), b"topic");
         live_events.push(frame(0, b"new replay"), b"topic");
         live_events.record_replay_payload(0, b"old replay").unwrap();
@@ -264,6 +329,13 @@ mod tests {
         assert!(!live_events.is_replayed_duplicate(&frame(0, b"old replay"), b"topic", Some(0)));
         live_events.record_replay_payload(0, b"new replay").unwrap();
         live_events.state.get_mut().recent_by_seq.remove(&0);
+        live_events.validate_handoff(b"topic", 0, None).unwrap();
+        assert!(live_events
+            .state
+            .get_mut()
+            .frames
+            .iter()
+            .all(|queued| queued.payload_fingerprint.is_some()));
 
         assert!(live_events.pop(b"topic", Some(0)).unwrap().1);
         assert!(live_events.pop(b"topic", Some(0)).unwrap().1);
