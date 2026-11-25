@@ -33,6 +33,12 @@ pub enum KvRequestTokens<'a> {
     PerWorker(&'a WorkerTokenInputs),
 }
 
+impl Default for KvRequestTokens<'_> {
+    fn default() -> Self {
+        Self::Shared(None)
+    }
+}
+
 /// Request-local placement qualification; it restricts credit, not candidacy.
 #[derive(Clone, Copy)]
 pub(crate) struct QualifiedKvInput<'a> {

@@ -229,11 +229,12 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
             .map(|&idx| (idx, workers[idx].url().to_string()))
             .collect();
 
+        // Without text, a fixed key would send all tied requests to one worker.
         let stateless_tie_break = session_id.is_none().then(|| {
-            format!(
-                "{:016x}",
-                ConsistentHashPolicy::fbi_hash(request_text.unwrap_or_default())
-            )
+            let digest = request_text
+                .filter(|text| !text.is_empty())
+                .map_or_else(rand::random::<u64>, ConsistentHashPolicy::fbi_hash);
+            format!("{digest:016x}")
         });
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
@@ -502,6 +503,19 @@ mod tests {
         let idx = policy.select_worker_for_session(&workers, Some(prompt), None, None);
         assert!(idx.is_some());
         assert_eq!(policy.active_session_count(), 0);
+    }
+
+    #[test]
+    fn test_stateless_requests_without_text_spread_across_tied_workers() {
+        let policy = StickyLeastLoadedPolicy::new();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+
+        for text in [None, Some("")] {
+            let selected: std::collections::HashSet<_> = (0..64)
+                .filter_map(|_| policy.select_worker_for_session(&workers, text, None, None))
+                .collect();
+            assert_eq!(selected.len(), workers.len(), "text: {text:?}");
+        }
     }
 
     #[test]

@@ -71,24 +71,26 @@ impl StableIdentity {
 pub struct IdentityFields<'a> {
     pub other: Option<&'a JsonMap<String, JsonValue>>,
     pub session_params: Option<&'a std::collections::HashMap<String, JsonValue>>,
+    /// Typed `user` field. Only sticky routing reads it.
+    pub user: Option<&'a str>,
 }
 
 impl<'a> IdentityFields<'a> {
     pub fn from_body(body: &'a JsonValue) -> Self {
         Self {
             other: body.as_object(),
-            session_params: None,
+            ..Self::default()
         }
     }
 
     /// Resolve the sticky policy's body ID from typed fields and passthrough JSON.
-    pub(crate) fn sticky_session_id(self, user: Option<&'a str>) -> Option<Cow<'a, str>> {
+    pub(crate) fn sticky_session_id(self) -> Option<Cow<'a, str>> {
         let field = |name| self.other?.get(name);
         self.session_params
             .and_then(|params| params.get("session_id"))
             .or_else(|| field("session_params")?.get("session_id"))
             .and_then(sticky_id_value)
-            .or_else(|| user.filter(|user| !user.is_empty()).map(Cow::Borrowed))
+            .or_else(|| self.user.filter(|user| !user.is_empty()).map(Cow::Borrowed))
             .or_else(|| field("user").and_then(sticky_id_value))
             .or_else(|| field("session_id").and_then(sticky_id_value))
             .or_else(|| field("user_id").and_then(sticky_id_value))
