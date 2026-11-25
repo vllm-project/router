@@ -1,7 +1,7 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
 use super::dp_utils;
-use super::pd_kv_state::PdKvState;
+use super::pd_kv_state::{PdDecodePrices, PdKvState};
 use super::pd_types::{
     Loads, PDRouterError, PdAttempt, PdEndpoint, PdLoadManager, PdPrefillInput, PdRequestContext,
     PdSelection, Stage, StageDecision,
@@ -735,7 +735,7 @@ impl PdRouterBase {
         decode_workers: &[Arc<dyn Worker>],
         context: &PdRequestContext<'_>,
     ) -> Option<(PdSelection, PdAttempt)> {
-        self.select_and_admit_with(prefill_workers, decode_workers, context, false)
+        self.select_and_admit_with(prefill_workers, decode_workers, context, false, None)
     }
 
     /// Admission with a deferred decode commitment.
@@ -753,6 +753,7 @@ impl PdRouterBase {
         decode_workers: &[Arc<dyn Worker>],
         context: &PdRequestContext<'_>,
         defer_decode: bool,
+        decode_prices: Option<&PdDecodePrices>,
     ) -> Option<(PdSelection, PdAttempt)> {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
@@ -765,7 +766,16 @@ impl PdRouterBase {
         // Deferred selection has no prefill pair. When any hybrid pairs are
         // configured, commit decode at admission for the entire pool.
         let defer = defer_decode && decode_policy_can_defer(decode_policy.as_ref(), &context);
+        // Keep the source guards until admission has committed the selection.
+        let mut validated = None;
         let select = |loads: &Loads| {
+            let mut context = context.clone();
+            if !defer && !context.probe {
+                validated = decode_prices.map(|prices| prices.validate(decode_workers));
+                if let Some(prices) = validated.as_ref() {
+                    context.decode_context = Some(&prices.tokens);
+                }
+            }
             select_pd_pair(
                 loads,
                 prefill_workers,
@@ -782,6 +792,7 @@ impl PdRouterBase {
         } else {
             self.pd_load.admit_with(select, reserve_decode)
         };
+        drop(validated);
         if let Some((selection, attempt)) = &admitted {
             let deferred = attempt.decode_pending_commit();
             if kv_aware_ops(prefill_policy.as_ref()).is_some() {

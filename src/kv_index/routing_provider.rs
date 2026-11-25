@@ -19,9 +19,9 @@ use smallvec::SmallVec;
 /// Hashes prompts using the verified source contract and reports the prefix
 /// that the cache layout can restore.
 ///
-/// Regular routing with a Prefill slot grants credit only for hits with
-/// evidence from that lookup. Hits from custom providers without evidence
-/// are scored as cache misses, and their workers remain eligible by load.
+/// Regular Prefill reservations and P/D Decode selection grant credit only
+/// for hits with evidence from that lookup. Hits from custom providers
+/// without evidence are scored as misses, and their workers remain eligible.
 /// To retain credit, forward `matches_with_cache` and its cache to the
 /// source provider that produced the hit.
 pub trait TieredMatchProvider: Send + Sync {

@@ -1017,11 +1017,25 @@ pub struct PromptHashes<'a> {
     // Each stage scores a single adapter identity for the entire request.
     matches: HashMap<(MatchScope, PromptKey<'a>), Vec<TierMatch>, foldhash::fast::RandomState>,
     hashes: RequestHashCache<'a>,
+    decode_targets: HashMap<String, RoutableTarget>,
 }
 
 impl PromptHashes<'_> {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn collect_decode_evidence<T>(
+        &mut self,
+        estimate: impl FnOnce(&mut Self) -> T,
+    ) -> (T, HashMap<String, RoutableTarget>, Vec<PlacementEvidence>) {
+        self.hashes.placement = Some(Vec::new());
+        let estimates = estimate(self);
+        (
+            estimates,
+            std::mem::take(&mut self.decode_targets),
+            self.hashes.placement.take().unwrap_or_default(),
+        )
     }
 
     fn set_stage_targets(
@@ -2159,6 +2173,7 @@ impl KvAwareOps for KvAwarePolicy {
                     ..self.params
                 };
                 let mut additional = 0u64;
+                let mut uses_credit = false;
                 for tokens in prompts {
                     let matches = Self::cached_matches(
                         hashes,
@@ -2194,6 +2209,7 @@ impl KvAwareOps for KvAwarePolicy {
                     } else {
                         reused
                     };
+                    uses_credit |= reused != 0;
                     // The engine shares one copy of the prompt's blocks across the
                     // request's sequences, so the marginal cost is the prompt's
                     // un-cached remainder once - the same amount the ledger charges when
@@ -2201,6 +2217,11 @@ impl KvAwareOps for KvAwarePolicy {
                     // a request cost more before admission than after, so the two sides of
                     // the comparison disagreed.
                     additional = additional.saturating_add(context.saturating_sub(reused));
+                }
+                if uses_credit && hashes.hashes.placement.is_some() {
+                    hashes
+                        .decode_targets
+                        .insert(worker.url().to_owned(), binding.target.clone());
                 }
                 DecodeWorkEstimate {
                     additional_tokens: Some(additional),

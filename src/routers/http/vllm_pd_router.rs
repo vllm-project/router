@@ -1248,7 +1248,7 @@ impl VllmPDRouter {
             affinity_key: affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
             cache_salt,
-            decode_context: decode_context.as_ref(),
+            decode_context: None,
             route: path,
             probe: false,
         };
@@ -1260,6 +1260,7 @@ impl VllmPDRouter {
             decode_workers,
             &context,
             defer_decode,
+            decode_context.as_ref(),
         )?;
         Some(Admission {
             selection,
@@ -1437,11 +1438,20 @@ impl VllmPDRouter {
             affinity_key: input.affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
             cache_salt: input.cache_salt.as_deref(),
-            decode_context: decode_context.as_ref(),
+            decode_context: None,
             route: &input.route,
             probe: false,
         };
+        // Keep the source guards until the deferred Decode commit finishes.
+        let mut validated = None;
         let committed = self.pd_router.pd_load.commit_decode(attempt, |loads| {
+            validated = decode_context
+                .as_ref()
+                .map(|prices| prices.validate(&candidates));
+            let context = PdRequestContext {
+                decode_context: validated.as_ref().map(|prices| &prices.tokens),
+                ..context
+            };
             super::pd_router::select_decode_stage(
                 loads,
                 &candidates,
@@ -1449,6 +1459,7 @@ impl VllmPDRouter {
                 &context,
             )
         });
+        drop(validated);
         let Some(decision) = committed else {
             RouterMetrics::record_pd_decode_commit("empty");
             return Err((
