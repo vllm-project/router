@@ -126,9 +126,9 @@ impl Subscriber {
     fn apply(&self, seq: u64, payload: &[u8], fresh: bool) -> Result<(), ()> {
         let cleared = if let Some((stream, lease)) = &self.binding {
             if fresh {
-                stream.observe_live(*lease, seq, payload)
+                stream.reset_and_try_publish_from_live_batch(*lease, seq, payload)
             } else {
-                stream.apply_publisher_payload(*lease, seq, payload)
+                stream.apply_next_batch(*lease, seq, payload)
             }
             .map_err(|_| ())?
         } else {
@@ -164,7 +164,7 @@ impl Subscriber {
         }
         let (stream, lease) = self.binding.as_ref().ok_or(ReplayError::ResetIndex)?;
         stream
-            .reset_index_from_replay_clear(*lease, seq, batch)
+            .reset_hidden_index_from_replay_clear(*lease, seq, batch)
             .map_err(|_| ReplayError::ResetIndex)?;
         self.invalidated("engine cleared KV cache");
         Ok(true)
