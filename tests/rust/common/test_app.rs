@@ -1,0 +1,133 @@
+use axum::Router;
+use reqwest::Client;
+use std::sync::Arc;
+use vllm_router_rs::{
+    config::RouterConfig,
+    otel_trace,
+    routers::{RouterFactory, RouterTrait},
+    server::{build_app_with_wasm_middleware, AppContext, AppState},
+    wasm_middleware::WasmMiddlewareRuntime,
+};
+
+/// Create a test Axum application using the actual server's build_app function
+#[allow(dead_code)]
+pub fn create_test_app(
+    router: Arc<dyn RouterTrait>,
+    client: Client,
+    router_config: &RouterConfig,
+) -> Router {
+    create_test_app_with_tracing(router, client, router_config, otel_trace::is_otel_enabled())
+}
+
+/// Build the router from `router_config` and wrap it in the full app.
+///
+/// The app gets a fresh context, not the router's. Use
+/// `create_test_app_with_context` when the two must share one.
+#[allow(dead_code)]
+pub async fn create_test_app_from_config(router_config: &RouterConfig) -> Router {
+    let context = super::create_test_context(router_config.clone());
+    let router: Arc<dyn RouterTrait> = Arc::from(
+        RouterFactory::create_router(&context)
+            .await
+            .expect("router"),
+    );
+    create_test_app(router, Client::new(), router_config)
+}
+
+/// Create a test Axum application with an explicit request-tracing toggle.
+#[allow(dead_code)]
+pub fn create_test_app_with_tracing(
+    router: Arc<dyn RouterTrait>,
+    client: Client,
+    router_config: &RouterConfig,
+    enable_request_tracing: bool,
+) -> Router {
+    create_test_app_with_wasm(router, client, router_config, enable_request_tracing, None)
+}
+
+/// Create a test Axum application with optional WASM OnRequest middleware.
+#[allow(dead_code)]
+pub fn create_test_app_with_wasm(
+    router: Arc<dyn RouterTrait>,
+    client: Client,
+    router_config: &RouterConfig,
+    enable_request_tracing: bool,
+    wasm_runtime: Option<Arc<WasmMiddlewareRuntime>>,
+) -> Router {
+    // Create AppContext
+    let app_context = Arc::new(
+        AppContext::new(
+            router_config.clone(),
+            client,
+            router_config.max_concurrent_requests,
+            router_config.rate_limit_tokens_per_second,
+            router_config.api_key_validation_urls.clone(),
+        )
+        .expect("Failed to create AppContext in test"),
+    );
+
+    build_test_app(
+        router,
+        app_context,
+        router_config,
+        enable_request_tracing,
+        wasm_runtime,
+    )
+}
+
+/// Create a test Axum application that shares `app_context` with the router.
+///
+/// Use this when a test calls endpoints that act on context state the router
+/// also uses, such as `/finish_session` releasing sessions in the router's
+/// `PolicyRegistry`. `create_test_app` builds a fresh context instead.
+#[allow(dead_code)]
+pub fn create_test_app_with_context(
+    router: Arc<dyn RouterTrait>,
+    app_context: Arc<AppContext>,
+    router_config: &RouterConfig,
+) -> Router {
+    build_test_app(
+        router,
+        app_context,
+        router_config,
+        otel_trace::is_otel_enabled(),
+        None,
+    )
+}
+
+fn build_test_app(
+    router: Arc<dyn RouterTrait>,
+    app_context: Arc<AppContext>,
+    router_config: &RouterConfig,
+    enable_request_tracing: bool,
+    wasm_runtime: Option<Arc<WasmMiddlewareRuntime>>,
+) -> Router {
+    // Create AppState with the test router and context
+    let app_state = Arc::new(AppState {
+        router,
+        context: app_context,
+        concurrency_queue_tx: None,
+        router_manager: None,
+    });
+
+    // Configure request ID headers (use defaults if not specified)
+    let request_id_headers = router_config.request_id_headers.clone().unwrap_or_else(|| {
+        vec![
+            "x-request-id".to_string(),
+            "x-correlation-id".to_string(),
+            "x-trace-id".to_string(),
+            "request-id".to_string(),
+        ]
+    });
+
+    // Use the actual server's build_app function (with optional WASM layer)
+    build_app_with_wasm_middleware(
+        app_state,
+        router_config.max_payload_size,
+        request_id_headers,
+        router_config.cors_allowed_origins.clone(),
+        true, // enable_transparent_proxy
+        enable_request_tracing,
+        wasm_runtime,
+    )
+}

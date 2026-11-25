@@ -1,6 +1,6 @@
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 use super::*;
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 use std::sync::Arc;
 
 #[test]

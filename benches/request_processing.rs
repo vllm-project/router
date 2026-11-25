@@ -61,7 +61,7 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
         stop_token_ids: None,
         no_stop_trim: false,
         ignore_eos: false,
-        add_generation_prompt: true,
+        add_generation_prompt: Some(true),
         continue_final_message: false,
         skip_special_tokens: true,
         // VLLM Extensions
@@ -151,7 +151,7 @@ fn create_sample_chat_completion_request() -> ChatCompletionRequest {
         messages: vec![
             ChatMessage::System {
                 role: "system".to_string(),
-                content: "You are a helpful assistant".to_string(),
+                content: UserMessageContent::Text("You are a helpful assistant".to_string()),
                 name: None,
             },
             ChatMessage::User {
@@ -192,7 +192,9 @@ fn create_sample_completion_request() -> CompletionRequest {
 fn create_large_chat_completion_request() -> ChatCompletionRequest {
     let mut messages = vec![ChatMessage::System {
         role: "system".to_string(),
-        content: "You are a helpful assistant with extensive knowledge.".to_string(),
+        content: UserMessageContent::Text(
+            "You are a helpful assistant with extensive knowledge.".to_string(),
+        ),
         name: None,
     }];
 
@@ -205,7 +207,7 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
         });
         messages.push(ChatMessage::Assistant {
             role: "assistant".to_string(),
-            content: Some(format!("Answer {}: This is a detailed response about topic {} that covers multiple aspects and provides comprehensive analysis of the interconnected systems you mentioned.", i, i)),
+            content: Some(UserMessageContent::Text(format!("Answer {}: This is a detailed response about topic {} that covers multiple aspects and provides comprehensive analysis of the interconnected systems you mentioned.", i, i))),
             name: None,
             tool_calls: None,
             function_call: None,
@@ -228,6 +230,22 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
         seed: Some(42),
         parallel_tool_calls: Some(true),
         ..default_chat_completion_request()
+    }
+}
+
+/// A `/v1/completions` request with a ~1 MiB CJK text prompt.
+///
+/// `PromptInput` is an untagged enum; before #310 the sequence variants were
+/// tried before `String`, so this request paid for formatting the whole prompt
+/// into discarded errors on every parse.
+fn create_large_completion_request() -> CompletionRequest {
+    let bytes = 1usize << 20;
+    let prompt = "汉".repeat(bytes / "汉".len());
+    CompletionRequest {
+        model: Some("benchmark-model".to_string()),
+        prompt: PromptInput::String(prompt),
+        max_tokens: Some(16),
+        ..default_completion_request()
     }
 }
 
@@ -286,6 +304,7 @@ fn bench_json_deserialization(c: &mut Criterion) {
     let chat_json = to_string(&create_sample_chat_completion_request()).unwrap();
     let completion_json = to_string(&create_sample_completion_request()).unwrap();
     let large_chat_json = to_string(&create_large_chat_completion_request()).unwrap();
+    let large_completion_json = to_string(&create_large_completion_request()).unwrap();
 
     group.bench_function("generate_request", |b| {
         b.iter(|| {
@@ -311,6 +330,13 @@ fn bench_json_deserialization(c: &mut Criterion) {
     group.bench_function("large_chat_completion_request", |b| {
         b.iter(|| {
             let req: ChatCompletionRequest = from_str(black_box(&large_chat_json)).unwrap();
+            black_box(req);
+        });
+    });
+
+    group.bench_function("large_completion_request", |b| {
+        b.iter(|| {
+            let req: CompletionRequest = from_str(black_box(&large_completion_json)).unwrap();
             black_box(req);
         });
     });
@@ -499,7 +525,7 @@ fn benchmark_summary(c: &mut Criterion) {
 
     println!("\nPerformance Insights:");
     if deserialize_time > serialize_time * 2 {
-        println!("  • Deserialization is significantly faster than serialization");
+        println!("  • Serialization is significantly faster than deserialization");
     }
     if total_pipeline < 100_000 {
         println!("  • Total pipeline latency is excellent (< 100μs)");

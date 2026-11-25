@@ -69,7 +69,7 @@ echo "Using CUDA installation at: $CUDA_PATH"
 
 # Step 7: Build aws-ofi-nccl
 echo "Step 7: Building aws-ofi-nccl..."
-make -j$(nproc)
+make -j"$(nproc)"
 
 # Step 8: Install aws-ofi-nccl
 echo "Step 8: Installing aws-ofi-nccl..."

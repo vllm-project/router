@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "algorithm": "sha256_cbor",
+  "cbor2_version": "5.6.5",
+  "block_size": 16,
+  "token_ids": [
+    0,
+    1,
+    22,
+    23,
+    24,
+    25,
+    254,
+    255,
+    256,
+    257,
+    65534,
+    65535,
+    65536,
+    65537,
+    151644,
+    4294967295,
+    151643,
+    151644,
+    151645,
+    151667,
+    151668,
+    198,
+    271,
+    872,
+    8948,
+    77091,
+    0,
+    23,
+    24,
+    255,
+    256,
+    65536,
+    4294967295,
+    42,
+    151644
+  ],
+  "trailing_partial_tokens": 3,
+  "cases": [
+    {
+      "seed": 0,
+      "seed_cbor_hex": "6130",
+      "none_hash": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+      "block_cbor_hex": [
+        "8358204e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e90000116171818181918fe18ff19010019010119fffe19ffff1a000100001a000100011a0002505c1afffffffff6",
+        "835820abc28f6fcd2e01b1d065fc6d90ab913189c6eb5513c03faba6ff4b8dbea2901a901a0002505b1a0002505c1a0002505d1a000250731a0002507418c619010f1903681922f41a00012d230017181818ff1901001a00010000f6"
+      ],
+      "block_hashes": [
+        "abc28f6fcd2e01b1d065fc6d90ab913189c6eb5513c03faba6ff4b8dbea2901a",
+        "64fc1a0d1957bba6c3546451a8fad6b975fce118dacc586b83338d9af6023d99"
+      ]
+    },
+    {
+      "seed": 42,
+      "seed_cbor_hex": "623432",
+      "none_hash": "9fa6eb003f14425eb9c8e6baacfbcaab26257357b829c7bfa74ffcc4f31c1780",
+      "block_cbor_hex": [
+        "8358209fa6eb003f14425eb9c8e6baacfbcaab26257357b829c7bfa74ffcc4f31c178090000116171818181918fe18ff19010019010119fffe19ffff1a000100001a000100011a0002505c1afffffffff6",
+        "8358208ac1f63c6af821cf66b6ab2fc127ac685fa1665b65c7b97762dd0ad9dcaedb04901a0002505b1a0002505c1a0002505d1a000250731a0002507418c619010f1903681922f41a00012d230017181818ff1901001a00010000f6"
+      ],
+      "block_hashes": [
+        "8ac1f63c6af821cf66b6ab2fc127ac685fa1665b65c7b97762dd0ad9dcaedb04",
+        "d42c1f2e9b78de1a9547153912d6f3a022dadb6b6b19bfb1a1943ea449809e76"
+      ]
+    }
+  ]
+}
