@@ -672,6 +672,7 @@ pub(super) async fn execute(
     policy_prefill: usize,
     pd_load: &Arc<super::pd_types::PdLoadManager>,
     decode_worker: Arc<dyn Worker>,
+    prefill_deadline: &mut Option<Instant>,
 ) -> Option<Result<(Response, Option<PdResponseContext>), String>> {
     // Discovery lacks a registration incarnation fence for this protocol.
     if runtime.discovery {
@@ -864,10 +865,18 @@ pub(super) async fn execute(
             attempt.finish_prefill();
             json!({"do_remote_decode":false,"do_remote_prefill":false,"pd_local_max_miss_tokens":warm_remote.config.local_execution_budget_tokens,"pd_local_max_running_requests":local_running_limit,"pd_local_max_local_prefills":warm_remote.config.max_local_requests_per_target})
         } else {
-            let permit = runtime
-                .reserve_prefill(&p.id)
-                .await
-                .map_err(|_| "P capacity timeout")?;
+            let deadline =
+                *prefill_deadline.get_or_insert_with(|| runtime.prefill_wait_deadline());
+            let permit = match runtime.reserve_prefill_until(&p.id, deadline).await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    if !prefill_target_is_live(runtime, &p.id) {
+                        warm_remote.invalidate_target(&p.base_url, p.dp_rank);
+                        return Err(ExecuteError::Reselect);
+                    }
+                    return Err(ExecuteError::Failed("P capacity timeout".into()));
+                }
+            };
             if !prefill_target_is_live(runtime, &p.id) {
                 warm_remote.invalidate_target(&p.base_url, p.dp_rank);
                 return Err(ExecuteError::Reselect);

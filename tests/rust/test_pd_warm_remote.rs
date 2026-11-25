@@ -226,8 +226,25 @@ async fn router_with_registry_and_policy(
     local: bool,
     pd_extra: serde_json::Value,
 ) -> (VllmPDRouter, Arc<vllm_router_rs::core::WorkerRegistry>) {
-    let (cfg, prefill_urls) =
-        warm_router_config(prefills, d, &PolicyConfig::RoundRobin, local, pd_extra);
+    router_with_registry_policy_and_queue_timeout(prefills, d, select, local, pd_extra, 2.0).await
+}
+
+async fn router_with_registry_policy_and_queue_timeout(
+    prefills: &[&Engine],
+    d: &Engine,
+    select: Arc<dyn LoadBalancingPolicy>,
+    local: bool,
+    pd_extra: serde_json::Value,
+    queue_timeout_seconds: f64,
+) -> (VllmPDRouter, Arc<vllm_router_rs::core::WorkerRegistry>) {
+    let (cfg, prefill_urls) = warm_router_config_with_queue_timeout(
+        prefills,
+        d,
+        &PolicyConfig::RoundRobin,
+        local,
+        pd_extra,
+        queue_timeout_seconds,
+    );
     let ctx = Arc::new(AppContext::new(cfg, reqwest::Client::new(), 64, None, vec![]).unwrap());
     let registry = ctx.worker_registry.clone();
     let router = router_with_selection(&ctx, select, prefill_urls, d).await;
@@ -260,6 +277,17 @@ fn warm_router_config(
     local: bool,
     pd_extra: serde_json::Value,
 ) -> (RouterConfig, Vec<(String, Option<u16>)>) {
+    warm_router_config_with_queue_timeout(prefills, d, policy, local, pd_extra, 2.0)
+}
+
+fn warm_router_config_with_queue_timeout(
+    prefills: &[&Engine],
+    d: &Engine,
+    policy: &PolicyConfig,
+    local: bool,
+    pd_extra: serde_json::Value,
+    queue_timeout_seconds: f64,
+) -> (RouterConfig, Vec<(String, Option<u16>)>) {
     let prefill_urls = prefills
         .iter()
         .map(|p| (p.url.clone(), None))
@@ -282,7 +310,8 @@ fn warm_router_config(
             target.insert(key.clone(), value.clone());
         }
     }
-    cfg.program_scheduling=Some(serde_json::from_value(json!({"token_capacity_per_dp_rank":100000,"enable_batch_gain_admission":false,"decode_buffer_tokens":4,"metrics_interval_seconds":0.02,"queue_timeout_seconds":2,"force_resume_timeout_seconds":1,"pd":pd})).unwrap());
+    let force_resume_timeout_seconds = queue_timeout_seconds.min(1.0);
+    cfg.program_scheduling=Some(serde_json::from_value(json!({"token_capacity_per_dp_rank":100000,"enable_batch_gain_admission":false,"decode_buffer_tokens":4,"metrics_interval_seconds":0.02,"queue_timeout_seconds":queue_timeout_seconds,"force_resume_timeout_seconds":force_resume_timeout_seconds,"pd":pd})).unwrap());
     if local {
         let pd = &mut cfg.program_scheduling.as_mut().unwrap().pd;
         pd.local_append = true;
@@ -780,6 +809,7 @@ struct RecordingPrefill {
     needs_cache_key: bool,
     needs_headers: bool,
     rotate: bool,
+    picks: Option<Vec<usize>>,
     calls: RecordedCalls,
     counter: AtomicUsize,
 }
@@ -793,6 +823,23 @@ impl RecordingPrefill {
         Self::with_rotation(needs_text, needs_cache_key, needs_headers, false)
     }
 
+    fn scripted(
+        needs_text: bool,
+        needs_cache_key: bool,
+        needs_headers: bool,
+        picks: Vec<usize>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            needs_text,
+            needs_cache_key,
+            needs_headers,
+            rotate: false,
+            picks: Some(picks),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            counter: AtomicUsize::new(0),
+        })
+    }
+
     fn with_rotation(
         needs_text: bool,
         needs_cache_key: bool,
@@ -804,6 +851,7 @@ impl RecordingPrefill {
             needs_cache_key,
             needs_headers,
             rotate,
+            picks: None,
             calls: Arc::new(Mutex::new(Vec::new())),
             counter: AtomicUsize::new(0),
         })
@@ -825,10 +873,11 @@ impl LoadBalancingPolicy for RecordingPrefill {
             .lock()
             .unwrap()
             .push((request_text.map(str::to_string), headers.cloned()));
-        let index = if self.rotate {
-            self.counter.fetch_add(1, Ordering::SeqCst) % workers.len()
-        } else {
-            0
+        let pos = self.counter.fetch_add(1, Ordering::SeqCst);
+        let index = match &self.picks {
+            Some(picks) => picks.get(pos).copied().unwrap_or(0) % workers.len(),
+            None if self.rotate => pos % workers.len(),
+            None => 0,
         };
         Some(index)
     }
@@ -1337,5 +1386,269 @@ async fn capacity_wait_returns_no_feasible_when_last_prefill_circuit_breaker_ope
     assert!(
         body_text.contains("No feasible registered P/D pair"),
         "expected no-feasible 503 after last prefill tripped circuit breaker during wait, got: {body_text}"
+    );
+}
+
+async fn run_capacity_wait_timeout_liveness_race(
+    prefills: &[&Engine],
+    policy: Arc<RecordingPrefill>,
+    headers: Option<HeaderMap>,
+    queue_timeout_seconds: f64,
+) -> (StatusCode, Vec<u8>) {
+    let p0 = prefills[0];
+    let d = engine(false, false, false).await;
+    let (r, registry) = router_with_registry_policy_and_queue_timeout(
+        prefills,
+        &d,
+        policy,
+        false,
+        json!({"max_prefill_requests_per_target": 1}),
+        queue_timeout_seconds,
+    )
+    .await;
+    let r = Arc::new(r);
+    let p0_worker = registry
+        .get_by_url(&p0.url)
+        .expect("prefill worker registered");
+    assert_eq!(registry.get_prefill_workers()[0].url(), p0.url);
+
+    // Populate warm capability cache for p0 and d before taking the capacity slot.
+    let (warm_status, _, warm_body) = send_completion(
+        &r,
+        None,
+        completion_body("timeout-warm", &[10, 11, 12], true, false),
+    )
+    .await;
+    assert_eq!(
+        warm_status,
+        StatusCode::OK,
+        "warmup turn failed: {}",
+        String::from_utf8_lossy(&warm_body)
+    );
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 1);
+    wait_for_worker_load(p0_worker.as_ref(), 0, false).await;
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *p0.state.prefill_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+
+    let r1 = Arc::clone(&r);
+    let req1 = tokio::spawn(async move {
+        send_completion(
+            &r1,
+            None,
+            completion_body("timeout-hold", &[20, 21, 22], true, false),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("timed out waiting for req1 to enter prefill gate");
+    assert_eq!(p0_worker.load(), 1);
+
+    let r2 = Arc::clone(&r);
+    let req2 = tokio::spawn(async move {
+        send_completion(
+            &r2,
+            headers.as_ref(),
+            completion_body("timeout-wait", &[30, 31, 32], true, false),
+        )
+        .await
+    });
+    wait_for_worker_load(p0_worker.as_ref(), 2, true).await;
+    // Allow req2 to park on reserve_prefill before tripping p0 while req1 keeps holding the slot.
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    p0_worker.circuit_breaker().force_open();
+    assert!(!p0_worker.is_available());
+
+    let (status2, _, body2) = req2.await.unwrap();
+    release.notify_one();
+    let (status1, _, body1) = req1.await.unwrap();
+    assert_eq!(
+        status1,
+        StatusCode::OK,
+        "holding request failed: {}",
+        String::from_utf8_lossy(&body1)
+    );
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    (status2, body2)
+}
+
+#[tokio::test]
+async fn capacity_wait_timeout_reselects_when_prefill_leaves_while_slot_held() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let policy = RecordingPrefill::pinned_first(true, false, true);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-session-id",
+        HeaderValue::from_static("session-timeout-wait"),
+    );
+
+    let (status2, body2) =
+        run_capacity_wait_timeout_liveness_race(&[&p0, &p1], policy.clone(), Some(headers), 0.25)
+            .await;
+    assert_eq!(
+        status2,
+        StatusCode::OK,
+        "expected reselection after timeout when prefill left while slot stayed held, got: {}",
+        String::from_utf8_lossy(&body2)
+    );
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 2);
+    assert_eq!(p1.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        4,
+        "expected warmup + hold + wait + reselect calls: {calls:?}"
+    );
+    assert_eq!(calls[2], calls[3]);
+    assert_eq!(
+        calls[3]
+            .1
+            .as_ref()
+            .and_then(|h| h.get("x-session-id"))
+            .map(String::as_str),
+        Some("session-timeout-wait")
+    );
+}
+
+#[tokio::test]
+async fn capacity_wait_timeout_reselect_preserves_overall_deadline_when_sibling_saturated() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::scripted(true, false, true, vec![0, 1, 0, 0, 0]);
+    let (r, registry) = router_with_registry_policy_and_queue_timeout(
+        &[&p0, &p1],
+        &d,
+        policy.clone(),
+        false,
+        json!({"max_prefill_requests_per_target": 1}),
+        0.4,
+    )
+    .await;
+    let r = Arc::new(r);
+    let p0_worker = registry.get_by_url(&p0.url).expect("p0 worker registered");
+    let p1_worker = registry.get_by_url(&p1.url).expect("p1 worker registered");
+
+    let (warm_status, _, warm_body) = send_completion(
+        &r,
+        None,
+        completion_body("timeout-deadline-warm", &[10, 11, 12], true, false),
+    )
+    .await;
+    assert_eq!(
+        warm_status,
+        StatusCode::OK,
+        "warmup turn failed: {}",
+        String::from_utf8_lossy(&warm_body)
+    );
+    wait_for_worker_load(p0_worker.as_ref(), 0, false).await;
+
+    let p1_entered = Arc::new(tokio::sync::Notify::new());
+    let p1_release = Arc::new(tokio::sync::Notify::new());
+    *p1.state.prefill_gate.lock().unwrap() = Some((p1_entered.clone(), p1_release.clone()));
+    let r_p1 = Arc::clone(&r);
+    let req_p1 = tokio::spawn(async move {
+        send_completion(
+            &r_p1,
+            None,
+            completion_body("timeout-hold-p1", &[20, 21, 22], true, false),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), p1_entered.notified())
+        .await
+        .expect("timed out waiting for req_p1 to enter p1 prefill gate");
+    assert_eq!(p1_worker.load(), 1);
+
+    let p0_entered = Arc::new(tokio::sync::Notify::new());
+    let p0_release = Arc::new(tokio::sync::Notify::new());
+    *p0.state.prefill_gate.lock().unwrap() = Some((p0_entered.clone(), p0_release.clone()));
+    let r_p0 = Arc::clone(&r);
+    let req_p0 = tokio::spawn(async move {
+        send_completion(
+            &r_p0,
+            None,
+            completion_body("timeout-hold-p0", &[25, 26, 27], true, false),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), p0_entered.notified())
+        .await
+        .expect("timed out waiting for req_p0 to enter p0 prefill gate");
+    assert_eq!(p0_worker.load(), 1);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-session-id",
+        HeaderValue::from_static("session-timeout-deadline"),
+    );
+    let started = std::time::Instant::now();
+    let r_wait = Arc::clone(&r);
+    let req_wait = tokio::spawn(async move {
+        send_completion(
+            &r_wait,
+            Some(&headers),
+            completion_body("timeout-wait-saturated", &[30, 31, 32], true, false),
+        )
+        .await
+    });
+    wait_for_worker_load(p0_worker.as_ref(), 2, true).await;
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    p0_worker.circuit_breaker().force_open();
+
+    let (status_wait, _, body_wait) = req_wait.await.unwrap();
+    let elapsed = started.elapsed();
+    p0_release.notify_one();
+    p1_release.notify_one();
+    assert_eq!(req_p0.await.unwrap().0, StatusCode::OK);
+    assert_eq!(req_p1.await.unwrap().0, StatusCode::OK);
+
+    assert_eq!(
+        status_wait,
+        StatusCode::TOO_MANY_REQUESTS,
+        "expected queue timeout 429 on saturated sibling after reselection, got: {}",
+        String::from_utf8_lossy(&body_wait)
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(350)
+            && elapsed < std::time::Duration::from_millis(650),
+        "expected single 0.4s overall queue timeout across reselection, elapsed={elapsed:?}"
+    );
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 2);
+    assert_eq!(p1.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        5,
+        "expected warmup + hold_p1 + hold_p0 + wait + reselect calls: {calls:?}"
+    );
+    assert_eq!(calls[3], calls[4]);
+    assert_eq!(
+        calls[4]
+            .1
+            .as_ref()
+            .and_then(|h| h.get("x-session-id"))
+            .map(String::as_str),
+        Some("session-timeout-deadline")
+    );
+}
+
+#[tokio::test]
+async fn capacity_wait_timeout_returns_no_feasible_when_last_prefill_leaves_while_slot_held() {
+    let p0 = engine(true, false, false).await;
+    let policy = RecordingPrefill::pinned_first(false, false, false);
+
+    let (status2, body2) =
+        run_capacity_wait_timeout_liveness_race(&[&p0], policy, None, 0.25).await;
+    assert_eq!(status2, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 2);
+    let body_text = String::from_utf8_lossy(&body2);
+    assert!(
+        body_text.contains("No feasible registered P/D pair"),
+        "expected no-feasible 503 after last prefill left during timeout wait, got: {body_text}"
     );
 }

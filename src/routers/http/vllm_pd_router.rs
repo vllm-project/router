@@ -1562,6 +1562,7 @@ impl VllmPDRouter {
         // text or cache routing key, plus headers), so hash and cache-aware
         // policies keep their affinity on the warm path too.
         let mut selected = None;
+        let mut prefill_deadline = None;
         if let Some(warm_remote) = &runtime.warm_remote {
             // The warm-remote protocol has no discovery incarnation fence, and
             // execute() rejects discovery; keep discovery on the native PD path.
@@ -1597,6 +1598,7 @@ impl VllmPDRouter {
                         index,
                         &self.pd_router.pd_load,
                         decode_worker.clone(),
+                        &mut prefill_deadline,
                     )
                     .await
                     {
@@ -1652,7 +1654,13 @@ impl VllmPDRouter {
                 "No feasible registered P/D pair",
             ));
         };
-        let permit = match runtime.reserve_prefill(&prefill_id).await {
+        let permit = match runtime
+            .reserve_prefill_until(
+                &prefill_id,
+                prefill_deadline.unwrap_or_else(|| runtime.prefill_wait_deadline()),
+            )
+            .await
+        {
             Ok(permit) => permit,
             Err(error) => {
                 completion.finish(false);
