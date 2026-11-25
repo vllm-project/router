@@ -11,7 +11,7 @@ from tests.python.e2e.perf.binaries import preflight_router_bin as _preflight_ro
 from tests.python.e2e.perf.binaries import router_bin as _shared_router_bin
 from tests.python.e2e.perf.binaries import vllm_rs_bin as _shared_vllm_rs_bin
 from tests.python.e2e.perf.l1_encode.case_loader import L1Case, check_limits
-from tests.python.e2e.perf.process import (
+from tests.python.helpers.process import (
     RunningProc,
     launch_router,
     launch_worker,
