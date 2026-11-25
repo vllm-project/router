@@ -3,113 +3,21 @@ import json
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
 
 import pytest
-import requests
-
-from ..fixtures.ports import find_free_port
-from ..fixtures.router_manager import RouterManager
-
-
-def pytest_configure(config):
-    config.addinivalue_line("markers", "integration: mark as router integration test")
 
 
 @pytest.fixture
-def router_manager() -> Iterable[RouterManager]:
-    mgr = RouterManager()
-    try:
-        yield mgr
-    finally:
-        mgr.stop_all()
-
-
-def _spawn_mock_worker(args: List[str]) -> Tuple[subprocess.Popen, str, str]:
-    repo_root = Path(__file__).resolve().parents[3]
-    script = repo_root / "tests" / "python" / "fixtures" / "mock_worker.py"
-    port = find_free_port()
-    worker_id = f"worker-{port}"
-    base_cmd = [
-        sys.executable,
-        str(script),
-        "--port",
-        str(port),
-        "--worker-id",
-        worker_id,
-    ]
-    cmd = base_cmd + args
-    proc = subprocess.Popen(cmd)
-    url = f"http://127.0.0.1:{port}"
-    _wait_health(url)
-    return proc, url, worker_id
-
-
-def _wait_health(url: str, timeout: float = 10.0):
-    start = time.time()
-    with requests.Session() as s:
-        while time.time() - start < timeout:
-            try:
-                r = s.get(f"{url}/health", timeout=1)
-                if r.status_code == 200:
-                    return
-            except requests.RequestException:
-                pass
-            time.sleep(0.1)
-    raise TimeoutError(f"Mock worker at {url} did not become healthy")
+def mock_worker(mock_worker_manager):
+    """Start a single healthy mock worker; returns (process, url, worker_id)."""
+    return mock_worker_manager.start_worker()
 
 
 @pytest.fixture
-def mock_worker():
-    """Start a single healthy mock worker; yields (process, url, worker_id)."""
-    proc, url, worker_id = _spawn_mock_worker([])
-    try:
-        yield proc, url, worker_id
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-
-
-@pytest.fixture
-def mock_workers():
-    """Factory to start N workers with custom args.
-
-    Usage:
-        procs, urls, ids = mock_workers(n=3, args=["--latency-ms", "5"])  # same args for all
-        ...
-    """
-
-    procs: List[subprocess.Popen] = []
-
-    def _start(n: int, args: Optional[List[str]] = None):
-        args = args or []
-        new_procs: List[subprocess.Popen] = []
-        urls: List[str] = []
-        ids: List[str] = []
-        for _ in range(n):
-            p, url, wid = _spawn_mock_worker(args)
-            procs.append(p)
-            new_procs.append(p)
-            urls.append(url)
-            ids.append(wid)
-        return new_procs, urls, ids
-
-    try:
-        yield _start
-    finally:
-        for p in procs:
-            if p.poll() is None:
-                p.terminate()
-                try:
-                    p.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    p.kill()
+def mock_workers(mock_worker_manager):
+    """Factory to start N healthy mock workers with custom args."""
+    return mock_worker_manager.start_workers
 
 
 @pytest.fixture(scope="session")
@@ -202,7 +110,7 @@ def kv_st_runtime(tmp_path_factory):
 
 @pytest.fixture
 def kv_workers(kv_st_runtime):
-    from ..fixtures.mock_worker import GrpcKvWorker
+    from tests.python.helpers.mock_worker import GrpcKvWorker
 
     workers = []
 
