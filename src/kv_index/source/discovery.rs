@@ -559,7 +559,8 @@ impl KvIndexSupervisor {
                 .flatten();
             }
         }
-        if connector != Some(KvConnector::Mooncake)
+        if !matches!(connector, Some(KvConnector::Nixl | KvConnector::Mooncake))
+            || layout.prefill_truncates_compressed.is_some()
             || !layout.ranks.iter().any(|rank| {
                 rank.groups
                     .iter()
@@ -577,11 +578,7 @@ impl KvIndexSupervisor {
             // This optional metadata lookup must leave time to install the source.
             if let Ok(Ok(runtime)) = tokio::time::timeout(
                 CONTROL_TIMEOUT / 4,
-                probe::query_server_info_json(
-                    &self.client,
-                    split_worker_rank(worker_url).0,
-                    self.api_key.as_deref(),
-                ),
+                probe::query_server_info_json(&self.client, base, self.api_key.as_deref()),
             )
             .await
             {
@@ -1171,6 +1168,7 @@ fn synthesize_plain_full_layout(
     ranks.sort_unstable_by_key(|rank| rank.rank);
     Some(CacheCapabilities {
         schema_version: 1,
+        prefill_truncates_compressed: None,
         adapters: Vec::new(),
         ranks,
     })

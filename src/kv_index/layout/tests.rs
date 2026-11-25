@@ -793,7 +793,7 @@ mod declarations {
         ] {
             let binding = bind_layout(&value, "epoch-1")
                 .unwrap()
-                .with_pd_prefill(connector, false);
+                .with_pd_prefill(connector, false, None);
             binding.begin_empty(0);
             binding.apply_payload(0, &payload).unwrap();
             assert_eq!(
@@ -912,15 +912,20 @@ mod declarations {
         value["ranks"][0]["groups"][2]["cache_role"] = "sparse".into();
         use crate::config::KvConnector;
         for (connector, truncates_compressed, expected) in [
-            (Some(KvConnector::Mooncake), true, 16383),
-            (Some(KvConnector::Mooncake), false, 16384),
-            (Some(KvConnector::Nixl), true, 16384),
-            (None, true, 16384),
+            (Some(KvConnector::Mooncake), None, 16383),
+            (Some(KvConnector::Mooncake), Some(false), 16384),
+            (Some(KvConnector::Nixl), Some(true), 16383),
+            (Some(KvConnector::Nixl), Some(false), 16384),
+            (Some(KvConnector::Nixl), None, 16384),
+            (None, Some(true), 16384),
         ] {
-            let binding = bind_layout(&value, "ds4")
-                .unwrap()
-                .with_pd_prefill(connector, truncates_compressed);
+            let binding = bind_layout(&value, "ds4").unwrap().with_pd_prefill(
+                connector,
+                true,
+                truncates_compressed,
+            );
             assert_eq!(binding.reusable_prompt_cap(16385), expected);
+            assert_eq!(binding.reusable_prompt_cap(16386), expected + 1);
         }
         let window = &mut value["ranks"][0]["groups"][0];
         window["prefix_cacheable"] = false.into();
@@ -932,7 +937,7 @@ mod declarations {
         ] {
             let binding = bind_layout(&value, "ds4")
                 .unwrap()
-                .with_pd_prefill(connector, truncates);
+                .with_pd_prefill(connector, truncates, None);
             assert_eq!(binding.reusable_prompt_cap(1025), expected);
         }
         value["ranks"][0]["groups"][0]["sliding_window"] = 0.into();

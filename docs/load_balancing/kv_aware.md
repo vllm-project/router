@@ -208,6 +208,7 @@ For a manual layout, add only the fields the deployment needs.
 - `hash_block_size` (tokens) when Router cannot discover it. HTTP event discovery can read it from worker metrics.
 - `partial_hash_hits: true` when the worker can reuse prefixes at boundaries inside a cache block.
 - `hash_seed` (string) when the worker uses a custom `PYTHONHASHSEED`. Use the same value.
+- `prefill_truncates_compressed: true` at worker level, next to `ranks`, when a P/D connector removes the last prompt token before looking up compressed prefixes. For example, set this for Ascend `MooncakeHybridConnector` with Router `--kv-connector nixl` passthrough when the worker does not expose this information through `/server_info`.
 
 ### Model layout reference
 
