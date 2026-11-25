@@ -199,8 +199,9 @@ mod decode_disconnect {
         let first = next_chunk(&mut body).await;
         assert_eq!(first, SSE_FIRST_EVENT, "[client] first event");
         decode.release();
-        let (_, broken) = rest_of_body(body).await;
+        let (rest, broken) = rest_of_body(body).await;
         assert!(broken, "[client] the stream ends with an error");
+        assert_eq!(rest, "", "[client] nothing after the first event");
         rig.expect_no_cancel().await;
     }
 
@@ -214,12 +215,15 @@ mod decode_disconnect {
             let client = rig.send(two_images(true));
             rig.consumer.wait_requests(1).await;
             rig.consumer.release();
+            rig.consumer.expect_completed().await;
             let response = answer(client).await;
             assert_eq!(
                 response.status(),
                 StatusCode::BAD_GATEWAY,
                 "[client] transport error"
             );
+            let text = text(response).await;
+            assert!(text.contains("Backend request failed"), "[client] {text}");
             rig.expect_cancel().await;
         }
         decode_breaks_mid_sse(Path::CombinedPd).await;
@@ -235,6 +239,7 @@ mod decode_disconnect {
             rig.decode.wait_requests(1).await;
             rig.consumer.expect_completed().await;
             rig.decode.release();
+            rig.decode.expect_completed().await;
             let response = answer(client).await;
             assert_eq!(
                 response.status(),
