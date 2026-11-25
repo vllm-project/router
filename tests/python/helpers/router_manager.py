@@ -1,4 +1,5 @@
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -15,6 +16,19 @@ class ProcHandle:
     process: subprocess.Popen
     url: str
     prometheus_port: Optional[int] = None
+
+
+class _RouterExited(Exception):
+    """The router process exited before /health returned 200."""
+
+
+def _port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            return True
+    return False
 
 
 class RouterManager:
@@ -43,6 +57,7 @@ class RouterManager:
         timeout: float = 30.0,
     ) -> ProcHandle:
         worker_urls = worker_urls or []
+        pick_port = not port
         port = port or find_free_port()
         router_bin = router_bin or os.environ.get("VLLM_ROUTER_TEST_BIN")
         if router_bin:
@@ -154,16 +169,44 @@ class RouterManager:
                 else:
                     cmd.extend([flag, str(v)])
 
-        proc = subprocess.Popen(cmd, env={**os.environ, **(env or {})})
-        self._children.append(proc)
-        url = f"http://127.0.0.1:{port}"
-        self._wait_health(url, timeout)
-        return ProcHandle(process=proc, url=url, prometheus_port=prom_port)
+        # A picked port can be taken by another process before the router binds
+        # it. Retry with fresh ports when an early exit looks like that.
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            proc = subprocess.Popen(cmd, env={**os.environ, **(env or {})})
+            self._children.append(proc)
+            url = f"http://127.0.0.1:{port}"
+            try:
+                self._wait_health(url, timeout, proc=proc)
+                return ProcHandle(process=proc, url=url, prometheus_port=prom_port)
+            except _RouterExited:
+                self._children.remove(proc)
+                clash = _port_in_use(port) or _port_in_use(prom_port)
+                if not clash or attempt == attempts:
+                    raise RuntimeError(
+                        f"Router exited with code {proc.returncode} before becoming "
+                        f"healthy (port={port}, prometheus_port={prom_port}, "
+                        f"port_clash={clash}, attempt {attempt}/{attempts})"
+                    ) from None
+            if pick_port:
+                port = find_free_port()
+            prom_port = find_free_port()
+            while prom_port == port:
+                prom_port = find_free_port()
+            cmd[cmd.index("--port") + 1] = str(port)
+            cmd[cmd.index("--prometheus-port") + 1] = str(prom_port)
 
-    def _wait_health(self, base_url: str, timeout: float = 30.0):
+    def _wait_health(
+        self,
+        base_url: str,
+        timeout: float = 30.0,
+        proc: Optional[subprocess.Popen] = None,
+    ):
         start = time.time()
         with requests.Session() as s:
             while time.time() - start < timeout:
+                if proc is not None and proc.poll() is not None:
+                    raise _RouterExited
                 try:
                     r = s.get(f"{base_url}/health", timeout=2)
                     if r.status_code == 200:
