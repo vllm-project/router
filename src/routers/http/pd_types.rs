@@ -1,5 +1,7 @@
 use crate::core::Worker;
-use crate::policies::{AffinityKey, AffinityRecord, RequestHeaders};
+use crate::policies::{
+    AffinityKey, AffinityRecord, PdDecodePrices, RequestHeaders, ValidatedDecodePrices,
+};
 use axum::body::Body;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
@@ -174,6 +176,12 @@ pub struct PdPrefillInput {
     pub fallback_reason: Option<&'static str>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum DecodePricing<'a> {
+    Prepared(&'a PdDecodePrices),
+    Validated(&'a HashMap<String, u64>),
+}
+
 /// Token inputs are keyed by the P base URL: each backend renders its own
 /// effective input, so different tokenizer/template configurations never mix.
 #[derive(Clone)]
@@ -193,14 +201,38 @@ pub struct PdRequestContext<'a> {
     pub lora_name: Option<&'a str>,
     /// Request cache salt scoping the binding digest.
     pub cache_salt: Option<&'a str>,
-    /// Marginal Decode context per candidate, keyed by worker URL, priced
-    /// immediately before Decode is selected. `None` keeps Decode on full
-    /// context tokens, or on request counts when those are unknown too.
-    pub decode_context: Option<&'a HashMap<String, u64>>,
+    /// Marginal Decode context per candidate, keyed by worker URL.
+    /// Prices must be validated before ranking with them.
+    pub(super) decode_pricing: Option<DecodePricing<'a>>,
     pub route: &'a str,
     /// True when this admission is a health probe: it takes a pair but starts
     /// no sequence, so it must not reserve Decode occupancy.
     pub probe: bool,
+}
+
+impl<'a> PdRequestContext<'a> {
+    pub(super) fn decode_tokens(&self) -> Option<&HashMap<String, u64>> {
+        match self.decode_pricing {
+            Some(DecodePricing::Validated(tokens)) => Some(tokens),
+            _ => None,
+        }
+    }
+
+    /// Keep the guard holder in the caller until the load transaction returns.
+    pub(super) fn validate_decode<'b>(
+        &'b self,
+        workers: &[Arc<dyn Worker>],
+        validated: &'b mut Option<ValidatedDecodePrices<'a>>,
+    ) -> PdRequestContext<'b> {
+        let mut context = self.clone();
+        if let Some(DecodePricing::Prepared(prices)) = self.decode_pricing {
+            *validated = Some(prices.validate(workers));
+            context.decode_pricing = validated
+                .as_ref()
+                .map(|prices| DecodePricing::Validated(prices.tokens()));
+        }
+        context
+    }
 }
 
 /// Prompt tokens a Prefill decision established, including credited prefix.

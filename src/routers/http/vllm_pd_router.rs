@@ -6,7 +6,9 @@ use super::logprobs_merge;
 use super::pd_cached_tokens;
 use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_router::PdRouterBase;
-use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext};
+use super::pd_types::{
+    error_chain, DecodePricing, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext,
+};
 use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
@@ -1248,7 +1250,7 @@ impl VllmPDRouter {
             affinity_key: affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
             cache_salt,
-            decode_context: None,
+            decode_pricing: decode_context.as_ref().map(DecodePricing::Prepared),
             route: path,
             probe: false,
         };
@@ -1260,7 +1262,6 @@ impl VllmPDRouter {
             decode_workers,
             &context,
             defer_decode,
-            decode_context.as_ref(),
         )?;
         Some(Admission {
             selection,
@@ -1407,7 +1408,8 @@ impl VllmPDRouter {
         // Price the marginal Decode context here, not at admission: #500 defers
         // Decode selection until Prefill completes, and the cheap placeholder
         // figure taken then is stale by the time a candidate is actually picked.
-        // This runs before the commit so the closure below is pure selection.
+        // Prepare the estimate before locking the ledger. The commit only
+        // pins and revalidates the captured source evidence before selection.
         let decode_context = match self.pd_router.kv_state.as_ref() {
             Some(state) => {
                 state
@@ -1438,20 +1440,14 @@ impl VllmPDRouter {
             affinity_key: input.affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
             cache_salt: input.cache_salt.as_deref(),
-            decode_context: None,
+            decode_pricing: decode_context.as_ref().map(DecodePricing::Prepared),
             route: &input.route,
             probe: false,
         };
         // Keep the source guards until the deferred Decode commit finishes.
         let mut validated = None;
         let committed = self.pd_router.pd_load.commit_decode(attempt, |loads| {
-            validated = decode_context
-                .as_ref()
-                .map(|prices| prices.validate(&candidates));
-            let context = PdRequestContext {
-                decode_context: validated.as_ref().map(|prices| &prices.tokens),
-                ..context
-            };
+            let context = context.validate_decode(&candidates, &mut validated);
             super::pd_router::select_decode_stage(
                 loads,
                 &candidates,

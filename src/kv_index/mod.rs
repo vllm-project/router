@@ -25,6 +25,7 @@ pub(crate) fn next_owner_incarnation() -> u64 {
 
 pub(crate) mod layout;
 pub mod storage;
+pub(crate) use storage::SourceReadGuard;
 pub mod types;
 
 pub use discovery::{

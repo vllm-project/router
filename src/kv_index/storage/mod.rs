@@ -153,6 +153,8 @@ impl KvBlockIndexer {
     /// Check a snapshot after dropping its locks. Ordinary store/remove is a
     /// valid snapshot transition; suspension, resume, or retirement invalidates
     /// the result. This does not reserve engine blocks.
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn source_version_is_current(&self, version: &SourceVersion) -> bool {
         version.is_current()
     }

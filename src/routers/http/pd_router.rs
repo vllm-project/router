@@ -13,7 +13,7 @@ use crate::core::{
     Worker, WorkerRegistry, WorkerResult, WorkerType,
 };
 use crate::policies::WorkerTokenInputs;
-use crate::policies::{kv_aware_ops, LoadBalancingPolicy, PdDecodePrices, PolicyRegistry};
+use crate::policies::{kv_aware_ops, LoadBalancingPolicy, PolicyRegistry};
 use crate::routers::header_utils;
 use async_trait::async_trait;
 use axum::{
@@ -359,7 +359,7 @@ fn select_stage(
         let decode_prices = if !decode_tokens_known {
             None
         } else {
-            context.decode_context.filter(|prices| {
+            context.decode_tokens().filter(|prices| {
                 projected
                     .iter()
                     .all(|worker| prices.contains_key(worker.url()))
@@ -429,7 +429,7 @@ fn select_stage(
         } else {
             // Report what the selector actually used, not whether a table merely
             // existed: a table that failed the completeness filter above fell back
-            // to occupancy even though `context.decode_context` was `Some`.
+            // to occupancy even though prepared prices existed.
             match (decode_tokens_known, decode_prices_used) {
                 (true, true) => "context_tokens_marginal",
                 (true, false) => "context_tokens",
@@ -484,7 +484,7 @@ fn select_stage(
             Stage::Decode => {
                 let additional = if decode_prices_used {
                     context
-                        .decode_context
+                        .decode_tokens()
                         .and_then(|prices| prices.get(worker.url()))
                         .copied()
                         .unwrap_or(0)
@@ -735,7 +735,7 @@ impl PdRouterBase {
         decode_workers: &[Arc<dyn Worker>],
         context: &PdRequestContext<'_>,
     ) -> Option<(PdSelection, PdAttempt)> {
-        self.select_and_admit_with(prefill_workers, decode_workers, context, false, None)
+        self.select_and_admit_with(prefill_workers, decode_workers, context, false)
     }
 
     /// Admission with a deferred decode commitment.
@@ -753,7 +753,6 @@ impl PdRouterBase {
         decode_workers: &[Arc<dyn Worker>],
         context: &PdRequestContext<'_>,
         defer_decode: bool,
-        decode_prices: Option<&PdDecodePrices>,
     ) -> Option<(PdSelection, PdAttempt)> {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
@@ -769,13 +768,11 @@ impl PdRouterBase {
         // Keep the source guards until admission has committed the selection.
         let mut validated = None;
         let select = |loads: &Loads| {
-            let mut context = context.clone();
-            if !defer && !context.probe {
-                validated = decode_prices.map(|prices| prices.validate(decode_workers));
-                if let Some(prices) = validated.as_ref() {
-                    context.decode_context = Some(&prices.tokens);
-                }
-            }
+            let context = if !defer && !context.probe {
+                context.validate_decode(decode_workers, &mut validated)
+            } else {
+                context.clone()
+            };
             select_pd_pair(
                 loads,
                 prefill_workers,
@@ -1614,7 +1611,7 @@ impl PdRouterBase {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
-            decode_context: None,
+            decode_pricing: None,
             route: "/health_generate",
             probe: true,
         };
@@ -2148,7 +2145,7 @@ mod tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
-            decode_context: None,
+            decode_pricing: None,
             route: "/health_generate",
             probe: true,
         };
@@ -2180,7 +2177,7 @@ mod tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
-            decode_context: None,
+            decode_pricing: None,
             route: "/health_generate",
             probe: true,
         };
@@ -2736,7 +2733,7 @@ mod tests {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod admission_tests {
-    use super::super::pd_types::PdLoadSample;
+    use super::super::pd_types::{DecodePricing, PdLoadSample};
     use super::*;
     use crate::core::{BasicWorker, DPAwareWorker};
     use crate::policies::{AffinityKey, KvAwarePolicy, RequestHeaders, RoundRobinPolicy};
@@ -2866,7 +2863,7 @@ mod admission_tests {
     fn decode_clear_after_pricing_removes_only_the_revoked_candidates_credit() {
         use crate::kv_index::source::test_support::{event_batch, full_binding, warm_full};
         use crate::kv_index::{CacheKey, KVEvent, RoutableTarget};
-        use crate::policies::PromptHashes;
+        use crate::policies::{KvAwareOps, PromptHashes};
 
         let policy = KvAwarePolicy::default();
         let prompts = [vec![42; 33]];
@@ -2899,18 +2896,17 @@ mod admission_tests {
             .prepare_decode_prices(&inputs, &mut PromptHashes::new(), false)
             .unwrap();
         let select = |expected_tokens: [u64; 2], expected_worker: usize| {
-            let validated = prices.validate(&workers);
-            assert_eq!(
-                [
-                    validated.tokens[workers[0].url()],
-                    validated.tokens[workers[1].url()]
-                ],
-                expected_tokens
-            );
-            let context = PdRequestContext {
-                decode_context: Some(&validated.tokens),
+            let prepared = PdRequestContext {
+                decode_pricing: Some(DecodePricing::Prepared(&prices)),
                 ..context()
             };
+            let mut validated = None;
+            let context = prepared.validate_decode(&workers, &mut validated);
+            let tokens = context.decode_tokens().unwrap();
+            assert_eq!(
+                [tokens[workers[0].url()], tokens[workers[1].url()]],
+                expected_tokens
+            );
             let decision = select_decode_stage(&Loads::new(), &workers, &policy, &context).unwrap();
             assert_eq!(decision.worker_index, expected_worker);
             assert_eq!(
@@ -2976,7 +2972,7 @@ mod admission_tests {
             (d[1].url().to_owned(), 50u64),
         ]);
         let priced = PdRequestContext {
-            decode_context: Some(&prices),
+            decode_pricing: Some(DecodePricing::Validated(&prices)),
             ..context()
         };
         let selection = select_pd_pair(&loads, &p, &d, &policy, &policy, &priced, true).unwrap();
@@ -2990,7 +2986,7 @@ mod admission_tests {
         // the price of the other rank and fall back to occupancy, where @1 wins.
         let partial = HashMap::from([(d[0].url().to_owned(), 0u64)]);
         let partial_context = PdRequestContext {
-            decode_context: Some(&partial),
+            decode_pricing: Some(DecodePricing::Validated(&partial)),
             ..context()
         };
         let fallback =
@@ -3082,7 +3078,7 @@ mod admission_tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
-            decode_context: None,
+            decode_pricing: None,
             route: "/v1/completions",
             probe: false,
         }
@@ -3171,7 +3167,7 @@ mod admission_tests {
             affinity_key: Some(affinity_key(session)),
             lora_name: None,
             cache_salt: None,
-            decode_context: None,
+            decode_pricing: None,
             route: "/v1/completions",
             probe: false,
         }
@@ -3925,7 +3921,7 @@ mod admission_tests {
                 affinity_key: None,
                 lora_name: None,
                 cache_salt: None,
-                decode_context: None,
+                decode_pricing: None,
                 route: "/v1/completions",
                 probe: false,
             }

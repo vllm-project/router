@@ -15,10 +15,9 @@ use sha2::{Digest as _, Sha256};
 
 use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
-use crate::kv_index::storage::SourceReadGuard;
 use crate::kv_index::{
     CacheKey, PlacementEvidence, PromptKey, RequestHashCache, RoutableTarget, SharedPrefixLookup,
-    StorageTier, TierMatch, WorkerKvInfo,
+    SourceReadGuard, StorageTier, TierMatch, WorkerKvInfo,
 };
 use crate::request_identity::StableIdentity;
 
@@ -124,19 +123,27 @@ struct PdDecodePrice {
     target: RoutableTarget,
 }
 
-pub(crate) struct PdDecodePrices {
+#[doc(hidden)]
+pub struct PdDecodePrices {
     workers: HashMap<String, PdDecodePrice>,
     evidence: HashMap<RoutableTarget, Vec<PlacementEvidence>>,
 }
 
 pub(crate) struct ValidatedDecodePrices<'a> {
-    pub(crate) tokens: HashMap<String, u64>,
+    tokens: HashMap<String, u64>,
     _pins: Vec<SourceReadGuard<'a>>,
+}
+
+impl ValidatedDecodePrices<'_> {
+    pub(crate) fn tokens(&self) -> &HashMap<String, u64> {
+        &self.tokens
+    }
 }
 
 impl PdDecodePrices {
     /// Pin credited sources without waiting under the P/D load lock. Each
     /// unpinnable candidate falls back to its full input in the same units.
+    /// Keep the returned guards until the ledger commit returns.
     pub(crate) fn validate(&self, workers: &[Arc<dyn Worker>]) -> ValidatedDecodePrices<'_> {
         let mut tokens = HashMap::with_capacity(workers.len());
         let mut pins = Vec::new();
@@ -153,6 +160,8 @@ impl PdDecodePrices {
                 {
                     pins.extend(guards);
                     additional = price.additional_tokens;
+                } else {
+                    crate::metrics::RouterMetrics::record_kv_placement_lookup("credit_pin_failed");
                 }
             }
             tokens.insert(worker.url().to_owned(), additional);
@@ -193,6 +202,15 @@ pub trait KvAwareOps: Send + Sync {
         _nixl_pull: bool,
     ) -> Vec<DecodeWorkEstimate> {
         self.estimate_decode_work(inputs, hashes)
+    }
+    #[doc(hidden)]
+    fn prepare_decode_prices<'tokens>(
+        &self,
+        _inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
+        _hashes: &mut PromptHashes<'tokens>,
+        _nixl_pull: bool,
+    ) -> Option<PdDecodePrices> {
+        None
     }
     fn pick_prefill(&self, costs: &[f64], occupancy: &[usize]) -> Option<usize>;
     /// Decode-side occupancy picker for P/D: deterministic argmin over the
@@ -1064,7 +1082,6 @@ pub struct PromptHashes<'a> {
     // Each stage scores a single adapter identity for the entire request.
     matches: HashMap<(MatchScope, PromptKey<'a>), Vec<TierMatch>, foldhash::fast::RandomState>,
     hashes: RequestHashCache<'a>,
-    decode_targets: Vec<RoutableTarget>,
 }
 
 impl PromptHashes<'_> {
@@ -1116,7 +1133,11 @@ impl SelectionPlan {
     fn discard_revoked_credit(&mut self) {
         for proof in self.placement.iter().filter(|proof| proof.is_revoked()) {
             for (position, binding) in self.bindings.iter().enumerate() {
-                if proof.target() == &binding.target {
+                if proof.target() == &binding.target
+                    && (!self.grouped[position].is_empty()
+                        || self.prefill_tokens[position].is_some())
+                {
+                    crate::metrics::RouterMetrics::record_kv_placement_lookup("credit_revoked");
                     self.grouped[position].clear();
                     self.prefill_tokens[position] = None;
                 }
@@ -1159,40 +1180,91 @@ impl std::fmt::Debug for KvAwarePolicy {
 }
 
 impl KvAwarePolicy {
-    /// Keep the source target from the same binding that priced each candidate.
-    pub(crate) fn prepare_decode_prices<'tokens>(
+    fn decode_work<'tokens>(
         &self,
         inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
         hashes: &mut PromptHashes<'tokens>,
         nixl_pull: bool,
-    ) -> Option<PdDecodePrices> {
-        hashes.hashes.placement = Some(Vec::new());
-        let work = self.estimate_decode_work_with_transfer(inputs, hashes, nixl_pull);
-        let targets = std::mem::take(&mut hashes.decode_targets);
-        let placement = hashes.hashes.placement.take().unwrap_or_default();
-        let mut workers = HashMap::with_capacity(work.len());
-        for (((worker, prompts, _), estimate), target) in inputs.iter().zip(work).zip(targets) {
-            let input_tokens = prompts
-                .iter()
-                .map(|prompt| prompt.len() as u64)
-                .fold(0, u64::saturating_add);
-            workers.insert(
-                worker.url().to_owned(),
-                PdDecodePrice {
-                    additional_tokens: estimate.additional_tokens?,
+    ) -> Vec<Option<PdDecodePrice>> {
+        hashes.set_stage_targets(inputs, nixl_pull);
+        let mut lookups = crate::metrics::PlacementLookups::default();
+        let mut unique = hashes.hashes.single_target.then_some(true);
+        inputs
+            .iter()
+            .map(|&(worker, prompts, credit)| {
+                let binding = self.binding_for_worker(worker);
+                if !credit || binding.cache_key.is_none() {
+                    return None;
+                }
+                // Decode occupancy shrinks only by blocks already on the device. A prefix
+                // that lives in host memory or on disk still needs a GPU block when it
+                // arrives, so the tiered credits must not discount it: that would understate
+                // the new occupancy and can pick a busier worker. Prefill keeps the tiered
+                // credits, because there they avoid recompute.
+                let params = CostParams {
+                    block_size: binding.block_size,
+                    transfer_credits: TransferCredits {
+                        host_pinned: 0.0,
+                        external: 0.0,
+                        disk: 0.0,
+                        ..self.params.transfer_credits
+                    },
+                    ..self.params
+                };
+                let mut input_tokens = 0u64;
+                let mut additional_tokens = 0u64;
+                for tokens in prompts {
+                    let matches = Self::cached_matches(
+                        hashes,
+                        &mut lookups,
+                        &binding,
+                        tokens,
+                        None,
+                        None,
+                        || {
+                            prompts.len() == 1
+                                && *unique.get_or_insert_with(|| {
+                                    all_unique(inputs.iter().map(|(w, _, _)| w.url()))
+                                })
+                        },
+                    );
+                    let context = u64::try_from(tokens.len()).unwrap_or(u64::MAX);
+                    let reused = credited_tokens(
+                        &CandidateView {
+                            target: &binding.target,
+                            matches: &matches,
+                            load: LoadSample::default(),
+                            input_tokens: tokens.len(),
+                            prefill_tokens: None,
+                        },
+                        &params,
+                    ) as u64;
+                    let reused = if nixl_pull {
+                        binding.matches.nixl_decode_credit(
+                            binding.target.dp_rank,
+                            tokens.len(),
+                            reused,
+                        )
+                    } else {
+                        reused
+                    };
+                    // The engine shares one copy of the prompt's blocks across the
+                    // request's sequences, so the marginal cost is the prompt's
+                    // un-cached remainder once - the same amount the ledger charges when
+                    // this request becomes an existing one. Multiplying by `n` here made
+                    // a request cost more before admission than after, so the two sides of
+                    // the comparison disagreed.
+                    input_tokens = input_tokens.saturating_add(context);
+                    additional_tokens =
+                        additional_tokens.saturating_add(context.saturating_sub(reused));
+                }
+                Some(PdDecodePrice {
+                    additional_tokens,
                     input_tokens,
-                    target,
-                },
-            );
-        }
-        let mut evidence: HashMap<_, Vec<_>> = HashMap::new();
-        for proof in placement {
-            evidence
-                .entry(proof.target().clone())
-                .or_default()
-                .push(proof);
-        }
-        Some(PdDecodePrices { workers, evidence })
+                    target: binding.target.clone(),
+                })
+            })
+            .collect()
     }
 
     pub fn new(params: CostParams) -> Self {
@@ -1367,6 +1439,7 @@ impl KvAwarePolicy {
                 binding.target.dp_rank,
                 hashes,
             );
+            let hit_count = hits.len();
             if let Some(start) = evidence_start {
                 let evidence = hashes
                     .placement
@@ -1376,7 +1449,9 @@ impl KvAwarePolicy {
                 // Each lookup must prove its own hits before they enter the memo.
                 hits.retain(|hit| evidence.iter().any(|proof| proof.target() == &hit.target));
             }
-            lookups.record(if binding.cache_key.is_none() {
+            lookups.record(if hit_count != hits.len() {
+                "unevidenced"
+            } else if binding.cache_key.is_none() {
                 "index_unavailable"
             } else if hits.is_empty() {
                 "miss"
@@ -1510,6 +1585,7 @@ impl KvAwarePolicy {
     ) -> Option<KvSelectionReceipt> {
         let digest = affinity_key.map(|key| key.scoped_digest(lora_name, cache_salt));
         let reserve_prefill = self.slot_manager.is_some();
+        let mut pin_failed = false;
         // After three stale placement snapshots, score live load and full input
         // work without querying the index or granting KV credit.
         for attempt in 0..=3 {
@@ -1608,6 +1684,8 @@ impl KvAwarePolicy {
                     .iter()
                     .filter(|proof| proof.target() == &target);
                 let Some(pins) = PlacementEvidence::try_pin_all(evidence) else {
+                    crate::metrics::RouterMetrics::record_kv_placement_lookup("credit_pin_failed");
+                    pin_failed = true;
                     if let Some(record) = record {
                         record.release_ref();
                     }
@@ -1627,6 +1705,8 @@ impl KvAwarePolicy {
             }
             let outcome = if used_binding {
                 "sticky_hit"
+            } else if attempt == 3 && pin_failed {
+                "placement_pin_failed"
             } else if attempt == 3 {
                 "registration_churn"
             } else if !plan.has_tokens {
@@ -2217,83 +2297,36 @@ impl KvAwareOps for KvAwarePolicy {
         hashes: &mut PromptHashes<'tokens>,
         nixl_pull: bool,
     ) -> Vec<DecodeWorkEstimate> {
-        hashes.set_stage_targets(inputs, nixl_pull);
-        let mut lookups = crate::metrics::PlacementLookups::default();
-        let mut unique = hashes.hashes.single_target.then_some(true);
-        inputs
-            .iter()
-            .map(|&(worker, prompts, credit)| {
-                let binding = self.binding_for_worker(worker);
-                if hashes.hashes.placement.is_some() {
-                    hashes.decode_targets.push(binding.target.clone());
-                }
-                if !credit || binding.cache_key.is_none() {
-                    return DecodeWorkEstimate::default();
-                }
-                // Decode occupancy shrinks only by blocks already on the device. A prefix
-                // that lives in host memory or on disk still needs a GPU block when it
-                // arrives, so the tiered credits must not discount it: that would understate
-                // the new occupancy and can pick a busier worker. Prefill keeps the tiered
-                // credits, because there they avoid recompute.
-                let params = CostParams {
-                    block_size: binding.block_size,
-                    transfer_credits: TransferCredits {
-                        host_pinned: 0.0,
-                        external: 0.0,
-                        disk: 0.0,
-                        ..self.params.transfer_credits
-                    },
-                    ..self.params
-                };
-                let mut additional = 0u64;
-                for tokens in prompts {
-                    let matches = Self::cached_matches(
-                        hashes,
-                        &mut lookups,
-                        &binding,
-                        tokens,
-                        None,
-                        None,
-                        || {
-                            prompts.len() == 1
-                                && *unique.get_or_insert_with(|| {
-                                    all_unique(inputs.iter().map(|(w, _, _)| w.url()))
-                                })
-                        },
-                    );
-                    let context = u64::try_from(tokens.len()).unwrap_or(u64::MAX);
-                    let reused = credited_tokens(
-                        &CandidateView {
-                            target: &binding.target,
-                            matches: &matches,
-                            load: LoadSample::default(),
-                            input_tokens: tokens.len(),
-                            prefill_tokens: None,
-                        },
-                        &params,
-                    ) as u64;
-                    let reused = if nixl_pull {
-                        binding.matches.nixl_decode_credit(
-                            binding.target.dp_rank,
-                            tokens.len(),
-                            reused,
-                        )
-                    } else {
-                        reused
-                    };
-                    // The engine shares one copy of the prompt's blocks across the
-                    // request's sequences, so the marginal cost is the prompt's
-                    // un-cached remainder once - the same amount the ledger charges when
-                    // this request becomes an existing one. Multiplying by `n` here made
-                    // a request cost more before admission than after, so the two sides of
-                    // the comparison disagreed.
-                    additional = additional.saturating_add(context.saturating_sub(reused));
-                }
-                DecodeWorkEstimate {
-                    additional_tokens: Some(additional),
-                }
+        self.decode_work(inputs, hashes, nixl_pull)
+            .into_iter()
+            .map(|price| DecodeWorkEstimate {
+                additional_tokens: price.map(|price| price.additional_tokens),
             })
             .collect()
+    }
+
+    fn prepare_decode_prices<'tokens>(
+        &self,
+        inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
+        hashes: &mut PromptHashes<'tokens>,
+        nixl_pull: bool,
+    ) -> Option<PdDecodePrices> {
+        hashes.hashes.placement = Some(Vec::new());
+        let work = self.decode_work(inputs, hashes, nixl_pull);
+        let placement = hashes.hashes.placement.take().unwrap_or_default();
+        let workers = inputs
+            .iter()
+            .zip(work)
+            .map(|((worker, _, _), price)| Some((worker.url().to_owned(), price?)))
+            .collect::<Option<HashMap<_, _>>>()?;
+        let mut evidence: HashMap<_, Vec<_>> = HashMap::new();
+        for proof in placement {
+            evidence
+                .entry(proof.target().clone())
+                .or_default()
+                .push(proof);
+        }
+        Some(PdDecodePrices { workers, evidence })
     }
 
     fn pick_prefill(&self, costs: &[f64], occupancy: &[usize]) -> Option<usize> {
@@ -4905,7 +4938,12 @@ mod tests {
                 }
             }
         }));
-        select(0, 33);
+        let revoked = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        metrics::with_local_recorder(&revoked, || select(0, 33));
+        let rendered = revoked.handle().render();
+        assert!(rendered
+            .contains("vllm_router_kv_placement_lookups_total{result=\"credit_revoked\"} 1"));
+        assert!(!rendered.contains("credit_pin_failed"));
 
         // Revoke the first rank on every lookup, while giving the peer an
         // uninterrupted generation and keeping the first rank queryable.
@@ -4925,7 +4963,13 @@ mod tests {
         // Invalidate after the initial plan check on every scored attempt.
         // The existing final attempt reserves full input without a KV query.
         *load.after_lookup.lock() = peer.before_lookup.lock().take();
-        select(0, 33);
+        let pin_failure = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        metrics::with_local_recorder(&pin_failure, || select(0, 33));
+        let rendered = pin_failure.handle().render();
+        assert!(rendered
+            .contains("vllm_router_kv_placement_lookups_total{result=\"credit_pin_failed\"} 3"));
+        assert!(rendered.contains("outcome=\"placement_pin_failed\""));
+        assert!(!rendered.contains("registration_churn"));
         assert_eq!(load.revocations.load(Ordering::Relaxed), 4);
     }
 

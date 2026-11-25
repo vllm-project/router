@@ -2,9 +2,9 @@
 
 use crate::kv_index::layout::align_down;
 use crate::kv_index::request_hash::{BlockKeyGenerator, SequenceHash};
-use crate::kv_index::source::binding::SourceLease;
+use crate::kv_index::source::binding::{PlacementSnapshot, SourceLease};
 use crate::kv_index::storage::source_transaction::StreamControl;
-use crate::kv_index::storage::{GroupPages, PageQuery, SourceReadGuard, SourceVersion};
+use crate::kv_index::storage::{GroupPages, PageQuery, SourceReadGuard};
 use crate::kv_index::SourceBinding;
 use crate::kv_index::{KvBlockIndexer, RoutableTarget, TierMatch};
 use std::collections::HashMap;
@@ -108,8 +108,7 @@ impl SourceBinding {
 /// Keep the hit and its source snapshot together until the provider accepts it.
 pub(in crate::kv_index) struct PlacementMatch {
     hits: Vec<TierMatch>,
-    source: SourceVersion,
-    generation: u64,
+    snapshot: PlacementSnapshot,
 }
 
 impl PlacementMatch {
@@ -120,8 +119,7 @@ impl PlacementMatch {
     ) -> Vec<TierMatch> {
         if let Some(placement) = &mut cache.placement {
             placement.push(PlacementEvidence {
-                source: self.source,
-                generation: self.generation,
+                snapshot: self.snapshot,
                 control: binding.control.clone(),
                 lease: binding.binding.clone(),
             });
@@ -130,23 +128,20 @@ impl PlacementMatch {
     }
 }
 
-/// Trust evidence for a hit, carried to the Regular reservation boundary.
+/// Trust evidence for a hit, carried to the routing commit boundary.
 pub(crate) struct PlacementEvidence {
-    source: SourceVersion,
-    generation: u64,
+    snapshot: PlacementSnapshot,
     control: Arc<StreamControl>,
     lease: Option<SourceLease>,
 }
 
 impl PlacementEvidence {
     pub(crate) fn target(&self) -> &RoutableTarget {
-        self.source.target()
+        self.snapshot.version.target()
     }
 
     pub(crate) fn is_revoked(&self) -> bool {
-        self.control.generation() != self.generation
-            || !self.source.is_current()
-            || self.lease.as_ref().is_some_and(|lease| !lease.is_active())
+        !self.snapshot.is_current(&self.control, self.lease.as_ref())
     }
 
     /// Try the source guards without waiting under the policy's selection lock.
@@ -155,7 +150,7 @@ impl PlacementEvidence {
     ) -> Option<SmallVec<[SourceReadGuard<'a>; 1]>> {
         let mut pins = SmallVec::new();
         for proof in evidence {
-            let guard = proof.source.try_read()?;
+            let guard = proof.snapshot.version.try_read()?;
             if proof.is_revoked() {
                 return None;
             }
@@ -226,7 +221,7 @@ impl SourceBinding {
             return None;
         }
         if self.plain_attention_match() {
-            let (mut claims, source, generation) =
+            let (mut claims, snapshot) =
                 self.page_snapshot(lora_name, tokens, cache.stop_at_gap, cache)?;
             let group_claims = claims.pop()?;
             let hits = crate::kv_index::layout::full_attention_matches(
@@ -237,20 +232,15 @@ impl SourceBinding {
                 block_size,
                 prompt_cap as u64,
             );
-            if hits.is_empty() || !self.snapshot_is_current(&source, generation) {
+            if hits.is_empty() || !self.snapshot_is_current(&snapshot) {
                 return None;
             }
-            return Some(PlacementMatch {
-                hits,
-                source,
-                generation,
-            });
+            return Some(PlacementMatch { hits, snapshot });
         }
         // The policy's page size can be coarser than the hash granularity: the
         // engine restores the aligned prefix, so round down instead of dropping
         // a recoverable hit.
-        let (tokens, tier, source, generation) =
-            self.credit_parts(lora_name, tokens, usize::MAX, cache)?;
+        let (tokens, tier, snapshot) = self.credit_parts(lora_name, tokens, usize::MAX, cache)?;
         let tokens = align_down(tokens, block_size);
         if tokens == 0 {
             return None;
@@ -264,8 +254,7 @@ impl SourceBinding {
                 tier,
                 segments: vec![(0, blocks)],
             }],
-            source,
-            generation,
+            snapshot,
         })
     }
 }

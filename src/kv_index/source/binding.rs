@@ -75,7 +75,25 @@ pub struct SourceBinding {
     pub(in crate::kv_index) binding: Option<crate::kv_index::source::binding::SourceLease>,
 }
 
-type PageSnapshot<'a> = (SmallVec<[PageTiers<'a>; 1]>, SourceVersion, u64);
+/// The index version and stream generation captured by one page lookup.
+pub(in crate::kv_index) struct PlacementSnapshot {
+    pub(in crate::kv_index) version: SourceVersion,
+    generation: u64,
+}
+
+impl PlacementSnapshot {
+    pub(in crate::kv_index) fn is_current(
+        &self,
+        control: &StreamControl,
+        lease: Option<&SourceLease>,
+    ) -> bool {
+        control.generation() == self.generation
+            && self.version.is_current()
+            && lease.is_none_or(SourceLease::is_active)
+    }
+}
+
+type PageSnapshot<'a> = (SmallVec<[PageTiers<'a>; 1]>, PlacementSnapshot);
 
 impl SourceBinding {
     /// Test constructor keyed by a `PYTHONHASHSEED` instead of a root digest.
@@ -492,7 +510,13 @@ impl SourceBinding {
         ) {
             return match matched {
                 PageMatch::Miss => None,
-                PageMatch::Hit(claims, version) => Some((claims, version, generation)),
+                PageMatch::Hit(claims, version) => Some((
+                    claims,
+                    PlacementSnapshot {
+                        version,
+                        generation,
+                    },
+                )),
             };
         }
         // Borrow unchanged evidence. Refresh all required groups together
@@ -528,12 +552,19 @@ impl SourceBinding {
                 }
                 let claims =
                     view.hash_page_runs(&self.owner, namespace, prepared, evidence, queries);
-                Some((claims, view.source_version(), state.reset_generation))
+                Some((
+                    claims,
+                    PlacementSnapshot {
+                        version: view.source_version(),
+                        generation: state.reset_generation,
+                    },
+                ))
             })
             .flatten()
     }
 
-    /// The credited prefix and the tier it is credited at. A page held in host
+    /// The credited prefix, its storage tier, and the snapshot that proves it.
+    /// A page held in host
     /// memory or on storage is still restorable, but the policy weighs it by the
     /// transfer credit of its tier, so the boundary is reported at the slowest
     /// tier that any group needs to satisfy it.
@@ -543,14 +574,13 @@ impl SourceBinding {
         tokens: &'a [u32],
         max_reusable_tokens: usize,
         cache: &mut RequestHashCache<'a>,
-    ) -> Option<(u64, StorageTier, SourceVersion, u64)> {
+    ) -> Option<(u64, StorageTier, PlacementSnapshot)> {
         let replay_tokens = if cache.count_replay_pages {
             0
         } else {
             self.replay_tokens
         };
-        let (claims, version, reset_generation) =
-            self.page_snapshot(namespace, tokens, true, cache)?;
+        let (claims, snapshot) = self.page_snapshot(namespace, tokens, true, cache)?;
         if claims
             .iter()
             .all(|pages| pages.prefix_len == 0 && pages.tail.is_empty())
@@ -574,19 +604,13 @@ impl SourceBinding {
         );
         let tier = tier?;
         if u32::try_from(credited / self.keys.block_size() as u64).is_err()
-            || !self.snapshot_is_current(&version, reset_generation)
+            || !self.snapshot_is_current(&snapshot)
         {
             return None;
         }
-        Some((credited, tier, version, reset_generation))
+        Some((credited, tier, snapshot))
     }
-    pub(in crate::kv_index) fn snapshot_is_current(
-        &self,
-        version: &SourceVersion,
-        generation: u64,
-    ) -> bool {
-        self.control.generation() == generation
-            && self.index.source_version_is_current(version)
-            && self.binding.as_ref().is_none_or(SourceLease::is_active)
+    pub(in crate::kv_index) fn snapshot_is_current(&self, snapshot: &PlacementSnapshot) -> bool {
+        snapshot.is_current(&self.control, self.binding.as_ref())
     }
 }

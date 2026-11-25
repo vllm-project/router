@@ -10,7 +10,7 @@ use crate::core::{Worker, WorkerRegistry};
 use crate::kv_index::discovery::CONTROL_TIMEOUT;
 use crate::kv_index::KvIndexSupervisor;
 use crate::policies::{
-    kv_aware_ops, kv_aware_policy, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy, PdDecodePrices,
+    kv_aware_ops, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy, PdDecodePrices,
     PrefillWorkEstimate, PromptHashes,
 };
 use axum::http::HeaderMap;
@@ -381,7 +381,7 @@ impl PdKvState {
         let prefill_work = kv_aware_ops(prefill_policy.as_ref())
             .map(|kv| Self::prefill_work(kv, prefill_workers, &prepared, &mut hashes));
         let decode_context = if decode_priced_here {
-            let kv = kv_aware_policy(decode_policy.as_ref()).expect("priced decode policy");
+            let kv = kv_aware_ops(decode_policy.as_ref()).expect("priced decode policy");
             self.decode_context_from_results(
                 kv,
                 decode_workers,
@@ -502,7 +502,7 @@ impl PdKvState {
     /// pool.
     fn decode_context_from_results<'tokens>(
         &self,
-        kv: &KvAwarePolicy,
+        kv: &dyn KvAwareOps,
         workers: &[Arc<dyn Worker>],
         allow_credit: &HashMap<String, bool>,
         results: &'tokens HashMap<
@@ -554,7 +554,7 @@ impl PdKvState {
         // The only caller is the deferred commit, which prices against the index as it
         // stands now, so this owns its cache. The admission path shares one cache across both
         // stages through `prepare_stages`.
-        let kv = kv_aware_policy(policy.as_ref())?;
+        let kv = kv_aware_ops(policy.as_ref())?;
         // Same no-render rule as admission: the commit path must not pay a
         // second fan-out for ids that cannot have changed.
         if router_prompts.is_none() && http_input_requires_render(request, route) {
