@@ -606,6 +606,12 @@ fn parse_batch_response(
     items: &[MediaItem],
     indices: &[usize],
 ) -> Result<Vec<Option<EncodedItem>>, EpdError> {
+    let reply = reply.as_object().ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Encoder response must be a JSON object".into(),
+        )
+    })?;
     let params = match reply.get("ec_transfer_params") {
         Some(Value::Object(params)) => params,
         None | Some(Value::Null) => return Ok(indices.iter().map(|_| None).collect()),
@@ -1344,9 +1350,15 @@ mod tests {
         use axum::response::IntoResponse;
         for (status, response_body, success) in [
             (StatusCode::OK, "{}", true),
+            (StatusCode::OK, r#"{"ec_transfer_params":null}"#, true),
             (StatusCode::BAD_REQUEST, "bad input", true),
             (StatusCode::INTERNAL_SERVER_ERROR, "failed", false),
             (StatusCode::OK, "invalid json", false),
+            (StatusCode::OK, "[]", false),
+            (StatusCode::OK, r#""report""#, false),
+            (StatusCode::OK, "42", false),
+            (StatusCode::OK, "true", false),
+            (StatusCode::OK, "null", false),
             (StatusCode::OK, r#"{"ec_transfer_params":[]}"#, false),
             (StatusCode::OK, r#"{"ec_transfer_params":"report"}"#, false),
             (StatusCode::OK, r#"{"ec_transfer_params":42}"#, false),
