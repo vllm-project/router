@@ -7,7 +7,7 @@ use super::pd_cached_tokens;
 use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_router::PdRouterBase;
 use super::pd_types::{
-    error_chain, DecodePricing, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext,
+    error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext, StagePricing,
 };
 use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
@@ -1165,8 +1165,7 @@ impl VllmPDRouter {
         // One hash cache for the request and one credit decision for both stages. The two
         // renders run concurrently - they are the only network work here - and only the
         // local estimation walks the prompts in sequence.
-        let (prefill_inputs, decode_inputs, decode_context) = match self.pd_router.kv_state.as_ref()
-        {
+        let (prefill_inputs, decode_inputs, prices) = match &self.pd_router.kv_state {
             Some(state) => {
                 let (stages, decode_inputs) = tokio::join!(
                     state.prepare_stages(
@@ -1188,8 +1187,12 @@ impl VllmPDRouter {
                         router_prompts,
                     ),
                 );
-                let (prefill_inputs, decode_context) = stages;
-                (Some(prefill_inputs), decode_inputs, decode_context)
+                let (prefill_inputs, prefill_prices, decode_prices) = stages;
+                (
+                    Some(prefill_inputs),
+                    decode_inputs,
+                    (prefill_prices, decode_prices),
+                )
             }
             None => {
                 let (prefill_inputs, decode_inputs) = tokio::join!(
@@ -1208,9 +1211,10 @@ impl VllmPDRouter {
                         router_prompts,
                     ),
                 );
-                (prefill_inputs, decode_inputs, None)
+                (prefill_inputs, decode_inputs, (None, None))
             }
         };
+        let (prefill_prices, decode_prices) = prices;
         let model_id = request.get("model").and_then(Value::as_str);
         let cache_salt = request
             .get("cache_salt")
@@ -1250,7 +1254,8 @@ impl VllmPDRouter {
             affinity_key: affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
             cache_salt,
-            decode_pricing: decode_context.as_ref().map(DecodePricing::Prepared),
+            prefill_pricing: prefill_prices.as_ref().map(StagePricing::Prepared),
+            decode_pricing: decode_prices.as_ref().map(StagePricing::Prepared),
             route: path,
             probe: false,
         };
@@ -1440,14 +1445,20 @@ impl VllmPDRouter {
             affinity_key: input.affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
             cache_salt: input.cache_salt.as_deref(),
-            decode_pricing: decode_context.as_ref().map(DecodePricing::Prepared),
+            prefill_pricing: None,
+            decode_pricing: decode_context.as_ref().map(StagePricing::Prepared),
             route: &input.route,
             probe: false,
         };
         // Keep the source guards until the deferred Decode commit finishes.
         let mut validated = None;
         let committed = self.pd_router.pd_load.commit_decode(attempt, |loads| {
-            let context = context.validate_decode(&candidates, &mut validated);
+            let context = PdRequestContext {
+                decode_pricing: context
+                    .decode_pricing
+                    .map(|prices| prices.validate(&candidates, &mut validated)),
+                ..context
+            };
             super::pd_router::select_decode_stage(
                 loads,
                 &candidates,

@@ -10,8 +10,7 @@ use crate::core::{Worker, WorkerRegistry};
 use crate::kv_index::discovery::CONTROL_TIMEOUT;
 use crate::kv_index::KvIndexSupervisor;
 use crate::policies::{
-    kv_aware_ops, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy, PdDecodePrices,
-    PrefillWorkEstimate, PromptHashes,
+    kv_aware_ops, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy, PdWorkPrices, PromptHashes,
 };
 use axum::http::HeaderMap;
 use serde_json::Value;
@@ -334,7 +333,11 @@ impl PdKvState {
         headers: Option<&HeaderMap>,
         router_prompts: Option<&Arc<[Vec<u32>]>>,
         defer_decode: bool,
-    ) -> (HashMap<String, PdPrefillInput>, Option<PdDecodePrices>) {
+    ) -> (
+        HashMap<String, PdPrefillInput>,
+        Option<PdWorkPrices>,
+        Option<PdWorkPrices>,
+    ) {
         let started = Instant::now();
         let bases = |workers: &[Arc<dyn Worker>]| -> Vec<String> {
             workers
@@ -376,10 +379,10 @@ impl PdKvState {
                 }
             },
         );
-        let mut prepared = Self::build_prefill_inputs(request, &allow_credit, prefill_results);
+        let prepared = Self::build_prefill_inputs(request, &allow_credit, prefill_results);
         let mut hashes = PromptHashes::new();
-        let prefill_work = kv_aware_ops(prefill_policy.as_ref())
-            .map(|kv| Self::prefill_work(kv, prefill_workers, &prepared, &mut hashes));
+        let prefill_prices = kv_aware_ops(prefill_policy.as_ref())
+            .and_then(|kv| Self::prefill_prices(kv, prefill_workers, &prepared, &mut hashes));
         let decode_context = if decode_priced_here {
             let kv = kv_aware_ops(decode_policy.as_ref()).expect("priced decode policy");
             self.decode_context_from_results(
@@ -396,19 +399,10 @@ impl PdKvState {
             None
         };
 
-        // The cache borrows tokens from prepared. Release it before recording
-        // either stage's estimates.
         drop(hashes);
-        if let Some(work) = prefill_work {
-            for (base, rank, estimate) in work {
-                if let Some(input) = prepared.get_mut(&base) {
-                    input.work_by_rank.insert(rank, estimate);
-                }
-            }
-        }
         metrics::histogram!("vllm_router_pd_kv_prepare_seconds")
             .record(started.elapsed().as_secs_f64());
-        (prepared, decode_context)
+        (prepared, prefill_prices, decode_context)
     }
 
     /// Render the request against each base, or reuse the router's own ids.
@@ -458,7 +452,6 @@ impl PdKvState {
             crate::metrics::RouterMetrics::record_kv_routing_input("pd", source);
             let input = PdPrefillInput {
                 prompts,
-                work_by_rank: HashMap::new(),
                 allow_credit: fallback_reason.is_none(),
                 fallback_reason,
             };
@@ -469,12 +462,12 @@ impl PdKvState {
         prepared
     }
 
-    fn prefill_work<'tokens>(
+    fn prefill_prices<'tokens>(
         kv: &dyn KvAwareOps,
         workers: &[Arc<dyn Worker>],
         prepared: &'tokens HashMap<String, PdPrefillInput>,
         hashes: &mut PromptHashes<'tokens>,
-    ) -> Vec<(String, Option<usize>, PrefillWorkEstimate)> {
+    ) -> Option<PdWorkPrices> {
         let inputs: Vec<_> = workers
             .iter()
             .filter_map(|worker| {
@@ -486,13 +479,7 @@ impl PdKvState {
                 ))
             })
             .collect();
-        inputs
-            .iter()
-            .zip(kv.estimate_prefill_work(&inputs, hashes))
-            .map(|((worker, _, _), estimate)| {
-                (worker.base_url().to_owned(), worker.dp_rank(), estimate)
-            })
-            .collect()
+        kv.prepare_prefill_prices(&inputs, hashes)
     }
 
     /// Pure: the Decode estimate over already-rendered prompts.
@@ -510,7 +497,7 @@ impl PdKvState {
             Result<crate::backend::preprocess::HttpTokenInput, &'static str>,
         >,
         hashes: &mut PromptHashes<'tokens>,
-    ) -> Option<PdDecodePrices> {
+    ) -> Option<PdWorkPrices> {
         let inputs: Vec<_> = workers
             .iter()
             .filter_map(|worker| {
@@ -550,7 +537,7 @@ impl PdKvState {
         route: &str,
         headers: Option<&HeaderMap>,
         router_prompts: Option<&Arc<[Vec<u32>]>>,
-    ) -> Option<PdDecodePrices> {
+    ) -> Option<PdWorkPrices> {
         // The only caller is the deferred commit, which prices against the index as it
         // stands now, so this owns its cache. The admission path shares one cache across both
         // stages through `prepare_stages`.
@@ -604,8 +591,8 @@ mod kv_input_tests {
         request: &Value,
         route: &str,
         headers: Option<&HeaderMap>,
-    ) -> HashMap<String, PdPrefillInput> {
-        state
+    ) -> (HashMap<String, PdPrefillInput>, Option<PdWorkPrices>) {
+        let (inputs, prices, _) = state
             .prepare_stages(
                 workers,
                 policy,
@@ -617,8 +604,8 @@ mod kv_input_tests {
                 None,
                 true,
             )
-            .await
-            .0
+            .await;
+        (inputs, prices)
     }
     #[tokio::test]
     async fn prompt_scoring_keeps_prefill_tokens_but_disables_pd_credit() {
@@ -644,7 +631,7 @@ mod kv_input_tests {
             body.as_object_mut()
                 .unwrap()
                 .extend(field.as_object().unwrap().clone());
-            let result = prepare_prefill(
+            let (result, prices) = prepare_prefill(
                 &state,
                 std::slice::from_ref(&worker),
                 &policy,
@@ -657,7 +644,12 @@ mod kv_input_tests {
             assert_eq!(input.fallback_reason, Some(expected));
             assert!(!input.allow_credit);
             assert_eq!(input.prompts.as_ref().unwrap()[0].len(), 65);
-            assert_eq!(input.work_by_rank[&worker.dp_rank()].new_prefill_tokens, 65);
+            let prices = prices.unwrap();
+            let work = prices.validate(std::slice::from_ref(&worker));
+            assert_eq!(
+                work.prefill_work(worker.url()).unwrap().new_prefill_tokens,
+                65
+            );
         }
     }
 
@@ -731,10 +723,15 @@ mod kv_input_tests {
                 json!({"model":"m","input":"hello","previous_response_id":"resp_1"}),
             ),
         ] {
-            let prepared = prepare_prefill(&state, &workers, &policy, &request, route, None).await;
+            let (prepared, prices) =
+                prepare_prefill(&state, &workers, &policy, &request, route, None).await;
             let input = &prepared[&base];
             assert!(input.prompts.is_none());
-            assert!(input.work_by_rank.is_empty());
+            assert!(prices
+                .unwrap()
+                .validate(&workers)
+                .prefill_work(workers[0].url())
+                .is_none());
             assert!(input.fallback_reason.is_some());
         }
         assert_eq!(calls.load(Ordering::Relaxed), 0);
@@ -802,7 +799,7 @@ mod kv_input_tests {
             state
                 .bind(&workers, kv_aware_ops(policy.as_ref()).unwrap())
                 .await;
-            let inputs = prepare_prefill(
+            let (inputs, _) = prepare_prefill(
                 &state,
                 &workers,
                 &policy,
@@ -1018,8 +1015,11 @@ mod kv_input_tests {
 
             let initial =
                 prepare_prefill(&state, &workers, &policy, &request, "/v1/completions", None).await;
-            assert_eq!(initial[&base].work_by_rank[&None].new_prefill_tokens, 33);
-            assert!(initial[&base].work_by_rank[&None].placement_verified);
+            let initial_prices = initial.1.unwrap();
+            let validated = initial_prices.validate(&workers);
+            let work = validated.prefill_work(workers[0].url()).unwrap();
+            assert_eq!(work.new_prefill_tokens, 33);
+            assert!(work.placement_verified);
 
             publisher
                 .replay_empty_and_publish(&[KVEvent::BlockStored(full_store(
@@ -1045,8 +1045,12 @@ mod kv_input_tests {
 
             let warm =
                 prepare_prefill(&state, &workers, &policy, &request, "/v1/completions", None).await;
-            assert_eq!(warm[&base].work_by_rank[&None].new_prefill_tokens, 1);
-            assert!(warm[&base].work_by_rank[&None].placement_verified);
+            let warm_prices = warm.1.unwrap();
+            let validated = warm_prices.validate(&workers);
+            let work = validated.prefill_work(workers[0].url()).unwrap();
+            assert_eq!(work.new_prefill_tokens, 1);
+            assert!(work.placement_verified);
+            drop(validated);
             drop(state);
             task.abort();
         }
@@ -1240,7 +1244,7 @@ mod kv_input_tests {
                 .as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
-            let (_, admission) = state
+            let (_, _, admission) = state
                 .prepare_stages(
                     &prefill,
                     &prefill_policy,

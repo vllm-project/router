@@ -1,6 +1,7 @@
 use crate::core::Worker;
 use crate::policies::{
-    AffinityKey, AffinityRecord, PdDecodePrices, RequestHeaders, ValidatedDecodePrices,
+    AffinityKey, AffinityRecord, PdWorkPrices, PrefillWorkEstimate, RequestHeaders,
+    ValidatedWorkPrices,
 };
 use axum::body::Body;
 use futures_util::StreamExt;
@@ -169,17 +170,16 @@ pub(super) type Loads = HashMap<(Stage, PdEndpoint), PdLoadSample>;
 #[derive(Debug, Clone)]
 pub struct PdPrefillInput {
     pub prompts: Option<Arc<[Vec<u32>]>>,
-    /// Per-rank placement snapshot.
-    /// Hashing and index queries are completed before the admission lock.
-    pub work_by_rank: HashMap<Option<usize>, crate::policies::PrefillWorkEstimate>,
     pub allow_credit: bool,
     pub fallback_reason: Option<&'static str>,
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum DecodePricing<'a> {
-    Prepared(&'a PdDecodePrices),
-    Validated(&'a HashMap<String, u64>),
+pub(super) enum StagePricing<'a> {
+    Prepared(&'a PdWorkPrices),
+    Validated(&'a ValidatedWorkPrices<'a>),
+    #[cfg(test)]
+    DecodeTokens(&'a HashMap<String, u64>),
 }
 
 /// Token inputs are keyed by the P base URL: each backend renders its own
@@ -201,37 +201,49 @@ pub struct PdRequestContext<'a> {
     pub lora_name: Option<&'a str>,
     /// Request cache salt scoping the binding digest.
     pub cache_salt: Option<&'a str>,
-    /// Marginal Decode context per candidate, keyed by worker URL.
-    /// Prices must be validated before ranking with them.
-    pub(super) decode_pricing: Option<DecodePricing<'a>>,
+    /// Prefill work per candidate, validated before admission ranks the workers.
+    pub(super) prefill_pricing: Option<StagePricing<'a>>,
+    /// Marginal Decode context per candidate, validated at its own commit.
+    pub(super) decode_pricing: Option<StagePricing<'a>>,
     pub route: &'a str,
     /// True when this admission is a health probe: it takes a pair but starts
     /// no sequence, so it must not reserve Decode occupancy.
     pub probe: bool,
 }
 
-impl<'a> PdRequestContext<'a> {
-    pub(super) fn decode_tokens(&self) -> Option<&HashMap<String, u64>> {
-        match self.decode_pricing {
-            Some(DecodePricing::Validated(tokens)) => Some(tokens),
+impl<'a> StagePricing<'a> {
+    /// Preserve the guard holder until the load transaction returns.
+    pub(super) fn validate<'b>(
+        self,
+        workers: &[Arc<dyn Worker>],
+        validated: &'b mut Option<ValidatedWorkPrices<'a>>,
+    ) -> StagePricing<'b>
+    where
+        'a: 'b,
+    {
+        if let Self::Prepared(prices) = self {
+            StagePricing::Validated(validated.insert(prices.validate(workers)))
+        } else {
+            self
+        }
+    }
+}
+
+impl PdRequestContext<'_> {
+    pub(super) fn prefill_work(&self, worker_url: &str) -> Option<PrefillWorkEstimate> {
+        match self.prefill_pricing {
+            Some(StagePricing::Validated(prices)) => prices.prefill_work(worker_url),
             _ => None,
         }
     }
 
-    /// Keep the guard holder in the caller until the load transaction returns.
-    pub(super) fn validate_decode<'b>(
-        &'b self,
-        workers: &[Arc<dyn Worker>],
-        validated: &'b mut Option<ValidatedDecodePrices<'a>>,
-    ) -> PdRequestContext<'b> {
-        let mut context = self.clone();
-        if let Some(DecodePricing::Prepared(prices)) = self.decode_pricing {
-            *validated = Some(prices.validate(workers));
-            context.decode_pricing = validated
-                .as_ref()
-                .map(|prices| DecodePricing::Validated(prices.tokens()));
+    pub(super) fn decode_tokens(&self) -> Option<&HashMap<String, u64>> {
+        match self.decode_pricing {
+            Some(StagePricing::Validated(prices)) => Some(prices.tokens()),
+            #[cfg(test)]
+            Some(StagePricing::DecodeTokens(tokens)) => Some(tokens),
+            _ => None,
         }
-        context
     }
 }
 

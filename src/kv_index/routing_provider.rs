@@ -19,7 +19,7 @@ use smallvec::SmallVec;
 /// Hashes prompts using the verified source contract and reports the prefix
 /// that the cache layout can restore.
 ///
-/// Regular Prefill reservations and P/D Decode selection grant credit only
+/// Regular Prefill reservations and P/D selection grant credit only
 /// for hits with evidence from that lookup. Hits from custom providers
 /// without evidence are scored as misses, and their workers remain eligible.
 /// To retain credit, forward `matches_with_cache` and its cache to the

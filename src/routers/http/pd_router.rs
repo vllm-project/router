@@ -278,7 +278,7 @@ fn select_stage(
                 Some((
                     input,
                     input.prompts.as_deref()?,
-                    *input.work_by_rank.get(&worker.dp_rank())?,
+                    context.prefill_work(worker.url())?,
                 ))
             })
             .collect();
@@ -650,7 +650,6 @@ impl PdRouterBase {
                         base,
                         PdPrefillInput {
                             prompts,
-                            work_by_rank: HashMap::new(),
                             allow_credit: false,
                             fallback_reason: reason,
                         },
@@ -766,12 +765,21 @@ impl PdRouterBase {
         // configured, commit decode at admission for the entire pool.
         let defer = defer_decode && decode_policy_can_defer(decode_policy.as_ref(), &context);
         // Keep the source guards until admission has committed the selection.
-        let mut validated = None;
+        let mut prefill_validated = None;
+        let mut decode_validated = None;
         let select = |loads: &Loads| {
-            let context = if !defer && !context.probe {
-                context.validate_decode(decode_workers, &mut validated)
-            } else {
-                context.clone()
+            let context = PdRequestContext {
+                prefill_pricing: context
+                    .prefill_pricing
+                    .map(|prices| prices.validate(prefill_workers, &mut prefill_validated)),
+                decode_pricing: if !defer && !context.probe {
+                    context
+                        .decode_pricing
+                        .map(|prices| prices.validate(decode_workers, &mut decode_validated))
+                } else {
+                    None
+                },
+                ..context.clone()
             };
             select_pd_pair(
                 loads,
@@ -789,7 +797,7 @@ impl PdRouterBase {
         } else {
             self.pd_load.admit_with(select, reserve_decode)
         };
-        drop(validated);
+        drop((prefill_validated, decode_validated));
         if let Some((selection, attempt)) = &admitted {
             let deferred = attempt.decode_pending_commit();
             if kv_aware_ops(prefill_policy.as_ref()).is_some() {
@@ -1611,6 +1619,7 @@ impl PdRouterBase {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
+            prefill_pricing: None,
             decode_pricing: None,
             route: "/health_generate",
             probe: true,
@@ -2145,6 +2154,7 @@ mod tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
+            prefill_pricing: None,
             decode_pricing: None,
             route: "/health_generate",
             probe: true,
@@ -2177,6 +2187,7 @@ mod tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
+            prefill_pricing: None,
             decode_pricing: None,
             route: "/health_generate",
             probe: true,
@@ -2733,7 +2744,7 @@ mod tests {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod admission_tests {
-    use super::super::pd_types::{DecodePricing, PdLoadSample};
+    use super::super::pd_types::{PdLoadSample, StagePricing};
     use super::*;
     use crate::core::{BasicWorker, DPAwareWorker};
     use crate::policies::{AffinityKey, KvAwarePolicy, RequestHeaders, RoundRobinPolicy};
@@ -2781,26 +2792,33 @@ mod admission_tests {
         p: &[Arc<dyn Worker>],
         tokens: &[u32],
         policy: &KvAwarePolicy,
-    ) -> HashMap<String, super::super::pd_types::PdPrefillInput> {
-        p.iter()
+    ) -> (
+        HashMap<String, PdPrefillInput>,
+        crate::policies::PdWorkPrices,
+    ) {
+        let prompts = [tokens.to_vec()];
+        let inputs: Vec<_> = p
+            .iter()
+            .map(|worker| (worker.as_ref(), prompts.as_slice(), true))
+            .collect();
+        let prices = kv_aware_ops(policy)
+            .unwrap()
+            .prepare_prefill_prices(&inputs, &mut crate::policies::PromptHashes::new())
+            .unwrap();
+        let inputs = p
+            .iter()
             .map(|worker| {
                 (
                     worker.base_url().to_owned(),
-                    super::super::pd_types::PdPrefillInput {
-                        prompts: Some(Arc::from(vec![tokens.to_vec()])),
-                        work_by_rank: HashMap::from([(
-                            worker.dp_rank(),
-                            kv_aware_ops(policy).unwrap().estimate_prefill_work(
-                                &[(worker.as_ref(), &[tokens.to_vec()], true)],
-                                &mut crate::policies::PromptHashes::new(),
-                            )[0],
-                        )]),
+                    PdPrefillInput {
+                        prompts: Some(Arc::from(prompts.clone())),
                         allow_credit: true,
                         fallback_reason: None,
                     },
                 )
             })
-            .collect()
+            .collect();
+        (inputs, prices)
     }
 
     #[cfg(all(feature = "cpu", feature = "ready"))]
@@ -2816,9 +2834,11 @@ mod admission_tests {
             .unwrap();
         assert_eq!(colocated.worker_index, 1);
         assert_eq!(colocated.new_prefill_tokens, 1);
-        let inputs = token_inputs(&p, &tokens, &policy);
+        let (inputs, prices) = token_inputs(&p, &tokens, &policy);
+        let validated = prices.validate(&p);
         let mut context = context();
         context.prefill_inputs = Some(&inputs);
+        context.prefill_pricing = Some(StagePricing::Validated(&validated));
         let (first, a) = manager
             .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
             .unwrap();
@@ -2860,7 +2880,7 @@ mod admission_tests {
 
     #[cfg(all(feature = "cpu", feature = "ready"))]
     #[test]
-    fn decode_clear_after_pricing_removes_only_the_revoked_candidates_credit() {
+    fn pd_clear_after_pricing_removes_only_the_revoked_candidates_credit() {
         use crate::kv_index::source::test_support::{event_batch, full_binding, warm_full};
         use crate::kv_index::{CacheKey, KVEvent, RoutableTarget};
         use crate::policies::{KvAwareOps, PromptHashes};
@@ -2895,24 +2915,65 @@ mod admission_tests {
         let prices = policy
             .prepare_decode_prices(&inputs, &mut PromptHashes::new(), false)
             .unwrap();
+        let (prefill_inputs, prefill_prices) = token_inputs(&workers, &prompts[0], &policy);
+        let other_decode = pool("other-decode", 1);
+        let manager = PdLoadManager::default();
         let select = |expected_tokens: [u64; 2], expected_worker: usize| {
             let prepared = PdRequestContext {
-                decode_pricing: Some(DecodePricing::Prepared(&prices)),
+                decode_pricing: Some(StagePricing::Prepared(&prices)),
                 ..context()
             };
             let mut validated = None;
-            let context = prepared.validate_decode(&workers, &mut validated);
-            let tokens = context.decode_tokens().unwrap();
+            let decode_context = PdRequestContext {
+                decode_pricing: prepared
+                    .decode_pricing
+                    .map(|prices| prices.validate(&workers, &mut validated)),
+                ..prepared
+            };
+            let tokens = decode_context.decode_tokens().unwrap();
             assert_eq!(
                 [tokens[workers[0].url()], tokens[workers[1].url()]],
                 expected_tokens
             );
-            let decision = select_decode_stage(&Loads::new(), &workers, &policy, &context).unwrap();
+            let decision =
+                select_decode_stage(&Loads::new(), &workers, &policy, &decode_context).unwrap();
             assert_eq!(decision.worker_index, expected_worker);
             assert_eq!(
                 decision.score,
                 Some(expected_tokens[expected_worker] as f64)
             );
+
+            let mut prefill_validated = None;
+            let (selection, attempt) = manager
+                .admit(|loads| {
+                    let context = PdRequestContext {
+                        prefill_inputs: Some(&prefill_inputs),
+                        prefill_pricing: Some(
+                            StagePricing::Prepared(&prefill_prices)
+                                .validate(&workers, &mut prefill_validated),
+                        ),
+                        ..context()
+                    };
+                    select_pd_pair(
+                        loads,
+                        &workers,
+                        &other_decode,
+                        &policy,
+                        &policy,
+                        &context,
+                        true,
+                    )
+                })
+                .unwrap();
+            let expected = expected_tokens[expected_worker];
+            assert_eq!(selection.prefill.worker_index, expected_worker);
+            assert_eq!(selection.prefill.new_prefill_tokens, Some(expected));
+            assert_eq!(
+                sample(&manager, Stage::Prefill, &selection.prefill.endpoint).active_prefill_tokens,
+                expected
+            );
+            drop(attempt);
+            assert!(manager.snapshot().is_empty());
         };
         select([1, 17], 0);
         sources[0]
@@ -2972,7 +3033,7 @@ mod admission_tests {
             (d[1].url().to_owned(), 50u64),
         ]);
         let priced = PdRequestContext {
-            decode_pricing: Some(DecodePricing::Validated(&prices)),
+            decode_pricing: Some(StagePricing::DecodeTokens(&prices)),
             ..context()
         };
         let selection = select_pd_pair(&loads, &p, &d, &policy, &policy, &priced, true).unwrap();
@@ -2986,7 +3047,7 @@ mod admission_tests {
         // the price of the other rank and fall back to occupancy, where @1 wins.
         let partial = HashMap::from([(d[0].url().to_owned(), 0u64)]);
         let partial_context = PdRequestContext {
-            decode_pricing: Some(DecodePricing::Validated(&partial)),
+            decode_pricing: Some(StagePricing::DecodeTokens(&partial)),
             ..context()
         };
         let fallback =
@@ -3011,8 +3072,10 @@ mod admission_tests {
         let mut context = context();
 
         let policy = prefix_policy_with_blocks(&p, &tokens, 12);
-        let inputs = token_inputs(&p, &tokens, &policy);
+        let (inputs, prices) = token_inputs(&p, &tokens, &policy);
+        let validated = prices.validate(&p);
         context.prefill_inputs = Some(&inputs);
+        context.prefill_pricing = Some(StagePricing::Validated(&validated));
         let manager = Arc::new(PdLoadManager::default());
         let (first, a) = manager
             .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
@@ -3039,9 +3102,11 @@ mod admission_tests {
         let (_, unknown) = manager
             .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context(), true))
             .unwrap();
-        let inputs = token_inputs(&p, &tokens, &policy);
+        let (inputs, prices) = token_inputs(&p, &tokens, &policy);
+        let validated = prices.validate(&p);
         let mut context = context();
         context.prefill_inputs = Some(&inputs);
+        context.prefill_pricing = Some(StagePricing::Validated(&validated));
         let (selection, known) = manager
             .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
             .unwrap();
@@ -3078,6 +3143,7 @@ mod admission_tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
+            prefill_pricing: None,
             decode_pricing: None,
             route: "/v1/completions",
             probe: false,
@@ -3167,6 +3233,7 @@ mod admission_tests {
             affinity_key: Some(affinity_key(session)),
             lora_name: None,
             cache_salt: None,
+            prefill_pricing: None,
             decode_pricing: None,
             route: "/v1/completions",
             probe: false,
@@ -3435,9 +3502,11 @@ mod admission_tests {
         let policy = resident_prefix_policy(&p, &tokens).with_shared_affinity(Arc::new(
             crate::policies::KvAffinityTable::with_ttl(Some(Duration::from_secs(1800))),
         ));
-        let inputs = token_inputs(&p, &tokens, &policy);
+        let (inputs, prices) = token_inputs(&p, &tokens, &policy);
+        let validated = prices.validate(&p);
         let mut ctx = context_with_session("session-a");
         ctx.prefill_inputs = Some(&inputs);
+        ctx.prefill_pricing = Some(StagePricing::Validated(&validated));
         let (first, a) = admit_with(&manager, &p, &d, &policy, &ctx);
         assert_eq!(first.prefill.worker_index, 1);
         assert_eq!(first.prefill.new_prefill_tokens, Some(1));
@@ -3612,9 +3681,11 @@ mod admission_tests {
         let d = pool("d", 1);
         let policy = KvAwarePolicy::default();
         let tokens: Vec<u32> = (0..33).collect();
-        let inputs = token_inputs(&p, &tokens, &policy);
+        let (inputs, prices) = token_inputs(&p, &tokens, &policy);
+        let validated = prices.validate(&p);
         let mut ctx = context();
         ctx.prefill_inputs = Some(&inputs);
+        ctx.prefill_pricing = Some(StagePricing::Validated(&validated));
 
         // Every admission starts from an idle pool again, so the same
         // equal-cost tie is met on each turn.
@@ -3921,6 +3992,7 @@ mod admission_tests {
                 affinity_key: None,
                 lora_name: None,
                 cache_salt: None,
+                prefill_pricing: None,
                 decode_pricing: None,
                 route: "/v1/completions",
                 probe: false,

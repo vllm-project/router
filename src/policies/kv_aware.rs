@@ -117,34 +117,59 @@ pub struct DecodeWorkEstimate {
     pub additional_tokens: Option<u64>,
 }
 
-struct PdDecodePrice {
+struct PdWorkPrice {
     additional_tokens: u64,
     input_tokens: u64,
     target: RoutableTarget,
+    placement_verified: bool,
+}
+
+#[derive(Clone, Copy)]
+enum WorkStage {
+    Prefill,
+    Decode { nixl_pull: bool },
 }
 
 #[doc(hidden)]
-pub struct PdDecodePrices {
-    workers: HashMap<String, PdDecodePrice>,
+pub struct PdWorkPrices {
+    workers: HashMap<String, PdWorkPrice>,
     evidence: HashMap<RoutableTarget, Vec<PlacementEvidence>>,
 }
 
-pub(crate) struct ValidatedDecodePrices<'a> {
+pub(crate) struct ValidatedWorkPrices<'a> {
+    prices: &'a PdWorkPrices,
     tokens: HashMap<String, u64>,
     _pins: Vec<SourceReadGuard<'a>>,
 }
 
-impl ValidatedDecodePrices<'_> {
+impl ValidatedWorkPrices<'_> {
     pub(crate) fn tokens(&self) -> &HashMap<String, u64> {
         &self.tokens
     }
+
+    pub(crate) fn prefill_work(&self, worker_url: &str) -> Option<PrefillWorkEstimate> {
+        Some(PrefillWorkEstimate {
+            new_prefill_tokens: *self.tokens.get(worker_url)?,
+            placement_verified: self.prices.workers.get(worker_url)?.placement_verified,
+        })
+    }
 }
 
-impl PdDecodePrices {
+fn pin_credit<'a>(
+    evidence: impl Iterator<Item = &'a PlacementEvidence>,
+) -> Option<smallvec::SmallVec<[SourceReadGuard<'a>; 1]>> {
+    let guards = PlacementEvidence::try_pin_all(evidence);
+    if guards.is_none() {
+        crate::metrics::RouterMetrics::record_kv_placement_lookup("credit_pin_failed");
+    }
+    guards
+}
+
+impl PdWorkPrices {
     /// Pin credited sources without waiting under the P/D load lock. Each
     /// unpinnable candidate falls back to its full input in the same units.
     /// Keep the returned guards until the ledger commit returns.
-    pub(crate) fn validate(&self, workers: &[Arc<dyn Worker>]) -> ValidatedDecodePrices<'_> {
+    pub(crate) fn validate(&self, workers: &[Arc<dyn Worker>]) -> ValidatedWorkPrices<'_> {
         let mut tokens = HashMap::with_capacity(workers.len());
         let mut pins = Vec::new();
         for worker in workers {
@@ -153,20 +178,17 @@ impl PdDecodePrices {
             };
             let mut additional = price.input_tokens;
             if price.additional_tokens < price.input_tokens {
-                if let Some(guards) = self
-                    .evidence
-                    .get(&price.target)
-                    .and_then(|evidence| PlacementEvidence::try_pin_all(evidence.iter()))
+                if let Some(guards) =
+                    pin_credit(self.evidence.get(&price.target).into_iter().flatten())
                 {
                     pins.extend(guards);
                     additional = price.additional_tokens;
-                } else {
-                    crate::metrics::RouterMetrics::record_kv_placement_lookup("credit_pin_failed");
                 }
             }
             tokens.insert(worker.url().to_owned(), additional);
         }
-        ValidatedDecodePrices {
+        ValidatedWorkPrices {
+            prices: self,
             tokens,
             _pins: pins,
         }
@@ -204,12 +226,20 @@ pub trait KvAwareOps: Send + Sync {
         self.estimate_decode_work(inputs, hashes)
     }
     #[doc(hidden)]
+    fn prepare_prefill_prices<'tokens>(
+        &self,
+        _inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
+        _hashes: &mut PromptHashes<'tokens>,
+    ) -> Option<PdWorkPrices> {
+        None
+    }
+    #[doc(hidden)]
     fn prepare_decode_prices<'tokens>(
         &self,
         _inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
         _hashes: &mut PromptHashes<'tokens>,
         _nixl_pull: bool,
-    ) -> Option<PdDecodePrices> {
+    ) -> Option<PdWorkPrices> {
         None
     }
     fn pick_prefill(&self, costs: &[f64], occupancy: &[usize]) -> Option<usize>;
@@ -1180,91 +1210,123 @@ impl std::fmt::Debug for KvAwarePolicy {
 }
 
 impl KvAwarePolicy {
-    fn decode_work<'tokens>(
-        &self,
-        inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
-        hashes: &mut PromptHashes<'tokens>,
-        nixl_pull: bool,
-    ) -> Vec<Option<PdDecodePrice>> {
+    fn stage_work<'work, 'tokens>(
+        &'work self,
+        inputs: &'work [(&'work dyn Worker, &'tokens [Vec<u32>], bool)],
+        hashes: &'work mut PromptHashes<'tokens>,
+        stage: WorkStage,
+    ) -> impl Iterator<Item = PdWorkPrice> + use<'work, 'tokens> {
+        let nixl_pull = matches!(stage, WorkStage::Decode { nixl_pull: true });
         hashes.set_stage_targets(inputs, nixl_pull);
         let mut lookups = crate::metrics::PlacementLookups::default();
         let mut unique = hashes.hashes.single_target.then_some(true);
-        inputs
-            .iter()
-            .map(|&(worker, prompts, credit)| {
-                let binding = self.binding_for_worker(worker);
-                if !credit || binding.cache_key.is_none() {
-                    return None;
-                }
-                // Decode occupancy shrinks only by blocks already on the device. A prefix
-                // that lives in host memory or on disk still needs a GPU block when it
-                // arrives, so the tiered credits must not discount it: that would understate
-                // the new occupancy and can pick a busier worker. Prefill keeps the tiered
-                // credits, because there they avoid recompute.
-                let params = CostParams {
-                    block_size: binding.block_size,
-                    transfer_credits: TransferCredits {
-                        host_pinned: 0.0,
-                        external: 0.0,
-                        disk: 0.0,
-                        ..self.params.transfer_credits
-                    },
-                    ..self.params
-                };
-                let mut input_tokens = 0u64;
-                let mut additional_tokens = 0u64;
-                for tokens in prompts {
-                    let matches = Self::cached_matches(
-                        hashes,
-                        &mut lookups,
-                        &binding,
-                        tokens,
-                        None,
-                        None,
-                        || {
-                            prompts.len() == 1
-                                && *unique.get_or_insert_with(|| {
-                                    all_unique(inputs.iter().map(|(w, _, _)| w.url()))
-                                })
-                        },
-                    );
-                    let context = u64::try_from(tokens.len()).unwrap_or(u64::MAX);
-                    let reused = credited_tokens(
-                        &CandidateView {
-                            target: &binding.target,
-                            matches: &matches,
-                            load: LoadSample::default(),
-                            input_tokens: tokens.len(),
-                            prefill_tokens: None,
-                        },
-                        &params,
-                    ) as u64;
-                    let reused = if nixl_pull {
-                        binding.matches.nixl_decode_credit(
-                            binding.target.dp_rank,
-                            tokens.len(),
-                            reused,
-                        )
-                    } else {
-                        reused
-                    };
-                    // The engine shares one copy of the prompt's blocks across the
-                    // request's sequences, so the marginal cost is the prompt's
-                    // un-cached remainder once - the same amount the ledger charges when
-                    // this request becomes an existing one. Multiplying by `n` here made
-                    // a request cost more before admission than after, so the two sides of
-                    // the comparison disagreed.
-                    input_tokens = input_tokens.saturating_add(context);
-                    additional_tokens =
-                        additional_tokens.saturating_add(context.saturating_sub(reused));
-                }
-                Some(PdDecodePrice {
-                    additional_tokens,
+        inputs.iter().map(move |&(worker, prompts, credit)| {
+            let binding = self.binding_for_worker(worker);
+            let placement_verified = credit && binding.cache_key.is_some();
+            if !placement_verified {
+                let input_tokens = prompts
+                    .iter()
+                    .map(|prompt| prompt.len() as u64)
+                    .fold(0, u64::saturating_add);
+                return PdWorkPrice {
+                    additional_tokens: input_tokens,
                     input_tokens,
                     target: binding.target.clone(),
-                })
+                    placement_verified,
+                };
+            }
+            let mut params = CostParams {
+                block_size: binding.block_size,
+                ..self.params
+            };
+            if matches!(stage, WorkStage::Decode { .. }) {
+                // Decode needs GPU blocks for host or external pages too.
+                params.transfer_credits.host_pinned = 0.0;
+                params.transfer_credits.external = 0.0;
+                params.transfer_credits.disk = 0.0;
+            }
+            let mut input_tokens = 0u64;
+            let mut additional_tokens = 0u64;
+            for tokens in prompts {
+                let matches = Self::cached_matches(
+                    hashes,
+                    &mut lookups,
+                    &binding,
+                    tokens,
+                    None,
+                    None,
+                    || {
+                        prompts.len() == 1
+                            && *unique.get_or_insert_with(|| {
+                                all_unique(inputs.iter().map(|(w, _, _)| w.url()))
+                            })
+                    },
+                );
+                let context = tokens.len() as u64;
+                let candidate = CandidateView {
+                    target: &binding.target,
+                    matches: &matches,
+                    load: LoadSample::default(),
+                    input_tokens: tokens.len(),
+                    prefill_tokens: None,
+                };
+                let additional = match stage {
+                    WorkStage::Prefill if !matches.is_empty() => {
+                        request_prefill_tokens(&candidate, &params)
+                    }
+                    WorkStage::Prefill => context,
+                    WorkStage::Decode { .. } => {
+                        let reused = credited_tokens(&candidate, &params) as u64;
+                        let reused = if nixl_pull {
+                            binding.matches.nixl_decode_credit(
+                                binding.target.dp_rank,
+                                tokens.len(),
+                                reused,
+                            )
+                        } else {
+                            reused
+                        };
+                        // Each request holds one copy of the prompt across its sequences.
+                        context.saturating_sub(reused)
+                    }
+                };
+                input_tokens = input_tokens.saturating_add(context);
+                additional_tokens = additional_tokens.saturating_add(additional);
+            }
+            PdWorkPrice {
+                additional_tokens,
+                input_tokens,
+                target: binding.target.clone(),
+                placement_verified,
+            }
+        })
+    }
+
+    fn prepare_pd_prices<'tokens>(
+        &self,
+        inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
+        hashes: &mut PromptHashes<'tokens>,
+        stage: WorkStage,
+    ) -> Option<PdWorkPrices> {
+        hashes.hashes.placement = Some(Vec::new());
+        let workers = inputs
+            .iter()
+            .zip(self.stage_work(inputs, hashes, stage))
+            .map(|((worker, _, _), price)| {
+                (price.placement_verified || matches!(stage, WorkStage::Prefill))
+                    .then(|| (worker.url().to_owned(), price))
             })
-            .collect()
+            .collect::<Option<HashMap<_, _>>>();
+        let placement = hashes.hashes.placement.take().unwrap_or_default();
+        let workers = workers?;
+        let mut evidence: HashMap<_, Vec<_>> = HashMap::new();
+        for proof in placement {
+            evidence
+                .entry(proof.target().clone())
+                .or_default()
+                .push(proof);
+        }
+        Some(PdWorkPrices { workers, evidence })
     }
 
     pub fn new(params: CostParams) -> Self {
@@ -1683,8 +1745,7 @@ impl KvAwarePolicy {
                     .placement
                     .iter()
                     .filter(|proof| proof.target() == &target);
-                let Some(pins) = PlacementEvidence::try_pin_all(evidence) else {
-                    crate::metrics::RouterMetrics::record_kv_placement_lookup("credit_pin_failed");
+                let Some(pins) = pin_credit(evidence) else {
                     pin_failed = true;
                     if let Some(record) = record {
                         record.release_ref();
@@ -2225,57 +2286,10 @@ impl KvAwareOps for KvAwarePolicy {
         inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
         hashes: &mut PromptHashes<'tokens>,
     ) -> Vec<PrefillWorkEstimate> {
-        hashes.set_stage_targets(inputs, false);
-        let mut lookups = crate::metrics::PlacementLookups::default();
-        let mut unique = hashes.hashes.single_target.then_some(true);
-        inputs
-            .iter()
-            .map(|&(worker, prompts, credit)| {
-                let binding = self.binding_for_worker(worker);
-                let verified = credit && binding.cache_key.is_some();
-                let params = CostParams {
-                    block_size: binding.block_size,
-                    ..self.params
-                };
-                let mut new_prefill_tokens = 0u64;
-                for tokens in prompts {
-                    let matches = if verified {
-                        Self::cached_matches(
-                            hashes,
-                            &mut lookups,
-                            &binding,
-                            tokens,
-                            None,
-                            None,
-                            || {
-                                prompts.len() == 1
-                                    && *unique.get_or_insert_with(|| {
-                                        all_unique(inputs.iter().map(|(w, _, _)| w.url()))
-                                    })
-                            },
-                        )
-                    } else {
-                        Cow::Borrowed(&[][..])
-                    };
-                    if matches.is_empty() {
-                        new_prefill_tokens = new_prefill_tokens.saturating_add(tokens.len() as u64);
-                        continue;
-                    }
-                    new_prefill_tokens = new_prefill_tokens.saturating_add(request_prefill_tokens(
-                        &CandidateView {
-                            target: &binding.target,
-                            matches: &matches,
-                            load: LoadSample::default(),
-                            input_tokens: tokens.len(),
-                            prefill_tokens: None,
-                        },
-                        &params,
-                    ));
-                }
-                PrefillWorkEstimate {
-                    new_prefill_tokens,
-                    placement_verified: verified,
-                }
+        self.stage_work(inputs, hashes, WorkStage::Prefill)
+            .map(|price| PrefillWorkEstimate {
+                new_prefill_tokens: price.additional_tokens,
+                placement_verified: price.placement_verified,
             })
             .collect()
     }
@@ -2297,12 +2311,19 @@ impl KvAwareOps for KvAwarePolicy {
         hashes: &mut PromptHashes<'tokens>,
         nixl_pull: bool,
     ) -> Vec<DecodeWorkEstimate> {
-        self.decode_work(inputs, hashes, nixl_pull)
-            .into_iter()
+        self.stage_work(inputs, hashes, WorkStage::Decode { nixl_pull })
             .map(|price| DecodeWorkEstimate {
-                additional_tokens: price.map(|price| price.additional_tokens),
+                additional_tokens: price.placement_verified.then_some(price.additional_tokens),
             })
             .collect()
+    }
+
+    fn prepare_prefill_prices<'tokens>(
+        &self,
+        inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
+        hashes: &mut PromptHashes<'tokens>,
+    ) -> Option<PdWorkPrices> {
+        self.prepare_pd_prices(inputs, hashes, WorkStage::Prefill)
     }
 
     fn prepare_decode_prices<'tokens>(
@@ -2310,23 +2331,8 @@ impl KvAwareOps for KvAwarePolicy {
         inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
         hashes: &mut PromptHashes<'tokens>,
         nixl_pull: bool,
-    ) -> Option<PdDecodePrices> {
-        hashes.hashes.placement = Some(Vec::new());
-        let work = self.decode_work(inputs, hashes, nixl_pull);
-        let placement = hashes.hashes.placement.take().unwrap_or_default();
-        let workers = inputs
-            .iter()
-            .zip(work)
-            .map(|((worker, _, _), price)| Some((worker.url().to_owned(), price?)))
-            .collect::<Option<HashMap<_, _>>>()?;
-        let mut evidence: HashMap<_, Vec<_>> = HashMap::new();
-        for proof in placement {
-            evidence
-                .entry(proof.target().clone())
-                .or_default()
-                .push(proof);
-        }
-        Some(PdDecodePrices { workers, evidence })
+    ) -> Option<PdWorkPrices> {
+        self.prepare_pd_prices(inputs, hashes, WorkStage::Decode { nixl_pull })
     }
 
     fn pick_prefill(&self, costs: &[f64], occupancy: &[usize]) -> Option<usize> {
