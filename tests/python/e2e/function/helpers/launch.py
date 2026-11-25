@@ -1,4 +1,4 @@
-"""Launch vllm-router and vllm-rs workers for tests/python/e2e/function (no vllm.test import)."""
+"""Launch vllm-router and workers for the functional E2E tests."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import TextIO
 from urllib.parse import urlparse
 
 import requests
@@ -143,10 +144,14 @@ def wait_worker_health(
     raise TimeoutError(f"Worker failed to become healthy in time: {health_url}")
 
 
-def wait_router_health(base_url: str, timeout: float) -> None:
+def wait_router_health(
+    base_url: str, timeout: float, proc: subprocess.Popen | None = None
+) -> None:
     start = time.perf_counter()
     with requests.Session() as session:
         while time.perf_counter() - start < timeout:
+            if proc is not None and (code := proc.poll()) is not None:
+                raise TimeoutError(f"Router exited with code {code}: {base_url}")
             try:
                 r = session.get(f"{base_url}/health", timeout=5)
                 if r.status_code == 200:
@@ -184,6 +189,7 @@ def kv_events_config_argv(
     replay_port: int | None = None,
     endpoint_bind: str = "*",
     replay_host: str = "127.0.0.1",
+    topic: str | None = None,
 ) -> list[str]:
     """``--kv-events-config`` JSON. Replay is included only when ``replay_port`` is set."""
     payload: dict[str, object] = {
@@ -193,7 +199,40 @@ def kv_events_config_argv(
     }
     if replay_port is not None:
         payload["replay_endpoint"] = f"tcp://{replay_host}:{replay_port}"
+    if topic is not None:
+        payload["topic"] = topic
     return ["--kv-events-config", json.dumps(payload, separators=(",", ":"))]
+
+
+def _cuda_visible_devices(gpu_ids: int | list[int]) -> str:
+    if isinstance(gpu_ids, int):
+        return str(gpu_ids)
+    return ",".join(map(str, gpu_ids))
+
+
+def popen_launch_vllm_http_worker(
+    executable: str,
+    model: str,
+    base_url: str,
+    *,
+    gpu_id: int | list[int],
+    hash_seed: str,
+    extra_argv: list[str],
+    log_file: TextIO,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.Popen:
+    """Launch an HTTP worker that publishes full KV block hashes."""
+    host, port = _parse_url(base_url)
+    env = {
+        **os.environ,
+        **(extra_env or {}),
+        "CUDA_VISIBLE_DEVICES": _cuda_visible_devices(gpu_id),
+        "PYTHONHASHSEED": hash_seed,
+        "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": "0",
+        "VLLM_USE_RUST_FRONTEND": "0",
+    }
+    cmd = [executable, "serve", model, "--host", host, "--port", port, *extra_argv]
+    return subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
 
 
 def resolve_worker_serve_launch(
@@ -225,7 +264,7 @@ def popen_launch_vllm_rs_grpc_worker(
     host: str = "127.0.0.1",
     http_port: int,
     grpc_port: int,
-    base_gpu_id: int = 0,
+    base_gpu_id: int | list[int] = 0,
     kv_events_zmq_port: int | None = None,
     kv_events_replay_port: int | None = None,
     extra_argv: list[str] | None = None,
@@ -233,18 +272,21 @@ def popen_launch_vllm_rs_grpc_worker(
     replay_host: str = "127.0.0.1",
     prefer_vllm_serve: bool = False,
     capture_output: bool = False,
+    hash_seed: str | None = None,
+    log_file: TextIO | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.Popen:
     """``vllm-rs serve`` with HTTP + ``--grpc-port``.
 
     KV-event flags are appended only when ``kv_events_zmq_port`` is set.
     ``--grpc-port`` is passed only on this ``vllm-rs`` path.
 
-    When ``capture_output`` is true, stdout/stderr are merged into a PIPE for
-    ``SubprocessLogPump`` (do not pass a custom stdout object).
+    Set ``hash_seed`` to publish full, reproducible KV hashes. Stdout and
+    stderr go to ``log_file`` or, with ``capture_output``, a log pump PIPE.
     """
     kind, prefix = resolve_worker_serve_launch(prefer_vllm_serve=prefer_vllm_serve)
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(base_gpu_id)
+    env = {**os.environ, **(extra_env or {})}
+    env["CUDA_VISIBLE_DEVICES"] = _cuda_visible_devices(base_gpu_id)
     serve_tail = list(extra_argv or [])
     if kv_events_zmq_port is not None and "--kv-events-config" not in serve_tail:
         serve_tail = [
@@ -267,6 +309,9 @@ def popen_launch_vllm_rs_grpc_worker(
         str(grpc_port),
         *serve_tail,
     ]
+    if hash_seed is not None:
+        env["PYTHONHASHSEED"] = hash_seed
+        env["VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES"] = "0"
     zmq_note = f" kv_events_zmq={kv_events_zmq_port}" if kv_events_zmq_port else ""
     replay_note = (
         f" kv_events_replay={kv_events_replay_port}"
@@ -287,6 +332,9 @@ def popen_launch_vllm_rs_grpc_worker(
         popen_kw["encoding"] = "utf-8"
         popen_kw["errors"] = "replace"
         popen_kw["bufsize"] = 1
+    elif log_file is not None:
+        popen_kw["stdout"] = log_file
+        popen_kw["stderr"] = subprocess.STDOUT
     return subprocess.Popen(cmd, **popen_kw)
 
 
@@ -301,6 +349,9 @@ def popen_launch_router_only(
     router_temperature: float | None = None,
     worker_urls: list[str] | None = None,
     router_model: str | None = None,
+    extra_argv: list[str] | None = None,
+    log_level: str | None = None,
+    log_file: TextIO | None = None,
 ) -> subprocess.Popen:
     host, port = _parse_url(base_url)
     prom_port = find_available_port()
@@ -336,19 +387,25 @@ def popen_launch_router_only(
         "--prometheus-host",
         "127.0.0.1",
     ]
-    env.setdefault("RUST_LOG", "vllm_router_rs=info")
+    if extra_argv:
+        cmd.extend(extra_argv)
+    if log_level is None:
+        env.setdefault("RUST_LOG", "vllm_router_rs=info")
+    else:
+        env["RUST_LOG"] = f"vllm_router_rs={log_level}"
     env.setdefault("VLLM_ROUTER_STAGES", "1")
-    # Inherit stdio so ``pytest -s`` shows router tracing (same as vllm-rs workers).
+    # With no log file, inherit stdio so pytest -s shows router tracing.
     print(f"[e2e] starting router {base_url} policy={policy!r}", flush=True)
     print(f"[e2e] router cmd: {cmd!r}", flush=True)
-    proc = subprocess.Popen(cmd, env=env)
+    output = {"stdout": log_file, "stderr": subprocess.STDOUT} if log_file else {}
+    proc = subprocess.Popen(cmd, env=env, **output)
     try:
-        wait_router_health(base_url, timeout)
+        wait_router_health(base_url, timeout, proc)
     except TimeoutError as exc:
-        if proc.poll() is None:
-            proc.kill()
+        terminate_process(proc)
+        log_location = str(log_file.name) if log_file else "this terminal"
         raise TimeoutError(
-            f"{exc}\nrouter cmd: {cmd!r}\n(router logs were streamed to this terminal)"
+            f"{exc}\nrouter cmd: {cmd!r}\n(router logs: {log_location})"
         ) from exc
     return proc
 

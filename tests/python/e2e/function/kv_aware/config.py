@@ -1,7 +1,8 @@
-"""Model and prompt constants for kv_aware functional e2e.
+"""Case settings and prompt constants for kv_aware functional e2e.
 
-Workers: **``vllm-rs serve``** with ``grpc://`` URLs (see ``scripts/backend``).
-``vllm serve`` does not accept ``--grpc-port`` (``docs/backend/grpc.md``).
+The dual-lane case uses ``vllm-rs serve`` with gRPC. The hybrid case covers
+both ``vllm serve`` with HTTP and ``vllm-rs serve`` with gRPC. Default worker
+settings live in ``cases/``.
 
 Optional environment (see also ``function/helpers/launch.py``):
 
@@ -11,6 +12,10 @@ Optional environment (see also ``function/helpers/launch.py``):
 - Model for workers + router (HF id or local dir), first match wins:
   ``KV_AWARE_E2E_MODEL``, ``MODEL``, ``VLLM_ROUTER_MODEL``, ``MODEL_DIR``;
   default ``Qwen/Qwen3-0.6B`` (see ``kv_aware_e2e_model()``).
+- ``KV_AWARE_HYBRID_MODEL``: optional local Qwen3.5-4B checkpoint.
+- ``KV_AWARE_HYBRID_QWEN3_8_27B_MODEL``: optional local Qwen3.8-27B checkpoint.
+  Each hybrid case declares its local checkpoint variable in
+  ``cases/hybrid_models.json``.
 - ``KV_AWARE_USE_VLLM_SERVE``: ``0`` (default) use ``vllm-rs serve``.
   ``1`` is rejected: ``vllm serve`` cannot be a ``grpc://`` worker.
 - Worker serve extras (shell-split, first set wins):
@@ -27,10 +32,9 @@ Optional environment (see also ``function/helpers/launch.py``):
 
 Worker GPUs (two worker serve processes):
 
-- If ``CUDA_VISIBLE_DEVICES`` is set (e.g. ``0,1,2,3`` or ``2,3,4,5``), worker A/B
-  use the **first two entries** in that list (physical ids).
-- If unset, query the machine via ``nvidia-smi`` and use physical ``0`` and ``1``
-  (requires at least two GPUs on the host).
+- Use GPU IDs from ``CUDA_VISIBLE_DEVICES``, or query ``nvidia-smi`` when unset.
+- The dual-lane case uses one GPU per worker. Hybrid cases assign each worker
+  a distinct slice of the GPU list based on its tensor parallel size.
 
 Routing scenario (``test_kv_aware_*`` under ``kv_aware/``):
 
@@ -45,12 +49,17 @@ contract, two-worker prime, index settle, then **first B reuse before any A reus
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
+from pathlib import Path
+from typing import Any
 
-# Default when no model env is set (see ``kv_aware_e2e_model()``).
-KV_AWARE_E2E_MODEL_DEFAULT = "Qwen/Qwen3-0.6B"
+
+def load_kv_aware_case(name: str) -> dict[str, Any]:
+    path = Path(__file__).with_name("cases") / f"{name}.json"
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def kv_aware_e2e_model() -> str:
@@ -59,7 +68,7 @@ def kv_aware_e2e_model() -> str:
         raw = os.environ.get(key, "").strip()
         if raw:
             return raw
-    return KV_AWARE_E2E_MODEL_DEFAULT
+    return load_kv_aware_case("qwen3_0_6b")["model"]
 
 
 # Independent long prefixes so two lanes do not share KV block hashes.
@@ -130,7 +139,7 @@ def worker_serve_extra_argv() -> list[str]:
         raw = os.environ.get(key, "").strip()
         if raw:
             return shlex.split(raw)
-    return ["--enable-prefix-caching"]
+    return load_kv_aware_case("qwen3_0_6b")["worker_args"]
 
 
 def _parse_cuda_visible_device_list(raw: str) -> list[int]:
