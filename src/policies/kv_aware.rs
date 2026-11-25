@@ -101,6 +101,8 @@ impl<'a> KvRequestTokens<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefillWorkEstimate {
     pub new_prefill_tokens: u64,
+    /// The candidate was eligible for KV credit at lookup. The commit check can
+    /// fall back to full input while this remains true.
     pub placement_verified: bool,
 }
 
@@ -121,7 +123,16 @@ struct PdWorkPrice {
     additional_tokens: u64,
     input_tokens: u64,
     target: RoutableTarget,
-    placement_verified: bool,
+    identity_verified: bool,
+}
+
+impl PdWorkPrice {
+    fn prefill_estimate(&self, new_prefill_tokens: u64) -> PrefillWorkEstimate {
+        PrefillWorkEstimate {
+            new_prefill_tokens,
+            placement_verified: self.identity_verified,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -148,10 +159,8 @@ impl ValidatedWorkPrices<'_> {
     }
 
     pub(crate) fn prefill_work(&self, worker_url: &str) -> Option<PrefillWorkEstimate> {
-        Some(PrefillWorkEstimate {
-            new_prefill_tokens: *self.tokens.get(worker_url)?,
-            placement_verified: self.prices.workers.get(worker_url)?.placement_verified,
-        })
+        let price = self.prices.workers.get(worker_url)?;
+        Some(price.prefill_estimate(*self.tokens.get(worker_url)?))
     }
 }
 
@@ -1222,19 +1231,7 @@ impl KvAwarePolicy {
         let mut unique = hashes.hashes.single_target.then_some(true);
         inputs.iter().map(move |&(worker, prompts, credit)| {
             let binding = self.binding_for_worker(worker);
-            let placement_verified = credit && binding.cache_key.is_some();
-            if !placement_verified {
-                let input_tokens = prompts
-                    .iter()
-                    .map(|prompt| prompt.len() as u64)
-                    .fold(0, u64::saturating_add);
-                return PdWorkPrice {
-                    additional_tokens: input_tokens,
-                    input_tokens,
-                    target: binding.target.clone(),
-                    placement_verified,
-                };
-            }
+            let identity_verified = credit && binding.cache_key.is_some();
             let mut params = CostParams {
                 block_size: binding.block_size,
                 ..self.params
@@ -1248,6 +1245,11 @@ impl KvAwarePolicy {
             let mut input_tokens = 0u64;
             let mut additional_tokens = 0u64;
             for tokens in prompts {
+                let context = u64::try_from(tokens.len()).unwrap_or(u64::MAX);
+                input_tokens = input_tokens.saturating_add(context);
+                if !identity_verified {
+                    continue;
+                }
                 let matches = Self::cached_matches(
                     hashes,
                     &mut lookups,
@@ -1262,7 +1264,6 @@ impl KvAwarePolicy {
                             })
                     },
                 );
-                let context = tokens.len() as u64;
                 let candidate = CandidateView {
                     target: &binding.target,
                     matches: &matches,
@@ -1290,14 +1291,17 @@ impl KvAwarePolicy {
                         context.saturating_sub(reused)
                     }
                 };
-                input_tokens = input_tokens.saturating_add(context);
                 additional_tokens = additional_tokens.saturating_add(additional);
             }
             PdWorkPrice {
-                additional_tokens,
+                additional_tokens: if identity_verified {
+                    additional_tokens
+                } else {
+                    input_tokens
+                },
                 input_tokens,
                 target: binding.target.clone(),
-                placement_verified,
+                identity_verified,
             }
         })
     }
@@ -1313,7 +1317,7 @@ impl KvAwarePolicy {
             .iter()
             .zip(self.stage_work(inputs, hashes, stage))
             .map(|((worker, _, _), price)| {
-                (price.placement_verified || matches!(stage, WorkStage::Prefill))
+                (price.identity_verified || matches!(stage, WorkStage::Prefill))
                     .then(|| (worker.url().to_owned(), price))
             })
             .collect::<Option<HashMap<_, _>>>();
@@ -2287,10 +2291,7 @@ impl KvAwareOps for KvAwarePolicy {
         hashes: &mut PromptHashes<'tokens>,
     ) -> Vec<PrefillWorkEstimate> {
         self.stage_work(inputs, hashes, WorkStage::Prefill)
-            .map(|price| PrefillWorkEstimate {
-                new_prefill_tokens: price.additional_tokens,
-                placement_verified: price.placement_verified,
-            })
+            .map(|price| price.prefill_estimate(price.additional_tokens))
             .collect()
     }
 
@@ -2313,7 +2314,7 @@ impl KvAwareOps for KvAwarePolicy {
     ) -> Vec<DecodeWorkEstimate> {
         self.stage_work(inputs, hashes, WorkStage::Decode { nixl_pull })
             .map(|price| DecodeWorkEstimate {
-                additional_tokens: price.placement_verified.then_some(price.additional_tokens),
+                additional_tokens: price.identity_verified.then_some(price.additional_tokens),
             })
             .collect()
     }

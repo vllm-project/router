@@ -2796,10 +2796,10 @@ mod admission_tests {
         HashMap<String, PdPrefillInput>,
         crate::policies::PdWorkPrices,
     ) {
-        let prompts = [tokens.to_vec()];
+        let prompts: Arc<[Vec<u32>]> = Arc::from([tokens.to_vec()]);
         let inputs: Vec<_> = p
             .iter()
-            .map(|worker| (worker.as_ref(), prompts.as_slice(), true))
+            .map(|worker| (worker.as_ref(), prompts.as_ref(), true))
             .collect();
         let prices = kv_aware_ops(policy)
             .unwrap()
@@ -2811,7 +2811,7 @@ mod admission_tests {
                 (
                     worker.base_url().to_owned(),
                     PdPrefillInput {
-                        prompts: Some(Arc::from(prompts.clone())),
+                        prompts: Some(prompts.clone()),
                         allow_credit: true,
                         fallback_reason: None,
                     },
@@ -2887,12 +2887,22 @@ mod admission_tests {
 
         let policy = KvAwarePolicy::default();
         let prompts = [vec![42; 33]];
-        let workers = pool("d", 2);
+        // Same engine URL, independent rank snapshots and prices.
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|rank| {
+                Arc::new(DPAwareWorker::new(
+                    "http://worker:8000".into(),
+                    rank,
+                    2,
+                    WorkerType::Decode,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
         let mut sources = Vec::new();
         for (index, (worker, warm)) in workers.iter().zip([32, 16]).enumerate() {
             let target = RoutableTarget {
-                instance_id: format!("engine-{index}").into(),
-                dp_rank: 0,
+                instance_id: worker.base_url().into(),
+                dp_rank: index as u32,
             };
             let source = Arc::new(full_binding(target.clone(), 16));
             source.begin_empty(0);
@@ -2918,30 +2928,35 @@ mod admission_tests {
         let (prefill_inputs, prefill_prices) = token_inputs(&workers, &prompts[0], &policy);
         let other_decode = pool("other-decode", 1);
         let manager = PdLoadManager::default();
-        let select = |expected_tokens: [u64; 2], expected_worker: usize| {
-            let prepared = PdRequestContext {
-                decode_pricing: Some(StagePricing::Prepared(&prices)),
+        let loads = Loads::from([(
+            (Stage::Decode, PdEndpoint::for_worker(workers[0].as_ref())),
+            PdLoadSample {
+                active_decode_tokens: 10,
+                ..Default::default()
+            },
+        )]);
+        let select_decode = |prices: &crate::policies::ValidatedWorkPrices<'_>| {
+            let decode_context = PdRequestContext {
+                decode_pricing: Some(StagePricing::Validated(prices)),
                 ..context()
             };
-            let mut validated = None;
-            let decode_context = PdRequestContext {
-                decode_pricing: prepared
-                    .decode_pricing
-                    .map(|prices| prices.validate(&workers, &mut validated)),
-                ..prepared
-            };
-            let tokens = decode_context.decode_tokens().unwrap();
+            select_decode_stage(&loads, &workers, &policy, &decode_context).unwrap()
+        };
+
+        // A price table missing rank 1 uses occupancy alone, even with rank 0 warm.
+        let partial = policy
+            .prepare_decode_prices(&inputs[..1], &mut PromptHashes::new(), false)
+            .unwrap();
+        assert_eq!(select_decode(&partial.validate(&workers)).worker_index, 1);
+
+        let select = |expected_tokens: [u64; 2], expected_worker: usize| {
+            let decode = prices.validate(&workers);
+            let tokens = decode.tokens();
             assert_eq!(
                 [tokens[workers[0].url()], tokens[workers[1].url()]],
                 expected_tokens
             );
-            let decision =
-                select_decode_stage(&Loads::new(), &workers, &policy, &decode_context).unwrap();
-            assert_eq!(decision.worker_index, expected_worker);
-            assert_eq!(
-                decision.score,
-                Some(expected_tokens[expected_worker] as f64)
-            );
+            assert_eq!(select_decode(&decode).worker_index, expected_worker);
 
             let mut prefill_validated = None;
             let (selection, attempt) = manager
@@ -2954,6 +2969,9 @@ mod admission_tests {
                         ),
                         ..context()
                     };
+                    let work = context.prefill_work(workers[0].url()).unwrap();
+                    assert_eq!(work.new_prefill_tokens, expected_tokens[0]);
+                    assert!(work.placement_verified);
                     select_pd_pair(
                         loads,
                         &workers,
@@ -2983,80 +3001,6 @@ mod admission_tests {
             )
             .unwrap();
         select([33, 17], 1);
-    }
-
-    #[test]
-    fn dp_rank_decode_prices_are_matched_by_worker_url() {
-        let p = pool("p", 1);
-        let d: Vec<Arc<dyn Worker>> = (0..2)
-            .map(|rank| {
-                Arc::new(DPAwareWorker::new(
-                    "http://d:8000".to_string(),
-                    rank,
-                    2,
-                    WorkerType::Decode,
-                )) as Arc<dyn Worker>
-            })
-            .collect();
-        assert_eq!(d[0].base_url(), d[1].base_url());
-        assert_ne!(d[0].url(), d[1].url());
-
-        let mut loads = Loads::new();
-        loads.insert(
-            (Stage::Decode, PdEndpoint::for_worker(d[0].as_ref())),
-            PdLoadSample {
-                active_decode_tokens: 100,
-                ..Default::default()
-            },
-        );
-        loads.insert(
-            (Stage::Decode, PdEndpoint::for_worker(d[1].as_ref())),
-            PdLoadSample {
-                active_decode_tokens: 60,
-                ..Default::default()
-            },
-        );
-        let policy = KvAwarePolicy::default();
-
-        // Without prices the less occupied rank wins.
-        let baseline = select_pd_pair(&loads, &p, &d, &policy, &policy, &context(), true).unwrap();
-        assert_eq!(
-            baseline.decode.endpoint,
-            PdEndpoint::for_worker(d[1].as_ref())
-        );
-
-        // A fully cached prefix on @0 (0 new tokens) beats @1's 50-token gap.
-        // Both keys are `Worker::url()`; keying by `base_url()` would collapse
-        // the two ranks and leave the whole table unusable.
-        let prices = HashMap::from([
-            (d[0].url().to_owned(), 0u64),
-            (d[1].url().to_owned(), 50u64),
-        ]);
-        let priced = PdRequestContext {
-            decode_pricing: Some(StagePricing::DecodeTokens(&prices)),
-            ..context()
-        };
-        let selection = select_pd_pair(&loads, &p, &d, &policy, &policy, &priced, true).unwrap();
-        assert_eq!(
-            selection.decode.endpoint,
-            PdEndpoint::for_worker(d[0].as_ref()),
-            "prefix credit on @0 must change the Decode choice"
-        );
-
-        // Missing one rank makes the table incomplete: the selector must ignore
-        // the price of the other rank and fall back to occupancy, where @1 wins.
-        let partial = HashMap::from([(d[0].url().to_owned(), 0u64)]);
-        let partial_context = PdRequestContext {
-            decode_pricing: Some(StagePricing::DecodeTokens(&partial)),
-            ..context()
-        };
-        let fallback =
-            select_pd_pair(&loads, &p, &d, &policy, &policy, &partial_context, true).unwrap();
-        assert_eq!(
-            fallback.decode.endpoint,
-            PdEndpoint::for_worker(d[1].as_ref()),
-            "a price table missing one DP rank must not credit the others"
-        );
     }
 
     #[cfg(all(feature = "cpu", feature = "ready"))]

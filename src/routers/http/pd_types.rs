@@ -178,8 +178,6 @@ pub struct PdPrefillInput {
 pub(super) enum StagePricing<'a> {
     Prepared(&'a PdWorkPrices),
     Validated(&'a ValidatedWorkPrices<'a>),
-    #[cfg(test)]
-    DecodeTokens(&'a HashMap<String, u64>),
 }
 
 /// Token inputs are keyed by the P base URL: each backend renders its own
@@ -240,8 +238,6 @@ impl PdRequestContext<'_> {
     pub(super) fn decode_tokens(&self) -> Option<&HashMap<String, u64>> {
         match self.decode_pricing {
             Some(StagePricing::Validated(prices)) => Some(prices.tokens()),
-            #[cfg(test)]
-            Some(StagePricing::DecodeTokens(tokens)) => Some(tokens),
             _ => None,
         }
     }
