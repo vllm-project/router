@@ -9,15 +9,18 @@ use tonic_prost::ProstCodec;
 use tracing::{info, warn};
 
 use super::lifecycle::WorkerLifecycle;
+use super::metrics_meta::EngineCacheConfigs;
 use super::{
-    discovered_block_size, metrics_meta, CacheCapabilities, KvEventSourceEntry,
-    KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe, SourcesUnavailable,
-    WorkerDiscovery, CONTROL_TIMEOUT,
+    discovered_block_size, events_enabled, metrics_meta, split_worker_rank, CacheCapabilities,
+    KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe,
+    SourcesUnavailable, WorkerDiscovery, CONTROL_TIMEOUT,
 };
 use crate::backend::control::control_channel;
 use crate::backend::pb::{GetKvEventSourcesRequest, KvEventSource};
 use crate::core::worker::{worker_get, UNLABELED_WORKER_MODEL_ID};
 use crate::core::Worker;
+
+const ADMISSION_HASH_TIMEOUT: Duration = Duration::from_millis(750);
 
 pub(super) struct RegistrationProbe {
     pub(super) descriptor: WorkerDescriptor,
@@ -67,6 +70,7 @@ impl KvIndexSupervisor {
         connector: Option<crate::config::KvConnector>,
         lifecycle: &WorkerLifecycle,
     ) -> Result<RegistrationProbe, String> {
+        let started = tokio::time::Instant::now();
         let mut worker = self.discover_for_role(base, connector).await;
         if plain_only
             && worker
@@ -105,7 +109,37 @@ impl KvIndexSupervisor {
                     .unwrap_or_default(),
             });
         }
+        if started.elapsed() < CONTROL_TIMEOUT - ADMISSION_HASH_TIMEOUT
+            && !lifecycle.keeps_descriptor(&lifecycle.state.lock(), &descriptor)
+        {
+            self.probe_admission_hashes(base, &mut worker).await;
+        }
         Ok(RegistrationProbe { descriptor, worker })
+    }
+
+    pub(super) async fn probe_admission_hashes(
+        &self,
+        worker_url: &str,
+        worker: &mut WorkerDiscovery,
+    ) {
+        let (base, _) = split_worker_rank(worker_url);
+        if worker.engine_cache_configs.is_some()
+            || worker.hybrid.is_none()
+            || !worker
+                .sources
+                .as_ref()
+                .is_ok_and(|sources| sources.values().any(events_enabled))
+            || crate::backend::is_grpc_url(base)
+        {
+            return;
+        }
+        worker.engine_cache_configs = tokio::time::timeout(
+            ADMISSION_HASH_TIMEOUT,
+            query_engine_cache_configs(&self.client, base, self.api_key.as_deref()),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
     }
 }
 
@@ -453,20 +487,27 @@ pub(super) fn parse_vllm_version(version: &str) -> Option<(u32, u32)> {
 /// Every source is optional; the error names what each one said, so an operator
 /// can tell a missing endpoint from an endpoint that answered without a block
 /// size.
+pub(super) type WorkerMetadata = (
+    ServerInfo,
+    Option<HashSet<String>>,
+    Option<EngineCacheConfigs>,
+);
+
 pub(super) async fn query_worker_metadata_and_models(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-) -> Result<(ServerInfo, Option<HashSet<String>>), String> {
+) -> Result<WorkerMetadata, String> {
     let control_error = match query_worker_control_metadata(client, worker_url, api_key).await {
-        Ok(info) => return Ok((info, None)),
+        Ok(info) => return Ok((info, None, None)),
         Err(error) => error,
     };
 
     query_metrics_metadata(client, worker_url, api_key)
         .await
-        .and_then(|(info, models)| {
-            validate_worker_metadata(worker_url, "metrics", Ok(info)).map(|info| (info, models))
+        .and_then(|(info, models, configs)| {
+            validate_worker_metadata(worker_url, "metrics", Ok(info))
+                .map(|info| (info, models, configs))
         })
         .map_err(|error| format!("{control_error}; {error}"))
 }
@@ -561,7 +602,7 @@ async fn query_metrics_metadata(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-) -> Result<(ServerInfo, Option<HashSet<String>>), String> {
+) -> Result<WorkerMetadata, String> {
     let engines = query_engine_cache_configs(client, worker_url, api_key).await?;
     let hash_unit = metrics_meta::shared_hash_unit(&engines).map_err(|units| {
         format!("metrics: engines disagree on block size {units:?} — refusing to index")
@@ -583,7 +624,7 @@ async fn query_metrics_metadata(
         kv_block_size: hash_unit,
         ..Default::default()
     };
-    Ok((info, models.as_ref().map(base_model_names)))
+    Ok((info, models.as_ref().map(base_model_names), Some(engines)))
 }
 
 pub(super) async fn query_engine_cache_configs(

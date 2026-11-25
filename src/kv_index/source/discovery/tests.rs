@@ -856,6 +856,7 @@ async fn hybrid_discovery_binds_only_ranks_for_the_worker_model() {
         base_models: None,
         hybrid: Some(capability),
         assumed_plain_full: false,
+        engine_cache_configs: None,
     };
     let (supervisor, _signals) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
     let worker_url = "http://127.0.0.1:8080";
@@ -1136,6 +1137,7 @@ fn declared_full_worker(
         base_models: None,
         hybrid: Some(layout),
         assumed_plain_full: false,
+        engine_cache_configs: None,
     }
 }
 
@@ -1862,14 +1864,91 @@ async fn spawn_metrics_only_worker(router: axum::Router) -> (String, tokio::task
 }
 
 #[tokio::test]
+async fn registration_checks_hashes_per_rank_and_replaces_old_bindings() {
+    use axum::routing::get;
+    use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
+
+    let sockets: Vec<_> = (0..3).map(|_| layout_endpoints()).collect();
+    let sources: serde_json::Map<_, _> = sockets
+        .iter()
+        .enumerate()
+        .map(|(rank, (publisher, replay, _, _))| {
+            (
+                rank.to_string(),
+                json!({
+                    "endpoint": publisher, "replay_endpoint": replay, "publisher": "zmq",
+                    "topic": format!("kv/admission/{rank}")
+                }),
+            )
+        })
+        .collect();
+    let metrics = Arc::new(Mutex::new(
+        concat!(
+            "vllm:cache_config_info{engine=\"0\",prefix_caching_hash_algo=\"sha256_cbor\"} 1.0\n",
+            "vllm:cache_config_info{engine=\"1\",prefix_caching_hash_algo=\"sha256\"} 1.0\n",
+            "vllm:cache_config_info{engine=\"2\"} 1.0\n",
+        )
+        .to_owned(),
+    ));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        "/metrics",
+        get({
+            let metrics = metrics.clone();
+            let requests = requests.clone();
+            move || {
+                requests.fetch_add(1, Ordering::Relaxed);
+                let data = metrics.lock().clone();
+                async move { data }
+            }
+        }),
+    );
+    let (worker, server) = source_boundary_worker_with_routes(
+        app,
+        json!({"model_id": "test", "instance_id": "boot", "kv_block_size": 16}),
+        Arc::new(Mutex::new(serde_json::Value::Object(sources))),
+    )
+    .await;
+    let (supervisor, _signals) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
+    let first = supervisor.on_worker_added(&worker).await.unwrap();
+    assert_eq!(
+        first.ranks.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([0, 2])
+    );
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+
+    let old = supervisor.lifecycle_for_worker(&worker);
+    *metrics.lock() = (0..3).map(|rank| {
+        format!("vllm:cache_config_info{{engine=\"{rank}\",prefix_caching_hash_algo=\"sha256\"}} 1.0\n")
+    }).collect();
+    supervisor
+        .probe_registration(&worker, false, None, &old)
+        .await
+        .unwrap();
+    assert_eq!(requests.load(Ordering::Relaxed), 1, "unchanged descriptor");
+    assert!(old.active.load(Ordering::Acquire));
+
+    let restarted = supervisor.on_worker_added(&worker).await.unwrap();
+    assert!(restarted.ranks.is_empty());
+    assert!(restarted.cache_key.is_none());
+    assert!(!old.active.load(Ordering::Acquire));
+    assert!(supervisor.match_provider_for_worker(&worker).is_none());
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    supervisor.shutdown();
+    server.abort();
+}
+
+#[tokio::test]
 async fn metrics_only_worker_supplies_cache_metadata() {
     let metrics = "vllm:cache_config_info{engine=\"0\"} 1.0\n\
         vllm:cache_config_info{block_size=\"8\",effective_attention_block_size=\"16\",engine=\"1\"} 1.0\n";
     let (worker, server) = spawn_metrics_only_worker(metrics_and_models_router(metrics)).await;
 
-    let (info, models) = query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None)
-        .await
-        .unwrap();
+    let (info, models, _) =
+        query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None)
+            .await
+            .unwrap();
     assert_eq!(info.kv_block_size, Some(16));
     assert_eq!(discovered_block_size(&info), Some(16));
     assert_eq!(info.model_id.as_deref(), Some("mock-model"));
@@ -1977,6 +2056,7 @@ fn descriptor_refresh_covers_identity_changes_and_failure_threshold() {
             base_models: None,
             hybrid: None,
             assumed_plain_full: false,
+            engine_cache_configs: None,
         })
         .unwrap()
     };

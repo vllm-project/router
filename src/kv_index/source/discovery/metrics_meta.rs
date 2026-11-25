@@ -12,6 +12,8 @@ use crate::protocols::prometheus_text::for_each_sample;
 /// The metric family that carries one engine's `CacheConfig`.
 pub(crate) const CACHE_CONFIG_INFO: &str = "vllm:cache_config_info";
 
+pub(super) type EngineCacheConfigs = BTreeMap<u32, EngineCacheConfig>;
+
 /// The parts of one engine's `CacheConfig` the KV index needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EngineCacheConfig {
@@ -21,6 +23,7 @@ pub(crate) struct EngineCacheConfig {
     pub(crate) effective_attention_block_size: Option<u32>,
     /// Resolved hash granularity. Older engines may leave it unset.
     pub(crate) hash_block_size: Option<u32>,
+    pub(crate) prefix_caching_hash_algo: Option<String>,
     /// Engine-declared cache layout, once vLLM populates it.
     pub(crate) kv_cache_layout: Option<String>,
 }
@@ -58,10 +61,15 @@ pub(crate) fn parse_cache_config_info(text: &str) -> BTreeMap<u32, EngineCacheCo
         if name != CACHE_CONFIG_INFO {
             return;
         }
-        let engine = labels
-            .get("engine")
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(0);
+        let engine = match labels.get("engine") {
+            Some(value) => {
+                let Ok(rank) = value.parse::<u32>() else {
+                    return;
+                };
+                rank
+            }
+            None => 0,
+        };
         let entry = engines.entry(engine).or_default();
         entry.block_size = labels
             .get("block_size")
@@ -73,6 +81,10 @@ pub(crate) fn parse_cache_config_info(text: &str) -> BTreeMap<u32, EngineCacheCo
             .get("hash_block_size")
             .and_then(|value| value.parse().ok())
             .filter(|size| *size > 0);
+        entry.prefix_caching_hash_algo = labels
+            .get("prefix_caching_hash_algo")
+            .filter(|algorithm| !is_unset(algorithm))
+            .cloned();
         entry.kv_cache_layout = labels
             .get("kv_cache_layout")
             .filter(|layout| !is_unset(layout))
@@ -107,6 +119,10 @@ mod tests {
         assert_eq!(engine.block_size, Some(16));
         assert_eq!(engine.effective_attention_block_size, Some(16));
         assert_eq!(engine.kv_cache_layout, None);
+        assert_eq!(
+            engine.prefix_caching_hash_algo.as_deref(),
+            Some("sha256_cbor")
+        );
         assert_eq!(engine.hash_unit(), Some(16));
     }
 
@@ -121,6 +137,33 @@ mod tests {
         assert_eq!(engines[&0].block_size, Some(32));
         assert_eq!(engines[&1].block_size, Some(16));
         assert_eq!(engines[&0].hash_unit(), Some(32));
+    }
+
+    #[test]
+    fn missing_engine_label_defaults_to_rank_zero() {
+        let metrics =
+            r#"vllm:cache_config_info{block_size="16",prefix_caching_hash_algo="sha256_cbor"} 1.0"#;
+        let engines = parse_cache_config_info(metrics);
+        assert_eq!(engines.len(), 1);
+        assert_eq!(
+            engines[&0].prefix_caching_hash_algo.as_deref(),
+            Some("sha256_cbor")
+        );
+    }
+
+    #[test]
+    fn malformed_engine_labels_do_not_overwrite_rank_zero() {
+        let valid = parse_cache_config_info(METRICS);
+        for engine in ["", "unknown", "-1", "4294967296"] {
+            let malformed = format!(
+                r#"vllm:cache_config_info{{block_size="32",engine="{engine}",prefix_caching_hash_algo="sha256"}} 1.0"#
+            );
+            assert_eq!(
+                parse_cache_config_info(&format!("{METRICS}\n{malformed}")),
+                valid,
+                "malformed engine label {engine:?}"
+            );
+        }
     }
 
     #[test]

@@ -160,16 +160,22 @@ impl WorkerLifecycle {
                 .is_none_or(|checked| checked.elapsed() >= CONTROL_TIMEOUT)
     }
 
+    pub(super) fn keeps_descriptor(
+        &self,
+        state: &LifecycleState,
+        descriptor: &WorkerDescriptor,
+    ) -> bool {
+        state.info.is_some()
+            && state.descriptor.as_ref() == Some(descriptor)
+            && (!self.layout || self.trusted(state))
+    }
+
     /// Descriptor probes run every 30s; three failures retire an installed owner.
     pub(super) fn observe_descriptor(&self, descriptor: Option<&WorkerDescriptor>) -> SourceAction {
         let mut state = self.state.lock();
         state.checked = Some(Instant::now());
         match descriptor {
-            Some(descriptor)
-                if state.info.is_some()
-                    && state.descriptor.as_ref() == Some(descriptor)
-                    && (!self.layout || self.trusted(&state)) =>
-            {
+            Some(descriptor) if self.keeps_descriptor(&state, descriptor) => {
                 state.probe_failures = 0;
                 SourceAction::Keep
             }

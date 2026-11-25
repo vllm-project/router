@@ -163,6 +163,7 @@ pub(crate) struct WorkerDiscovery {
     base_models: Option<HashSet<String>>,
     pub(crate) hybrid: Option<CacheCapabilities>,
     pub(super) assumed_plain_full: bool,
+    engine_cache_configs: Option<metrics_meta::EngineCacheConfigs>,
 }
 
 /// What the optional KV event source control probe found. A 404/405 means the
@@ -451,7 +452,9 @@ impl KvIndexSupervisor {
             let lifecycle = self.lifecycle_for_worker(worker_url);
             (owner, lifecycle)
         };
-        let discovery = self.discover(worker_url).await;
+        let mut discovery = self.discover(worker_url).await;
+        self.probe_admission_hashes(worker_url, &mut discovery)
+            .await;
         let models = discovery.base_models.clone();
         let info =
             self.install_observed_worker(worker_url, discovery, observed, Some(lifecycle), None)?;
@@ -701,6 +704,7 @@ impl KvIndexSupervisor {
                 if let Ok(info) = &mut discovery.server_info {
                     info.kv_block_size = layout.ranks.iter().find_map(|rank| rank.hash_block_size);
                 }
+                discovery.engine_cache_configs = Some(engines);
             }
             for rank in &mut layout.ranks {
                 if rank.model.trim().is_empty() {
@@ -820,6 +824,7 @@ fn failed_hybrid_discovery(probe: SourcesProbe, error: String) -> WorkerDiscover
         base_models: None,
         hybrid: None,
         assumed_plain_full: false,
+        engine_cache_configs: None,
     }
 }
 
@@ -875,6 +880,7 @@ async fn discover_worker(
             base_models: None,
             hybrid: None,
             assumed_plain_full: false,
+            engine_cache_configs: None,
         };
     }
     discover_full_attention_http_worker(client, worker_url, api_key).await
@@ -920,6 +926,7 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
             base_models: None,
             hybrid: config.hybrid.clone(),
             assumed_plain_full: false,
+            engine_cache_configs: None,
         };
     }
     let sources = config
@@ -961,6 +968,7 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         model_id: Ok(Some(model)),
         base_models: None,
         hybrid: config.hybrid.clone(),
+        engine_cache_configs: None,
         assumed_plain_full: config
             .hybrid
             .as_ref()
@@ -1013,9 +1021,9 @@ async fn discover_full_attention_http_worker(
         query_worker_metadata_and_models(client, worker_url, api_key),
         fetch_native_sources(client, worker_url, api_key, CONTROL_TIMEOUT),
     );
-    let (server_info, base_models) = match server {
-        Ok((info, base_models)) => (Ok(info), base_models),
-        Err(error) => (Err(error), None),
+    let (server_info, base_models, engine_cache_configs) = match server {
+        Ok((info, base_models, configs)) => (Ok(info), base_models, configs),
+        Err(error) => (Err(error), None, None),
     };
     let model_id = server_info
         .as_ref()
@@ -1023,6 +1031,7 @@ async fn discover_full_attention_http_worker(
         .map_err(Clone::clone);
     let mut discovery = native_worker_discovery(worker_url, server_info, sources, model_id, layout);
     discovery.base_models = base_models;
+    discovery.engine_cache_configs = engine_cache_configs;
     discovery
 }
 
@@ -1091,6 +1100,7 @@ fn native_worker_discovery(
         base_models: None,
         hybrid,
         assumed_plain_full,
+        engine_cache_configs: None,
     }
 }
 
