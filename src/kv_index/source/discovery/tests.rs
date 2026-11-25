@@ -1863,135 +1863,246 @@ async fn spawn_metrics_only_worker(router: axum::Router) -> (String, tokio::task
     (worker, server)
 }
 
-#[tokio::test]
-async fn registration_checks_hashes_per_rank_and_replaces_old_bindings() {
-    use axum::routing::get;
-    use serde_json::json;
-    use std::sync::atomic::AtomicUsize;
+struct HashAdmissionWorker {
+    url: String,
+    supervisor: KvIndexSupervisor,
+    metrics: Arc<Mutex<String>>,
+    sources: Arc<Mutex<serde_json::Value>>,
+    metrics_requests: Arc<std::sync::atomic::AtomicUsize>,
+    model_requests: Arc<std::sync::atomic::AtomicUsize>,
+    _sockets: Vec<(String, String, zmq::Socket, zmq::Socket)>,
+    server: tokio::task::JoinHandle<()>,
+}
 
-    let sockets: Vec<_> = (0..3).map(|_| layout_endpoints()).collect();
-    let sources: serde_json::Map<_, _> = sockets
-        .iter()
-        .enumerate()
-        .map(|(rank, (publisher, replay, _, _))| {
-            (
-                rank.to_string(),
-                json!({
-                    "endpoint": publisher, "replay_endpoint": replay, "publisher": "zmq",
-                    "topic": format!("kv/admission/{rank}")
+impl HashAdmissionWorker {
+    async fn start(ranks: usize, metrics: &str) -> Self {
+        use axum::routing::get;
+        use serde_json::json;
+        use std::sync::atomic::AtomicUsize;
+
+        let sockets: Vec<_> = (0..ranks).map(|_| layout_endpoints()).collect();
+        let sources = Arc::new(Mutex::new(serde_json::Value::Object(
+            sockets
+                .iter()
+                .enumerate()
+                .map(|(rank, (publisher, replay, _, _))| {
+                    (
+                        rank.to_string(),
+                        json!({
+                            "endpoint": publisher, "replay_endpoint": replay, "publisher": "zmq",
+                            "topic": format!("kv/admission/{rank}")
+                        }),
+                    )
+                })
+                .collect(),
+        )));
+        let metrics = Arc::new(Mutex::new(metrics.to_owned()));
+        let metrics_requests = Arc::new(AtomicUsize::new(0));
+        let model_requests = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .route(
+                "/metrics",
+                get({
+                    let metrics = metrics.clone();
+                    let requests = metrics_requests.clone();
+                    move || {
+                        let data = metrics.lock().clone();
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        async move { data }
+                    }
                 }),
             )
-        })
-        .collect();
-    let metrics = Arc::new(Mutex::new(
+            .route(
+                "/v1/models",
+                get({
+                    let requests = model_requests.clone();
+                    move || {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        async {
+                            axum::Json(json!({"data": [
+                                {"id": "model-list-alias"},
+                                {"id": "adapter", "parent": "test"}
+                            ]}))
+                        }
+                    }
+                }),
+            );
+        let (url, server) = source_boundary_worker_with_routes(
+            app,
+            json!({
+                "model_id": "test", "instance_id": "boot", "kv_block_size": 16,
+                "served_model_aliases": ["control-alias"]
+            }),
+            sources.clone(),
+        )
+        .await;
+        let (supervisor, _signals) =
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
+        Self {
+            url,
+            supervisor,
+            metrics,
+            sources,
+            metrics_requests,
+            model_requests,
+            _sockets: sockets,
+            server,
+        }
+    }
+}
+
+impl Drop for HashAdmissionWorker {
+    fn drop(&mut self) {
+        self.supervisor.shutdown();
+        self.server.abort();
+    }
+}
+
+#[tokio::test]
+async fn registration_checks_hashes_per_rank() {
+    let worker = HashAdmissionWorker::start(
+        3,
         concat!(
             "vllm:cache_config_info{engine=\"0\",prefix_caching_hash_algo=\"sha256_cbor\"} 1.0\n",
             "vllm:cache_config_info{engine=\"1\",prefix_caching_hash_algo=\"sha256\"} 1.0\n",
             "vllm:cache_config_info{engine=\"2\"} 1.0\n",
-        )
-        .to_owned(),
-    ));
-    let requests = Arc::new(AtomicUsize::new(0));
-    let app = axum::Router::new().route(
-        "/metrics",
-        get({
-            let metrics = metrics.clone();
-            let requests = requests.clone();
-            move || {
-                requests.fetch_add(1, Ordering::Relaxed);
-                let data = metrics.lock().clone();
-                async move { data }
-            }
-        }),
-    );
-    let sources = Arc::new(Mutex::new(serde_json::Value::Object(sources)));
-    let (worker, server) = source_boundary_worker_with_routes(
-        app,
-        json!({"model_id": "test", "instance_id": "boot", "kv_block_size": 16}),
-        sources.clone(),
+        ),
     )
     .await;
-    let (supervisor, _signals) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-    let first = supervisor.on_worker_added(&worker).await.unwrap();
+    let info = worker
+        .supervisor
+        .on_worker_added(&worker.url)
+        .await
+        .unwrap();
     assert_eq!(
-        first.ranks.into_iter().collect::<HashSet<_>>(),
+        info.ranks.into_iter().collect::<HashSet<_>>(),
         HashSet::from([0, 2])
     );
-    assert_eq!(requests.load(Ordering::Relaxed), 1);
+    assert_eq!(worker.metrics_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(worker.model_requests.load(Ordering::Relaxed), 0);
+}
 
-    let mut discovered = supervisor.discover(&worker).await;
+#[tokio::test]
+async fn registration_only_scrapes_hashes_for_usable_http_sources() {
+    let worker = HashAdmissionWorker::start(1, METRICS_ONLY).await;
+    let supervisor = &worker.supervisor;
+    supervisor.on_worker_added(&worker.url).await.unwrap();
+
+    let mut discovered = supervisor.discover(&worker.url).await;
     assert!(discovered.hybrid.is_some());
     assert!(discovered.engine_cache_configs.is_none());
-    let grpc_worker = worker.replacen("http://", "grpc://", 1);
+    let grpc_worker = worker.url.replacen("http://", "grpc://", 1);
     supervisor
         .probe_admission_hashes(&grpc_worker, &mut discovered)
         .await;
     assert!(discovered.engine_cache_configs.is_none());
-    assert_eq!(requests.load(Ordering::Relaxed), 1);
+    assert_eq!(worker.metrics_requests.load(Ordering::Relaxed), 1);
 
-    let old = supervisor.lifecycle_for_worker(&worker);
-    let valid_sources = std::mem::replace(&mut *sources.lock(), json!([]));
-    old.state.lock().trusted = false;
+    let lifecycle = supervisor.lifecycle_for_worker(&worker.url);
+    supervisor
+        .probe_registration(&worker.url, false, None, &lifecycle)
+        .await
+        .unwrap();
+    assert_eq!(
+        worker.metrics_requests.load(Ordering::Relaxed),
+        1,
+        "unchanged descriptor"
+    );
+
+    let valid_sources = std::mem::replace(&mut *worker.sources.lock(), serde_json::json!([]));
+    lifecycle.state.lock().trusted = false;
     assert!(supervisor
-        .probe_registration(&worker, false, None, &old)
+        .probe_registration(&worker.url, false, None, &lifecycle)
         .await
         .is_err());
     assert_eq!(
-        requests.load(Ordering::Relaxed),
+        worker.metrics_requests.load(Ordering::Relaxed),
         1,
         "source discovery failed"
     );
-    *sources.lock() = valid_sources;
-    old.state.lock().trusted = true;
 
-    *metrics.lock() = (0..3).map(|rank| {
-        format!("vllm:cache_config_info{{engine=\"{rank}\",prefix_caching_hash_algo=\"sha256\"}} 1.0\n")
-    }).collect();
-    supervisor
-        .probe_registration(&worker, false, None, &old)
+    *worker.sources.lock() = valid_sources;
+    let probe = supervisor
+        .probe_registration(&worker.url, false, None, &lifecycle)
         .await
         .unwrap();
-    assert_eq!(requests.load(Ordering::Relaxed), 1, "unchanged descriptor");
-    assert!(old.active.load(Ordering::Acquire));
+    assert!(probe.worker.engine_cache_configs.is_some());
+    assert_eq!(
+        worker.metrics_requests.load(Ordering::Relaxed),
+        2,
+        "usable source for re-admission"
+    );
+}
 
-    let restarted = supervisor.on_worker_added(&worker).await.unwrap();
-    assert!(restarted.ranks.is_empty());
-    assert!(restarted.cache_key.is_none());
+#[tokio::test]
+async fn load_only_registration_replaces_binding_and_preserves_model_aliases() {
+    let worker = HashAdmissionWorker::start(2, METRICS_ONLY).await;
+    let supervisor = &worker.supervisor;
+    let first = supervisor.on_worker_added(&worker.url).await.unwrap();
+    assert!(first.cache_key.is_some());
+    let old = supervisor.lifecycle_for_worker(&worker.url);
+
+    *worker.metrics.lock() = concat!(
+        "vllm:cache_config_info{engine=\"0\",prefix_caching_hash_algo=\"sha256\"} 1.0\n",
+        "vllm:cache_config_info{engine=\"1\",prefix_caching_hash_algo=\"sha256\"} 1.0\n",
+    )
+    .to_owned();
+    let (info, models) = supervisor
+        .on_worker_added_with_models(&worker.url)
+        .await
+        .unwrap();
+    assert!(info.ranks.is_empty());
+    assert!(info.cache_key.is_none());
     assert!(!old.active.load(Ordering::Acquire));
-    assert!(supervisor.match_provider_for_worker(&worker).is_none());
-    assert_eq!(requests.load(Ordering::Relaxed), 2);
-    let workers: Vec<Arc<dyn crate::core::Worker>> = vec![Arc::new(
-        crate::core::DPAwareWorker::new(worker.clone(), 0, 3, crate::core::WorkerType::Regular),
-    )];
-    assert_eq!(
-        supervisor.cache_eligible_workers(&workers, "test"),
-        Some(vec![true])
-    );
-    assert_eq!(
-        supervisor.cache_eligible_workers(&workers, "other"),
-        Some(vec![false])
-    );
+    assert!(supervisor.match_provider_for_worker(&worker.url).is_none());
+    assert_eq!(worker.metrics_requests.load(Ordering::Relaxed), 2);
 
-    *metrics.lock() = METRICS_ONLY.to_owned();
-    let load_only = supervisor.lifecycle_for_worker(&worker);
+    let workers: Vec<Arc<dyn crate::core::Worker>> = vec![Arc::new(
+        crate::core::DPAwareWorker::new(worker.url.clone(), 0, 2, crate::core::WorkerType::Regular),
+    )];
+    for model in ["model-list-alias", "control-alias", "test"] {
+        assert_eq!(
+            supervisor.cache_eligible_workers(&workers, model),
+            Some(vec![true]),
+            "{model}"
+        );
+    }
+    for model in ["adapter", "other"] {
+        assert_eq!(
+            supervisor.cache_eligible_workers(&workers, model),
+            Some(vec![false]),
+            "{model}"
+        );
+    }
+    assert!(models.unwrap().contains("model-list-alias"));
+    assert_eq!(worker.model_requests.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn explicit_reregistration_restores_load_only_binding() {
+    let incompatible = METRICS_ONLY.replace("sha256_cbor", "sha256");
+    let worker = HashAdmissionWorker::start(1, &incompatible).await;
+    let supervisor = &worker.supervisor;
+    let initial = supervisor.on_worker_added(&worker.url).await.unwrap();
+    assert!(initial.cache_key.is_none());
+    assert_eq!(*supervisor.first_block_size.lock(), Some(16));
+
+    *worker.metrics.lock() = METRICS_ONLY.to_owned();
+    let load_only = supervisor.lifecycle_for_worker(&worker.url);
     let probe = supervisor
-        .probe_registration(&worker, false, None, &load_only)
+        .probe_registration(&worker.url, false, None, &load_only)
         .await
         .unwrap();
     assert!(load_only.keeps_descriptor(&load_only.state.lock(), &probe.descriptor));
     assert_eq!(
-        requests.load(Ordering::Relaxed),
-        2,
-        "hash-only changes do not register the worker"
+        worker.metrics_requests.load(Ordering::Relaxed),
+        1,
+        "hash-only changes keep the current registration"
     );
-    let registered = supervisor.on_worker_added(&worker).await.unwrap();
-    assert_eq!(
-        registered.ranks.into_iter().collect::<HashSet<_>>(),
-        HashSet::from([0, 1, 2])
-    );
-    assert_eq!(requests.load(Ordering::Relaxed), 3);
-    supervisor.shutdown();
-    server.abort();
+
+    let registered = supervisor.on_worker_added(&worker.url).await.unwrap();
+    assert_eq!(registered.ranks, [0]);
+    assert_eq!(worker.metrics_requests.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]

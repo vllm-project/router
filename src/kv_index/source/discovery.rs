@@ -455,6 +455,8 @@ impl KvIndexSupervisor {
         let mut discovery = self.discover(worker_url).await;
         self.probe_admission_hashes(worker_url, &mut discovery)
             .await;
+        self.probe_load_only_models(worker_url, &mut discovery)
+            .await;
         let models = discovery.base_models.clone();
         let info =
             self.install_observed_worker(worker_url, discovery, observed, Some(lifecycle), None)?;

@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 use super::lifecycle::WorkerLifecycle;
 use super::metrics_meta::EngineCacheConfigs;
+use super::registration::incompatible_prefix_hash;
 use super::{
     discovered_block_size, events_enabled, metrics_meta, split_worker_rank, CacheCapabilities,
     KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe,
@@ -109,14 +110,58 @@ impl KvIndexSupervisor {
                     .unwrap_or_default(),
             });
         }
-        // Failed source probes return above. Leave room for the optional
-        // admission scrape inside the existing refresh timeout.
+        // Failed source probes return above. A usable source whose layout lost
+        // trust can be re-admitted, so read a fresh hash within the refresh budget.
         if started.elapsed() < CONTROL_TIMEOUT.saturating_sub(ADMISSION_HASH_TIMEOUT)
             && !lifecycle.keeps_descriptor(&lifecycle.state.lock(), &descriptor)
         {
             self.probe_admission_hashes(base, &mut worker).await;
         }
         Ok(RegistrationProbe { descriptor, worker })
+    }
+
+    pub(super) async fn probe_load_only_models(
+        &self,
+        worker_url: &str,
+        worker: &mut WorkerDiscovery,
+    ) {
+        let (base, _) = split_worker_rank(worker_url);
+        if worker.base_models.is_some() || crate::backend::is_grpc_url(base) {
+            return;
+        }
+        let (Some(layout), Some(configs), Ok(sources)) = (
+            &worker.hybrid,
+            &worker.engine_cache_configs,
+            &worker.sources,
+        ) else {
+            return;
+        };
+        let mut has_source = false;
+        for (rank, source) in sources {
+            if !events_enabled(source) {
+                continue;
+            }
+            let mismatch = rank
+                .parse::<u32>()
+                .ok()
+                .and_then(|rank| incompatible_prefix_hash(layout, configs, rank));
+            if mismatch.is_none() {
+                return;
+            }
+            has_source = true;
+        }
+        if !has_source {
+            return;
+        }
+        worker.base_models = tokio::time::timeout(
+            CONTROL_TIMEOUT / 4,
+            query_model_list(&self.client, base, self.api_key.as_deref()),
+        )
+        .await
+        .ok()
+        .flatten()
+        .as_ref()
+        .map(base_model_names);
     }
 
     pub(super) async fn probe_admission_hashes(
@@ -635,7 +680,16 @@ pub(super) async fn query_engine_cache_configs(
     api_key: Option<&str>,
 ) -> Result<BTreeMap<u32, metrics_meta::EngineCacheConfig>, String> {
     let text = query_worker_text(client, worker_url, "metrics", true, api_key).await?;
-    let engines = metrics_meta::parse_cache_config_info(&text);
+    let (engines, malformed_ranks) = metrics_meta::parse_cache_config_info(&text);
+    if malformed_ranks > 0 {
+        tracing::debug!(
+            worker_url,
+            metric = metrics_meta::CACHE_CONFIG_INFO,
+            label = "engine",
+            malformed_ranks,
+            "ignoring cache config samples with invalid engine ranks"
+        );
+    }
     if engines.is_empty() {
         return Err("metrics: no vllm:cache_config_info series".to_string());
     }

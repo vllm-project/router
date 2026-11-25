@@ -8,14 +8,25 @@ use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use super::lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
+use super::metrics_meta::EngineCacheConfigs;
 use super::probe::{layout_model, server_instance_id, worker_descriptor};
 use super::{
     discovered_block_size, event_source_label, event_sources_for_worker, metadata_source_label,
-    CacheKey, KvIndexSupervisor, LiveSource, ServerInfo, SourcesProbe, WorkerDiscovery,
-    WorkerKvInfo, WorkerSubs,
+    CacheCapabilities, CacheKey, KvIndexSupervisor, LiveSource, ServerInfo, SourcesProbe,
+    WorkerDiscovery, WorkerKvInfo, WorkerSubs,
 };
 use crate::config::KvConnector;
 use crate::kv_index::{EventStream, SourceId};
+
+pub(super) fn incompatible_prefix_hash<'a>(
+    layout: &'a CacheCapabilities,
+    configs: &'a EngineCacheConfigs,
+    rank: u32,
+) -> Option<(&'a str, &'a str)> {
+    let expected = layout.rank_capability(rank)?.hash_algorithm.as_str();
+    let reported = configs.get(&rank)?.prefix_caching_hash_algo.as_deref()?;
+    (expected != reported).then_some((expected, reported))
+}
 
 impl KvIndexSupervisor {
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -180,17 +191,10 @@ impl KvIndexSupervisor {
         let mut incompatible_ranks = 0;
         event_sources.retain(|source| {
             let rank = source.dp_rank;
-            let expected = capability
-                .rank_capability(rank)
-                .map(|layout| layout.hash_algorithm.as_str());
-            let reported = discovery
+            if let Some((expected, reported)) = discovery
                 .engine_cache_configs
                 .as_ref()
-                .and_then(|engines| engines.get(&rank))
-                .and_then(|engine| engine.prefix_caching_hash_algo.as_deref());
-            if let Some((expected, reported)) = expected
-                .zip(reported)
-                .filter(|(expected, reported)| expected != reported)
+                .and_then(|configs| incompatible_prefix_hash(&capability, configs, rank))
             {
                 warn!(
                     worker_url,
@@ -315,7 +319,10 @@ impl KvIndexSupervisor {
             // Preserve model eligibility even though this registration has no cache key.
             let mut base_models = discovery.base_models.unwrap_or_default();
             base_models.insert(model_id);
+            base_models.extend(server_info.served_model_aliases);
             self.publish_registration(worker_url, lifecycle, &info, Some(base_models));
+            self.check_block_size(worker_url, info.block_size);
+            info!(worker_url, incompatible_ranks, "KV registration is load-only because every rank reported an incompatible prefix hash");
             return Ok(info);
         }
         let indexer = self.installed.acquire_identity(&key);

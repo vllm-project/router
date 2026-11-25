@@ -54,9 +54,10 @@ pub(crate) fn shared_hash_unit(
     }
 }
 
-/// Every engine that published `vllm:cache_config_info`, ordered by engine index.
-pub(crate) fn parse_cache_config_info(text: &str) -> BTreeMap<u32, EngineCacheConfig> {
-    let mut engines: BTreeMap<u32, EngineCacheConfig> = BTreeMap::new();
+/// Engine configs in rank order, with the number of samples skipped for an invalid rank.
+pub(super) fn parse_cache_config_info(text: &str) -> (EngineCacheConfigs, usize) {
+    let mut engines = EngineCacheConfigs::new();
+    let mut malformed_ranks = 0;
     for_each_sample(text, |name, labels, _value| {
         if name != CACHE_CONFIG_INFO {
             return;
@@ -64,7 +65,7 @@ pub(crate) fn parse_cache_config_info(text: &str) -> BTreeMap<u32, EngineCacheCo
         let engine = match labels.get("engine") {
             Some(value) => {
                 let Ok(rank) = value.parse::<u32>() else {
-                    tracing::debug!(engine = ?value, "ignoring cache config sample with invalid engine rank");
+                    malformed_ranks += 1;
                     return;
                 };
                 rank
@@ -91,7 +92,7 @@ pub(crate) fn parse_cache_config_info(text: &str) -> BTreeMap<u32, EngineCacheCo
             .filter(|layout| !is_unset(layout))
             .cloned();
     });
-    engines
+    (engines, malformed_ranks)
 }
 
 /// vLLM serializes an unset `CacheConfig` field as the string `None`.
@@ -114,7 +115,8 @@ mod tests {
 
     #[test]
     fn parses_one_engine() {
-        let engines = parse_cache_config_info(METRICS);
+        let (engines, malformed_ranks) = parse_cache_config_info(METRICS);
+        assert_eq!(malformed_ranks, 0);
         assert_eq!(engines.len(), 1);
         let engine = &engines[&0];
         assert_eq!(engine.block_size, Some(16));
@@ -133,7 +135,8 @@ mod tests {
     vllm:cache_config_info{block_size="16",engine="1"} 1.0
     vllm:cache_config_info{block_size="32",engine="0"} 1.0
     "#;
-        let engines = parse_cache_config_info(metrics);
+        let (engines, malformed_ranks) = parse_cache_config_info(metrics);
+        assert_eq!(malformed_ranks, 0);
         assert_eq!(engines.len(), 2);
         assert_eq!(engines[&0].block_size, Some(32));
         assert_eq!(engines[&1].block_size, Some(16));
@@ -144,7 +147,8 @@ mod tests {
     fn missing_engine_label_defaults_to_rank_zero() {
         let metrics =
             r#"vllm:cache_config_info{block_size="16",prefix_caching_hash_algo="sha256_cbor"} 1.0"#;
-        let engines = parse_cache_config_info(metrics);
+        let (engines, malformed_ranks) = parse_cache_config_info(metrics);
+        assert_eq!(malformed_ranks, 0);
         assert_eq!(engines.len(), 1);
         assert_eq!(
             engines[&0].prefix_caching_hash_algo.as_deref(),
@@ -154,15 +158,18 @@ mod tests {
 
     #[test]
     fn malformed_engine_labels_do_not_overwrite_rank_zero() {
-        let valid = parse_cache_config_info(METRICS);
+        let (valid, _) = parse_cache_config_info(METRICS);
         for engine in ["", "unknown", "-1", "4294967296"] {
             let malformed = format!(
                 r#"vllm:cache_config_info{{block_size="32",engine="{engine}",prefix_caching_hash_algo="sha256"}} 1.0"#
             );
-            assert!(parse_cache_config_info(&malformed).is_empty());
+            assert_eq!(
+                parse_cache_config_info(&malformed),
+                (EngineCacheConfigs::new(), 1)
+            );
             assert_eq!(
                 parse_cache_config_info(&format!("{METRICS}\n{malformed}")),
-                valid,
+                (valid.clone(), 1),
                 "malformed engine label {engine:?}"
             );
         }
@@ -173,7 +180,8 @@ mod tests {
         let metrics = r#"
     vllm:cache_config_info{block_size="64",hash_block_size="4",kv_cache_layout="hybrid-v1",engine="0"} 1.0
     "#;
-        let engine = &parse_cache_config_info(metrics)[&0];
+        let (engines, _) = parse_cache_config_info(metrics);
+        let engine = &engines[&0];
         assert_eq!(engine.kv_cache_layout.as_deref(), Some("hybrid-v1"));
     }
 
@@ -190,11 +198,11 @@ vllm:cache_config_info{block_size="8",effective_attention_block_size="32",engine
 "#,
         ] {
             assert_eq!(
-                shared_hash_unit(&parse_cache_config_info(metrics)),
+                shared_hash_unit(&parse_cache_config_info(metrics).0),
                 Err(vec![16, 32])
             );
         }
-        let agreed =
+        let (agreed, _) =
             parse_cache_config_info(r#"vllm:cache_config_info{block_size="16",engine="0"} 1.0"#);
         assert_eq!(shared_hash_unit(&agreed), Ok(Some(16)));
         assert_eq!(shared_hash_unit(&BTreeMap::new()), Ok(None));
@@ -202,7 +210,10 @@ vllm:cache_config_info{block_size="8",effective_attention_block_size="32",engine
 
     #[test]
     fn missing_family_yields_no_engines() {
-        assert!(parse_cache_config_info("vllm:num_requests_running{engine=\"0\"} 1\n").is_empty());
-        assert!(parse_cache_config_info("").is_empty());
+        assert_eq!(
+            parse_cache_config_info("vllm:num_requests_running{engine=\"0\"} 1\n"),
+            (EngineCacheConfigs::new(), 0)
+        );
+        assert_eq!(parse_cache_config_info(""), (EngineCacheConfigs::new(), 0));
     }
 }
