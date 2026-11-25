@@ -1,5 +1,6 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
+use super::completion_route::reject_full_report;
 use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_cached_tokens;
@@ -1306,6 +1307,7 @@ impl VllmPDRouter {
         // cache matches can be recomputed against the tree at dispatch.
         let decode_cache = decode_cache.map(Arc::new);
         let context = PdRequestContext {
+            worker_pairs: None,
             prefill_inputs: prefill_inputs.as_ref(),
             model_id,
             legacy_policy_input: text.as_deref(),
@@ -1495,6 +1497,7 @@ impl VllmPDRouter {
         candidates = self.live_decode_candidates(&input.pool);
         Self::retain_commit_candidates(&mut candidates, input.model_id.as_deref(), pin);
         let context = PdRequestContext {
+            worker_pairs: None,
             prefill_inputs: None,
             model_id: input.model_id.as_deref(),
             legacy_policy_input: None,
@@ -3539,6 +3542,12 @@ impl RouterTrait for VllmPDRouter {
         path: &str,
         model_id: Option<&str>,
     ) -> Response {
+        if let Some(response) = reject_full_report(
+            self.pd_router.kv_state.is_some(),
+            body.other.get("vllm_xargs"),
+        ) {
+            return response;
+        }
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
             Err(e) => {
@@ -3560,6 +3569,12 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        if let Some(response) = reject_full_report(
+            self.pd_router.kv_state.is_some(),
+            body.other.get("vllm_xargs"),
+        ) {
+            return response;
+        }
         if !self.use_discovery && self.uses_grpc_pools() {
             return self.route_grpc_chat(headers, body).await;
         }
@@ -3596,6 +3611,12 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        if let Some(response) = reject_full_report(
+            self.pd_router.kv_state.is_some(),
+            body.other.get("vllm_xargs"),
+        ) {
+            return response;
+        }
         if self.program_turn_enabled(headers, &body.other) {
             let request = match serde_json::to_value(body) {
                 Ok(request) => request,
@@ -3727,6 +3748,10 @@ impl RouterTrait for VllmPDRouter {
         }
     }
 
+    fn monitors_kv_events(&self) -> bool {
+        self.pd_router.kv_state.is_some()
+    }
+
     fn router_type(&self) -> &'static str {
         "vllm_pd"
     }
@@ -3744,6 +3769,11 @@ impl RouterTrait for VllmPDRouter {
         method: &Method,
         body: serde_json::Value,
     ) -> Response {
+        if let Some(response) =
+            reject_full_report(self.pd_router.kv_state.is_some(), body.get("vllm_xargs"))
+        {
+            return response;
+        }
         // Only handle POST requests for inference
         if *method != Method::POST {
             return (
@@ -4560,6 +4590,75 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn monitored_pd_routes_reject_full_before_scheduling() {
+        let mut router = test_vllm_pd_router().await;
+        router.pd_router.kv_state = Some(
+            super::super::pd_kv_state::PdKvState::start(
+                reqwest::Client::new(),
+                None,
+                HashMap::new(),
+                router.kv_connector,
+                HashMap::new(),
+                router.pd_router.worker_registry.clone(),
+                Some(Arc::new(crate::policies::KvAwarePolicy::default())),
+                None,
+                false,
+                true,
+            )
+            .await,
+        );
+        let chat = json!({"messages": [], "vllm_xargs": {"kv_cache_report_mode": "full"}});
+        let completion =
+            json!({"prompt": [1, 2, 3], "vllm_xargs": {"kv_cache_report_mode": "full"}});
+        let chat_req = serde_json::from_value(chat.clone()).unwrap();
+        let completion_req = serde_json::from_value(completion).unwrap();
+        assert_eq!(
+            router.route_chat(None, &chat_req, None).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            router
+                .route_completion(None, &completion_req, None)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let generate_req = serde_json::from_value(
+            json!({"token_ids": [1, 2, 3], "vllm_xargs": {"kv_cache_report_mode": "full"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            router
+                .route_inference_generate(None, &generate_req, None)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            router
+                .route_inference_generate_path(None, &generate_req, "/custom/v1/generate", None)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            router
+                .route_transparent(None, "/custom", &Method::POST, chat.clone())
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        router.pd_router.kv_state = None;
+        assert_ne!(
+            router
+                .route_transparent(None, "/custom", &Method::POST, chat)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
 
     #[tokio::test]
     async fn prefill_body_limit_rejects_oversized_responses() {
@@ -6637,6 +6736,7 @@ mod tests {
                     replay_endpoints: None,
                     block_size: 16,
                     model: Some("m".to_owned()),
+                    hybrid: None,
                 },
             )]),
             worker_startup_timeout_secs: 5,
@@ -6761,6 +6861,7 @@ mod tests {
                     replay_endpoints: None,
                     block_size: 16,
                     model: Some("m".to_owned()),
+                    hybrid: None,
                 },
             )]),
             worker_startup_timeout_secs: 5,
