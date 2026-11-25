@@ -49,13 +49,6 @@ pub trait TieredMatchProvider: Send + Sync {
         None
     }
 
-    /// Whether this provider still represents the installed source owner.
-    /// Temporary placement trust loss does not end the registration.
-    #[doc(hidden)]
-    fn history_registration_current(&self, _rank: u32) -> bool {
-        true
-    }
-
     fn nixl_decode_credit(&self, _rank: u32, _prompt_len: usize, reused: u64) -> u64 {
         reused
     }

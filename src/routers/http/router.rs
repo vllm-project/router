@@ -1,7 +1,5 @@
-use super::completion_output::{CompletionOutputObserver, HistoryOutput};
-use super::completion_route::{
-    completion_history_input, prepare_completion_route, reject_full_report, CompletionRoute,
-};
+use super::completion_output::{observe_body_with, CompletionOutputObserver};
+use super::completion_route::{prepare_completion_route, reject_full_report, CompletionRoute};
 use super::program_adapter::{
     prepare_stream_usage_body, settle_grpc_response, ProgramCompletion, SseUsageStripper, StreamEnd,
 };
@@ -23,7 +21,10 @@ use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
     RetryExecutor, Worker, WorkerRegistry, WorkerType,
 };
-use crate::kv_index::discovery::inferred_lora_name;
+use crate::kv_index::{
+    discovery::{inferred_lora_name, WorkerRegistration},
+    KvIndexSupervisor, WorkerKvInfo,
+};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::KvRequestTokens;
@@ -32,7 +33,7 @@ use crate::policies::{
     PolicyRegistry,
 };
 use crate::policies::{
-    CompletionHistoryRequest, HistoryObservation, QualifiedKvInput, SelectionIdentity,
+    HistoryAttempt, HistoryCapture, KvAwareHistoryHook, QualifiedKvInput, SelectionIdentity,
 };
 use crate::program_scheduling::{
     ArrivalTokenFacts, BackendObservationProvider, ProgramIdentity, ProgramScheduler,
@@ -78,18 +79,33 @@ pub(super) fn prepare_error_status(error: &PrepareError) -> StatusCode {
     }
 }
 
+fn verified_kv_registration(
+    supervisor: Option<&KvIndexSupervisor>,
+    worker_url: &str,
+    discovery_info: Option<&WorkerKvInfo>,
+) -> Option<WorkerRegistration> {
+    // Failed or degraded discovery may leave a previous source installed.
+    discovery_info?.cache_key.as_ref()?;
+    supervisor?.worker_registration_for_worker(worker_url)
+}
+
 fn register_kv_target_for_policy(
     policy: &dyn LoadBalancingPolicy,
     worker: &Arc<dyn Worker>,
-    info: Option<&crate::kv_index::WorkerKvInfo>,
-    provider: Option<Arc<dyn crate::policies::TieredMatchProvider>>,
+    registration: Option<&WorkerRegistration>,
+    fallback_info: Option<&WorkerKvInfo>,
     history_enabled: bool,
 ) {
     let Some(kv_aware) = kv_aware_ops(policy) else {
         return;
     };
+    let (info, provider) = match registration {
+        Some(registration) => (registration.info.as_ref(), registration.provider.clone()),
+        None => (fallback_info, None),
+    };
     if history_enabled {
-        kv_aware.register_history_worker(worker, info, provider);
+        let current = registration.and_then(|registration| registration.current.clone());
+        kv_aware.register_history_worker(worker, info, provider, current);
     } else {
         kv_aware.register_worker(worker.as_ref(), info, provider);
     }
@@ -303,7 +319,7 @@ struct TypedDispatch<'a> {
     completion: Option<&'a CompletionRoute>,
     load: RequestLoadGuard,
     prepared: Option<crate::backend::PreparedRequest>,
-    history: Option<(Arc<dyn LoadBalancingPolicy>, HistoryObservation)>,
+    history: Option<HistoryAttempt>,
     /// Body to forward instead of `typed_req` (usage-injected HTTP stream).
     request_body: Option<serde_json::Value>,
 }
@@ -586,22 +602,24 @@ impl Router {
             };
             ctx.worker_registry.register(worker_arc.clone());
 
-            let provider = kv_index_supervisor
-                .as_ref()
-                .and_then(|supervisor| supervisor.match_provider_for_worker(worker_arc.base_url()));
-            register_kv_target_for_policy(
-                default_policy.as_ref(),
-                &worker_arc,
-                kv_worker_info
-                    .get(worker_arc.base_url())
-                    .map(|(info, _)| info),
-                provider,
-                kv_aware_completion_history,
-            );
-
-            // Notify PolicyRegistry about the new worker
+            // Notify PolicyRegistry before attaching the same registration to both policies.
             let model_id = worker_arc.model_id();
             let policy = ctx.policy_registry.on_worker_added(model_id, None);
+            let info = kv_worker_info
+                .get(worker_arc.base_url())
+                .map(|(info, _)| info);
+            let registration = verified_kv_registration(
+                kv_index_supervisor.as_deref(),
+                worker_arc.base_url(),
+                info,
+            );
+            Self::attach_kv_provider(
+                &ctx.policy_registry,
+                &worker_arc,
+                registration.as_ref(),
+                info,
+                kv_aware_completion_history,
+            );
 
             // If this is a cache-aware policy and it's the first worker for this model,
             // initialize it with the worker
@@ -801,8 +819,8 @@ impl Router {
                         Self::attach_kv_provider(
                             &policies,
                             &worker,
-                            registration.info.as_ref(),
-                            registration.provider.clone(),
+                            Some(registration),
+                            None,
                             kv_aware_completion_history,
                         );
                     }
@@ -872,20 +890,14 @@ impl Router {
         }
     }
 
-    pub(crate) fn register_kv_target(
-        &self,
-        worker: &Arc<dyn Worker>,
-        info: Option<&crate::kv_index::WorkerKvInfo>,
-    ) {
-        let provider = self
-            .kv_index_supervisor
-            .as_ref()
-            .and_then(|supervisor| supervisor.match_provider_for_worker(worker.base_url()));
+    pub(crate) fn register_kv_target(&self, worker: &Arc<dyn Worker>, info: Option<&WorkerKvInfo>) {
+        let registration =
+            verified_kv_registration(self.kv_index_supervisor.as_deref(), worker.base_url(), info);
         Self::attach_kv_provider(
             &self.policy_registry,
             worker,
+            registration.as_ref(),
             info,
-            provider,
             self.kv_aware_completion_history,
         );
     }
@@ -893,8 +905,8 @@ impl Router {
     fn attach_kv_provider(
         policies: &PolicyRegistry,
         worker: &Arc<dyn Worker>,
-        info: Option<&crate::kv_index::WorkerKvInfo>,
-        provider: Option<Arc<dyn crate::policies::TieredMatchProvider>>,
+        registration: Option<&WorkerRegistration>,
+        fallback_info: Option<&WorkerKvInfo>,
         history_enabled: bool,
     ) {
         let policy = policies.get_policy_or_default(worker.model_id());
@@ -903,12 +915,18 @@ impl Router {
             register_kv_target_for_policy(
                 default.as_ref(),
                 worker,
-                info,
-                provider.clone(),
+                registration,
+                fallback_info,
                 history_enabled,
             );
         }
-        register_kv_target_for_policy(policy.as_ref(), worker, info, provider, history_enabled);
+        register_kv_target_for_policy(
+            policy.as_ref(),
+            worker,
+            registration,
+            fallback_info,
+            history_enabled,
+        );
     }
 
     pub(crate) fn remove_kv_workers(&self, removed: &[Arc<dyn Worker>]) {
@@ -1732,12 +1750,12 @@ impl Router {
         text: Option<&str>,
         headers: Option<&HeaderMap>,
         input: QualifiedKvInput<'_>,
-        history: Option<&CompletionHistoryRequest>,
+        history: Option<&HistoryCapture>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
-    ) -> Option<(SelectedWorker, Option<HistoryObservation>)> {
+    ) -> Option<(SelectedWorker, Option<HistoryAttempt>)> {
         if available.is_empty() {
             return None;
         }
@@ -1746,39 +1764,49 @@ impl Router {
         if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
             // The policy sees the full list: a retry exclusion must not
             // rewrite a still-valid binding.
-            let (receipt, observation) =
-                if history.is_some() && lora_name.is_none() && cache_salt.is_none() {
-                    kv_aware.select_with_history(
+            let (receipt, observation) = if let Some(request) =
+                history.and_then(|capture| capture.request(lora_name, cache_salt))
+            {
+                kv_aware.select_with_history(
+                    available,
+                    input.tokens,
+                    input.eligibility,
+                    Some(request),
+                    SelectionIdentity {
+                        lora_name,
+                        cache_salt,
+                        affinity_key,
+                    },
+                    excluded_workers,
+                )
+            } else {
+                kv_aware
+                    .select_worker_with_qualified_inputs(
                         available,
                         input.tokens,
-                        input.eligibility,
-                        history,
-                        SelectionIdentity {
-                            lora_name,
-                            cache_salt,
-                            affinity_key,
-                        },
+                        lora_name,
+                        cache_salt,
+                        affinity_key,
                         excluded_workers,
+                        input.eligibility,
                     )
-                } else {
-                    kv_aware
-                        .select_worker_with_qualified_inputs(
-                            available,
-                            input.tokens,
-                            lora_name,
-                            cache_salt,
-                            affinity_key,
-                            excluded_workers,
-                            input.eligibility,
-                        )
-                        .map(|receipt| (receipt, None))
-                }?;
+                    .map(|receipt| (receipt, None))
+            }?;
+            let worker = available.get(receipt.worker_index)?.clone();
+            let attempt = history.zip(observation).map(|(capture, observation)| {
+                capture.bind(
+                    observation,
+                    policy,
+                    self.worker_registry.clone(),
+                    worker.url(),
+                )
+            });
             return Some((
                 SelectedWorker {
-                    worker: available.get(receipt.worker_index)?.clone(),
+                    worker,
                     kv_receipt: Some(receipt),
                 },
-                observation,
+                attempt,
             ));
         }
 
@@ -1880,32 +1908,14 @@ impl Router {
                 .into_response();
         }
 
-        // Fence registrations before either transport awaits preparation.
-        let history_eligible = match (pool, typed_req.grpc_request()) {
-            (Some(_), Some(GrpcRequestRef::Completion(request))) => {
-                completion_history_input(request)
-            }
-            // HTTP Chat gets only the prompts qualified by the existing
-            // identity/render preparation below; no second field allowlist.
-            (Some(crate::backend::WorkerPoolKind::Http), Some(GrpcRequestRef::Chat(_))) => true,
-            _ => false,
-        };
-        let history = if self.kv_aware_completion_history
-            && history_eligible
-            && typed_req.cache_identity() == (None, None)
-        {
-            typed_req
-                .get_model()
-                .filter(|m| !m.is_empty() && model_id.is_none_or(|id| id == *m))
-                .and_then(|model| {
-                    let policy = self.policy_for_model(model_id);
-                    kv_aware_ops(policy.as_ref())?
-                        .capture_completion_history(&self.available_workers(model_id), model)
-                })
-        } else {
-            None
-        };
-        let history = history.as_ref();
+        let history = KvAwareHistoryHook::capture(
+            self.kv_aware_completion_history,
+            pool,
+            typed_req,
+            model_id,
+            || self.policy_for_model(model_id),
+            || self.available_workers(model_id),
+        );
 
         // Prepare gRPC once before retries. HTTP text preparation is optional:
         // resolve identity once and gate the extra tokenization by mode, pool
@@ -2068,6 +2078,8 @@ impl Router {
         if let Some(reason) = cache_read_fallback {
             RouterMetrics::record_kv_placement_lookup(reason);
         }
+        let history = history.and_then(|capture| capture.allow_cache_read(cache_read_fallback));
+        let history = history.as_ref();
         let affinity_key = self
             .kv_aware_session_affinity_ttl_secs
             .filter(|_| kv_aware_ops(self.policy_for_model(model_id).as_ref()).is_some())
@@ -2240,14 +2252,14 @@ impl Router {
                         }),
                         headers,
                         QualifiedKvInput { tokens: request_tokens, eligibility: eligibility.as_deref() },
-                        history.filter(|_| cache_read_fallback.is_none()),
+                        history,
                         lora_name,
                         cache_salt,
                         affinity_key.as_ref(),
                         &excluded_workers,
                     )
                 };
-                let (SelectedWorker { worker, kv_receipt }, observation) = match selected_worker {
+                let (SelectedWorker { worker, kv_receipt }, history) = match selected_worker {
                     Some(selection) => selection,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -2283,13 +2295,7 @@ impl Router {
                             completion,
                             load,
                             prepared: (*prepared).clone(),
-                            history: observation
-                                .filter(|_| !is_http || match typed_req.grpc_request() {
-                                    Some(GrpcRequestRef::Completion(request)) => !request.echo,
-                                    Some(GrpcRequestRef::Chat(request)) => request.echo != Some(true),
-                                    _ => false,
-                                })
-                                .map(|observation| (policy.clone(), observation)),
+                            history,
                             request_body: injected_body.clone(),
                         },
                         program_completion.clone(),
@@ -2500,23 +2506,15 @@ impl Router {
             // A stream opening or prompt-info message is not an observation.
             // Streaming load still changes phase at its existing output-frame
             // boundary; the optional history hook owns no load receipt.
-            let history = history.and_then(|(policy, observation)| {
-                self.worker_registry
-                    .get_by_url(worker_url)
-                    .map(|worker| (policy, worker, Mutex::new(Some(observation))))
-            });
+            let history = history.map(HistoryAttempt::grpc_callback);
             let decode_load = (!is_stream).then(|| load.clone());
             let on_first_output = (decode_load.is_some() || history.is_some()).then(|| {
                 Arc::new(move || {
                     if let Some(load) = &decode_load {
                         load.begin_decode();
                     }
-                    if let Some((policy, worker, observation)) = &history {
-                        if let Some(observation) = observation.lock().take() {
-                            if let Some(kv) = kv_aware_ops(policy.as_ref()) {
-                                kv.observe_completion_milestone(worker.as_ref(), observation);
-                            }
-                        }
+                    if let Some(observe) = &history {
+                        observe();
                     }
                 }) as crate::backend::grpc::FirstOutputCallback
             });
@@ -2656,26 +2654,8 @@ impl Router {
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        // History inspects only recognizable output, without changing forwarding
-        // or negotiating a different encoding for this optional observation.
         let history = history
-            .filter(|_| {
-                status.is_success()
-                    && res
-                        .headers()
-                        .get_all(http::header::CONTENT_ENCODING)
-                        .iter()
-                        .all(|value| value.as_bytes().eq_ignore_ascii_case(b"identity"))
-            })
-            .and_then(|(policy, observation)| {
-                let output = match (route, is_stream) {
-                    ("/v1/completions", _) => HistoryOutput::Completion,
-                    ("/v1/chat/completions", true) => HistoryOutput::ChatDelta,
-                    ("/v1/chat/completions", false) => HistoryOutput::ChatMessage,
-                    _ => return None,
-                };
-                Some((policy, observation, output))
-            });
+            .and_then(|attempt| attempt.for_http_response(route, is_stream, status, res.headers()));
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
         if strip_usage
@@ -2711,15 +2691,10 @@ impl Router {
                     if let Some(completion) = &program_completion {
                         completion.observe_json(&body);
                     }
-                    if let Some((policy, observation, _)) =
-                        history.filter(|(_, _, output)| output.has_output(&body))
-                    {
-                        if let (Some(kv), Some(current)) = (
-                            kv_aware_ops(policy.as_ref()),
-                            self.worker_registry.get_by_url(worker_url),
-                        ) {
-                            kv.observe_completion_milestone(current.as_ref(), observation);
-                        }
+                    if let Some(attempt) = history.filter(|attempt| {
+                        observe_body_with(&body, |event, data| attempt.inspect(event, data))
+                    }) {
+                        attempt.commit();
                     }
                     let mut response = Response::new(axum::body::Body::from(body));
                     *response.status_mut() = status;
@@ -2739,15 +2714,8 @@ impl Router {
             response
         } else if load_incremented {
             let mut completion_output = completion.map(|input| input.output_observer(status));
-            let mut history = history.map(|(policy, observation, output)| {
-                (
-                    policy,
-                    observation,
-                    CompletionOutputObserver::for_history(output),
-                    self.worker_registry.clone(),
-                    worker_url.to_owned(),
-                )
-            });
+            let mut history =
+                history.map(|attempt| (attempt, CompletionOutputObserver::new(false)));
             // The forwarding task and response body share one cleanup receipt.
             let completion = if status.is_success() {
                 program_completion
@@ -2842,9 +2810,12 @@ impl Router {
                                 },
                                 None => bytes,
                             };
-                            let history_ready = history
-                                .as_mut()
-                                .is_some_and(|(_, _, observer, _, _)| observer.observe(&outgoing));
+                            let history_ready =
+                                history.as_mut().is_some_and(|(attempt, observer)| {
+                                    observer.observe_with(&outgoing, |event, data| {
+                                        attempt.inspect(event, data)
+                                    })
+                                });
                             let sent = match producer_output_frame.as_mut() {
                                 Some(output_frame) => output_frame.send(&tx, outgoing, has_output),
                                 None => tx.send(Ok(outgoing)).is_ok(),
@@ -2853,19 +2824,8 @@ impl Router {
                                 stream_succeeded = false;
                                 break;
                             }
-                            if history_ready {
-                                if let Some((policy, observation, _, registry, url)) =
-                                    history.take()
-                                {
-                                    if let (Some(kv), Some(current)) =
-                                        (kv_aware_ops(policy.as_ref()), registry.get_by_url(&url))
-                                    {
-                                        kv.observe_completion_milestone(
-                                            current.as_ref(),
-                                            observation,
-                                        );
-                                    }
-                                }
+                            if let Some((attempt, _)) = history.take_if(|_| history_ready) {
+                                attempt.commit();
                             }
                             if has_output {
                                 producer_load.begin_decode();
@@ -3061,11 +3021,10 @@ impl Router {
 
                             let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                             self.worker_registry.register(worker_arc.clone());
-                            self.register_kv_target(&worker_arc, kv_info.as_ref());
-
                             // Notify PolicyRegistry about the new worker
                             let model_id = worker_arc.model_id();
                             let policy = self.policy_registry.on_worker_added(model_id, None);
+                            self.register_kv_target(&worker_arc, kv_info.as_ref());
 
                             // If this is a cache-aware policy, update it with all workers for this model
                             if policy.needs_cache_routing_key() {
@@ -3121,14 +3080,13 @@ impl Router {
 
                         let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                         self.worker_registry.register(worker_arc.clone());
+                        // Notify PolicyRegistry before attaching the registration to both policies.
+                        let model_id = worker_arc.model_id();
+                        let policy = self.policy_registry.on_worker_added(model_id, None);
                         self.register_kv_target(
                             &worker_arc,
                             kv_info.as_ref().map(|(info, _)| info),
                         );
-
-                        // Notify PolicyRegistry about the new worker
-                        let model_id = worker_arc.model_id();
-                        let policy = self.policy_registry.on_worker_added(model_id, None);
 
                         // If this is a cache-aware policy, add this worker to it
                         if policy.needs_cache_routing_key() {
@@ -4853,6 +4811,44 @@ mod tests {
             ));
             router.worker_registry.register(grpc.clone());
             assert!(!Arc::ptr_eq(&registered, &grpc));
+            let degraded = WorkerKvInfo {
+                instance_id: "degraded-worker".into(),
+                cache_key: None,
+                ..info.clone()
+            };
+            for (discovery, target) in [
+                (None, worker.as_str()),
+                (Some(&degraded), degraded.instance_id.as_str()),
+            ] {
+                router.register_kv_target(&grpc, discovery);
+                assert_eq!(Arc::weak_count(&grpc), 0, "{target}");
+                let candidates = std::slice::from_ref(&grpc);
+                let history = kv.capture_completion_history(candidates, "future-model");
+                let (receipt, observation) = kv
+                    .select_with_history(
+                        candidates,
+                        KvRequestTokens::Shared(Some(&[77; 9])),
+                        None,
+                        history.as_ref(),
+                        SelectionIdentity::default(),
+                        &[],
+                    )
+                    .unwrap();
+                assert!(observation.is_none(), "{target}");
+                assert_eq!(receipt.new_prefill_tokens, 9, "{target}");
+                assert_eq!(receipt.decision.target.instance_id.as_ref(), target);
+                drop(RequestLoadGuard::from_selection(
+                    grpc.clone(),
+                    Some(receipt),
+                    true,
+                ));
+                assert_eq!(grpc.load(), 0, "{target}");
+                assert_eq!(
+                    slots.sample(&kv.target_for_worker(grpc.as_ref())),
+                    crate::policies::LoadSample::default(),
+                    "{target}"
+                );
+            }
             router.register_kv_target(&grpc, Some(&info));
             assert_eq!(
                 Arc::weak_count(&grpc),
@@ -5951,6 +5947,7 @@ mod tests {
                     ..Default::default()
                 }),
                 Some(index.clone()),
+                Some(crate::kv_index::source::test_support::current_registration()),
             );
             if worker_index == warm {
                 worker.increment_load();
@@ -6011,6 +6008,7 @@ mod tests {
                 ..Default::default()
             }),
             Some(binding),
+            Some(crate::kv_index::source::test_support::current_registration()),
         );
     }
 
@@ -6071,24 +6069,40 @@ mod tests {
             );
         }
         f.workers[0].set_healthy(true);
+        // Echo sees the stored prefix for selection, but cannot extend it with
+        // the extra complete block in this request.
+        let echo_ids = vec![42u32; 35];
+        let echo: CompletionRequest = serde_json::from_value(
+            serde_json::json!({"model":"model","prompt":echo_ids,"echo":true}),
+        )
+        .unwrap();
+        let history_reasons = count("vllm_router_history_decisions_total{");
         assert_eq!(
             selected_http_worker(
                 f.router
-                    .route_typed_request(None, &req, "/v1/completions", None)
+                    .route_typed_request(None, &echo, "/v1/completions", None)
                     .await
             )
             .await,
             1
         );
         assert_eq!(
+            kv.observed_completion_prefix(f.workers[1].as_ref(), &echo_ids),
+            32
+        );
+        assert_eq!(
+            count("vllm_router_history_decisions_total{") - history_reasons,
+            1
+        );
+        assert_eq!(
             f.loads.lock().as_slice(),
-            &[(
+            &[33, 33, 35].map(|tokens| (
                 1,
                 crate::policies::LoadSample {
-                    active_prefill_tokens: 33,
+                    active_prefill_tokens: tokens,
                     active_requests: 1,
-                }
-            ); 3]
+                },
+            ))
         );
         assert!(f.workers.iter().all(|w| w.load() == 0));
         let metrics = handle.render();

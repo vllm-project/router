@@ -29,10 +29,22 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
     let active = Arc::new(AtomicBool::new(true));
     let lifecycle = Arc::new(WorkerLifecycle::new(active.clone(), true, None));
     lifecycle.state.lock().verified_at = Instant::now() - Duration::from_secs(6);
-    let provider = LayoutWorkerProvider {
-        indexes: HashMap::default(),
-        lifecycle,
-    };
+    let mut indexes = HashMap::default();
+    indexes.insert(
+        0,
+        Arc::new(full_binding(
+            crate::kv_index::RoutableTarget {
+                instance_id: Arc::from("worker"),
+                dp_rank: 0,
+            },
+            16,
+        )),
+    );
+    let provider = LayoutWorkerProvider { indexes, lifecycle };
+    assert!(!provider.current(0)); // Missing info despite an active rank.
+    provider.lifecycle.state.lock().info = Some(WorkerKvInfo::default());
+    assert!(provider.current(0));
+    assert!(!provider.current(1));
     assert!(!provider.is_trusted());
     assert!(provider.lifecycle.expire_if_needed());
     assert!(active.load(Ordering::Acquire));
@@ -43,6 +55,7 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
         SourceAction::Keep
     );
     assert!(!provider.is_trusted());
+    assert!(provider.current(0)); // Trust loss is not retirement.
     assert_eq!(
         provider
             .lifecycle
@@ -60,11 +73,7 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
             .observe_layout(&StaticHybridMatch::Unavailable(SourcesProbe::Unsupported)),
         SourceAction::Recover
     );
-    let revision = {
-        let mut state = provider.lifecycle.state.lock();
-        state.info = Some(WorkerKvInfo::default());
-        state.revision
-    };
+    let revision = provider.lifecycle.state.lock().revision;
     assert!(!provider.lifecycle.finish_layout_recovery(false));
     {
         let state = provider.lifecycle.state.lock();
@@ -79,6 +88,7 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
     );
     assert!(!active.load(Ordering::Acquire));
     assert!(!provider.is_trusted());
+    assert!(!provider.current(0));
 }
 
 #[test]
@@ -102,8 +112,9 @@ use super::lifecycle::SourceAction;
 use super::probe::worker_descriptor;
 use super::reconcile::{bound_source_moved, probe_keeps_trust, probe_renews_trust, BoundSource};
 use super::*;
-use crate::kv_index::source::test_support::{event_payload, full_store};
+use crate::kv_index::source::test_support::{event_payload, full_binding, full_store};
 use crate::kv_index::wire::KVEvent;
+use crate::policies::RegistrationCurrent;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -1253,7 +1264,14 @@ async fn failed_readd_preserves_the_active_binding_and_success_fences_it() {
         )
         .unwrap();
 
-    let provider = supervisor.match_provider_for_worker(worker).unwrap();
+    let registration = supervisor.worker_registration_for_worker(worker).unwrap();
+    let provider = registration.provider.unwrap();
+    let current = registration.current.unwrap();
+    assert!(std::ptr::addr_eq(
+        Arc::as_ptr(&provider),
+        Arc::as_ptr(&current)
+    ));
+    assert!(current.current(0));
     let active = supervisor.installed.workers.lock()[worker].active.clone();
     boundary_subscription(&publisher, "kv", true).await;
     finish_empty_startup_replay(&replay).await;
@@ -1273,10 +1291,15 @@ async fn failed_readd_preserves_the_active_binding_and_success_fences_it() {
     assert!(error.contains("live KV streams") || error.contains("KV replay endpoints"));
     assert!(active.load(Ordering::Acquire));
     assert!(hit());
+    assert!(current.current(0));
 
     supervisor.install_worker(worker, initial()).unwrap();
     assert!(!active.load(Ordering::Acquire));
     assert!(!hit());
+    assert!(!current.current(0));
+    let replacement = &supervisor.worker_registrations()[worker];
+    assert_ne!(registration.revision, replacement.revision);
+    assert!(replacement.current.as_ref().unwrap().current(0));
     assert!(supervisor.match_provider_for_worker(neighbor).is_some());
     supervisor.shutdown();
 }

@@ -1,4 +1,6 @@
-//! Conservative model-output detection for HTTP load and history observation.
+//! Bounded HTTP output observation and Completion load detection.
+
+use std::ops::ControlFlow;
 
 use serde_json::Value;
 
@@ -6,63 +8,11 @@ use super::sse::{sse_lines, FrameScanner};
 
 const MAX_OBSERVABLE_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Copy)]
-pub(super) enum HistoryOutput {
-    Completion,
-    ChatDelta,
-    ChatMessage,
-}
-
-enum Observation {
-    Ignore,
-    Output,
-    Terminal,
-}
-
-impl HistoryOutput {
-    pub(super) fn has_output(self, body: &[u8]) -> bool {
-        body.len() <= MAX_OBSERVABLE_BYTES
-            && serde_json::from_slice(body)
-                .is_ok_and(|value| matches!(self.inspect(&value), Observation::Output))
-    }
-
-    fn inspect(self, value: &Value) -> Observation {
-        if value.get("error").is_some_and(|error| !error.is_null())
-            || value.get("object").and_then(Value::as_str) == Some("error")
-        {
-            return Observation::Terminal;
-        }
-        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
-            return Observation::Ignore;
-        };
-        let mut output = false;
-        for choice in choices {
-            let reason = choice.get("finish_reason").and_then(Value::as_str);
-            if matches!(reason, Some("abort" | "error")) {
-                return Observation::Terminal;
-            }
-            output |= self.choice_has_output(choice);
-        }
-        if output {
-            Observation::Output
-        } else {
-            Observation::Ignore
-        }
-    }
-
-    fn choice_has_output(self, choice: &Value) -> bool {
-        // Reasoning (including reasoning_content), tools, roles and prompt
-        // metadata are not evidence of generated text on these routes.
-        let text = match self {
-            Self::Completion => choice.get("text"),
-            Self::ChatDelta => choice.get("delta").and_then(|delta| delta.get("content")),
-            Self::ChatMessage => choice
-                .get("message")
-                .and_then(|message| message.get("content")),
-        };
-        text.and_then(Value::as_str)
-            .is_some_and(|text| !text.is_empty())
-    }
+pub(super) fn observe_body_with(
+    body: &[u8],
+    predicate: impl FnOnce(Option<&[u8]>, &[u8]) -> ControlFlow<bool>,
+) -> bool {
+    body.len() <= MAX_OBSERVABLE_BYTES && matches!(predicate(None, body), ControlFlow::Break(true))
 }
 
 pub(super) struct CompletionOutputObserver {
@@ -70,7 +20,6 @@ pub(super) struct CompletionOutputObserver {
     scanner: FrameScanner,
     first_event: bool,
     stopped: bool,
-    history: Option<HistoryOutput>,
 }
 
 impl CompletionOutputObserver {
@@ -80,22 +29,22 @@ impl CompletionOutputObserver {
             scanner: FrameScanner::default(),
             first_event: true,
             stopped: disabled,
-            history: None,
         }
     }
 
-    pub(super) fn for_history(output: HistoryOutput) -> Self {
-        Self {
-            history: Some(output),
-            ..Self::new(false)
-        }
+    pub(super) fn observe(&mut self, chunk: &[u8]) -> bool {
+        self.observe_with(chunk, inspect_completion_load)
     }
 
     /// Return true only once, after a complete SSE event proves model output.
     /// No EOF flush: an unterminated event is not evidence. Oversized events
     /// permanently disable detection for this attempt without affecting bytes.
     /// The bound counts wire bytes, including CRLF delimiters.
-    pub(super) fn observe(&mut self, mut chunk: &[u8]) -> bool {
+    pub(super) fn observe_with(
+        &mut self,
+        mut chunk: &[u8],
+        mut predicate: impl FnMut(Option<&[u8]>, &[u8]) -> ControlFlow<bool>,
+    ) -> bool {
         if self.stopped {
             return false;
         }
@@ -118,11 +67,11 @@ impl CompletionOutputObserver {
                 } else {
                     &self.event
                 };
-                let observation = inspect_event(event, self.history);
+                let observation = inspect_event(event, &mut predicate);
                 self.event.clear();
-                if !matches!(observation, Observation::Ignore) {
+                if let ControlFlow::Break(output) = observation {
                     self.stopped = true;
-                    return matches!(observation, Observation::Output);
+                    return output;
                 }
             }
         }
@@ -130,7 +79,10 @@ impl CompletionOutputObserver {
     }
 }
 
-fn inspect_event(event: &[u8], history: Option<HistoryOutput>) -> Observation {
+fn inspect_event(
+    event: &[u8],
+    predicate: impl FnOnce(Option<&[u8]>, &[u8]) -> ControlFlow<bool>,
+) -> ControlFlow<bool> {
     let mut data = Vec::new();
     let mut event_type = None;
     for (line, _) in sse_lines(event) {
@@ -143,35 +95,32 @@ fn inspect_event(event: &[u8], history: Option<HistoryOutput>) -> Observation {
             event_type = Some(value.strip_prefix(b" ").unwrap_or(value));
         }
     }
-    if history.is_some()
-        && (matches!(event_type, Some(b"error" | b"abort")) || data.trim_ascii() == b"[DONE]")
-    {
-        return Observation::Terminal;
-    }
+    predicate(event_type, &data)
+}
+
+fn inspect_completion_load(event_type: Option<&[u8]>, data: &[u8]) -> ControlFlow<bool> {
     if event_type == Some(b"error".as_slice()) {
-        return Observation::Ignore;
+        return ControlFlow::Continue(());
     }
-    let Ok(value) = serde_json::from_slice::<Value>(&data) else {
-        return Observation::Ignore;
+    let Ok(value) = serde_json::from_slice::<Value>(data) else {
+        return ControlFlow::Continue(());
     };
-    if let Some(history) = history {
-        return history.inspect(&value);
-    }
-    // Keep load's existing Completion-only frame predicate, including its
-    // distinct handling of error fields and terminal events.
     if value.get("error").is_none()
         && value
             .get("choices")
             .and_then(Value::as_array)
             .is_some_and(|choices| {
-                choices
-                    .iter()
-                    .any(|choice| HistoryOutput::Completion.choice_has_output(choice))
+                choices.iter().any(|choice| {
+                    choice
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                })
             })
     {
-        Observation::Output
+        ControlFlow::Break(true)
     } else {
-        Observation::Ignore
+        ControlFlow::Continue(())
     }
 }
 
@@ -180,30 +129,45 @@ fn inspect_event(event: &[u8], history: Option<HistoryOutput>) -> Observation {
 mod tests {
     use super::*;
 
+    fn observe_callback(observer: &mut CompletionOutputObserver, chunk: &[u8]) -> bool {
+        observer.observe_with(chunk, |event, data| {
+            assert!(event.is_none());
+            let expected = br#""text":"output""#;
+            if data.windows(expected.len()).any(|win| win == expected) {
+                ControlFlow::Break(true)
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+    }
+
     fn assert_output_at(event: &[u8], complete_at: usize) {
-        for (mode, history) in [("load", None), ("history", Some(HistoryOutput::Completion))] {
-            let observer = || match history {
-                Some(output) => CompletionOutputObserver::for_history(output),
-                None => CompletionOutputObserver::new(false),
-            };
+        for (mode, observe) in [
+            (
+                "load",
+                CompletionOutputObserver::observe
+                    as fn(&mut CompletionOutputObserver, &[u8]) -> bool,
+            ),
+            ("callback", observe_callback),
+        ] {
             for split in 0..=event.len() {
-                let mut observer = observer();
+                let mut observer = CompletionOutputObserver::new(false);
                 assert_eq!(
-                    observer.observe(&event[..split]),
+                    observe(&mut observer, &event[..split]),
                     split >= complete_at,
                     "{mode}, split {split}"
                 );
                 assert_eq!(
-                    observer.observe(&event[split..]),
+                    observe(&mut observer, &event[split..]),
                     split < complete_at,
                     "{mode}, split {split}"
                 );
-                assert!(!observer.observe(event), "{mode}: repeated output");
+                assert!(!observe(&mut observer, event), "{mode}: repeated output");
             }
-            let mut observer = observer();
+            let mut observer = CompletionOutputObserver::new(false);
             for (index, byte) in event.iter().enumerate() {
                 assert_eq!(
-                    observer.observe(&[*byte]),
+                    observe(&mut observer, &[*byte]),
                     index + 1 == complete_at,
                     "{mode}, byte {index}"
                 );
@@ -288,130 +252,45 @@ mod tests {
     #[test]
     fn oversized_event_disables_detection_before_buffer_growth() {
         let pending = vec![b'x'; MAX_OBSERVABLE_BYTES];
-        for mut observer in [
-            CompletionOutputObserver::new(false),
-            CompletionOutputObserver::for_history(HistoryOutput::Completion),
-        ] {
-            assert!(!observer.observe(&pending));
-            assert_eq!(observer.event.len(), MAX_OBSERVABLE_BYTES);
-            assert!(
-                !observer.observe(b"x\n\ndata: {\"choices\":[{\"text\":\"false positive\"}]}\n\n")
-            );
-            assert!(observer.event.is_empty());
-            assert!(observer.stopped);
-            assert!(!observer.observe(b"data: {\"choices\":[{\"text\":\"still disabled\"}]}\n\n"));
-        }
+        let mut observer = CompletionOutputObserver::new(false);
+        let unexpected = |_: Option<&[u8]>, _: &[u8]| panic!("oversized event reached callback");
+        assert!(!observer.observe_with(&pending, unexpected));
+        assert_eq!(observer.event.len(), MAX_OBSERVABLE_BYTES);
+        assert!(!observer.observe_with(b"x\n\ndata: too late\n\n", unexpected));
+        assert!(observer.event.is_empty());
+        assert!(observer.stopped);
+        assert!(!observer.observe_with(b"data: still disabled\n\n", unexpected));
     }
 
     #[test]
-    fn history_requires_route_specific_generated_text() {
-        for (case, json, expected) in [
-            (
-                "final completion text",
-                r#"{"error":null,"choices":[{"text":" ","finish_reason":"stop"}]}"#,
-                [true, true, false, false],
-            ),
-            (
-                "chat delta",
-                r#"{"choices":[{"delta":{"content":"generated"}}]}"#,
-                [false, false, true, false],
-            ),
-            (
-                "chat message",
-                r#"{"choices":[{"message":{"content":"generated"},"finish_reason":"length"}]}"#,
-                [false, false, false, true],
-            ),
-            (
-                "wrong types and empty text",
-                r#"{"choices":[{"text":"","delta":{"content":42},"message":{"content":[]}}]}"#,
-                [false; 4],
-            ),
-            (
-                "role, reasoning, tools and prompt metadata",
-                r#"{"choices":[{"prompt_token_ids":[1],"delta":{"role":"assistant","reasoning":"hidden","tool_calls":[{}]},"message":{"role":"assistant","reasoning_content":"hidden","tool_calls":[{}]}}]}"#,
-                [false; 4],
-            ),
-            (
-                "usage only",
-                r#"{"choices":[],"usage":{"completion_tokens":1}}"#,
-                [false; 4],
-            ),
-            (
-                "incomplete JSON",
-                r#"{"choices":[{"text":"partial"}"#,
-                [false; 4],
-            ),
-            (
-                "abort takes precedence over text in any choice",
-                r#"{"choices":[{"text":"not output","delta":{"content":"not output"},"message":{"content":"not output"}},{"finish_reason":"abort"}]}"#,
-                [false; 4],
-            ),
-            (
-                "error object takes precedence over text",
-                r#"{"object":"error","choices":[{"text":"not output","delta":{"content":"not output"},"message":{"content":"not output"}}]}"#,
-                [false; 4],
-            ),
-            (
-                "non-null error field takes precedence over text",
-                r#"{"error":{},"choices":[{"text":"not output","delta":{"content":"not output"},"message":{"content":"not output"}}]}"#,
-                [false; 4],
-            ),
-        ] {
-            let event = format!("data: {json}\n\n");
-            for ((output, stream, mode), expected) in [
-                (HistoryOutput::Completion, true, "completion stream"),
-                (HistoryOutput::Completion, false, "completion body"),
-                (HistoryOutput::ChatDelta, true, "chat stream"),
-                (HistoryOutput::ChatMessage, false, "chat body"),
-            ]
-            .into_iter()
-            .zip(expected)
-            {
-                let observed = if stream {
-                    CompletionOutputObserver::for_history(output).observe(event.as_bytes())
-                } else {
-                    output.has_output(json.as_bytes())
-                };
-                assert_eq!(observed, expected, "{case}: {mode}");
-            }
-        }
-    }
-
-    #[test]
-    fn history_stops_at_terminal_frames_before_later_output() {
-        let output = "data: {\"choices\":[{\"text\":\"too late\"}]}\n\n";
-        for terminal in [
-            "data: \t[DONE] \t\n\n",
-            "event: error\ndata: {\"choices\":[{\"text\":\"not output\"}]}\n\n",
-            "event: abort\n\n",
-            "data: {\"error\":{}}\n\n",
-            "data: {\"object\":\"error\"}\n\n",
-            "data: {\"choices\":[{\"text\":\"not output\",\"finish_reason\":\"abort\"}]}\n\n",
-            "data: {\"choices\":[{\"text\":\"not output\",\"finish_reason\":\"error\"}]}\n\n",
-        ] {
-            let mut observer = CompletionOutputObserver::for_history(HistoryOutput::Completion);
-            assert!(!observer.observe(b": router-stages\n\ndata: not-json\n\n"));
-            assert!(!observer.stopped);
-            assert!(
-                !observer.observe(format!("{terminal}{output}").as_bytes()),
-                "{terminal:?}"
-            );
-            assert!(!observer.observe(output.as_bytes()), "{terminal:?}");
-        }
-        // A normal finish belongs to one choice, not the entire response.
-        let mut observer = CompletionOutputObserver::for_history(HistoryOutput::Completion);
-        assert!(!observer.observe(
-            b"data: {\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\"stop\"}]}\n\n"
+    fn callback_can_stop_without_evidence_and_skip_later_events() {
+        let mut observer = CompletionOutputObserver::new(false);
+        let inspect = |event: Option<&[u8]>, data: &[u8]| match (event, data) {
+            (None, b"wait") => ControlFlow::Continue(()),
+            (Some(b"stop"), b"first\nsecond") => ControlFlow::Break(false),
+            _ => panic!("stopped observer inspected another event"),
+        };
+        assert!(!observer.observe_with(b"data: wait\n\n", inspect));
+        assert!(!observer.stopped);
+        assert!(!observer.observe_with(
+            b"event: stop\r\ndata: first\r\ndata: second\r\n\r\ndata: too late\n\n",
+            inspect,
         ));
-        assert!(observer.observe(b"data: {\"choices\":[{\"index\":1,\"text\":\"generated\"}]}\n\n"));
+        assert!(observer.stopped);
+        assert!(!observer.observe_with(b"data: still stopped\n\n", inspect));
     }
 
     #[test]
-    fn history_bounds_complete_json_before_parsing() {
-        let mut body = br#"{"choices":[{"text":"generated"}]}"#.to_vec();
-        body.resize(MAX_OBSERVABLE_BYTES, b' ');
-        assert!(HistoryOutput::Completion.has_output(&body));
+    fn complete_body_observation_is_bounded_before_callback() {
+        let mut body = vec![b' '; MAX_OBSERVABLE_BYTES];
+        assert!(observe_body_with(&body, |event, bytes| {
+            assert!(event.is_none());
+            assert_eq!(bytes, body.as_slice());
+            ControlFlow::Break(true)
+        }));
         body.push(b' ');
-        assert!(!HistoryOutput::Completion.has_output(&body));
+        assert!(!observe_body_with(&body, |_, _| panic!(
+            "oversized body reached callback"
+        )));
     }
 }

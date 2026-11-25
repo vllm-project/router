@@ -109,25 +109,23 @@ impl KvIndexSupervisor {
             .lock()
             .iter()
             .map(|(url, lifecycle)| {
-                let state = lifecycle.state.lock();
-                let provider = state
-                    .info
-                    .as_ref()
-                    .and_then(|_| workers.get(url))
-                    .filter(|worker| Arc::ptr_eq(&worker.active, &lifecycle.active))
-                    .map(|worker| {
-                        worker.provider.clone() as Arc<dyn crate::policies::TieredMatchProvider>
-                    });
                 (
                     url.clone(),
-                    WorkerRegistration {
-                        revision: state.revision,
-                        info: state.info.clone(),
-                        provider,
-                    },
+                    WorkerRegistration::snapshot(lifecycle, workers.get(url)),
                 )
             })
             .collect()
+    }
+
+    pub(crate) fn worker_registration_for_worker(
+        &self,
+        worker_url: &str,
+    ) -> Option<WorkerRegistration> {
+        let workers = self.installed.workers.lock();
+        self.lifecycles
+            .lock()
+            .get(worker_url)
+            .map(|lifecycle| WorkerRegistration::snapshot(lifecycle, workers.get(worker_url)))
     }
 
     /// Reconcile one pool outside its request path, sharing registration and trust.

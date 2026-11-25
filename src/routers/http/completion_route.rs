@@ -59,26 +59,6 @@ pub(super) fn prepare_completion_route(
     }
 }
 
-/// History uses one effective prompt and a narrower set of modifiers than
-/// ordinary cache credit.
-pub(super) fn completion_history_input(request: &CompletionRequest) -> bool {
-    matches!(
-        request.prompt,
-        crate::protocols::spec::PromptInput::String(_)
-            | crate::protocols::spec::PromptInput::IntArray(_)
-    ) && request.lora_path.is_none()
-        && crate::backend::preprocess::completion_cache_read_fallback(request).is_none()
-        && request
-            .other
-            .iter()
-            .all(|(field, value)| match field.as_str() {
-                "add_special_tokens" => value.is_boolean(),
-                "priority" => value.is_i64() || value.is_u64(),
-                "truncate_prompt_tokens" => true,
-                _ => false,
-            })
-}
-
 /// Full reports re-announce existing blocks and cannot be counted as physical
 /// copies. Reject them before they contaminate a monitored event stream.
 pub(crate) fn reject_full_report(

@@ -15,6 +15,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
+use crate::kv_index::prefix_history::{CompletionHistory, HistoryHit};
 use crate::kv_index::{
     CacheKey, PromptKey, RequestHashCache, RoutableTarget, SharedPrefixLookup, StorageTier,
     TierMatch, WorkerKvInfo,
@@ -24,8 +25,15 @@ use crate::request_identity::StableIdentity;
 pub use crate::kv_index::TieredMatchProvider;
 
 mod history;
-use history::CompletionHistory;
-pub use history::HistoryObservation;
+mod history_hook;
+pub use crate::kv_index::prefix_history::HistoryObservation;
+pub(crate) use history_hook::{HistoryAttempt, HistoryCapture, KvAwareHistoryHook};
+
+/// Confirms that a rank still belongs to the owner captured at registration.
+/// Temporary loss of placement trust does not end that registration.
+pub trait RegistrationCurrent: Send + Sync {
+    fn current(&self, rank: u32) -> bool;
+}
 
 /// Registrations captured before input preparation. A retry must not attach
 /// their tokens to another Worker object or a replacement at the same address.
@@ -220,6 +228,7 @@ pub trait KvAwareOps: Send + Sync {
         worker: &Arc<dyn Worker>,
         info: Option<&WorkerKvInfo>,
         matches: Option<Arc<dyn TieredMatchProvider>>,
+        _current: Option<Arc<dyn RegistrationCurrent>>,
     ) {
         self.register_worker(worker.as_ref(), info, matches);
     }
@@ -1054,6 +1063,7 @@ struct TargetBinding {
     shared_prefix: Option<SharedPrefixLookup>,
     block_size: u32,
     history_worker: Option<std::sync::Weak<dyn Worker>>,
+    history_current: Option<Arc<dyn RegistrationCurrent>>,
 }
 
 impl TargetBinding {
@@ -1067,8 +1077,9 @@ impl TargetBinding {
     }
 
     fn history_registration_current(&self) -> bool {
-        self.matches
-            .history_registration_current(self.target.dp_rank)
+        self.history_current
+            .as_ref()
+            .is_some_and(|owner| owner.current(self.target.dp_rank))
     }
 }
 
@@ -1167,7 +1178,7 @@ struct SelectionPlan {
     has_tokens: bool,
 }
 
-type HistoryCandidate<'a> = (u64, &'a [u32], Option<history::HistoryHit>);
+type HistoryCandidate<'a> = (u64, &'a [u32], Option<HistoryHit>);
 
 /// Registered `kv_aware` policy. Discovery binds each worker target to the
 /// placement provider for its cache identity.
@@ -1308,7 +1319,14 @@ impl KvAwarePolicy {
     }
 
     pub fn register_target(&self, worker_url: impl Into<String>, target: RoutableTarget) {
-        self.register_binding(worker_url.into(), target, None, self.matches.clone(), None);
+        self.register_binding(
+            worker_url.into(),
+            target,
+            None,
+            self.matches.clone(),
+            None,
+            None,
+        );
     }
 
     pub fn register_target_with_cache_identity(
@@ -1318,7 +1336,14 @@ impl KvAwarePolicy {
         cache_key: CacheKey,
         matches: Arc<dyn TieredMatchProvider>,
     ) {
-        self.register_binding(worker_url.into(), target, Some(cache_key), matches, None);
+        self.register_binding(
+            worker_url.into(),
+            target,
+            Some(cache_key),
+            matches,
+            None,
+            None,
+        );
     }
 
     fn register_binding(
@@ -1328,6 +1353,7 @@ impl KvAwarePolicy {
         cache_key: Option<CacheKey>,
         matches: Arc<dyn TieredMatchProvider>,
         history_worker: Option<std::sync::Weak<dyn Worker>>,
+        history_current: Option<Arc<dyn RegistrationCurrent>>,
     ) {
         let block_size = cache_key
             .as_ref()
@@ -1349,6 +1375,7 @@ impl KvAwarePolicy {
                 shared_prefix,
                 block_size,
                 history_worker,
+                history_current,
             }),
         );
         if let (Some(old), Some(history)) = (old, self.completion_history.get()) {
@@ -1362,6 +1389,7 @@ impl KvAwarePolicy {
         info: Option<&WorkerKvInfo>,
         matches: Option<Arc<dyn TieredMatchProvider>>,
         history_worker: Option<std::sync::Weak<dyn Worker>>,
+        history_current: Option<Arc<dyn RegistrationCurrent>>,
     ) {
         let target = RoutableTarget {
             instance_id: Arc::from(
@@ -1376,12 +1404,14 @@ impl KvAwarePolicy {
             _ => (None, self.matches.clone()),
         };
         let history_worker = cache_key.as_ref().and(history_worker);
+        let history_current = cache_key.as_ref().and(history_current);
         self.register_binding(
             worker.url().to_owned(),
             target,
             cache_key,
             matches,
             history_worker,
+            history_current,
         );
     }
 
@@ -1448,6 +1478,7 @@ impl KvAwarePolicy {
                     shared_prefix: None,
                     block_size: self.params.block_size,
                     history_worker: None,
+                    history_current: None,
                 })
             })
     }
@@ -2363,6 +2394,7 @@ impl KvAwareOps for KvAwarePolicy {
         worker: &Arc<dyn Worker>,
         info: Option<&WorkerKvInfo>,
         matches: Option<Arc<dyn TieredMatchProvider>>,
+        current: Option<Arc<dyn RegistrationCurrent>>,
     ) {
         self.register_worker_binding(
             worker.as_ref(),
@@ -2370,6 +2402,7 @@ impl KvAwareOps for KvAwarePolicy {
             matches,
             info.is_some_and(|i| i.ranks.as_slice() == [0])
                 .then(|| Arc::downgrade(worker)),
+            current,
         );
     }
 
@@ -2754,7 +2787,7 @@ impl KvAwareOps for KvAwarePolicy {
         info: Option<&WorkerKvInfo>,
         matches: Option<Arc<dyn TieredMatchProvider>>,
     ) {
-        self.register_worker_binding(worker, info, matches, None);
+        self.register_worker_binding(worker, info, matches, None, None);
     }
 
     fn unregister_worker(&self, worker_url: &str) {
@@ -2867,7 +2900,8 @@ mod tests {
 
     use crate::core::{BasicWorker, DPAwareWorker, WorkerType};
     use crate::kv_index::source::test_support::{
-        event_batch, full_binding, full_binding_with_adapter, full_store, warm_full,
+        current_registration, event_batch, full_binding, full_binding_with_adapter, full_store,
+        warm_full,
     };
     use crate::kv_index::{KVEvent, SourceBinding};
     use crate::policies::RoundRobinPolicy;
@@ -4295,6 +4329,7 @@ mod tests {
                     ..WorkerKvInfo::default()
                 }),
                 Some(Arc::new(EmptyMatchProvider)),
+                Some(current_registration()),
             );
             inputs.insert(
                 worker.base_url().to_owned(),
@@ -4306,6 +4341,59 @@ mod tests {
             );
         }
         (policy, workers, inputs)
+    }
+
+    #[test]
+    fn completion_history_equal_overlap_keeps_ordinary_selection_and_full_cost() {
+        let (policy, workers, inputs) = completion_history_fixture();
+        let request = policy
+            .capture_completion_history(&workers, "model")
+            .unwrap();
+        let select = |excluded: &[String]| {
+            policy
+                .select_with_history(
+                    &workers,
+                    KvRequestTokens::PerWorker(&inputs),
+                    None,
+                    Some(&request),
+                    SelectionIdentity::default(),
+                    excluded,
+                )
+                .unwrap()
+        };
+        for index in 0..2 {
+            let (seed, observation) = select(&[workers[1 - index].url().to_owned()]);
+            assert_eq!(seed.worker_index, index);
+            policy.observe_completion_milestone(workers[index].as_ref(), observation.unwrap());
+            release_receipt(&workers, &seed);
+        }
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let (receipt, observation) = metrics::with_local_recorder(&recorder, || select(&[]));
+        assert_eq!(receipt.worker_index, 0);
+        assert_eq!(receipt.new_prefill_tokens, 4);
+        assert!(observation.is_some());
+        let target = &receipt.decision.target;
+        assert_eq!(
+            policy.load.sample(target),
+            LoadSample {
+                active_prefill_tokens: 4,
+                active_requests: 1,
+            }
+        );
+        assert_eq!(workers[0].load(), 2);
+        release_receipt(&workers, &receipt);
+        assert_eq!(policy.load.sample(target), LoadSample::default());
+        assert_eq!(workers[0].load(), 1);
+        assert_eq!(workers[1].load(), 1);
+
+        let rendered = recorder.handle().render();
+        assert!(
+            rendered.contains("reason=\"eligible_ordinary\""),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("reason=\"override\""), "{rendered}");
+        assert!(!rendered.contains("outcome=\"history_hint\""), "{rendered}");
     }
 
     #[test]
@@ -4418,9 +4506,10 @@ mod tests {
         struct RetiringProvider {
             current: AtomicBool,
         }
-        impl TieredMatchProvider for RetiringProvider {
-            fn history_registration_current(&self, _: u32) -> bool {
-                self.current.load(Ordering::Acquire)
+        impl TieredMatchProvider for RetiringProvider {}
+        impl RegistrationCurrent for RetiringProvider {
+            fn current(&self, rank: u32) -> bool {
+                rank == 0 && self.current.load(Ordering::Acquire)
             }
         }
 
@@ -4453,6 +4542,7 @@ mod tests {
                     .clone(),
                 ..WorkerKvInfo::default()
             }),
+            Some(provider.clone()),
             Some(provider.clone()),
         );
         let request = policy
@@ -4542,6 +4632,7 @@ mod tests {
                     ..WorkerKvInfo::default()
                 }),
                 Some(Arc::new(EmptyMatchProvider)),
+                Some(current_registration()),
             );
             assert_eq!(
                 other.binding_for_worker(worker.as_ref()).generation,
@@ -4703,6 +4794,7 @@ mod tests {
                     ..Default::default()
                 }),
                 Some(matches.clone()),
+                Some(current_registration()),
             );
         }
         let request = policy
@@ -4869,6 +4961,7 @@ mod tests {
                     ..WorkerKvInfo::default()
                 }),
                 Some(Arc::new(Credit(binding.target.clone(), tier))),
+                Some(current_registration()),
             );
             let current = policy
                 .capture_completion_history(&workers, "model")
@@ -5011,6 +5104,7 @@ mod tests {
                 ..WorkerKvInfo::default()
             }),
             Some(Arc::new(EmptyMatchProvider)),
+            Some(current_registration()),
         );
         policy.observe_completion_milestone(workers[0].as_ref(), old_observation);
         let new_binding = policy.targets.get(workers[0].url()).unwrap().clone();
@@ -5847,7 +5941,12 @@ mod tests {
             let register =
                 move |policy: &KvAwarePolicy, worker: &Arc<dyn Worker>, matches: Arc<Churn>| {
                     if history_enabled {
-                        policy.register_history_worker(worker, Some(&info), Some(matches));
+                        policy.register_history_worker(
+                            worker,
+                            Some(&info),
+                            Some(matches),
+                            Some(current_registration()),
+                        );
                     } else {
                         policy.register_worker(worker.as_ref(), Some(&info), Some(matches));
                     }
