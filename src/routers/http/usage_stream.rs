@@ -2,7 +2,7 @@
 
 use super::{
     response_usage::SseUsageObservation,
-    sse::{sse_lines, FrameScanner},
+    sse::{is_error_envelope, sse_lines, FrameScanner},
     usage_merge,
 };
 use crate::kv_observation::{KvRouteAttempt, UnavailableReason, MAX_USAGE_BYTES};
@@ -98,10 +98,11 @@ fn rewrite_frame(
     mut observation: Option<&mut SseUsageObservation>,
     limit: usize,
 ) -> Option<Bytes> {
+    let observe_errors = observation.is_some();
     if !frame.contains(&b'\\')
         && !frame
             .windows(7)
-            .any(|window| window[0] == b'"' && &window[1..] == b"usage\"")
+            .any(|window| window == b"\"usage\"" || (observe_errors && window == b"\"error\""))
     {
         return None;
     }
@@ -125,6 +126,13 @@ fn rewrite_frame(
         }
         return None;
     };
+    if let Some(obs) = observation
+        .as_deref_mut()
+        .filter(|_| is_error_envelope(&json))
+    {
+        obs.reject(UnavailableReason::StreamError);
+        return None;
+    }
     usage_merge::usage_object(&json)?;
     let UsageMode::Reconcile { cached, prefill } = mode else {
         if let Some(obs) = observation {
@@ -1229,6 +1237,61 @@ mod tests {
                 success,
                 "{metrics}"
             );
+        }
+    }
+
+    #[test]
+    fn sse_wire_error_invalidates_pending_usage_without_changing_bytes() {
+        use crate::kv_observation::test_helpers::{has_outcome, prediction, render};
+        use futures_util::FutureExt;
+
+        let usage = "data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":32}}}\n\n";
+        for (tail, success) in [
+            (r#"{"error":{"message":"backend failed"}}"#, false),
+            (
+                r#"{"object":"error","usage":{"prompt_tokens_details":{"cached_tokens":7}}}"#,
+                false,
+            ),
+            (r#"{"object":"\u0065rror"}"#, false),
+            (r#"{"error":null}"#, true),
+        ] {
+            let input = Bytes::from(format!("{usage}data: {tail}\r\n\r\n"));
+            for mode in [
+                UsageMode::Keep,
+                UsageMode::Reconcile {
+                    cached: Some(32),
+                    prefill: None,
+                },
+            ] {
+                let metrics = render(|| {
+                    let attempt = KvRouteAttempt::new(prediction());
+                    let output = sse_stream_with_mode(
+                        chunks(&input, 5),
+                        mode,
+                        MAX_USAGE_BYTES,
+                        Some(SseUsageObservation::new(attempt.clone(), StatusCode::OK)),
+                    )
+                    .try_collect::<Vec<_>>()
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(output.concat(), input.as_ref(), "{tail}");
+                    assert!(attempt.is_finished());
+                });
+                let (status, reason) = if success {
+                    ("observed", "none")
+                } else {
+                    ("unavailable", "stream_error")
+                };
+                assert!(has_outcome(&metrics, status, reason), "{tail}: {metrics}");
+                for metric in [
+                    "vllm_router_kv_predicted_cached_tokens_count",
+                    "vllm_router_kv_actual_cached_tokens_count",
+                    "vllm_router_kv_cached_token_absolute_error_count",
+                ] {
+                    assert_eq!(metrics.contains(metric), success, "{tail}: {metrics}");
+                }
+            }
         }
     }
 

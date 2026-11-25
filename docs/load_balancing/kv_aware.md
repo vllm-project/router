@@ -580,10 +580,10 @@ JSON and SSE share the same attempt receipt; a failed dispatch, cancellation,
 or response observation can finalize it only once. Multi-prompt predictions
 carry no aggregate cached-token count and cannot enter the accuracy histograms.
 Conflicting SSE counts are `invalid_usage`, rather than a last-value-wins sample.
-A usage frame contributes an accuracy pair only after a clean stream EOF;
-subsequent transport failure or cancellation discards the provisional count.
-The `stream_error` outcome reason includes both upstream body failures and
-downstream client cancellations before EOF.
+A usage frame contributes an accuracy pair only after a clean stream EOF.
+An SSE error envelope discards the provisional count even if the HTTP body
+ends cleanly. The `stream_error` outcome also covers upstream body failures
+and downstream client cancellations before EOF.
 
 Ordinary transparent non-streaming responses forward each chunk immediately and
 retain at most 1 MiB for observation. Larger bodies are returned intact and

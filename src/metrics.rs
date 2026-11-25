@@ -93,7 +93,7 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "vllm_router_kv_route_outcomes_total",
-        "KV-aware route predictions correlated with backend cache observations; SSE stream_error includes upstream body failures and downstream cancellations before EOF"
+        "KV-aware route predictions correlated with backend cache observations; SSE stream_error includes in-band error envelopes, upstream body failures and downstream cancellations before EOF"
     );
     describe_histogram!(
         "vllm_router_kv_predicted_cached_tokens",
