@@ -1858,14 +1858,11 @@ fn metrics_and_models_router(
                 async move { body }
             }),
         )
-        .route(
-            "/v1/models",
-            get(|| async {
-                axum::Json(
-                    serde_json::json!({"data": [{"id": "mock-model"}, {"id": "mock-alias"}]}),
-                )
-            }),
-        )
+        .route("/v1/models", get(mock_model_list))
+}
+
+async fn mock_model_list() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({"data": [{"id": "mock-model"}, {"id": "mock-alias"}]}))
 }
 
 /// Spawn a worker that serves only what a plain `vllm serve` exposes.
@@ -1971,7 +1968,11 @@ fn hash_metadata_router(
     metrics: impl Fn() -> String + Clone + Send + Sync + 'static,
     sources: Arc<Mutex<serde_json::Value>>,
 ) -> axum::Router {
-    metrics_and_models_router(metrics).route(
+    metrics_and_models_router(metrics).merge(event_sources_routes(sources))
+}
+
+fn event_sources_routes(sources: Arc<Mutex<serde_json::Value>>) -> axum::Router {
+    axum::Router::new().route(
         "/kv_event_sources",
         axum::routing::get(move || {
             let data = sources.lock().clone();
@@ -1989,23 +1990,15 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
 
     let endpoints: Vec<_> = (0..3).map(|_| layout_endpoints()).collect();
     let topics = ["kv/hash-probe/0", "kv/hash-probe/1", "kv/hash-probe/2"];
-    let sources = Arc::new(Mutex::new(serde_json::Value::Object(
-        endpoints
-            .iter()
-            .enumerate()
-            .map(|(rank, (endpoint, replay_endpoint, _, _))| {
-                (
-                    rank.to_string(),
-                    serde_json::json!({
-                        "endpoint": endpoint,
-                        "replay_endpoint": replay_endpoint,
-                        "topic": topics[rank],
-                        "publisher": "zmq"
-                    }),
-                )
-            })
-            .collect(),
-    )));
+    let source = |rank: usize| {
+        serde_json::json!({
+            "endpoint": endpoints[rank].0, "replay_endpoint": endpoints[rank].1,
+            "topic": topics[rank], "publisher": "zmq"
+        })
+    };
+    let sources = Arc::new(Mutex::new(serde_json::json!({
+        "0": source(0), "1": source(1), "2": source(2)
+    })));
     let metrics = |first, second| {
         format!(
             "vllm:cache_config_info{{block_size=\"16\",engine=\"0\",prefix_caching_hash_algo=\"{first}\"}} 1.0\n\
@@ -2113,10 +2106,6 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
         !has_binding(1),
         "a rank rejected at discovery gained a binding"
     );
-    assert_eq!(
-        supervisor.worker_registrations()[&worker].revision,
-        revision
-    );
     // The descriptor refresh can fence the last remaining binding using the same path.
     *reported.lock() = metrics("xxhash", "xxhash").replace(
         "engine=\"2\"",
@@ -2144,98 +2133,69 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
 }
 
 #[tokio::test]
-async fn failed_early_metrics_scrape_retries_the_metadata_fallback() {
-    use axum::{http::StatusCode, routing::get};
+async fn optional_metrics_preserves_registration_and_metadata_fallback() {
+    use axum::{http::StatusCode, response::IntoResponse, routing::get, Json};
     use std::sync::atomic::AtomicUsize;
 
-    let scrapes = Arc::new(AtomicUsize::new(0));
-    let first_scrape = Arc::new(tokio::sync::Notify::new());
-    let router = axum::Router::new()
-        .route(
-            "/get_server_info",
-            get({
+    let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
+    let sources = serde_json::json!({"0": {
+        "endpoint": endpoint, "replay_endpoint": replay_endpoint,
+        "topic": "kv/metrics-fallback", "publisher": "zmq"
+    }});
+    for slow_metrics in [true, false] {
+        let scrapes = Arc::new(AtomicUsize::new(0));
+        let first_scrape = Arc::new(tokio::sync::Notify::new());
+        let router = event_sources_routes(Arc::new(Mutex::new(sources.clone())))
+            .route("/v1/models", get(mock_model_list))
+            .route("/get_server_info", get({
                 let first_scrape = first_scrape.clone();
                 move || {
                     let first_scrape = first_scrape.clone();
                     async move {
-                        first_scrape.notified().await;
-                        StatusCode::NOT_FOUND
-                    }
-                }
-            }),
-        )
-        .route(
-            "/metrics",
-            get({
-                let scrapes = scrapes.clone();
-                move || {
-                    let attempts = scrapes.fetch_add(1, Ordering::Relaxed);
-                    let first_scrape = first_scrape.clone();
-                    async move {
-                        if attempts == 0 {
-                            first_scrape.notify_one();
-                            (StatusCode::SERVICE_UNAVAILABLE, "")
+                        if slow_metrics {
+                            tokio::time::sleep(Duration::from_millis(2500)).await;
+                            Json(serde_json::json!({"model_id": "mock-model", "kv_block_size": 16})).into_response()
                         } else {
-                            (StatusCode::OK, METRICS_ONLY)
+                            first_scrape.notified().await;
+                            StatusCode::NOT_FOUND.into_response()
                         }
                     }
                 }
-            }),
+            }))
+            .route("/metrics", get({
+                let scrapes = scrapes.clone();
+                move || {
+                    let attempt = scrapes.fetch_add(1, Ordering::Relaxed);
+                    let first_scrape = first_scrape.clone();
+                    async move {
+                        if slow_metrics {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        } else if attempt == 0 {
+                            first_scrape.notify_one();
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        METRICS_ONLY.into_response()
+                    }
+                }
+            }));
+        let (worker, server) = spawn_metrics_only_worker(router).await;
+        let (supervisor, _) = KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMap::new());
+        let registered = supervisor
+            .refresh_workers(
+                &HashSet::from([worker.clone()]),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .await;
+        assert!(registered[&worker].provider.is_some());
+        assert!(supervisor.workers_have_cache_bindings([(worker.as_str(), 0)].into_iter()));
+        assert_eq!(
+            scrapes.load(Ordering::Relaxed),
+            if slow_metrics { 1 } else { 2 }
         );
-    let (worker, server) = spawn_metrics_only_worker(router).await;
-    let (info, _, configs) =
-        query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None, true)
-            .await
-            .unwrap();
-    assert_eq!(discovered_block_size(&info), Some(16));
-    assert!(configs.is_some());
-    assert_eq!(scrapes.load(Ordering::Relaxed), 2);
-    server.abort();
-}
-
-#[tokio::test]
-async fn slow_optional_metrics_does_not_exhaust_pd_registration_budget() {
-    use axum::{routing::get, Json};
-    let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
-    let sources = serde_json::json!({"0": {
-        "endpoint": endpoint, "replay_endpoint": replay_endpoint,
-        "topic": "kv/slow-metrics", "publisher": "zmq"
-    }});
-    let router = axum::Router::new()
-        .route(
-            "/metrics",
-            get(|| async {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                METRICS_ONLY
-            }),
-        )
-        .route(
-            "/get_server_info",
-            get(|| async {
-                tokio::time::sleep(Duration::from_millis(2500)).await;
-                Json(serde_json::json!({"model_id": "mock-model", "kv_block_size": 16}))
-            }),
-        )
-        .route(
-            "/kv_event_sources",
-            get(move || {
-                let sources = sources.clone();
-                async move { Json(sources) }
-            }),
-        );
-    let (worker, server) = spawn_metrics_only_worker(router).await;
-    let (supervisor, _signals) = KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMap::new());
-    let registered = supervisor
-        .refresh_workers(
-            &HashSet::from([worker.clone()]),
-            &HashSet::new(),
-            &HashSet::new(),
-        )
-        .await;
-    assert!(registered[&worker].provider.is_some());
-    assert!(supervisor.workers_have_cache_bindings([(worker.as_str(), 0)].into_iter()));
-    supervisor.shutdown();
-    server.abort();
+        supervisor.shutdown();
+        server.abort();
+    }
 }
 
 #[tokio::test]

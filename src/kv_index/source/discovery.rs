@@ -28,7 +28,10 @@ mod registration;
 pub(crate) use lifecycle::CONTROL_TIMEOUT;
 use lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
 use observer::WorkerObservation;
-use reconcile::{bound_source_moved, static_hybrid_sources_match, BoundSources, StaticHybridMatch};
+use reconcile::{
+    bound_source_moved, static_hybrid_sources_match, unfenced_sources, BoundSources,
+    StaticHybridMatch,
+};
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 pub(crate) use probe::worker_serves_base_model;
@@ -487,17 +490,10 @@ impl KvIndexSupervisor {
                 if discovery.sources.is_err() {
                     return discovery;
                 }
-                let (verification, configs) =
-                    tokio::join!(self.verify_static_source(worker_url, &discovery), async {
-                        discovery.hybrid.as_ref()?;
-                        probe::probe_engine_cache_configs(
-                            &self.client,
-                            split_worker_rank(worker_url).0,
-                            self.api_key.as_deref(),
-                            CONTROL_TIMEOUT / 4,
-                        )
-                        .await
-                    },);
+                let (verification, configs) = tokio::join!(
+                    self.verify_static_source(worker_url, &discovery),
+                    self.probe_configured_cache_configs(worker_url, discovery.hybrid.is_some()),
+                );
                 if let Err((probe, reason)) = verification {
                     discovery.sources = Err(SourcesUnavailable {
                         probe,
@@ -609,6 +605,22 @@ impl KvIndexSupervisor {
         discovery
     }
 
+    async fn probe_configured_cache_configs(
+        &self,
+        worker_url: &str,
+        enabled: bool,
+    ) -> Option<metrics_meta::EngineCacheConfigs> {
+        enabled.then_some(())?;
+        let (base, _) = split_worker_rank(worker_url);
+        probe::probe_engine_cache_configs(
+            &self.client,
+            base,
+            self.api_key.as_deref(),
+            CONTROL_TIMEOUT / 4,
+        )
+        .await
+    }
+
     async fn discover_declared_layout(
         &self,
         worker_url: &str,
@@ -652,19 +664,7 @@ impl KvIndexSupervisor {
                     )
                 }
             },
-            async {
-                if requires_hash_size {
-                    None
-                } else {
-                    probe::probe_engine_cache_configs(
-                        &self.client,
-                        base,
-                        api_key,
-                        CONTROL_TIMEOUT / 4,
-                    )
-                    .await
-                }
-            }
+            self.probe_configured_cache_configs(worker_url, !requires_hash_size),
         );
         discovery.base_models = base_models;
         let Ok(sources) = sources else {
@@ -1021,6 +1021,12 @@ fn layout_only(discovery: &WorkerDiscovery) -> bool {
     discovery.hybrid.is_some() && discovery.sources.as_ref().is_ok_and(HashMap::is_empty)
 }
 
+fn canonical_source_rank(key: &str) -> Option<u32> {
+    key.parse::<u32>()
+        .ok()
+        .filter(|rank| key == rank.to_string())
+}
+
 /// The layout names the publisher topic each rank must use. A discovered
 /// publisher that advertises another topic belongs to a different boot, so
 /// subscribing to it would index the wrong stream.
@@ -1173,16 +1179,9 @@ fn validate_native_publishers(
     sources: &KvEventSourcesResponse,
     info: &ServerInfo,
     model: &str,
-    fenced: impl Fn(u32) -> bool,
+    fenced: impl Fn(u32) -> bool + Copy,
 ) -> Result<(), String> {
-    let active = sources.iter().filter(|(rank, source)| {
-        events_enabled(source)
-            && !rank
-                .parse::<u32>()
-                .ok()
-                .filter(|parsed| **rank == parsed.to_string())
-                .is_some_and(&fenced)
-    });
+    let active = unfenced_sources(sources, fenced).filter(|(_, source)| events_enabled(source));
     if active.clone().count()
         != layout
             .ranks
@@ -1199,11 +1198,8 @@ fn validate_native_publishers(
     let mut topics = HashSet::new();
     for (key, source) in active {
         let rejected = |reason| format!("DP rank {key}: {reason}");
-        let rank = key
-            .parse::<u32>()
-            .ok()
-            .filter(|rank| key == &rank.to_string())
-            .ok_or_else(|| rejected("invalid event source rank"))?;
+        let rank =
+            canonical_source_rank(key).ok_or_else(|| rejected("invalid event source rank"))?;
         if !topics.insert(source.topic.as_str()) {
             return Err(rejected("event topic is shared by multiple ranks"));
         }
@@ -1238,9 +1234,8 @@ fn synthesize_plain_full_layout(
         .iter()
         .filter(|(_, source)| events_enabled(source))
         .map(|(key, source)| {
-            let rank = key.parse::<u32>().ok()?;
-            if key != &rank.to_string()
-                || source.topic.is_empty()
+            let rank = canonical_source_rank(key)?;
+            if source.topic.is_empty()
                 || source.replay_endpoint.as_deref().is_none_or(str::is_empty)
             {
                 return None;

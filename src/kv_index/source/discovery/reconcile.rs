@@ -8,8 +8,8 @@ use super::lifecycle::{SourceAction, WorkerLifecycle, WorkerRegistration, CONTRO
 use super::metrics_meta::EngineCacheConfigs;
 use super::probe::{probe_bound_sources, worker_serves_base_model};
 use super::{
-    events_enabled, resolve_endpoint, split_worker_rank, worker_host, KvEventSourceEntry,
-    KvEventSourcesResponse, KvIndexSupervisor, SourcesProbe, WorkerDiscovery,
+    canonical_source_rank, events_enabled, resolve_endpoint, split_worker_rank, worker_host,
+    KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, SourcesProbe, WorkerDiscovery,
 };
 use crate::core::{worker::UNLABELED_WORKER_MODEL_ID, Worker};
 use crate::kv_index::subscriber::EventSource;
@@ -346,38 +346,47 @@ impl From<&EventSource> for BoundSource {
 /// Publisher identities by rank, including publishers fenced before subscription.
 pub(super) type BoundSources = HashMap<u32, BoundSource>;
 
+pub(super) fn unfenced_sources<'a>(
+    sources: &'a KvEventSourcesResponse,
+    fenced: impl Fn(u32) -> bool + Copy + 'a,
+) -> impl Iterator<Item = (&'a String, &'a KvEventSourceEntry)> + Clone {
+    sources
+        .iter()
+        .filter(move |(key, _)| !canonical_source_rank(key).is_some_and(fenced))
+}
+
 pub(super) fn runtime_hash_mismatch(
     configs: Option<&EngineCacheConfigs>,
     capability: &CacheCapabilities,
     worker_url: &str,
     rank: u32,
 ) -> bool {
-    let reported = configs
-        .and_then(|engines| engines.get(&rank))
-        .and_then(|engine| engine.prefix_caching_hash_algo.as_deref());
-    let expected = capability
-        .rank_capability(rank)
-        .map(|contract| contract.hash_algorithm.as_str());
-    if configs.is_some() && reported.is_none() && expected.is_some() {
+    let (Some(configs), Some(contract)) = (configs, capability.rank_capability(rank)) else {
+        return false;
+    };
+    let Some(reported) = configs
+        .get(&rank)
+        .and_then(|engine| engine.prefix_caching_hash_algo.as_deref())
+    else {
         tracing::debug!(
             worker_url,
             rank,
             "worker cache metrics omit the prefix hash algorithm"
         );
+        return false;
+    };
+    let expected = contract.hash_algorithm.as_str();
+    let mismatch = reported != expected;
+    if mismatch {
+        tracing::warn!(
+            worker_url,
+            rank,
+            reported,
+            expected,
+            "KV credit disabled for incompatible worker prefix hash algorithm"
+        );
     }
-    if let (Some(reported), Some(expected)) = (reported, expected) {
-        if reported != expected {
-            tracing::warn!(
-                worker_url,
-                rank,
-                reported,
-                expected,
-                "KV credit disabled for incompatible worker prefix hash algorithm"
-            );
-            return true;
-        }
-    }
-    false
+    mismatch
 }
 
 /// Check the surviving publisher set against the same source snapshot.

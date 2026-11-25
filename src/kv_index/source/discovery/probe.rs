@@ -11,7 +11,7 @@ use tonic_prost::ProstCodec;
 use tracing::{info, warn};
 
 use super::lifecycle::WorkerLifecycle;
-use super::reconcile::{layouts_match, BoundSources};
+use super::reconcile::{layouts_match, unfenced_sources, BoundSources};
 use super::{
     discovered_block_size, metrics_meta, split_worker_rank, CacheCapabilities, KvEventSourceEntry,
     KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe, SourcesUnavailable,
@@ -48,16 +48,12 @@ impl WorkerDescriptor {
         }
         let sources_match = match (&self.sources, &other.sources) {
             (Some(left), Some(right)) => {
-                let retained = |rank: &str| {
-                    rank.parse::<u32>()
-                        .ok()
-                        .is_none_or(|rank| !fences.contains_key(&rank))
-                };
-                left.iter()
-                    .all(|(rank, entry)| !retained(rank) || right.get(rank) == Some(entry))
-                    && right
-                        .keys()
-                        .all(|rank| !retained(rank) || left.contains_key(rank))
+                let fenced = |rank| fences.contains_key(&rank);
+                let left = unfenced_sources(left, fenced);
+                left.clone().count() == unfenced_sources(right, fenced).count()
+                    && left
+                        .into_iter()
+                        .all(|(rank, entry)| right.get(rank) == Some(entry))
             }
             (None, None) => true,
             _ => false,
@@ -686,26 +682,16 @@ pub(super) async fn probe_engine_cache_configs(
     if crate::backend::is_grpc_url(worker_url) {
         return None;
     }
-    match tokio::time::timeout(
+    let configs = tokio::time::timeout(
         budget,
         query_engine_cache_configs(client, worker_url, api_key),
     )
     .await
-    {
-        Ok(Ok(configs)) => Some(configs),
-        Ok(Err(error)) => {
-            tracing::debug!(worker_url, %error, "optional worker cache metrics probe failed");
-            None
-        }
-        Err(_) => {
-            tracing::debug!(
-                worker_url,
-                ?budget,
-                "optional worker cache metrics probe timed out"
-            );
-            None
-        }
+    .unwrap_or_else(|_| Err(format!("metrics probe timed out after {budget:?}")));
+    if let Err(error) = &configs {
+        tracing::debug!(worker_url, %error, "optional worker cache metrics unavailable");
     }
+    configs.ok()
 }
 
 pub(super) async fn query_model_list(
