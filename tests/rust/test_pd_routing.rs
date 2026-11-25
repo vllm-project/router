@@ -56,7 +56,15 @@ mod test_pd_routing {
             .with_state(push)
             .route("/d/v1/chat/completions", decode.clone())
             .route("/d/v1/responses", decode.clone())
-            .route("/d/v1/completions", decode);
+            .route("/d/v1/completions", decode)
+            .route(
+                "/d/v1/kv_transfer/reject",
+                post(|| async { axum::http::StatusCode::ACCEPTED }),
+            )
+            .route(
+                "/d/kv_transfer/reject",
+                post(|| async { axum::http::StatusCode::ACCEPTED }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -855,5 +863,513 @@ mod test_pd_routing {
                 error_msg
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_during_prefill_sends_rejection() {
+        use axum::{
+            extract::State,
+            http::{Method, StatusCode},
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::{json, Value};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let rejections = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let rejections_clone = rejections.clone();
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        let decode_calls_clone = decode_calls.clone();
+
+        async fn slow_prefill() -> Json<Value> {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            json!({
+                "kv_transfer_params": {
+                    "remote_engine_id": "P-engine",
+                    "do_remote_prefill": true,
+                    "remote_block_ids": [10, 20, 30]
+                },
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "total_tokens": 11
+                }
+            })
+            .into()
+        }
+
+        async fn decode_gen(
+            State(calls): State<Arc<AtomicUsize>>,
+            Json(_body): Json<Value>,
+        ) -> Json<Value> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            json!({"choices": [{"text": "answer"}]}).into()
+        }
+
+        async fn reject_handler(
+            State(rejections): State<Arc<tokio::sync::Mutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> StatusCode {
+            rejections.lock().await.push(body);
+            StatusCode::ACCEPTED
+        }
+
+        let app = Router::new()
+            .route("/p/health", get(|| async { "ok" }))
+            .route("/d/health", get(|| async { "ok" }))
+            .route("/p/v1/chat/completions", post(slow_prefill))
+            .route(
+                "/d/v1/chat/completions",
+                post(decode_gen).with_state(decode_calls_clone),
+            )
+            .route(
+                "/d/v1/kv_transfer/reject",
+                post(reject_handler).with_state(rejections_clone),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(format!("{base}/p"), None)],
+                decode_urls: vec![format!("{base}/d")],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            policy: PolicyConfig::Random,
+            kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            disable_retries: true,
+            disable_circuit_breaker: true,
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+
+        let app_context = vllm_router_rs::server::AppContext::new(
+            config.clone(),
+            reqwest::Client::new(),
+            64,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let router = RouterFactory::create_router(&std::sync::Arc::new(app_context))
+            .await
+            .unwrap();
+
+        let request = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "stream": false
+        });
+
+        // Downstream client disconnects after 40ms while Prefill is still running
+        let req_fut =
+            router.route_transparent(None, "/v1/chat/completions", &Method::POST, request);
+        let _ = tokio::time::timeout(Duration::from_millis(40), req_fut).await;
+
+        // Give the retained background prefill collection task time to finish (150ms total) and notify rejection
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Verify Decode never received a generation POST
+        assert_eq!(decode_calls.load(Ordering::SeqCst), 0);
+
+        // Verify Decode companion endpoint received the rejection notification with HTTP 202
+        let recorded = rejections.lock().await;
+        assert_eq!(
+            recorded.len(),
+            1,
+            "Expected exactly 1 rejection notification"
+        );
+        assert_eq!(recorded[0]["kv_transfer_params"]["do_remote_prefill"], true);
+        assert_eq!(
+            recorded[0]["kv_transfer_params"]["remote_engine_id"],
+            "P-engine"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_during_prefill_explicit_false_skips_rejection() {
+        use axum::{
+            extract::State,
+            http::{Method, StatusCode},
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::{json, Value};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let rejections = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let rejections_clone = rejections.clone();
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        let decode_calls_clone = decode_calls.clone();
+
+        async fn prefill_without_remote() -> Json<Value> {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            json!({
+                "kv_transfer_params": {
+                    "remote_engine_id": "P-engine",
+                    "do_remote_prefill": false
+                },
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "total_tokens": 11
+                }
+            })
+            .into()
+        }
+
+        async fn decode_gen(
+            State(calls): State<Arc<AtomicUsize>>,
+            Json(_body): Json<Value>,
+        ) -> Json<Value> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            json!({"choices": [{"text": "answer"}]}).into()
+        }
+
+        async fn reject_handler(
+            State(rejections): State<Arc<tokio::sync::Mutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> StatusCode {
+            rejections.lock().await.push(body);
+            StatusCode::ACCEPTED
+        }
+
+        let app = Router::new()
+            .route("/p/health", get(|| async { "ok" }))
+            .route("/d/health", get(|| async { "ok" }))
+            .route("/p/v1/chat/completions", post(prefill_without_remote))
+            .route(
+                "/d/v1/chat/completions",
+                post(decode_gen).with_state(decode_calls_clone),
+            )
+            .route(
+                "/d/v1/kv_transfer/reject",
+                post(reject_handler).with_state(rejections_clone),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(format!("{base}/p"), None)],
+                decode_urls: vec![format!("{base}/d")],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            policy: PolicyConfig::Random,
+            kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            disable_retries: true,
+            disable_circuit_breaker: true,
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+
+        let app_context = vllm_router_rs::server::AppContext::new(
+            config.clone(),
+            reqwest::Client::new(),
+            64,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let router = RouterFactory::create_router(&std::sync::Arc::new(app_context))
+            .await
+            .unwrap();
+
+        let request = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "stream": false
+        });
+
+        // Downstream client disconnects after 40ms while Prefill is still running
+        let req_fut =
+            router.route_transparent(None, "/v1/chat/completions", &Method::POST, request);
+        let _ = tokio::time::timeout(Duration::from_millis(40), req_fut).await;
+
+        // Give the background prefill collection task time to finish (150ms total)
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Verify Decode never received a generation POST
+        assert_eq!(decode_calls.load(Ordering::SeqCst), 0);
+
+        // Verify NO rejection notification was sent because do_remote_prefill was false
+        let recorded = rejections.lock().await;
+        assert_eq!(
+            recorded.len(),
+            0,
+            "Rejection should not be sent when do_remote_prefill is false"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_prefill_invalid_json_with_transfer_id_fires_rejection() {
+        use axum::{
+            body::Body,
+            extract::State,
+            http::{Method, StatusCode},
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::{json, Value};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let rejections = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let rejections_clone = rejections.clone();
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        let decode_calls_clone = decode_calls.clone();
+
+        async fn prefill_invalid_json() -> (StatusCode, axum::response::Response) {
+            (
+                StatusCode::OK,
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from("not-valid-json-response"))
+                    .unwrap(),
+            )
+        }
+
+        async fn decode_gen(
+            State(calls): State<Arc<AtomicUsize>>,
+            Json(_body): Json<Value>,
+        ) -> Json<Value> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            json!({"choices": [{"text": "answer"}]}).into()
+        }
+
+        async fn reject_handler(
+            State(rejections): State<Arc<tokio::sync::Mutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> StatusCode {
+            rejections.lock().await.push(body);
+            StatusCode::ACCEPTED
+        }
+
+        let app = Router::new()
+            .route("/p/health", get(|| async { "ok" }))
+            .route("/d/health", get(|| async { "ok" }))
+            .route("/p/v1/chat/completions", post(prefill_invalid_json))
+            .route(
+                "/d/v1/chat/completions",
+                post(decode_gen).with_state(decode_calls_clone),
+            )
+            .route(
+                "/d/v1/kv_transfer/reject",
+                post(reject_handler).with_state(rejections_clone),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(format!("{base}/p"), None)],
+                decode_urls: vec![format!("{base}/d")],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            policy: PolicyConfig::Random,
+            kv_connector: vllm_router_rs::config::KvConnector::Mooncake,
+            disable_retries: true,
+            disable_circuit_breaker: true,
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+
+        let app_context = vllm_router_rs::server::AppContext::new(
+            config.clone(),
+            reqwest::Client::new(),
+            64,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let router = RouterFactory::create_router(&std::sync::Arc::new(app_context))
+            .await
+            .unwrap();
+
+        let request = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "stream": false
+        });
+
+        // Request fails during prefill JSON parsing
+        let response = router
+            .route_transparent(None, "/v1/chat/completions", &Method::POST, request)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        // Verify Decode never received generation POST
+        assert_eq!(decode_calls.load(Ordering::SeqCst), 0);
+
+        // Verify rejection was sent using the known Mooncake transfer_id despite invalid JSON
+        let recorded = rejections.lock().await;
+        assert_eq!(
+            recorded.len(),
+            1,
+            "Rejection must be sent for Mooncake transfer_id on invalid JSON prefill response"
+        );
+        assert_eq!(recorded[0]["kv_transfer_params"]["do_remote_prefill"], true);
+        assert!(recorded[0]["kv_transfer_params"]["transfer_id"].is_string());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_prefill_2xx_body_read_failure_with_transfer_id_fires_rejection() {
+        use axum::{
+            body::Body,
+            extract::State,
+            http::{Method, StatusCode},
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::{json, Value};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let rejections = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let rejections_clone = rejections.clone();
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        let decode_calls_clone = decode_calls.clone();
+
+        // Prefill server responds with HTTP 200 headers,
+        // but stream aborts with error so read_prefill_body fails.
+        async fn prefill_truncated_body() -> axum::response::Response {
+            let chunks: Vec<std::io::Result<bytes::Bytes>> = vec![
+                Ok(bytes::Bytes::from("start")),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "premature stream EOF",
+                )),
+            ];
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                .unwrap()
+        }
+
+        async fn decode_gen(
+            State(calls): State<Arc<AtomicUsize>>,
+            Json(_body): Json<Value>,
+        ) -> Json<Value> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            json!({"choices": [{"text": "answer"}]}).into()
+        }
+
+        async fn reject_handler(
+            State(rejections): State<Arc<tokio::sync::Mutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> StatusCode {
+            rejections.lock().await.push(body);
+            StatusCode::ACCEPTED
+        }
+
+        let app = Router::new()
+            .route("/p/health", get(|| async { "ok" }))
+            .route("/d/health", get(|| async { "ok" }))
+            .route("/p/v1/chat/completions", post(prefill_truncated_body))
+            .route(
+                "/d/v1/chat/completions",
+                post(decode_gen).with_state(decode_calls_clone),
+            )
+            .route(
+                "/d/v1/kv_transfer/reject",
+                post(reject_handler).with_state(rejections_clone),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(format!("{base}/p"), None)],
+                decode_urls: vec![format!("{base}/d")],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            policy: PolicyConfig::Random,
+            kv_connector: vllm_router_rs::config::KvConnector::Mooncake,
+            disable_retries: true,
+            disable_circuit_breaker: true,
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+
+        let app_context = vllm_router_rs::server::AppContext::new(
+            config.clone(),
+            reqwest::Client::new(),
+            64,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let router = RouterFactory::create_router(&std::sync::Arc::new(app_context))
+            .await
+            .unwrap();
+
+        let request = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "stream": false
+        });
+
+        // Request fails during prefill body read
+        let response = router
+            .route_transparent(None, "/v1/chat/completions", &Method::POST, request)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        // Verify Decode never received generation POST
+        assert_eq!(decode_calls.load(Ordering::SeqCst), 0);
+
+        // Guard dropped on prefill body error must fire rejection to companion decode endpoint
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let recorded = rejections.lock().await;
+        assert_eq!(
+            recorded.len(),
+            1,
+            "Rejection must be fired when prefill 2xx body read fails"
+        );
+        assert_eq!(recorded[0]["kv_transfer_params"]["do_remote_prefill"], true);
+        assert!(recorded[0]["kv_transfer_params"]["transfer_id"].is_string());
+
+        server.abort();
     }
 }
