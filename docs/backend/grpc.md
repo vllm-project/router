@@ -22,7 +22,7 @@ Support status of the OpenAI HTTP surface when the worker pool is `grpc://`:
 | API | Status | Behavior |
 |---|---|---|
 | `/v1/chat/completions` | Supported | The router renders the chat template and tokenizes, then sends `TokenIds`. |
-| `/v1/completions` | Supported, single prompt | `prompt` may be `str`, `list[str]`, `list[int]`, or `list[list[int]]`; a text prompt is tokenized once with the model tokenizer (`add_special_tokens` defaults to `true`) and ids go straight to the wire. Batched prompts and fields the chat shape cannot express (`suffix`, `best_of`, `n > 1`, `json_schema`, `logprobs`, `echo`, `return_hidden_states`, `documents`) are rejected with `400`. |
+| `/v1/completions` | Supported, single prompt | On the regular gRPC pool, `prompt` may be `str`, `list[str]`, `list[int]`, or `list[list[int]]`; a text prompt is tokenized once with the model tokenizer (`add_special_tokens` defaults to `true`) and ids go straight to the wire. On a static P/D gRPC pool only a single token-id prompt (`list[int]`) is accepted — text prompts are rejected with `400`. Batched prompts and fields the chat shape cannot express (`suffix`, `best_of`, `n > 1`, `json_schema`, `logprobs`, `echo`, `return_hidden_states`, `documents`) are rejected with `400`. |
 | `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/generate`, `/inference/v1/generate` | Not supported | Rejected with `400` before dispatch, so they are client errors and never reach a worker. |
 | `/v1/models`, `/health` | Supported | Answered through the gRPC control/health services. |
 | `/health_generate` | Not supported | Returns `501`; use `/health` for gRPC readiness. |
@@ -296,7 +296,7 @@ See [KV-aware P/D routing](../load_balancing/kv_aware.md#pd-routing) for layout 
 |---|---|
 | `src/backend/mod.rs` | Shared backend exports and `pb` aliases for `vllm-proto` |
 | `src/backend/detect.rs` | Scheme detection, pool-kind locking, DP rank stripping, tonic URI conversion |
-| `src/backend/frontend.rs` | `EngineFrontend`: `prepare(chat)`, `prepare_completions(completion)`, `prepare_token_ids(chat, ids)` (token-id-only legacy path, no production callers), and `dispatch` |
+| `src/backend/frontend.rs` | `EngineFrontend`: `prepare(chat)`, `prepare_completions(completion)`, `prepare_token_ids(chat, ids)` (token-id-only path, used by the gRPC P/D route), and `dispatch` |
 | `src/backend/health.rs` | gRPC health checks for startup and worker probes |
 | `src/backend/preprocess.rs` | Tokenizer/model cache and chat render/encode |
 | `src/backend/vllm_frontend.rs` | Adapter around `vllm-chat`, `vllm-tokenizer`, and `vllm-text` |
