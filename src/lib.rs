@@ -326,7 +326,6 @@ impl Router {
         balance_rel_threshold = 1.5,
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(25),
-        preparation_timeout_secs = 1,
         max_payload_size = 512 * 1024 * 1024,  // 512MB default for large batches
         intra_node_data_parallel_size = 1,
         api_key = None,
@@ -399,7 +398,8 @@ impl Router {
         kv_event_strict_recovery = false,
         kv_hybrid_layout = None,
         kv_event_topic = vec![],
-        pd_pair = vec![]
+        pd_pair = vec![],
+        preparation_timeout_secs = 1,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -414,7 +414,6 @@ impl Router {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
-        preparation_timeout_secs: u64,
         max_payload_size: usize,
         intra_node_data_parallel_size: usize,
         api_key: Option<String>,
@@ -482,6 +481,7 @@ impl Router {
         kv_hybrid_layout: Option<std::path::PathBuf>,
         kv_event_topic: Vec<String>,
         pd_pair: Vec<String>,
+        preparation_timeout_secs: u64,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()

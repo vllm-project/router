@@ -7,7 +7,6 @@ use crate::policies::WorkerTokenInputs;
 use http::HeaderMap;
 use reqwest::Client;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::debug;
@@ -502,21 +501,18 @@ async fn http_input_json(
 }
 
 /// Per-call budget for pre-dispatch token preparation (/render, then the
-/// /tokenize fallback). Set once at startup from
-/// `RouterConfig::preparation_timeout_secs`. The 1s default starves large
-/// prompts: a several-hundred-K-token body renders in more than a second,
-/// the client times out, and the request becomes an "unknown prefill" that
-/// latches pool-wide cost comparison into occupancy fallback for its whole
-/// multi-minute flight. Stacks serving big contexts raise this to cover
-/// their largest body.
-static PREPARATION_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(1);
-
-pub(crate) fn set_preparation_timeout_secs(secs: u64) {
-    PREPARATION_TIMEOUT_SECS.store(secs.max(1), Ordering::Relaxed);
-}
-
-pub(crate) fn preparation_timeout() -> Duration {
-    Duration::from_secs(PREPARATION_TIMEOUT_SECS.load(Ordering::Relaxed))
+/// /tokenize fallback), resolved from `RouterConfig::preparation_timeout_secs`.
+/// The 1s default starves large prompts: a several-hundred-K-token body
+/// renders in more than a second, the client times out, and the request
+/// becomes an "unknown prefill" that latches pool-wide cost comparison into
+/// occupancy fallback for its whole multi-minute flight. Stacks serving big
+/// contexts raise this to cover their largest body.
+///
+/// Kept as a per-router value (held by PdRouterBase and PdKvState) rather
+/// than process-wide state: one process can embed several routers, and a
+/// later construction must not rewrite the budget of an already-running one.
+pub(crate) fn preparation_budget(secs: u64) -> Duration {
+    Duration::from_secs(secs.max(1))
 }
 
 pub(crate) fn http_tokenize_fallback(
@@ -1197,17 +1193,11 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     #[test]
-    fn preparation_timeout_clamps_to_one_second_floor() {
-        use super::{preparation_timeout, set_preparation_timeout_secs};
+    fn preparation_budget_floors_at_one_second() {
+        use super::preparation_budget;
         use std::time::Duration;
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_preparation_timeout_secs(0);
-        assert_eq!(preparation_timeout(), Duration::from_secs(1));
-        set_preparation_timeout_secs(5);
-        assert_eq!(preparation_timeout(), Duration::from_secs(5));
-        // restore the upstream default for any test that reads the budget
-        set_preparation_timeout_secs(1);
+        assert_eq!(preparation_budget(0), Duration::from_secs(1));
+        assert_eq!(preparation_budget(5), Duration::from_secs(5));
     }
 
     #[test]

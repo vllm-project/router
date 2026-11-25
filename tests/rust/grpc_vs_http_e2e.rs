@@ -46,6 +46,7 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
         worker_startup_timeout_secs: 5,
         worker_startup_check_interval_secs: 1,
         intra_node_data_parallel_size: 1,
+        preparation_timeout_secs: 1,
         api_key: None,
         api_key_validation_urls: vec![],
         discovery: None,

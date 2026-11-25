@@ -578,6 +578,9 @@ pub struct PdRouterBase {
     pub circuit_breaker_config: CircuitBreakerConfig,
     // Fallback DP size for servers that report no engine metrics
     pub dp_size: usize,
+    // Per-call budget for pre-dispatch token preparation, resolved at
+    // construction from `RouterConfig::preparation_timeout_secs`.
+    preparation_timeout: Duration,
 }
 
 /// Build the workers backing one server URL, one per engine the server fronts.
@@ -710,7 +713,7 @@ impl PdRouterBase {
                     route,
                     headers,
                     self.api_key.as_deref(),
-                    crate::backend::preprocess::preparation_timeout(),
+                    self.preparation_timeout,
                 )
                 .await
             }
@@ -1393,6 +1396,7 @@ impl PdRouterBase {
                         .then(|| decode_policy.clone()),
                     ctx.router_config.kv_event_strict_recovery,
                     ctx.router_config.program_scheduling.is_none(),
+                    ctx.router_config.preparation_timeout_secs,
                 )
                 .await,
             )
@@ -1414,6 +1418,9 @@ impl PdRouterBase {
             api_key: ctx.router_config.api_key.clone(),
             circuit_breaker_config: core_cb_config,
             dp_size: fallback_dp_size,
+            preparation_timeout: crate::backend::preprocess::preparation_budget(
+                ctx.router_config.preparation_timeout_secs,
+            ),
         })
     }
 
@@ -1946,6 +1953,7 @@ mod tests {
             api_key: None,
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size: 1,
+            preparation_timeout: Duration::from_secs(1),
         }
     }
 
@@ -1967,6 +1975,7 @@ mod tests {
             api_key: None,
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size,
+            preparation_timeout: Duration::from_secs(1),
         }
     }
 

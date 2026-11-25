@@ -75,9 +75,6 @@ impl AppContext {
                 source.validate(worker).map_err(|error| error.to_string())?;
             }
         }
-        crate::backend::preprocess::set_preparation_timeout_secs(
-            router_config.preparation_timeout_secs,
-        );
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
