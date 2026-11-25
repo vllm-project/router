@@ -1,6 +1,6 @@
 //! Read worker model metadata and KV event source endpoints.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -110,12 +110,13 @@ impl KvIndexSupervisor {
                     .unwrap_or_default(),
             });
         }
-        // Failed source probes return above. A usable source whose layout lost
-        // trust can be re-admitted, so read a fresh hash within the refresh budget.
+        // A retry can re-admit usable sources after trust expires. Reserve
+        // time for one optional metrics scrape. Model lookup is handled above.
         if started.elapsed() < CONTROL_TIMEOUT.saturating_sub(ADMISSION_HASH_TIMEOUT)
             && !lifecycle.keeps_descriptor(&lifecycle.state.lock(), &descriptor)
         {
-            self.probe_admission_metadata(base, &mut worker).await;
+            self.probe_admission_metadata(base, &mut worker, false)
+                .await;
         }
         Ok(RegistrationProbe { descriptor, worker })
     }
@@ -124,6 +125,7 @@ impl KvIndexSupervisor {
         &self,
         worker_url: &str,
         worker: &mut WorkerDiscovery,
+        lookup_load_only_models: bool,
     ) {
         let (base, _) = split_worker_rank(worker_url);
         let (Some(layout), Ok(sources)) = (&worker.hybrid, &worker.sources) else {
@@ -144,7 +146,7 @@ impl KvIndexSupervisor {
         let Some(configs) = worker
             .engine_cache_configs
             .as_ref()
-            .filter(|_| worker.base_models.is_none())
+            .filter(|_| lookup_load_only_models && worker.base_models.is_none())
         else {
             return;
         };
@@ -659,7 +661,7 @@ pub(super) async fn query_engine_cache_configs(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-) -> Result<BTreeMap<u32, metrics_meta::EngineCacheConfig>, String> {
+) -> Result<EngineCacheConfigs, String> {
     let text = query_worker_text(client, worker_url, "metrics", true, api_key).await?;
     let (engines, malformed_ranks) = metrics_meta::parse_cache_config_info(&text);
     if malformed_ranks > 0 {

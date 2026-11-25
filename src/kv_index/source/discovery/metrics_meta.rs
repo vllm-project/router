@@ -62,7 +62,7 @@ pub(super) fn parse_cache_config_info(text: &str) -> (EngineCacheConfigs, usize)
         if name != CACHE_CONFIG_INFO {
             return;
         }
-        let engine = match labels.get("engine") {
+        let engine = match labels.get("engine").filter(|value| !is_unset(value)) {
             Some(value) => {
                 let Ok(rank) = value.parse::<u32>() else {
                     malformed_ranks += 1;
@@ -143,12 +143,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_engine_label_defaults_to_rank_zero() {
-        let without_engine = METRICS.replacen(r#",engine="0""#, "", 1);
-        assert_eq!(
-            parse_cache_config_info(&without_engine),
-            parse_cache_config_info(METRICS)
-        );
+    fn missing_or_unset_engine_label_defaults_to_rank_zero() {
+        let expected = parse_cache_config_info(METRICS);
+        for label in ["", r#",engine="""#, r#",engine="  ""#, r#",engine="None""#] {
+            let metrics = METRICS.replacen(r#",engine="0""#, label, 1);
+            assert_eq!(parse_cache_config_info(&metrics), expected, "{label:?}");
+        }
     }
 
     #[test]

@@ -1889,14 +1889,22 @@ async fn spawn_metrics_only_worker(router: axum::Router) -> (String, tokio::task
     (worker, server)
 }
 
+struct AbortTestServer(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortTestServer {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 struct HashAdmissionWorker {
     url: String,
     supervisor: KvIndexSupervisor,
     metrics: Arc<Mutex<String>>,
     sources: Arc<Mutex<serde_json::Value>>,
     requests: Arc<MetadataRequests>,
+    _server: AbortTestServer,
     _sockets: Vec<(String, String, zmq::Socket, zmq::Socket)>,
-    server: tokio::task::JoinHandle<()>,
 }
 
 impl HashAdmissionWorker {
@@ -1941,16 +1949,9 @@ impl HashAdmissionWorker {
             metrics,
             sources,
             requests,
+            _server: AbortTestServer(server),
             _sockets: sockets,
-            server,
         }
-    }
-}
-
-impl Drop for HashAdmissionWorker {
-    fn drop(&mut self) {
-        self.supervisor.shutdown();
-        self.server.abort();
     }
 }
 
@@ -1982,7 +1983,7 @@ async fn registration_only_scrapes_hashes_for_usable_http_sources() {
     let mut discovered = supervisor.discover(url).await;
     let grpc_url = url.replacen("http://", "grpc://", 1);
     supervisor
-        .probe_admission_metadata(&grpc_url, &mut discovered)
+        .probe_admission_metadata(&grpc_url, &mut discovered, true)
         .await;
     assert!(discovered.engine_cache_configs.is_none());
 
@@ -2004,6 +2005,14 @@ async fn registration_only_scrapes_hashes_for_usable_http_sources() {
     *worker.sources.lock() = sources;
     assert!(probe().await.unwrap().worker.engine_cache_configs.is_some());
     assert_eq!(requests(), 2, "usable source for re-admission");
+
+    *worker.metrics.lock() = METRICS_ONLY.replace("sha256_cbor", "sha256");
+    let mut discovered = supervisor.discover(url).await;
+    supervisor
+        .probe_admission_metadata(url, &mut discovered, false)
+        .await;
+    assert!(discovered.engine_cache_configs.is_some());
+    assert!(discovered.base_models.is_none());
 }
 
 #[tokio::test]
@@ -2119,6 +2128,7 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
             }),
         );
         let (worker, server) = spawn_metrics_only_worker(router).await;
+        let _server = AbortTestServer(server);
         let (supervisor, _signals) =
             KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
         let (info, models) = supervisor
@@ -2147,8 +2157,6 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
         assert_eq!(labels["served_model_aliases"], "mock-alias,mock-model");
         assert_eq!(requests.models.load(Ordering::Relaxed), 1);
         assert_eq!(requests.metrics.load(Ordering::Relaxed), 1);
-        supervisor.shutdown();
-        server.abort();
     }
 }
 

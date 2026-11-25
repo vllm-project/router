@@ -27,6 +27,7 @@ mod registration;
 
 pub(crate) use lifecycle::CONTROL_TIMEOUT;
 use lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
+use metrics_meta::EngineCacheConfigs;
 use observer::WorkerObservation;
 use reconcile::{static_hybrid_sources_match, StaticHybridMatch};
 
@@ -163,7 +164,7 @@ pub(crate) struct WorkerDiscovery {
     base_models: Option<HashSet<String>>,
     pub(crate) hybrid: Option<CacheCapabilities>,
     pub(super) assumed_plain_full: bool,
-    engine_cache_configs: Option<metrics_meta::EngineCacheConfigs>,
+    engine_cache_configs: Option<EngineCacheConfigs>,
 }
 
 /// What the optional KV event source control probe found. A 404/405 means the
@@ -453,7 +454,7 @@ impl KvIndexSupervisor {
             (owner, lifecycle)
         };
         let mut discovery = self.discover(worker_url).await;
-        self.probe_admission_metadata(worker_url, &mut discovery)
+        self.probe_admission_metadata(worker_url, &mut discovery, true)
             .await;
         let models = discovery.base_models.clone();
         let info =
