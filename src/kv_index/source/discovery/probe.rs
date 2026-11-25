@@ -115,78 +115,59 @@ impl KvIndexSupervisor {
         if started.elapsed() < CONTROL_TIMEOUT.saturating_sub(ADMISSION_HASH_TIMEOUT)
             && !lifecycle.keeps_descriptor(&lifecycle.state.lock(), &descriptor)
         {
-            self.probe_admission_hashes(base, &mut worker).await;
+            self.probe_admission_metadata(base, &mut worker).await;
         }
         Ok(RegistrationProbe { descriptor, worker })
     }
 
-    pub(super) async fn probe_load_only_models(
+    pub(super) async fn probe_admission_metadata(
         &self,
         worker_url: &str,
         worker: &mut WorkerDiscovery,
     ) {
         let (base, _) = split_worker_rank(worker_url);
-        if worker.base_models.is_some() || crate::backend::is_grpc_url(base) {
-            return;
-        }
-        let (Some(layout), Some(configs), Ok(sources)) = (
-            &worker.hybrid,
-            &worker.engine_cache_configs,
-            &worker.sources,
-        ) else {
+        let (Some(layout), Ok(sources)) = (&worker.hybrid, &worker.sources) else {
             return;
         };
-        let mut has_source = false;
-        for (rank, source) in sources {
-            if !events_enabled(source) {
-                continue;
-            }
-            let mismatch = rank
-                .parse::<u32>()
-                .ok()
-                .and_then(|rank| incompatible_prefix_hash(layout, configs, rank));
-            if mismatch.is_none() {
-                return;
-            }
-            has_source = true;
-        }
-        if !has_source {
+        if crate::backend::is_grpc_url(base) || !sources.values().any(events_enabled) {
             return;
         }
-        worker.base_models = tokio::time::timeout(
-            CONTROL_TIMEOUT / 4,
-            query_model_list(&self.client, base, self.api_key.as_deref()),
-        )
-        .await
-        .ok()
-        .flatten()
-        .as_ref()
-        .map(base_model_names);
-    }
-
-    pub(super) async fn probe_admission_hashes(
-        &self,
-        worker_url: &str,
-        worker: &mut WorkerDiscovery,
-    ) {
-        let (base, _) = split_worker_rank(worker_url);
-        if worker.engine_cache_configs.is_some()
-            || worker.hybrid.is_none()
-            || !worker
-                .sources
-                .as_ref()
-                .is_ok_and(|sources| sources.values().any(events_enabled))
-            || crate::backend::is_grpc_url(base)
-        {
-            return;
+        if worker.engine_cache_configs.is_none() {
+            worker.engine_cache_configs = tokio::time::timeout(
+                ADMISSION_HASH_TIMEOUT,
+                query_engine_cache_configs(&self.client, base, self.api_key.as_deref()),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
         }
-        worker.engine_cache_configs = tokio::time::timeout(
-            ADMISSION_HASH_TIMEOUT,
-            query_engine_cache_configs(&self.client, base, self.api_key.as_deref()),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok);
+        let Some(configs) = worker
+            .engine_cache_configs
+            .as_ref()
+            .filter(|_| worker.base_models.is_none())
+        else {
+            return;
+        };
+        let all_incompatible = sources
+            .iter()
+            .filter(|(_, source)| events_enabled(source))
+            .all(|(rank, _)| {
+                rank.parse::<u32>()
+                    .ok()
+                    .and_then(|rank| incompatible_prefix_hash(layout, configs, rank))
+                    .is_some()
+            });
+        if all_incompatible {
+            worker.base_models = tokio::time::timeout(
+                CONTROL_TIMEOUT / 4,
+                query_model_list(&self.client, base, self.api_key.as_deref()),
+            )
+            .await
+            .ok()
+            .flatten()
+            .as_ref()
+            .map(base_model_names);
+        }
     }
 }
 

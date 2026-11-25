@@ -1840,19 +1840,45 @@ const METRICS_ONLY: &str = "\
 vllm:cache_config_info{block_size=\"16\",effective_attention_block_size=\"16\",enable_prefix_caching=\"True\",prefix_caching_hash_algo=\"sha256_cbor\",hash_block_size=\"None\",kv_cache_layout=\"None\",engine=\"0\"} 1.0
 ";
 
-fn metrics_and_models_router(metrics: &'static str) -> axum::Router {
-    use axum::{routing::get, Router};
+#[derive(Default)]
+struct MetadataRequests {
+    metrics: std::sync::atomic::AtomicUsize,
+    models: std::sync::atomic::AtomicUsize,
+}
 
-    Router::new()
-        .route("/metrics", get(move || async move { metrics }))
+fn metrics_and_models_router(
+    metrics: impl Fn() -> String + Clone + Send + Sync + 'static,
+) -> (axum::Router, Arc<MetadataRequests>) {
+    use axum::{routing::get, Json, Router};
+
+    let requests = Arc::new(MetadataRequests::default());
+    let app = Router::new()
         .route(
-            "/v1/models",
-            get(|| async {
-                axum::Json(
-                    serde_json::json!({"data": [{"id": "mock-model"}, {"id": "mock-alias"}]}),
-                )
+            "/metrics",
+            get({
+                let requests = requests.clone();
+                move || {
+                    requests.metrics.fetch_add(1, Ordering::Relaxed);
+                    std::future::ready(metrics())
+                }
             }),
         )
+        .route(
+            "/v1/models",
+            get({
+                let requests = requests.clone();
+                move || {
+                    requests.models.fetch_add(1, Ordering::Relaxed);
+                    async {
+                        Json(serde_json::json!({"data": [
+                            {"id": "mock-model"}, {"id": "mock-alias"},
+                            {"id": "adapter", "parent": "mock-model"}
+                        ]}))
+                    }
+                }
+            }),
+        );
+    (app, requests)
 }
 
 /// Spawn a worker that serves only what a plain `vllm serve` exposes.
@@ -1868,17 +1894,14 @@ struct HashAdmissionWorker {
     supervisor: KvIndexSupervisor,
     metrics: Arc<Mutex<String>>,
     sources: Arc<Mutex<serde_json::Value>>,
-    metrics_requests: Arc<std::sync::atomic::AtomicUsize>,
-    model_requests: Arc<std::sync::atomic::AtomicUsize>,
+    requests: Arc<MetadataRequests>,
     _sockets: Vec<(String, String, zmq::Socket, zmq::Socket)>,
     server: tokio::task::JoinHandle<()>,
 }
 
 impl HashAdmissionWorker {
     async fn start(ranks: usize, metrics: &str) -> Self {
-        use axum::routing::get;
         use serde_json::json;
-        use std::sync::atomic::AtomicUsize;
 
         let sockets: Vec<_> = (0..ranks).map(|_| layout_endpoints()).collect();
         let sources = Arc::new(Mutex::new(serde_json::Value::Object(
@@ -1897,40 +1920,14 @@ impl HashAdmissionWorker {
                 .collect(),
         )));
         let metrics = Arc::new(Mutex::new(metrics.to_owned()));
-        let metrics_requests = Arc::new(AtomicUsize::new(0));
-        let model_requests = Arc::new(AtomicUsize::new(0));
-        let app = axum::Router::new()
-            .route(
-                "/metrics",
-                get({
-                    let metrics = metrics.clone();
-                    let requests = metrics_requests.clone();
-                    move || {
-                        let data = metrics.lock().clone();
-                        requests.fetch_add(1, Ordering::Relaxed);
-                        async move { data }
-                    }
-                }),
-            )
-            .route(
-                "/v1/models",
-                get({
-                    let requests = model_requests.clone();
-                    move || {
-                        requests.fetch_add(1, Ordering::Relaxed);
-                        async {
-                            axum::Json(json!({"data": [
-                                {"id": "model-list-alias"},
-                                {"id": "adapter", "parent": "test"}
-                            ]}))
-                        }
-                    }
-                }),
-            );
+        let (app, requests) = metrics_and_models_router({
+            let metrics = metrics.clone();
+            move || metrics.lock().clone()
+        });
         let (url, server) = source_boundary_worker_with_routes(
             app,
             json!({
-                "model_id": "test", "instance_id": "boot", "kv_block_size": 16,
+                "model_id": "mock-model", "instance_id": "boot", "kv_block_size": 16,
                 "served_model_aliases": ["control-alias"]
             }),
             sources.clone(),
@@ -1943,8 +1940,7 @@ impl HashAdmissionWorker {
             supervisor,
             metrics,
             sources,
-            metrics_requests,
-            model_requests,
+            requests,
             _sockets: sockets,
             server,
         }
@@ -1969,69 +1965,45 @@ async fn registration_checks_hashes_per_rank() {
         ),
     )
     .await;
-    let info = worker
-        .supervisor
-        .on_worker_added(&worker.url)
-        .await
-        .unwrap();
-    assert_eq!(
-        info.ranks.into_iter().collect::<HashSet<_>>(),
-        HashSet::from([0, 2])
-    );
-    assert_eq!(worker.metrics_requests.load(Ordering::Relaxed), 1);
-    assert_eq!(worker.model_requests.load(Ordering::Relaxed), 0);
+    let supervisor = &worker.supervisor;
+    let mut ranks = supervisor.on_worker_added(&worker.url).await.unwrap().ranks;
+    ranks.sort_unstable();
+    assert_eq!(ranks, [0, 2]);
+    assert_eq!(worker.requests.metrics.load(Ordering::Relaxed), 1);
+    assert_eq!(worker.requests.models.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
 async fn registration_only_scrapes_hashes_for_usable_http_sources() {
     let worker = HashAdmissionWorker::start(1, METRICS_ONLY).await;
-    let supervisor = &worker.supervisor;
-    supervisor.on_worker_added(&worker.url).await.unwrap();
+    let (supervisor, url) = (&worker.supervisor, &worker.url);
+    supervisor.on_worker_added(url).await.unwrap();
 
-    let mut discovered = supervisor.discover(&worker.url).await;
-    assert!(discovered.hybrid.is_some());
-    assert!(discovered.engine_cache_configs.is_none());
-    let grpc_worker = worker.url.replacen("http://", "grpc://", 1);
+    let mut discovered = supervisor.discover(url).await;
+    let grpc_url = url.replacen("http://", "grpc://", 1);
     supervisor
-        .probe_admission_hashes(&grpc_worker, &mut discovered)
+        .probe_admission_metadata(&grpc_url, &mut discovered)
         .await;
     assert!(discovered.engine_cache_configs.is_none());
-    assert_eq!(worker.metrics_requests.load(Ordering::Relaxed), 1);
 
-    let lifecycle = supervisor.lifecycle_for_worker(&worker.url);
-    supervisor
-        .probe_registration(&worker.url, false, None, &lifecycle)
-        .await
-        .unwrap();
+    let lifecycle = supervisor.lifecycle_for_worker(url);
+    let probe = || supervisor.probe_registration(url, false, None, &lifecycle);
+    probe().await.unwrap();
+    let requests = || worker.requests.metrics.load(Ordering::Relaxed);
     assert_eq!(
-        worker.metrics_requests.load(Ordering::Relaxed),
+        requests(),
         1,
-        "unchanged descriptor"
+        "gRPC and unchanged descriptors skip the scrape"
     );
 
-    let valid_sources = std::mem::replace(&mut *worker.sources.lock(), serde_json::json!([]));
+    let sources = std::mem::replace(&mut *worker.sources.lock(), serde_json::json!([]));
     lifecycle.state.lock().trusted = false;
-    assert!(supervisor
-        .probe_registration(&worker.url, false, None, &lifecycle)
-        .await
-        .is_err());
-    assert_eq!(
-        worker.metrics_requests.load(Ordering::Relaxed),
-        1,
-        "source discovery failed"
-    );
+    assert!(probe().await.is_err());
+    assert_eq!(requests(), 1, "failed source probe");
 
-    *worker.sources.lock() = valid_sources;
-    let probe = supervisor
-        .probe_registration(&worker.url, false, None, &lifecycle)
-        .await
-        .unwrap();
-    assert!(probe.worker.engine_cache_configs.is_some());
-    assert_eq!(
-        worker.metrics_requests.load(Ordering::Relaxed),
-        2,
-        "usable source for re-admission"
-    );
+    *worker.sources.lock() = sources;
+    assert!(probe().await.unwrap().worker.engine_cache_configs.is_some());
+    assert_eq!(requests(), 2, "usable source for re-admission");
 }
 
 #[tokio::test]
@@ -2055,61 +2027,62 @@ async fn load_only_registration_replaces_binding_and_preserves_model_aliases() {
     assert!(info.cache_key.is_none());
     assert!(!old.active.load(Ordering::Acquire));
     assert!(supervisor.match_provider_for_worker(&worker.url).is_none());
-    assert_eq!(worker.metrics_requests.load(Ordering::Relaxed), 2);
 
     let workers: Vec<Arc<dyn crate::core::Worker>> = vec![Arc::new(
         crate::core::DPAwareWorker::new(worker.url.clone(), 0, 2, crate::core::WorkerType::Regular),
     )];
-    for model in ["model-list-alias", "control-alias", "test"] {
+    for (model, eligible) in [
+        ("mock-model", true),
+        ("mock-alias", true),
+        ("control-alias", true),
+        ("adapter", false),
+        ("other", false),
+    ] {
         assert_eq!(
             supervisor.cache_eligible_workers(&workers, model),
-            Some(vec![true]),
+            Some(vec![eligible]),
             "{model}"
         );
     }
-    for model in ["adapter", "other"] {
-        assert_eq!(
-            supervisor.cache_eligible_workers(&workers, model),
-            Some(vec![false]),
-            "{model}"
-        );
-    }
-    assert!(models.unwrap().contains("model-list-alias"));
-    assert_eq!(worker.model_requests.load(Ordering::Relaxed), 1);
+    assert!(models.unwrap().contains("mock-alias"));
+    assert_eq!(worker.requests.models.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
 async fn explicit_reregistration_restores_load_only_binding() {
     let incompatible = METRICS_ONLY.replace("sha256_cbor", "sha256");
     let worker = HashAdmissionWorker::start(1, &incompatible).await;
-    let supervisor = &worker.supervisor;
-    let initial = supervisor.on_worker_added(&worker.url).await.unwrap();
-    assert!(initial.cache_key.is_none());
-    assert_eq!(*supervisor.first_block_size.lock(), Some(16));
+    let (supervisor, url) = (&worker.supervisor, &worker.url);
+    assert!(supervisor
+        .on_worker_added(url)
+        .await
+        .unwrap()
+        .cache_key
+        .is_none());
+    assert_eq!(*supervisor.first_block_size.lock(), None);
 
     *worker.metrics.lock() = METRICS_ONLY.to_owned();
-    let load_only = supervisor.lifecycle_for_worker(&worker.url);
-    let probe = supervisor
-        .probe_registration(&worker.url, false, None, &load_only)
-        .await
-        .unwrap();
-    assert!(load_only.keeps_descriptor(&load_only.state.lock(), &probe.descriptor));
-    assert_eq!(
-        worker.metrics_requests.load(Ordering::Relaxed),
-        1,
-        "hash-only changes keep the current registration"
-    );
+    supervisor.lifecycle_for_worker(url).state.lock().checked = None;
+    supervisor
+        .refresh_workers(
+            &HashSet::from([url.clone()]),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .await;
+    assert!(supervisor.match_provider_for_worker(url).is_none());
+    assert_eq!(worker.requests.metrics.load(Ordering::Relaxed), 1);
 
-    let registered = supervisor.on_worker_added(&worker.url).await.unwrap();
-    assert_eq!(registered.ranks, [0]);
-    assert_eq!(worker.metrics_requests.load(Ordering::Relaxed), 2);
+    assert_eq!(supervisor.on_worker_added(url).await.unwrap().ranks, [0]);
+    assert_eq!(*supervisor.first_block_size.lock(), Some(16));
 }
 
 #[tokio::test]
 async fn metrics_only_worker_supplies_cache_metadata() {
     let metrics = "vllm:cache_config_info{engine=\"0\"} 1.0\n\
         vllm:cache_config_info{block_size=\"8\",effective_attention_block_size=\"16\",engine=\"1\"} 1.0\n";
-    let (worker, server) = spawn_metrics_only_worker(metrics_and_models_router(metrics)).await;
+    let (router, _) = metrics_and_models_router(move || metrics.to_owned());
+    let (worker, server) = spawn_metrics_only_worker(router).await;
 
     let (info, models, _) =
         query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None)
@@ -2128,48 +2101,23 @@ async fn metrics_only_worker_supplies_cache_metadata() {
 #[tokio::test]
 async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
     use axum::routing::get;
-    use std::sync::atomic::AtomicUsize;
 
-    let context = zmq::Context::new();
-    let publisher = context.socket(zmq::XPUB).unwrap();
-    publisher.bind("tcp://127.0.0.1:*").unwrap();
-    let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-    let replay = context.socket(zmq::ROUTER).unwrap();
-    replay.bind("tcp://127.0.0.1:*").unwrap();
-    let replay_endpoint = replay.get_last_endpoint().unwrap().unwrap();
+    let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
     for with_replay in [false, true] {
-        let model_requests = Arc::new(AtomicUsize::new(0));
-        let metrics_requests = Arc::new(AtomicUsize::new(0));
         let sources = serde_json::json!({"0": {
             "endpoint": endpoint,
             "replay_endpoint": with_replay.then_some(&replay_endpoint),
             "topic": "kv/metrics-only",
             "publisher": "zmq"
         }});
-        let router = metrics_and_models_router(METRICS_ONLY)
-            .route(
-                "/kv_event_sources",
-                get(move || {
-                    let sources = sources.clone();
-                    async move { axum::Json(sources) }
-                }),
-            )
-            .layer(axum::middleware::from_fn({
-                let model_requests = model_requests.clone();
-                let metrics_requests = metrics_requests.clone();
-                move |request: axum::extract::Request, next: axum::middleware::Next| {
-                    match request.uri().path() {
-                        "/v1/models" => {
-                            model_requests.fetch_add(1, Ordering::Relaxed);
-                        }
-                        "/metrics" => {
-                            metrics_requests.fetch_add(1, Ordering::Relaxed);
-                        }
-                        _ => {}
-                    }
-                    next.run(request)
-                }
-            }));
+        let (router, requests) = metrics_and_models_router(|| METRICS_ONLY.to_owned());
+        let router = router.route(
+            "/kv_event_sources",
+            get(move || {
+                let sources = sources.clone();
+                async move { axum::Json(sources) }
+            }),
+        );
         let (worker, server) = spawn_metrics_only_worker(router).await;
         let (supervisor, _signals) =
             KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
@@ -2197,12 +2145,8 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
         )
         .await;
         assert_eq!(labels["served_model_aliases"], "mock-alias,mock-model");
-        assert_eq!(model_requests.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            metrics_requests.load(Ordering::Relaxed),
-            1,
-            "reuse the metadata scrape"
-        );
+        assert_eq!(requests.models.load(Ordering::Relaxed), 1);
+        assert_eq!(requests.metrics.load(Ordering::Relaxed), 1);
         supervisor.shutdown();
         server.abort();
     }

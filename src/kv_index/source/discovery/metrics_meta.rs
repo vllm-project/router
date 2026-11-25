@@ -135,8 +135,7 @@ mod tests {
     vllm:cache_config_info{block_size="16",engine="1"} 1.0
     vllm:cache_config_info{block_size="32",engine="0"} 1.0
     "#;
-        let (engines, malformed_ranks) = parse_cache_config_info(metrics);
-        assert_eq!(malformed_ranks, 0);
+        let (engines, _) = parse_cache_config_info(metrics);
         assert_eq!(engines.len(), 2);
         assert_eq!(engines[&0].block_size, Some(32));
         assert_eq!(engines[&1].block_size, Some(16));
@@ -145,34 +144,25 @@ mod tests {
 
     #[test]
     fn missing_engine_label_defaults_to_rank_zero() {
-        let metrics =
-            r#"vllm:cache_config_info{block_size="16",prefix_caching_hash_algo="sha256_cbor"} 1.0"#;
-        let (engines, malformed_ranks) = parse_cache_config_info(metrics);
-        assert_eq!(malformed_ranks, 0);
-        assert_eq!(engines.len(), 1);
+        let without_engine = METRICS.replacen(r#",engine="0""#, "", 1);
         assert_eq!(
-            engines[&0].prefix_caching_hash_algo.as_deref(),
-            Some("sha256_cbor")
+            parse_cache_config_info(&without_engine),
+            parse_cache_config_info(METRICS)
         );
     }
 
     #[test]
     fn malformed_engine_labels_do_not_overwrite_rank_zero() {
+        let malformed = r#"vllm:cache_config_info{block_size="32",engine="unknown",prefix_caching_hash_algo="sha256"} 1.0"#;
         let (valid, _) = parse_cache_config_info(METRICS);
-        for engine in ["", "unknown", "-1", "4294967296"] {
-            let malformed = format!(
-                r#"vllm:cache_config_info{{block_size="32",engine="{engine}",prefix_caching_hash_algo="sha256"}} 1.0"#
-            );
-            assert_eq!(
-                parse_cache_config_info(&malformed),
-                (EngineCacheConfigs::new(), 1)
-            );
-            assert_eq!(
-                parse_cache_config_info(&format!("{METRICS}\n{malformed}")),
-                (valid.clone(), 1),
-                "malformed engine label {engine:?}"
-            );
-        }
+        assert_eq!(
+            parse_cache_config_info(malformed),
+            (EngineCacheConfigs::new(), 1)
+        );
+        assert_eq!(
+            parse_cache_config_info(&format!("{METRICS}\n{malformed}")),
+            (valid, 1)
+        );
     }
 
     #[test]

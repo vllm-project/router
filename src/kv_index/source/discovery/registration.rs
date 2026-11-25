@@ -321,7 +321,6 @@ impl KvIndexSupervisor {
             base_models.insert(model_id);
             base_models.extend(server_info.served_model_aliases);
             self.publish_registration(worker_url, lifecycle, &info, Some(base_models));
-            self.check_block_size(worker_url, info.block_size);
             info!(worker_url, incompatible_ranks, "KV registration is load-only because every rank reported an incompatible prefix hash");
             return Ok(info);
         }
