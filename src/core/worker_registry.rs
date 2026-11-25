@@ -698,4 +698,38 @@ mod tests {
         assert!(registry.get_by_type(&WorkerType::Decode).is_empty());
         assert!(registry.get_by_connection(&ConnectionMode::Http).is_empty());
     }
+
+    #[test]
+    fn test_reregister_worker_keeps_registration_order() {
+        let registry = WorkerRegistry::new();
+        for (url, port) in [("http://z", Some(2u16)), ("http://a", Some(1))] {
+            registry.register(Arc::new(BasicWorker::new(
+                url.to_string(),
+                WorkerType::Prefill {
+                    bootstrap_port: port,
+                },
+            )));
+        }
+        registry.register(Arc::new(BasicWorker::new(
+            "http://z".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(3),
+            },
+        )));
+
+        let urls: Vec<_> = registry
+            .get_prefill_workers()
+            .iter()
+            .map(|worker| worker.url().to_string())
+            .collect();
+        assert_eq!(urls, ["http://z", "http://a"]);
+        assert_eq!(
+            registry
+                .get_by_type(&WorkerType::Prefill {
+                    bootstrap_port: Some(2)
+                })
+                .len(),
+            0
+        );
+    }
 }
