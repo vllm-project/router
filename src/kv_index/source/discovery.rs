@@ -29,7 +29,7 @@ pub(crate) use lifecycle::CONTROL_TIMEOUT;
 use lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
 use observer::WorkerObservation;
 use reconcile::{
-    bound_source_moved, static_hybrid_sources_match, unfenced_sources, BoundSources,
+    bound_source_moved, is_fenced_source, reported_runtime_hash, static_hybrid_sources_match,
     StaticHybridMatch,
 };
 
@@ -492,7 +492,12 @@ impl KvIndexSupervisor {
                 }
                 let (verification, configs) = tokio::join!(
                     self.verify_static_source(worker_url, &discovery),
-                    self.probe_configured_cache_configs(worker_url, discovery.hybrid.is_some()),
+                    probe::probe_engine_cache_configs(
+                        &self.client,
+                        worker_url,
+                        self.api_key.as_deref(),
+                        discovery.hybrid.is_some().then_some(CONTROL_TIMEOUT / 4),
+                    ),
                 );
                 if let Err((probe, reason)) = verification {
                     discovery.sources = Err(SourcesUnavailable {
@@ -506,18 +511,13 @@ impl KvIndexSupervisor {
                 discovery
             }
             None => {
-                let hash_fences = self
-                    .lifecycles
-                    .lock()
-                    .get(worker_url)
-                    .map(|lifecycle| lifecycle.state.lock().hash_fences.clone())
-                    .unwrap_or_default();
+                let lifecycle = self.lifecycles.lock().get(worker_url).cloned();
                 let mut discovery = discover_worker(
                     &self.client,
                     worker_url,
                     self.http_pd || self.full_attention_http,
                     self.api_key.as_deref(),
-                    &hash_fences,
+                    lifecycle.as_deref(),
                 )
                 .await;
                 if discovery.assumed_plain_full
@@ -605,22 +605,6 @@ impl KvIndexSupervisor {
         discovery
     }
 
-    async fn probe_configured_cache_configs(
-        &self,
-        worker_url: &str,
-        enabled: bool,
-    ) -> Option<metrics_meta::EngineCacheConfigs> {
-        enabled.then_some(())?;
-        let (base, _) = split_worker_rank(worker_url);
-        probe::probe_engine_cache_configs(
-            &self.client,
-            base,
-            self.api_key.as_deref(),
-            CONTROL_TIMEOUT / 4,
-        )
-        .await
-    }
-
     async fn discover_declared_layout(
         &self,
         worker_url: &str,
@@ -664,7 +648,12 @@ impl KvIndexSupervisor {
                     )
                 }
             },
-            self.probe_configured_cache_configs(worker_url, !requires_hash_size),
+            probe::probe_engine_cache_configs(
+                &self.client,
+                base,
+                api_key,
+                (!requires_hash_size).then_some(CONTROL_TIMEOUT / 4),
+            ),
         );
         discovery.base_models = base_models;
         let Ok(sources) = sources else {
@@ -872,7 +861,7 @@ async fn discover_worker(
     worker_url: &str,
     http_pd: bool,
     api_key: Option<&str>,
-    hash_fences: &BoundSources,
+    lifecycle: Option<&WorkerLifecycle>,
 ) -> WorkerDiscovery {
     if crate::backend::is_grpc_url(worker_url) {
         let timeout = Duration::from_secs(10);
@@ -898,14 +887,8 @@ async fn discover_worker(
             .into_iter()
             .flat_map(|id| id.iter().cloned())
             .collect();
-        let mut discovery = native_worker_discovery(
-            worker_url,
-            server_info,
-            sources,
-            model_id,
-            layout,
-            hash_fences,
-        );
+        let mut discovery =
+            native_worker_discovery(worker_url, server_info, sources, model_id, layout, None);
         discovery.base_models = Some(base_models);
         return discovery;
     }
@@ -923,7 +906,7 @@ async fn discover_worker(
             engine_cache_configs: None,
         };
     }
-    discover_full_attention_http_worker(client, worker_url, api_key, hash_fences).await
+    discover_full_attention_http_worker(client, worker_url, api_key, lifecycle).await
 }
 
 /// Split a pinned data-parallel rank, as in `http://host:8000@3`.
@@ -1062,7 +1045,7 @@ async fn discover_full_attention_http_worker(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-    hash_fences: &BoundSources,
+    lifecycle: Option<&WorkerLifecycle>,
 ) -> WorkerDiscovery {
     let (server, (sources, layout)) = tokio::join!(
         query_worker_metadata_and_models(client, worker_url, api_key, true),
@@ -1084,7 +1067,7 @@ async fn discover_full_attention_http_worker(
         sources,
         model_id,
         layout,
-        hash_fences,
+        lifecycle.map(|entry| (entry, engine_cache_configs.as_ref())),
     );
     discovery.base_models = base_models;
     discovery.engine_cache_configs = engine_cache_configs;
@@ -1097,15 +1080,30 @@ fn native_worker_discovery(
     sources: Result<KvEventSourcesResponse, SourcesUnavailable>,
     model_id: Result<Option<String>, String>,
     layout: Result<Option<CacheCapabilities>, String>,
-    hash_fences: &BoundSources,
+    runtime: Option<(&WorkerLifecycle, Option<&metrics_meta::EngineCacheConfigs>)>,
 ) -> WorkerDiscovery {
     let (hybrid, assumed_plain_full) = match (&server_info, &sources, &model_id, layout) {
         (Ok(info), Ok(sources), Ok(Some(model)), Ok(Some(layout))) => {
+            let state = runtime.map(|(entry, configs)| (entry.state.lock(), configs));
             let host = worker_host(split_worker_rank(worker_url).0);
-            // The same fenced publisher stays ineligible even if its layout row
-            // changed. A replacement publisher still needs full validation.
-            let fenced = |rank: u32| {
-                hash_fences.get(&rank).is_some_and(|fence| {
+            let fenced = |rank| {
+                let Some((state, configs)) = &state else {
+                    return false;
+                };
+                let expected = state
+                    .descriptor
+                    .as_ref()
+                    .and_then(probe::WorkerDescriptor::layout)
+                    .and_then(|layout| layout.rank_capability(rank));
+                // Use this sample before validating the whole layout. The rejected
+                // publisher and its layout may have crossed a restart boundary.
+                if expected
+                    .zip(reported_runtime_hash(*configs, rank))
+                    .is_some_and(|(expected, reported)| reported != expected.hash_algorithm)
+                {
+                    return true;
+                }
+                state.hash_fences.get(&rank).is_some_and(|fence| {
                     sources.get(&rank.to_string()).is_none_or(|source| {
                         !events_enabled(source)
                             || host
@@ -1181,7 +1179,9 @@ fn validate_native_publishers(
     model: &str,
     fenced: impl Fn(u32) -> bool + Copy,
 ) -> Result<(), String> {
-    let active = unfenced_sources(sources, fenced).filter(|(_, source)| events_enabled(source));
+    let active = sources
+        .iter()
+        .filter(|(key, source)| events_enabled(source) && !is_fenced_source(key, fenced));
     if active.clone().count()
         != layout
             .ranks

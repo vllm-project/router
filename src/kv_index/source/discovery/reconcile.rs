@@ -259,10 +259,10 @@ impl KvIndexSupervisor {
             {
                 continue;
             }
-            let configs = probe
+            if let Some(configs) = probe
                 .as_ref()
-                .and_then(|probe| probe.worker.engine_cache_configs.as_ref());
-            if configs.is_some() {
+                .and_then(|probe| probe.worker.engine_cache_configs.as_ref())
+            {
                 let provider = self
                     .installed
                     .workers
@@ -271,7 +271,7 @@ impl KvIndexSupervisor {
                     .filter(|worker| Arc::ptr_eq(&worker.provider.lifecycle, &lifecycle))
                     .map(|worker| worker.provider.clone());
                 if let Some(provider) = provider {
-                    provider.fence_runtime_hashes(&base, configs, &Some(self.signal_tx.clone()));
+                    provider.fence_runtime_hashes(&base, configs, &self.signal_tx);
                 }
             }
             let action =
@@ -346,13 +346,15 @@ impl From<&EventSource> for BoundSource {
 /// Publisher identities by rank, including publishers fenced before subscription.
 pub(super) type BoundSources = HashMap<u32, BoundSource>;
 
-pub(super) fn unfenced_sources<'a>(
-    sources: &'a KvEventSourcesResponse,
-    fenced: impl Fn(u32) -> bool + Copy + 'a,
-) -> impl Iterator<Item = (&'a String, &'a KvEventSourceEntry)> + Clone {
-    sources
-        .iter()
-        .filter(move |(key, _)| !canonical_source_rank(key).is_some_and(fenced))
+pub(super) fn is_fenced_source(key: &str, fenced: impl FnOnce(u32) -> bool) -> bool {
+    canonical_source_rank(key).is_some_and(fenced)
+}
+
+pub(super) fn reported_runtime_hash(
+    configs: Option<&EngineCacheConfigs>,
+    rank: u32,
+) -> Option<&str> {
+    configs?.get(&rank)?.prefix_caching_hash_algo.as_deref()
 }
 
 pub(super) fn runtime_hash_mismatch(
@@ -361,13 +363,13 @@ pub(super) fn runtime_hash_mismatch(
     worker_url: &str,
     rank: u32,
 ) -> bool {
-    let (Some(configs), Some(contract)) = (configs, capability.rank_capability(rank)) else {
+    let Some(contract) = capability
+        .rank_capability(rank)
+        .filter(|_| configs.is_some())
+    else {
         return false;
     };
-    let Some(reported) = configs
-        .get(&rank)
-        .and_then(|engine| engine.prefix_caching_hash_algo.as_deref())
-    else {
+    let Some(reported) = reported_runtime_hash(configs, rank) else {
         tracing::debug!(
             worker_url,
             rank,

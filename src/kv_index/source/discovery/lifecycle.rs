@@ -278,12 +278,9 @@ impl LayoutWorkerProvider {
     pub(super) fn fence_runtime_hashes(
         &self,
         worker: &str,
-        configs: Option<&EngineCacheConfigs>,
-        signals: &Option<tokio::sync::mpsc::Sender<IngestionSignal>>,
+        configs: &EngineCacheConfigs,
+        signal_tx: &tokio::sync::mpsc::Sender<IngestionSignal>,
     ) {
-        if configs.is_none() {
-            return;
-        }
         let mut state = self.lifecycle.state.lock();
         let Some(capability) = state.descriptor.as_ref().and_then(WorkerDescriptor::layout) else {
             return;
@@ -294,8 +291,9 @@ impl LayoutWorkerProvider {
             .filter_map(|(&rank, source)| {
                 let index = &self.indexes[&rank];
                 let lease = index.binding.as_ref()?;
-                (lease.is_active() && runtime_hash_mismatch(configs, capability, worker, rank))
-                    .then_some((rank, source, index, lease))
+                (lease.is_active()
+                    && runtime_hash_mismatch(Some(configs), capability, worker, rank))
+                .then_some((rank, source, index, lease))
             })
             .collect();
         for &(rank, source, _, lease) in &fenced {
@@ -313,7 +311,7 @@ impl LayoutWorkerProvider {
             }
             index.invalidate();
             crate::kv_index::subscriber::emit(
-                signals,
+                &Some(signal_tx.clone()),
                 IngestionSignal::Invalidated {
                     source: index.target.instance_id.clone(),
                     dp_rank: rank,
@@ -397,7 +395,8 @@ impl KvIndexSupervisor {
         let provider = Arc::downgrade(provider);
         let probe_ctx = self.ctx.clone();
         let client = self.client.clone();
-        let signals = Some(self.signal_tx.clone());
+        let signal_tx = self.signal_tx.clone();
+        let signals = Some(signal_tx.clone());
         let worker = worker_url.to_owned();
         let api_key = self.api_key.clone();
         let static_source = self.resolved_static_source(worker_url).is_some();
@@ -439,23 +438,17 @@ impl KvIndexSupervisor {
                 if lifecycle.expire_if_needed() {
                     invalidate(&handles);
                 }
-                let probe_hash = || {
+                let probe_hash = |due: bool| {
                     probe_engine_cache_configs(
                         &client,
-                        super::split_worker_rank(&worker).0,
+                        &worker,
                         api_key.as_deref(),
-                        HASH_PROBE_BUDGET,
+                        due.then_some(HASH_PROBE_BUDGET),
                     )
                 };
                 let (observed, mut configs) = tokio::join!(
                     probe_bound_sources(&client, &worker, api_key.as_deref(), static_source),
-                    async {
-                        if hash_due {
-                            probe_hash().await
-                        } else {
-                            None
-                        }
-                    },
+                    probe_hash(hash_due),
                 );
                 let source_match = |state: &LifecycleState| {
                     observed_sources_match(
@@ -473,7 +466,7 @@ impl KvIndexSupervisor {
                         && source_match(&state) == StaticHybridMatch::Differs
                 };
                 if source_changed {
-                    configs = probe_hash().await;
+                    configs = probe_hash(true).await;
                 }
                 if !lifecycle.active.load(Ordering::Acquire) {
                     for handle in &handles {
@@ -485,7 +478,9 @@ impl KvIndexSupervisor {
                 if lifecycle.expire_if_needed() {
                     invalidate(&handles);
                 }
-                provider.fence_runtime_hashes(&worker, configs.as_ref(), &signals);
+                if let Some(configs) = &configs {
+                    provider.fence_runtime_hashes(&worker, configs, &signal_tx);
+                }
                 let action = {
                     let mut state = lifecycle.state.lock();
                     if lifecycle.all_publishers_fenced(&state) {

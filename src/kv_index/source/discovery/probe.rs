@@ -11,7 +11,7 @@ use tonic_prost::ProstCodec;
 use tracing::{info, warn};
 
 use super::lifecycle::WorkerLifecycle;
-use super::reconcile::{layouts_match, unfenced_sources, BoundSources};
+use super::reconcile::{is_fenced_source, BoundSources};
 use super::{
     discovered_block_size, metrics_meta, split_worker_rank, CacheCapabilities, KvEventSourceEntry,
     KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe, SourcesUnavailable,
@@ -27,7 +27,7 @@ pub(super) struct RegistrationProbe {
     pub(super) worker: WorkerDiscovery,
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(super) struct WorkerDescriptor {
     server_info: ServerInfo,
     sources: Option<KvEventSourcesResponse>,
@@ -43,27 +43,25 @@ impl WorkerDescriptor {
     }
 
     pub(super) fn matches_unfenced(&self, other: &Self, fences: &BoundSources) -> bool {
-        if fences.is_empty() {
-            return self == other;
+        if self == other {
+            return true;
         }
-        let sources_match = match (&self.sources, &other.sources) {
-            (Some(left), Some(right)) => {
-                let fenced = |rank| fences.contains_key(&rank);
-                let left = unfenced_sources(left, fenced);
-                left.clone().count() == unfenced_sources(right, fenced).count()
-                    && left
-                        .into_iter()
-                        .all(|(rank, entry)| right.get(rank) == Some(entry))
+        if fences.is_empty() {
+            return false;
+        }
+        // Compare a filtered copy on the slow refresh path. Keep the original
+        // publisher identities available for registration.
+        let view = |mut descriptor: Self| {
+            let fenced = |rank| fences.contains_key(&rank);
+            if let Some(sources) = &mut descriptor.sources {
+                sources.retain(|rank, _| !is_fenced_source(rank, fenced));
             }
-            (None, None) => true,
-            _ => false,
+            if let Some(layout) = &mut descriptor.hybrid {
+                layout.ranks.retain(|rank| !fenced(rank.rank));
+            }
+            descriptor
         };
-        sources_match
-            && self.server_info == other.server_info
-            && self.model_id == other.model_id
-            && self.assumed_plain_full == other.assumed_plain_full
-            && self.connector == other.connector
-            && layouts_match(self.layout(), other.layout(), fences)
+        view(self.clone()) == view(other.clone())
     }
 
     pub(super) fn has_nonplain_layout(&self) -> bool {
@@ -520,13 +518,12 @@ pub(super) async fn query_worker_metadata_and_models(
 ) -> Result<WorkerMetadata, String> {
     let (control, metrics) = tokio::join!(
         query_worker_control_metadata(client, worker_url, api_key),
-        async {
-            if check_runtime_hash {
-                probe_engine_cache_configs(client, worker_url, api_key, CONTROL_TIMEOUT / 4).await
-            } else {
-                None
-            }
-        },
+        probe_engine_cache_configs(
+            client,
+            worker_url,
+            api_key,
+            check_runtime_hash.then_some(CONTROL_TIMEOUT / 4),
+        ),
     );
     let control_error = match control {
         Ok(info) => return Ok((info, None, metrics)),
@@ -677,8 +674,10 @@ pub(super) async fn probe_engine_cache_configs(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-    budget: Duration,
+    budget: Option<Duration>,
 ) -> Option<EngineCacheConfigs> {
+    let budget = budget?;
+    let (worker_url, _) = split_worker_rank(worker_url);
     if crate::backend::is_grpc_url(worker_url) {
         return None;
     }

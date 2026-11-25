@@ -2086,14 +2086,10 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
     assert_eq!(refresh().await[&worker].revision, revision);
     assert!(hits(2));
 
+    // Refresh can observe a new topic before the native layout reports it.
     *reported.lock() = metrics("xxhash", "sha256_cbor");
     sources.lock()["0"]["topic"] = serde_json::json!("kv/changed/0");
-    {
-        let mut layout = native.lock();
-        layout["ranks"][0]["publisher_topic"] = serde_json::json!("kv/changed/0");
-        layout["ranks"][1]["publisher_topic"] = serde_json::json!(topics[1]);
-    }
-    wait_for(|| !has_binding(0)).await;
+    native.lock()["ranks"][1]["publisher_topic"] = serde_json::json!(topics[1]);
     lifecycle.state.lock().checked = None;
     assert_eq!(refresh().await[&worker].revision, revision);
     assert!(!hits(0));
@@ -2106,21 +2102,18 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
         !has_binding(1),
         "a rank rejected at discovery gained a binding"
     );
-    // The descriptor refresh can fence the last remaining binding using the same path.
+    // A source change lets the fast monitor fence the last remaining binding too.
     *reported.lock() = metrics("xxhash", "xxhash").replace(
         "engine=\"2\"",
         "engine=\"2\",prefix_caching_hash_algo=\"xxhash\"",
     );
-    lifecycle.state.lock().checked = None;
-    assert!(refresh().await[&worker]
-        .info
-        .as_ref()
-        .unwrap()
-        .ranks
-        .is_empty());
+    sources.lock()["2"]["topic"] = serde_json::json!("kv/changed/2");
+    wait_for(|| !has_binding(2)).await;
     assert!(!has_binding(2) && !hits(2));
 
     supervisor.on_worker_removed(&worker);
+    sources.lock()["0"]["topic"] = serde_json::json!(topics[0]);
+    sources.lock()["2"]["topic"] = serde_json::json!(topics[2]);
     assert!(refresh().await[&worker]
         .info
         .as_ref()
@@ -2134,7 +2127,9 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
 
 #[tokio::test]
 async fn optional_metrics_preserves_registration_and_metadata_fallback() {
-    use axum::{http::StatusCode, response::IntoResponse, routing::get, Json};
+    use axum::{
+        extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router,
+    };
     use std::sync::atomic::AtomicUsize;
 
     let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
@@ -2145,39 +2140,37 @@ async fn optional_metrics_preserves_registration_and_metadata_fallback() {
     for slow_metrics in [true, false] {
         let scrapes = Arc::new(AtomicUsize::new(0));
         let first_scrape = Arc::new(tokio::sync::Notify::new());
-        let router = event_sources_routes(Arc::new(Mutex::new(sources.clone())))
-            .route("/v1/models", get(mock_model_list))
-            .route("/get_server_info", get({
-                let first_scrape = first_scrape.clone();
-                move || {
-                    let first_scrape = first_scrape.clone();
-                    async move {
-                        if slow_metrics {
-                            tokio::time::sleep(Duration::from_millis(2500)).await;
-                            Json(serde_json::json!({"model_id": "mock-model", "kv_block_size": 16})).into_response()
-                        } else {
-                            first_scrape.notified().await;
-                            StatusCode::NOT_FOUND.into_response()
-                        }
+        type Fixture = (bool, Arc<AtomicUsize>, Arc<tokio::sync::Notify>);
+        let router = Router::new()
+            .route(
+                "/get_server_info",
+                get(|State((slow, _, first)): State<Fixture>| async move {
+                    if slow {
+                        tokio::time::sleep(Duration::from_millis(2500)).await;
+                        Json(serde_json::json!({"model_id": "mock-model", "kv_block_size": 16}))
+                            .into_response()
+                    } else {
+                        first.notified().await;
+                        StatusCode::NOT_FOUND.into_response()
                     }
-                }
-            }))
-            .route("/metrics", get({
-                let scrapes = scrapes.clone();
-                move || {
+                }),
+            )
+            .route(
+                "/metrics",
+                get(|State((slow, scrapes, first)): State<Fixture>| async move {
                     let attempt = scrapes.fetch_add(1, Ordering::Relaxed);
-                    let first_scrape = first_scrape.clone();
-                    async move {
-                        if slow_metrics {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        } else if attempt == 0 {
-                            first_scrape.notify_one();
-                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-                        }
-                        METRICS_ONLY.into_response()
+                    if slow {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    } else if attempt == 0 {
+                        first.notify_one();
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
                     }
-                }
-            }));
+                    METRICS_ONLY.into_response()
+                }),
+            )
+            .with_state((slow_metrics, scrapes.clone(), first_scrape))
+            .route("/v1/models", get(mock_model_list))
+            .merge(event_sources_routes(Arc::new(Mutex::new(sources.clone()))));
         let (worker, server) = spawn_metrics_only_worker(router).await;
         let (supervisor, _) = KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMap::new());
         let registered = supervisor
