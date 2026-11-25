@@ -1,7 +1,7 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
 use super::dp_utils;
-use super::pd_kv_state::{PdDecodePrices, PdKvState};
+use super::pd_kv_state::PdKvState;
 use super::pd_types::{
     Loads, PDRouterError, PdAttempt, PdEndpoint, PdLoadManager, PdPrefillInput, PdRequestContext,
     PdSelection, Stage, StageDecision,
@@ -13,7 +13,7 @@ use crate::core::{
     Worker, WorkerRegistry, WorkerResult, WorkerType,
 };
 use crate::policies::WorkerTokenInputs;
-use crate::policies::{kv_aware_ops, LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{kv_aware_ops, LoadBalancingPolicy, PdDecodePrices, PolicyRegistry};
 use crate::routers::header_utils;
 use async_trait::async_trait;
 use axum::{
@@ -2859,6 +2859,73 @@ mod admission_tests {
         let selection = select_pd_pair(&loads, &p, &d, &policy, &policy, &context, true).unwrap();
         assert_eq!(selection.prefill.worker_index, 0); // Token backlog outweighs warm residency.
         assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
+    }
+
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    #[test]
+    fn decode_clear_after_pricing_removes_only_the_revoked_candidates_credit() {
+        use crate::kv_index::source::test_support::{event_batch, full_binding, warm_full};
+        use crate::kv_index::{CacheKey, KVEvent, RoutableTarget};
+        use crate::policies::PromptHashes;
+
+        let policy = KvAwarePolicy::default();
+        let prompts = [vec![42; 33]];
+        let workers = pool("d", 2);
+        let mut sources = Vec::new();
+        for (index, (worker, warm)) in workers.iter().zip([32, 16]).enumerate() {
+            let target = RoutableTarget {
+                instance_id: format!("engine-{index}").into(),
+                dp_rank: 0,
+            };
+            let source = Arc::new(full_binding(target.clone(), 16));
+            source.begin_empty(0);
+            warm_full(&source, 0, &prompts[0][..warm]);
+            policy.register_target_with_cache_identity(
+                worker.url(),
+                target,
+                CacheKey {
+                    model: "model".into(),
+                    block_size: 16,
+                },
+                source.clone(),
+            );
+            sources.push(source);
+        }
+        let inputs: Vec<_> = workers
+            .iter()
+            .map(|worker| (worker.as_ref(), prompts.as_slice(), true))
+            .collect();
+        let prices = policy
+            .prepare_decode_prices(&inputs, &mut PromptHashes::new(), false)
+            .unwrap();
+        let select = |expected_tokens: [u64; 2], expected_worker: usize| {
+            let validated = prices.validate(&workers);
+            assert_eq!(
+                [
+                    validated.tokens[workers[0].url()],
+                    validated.tokens[workers[1].url()]
+                ],
+                expected_tokens
+            );
+            let context = PdRequestContext {
+                decode_context: Some(&validated.tokens),
+                ..context()
+            };
+            let decision = select_decode_stage(&Loads::new(), &workers, &policy, &context).unwrap();
+            assert_eq!(decision.worker_index, expected_worker);
+            assert_eq!(
+                decision.score,
+                Some(expected_tokens[expected_worker] as f64)
+            );
+        };
+        select([1, 17], 0);
+        sources[0]
+            .apply_batch(
+                1,
+                &event_batch(vec![KVEvent::AllBlocksCleared(Default::default())]),
+            )
+            .unwrap();
+        select([33, 17], 1);
     }
 
     #[test]

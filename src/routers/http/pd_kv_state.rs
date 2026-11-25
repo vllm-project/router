@@ -8,10 +8,10 @@ use crate::backend::preprocess::{
 use crate::config::KvConnector;
 use crate::core::{Worker, WorkerRegistry};
 use crate::kv_index::discovery::CONTROL_TIMEOUT;
-use crate::kv_index::storage::SourceReadGuard;
-use crate::kv_index::{KvIndexSupervisor, PlacementEvidence, RoutableTarget};
+use crate::kv_index::KvIndexSupervisor;
 use crate::policies::{
-    kv_aware_ops, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy, PrefillWorkEstimate, PromptHashes,
+    kv_aware_ops, kv_aware_policy, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy, PdDecodePrices,
+    PrefillWorkEstimate, PromptHashes,
 };
 use axum::http::HeaderMap;
 use serde_json::Value;
@@ -24,53 +24,6 @@ use tokio::sync::Mutex;
 const REFRESH_TICK: Duration = Duration::from_secs(1);
 
 type StagePool<'a> = (&'a [Arc<dyn Worker>], Option<&'a dyn KvAwareOps>);
-
-struct PdDecodePrice {
-    additional_tokens: u64,
-    input_tokens: u64,
-    target: Option<RoutableTarget>,
-}
-
-pub(super) struct PdDecodePrices {
-    workers: HashMap<String, PdDecodePrice>,
-    evidence: HashMap<RoutableTarget, Vec<PlacementEvidence>>,
-}
-
-pub(super) struct ValidatedDecodePrices<'a> {
-    pub(super) tokens: HashMap<String, u64>,
-    _pins: Vec<SourceReadGuard<'a>>,
-}
-
-impl PdDecodePrices {
-    /// Pin credited sources without waiting under the P/D load lock. Each
-    /// unpinnable candidate falls back to its full input in the same units.
-    pub(super) fn validate(&self, workers: &[Arc<dyn Worker>]) -> ValidatedDecodePrices<'_> {
-        let mut tokens = HashMap::with_capacity(workers.len());
-        let mut pins = Vec::new();
-        for worker in workers {
-            let Some(price) = self.workers.get(worker.url()) else {
-                continue;
-            };
-            let mut additional = price.input_tokens;
-            if price.additional_tokens < price.input_tokens {
-                if let Some(guards) = price
-                    .target
-                    .as_ref()
-                    .and_then(|target| self.evidence.get(target))
-                    .and_then(|evidence| PlacementEvidence::try_pin_all(evidence.iter()))
-                {
-                    pins.extend(guards);
-                    additional = price.additional_tokens;
-                }
-            }
-            tokens.insert(worker.url().to_owned(), additional);
-        }
-        ValidatedDecodePrices {
-            tokens,
-            _pins: pins,
-        }
-    }
-}
 
 #[derive(PartialEq, Eq)]
 struct TargetRegistration {
@@ -428,7 +381,7 @@ impl PdKvState {
         let prefill_work = kv_aware_ops(prefill_policy.as_ref())
             .map(|kv| Self::prefill_work(kv, prefill_workers, &prepared, &mut hashes));
         let decode_context = if decode_priced_here {
-            let kv = kv_aware_ops(decode_policy.as_ref()).expect("priced decode policy");
+            let kv = kv_aware_policy(decode_policy.as_ref()).expect("priced decode policy");
             self.decode_context_from_results(
                 kv,
                 decode_workers,
@@ -549,7 +502,7 @@ impl PdKvState {
     /// pool.
     fn decode_context_from_results<'tokens>(
         &self,
-        kv: &dyn KvAwareOps,
+        kv: &KvAwarePolicy,
         workers: &[Arc<dyn Worker>],
         allow_credit: &HashMap<String, bool>,
         results: &'tokens HashMap<
@@ -582,32 +535,7 @@ impl PdKvState {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unpriced");
             return None;
         }
-        let (work, mut targets, placement) = hashes.collect_decode_evidence(|hashes| {
-            kv.estimate_decode_work_with_transfer(&inputs, hashes, self.nixl_decode_replay)
-        });
-        let mut workers = HashMap::with_capacity(work.len());
-        for ((worker, prompts, _), estimate) in inputs.iter().zip(work) {
-            let input_tokens = prompts
-                .iter()
-                .map(|prompt| prompt.len() as u64)
-                .fold(0, u64::saturating_add);
-            workers.insert(
-                worker.url().to_owned(),
-                PdDecodePrice {
-                    additional_tokens: estimate.additional_tokens?,
-                    input_tokens,
-                    target: targets.remove(worker.url()),
-                },
-            );
-        }
-        let mut evidence: HashMap<_, Vec<_>> = HashMap::new();
-        for proof in placement {
-            evidence
-                .entry(proof.target().clone())
-                .or_default()
-                .push(proof);
-        }
-        Some(PdDecodePrices { workers, evidence })
+        kv.prepare_decode_prices(&inputs, hashes, self.nixl_decode_replay)
     }
 
     /// Marginal Decode context per candidate, priced against the KV index.
@@ -626,7 +554,7 @@ impl PdKvState {
         // The only caller is the deferred commit, which prices against the index as it
         // stands now, so this owns its cache. The admission path shares one cache across both
         // stages through `prepare_stages`.
-        let kv = kv_aware_ops(policy.as_ref())?;
+        let kv = kv_aware_policy(policy.as_ref())?;
         // Same no-render rule as admission: the commit path must not pay a
         // second fan-out for ids that cannot have changed.
         if router_prompts.is_none() && http_input_requires_render(request, route) {
@@ -666,95 +594,6 @@ mod kv_input_tests {
     use axum::response::IntoResponse;
     use reqwest::Client;
     use serde_json::json;
-
-    #[test]
-    fn decode_clear_after_pricing_removes_only_the_revoked_candidates_credit() {
-        use crate::kv_index::source::test_support::{event_batch, full_binding, warm_full};
-        use crate::kv_index::{CacheKey, KVEvent};
-        use crate::routers::http::pd_router::select_decode_stage;
-        use crate::routers::http::pd_types::{Loads, PdRequestContext};
-
-        let policy = KvAwarePolicy::default();
-        let state = PdKvState::new_with_statics(Client::new(), HashMap::new());
-        let prompts: Arc<[Vec<u32>]> = Arc::from([vec![42; 33]]);
-        let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
-        let mut sources = Vec::new();
-        for (index, warm) in [32, 16].into_iter().enumerate() {
-            let worker = Arc::new(BasicWorker::new(
-                format!("http://decode-{index}"),
-                WorkerType::Decode,
-            ));
-            let target = RoutableTarget {
-                instance_id: format!("engine-{index}").into(),
-                dp_rank: 0,
-            };
-            let source = Arc::new(full_binding(target.clone(), 16));
-            source.begin_empty(0);
-            warm_full(&source, 0, &prompts[0][..warm]);
-            policy.register_target_with_cache_identity(
-                worker.url(),
-                target,
-                CacheKey {
-                    model: "model".into(),
-                    block_size: 16,
-                },
-                source.clone(),
-            );
-            sources.push(source);
-            workers.push(worker);
-        }
-        let bases = workers.iter().map(|worker| worker.base_url().to_owned());
-        let allow_credit = bases.clone().map(|url| (url, true)).collect();
-        let results = router_token_inputs(bases, &json!({}), &prompts);
-        let prices = state
-            .decode_context_from_results(
-                &policy,
-                &workers,
-                &allow_credit,
-                &results,
-                &mut PromptHashes::new(),
-            )
-            .unwrap();
-        let select = |expected_tokens: [u64; 2], expected_worker: usize| {
-            let validated = prices.validate(&workers);
-            assert_eq!(
-                [
-                    validated.tokens[workers[0].url()],
-                    validated.tokens[workers[1].url()]
-                ],
-                expected_tokens
-            );
-            let context = PdRequestContext {
-                worker_pairs: None,
-                prefill_inputs: None,
-                model_id: None,
-                legacy_policy_input: None,
-                prefill_cache: None,
-                decode_cache: None,
-                headers: None,
-                affinity_key: None,
-                lora_name: None,
-                cache_salt: None,
-                decode_context: Some(&validated.tokens),
-                route: "/v1/completions",
-                probe: false,
-            };
-            let decision = select_decode_stage(&Loads::new(), &workers, &policy, &context).unwrap();
-            assert_eq!(decision.worker_index, expected_worker);
-            assert_eq!(
-                decision.score,
-                Some(expected_tokens[expected_worker] as f64)
-            );
-        };
-        select([1, 17], 0);
-        sources[0]
-            .apply_batch(
-                1,
-                &event_batch(vec![KVEvent::AllBlocksCleared(Default::default())]),
-            )
-            .unwrap();
-        select([33, 17], 1);
-    }
 
     /// Exercise the same preparation entry point as the request path. Decode is
     /// deferred so these prefill-only tests need no Decode pool.

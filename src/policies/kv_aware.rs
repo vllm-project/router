@@ -15,6 +15,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
+use crate::kv_index::storage::SourceReadGuard;
 use crate::kv_index::{
     CacheKey, PlacementEvidence, PromptKey, RequestHashCache, RoutableTarget, SharedPrefixLookup,
     StorageTier, TierMatch, WorkerKvInfo,
@@ -115,6 +116,52 @@ pub struct DecodeWorkEstimate {
     /// to plain occupancy instead of comparing a credited figure against a
     /// full-price one.
     pub additional_tokens: Option<u64>,
+}
+
+struct PdDecodePrice {
+    additional_tokens: u64,
+    input_tokens: u64,
+    target: RoutableTarget,
+}
+
+pub(crate) struct PdDecodePrices {
+    workers: HashMap<String, PdDecodePrice>,
+    evidence: HashMap<RoutableTarget, Vec<PlacementEvidence>>,
+}
+
+pub(crate) struct ValidatedDecodePrices<'a> {
+    pub(crate) tokens: HashMap<String, u64>,
+    _pins: Vec<SourceReadGuard<'a>>,
+}
+
+impl PdDecodePrices {
+    /// Pin credited sources without waiting under the P/D load lock. Each
+    /// unpinnable candidate falls back to its full input in the same units.
+    pub(crate) fn validate(&self, workers: &[Arc<dyn Worker>]) -> ValidatedDecodePrices<'_> {
+        let mut tokens = HashMap::with_capacity(workers.len());
+        let mut pins = Vec::new();
+        for worker in workers {
+            let Some(price) = self.workers.get(worker.url()) else {
+                continue;
+            };
+            let mut additional = price.input_tokens;
+            if price.additional_tokens < price.input_tokens {
+                if let Some(guards) = self
+                    .evidence
+                    .get(&price.target)
+                    .and_then(|evidence| PlacementEvidence::try_pin_all(evidence.iter()))
+                {
+                    pins.extend(guards);
+                    additional = price.additional_tokens;
+                }
+            }
+            tokens.insert(worker.url().to_owned(), additional);
+        }
+        ValidatedDecodePrices {
+            tokens,
+            _pins: pins,
+        }
+    }
 }
 
 /// Optional operations used by adapters with tokenized requests and KV discovery.
@@ -1017,25 +1064,12 @@ pub struct PromptHashes<'a> {
     // Each stage scores a single adapter identity for the entire request.
     matches: HashMap<(MatchScope, PromptKey<'a>), Vec<TierMatch>, foldhash::fast::RandomState>,
     hashes: RequestHashCache<'a>,
-    decode_targets: HashMap<String, RoutableTarget>,
+    decode_targets: Vec<RoutableTarget>,
 }
 
 impl PromptHashes<'_> {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub(crate) fn collect_decode_evidence<T>(
-        &mut self,
-        estimate: impl FnOnce(&mut Self) -> T,
-    ) -> (T, HashMap<String, RoutableTarget>, Vec<PlacementEvidence>) {
-        self.hashes.placement = Some(Vec::new());
-        let estimates = estimate(self);
-        (
-            estimates,
-            std::mem::take(&mut self.decode_targets),
-            self.hashes.placement.take().unwrap_or_default(),
-        )
     }
 
     fn set_stage_targets(
@@ -1125,6 +1159,42 @@ impl std::fmt::Debug for KvAwarePolicy {
 }
 
 impl KvAwarePolicy {
+    /// Keep the source target from the same binding that priced each candidate.
+    pub(crate) fn prepare_decode_prices<'tokens>(
+        &self,
+        inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
+        hashes: &mut PromptHashes<'tokens>,
+        nixl_pull: bool,
+    ) -> Option<PdDecodePrices> {
+        hashes.hashes.placement = Some(Vec::new());
+        let work = self.estimate_decode_work_with_transfer(inputs, hashes, nixl_pull);
+        let targets = std::mem::take(&mut hashes.decode_targets);
+        let placement = hashes.hashes.placement.take().unwrap_or_default();
+        let mut workers = HashMap::with_capacity(work.len());
+        for (((worker, prompts, _), estimate), target) in inputs.iter().zip(work).zip(targets) {
+            let input_tokens = prompts
+                .iter()
+                .map(|prompt| prompt.len() as u64)
+                .fold(0, u64::saturating_add);
+            workers.insert(
+                worker.url().to_owned(),
+                PdDecodePrice {
+                    additional_tokens: estimate.additional_tokens?,
+                    input_tokens,
+                    target,
+                },
+            );
+        }
+        let mut evidence: HashMap<_, Vec<_>> = HashMap::new();
+        for proof in placement {
+            evidence
+                .entry(proof.target().clone())
+                .or_default()
+                .push(proof);
+        }
+        Some(PdDecodePrices { workers, evidence })
+    }
+
     pub fn new(params: CostParams) -> Self {
         let slots = Arc::new(InMemorySlotManager::new());
         let mut policy = Self::with_components(
@@ -2154,6 +2224,9 @@ impl KvAwareOps for KvAwarePolicy {
             .iter()
             .map(|&(worker, prompts, credit)| {
                 let binding = self.binding_for_worker(worker);
+                if hashes.hashes.placement.is_some() {
+                    hashes.decode_targets.push(binding.target.clone());
+                }
                 if !credit || binding.cache_key.is_none() {
                     return DecodeWorkEstimate::default();
                 }
@@ -2173,7 +2246,6 @@ impl KvAwareOps for KvAwarePolicy {
                     ..self.params
                 };
                 let mut additional = 0u64;
-                let mut uses_credit = false;
                 for tokens in prompts {
                     let matches = Self::cached_matches(
                         hashes,
@@ -2209,7 +2281,6 @@ impl KvAwareOps for KvAwarePolicy {
                     } else {
                         reused
                     };
-                    uses_credit |= reused != 0;
                     // The engine shares one copy of the prompt's blocks across the
                     // request's sequences, so the marginal cost is the prompt's
                     // un-cached remainder once - the same amount the ledger charges when
@@ -2217,11 +2288,6 @@ impl KvAwareOps for KvAwarePolicy {
                     // a request cost more before admission than after, so the two sides of
                     // the comparison disagreed.
                     additional = additional.saturating_add(context.saturating_sub(reused));
-                }
-                if uses_credit && hashes.hashes.placement.is_some() {
-                    hashes
-                        .decode_targets
-                        .insert(worker.url().to_owned(), binding.target.clone());
                 }
                 DecodeWorkEstimate {
                     additional_tokens: Some(additional),
