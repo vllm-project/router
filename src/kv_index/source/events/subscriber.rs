@@ -7,7 +7,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use super::event_stream::{batch_contains_clear, EventStream, StreamLease};
-use super::overlap::LiveEventBuffer;
+use super::live_event_buffer::LiveEventBuffer;
 use super::transport::{
     live_sequence, retry_backoff, ConnectionMonitor, ReplayPoll, IDLE_REPLAY_INTERVAL,
 };

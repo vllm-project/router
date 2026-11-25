@@ -1,4 +1,5 @@
-//! Queued live frames and matching replay payloads for the replay-to-live handoff.
+//! Queue live KV event frames during replay and compare payloads for sequences
+//! that arrive on both streams before handing back to live ingestion.
 
 use std::collections::{hash_map::Entry, HashMap, VecDeque};
 

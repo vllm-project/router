@@ -674,7 +674,7 @@ async fn long_replay_verifies_the_oldest_buffered_live_frame() {
 
 #[tokio::test]
 async fn repeated_live_buffer_overflow_does_not_exhaust_replay() {
-    use super::super::overlap::MAX_PENDING_LIVE_FRAMES;
+    use super::super::live_event_buffer::MAX_PENDING_LIVE_FRAMES;
 
     let tcp = TcpReplay::with_hwm((MAX_PENDING_LIVE_FRAMES * 2) as i32);
     let index = Arc::new(full_binding(target("live-backpressure"), BLOCK_SIZE));
