@@ -171,9 +171,6 @@ impl KvIndexSupervisor {
         let nixl_truncates_replay = server_info
             .vllm_version
             .is_none_or(|version| version >= (0, 32));
-        let truncates_compressed = capability
-            .prefill_truncates_compressed
-            .or(server_info.mooncake_truncates_compressed);
         let mut bindings = HashMap::new();
         event_sources.retain(|source| {
             match capability
@@ -191,7 +188,7 @@ impl KvIndexSupervisor {
                         binding.with_pd_prefill(
                             connector,
                             nixl_truncates_replay,
-                            truncates_compressed,
+                            server_info.mooncake_truncates_compressed,
                         ),
                     );
                     true

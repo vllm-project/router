@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -18,6 +18,17 @@ use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::EventSubscriberHandle;
 use crate::kv_index::{CacheCapabilities, GroupCapability, RankCapability};
 use crate::kv_index::{IngestionSignal, SourceId};
+
+const PREFILL_TRUNCATION_ENV: &str = "VLLM_ROUTER_PD_PREFILL_TRUNCATION";
+static PREFILL_TRUNCATION_OVERRIDES: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
+    let Ok(value) = std::env::var(PREFILL_TRUNCATION_ENV) else {
+        return HashMap::new();
+    };
+    serde_json::from_str(&value).unwrap_or_else(|error| {
+        warn!(variable = PREFILL_TRUNCATION_ENV, %error, "invalid P/D Prefill truncation overrides");
+        HashMap::new()
+    })
+});
 
 mod lifecycle;
 mod observer;
@@ -560,7 +571,6 @@ impl KvIndexSupervisor {
             }
         }
         if !matches!(connector, Some(KvConnector::Nixl | KvConnector::Mooncake))
-            || layout.prefill_truncates_compressed.is_some()
             || !layout.ranks.iter().any(|rank| {
                 rank.groups
                     .iter()
@@ -569,20 +579,23 @@ impl KvIndexSupervisor {
         {
             return discovery;
         }
-        if let Some(info) = discovery
-            .server_info
-            .as_mut()
-            .ok()
-            .filter(|info| info.mooncake_truncates_compressed.is_none())
-        {
-            // This optional metadata lookup must leave time to install the source.
-            if let Ok(Ok(runtime)) = tokio::time::timeout(
-                CONTROL_TIMEOUT / 4,
-                probe::query_server_info_json(&self.client, base, self.api_key.as_deref()),
-            )
-            .await
-            {
-                info.mooncake_truncates_compressed = runtime.mooncake_truncates_compressed;
+        if let Ok(info) = &mut discovery.server_info {
+            let configured = PREFILL_TRUNCATION_OVERRIDES
+                .get(worker_url)
+                .or_else(|| PREFILL_TRUNCATION_OVERRIDES.get(base))
+                .copied();
+            if configured.is_some() {
+                info.mooncake_truncates_compressed = configured;
+            } else if info.mooncake_truncates_compressed.is_none() {
+                // This optional metadata lookup must leave time to install the source.
+                if let Ok(Ok(runtime)) = tokio::time::timeout(
+                    CONTROL_TIMEOUT / 4,
+                    probe::query_server_info_json(&self.client, base, self.api_key.as_deref()),
+                )
+                .await
+                {
+                    info.mooncake_truncates_compressed = runtime.mooncake_truncates_compressed;
+                }
             }
         }
         discovery
@@ -1168,7 +1181,6 @@ fn synthesize_plain_full_layout(
     ranks.sort_unstable_by_key(|rank| rank.rank);
     Some(CacheCapabilities {
         schema_version: 1,
-        prefill_truncates_compressed: None,
         adapters: Vec::new(),
         ranks,
     })

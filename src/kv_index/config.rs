@@ -155,7 +155,6 @@ impl KvSourceOptions<'_> {
                 .map(|(index, topic)| (pinned_rank.unwrap_or(index as u32), topic));
             let layout = layout.get_or_insert_with(|| crate::kv_index::CacheCapabilities {
                 schema_version: 1,
-                prefill_truncates_compressed: None,
                 adapters: Vec::new(),
                 ranks: ranked
                     .clone()

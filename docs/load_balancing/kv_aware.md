@@ -208,7 +208,8 @@ For a manual layout, add only the fields the deployment needs.
 - `hash_block_size` (tokens) when Router cannot discover it. HTTP event discovery can read it from worker metrics.
 - `partial_hash_hits: true` when the worker can reuse prefixes at boundaries inside a cache block.
 - `hash_seed` (string) when the worker uses a custom `PYTHONHASHSEED`. Use the same value.
-- `prefill_truncates_compressed: true` at worker level, next to `ranks`, when a P/D connector removes the last prompt token before looking up compressed prefixes. For example, set this for Ascend `MooncakeHybridConnector` with Router `--kv-connector nixl` passthrough when the worker does not expose this information through `/server_info`.
+
+For P/D with `--kv-connector nixl` passthrough, Router can use worker metadata to recognize connectors that trim the last prompt token before looking up compressed prefixes. If the metadata is unavailable, set `VLLM_ROUTER_PD_PREFILL_TRUNCATION='{"http://127.0.0.1:8000":true}'` in the Router process environment. Replace the URL with the affected Prefill worker, such as an Ascend `MooncakeHybridConnector` worker. An explicit `false` disables the extra deduction for that worker's compressed prefix. Omit other workers to use discovery and connector defaults.
 
 ### Model layout reference
 

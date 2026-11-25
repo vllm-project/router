@@ -7,10 +7,6 @@ use std::collections::HashSet;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CacheCapabilities {
     pub schema_version: u32,
-    /// Whether this worker's P/D connector removes one token before Prefill
-    /// looks up a compressed prefix. Omit to use discovery and connector defaults.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prefill_truncates_compressed: Option<bool>,
     /// LoRA adapters this worker serves. The engine hashes an adapter's pages
     /// with the adapter identity, so the Router can only credit them when the
     /// layout names them.
