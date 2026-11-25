@@ -574,9 +574,14 @@ impl KvIndexSupervisor {
             .ok()
             .filter(|info| info.mooncake_truncates_compressed.is_none())
         {
-            // This optional metadata lookup must leave time to install the source.
+            // A cold /server_info can spend time collecting worker diagnostics.
+            let metadata_timeout = if connector == Some(KvConnector::Nixl) {
+                CONTROL_TIMEOUT / 2
+            } else {
+                CONTROL_TIMEOUT / 4
+            };
             if let Ok(Ok(runtime)) = tokio::time::timeout(
-                CONTROL_TIMEOUT / 4,
+                metadata_timeout,
                 probe::query_server_info_json(&self.client, base, self.api_key.as_deref()),
             )
             .await

@@ -1580,6 +1580,8 @@ async fn nixl_prefill_discovers_mooncake_compressed_truncation() {
     let app = axum::Router::new().route(
         "/server_info",
         axum::routing::get(|| async {
+            // Exercise a cold metadata response that exceeds the prior 750 ms budget.
+            tokio::time::sleep(Duration::from_secs(1)).await;
             axum::Json(serde_json::json!({
                 "vllm_config": {"kv_transfer_config": {"kv_connector": "MooncakeHybridConnector"}}
             }))
