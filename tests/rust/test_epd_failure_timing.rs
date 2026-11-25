@@ -21,7 +21,7 @@ mod consumer_2xx_with_stalled_or_invalid_body {
     async fn p_body_stalled(path: Path, mode: Mode) -> (Rig, JoinHandle<Response>) {
         let mut rig = Rig::new(path).await;
         rig.consumer.set_mode(mode);
-        let mut client = rig.send(two_images(false));
+        let mut client = rig.send(two_images());
         rig.consumer.wait_stalls(1).await;
         expect_waiting(&mut client).await;
         rig.expect_no_cancel().await;
@@ -36,7 +36,7 @@ mod consumer_2xx_with_stalled_or_invalid_body {
         {
             let mut rig = Rig::new(Path::CombinedPd).await;
             rig.consumer.set_mode(Mode::StallBodyInvalidJson);
-            let response = answer(rig.send(two_images(false))).await;
+            let response = answer(rig.send(two_images())).await;
             assert_eq!(
                 response.status(),
                 StatusCode::OK,
@@ -61,7 +61,7 @@ mod consumer_2xx_with_stalled_or_invalid_body {
         {
             let mut rig = Rig::new(Path::CombinedPd).await;
             rig.consumer.set_mode(Mode::StallBody);
-            let response = answer(rig.send(two_images(false))).await;
+            let response = answer(rig.send(two_images())).await;
             let mut body = response.into_body().into_data_stream();
             next_chunk(&mut body).await;
             drop(body); // [local drop]: the response body
@@ -101,7 +101,7 @@ mod consumer_2xx_with_stalled_or_invalid_body {
         // The client goes away while P's body stalls.
         let mut rig = Rig::new(Path::SplitPdSequential).await;
         rig.consumer.set_mode(Mode::StallBody);
-        let mut client = rig.send(two_images(false));
+        let mut client = rig.send(two_images());
         rig.consumer.wait_stalls(1).await;
         expect_waiting(&mut client).await;
         disconnect(client).await;
@@ -158,7 +158,7 @@ mod consumer_2xx_with_stalled_or_invalid_body {
         let mut rig = Rig::new(Path::SplitPdConcurrent).await;
         rig.consumer.set_mode(Mode::StallBody);
         rig.decode.set_mode(Mode::StallBody);
-        let mut client = rig.send(two_images(false));
+        let mut client = rig.send(two_images());
         rig.consumer.wait_stalls(1).await;
         rig.decode.wait_stalls(1).await;
         expect_waiting(&mut client).await;
@@ -193,7 +193,7 @@ mod decode_disconnect {
             &rig.decode
         };
         decode.set_mode(Mode::BreakBody);
-        let response = answer(rig.send(two_images(true))).await;
+        let response = answer(rig.send(two_images_stream())).await;
         assert_eq!(response.status(), StatusCode::OK, "[client]");
         let mut body = response.into_body().into_data_stream();
         let first = next_chunk(&mut body).await;
@@ -212,7 +212,7 @@ mod decode_disconnect {
         {
             let mut rig = Rig::with(Path::CombinedPd, raw_last_stage()).await;
             rig.consumer.set_mode(Mode::HangUp);
-            let client = rig.send(two_images(true));
+            let client = rig.send(two_images_stream());
             rig.consumer.wait_requests(1).await;
             rig.consumer.release();
             rig.consumer.expect_completed().await;
@@ -235,7 +235,7 @@ mod decode_disconnect {
         {
             let mut rig = Rig::with(Path::SplitPdSequential, raw_last_stage()).await;
             rig.decode.set_mode(Mode::HangUp);
-            let client = rig.send(two_images(true));
+            let client = rig.send(two_images_stream());
             rig.decode.wait_requests(1).await;
             rig.consumer.expect_completed().await;
             rig.decode.release();
@@ -263,7 +263,7 @@ mod decode_disconnect {
             let mut rig = Rig::with(Path::SplitPdConcurrent, raw_last_stage()).await;
             rig.consumer.set_mode(Mode::HoldThenReply);
             rig.decode.set_mode(Mode::HangUp);
-            let mut client = rig.send(two_images(true));
+            let mut client = rig.send(two_images_stream());
             rig.consumer.wait_requests(1).await;
             rig.decode.wait_requests(1).await;
             rig.decode.release();
