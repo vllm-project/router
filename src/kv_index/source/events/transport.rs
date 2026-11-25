@@ -509,8 +509,7 @@ impl PendingLive {
                 let superseded = replay_clear_seq.is_some_and(|first| seq < first);
                 verified &= seq > last_applied_seq
                     || replay_fingerprints
-                        .compare_payload(seq as u64, &frames[2])
-                        .unwrap_or(superseded);
+                        .verify_queued_payload(seq as u64, &frames[2], superseded);
                 return true;
             }
             verified = false;
@@ -666,6 +665,7 @@ struct ReplayFingerprintEntries {
 struct QueuedLiveSequence {
     frame_count: usize,
     replay_fingerprint: Option<[u8; 32]>,
+    had_replay_conflict: bool,
 }
 
 impl ReplayFingerprintEntries {
@@ -690,6 +690,7 @@ impl ReplayFingerprints {
             .or_insert(QueuedLiveSequence {
                 frame_count: 0,
                 replay_fingerprint: fingerprint,
+                had_replay_conflict: false,
             });
         queued.frame_count += 1;
     }
@@ -752,11 +753,32 @@ impl ReplayFingerprints {
         Some(fingerprint == <[u8; 32]>::from(Sha256::digest(payload)))
     }
 
+    fn verify_queued_payload(&self, seq: u64, payload: &[u8], superseded_by_clear: bool) -> bool {
+        match self.compare_payload(seq, payload) {
+            Some(true) => true,
+            Some(false) => {
+                if let Some(queued) = self.entries.lock().queued_live_by_seq.get_mut(&seq) {
+                    queued.had_replay_conflict = true;
+                }
+                false
+            }
+            None => {
+                superseded_by_clear
+                    && !self
+                        .entries
+                        .lock()
+                        .queued_live_by_seq
+                        .get(&seq)
+                        .is_some_and(|queued| queued.had_replay_conflict)
+            }
+        }
+    }
+
     pub(super) fn clear_fingerprints(&mut self) {
         let entries = self.entries.get_mut();
         if !entries.recent_by_seq.is_empty() {
             entries.recent_by_seq = HashMap::new();
-            // Keep the live frame counts for the next replay.
+            // Keep live frame counts and known conflicts for the next replay.
             for queued in entries.queued_live_by_seq.values_mut() {
                 queued.replay_fingerprint = None;
             }

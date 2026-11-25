@@ -544,9 +544,13 @@ async fn retained_clear_does_not_hide_a_buffered_payload_conflict() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     tcp.history(&request, &[(9, &empty), (10, &clear), (11, &store)]);
 
-    let retry = tcp.request(0).await;
+    let without_conflicting_seq = tcp.request(0).await;
     assert_eq!(credit(&index), 0);
-    tcp.history(&retry, &[(9, &store), (10, &clear), (11, &store)]);
+    tcp.history(&without_conflicting_seq, &[(10, &clear), (11, &store)]);
+
+    let matching = tcp.request(0).await;
+    assert_eq!(credit(&index), 0);
+    tcp.history(&matching, &[(9, &store), (10, &clear), (11, &store)]);
     wait_until(|| credit(&index) == 4).await;
 }
 
