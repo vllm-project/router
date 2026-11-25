@@ -1229,6 +1229,52 @@ mod tests {
         assert_eq!(gauge.value.load(Ordering::SeqCst), 0);
     }
 
+    #[test]
+    fn same_model_replacement_keeps_model_index_visible() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (unused_tx, _) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let recorder = Recorder(Arc::new(BlockingGauge {
+            value: AtomicUsize::new(0),
+            first_entered: entered_tx,
+            second_entered: unused_tx,
+            release_first: std::sync::Mutex::new(release_rx),
+        }));
+        let registry = super::super::WorkerRegistry::new();
+        let worker_for_model = |url: &str, model: &str| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorker::new(url.into(), WorkerType::Regular).with_labels(
+                    std::collections::HashMap::from([("model_id".into(), model.into())]),
+                ),
+            )
+        };
+        let old = worker_for_model("http://replacement:8000", "model-a");
+        let current = worker_for_model(old.url(), "model-a");
+        let id = registry.register(old.clone());
+        registry.register(worker_for_model("http://other:8000", "model-b"));
+        current.increment_load();
+
+        std::thread::scope(|scope| {
+            let replace = scope.spawn(|| {
+                metrics::with_local_recorder(&recorder, || registry.register(current.clone()))
+            });
+            // Pause the replacement during initial load publication, where the
+            // old implementation had already emptied model A's routing pool.
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let has_model = registry.has_model("model-a");
+            let indexed = registry.get_by_model_fast("model-a");
+            release_tx.send(()).unwrap();
+            assert_eq!(replace.join().unwrap(), id);
+            assert!(has_model, "routing must not fall back to the global pool");
+            assert_eq!(indexed.len(), 1);
+            assert!(Arc::ptr_eq(&indexed[0], &old));
+        });
+
+        let indexed = registry.get_by_model_fast("model-a");
+        assert_eq!(indexed.len(), 1);
+        assert!(Arc::ptr_eq(&indexed[0], &current));
+    }
+
     // Test WorkerType
     #[test]
     fn test_worker_type_display() {

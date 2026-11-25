@@ -111,10 +111,17 @@ impl WorkerRegistry {
         // Retire the previous writer before enabling the replacement. Retirement
         // takes the same lock as publication, so an in-progress old write must
         // finish before the new instance publishes its initial/current load.
-        if let Some(previous) = self.workers.get(&worker_id) {
+        let replaces_same_model = if let Some(previous) = self.get(&worker_id) {
             previous.set_load_metrics_enabled(false);
-            self.remove_secondary_indexes(&worker_id, previous.as_ref());
-        }
+            let same_model = previous.model_id() == worker.model_id();
+            if !same_model {
+                self.remove_model_indexes(&worker_id, previous.as_ref());
+            }
+            self.remove_type_and_connection_indexes(&worker_id, previous.as_ref());
+            same_model
+        } else {
+            false
+        };
         worker.set_load_metrics_enabled(true);
 
         // Store worker only after its initial metric has been published.
@@ -126,18 +133,34 @@ impl WorkerRegistry {
 
         // Update model index (both ID-based and optimized)
         let model_id = worker.model_id().to_string();
-        self.model_workers
-            .entry(model_id.clone())
-            .or_default()
-            .push(worker_id.clone());
+        if !replaces_same_model {
+            self.model_workers
+                .entry(model_id.clone())
+                .or_default()
+                .push(worker_id.clone());
+        }
 
-        // Update optimized model index for O(1) lookups
-        self.model_index
-            .entry(model_id)
-            .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
-            .write()
-            .expect("RwLock for model_index is poisoned")
-            .push(worker.clone());
+        {
+            let model_entry = self
+                .model_index
+                .entry(model_id)
+                .or_insert_with(|| Arc::new(RwLock::new(Vec::new())));
+            let mut model_workers = model_entry
+                .write()
+                .expect("RwLock for model_index is poisoned");
+            // Same-model replacement must keep the pool visible to readers that
+            // do not take mutation_lock. Swap the Arc under the index write lock.
+            let existing = if replaces_same_model {
+                model_workers.iter_mut().find(|w| w.url() == worker.url())
+            } else {
+                None
+            };
+            if let Some(existing) = existing {
+                *existing = worker.clone();
+            } else {
+                model_workers.push(worker.clone());
+            }
+        }
 
         // Update type index
         self.type_workers
@@ -160,7 +183,7 @@ impl WorkerRegistry {
     }
 
     /// Caller must hold mutation_lock while changing the secondary indexes.
-    fn remove_secondary_indexes(&self, worker_id: &WorkerId, worker: &dyn Worker) {
+    fn remove_model_indexes(&self, worker_id: &WorkerId, worker: &dyn Worker) {
         // Remove from model index (both ID-based and optimized)
         if let Some(mut model_workers) = self.model_workers.get_mut(worker.model_id()) {
             model_workers.retain(|id| id != worker_id);
@@ -174,7 +197,10 @@ impl WorkerRegistry {
                 .expect("RwLock for model_index is poisoned")
                 .retain(|w| w.url() != worker_url);
         }
+    }
 
+    /// Caller must hold mutation_lock while changing the secondary indexes.
+    fn remove_type_and_connection_indexes(&self, worker_id: &WorkerId, worker: &dyn Worker) {
         // Remove from type index
         if let Some(mut type_workers) = self.type_workers.get_mut(&worker.worker_type()) {
             type_workers.retain(|id| id != worker_id);
@@ -199,7 +225,8 @@ impl WorkerRegistry {
             // Remove from URL mapping
             self.url_to_id.remove(worker.url());
 
-            self.remove_secondary_indexes(worker_id, worker.as_ref());
+            self.remove_model_indexes(worker_id, worker.as_ref());
+            self.remove_type_and_connection_indexes(worker_id, worker.as_ref());
             self.registration_order
                 .write()
                 .expect("RwLock for registration_order is poisoned")
