@@ -1934,6 +1934,18 @@ mod tests {
             (vec!["tcp://[::]:5557".into()], 16, "reachable ZMQ"),
             (vec!["tcp://prefill:0".into()], 16, "reachable ZMQ"),
             (vec!["tcp://prefill".into()], 16, "reachable ZMQ"),
+            (vec!["tcp://prefill:5557/x".into()], 16, "reachable ZMQ"),
+            (
+                vec!["tcp://prefill:5557?rank=1".into()],
+                16,
+                "reachable ZMQ",
+            ),
+            (vec!["tcp://prefill:5557#rank".into()], 16, "reachable ZMQ"),
+            (
+                vec!["tcp://user:pass@prefill:5557".into()],
+                16,
+                "reachable ZMQ",
+            ),
             (vec!["ipc://".into()], 16, "reachable ZMQ"),
             (vec![], 16, "no endpoints"),
             (vec!["tcp://prefill:5557".to_string()], 0, "block_size"),

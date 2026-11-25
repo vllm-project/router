@@ -360,18 +360,11 @@ impl StaticKvEventSources {
     }
 }
 
-fn is_reachable_tcp_endpoint(endpoint: &str) -> bool {
-    url::Url::parse(endpoint).is_ok_and(|parsed| {
-        parsed.scheme() == "tcp"
-            && parsed.host_str().is_some_and(|host| {
-                let host = host.trim_start_matches('[').trim_end_matches(']');
-                host != "*"
-                    && !host
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| ip.is_unspecified())
-            })
-            && parsed.port().is_some_and(|port| port != 0)
-    })
+fn is_valid_pd_kv_endpoint(endpoint: &str) -> bool {
+    crate::kv_index::canonical_endpoint(endpoint).is_ok()
+        || endpoint
+            .strip_prefix("ipc://")
+            .is_some_and(|path| !path.is_empty())
 }
 
 pub(crate) fn validate_regular_sources(config: &RouterConfig) -> ConfigResult<()> {
@@ -543,11 +536,7 @@ pub(crate) fn validate_pd_sources(config: &RouterConfig) -> ConfigResult<()> {
                     .iter()
                     .chain(sources.replay_endpoints.iter().flatten())
                 {
-                    if !is_reachable_tcp_endpoint(endpoint)
-                        && endpoint
-                            .strip_prefix("ipc://")
-                            .is_none_or(|path| path.is_empty())
-                    {
+                    if !is_valid_pd_kv_endpoint(endpoint) {
                         return Err(ConfigError::IncompatibleConfig {
                             reason: format!(
                                 "pd_kv_event_sources['{url}'] endpoint '{endpoint}' must be \
