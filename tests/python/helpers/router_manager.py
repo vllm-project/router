@@ -2,13 +2,15 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
 
 import requests
 
-from .ports import find_free_port
+from .process import release_all_port_holders, reserve_port
 
 
 @dataclass
@@ -22,13 +24,12 @@ class _RouterExited(Exception):
     """The router process exited before /health returned 200."""
 
 
-def _port_in_use(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind(("127.0.0.1", port))
-        except OSError:
-            return True
-    return False
+def _tee(stream, tail: Deque[str]) -> None:
+    # sys.__stderr__ is fd 2, where the router wrote before its output was piped.
+    for line in stream:
+        sys.__stderr__.write(line)
+        sys.__stderr__.flush()
+        tail.append(line)
 
 
 class RouterManager:
@@ -58,7 +59,8 @@ class RouterManager:
     ) -> ProcHandle:
         worker_urls = worker_urls or []
         pick_port = not port
-        port = port or find_free_port()
+        holders: List[Optional[socket.socket]] = []
+        port = port or reserve_port(holders)
         router_bin = router_bin or os.environ.get("VLLM_ROUTER_TEST_BIN")
         if router_bin:
             cmd = [
@@ -82,10 +84,10 @@ class RouterManager:
                 "--policy",
                 policy,
             ]
-        prom_port = find_free_port()
-        # The API port isn't bound yet, so the allocator can return it again.
+        prom_port = reserve_port(holders)
+        # A caller's API port isn't reserved, so the allocator can return it.
         while prom_port == port:
-            prom_port = find_free_port()
+            prom_port = reserve_port(holders)
         cmd.extend(
             ["--prometheus-port", str(prom_port), "--prometheus-host", "127.0.0.1"]
         )
@@ -169,30 +171,49 @@ class RouterManager:
                 else:
                     cmd.extend([flag, str(v)])
 
-        # A picked port can be taken by another process before the router binds
-        # it. Retry with fresh ports when an early exit looks like that.
+        # Reserved ports are freed just before Popen, so another process can
+        # still take one first. Retry when the router says its bind failed.
         attempts = 3
         for attempt in range(1, attempts + 1):
-            proc = subprocess.Popen(cmd, env={**os.environ, **(env or {})})
+            release_all_port_holders(holders)
+            proc = subprocess.Popen(
+                cmd,
+                env={**os.environ, **(env or {})},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                bufsize=1,
+            )
+            tail: Deque[str] = deque(maxlen=50)
+            reader = threading.Thread(
+                target=_tee, args=(proc.stdout, tail), daemon=True
+            )
+            reader.start()
             self._children.append(proc)
             url = f"http://127.0.0.1:{port}"
             try:
                 self._wait_health(url, timeout, proc=proc)
                 return ProcHandle(process=proc, url=url, prometheus_port=prom_port)
             except _RouterExited:
+                proc.wait()
+                reader.join(timeout=5)
                 self._children.remove(proc)
-                clash = _port_in_use(port) or _port_in_use(prom_port)
+                output = "".join(tail)
+                # API bind: "AddrInUse"; Prometheus bind: "Address already in use".
+                clash = "AddrInUse" in output or "Address already in use" in output
                 if not clash or attempt == attempts:
                     raise RuntimeError(
                         f"Router exited with code {proc.returncode} before becoming "
                         f"healthy (port={port}, prometheus_port={prom_port}, "
-                        f"port_clash={clash}, attempt {attempt}/{attempts})"
+                        f"port_clash={clash}, attempt {attempt}/{attempts}). "
+                        f"Last output:\n{output}"
                     ) from None
             if pick_port:
-                port = find_free_port()
-            prom_port = find_free_port()
+                port = reserve_port(holders)
+            prom_port = reserve_port(holders)
             while prom_port == port:
-                prom_port = find_free_port()
+                prom_port = reserve_port(holders)
             cmd[cmd.index("--port") + 1] = str(port)
             cmd[cmd.index("--prometheus-port") + 1] = str(prom_port)
 

@@ -1,8 +1,15 @@
+import io
+import socket
+import subprocess
+import sys
+import time
 from unittest.mock import Mock
 
 import pytest
+import requests
 
 from ..helpers import router_manager
+from ..helpers.ports import find_free_port
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
@@ -19,9 +26,10 @@ def test_start_router_selects_distinct_prometheus_port(
 ):
     manager = router_manager.RouterManager()
     popen = Mock()
+    popen.return_value.stdout = io.StringIO()
     wait_health = Mock()
     monkeypatch.setattr(
-        router_manager, "find_free_port", Mock(side_effect=allocated_ports)
+        router_manager, "reserve_port", Mock(side_effect=allocated_ports)
     )
     monkeypatch.setattr(router_manager.subprocess, "Popen", popen)
     monkeypatch.setattr(manager, "_wait_health", wait_health)
@@ -39,8 +47,8 @@ def test_start_router_selects_distinct_prometheus_port(
     wait_health.assert_called_once_with(handle.url, timeout, proc=popen.return_value)
 
 
-def _patch_start(monkeypatch, manager, allocated_ports, health, port_in_use):
-    procs = iter([Mock(returncode=1) for _ in range(3)])
+def _patch_start(monkeypatch, manager, allocated_ports, health, outputs):
+    procs = iter(Mock(returncode=1, stdout=io.StringIO(out)) for out in outputs)
     cmds = []
 
     def popen(cmd, **kwargs):
@@ -49,9 +57,8 @@ def _patch_start(monkeypatch, manager, allocated_ports, health, port_in_use):
         return next(procs)
 
     monkeypatch.setattr(
-        router_manager, "find_free_port", Mock(side_effect=allocated_ports)
+        router_manager, "reserve_port", Mock(side_effect=allocated_ports)
     )
-    monkeypatch.setattr(router_manager, "_port_in_use", Mock(side_effect=port_in_use))
     monkeypatch.setattr(router_manager.subprocess, "Popen", popen)
     monkeypatch.setattr(manager, "_wait_health", Mock(side_effect=health))
     return cmds
@@ -61,41 +68,7 @@ def _ports(cmd):
     return cmd[cmd.index("--port") + 1], cmd[cmd.index("--prometheus-port") + 1]
 
 
-def test_start_router_retries_after_port_clash(monkeypatch):
-    manager = router_manager.RouterManager()
-    cmds = _patch_start(
-        monkeypatch,
-        manager,
-        [53000, 53001, 53002, 53003],
-        [router_manager._RouterExited, None],
-        lambda port: port == 53001,
-    )
-
-    handle = manager.start_router(router_bin="test-router")
-
-    assert len(cmds) == 2
-    assert _ports(cmds[0]) == ("53000", "53001")
-    assert _ports(cmds[1]) == ("53002", "53003")
-    assert handle.url == "http://127.0.0.1:53002"
-    assert handle.prometheus_port == 53003
-    assert manager._children == [handle.process]
-
-
-def test_start_router_early_exit_without_clash_raises(monkeypatch):
-    manager = router_manager.RouterManager()
-    cmds = _patch_start(
-        monkeypatch,
-        manager,
-        [53000, 53001],
-        [router_manager._RouterExited],
-        lambda port: False,
-    )
-
-    with pytest.raises(RuntimeError, match="code 1.*attempt 1/3"):
-        manager.start_router(router_bin="test-router")
-
-    assert len(cmds) == 1
-    assert manager._children == []
+CLASH = "Error: Os { code: 98, kind: AddrInUse, message: ... }\n"
 
 
 def test_start_router_gives_up_after_three_clashes(monkeypatch):
@@ -105,7 +78,7 @@ def test_start_router_gives_up_after_three_clashes(monkeypatch):
         manager,
         range(53000, 53006),
         [router_manager._RouterExited] * 3,
-        lambda port: True,
+        [CLASH] * 3,
     )
 
     with pytest.raises(RuntimeError, match="port_clash=True, attempt 3/3"):
@@ -122,7 +95,7 @@ def test_start_router_retry_keeps_explicit_port(monkeypatch):
         manager,
         [53001, 53002],
         [router_manager._RouterExited, None],
-        lambda port: port == 53001,
+        [CLASH, ""],
     )
 
     handle = manager.start_router(port=53000, router_bin="test-router")
@@ -131,3 +104,100 @@ def test_start_router_retry_keeps_explicit_port(monkeypatch):
     assert _ports(cmds[1]) == ("53000", "53002")
     assert handle.url == "http://127.0.0.1:53000"
     assert handle.prometheus_port == 53002
+
+
+def test_wait_health_returns_early_when_process_exits():
+    proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(3)"])
+    manager = router_manager.RouterManager()
+
+    start = time.monotonic()
+    with pytest.raises(router_manager._RouterExited):
+        manager._wait_health(f"http://127.0.0.1:{find_free_port()}", 30, proc=proc)
+
+    assert time.monotonic() - start < 5
+    assert proc.returncode == 3
+
+
+FAKE_ROUTER = """\
+#!{python}
+import argparse
+import socket
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--port", type=int)
+parser.add_argument("--prometheus-port", type=int)
+args, _ = parser.parse_known_args()
+{body}
+"""
+
+SERVE = """
+class Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200 if self.path == "/health" else 404)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+HTTPServer.allow_reuse_address = False
+try:
+    prom = socket.create_server(("127.0.0.1", args.prometheus_port), reuse_port=False)
+    server = HTTPServer(("127.0.0.1", args.port), Health)
+except OSError:
+    print("Address already in use", flush=True)
+    sys.exit(1)
+server.serve_forever()
+"""
+
+
+def _fake_router(tmp_path, body):
+    path = tmp_path / "fake_router.py"
+    path.write_text(FAKE_ROUTER.format(python=sys.executable, body=body))
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_start_router_retries_when_reserved_port_is_taken(monkeypatch, tmp_path):
+    release = router_manager.release_all_port_holders
+    taken = []
+
+    def release_then_take_api_port(holders):
+        port = holders[0].getsockname()[1] if holders else None
+        release(holders)
+        if port and not taken:
+            # Another process grabs the API port between release and Popen.
+            taken.append(socket.create_server(("127.0.0.1", port)))
+
+    monkeypatch.setattr(
+        router_manager, "release_all_port_holders", release_then_take_api_port
+    )
+    manager = router_manager.RouterManager()
+    try:
+        handle = manager.start_router(
+            router_bin=_fake_router(tmp_path, SERVE), timeout=10
+        )
+        taken_port = taken[0].getsockname()[1]
+        assert handle.url != f"http://127.0.0.1:{taken_port}"
+        assert requests.get(f"{handle.url}/health", timeout=2).status_code == 200
+        assert manager._children == [handle.process]
+    finally:
+        manager.stop_all()
+        for sock in taken:
+            sock.close()
+
+
+def test_start_router_raises_on_crash_without_port_clash(tmp_path):
+    body = 'print("boom: config is broken", flush=True)\nsys.exit(7)'
+    manager = router_manager.RouterManager()
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            manager.start_router(router_bin=_fake_router(tmp_path, body), timeout=10)
+        message = str(exc.value)
+        assert "code 7" in message
+        assert "attempt 1/3" in message
+        assert "boom: config is broken" in message
+        assert manager._children == []
+    finally:
+        manager.stop_all()
