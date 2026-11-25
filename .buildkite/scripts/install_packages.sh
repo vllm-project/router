@@ -33,11 +33,18 @@ require_sourced() {
   fi
 }
 
+install_python_set() {
+  local set_name="$1"
+  shift
+  python3 -m pip install --disable-pip-version-check --quiet "$@" \
+    -r "${root}/requirements/${set_name}.txt"
+}
+
 activate_venv() {
   python3 -m venv /tmp/venv
   # shellcheck disable=SC1091
   source /tmp/venv/bin/activate
-  pip install -U pip
+  install_python_set pip --upgrade
 }
 
 if [ "$#" -ne 1 ] || [ -z "${1}" ]; then
@@ -53,17 +60,9 @@ if [ "${name}" = "router-bin" ]; then
   exit 0
 fi
 
-if [ "${name}" = "lm-eval" ]; then
-  python3 -m pip install --no-cache-dir \
-    requests \
-    openai \
-    'lm-eval[api]==0.4.12'
-  exit 0
-fi
-
-requirements="$(dirname "${script_path}")/../requirements/${name}.txt"
-if [ -f "${requirements}" ]; then
-  python3 -m pip install --disable-pip-version-check --quiet -r "${requirements}"
+root="$(cd "$(dirname "${script_path}")/.." && pwd)"
+if [ -f "${root}/requirements/${name}.txt" ]; then
+  install_python_set "${name}"
   exit 0
 fi
 
@@ -72,7 +71,6 @@ if [ "${name}" = "python-wheel" ]; then
   apt_name="python"
 fi
 
-root="$(cd "$(dirname "${script_path}")/.." && pwd)"
 config="${root}/ci_apt_packages.conf"
 packages=""
 
@@ -95,7 +93,6 @@ if [ -z "${packages}" ]; then
     fi
   done < "${config}"
   echo "  router-bin"
-  echo "  lm-eval"
   echo "  python-wheel"
   echo "Python dependency sets: ${root}/requirements/*.txt"
   exit 1
@@ -115,5 +112,5 @@ if [ "${name}" = "python" ]; then
 elif [ "${name}" = "python-wheel" ]; then
   require_sourced
   activate_venv
-  pip install build
+  install_python_set build
 fi
