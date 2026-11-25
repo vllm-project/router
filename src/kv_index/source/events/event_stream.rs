@@ -22,10 +22,10 @@ use crate::metrics::RouterMetrics;
 pub struct StreamLease(pub(crate) u64);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum BatchMode {
-    Continuous,
-    FreshLive,
-    ReplayClear,
+enum StreamApplyMode {
+    Continue,
+    RebaseLive,
+    RebaseOnReplayClear,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,7 +132,7 @@ impl EventStream {
             lease,
             seq,
             crate::kv_index::decode_batch(payload),
-            BatchMode::Continuous,
+            StreamApplyMode::Continue,
         )
     }
 
@@ -143,7 +143,7 @@ impl EventStream {
         seq: u64,
         batch: KVEventBatch,
     ) -> Result<bool, StreamError> {
-        self.apply_batch_at(lease, seq, Ok(batch), BatchMode::ReplayClear)
+        self.apply_batch_at(lease, seq, Ok(batch), StreamApplyMode::RebaseOnReplayClear)
     }
 
     /// Start from a fresh SUB connection after the replay budget is exhausted.
@@ -158,7 +158,7 @@ impl EventStream {
             lease,
             seq,
             crate::kv_index::decode_batch(payload),
-            BatchMode::FreshLive,
+            StreamApplyMode::RebaseLive,
         )
     }
 
@@ -167,7 +167,7 @@ impl EventStream {
         lease: StreamLease,
         seq: u64,
         batch: Result<KVEventBatch, String>,
-        mode: BatchMode,
+        mode: StreamApplyMode,
     ) -> Result<bool, StreamError> {
         let prepared = batch
             .as_ref()
@@ -186,13 +186,13 @@ impl EventStream {
                     .iter()
                     .any(|event| matches!(event, KVEvent::AllBlocksCleared(_)))
             });
-            if mode != BatchMode::Continuous {
+            if mode != StreamApplyMode::Continue {
                 if batch.is_err() {
                     return Err(StreamError::Index(SourceError::InvalidBatch));
                 }
-                if (mode == BatchMode::ReplayClear
+                if (mode == StreamApplyMode::RebaseOnReplayClear
                     && (state.phase != Phase::Replaying || !cleared))
-                    || (mode == BatchMode::FreshLive && self.strict_recovery && !cleared)
+                    || (mode == StreamApplyMode::RebaseLive && self.strict_recovery && !cleared)
                 {
                     return Err(StreamError::InvalidState);
                 }
@@ -241,7 +241,7 @@ impl EventStream {
                 state.phase = Phase::Replaying;
                 return Err(StreamError::Index(error));
             }
-            if mode == BatchMode::FreshLive {
+            if mode == StreamApplyMode::RebaseLive {
                 self.index
                     .publish_stream(state, tx, seq + 1)
                     .map_err(StreamError::Index)?;
@@ -257,7 +257,7 @@ impl EventStream {
             if state.visible() {
                 if cleared {
                     self.record_recovery(Reason::ClearBarrier);
-                } else if mode == BatchMode::FreshLive {
+                } else if mode == StreamApplyMode::RebaseLive {
                     self.record_recovery(Reason::FreshObservation);
                 } else if seq == 0 {
                     self.record_recovery(Reason::InitialSequence);
