@@ -2,7 +2,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from ..fixtures import router_manager
+from ..helpers import router_manager
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
@@ -26,7 +26,8 @@ def test_start_router_selects_distinct_prometheus_port(
     monkeypatch.setattr(router_manager.subprocess, "Popen", popen)
     monkeypatch.setattr(manager, "_wait_health", wait_health)
 
-    handle = manager.start_router(port=port, router_bin="test-router")
+    timeout = 12.0
+    handle = manager.start_router(port=port, router_bin="test-router", timeout=timeout)
 
     popen.assert_called_once()
     cmd = popen.call_args.args[0]
@@ -35,4 +36,4 @@ def test_start_router_selects_distinct_prometheus_port(
     assert handle.process is popen.return_value
     assert handle.url == "http://127.0.0.1:53000"
     assert handle.prometheus_port == 53001
-    wait_health.assert_called_once_with(handle.url)
+    wait_health.assert_called_once_with(handle.url, timeout)

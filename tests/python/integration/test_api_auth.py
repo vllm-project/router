@@ -5,9 +5,9 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
 @pytest.mark.integration
-def test_router_api_key_enforcement(router_manager, mock_workers):
+def test_router_api_key_enforcement(router_manager, mock_worker_manager):
     # Start backend requiring API key; router should forward Authorization header transparently
-    _, urls, _ = mock_workers(
+    _, urls, _ = mock_worker_manager.start_workers(
         n=1, args=["--require-api-key", "--api-key", "correct_api_key"]
     )
     rh = router_manager.start_router(
