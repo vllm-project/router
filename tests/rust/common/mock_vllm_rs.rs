@@ -510,7 +510,8 @@ impl MockVllmRs {
 
 macro_rules! mock_control {
     ($($method:ident($request:ident) -> $response:ident;)*) => {
-        /// Records `Abort` and serves the worker discovery RPCs.
+        /// Records `Abort` and serves model/server info. Other Control RPCs
+        /// remain unimplemented unless the server installs a custom response.
         #[tonic::async_trait]
         impl Control for MockVllmRs {
             async fn abort(
@@ -554,7 +555,8 @@ macro_rules! mock_control {
                 request: Request<pb::GetKvEventSourcesRequest>,
             ) -> Result<Response<pb::GetKvEventSourcesResponse>, Status> {
                 self.verify_control("GetKvEventSources", &request)?;
-                Ok(Response::new(pb::GetKvEventSourcesResponse::default()))
+                // An empty successful report would contradict static KV sources.
+                Err(Status::unimplemented("get_kv_event_sources"))
             }
 
             $(
