@@ -96,10 +96,6 @@ discovery; workers can be registered later through `/add_worker`. Gateway mode
 and the Rust OpenAI backend use different configuration paths. See
 [gRPC workers](backend/grpc.md) for supported gRPC worker capabilities.
 
-Regular HTTP health checks and the regular and P/D admin requests
-(`POST /flush_cache` and `GET /get_load`) send the configured bearer token.
-Load polling requires a worker that serves `/get_load`.
-
 ## Routing policies
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
@@ -272,8 +268,14 @@ has tracing support.
 | `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key for the router's own requests to workers, including HTTP health checks. |
 | `--api-key-validation-urls` | `string [0..] (repeatable)` | `[]` | — | — | Validation URLs; an empty list falls back to comma-separated `API_KEY_VALIDATION_URLS` from the environment or `.env`. |
 
-The router uses `--api-key` for its own worker requests. Clients authenticate
-to the router separately with `--api-key-validation-urls`.
+Regular HTTP worker health checks and the regular and P/D admin requests
+(`POST /flush_cache` and `GET /get_load`) send the configured bearer token.
+A cache flush sends one POST per worker base URL, even when several DP ranks
+or P/D roles share it. Load polling requires a worker that serves `/get_load`.
+
+gRPC worker calls and HTTP health checks for P/D or IGW-registered workers
+omit this token. Clients authenticate to the router separately with
+`--api-key-validation-urls`.
 
 The startup wait and `add_worker` always probe `/health`, regardless of
 `--health-check-endpoint`.

@@ -18,7 +18,7 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 pub(crate) const UNLABELED_WORKER_MODEL_ID: &str = "unknown";
 
 /// Attach the router's API key as a bearer token when one is configured.
-pub(crate) fn worker_request(
+fn worker_request(
     request: reqwest::RequestBuilder,
     api_key: Option<&str>,
 ) -> reqwest::RequestBuilder {
@@ -38,14 +38,23 @@ pub(crate) fn worker_get(
     worker_request(client.get(url), api_key)
 }
 
-/// POST request to a worker, with the router's API key as a bearer token when
-/// one is configured.
-pub(crate) fn worker_post(
+/// Flush the cache at one HTTP worker endpoint.
+pub(crate) async fn flush_worker_cache(
     client: &reqwest::Client,
-    url: &str,
+    base_url: &str,
     api_key: Option<&str>,
-) -> reqwest::RequestBuilder {
-    worker_request(client.post(url), api_key)
+) -> Result<(), String> {
+    let request = client.post(format!("{base_url}/flush_cache"));
+    let response = worker_request(request, api_key)
+        .send()
+        .await
+        .map_err(|error| format!("error: {error}"))?;
+    let status = response.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!("returned status: {status}"))
+    }
 }
 
 /// Read the load reported by an HTTP worker after the caller resolves its DP URL.

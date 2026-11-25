@@ -14,7 +14,9 @@ use crate::backend::{
     PrepareError,
 };
 use crate::config::types::RetryConfig;
-use crate::core::worker::{fetch_worker_load, worker_get, worker_post, UNLABELED_WORKER_MODEL_ID};
+use crate::core::worker::{
+    fetch_worker_load, flush_worker_cache, worker_get, UNLABELED_WORKER_MODEL_ID,
+};
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
     RetryExecutor, Worker, WorkerRegistry, WorkerType,
@@ -3427,43 +3429,37 @@ impl RouterTrait for Router {
         // Get all worker URLs
         let worker_urls = self.get_worker_urls();
 
-        // Send the cache flush to all workers concurrently.
+        // Send one flush per physical endpoint, concurrently.
+        let mut endpoints = std::collections::HashSet::new();
         let mut tasks = Vec::new();
         for worker_url in &worker_urls {
-            let worker_url = if self.intra_node_data_parallel_size > 1 {
-                // Need to extract the URL from "http://host:port@dp_rank"
-                let (worker_url_prefix, _dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
-                    Ok(tup) => tup,
-                    Err(e) => {
-                        error!("Failed to extract dp_rank: {}", e);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to extract dp_rank: {}", e),
-                        )
-                            .into_response();
-                    }
-                };
-                worker_url_prefix
-            } else {
-                worker_url
-            };
-            let request_builder = worker_post(
-                &self.client,
-                &format!("{}/flush_cache", worker_url),
-                self.api_key.as_deref(),
-            );
-            tasks.push(request_builder.send());
+            let base_url = match dp_utils::extract_dp_rank(worker_url) {
+                Ok((base_url, _)) => base_url,
+                Err(e) if self.intra_node_data_parallel_size > 1 => {
+                    error!("Failed to extract dp_rank: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to extract dp_rank: {}", e),
+                    )
+                        .into_response();
+                }
+                Err(_) => worker_url,
+            }
+            .trim_end_matches('/');
+            if endpoints.insert(base_url) {
+                tasks.push(flush_worker_cache(
+                    &self.client,
+                    base_url,
+                    self.api_key.as_deref(),
+                ));
+            }
         }
 
         // Wait for all responses
         let results = futures_util::future::join_all(tasks).await;
 
         // Check if all succeeded
-        let all_success = results.iter().all(|r| {
-            r.as_ref()
-                .map(|res| res.status().is_success())
-                .unwrap_or(false)
-        });
+        let all_success = results.iter().all(Result::is_ok);
 
         if all_success {
             (StatusCode::OK, "Cache flushed on all servers").into_response()
@@ -8639,12 +8635,13 @@ mod tests {
         server.abort();
     }
 
-    async fn assert_admin_requests_use_api_key(api_key: Option<&str>) {
+    async fn assert_admin_requests_use_api_key(api_key: Option<&str>, dp_size: usize) {
         use crate::config::RouterConfig;
 
-        let (url, server, _) = start_admin_auth_mock_server(api_key).await;
+        let (url, server, requests) = start_admin_auth_mock_server(api_key).await;
         let config = RouterConfig {
             api_key: api_key.map(str::to_owned),
+            intra_node_data_parallel_size: dp_size,
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             ..Default::default()
@@ -8653,6 +8650,14 @@ mod tests {
 
         let flush = router.flush_cache().await;
         assert_eq!(flush.status(), StatusCode::OK, "flush_cache");
+        assert_eq!(
+            requests
+                .borrow()
+                .iter()
+                .filter(|(path, _)| path == "/flush_cache")
+                .count(),
+            1
+        );
 
         let loads = router.get_worker_loads().await;
         assert_eq!(loads.status(), StatusCode::OK, "get_loads");
@@ -8660,7 +8665,12 @@ mod tests {
             .await
             .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["workers"][0]["load"], 7, "{payload}");
+        let workers = payload["workers"].as_array().unwrap();
+        assert_eq!(workers.len(), dp_size);
+        assert!(
+            workers.iter().all(|worker| worker["load"] == 7),
+            "{payload}"
+        );
         assert_eq!(
             Router::get_worker_load_static(&Client::new(), &url, api_key).await,
             Some(7)
@@ -8671,12 +8681,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_flush_cache_and_get_load_send_api_key() {
-        assert_admin_requests_use_api_key(Some("worker-key")).await;
+        assert_admin_requests_use_api_key(Some("worker-key"), 2).await;
     }
 
     #[tokio::test]
     async fn test_flush_cache_and_get_load_send_no_authorization_without_api_key() {
-        assert_admin_requests_use_api_key(None).await;
+        assert_admin_requests_use_api_key(None, 1).await;
     }
 
     #[tokio::test]
