@@ -1,4 +1,6 @@
-# KV transfer planning for kv_aware
+# Peer fetch for kv_aware
+
+**Terms.** *Peer fetch* is this feature: the router plans whether a picked worker should fetch a prefix from a peer (`--peer-fetch-*`, `peer_fetch:`, `vllm_router_peer_fetch_*`) and, in active mode, tells the engine to do it through `kv_transfer_params`. *KV transfer* elsewhere in the router means the PD connector and the tier credits (`--kv-penalty-*`).
 
 ## What it does
 
@@ -27,14 +29,14 @@ sequenceDiagram
     P->>P: 4. rank peers that share the destination's cache identity
     P->>P: 5. run the gates on each peer in rank order
     P-->>R: 6. plan, or the skip reason
-    R->>R: 7. count vllm_router_kv_transfer_plans_total{outcome}
+    R->>R: 7. count vllm_router_peer_fetch_plans_total{outcome}
     alt shadow mode, or no plan
         R->>D: 8a. request, unchanged
     else active mode and a plan
         R->>R: 8b. look up the source's peer address, take an in-flight slot
         R->>D: 9. request + kv_transfer_params (source address)
         D->>S: 10. peer lookup and KV read (engine to engine)
-        R->>R: 11. count vllm_router_kv_transfer_requests_total{outcome}
+        R->>R: 11. count vllm_router_peer_fetch_requests_total{outcome}
     end
     D-->>C: response
     R->>R: 12. free the in-flight slot when the request ends
@@ -50,11 +52,11 @@ Checks run in this order. The first one that fails gives the outcome label.
 
 | Check | Outcome label |
 |---|---|
+| The client set `prompt_logprobs` or `prompt_logprob_token_ids` (the engine computes every prompt token for these, so it reads no external KV; the request still gets its KV-aware worker but takes no source permit) | `prompt_logprobs` |
 | The pick came from a session binding | `session_binding` |
 | The request has no token ids to match | `missing_tokens` |
-| The client set `prompt_logprobs` or `prompt_logprob_token_ids` (the engine computes every prompt token for these, so it reads no external KV; the request still gets its KV-aware worker but takes no source permit) | `prompt_logprobs` |
 
-**Planner, request level (`plan_transfer`, `kv_transfer.rs`):**
+**Planner, request level (`plan_transfer`, `peer_fetch.rs`):**
 
 | Check | Outcome label |
 |---|---|
@@ -94,8 +96,8 @@ transfer_ms < saved_ms * margin
 | Term | Formula | Inputs come from |
 |---|---|---|
 | `credited` | `min(missing_blocks * block_size, input_tokens - 1 - dest_prefix_blocks * block_size)` | KV index hits for the destination's prompt |
-| `transfer_ms` | `transfer_fixed_ms + credited * transfer_us_per_token / 1000` | `--kv-transfer-fixed-ms`, `--kv-transfer-us-per-token` |
-| `dest_queue_ms` | `dest.active_prefill_tokens * prefill_us_per_token / 1000` | router's in-flight accounting, `--kv-transfer-prefill-us-per-token` |
+| `transfer_ms` | `transfer_fixed_ms + credited * transfer_us_per_token / 1000` | `--peer-fetch-fixed-ms`, `--peer-fetch-us-per-token` |
+| `dest_queue_ms` | `dest.active_prefill_tokens * prefill_us_per_token / 1000` | router's in-flight accounting, `--peer-fetch-prefill-us-per-token` |
 | `source_wait_ms` | `source.active_prefill_tokens * prefill_us_per_token / 1000` | same |
 | `fetch_ms` | `dest_queue_ms + transfer_ms + prefill(remaining on destination after the fetch)` | remaining tokens use the routing estimate (tier credits `--kv-penalty-*`) |
 | `wait_ms` | `source_wait_ms + prefill(remaining on source)` | same routing estimate |
@@ -119,7 +121,7 @@ The planned rate from shadow mode is an upper estimate. Read it with these four 
 
 1. **The wait path is priced as serial time.** `source_wait_ms` treats the source's queued tokens as if they run one after another. Routing itself scores workers as `(new prefill + queued tokens) * (active requests + 1)`, so the two numbers are not on the same scale, and a batching engine drains its queue faster than the serial estimate. This overstates `wait_ms`.
 2. **The source's export work is free.** `fetch_ms` has no term for the busy source serving the read. This understates `fetch_ms`.
-3. **The counter counts selections, not requests.** `vllm_router_kv_transfer_plans_total` is incremented once per selection. A retried request is counted again, and there is no per-request total to divide by.
+3. **The counter counts selections, not requests.** `vllm_router_peer_fetch_plans_total` is incremented once per selection. A retried request is counted again, and there is no per-request total to divide by.
 4. **Host-memory blocks are counted as sendable, but the engine serves GPU blocks only.** The planner treats a peer's `HostPinned` blocks as exportable. The vLLM NIXL peer lookup pins and serves GPU blocks only, so the destination fetches the GPU part and computes the rest. A fetch is never wrong, only slower than estimated. This overstates `saved_ms` for peers that hold much of the prefix in host memory. It goes away once the engine can pin and serve host blocks under the same lease as GPU blocks, which is the intended follow-up on the engine side.
 
 Points 1, 2 and 4 all favour `planned`. Calibrate the constants against a measured baseline before acting on the rate.
@@ -133,7 +135,7 @@ Points 1, 2 and 4 all favour `planned`. Calibrate the constants against a measur
 | `shadow` | `true` | plus: source can export, destination can import, same connector, version and layout fingerprint | counted, request unchanged |
 | `active` | forced `true` | same as above | counted; then see below |
 
-In `active` mode a planned request goes through these checks, in order. Each failure is counted on `vllm_router_kv_transfer_requests_total{outcome}` and the request is sent unchanged.
+In `active` mode a planned request goes through these checks, in order. Each failure is counted on `vllm_router_peer_fetch_requests_total{outcome}` and the request is sent unchanged. Only POST requests reach these checks: the router reads token ids only from POST bodies, so any other method stops at `missing_tokens` in `plans_total` and never takes a source slot.
 
 | Check | Outcome |
 |---|---|
@@ -148,7 +150,13 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 
 **Where capabilities come from.**
 - *Engine-reported:* a worker's `peer_lookup` record on `/kv_event_sources` gives both a capability and a peer address (host, port, engine id, TP/DCP/PP sizes). The record is described below.
-- *Static:* `kv_transfer.capabilities` in the router config gives a capability only. It has no address, so a statically declared source can be planned in shadow mode but always ends as `no_peer_endpoint` in active mode. A static entry wins over the engine's capability for the same worker; the engine's address is still stored.
+- *Static:* `--peer-fetch-capability WORKER_URL=JSON` (repeatable; `peer_fetch.capabilities` in a config file) gives a capability only. A static entry wins over the engine's capability for the same worker, but the router still stores the address from the engine's `peer_lookup` record. In active mode a static source is fetchable when its engine reports that address, and ends as `no_peer_endpoint` when it does not. Example:
+
+  ```bash
+  --peer-fetch-capability 'http://10.0.0.1:8000={"connector":"nixl","connector_version":"1","layout_fingerprint":"llama70b-fp8-tp8-b16"}'
+  ```
+
+  `can_export` and `can_import` default to `true`. The flag needs `--policy kv_aware` and `--peer-fetch-mode shadow` or `active`; an unknown key, an empty field or a repeated worker URL fails at startup.
 
 **The `peer_lookup` record.** `/kv_event_sources` returns a JSON object keyed by DP rank as a string (`"0"`, `"1"`, ...). A key that is not a number is skipped without a warning. Each rank's entry may carry a `peer_lookup` object. The router attaches to a worker the record of the worker's own DP rank, or of rank `"0"` when the worker has no DP rank.
 
@@ -199,15 +207,15 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 
 **Registration binding.** The planner checks a source's layout against the record it read. Discovery can replace a worker's record (new engine id, port or layout) for the same URL after the planner read it. So the grant fetches only if both the source and the destination still have the record and registration the planner saw, and it uses the address from that record. Otherwise the outcome is `registration_changed` and the request is sent unchanged, never with the old cache credit. Re-polling an identical record does not count as a change.
 
-**Kill switch.** `POST /kv_transfer/peer_fetch` with `{"enabled": false}` stops peer fetches on every active-mode `kv_aware` policy of the router at once; `{"enabled": true}` resumes them.
-- Routing, planning and the `planned` count on `vllm_router_kv_transfer_plans_total` continue as before. A planned request is sent without `kv_transfer_params` and is not counted on `vllm_router_kv_transfer_requests_total`, as in shadow mode.
+**Kill switch.** `POST /peer_fetch` with `{"enabled": false}` stops peer fetches on every active-mode `kv_aware` policy of the router at once; `{"enabled": true}` resumes them.
+- Routing, planning and the `planned` count on `vllm_router_peer_fetch_plans_total` continue as before. A planned request is sent without `kv_transfer_params` and is not counted on `vllm_router_peer_fetch_requests_total`, as in shadow mode.
 - It takes effect for selections made after the call. Fetches already in flight finish normally.
 - The state is held in memory only. A restart returns to the configured mode.
 - It covers one router instance. With several router replicas, call each one.
 - It is a manual switch, not a circuit breaker: the router never flips it by itself.
 - It uses the same authorization as the other admin routes. Any key accepted by one of the `api_key_validation_urls` can flip it, and when none are configured the endpoint is open.
 
-`GET /kv_transfer/peer_fetch` returns the current state. `POST /kv_transfer/peer_fetch` takes a JSON object with one boolean field:
+`GET /peer_fetch` returns the current state. `POST /peer_fetch` takes a JSON object with one boolean field:
 
 ```json
 {"enabled": false}
@@ -219,7 +227,7 @@ Both return the state after the call:
 {
   "enabled": false,
   "policies": [
-    {"models": ["my-model"], "default": true, "enabled": false}
+    {"models": ["my-model"], "default": true}
   ]
 }
 ```
@@ -230,7 +238,6 @@ Both return the state after the call:
 | `policies` | Each active-mode `kv_aware` policy instance the switch covers; empty when no policy is in active mode |
 | `policies[].models` | Model ids routed by this instance, sorted. Empty until a worker registers |
 | `policies[].default` | Whether this instance is the router's main policy |
-| `policies[].enabled` | Whether this instance fetches now; always equal to the top-level `enabled` |
 
 | Status | When |
 |---|---|
@@ -239,7 +246,7 @@ Both return the state after the call:
 | 401 | API keys are configured and the request has no accepted key. Checked before the body is read |
 | 409 | No policy is in active mode: `{"error": "no policy in active mode"}`. The state is not changed |
 
-Each successful `POST` is logged at `WARN` with the new state and sets `vllm_router_kv_transfer_peer_fetch_enabled`.
+Each successful `POST` is logged at `WARN` with the new state and sets `vllm_router_peer_fetch_enabled`.
 
 **Not supported.**
 - Prefill/decode (PD) routing: any mode other than `off` is rejected at startup.
@@ -249,8 +256,8 @@ Each successful `POST` is logged at `WARN` with the new state and sets `vllm_rou
 
 | Metric | Labels | Meaning |
 |---|---|---|
-| `vllm_router_kv_transfer_plans_total` | `outcome` | One per selection: `planned` or a skip label from the tables above |
-| `vllm_router_kv_transfer_requests_total` | `outcome` | Active mode only, one per planned request: `sent`, `grpc_destination`, `registration_changed`, `no_peer_endpoint`, `inflight_cap`, `client_params_present`, `prompt_logprobs`, `invalid_body` |
-| `vllm_router_kv_transfer_estimated_saved_ms` | none | `saved_ms` of each planned transfer |
-| `vllm_router_kv_transfer_estimated_cost_ms` | `path` = `fetch` or `wait` | Both estimates, whenever the cost rule was evaluated |
-| `vllm_router_kv_transfer_peer_fetch_enabled` | none | Gauge: 1 while the kill switch lets active-mode policies fetch, 0 while it stops them. Set at startup when the main policy is in active mode, and on each successful `POST /kv_transfer/peer_fetch` |
+| `vllm_router_peer_fetch_plans_total` | `outcome` | One per selection: `planned` or a skip label from the tables above |
+| `vllm_router_peer_fetch_requests_total` | `outcome` | Active mode only, one per planned request: `sent`, `grpc_destination`, `registration_changed`, `no_peer_endpoint`, `inflight_cap`, `client_params_present`, `prompt_logprobs`, `invalid_body` |
+| `vllm_router_peer_fetch_estimated_saved_ms` | none | `saved_ms` of each planned transfer |
+| `vllm_router_peer_fetch_estimated_cost_ms` | `path` = `fetch` or `wait` | Both estimates, whenever the cost rule was evaluated |
+| `vllm_router_peer_fetch_enabled` | none | Gauge: 1 while the kill switch lets active-mode policies fetch, 0 while it stops them. Set at startup when the main policy is in active mode, and on each successful `POST /peer_fetch` |

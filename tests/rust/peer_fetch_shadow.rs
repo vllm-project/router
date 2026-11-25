@@ -4,12 +4,12 @@
 //! mock workers that publish real KV events.
 //!
 //! Each test starts a real `kv_aware` router (`RouterFactory::create_router`,
-//! the same path `main` takes) with `kv_transfer: {mode: shadow}` (or active) and only
+//! the same path `main` takes) with `peer_fetch: {mode: shadow}` (or active) and only
 //! [`KvEventMock`] backends. The mocks answer discovery over HTTP and publish
 //! `BlockStored` / `BlockRemoved` / `AllBlocksCleared` over ZMQ, so the router
 //! builds its index from the wire exactly as it does against vLLM. Requests carry
 //! token ids (`/v1/completions` with an integer prompt) and each test asserts on
-//! the delta of `vllm_router_kv_transfer_plans_total{outcome}`.
+//! the delta of `vllm_router_peer_fetch_plans_total{outcome}`.
 //!
 //! # How the counter is read
 //!
@@ -32,7 +32,7 @@
 //!
 //! # Active mode
 //!
-//! The last section runs the same fixture with `kv_transfer: {mode: active}`.
+//! The last section runs the same fixture with `peer_fetch: {mode: active}`.
 //! The mocks record every request body, so those tests assert on exactly what
 //! reached the destination worker (`kv_transfer_params` from the source's
 //! `peer_lookup` record) and what did not.
@@ -58,17 +58,17 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tower::ServiceExt;
-use vllm_router_rs::config::types::{KvTransferConfig, KvTransferMode};
+use vllm_router_rs::config::types::{PeerFetchConfig, PeerFetchMode};
 use vllm_router_rs::config::{PolicyConfig, RouterConfig, RoutingMode};
 use vllm_router_rs::policies::KvAwarePolicy;
 use vllm_router_rs::routers::RouterFactory;
 use vllm_router_rs::server::AppContext;
 
 const BLOCK_SIZE: u32 = 16;
-const COUNTER: &str = "vllm_router_kv_transfer_plans_total";
-const REQUESTS: &str = "vllm_router_kv_transfer_requests_total";
-const SAVED_MS: &str = "vllm_router_kv_transfer_estimated_saved_ms";
-const COST_MS: &str = "vllm_router_kv_transfer_estimated_cost_ms";
+const COUNTER: &str = "vllm_router_peer_fetch_plans_total";
+const REQUESTS: &str = "vllm_router_peer_fetch_requests_total";
+const SAVED_MS: &str = "vllm_router_peer_fetch_estimated_saved_ms";
+const COST_MS: &str = "vllm_router_peer_fetch_estimated_cost_ms";
 
 // ---------------------------------------------------------------------------
 // Metrics and serialization
@@ -222,7 +222,7 @@ struct Options {
     workers: Vec<(&'static str, &'static str)>,
     router_temperature: f64,
     session_ttl_secs: Option<u64>,
-    transfer: KvTransferConfig,
+    transfer: PeerFetchConfig,
     /// `peer_lookup` record each mock reports, by instance id.
     peers: BTreeMap<&'static str, PeerLookupMock>,
 }
@@ -233,10 +233,10 @@ impl Options {
             workers: workers.to_vec(),
             router_temperature: 0.0,
             session_ttl_secs: None,
-            transfer: KvTransferConfig {
-                mode: KvTransferMode::Shadow,
+            transfer: PeerFetchConfig {
+                mode: PeerFetchMode::Shadow,
                 require_capability: false,
-                ..KvTransferConfig::default()
+                ..PeerFetchConfig::default()
             },
             peers: BTreeMap::new(),
         }
@@ -245,7 +245,7 @@ impl Options {
     /// Active mode: planned requests carry `kv_transfer_params`. Capabilities
     /// come from the engines' records, as active mode requires.
     fn active(mut self, peers: &[(&'static str, PeerLookupMock)]) -> Self {
-        self.transfer.mode = KvTransferMode::Active;
+        self.transfer.mode = PeerFetchMode::Active;
         self.with_engine_capabilities(peers)
     }
 
@@ -289,7 +289,7 @@ impl Fixture {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-                kv_transfer: Some(Box::new(options.transfer.clone())),
+                peer_fetch: Some(Box::new(options.transfer.clone())),
             },
             kv_aware_session_affinity_ttl_secs: options.session_ttl_secs,
             port: 0,
@@ -785,7 +785,7 @@ async fn removal_events_drop_credit_and_restore_recovers_it() {
 
 // ---------------------------------------------------------------------------
 // Engine-reported capabilities (`peer_lookup` in /kv_event_sources), with
-// `require_capability: true` and no static `kv_transfer.capabilities`. Same
+// `require_capability: true` and no static `peer_fetch.capabilities`. Same
 // setup as scenario 1: A holds 100 blocks and is busy, B is idle and cold.
 // ---------------------------------------------------------------------------
 
@@ -1043,7 +1043,7 @@ async fn s15_inflight_cap_holds_until_the_stream_ends() {
 #[tokio::test]
 async fn s16_source_without_an_address_is_not_fetched_from() {
     let mut options = Options::new(&[("a", "m"), ("b", "m")]);
-    options.transfer.mode = KvTransferMode::Active;
+    options.transfer.mode = PeerFetchMode::Active;
     options.transfer.require_capability = true;
     // No engine records at all; the capabilities are added below, once the
     // mock URLs are known.
@@ -1166,16 +1166,16 @@ async fn s17_rediscovered_source_record_replaces_the_old_address() {
 }
 
 // ---------------------------------------------------------------------------
-// Kill switch: POST /kv_transfer/peer_fetch flips active mode at runtime.
+// Kill switch: POST /peer_fetch flips active mode at runtime.
 // ---------------------------------------------------------------------------
 
-const PEER_FETCH_GAUGE: &str = "vllm_router_kv_transfer_peer_fetch_enabled";
+const PEER_FETCH_GAUGE: &str = "vllm_router_peer_fetch_enabled";
 
 /// POST `{"enabled": enabled}` to the kill switch; returns status and body.
 async fn set_peer_fetch(app: &Router, enabled: bool) -> (u16, serde_json::Value) {
     let request = Request::builder()
         .method("POST")
-        .uri("/kv_transfer/peer_fetch")
+        .uri("/peer_fetch")
         .header("content-type", "application/json")
         .body(Body::from(json!({ "enabled": enabled }).to_string()))
         .unwrap();

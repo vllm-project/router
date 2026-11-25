@@ -1,7 +1,5 @@
 use super::ConfigResult;
 use crate::config::validation::ConfigValidator;
-use crate::policies::kv_transfer_capability::StaticTransferCapability;
-use crate::policies::TransferPolicy;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
@@ -1043,7 +1041,7 @@ pub enum PolicyConfig {
         static_kv_event_sources: Box<HashMap<String, StaticKvEventSources>>,
         /// Optional KV transfer planning. Absent means off.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        kv_transfer: Option<Box<KvTransferConfig>>,
+        peer_fetch: Option<Box<PeerFetchConfig>>,
     },
 
     #[serde(rename = "power_of_two")]
@@ -1073,7 +1071,7 @@ pub enum PolicyConfig {
 /// KV transfer planner mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum KvTransferMode {
+pub enum PeerFetchMode {
     /// No planner is built.
     #[default]
     Off,
@@ -1085,14 +1083,15 @@ pub enum KvTransferMode {
     Active,
 }
 
-/// Settings for the KV transfer planner. `transfer_policy()` is the only way to
-/// build a `TransferPolicy`: `enabled` is derived from `mode`, and
+/// Settings for the KV transfer planner. `PeerFetchRules::from(&config)` (in
+/// `policies::peer_fetch`) is the only way to build a planner policy:
+/// `enabled` is derived from `mode`, and
 /// `require_capability` defaults to `false` so shadow measurement works without
 /// declared capabilities.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
-pub struct KvTransferConfig {
-    pub mode: KvTransferMode,
+pub struct PeerFetchConfig {
+    pub mode: PeerFetchMode,
     pub min_prefix_blocks: u32,
     pub source_load_threshold: usize,
     pub margin: f64,
@@ -1108,10 +1107,10 @@ pub struct KvTransferConfig {
     pub capabilities: HashMap<String, StaticTransferCapability>,
 }
 
-impl Default for KvTransferConfig {
+impl Default for PeerFetchConfig {
     fn default() -> Self {
         Self {
-            mode: KvTransferMode::Off,
+            mode: PeerFetchMode::Off,
             min_prefix_blocks: 64,
             source_load_threshold: 1,
             margin: 0.8,
@@ -1125,20 +1124,76 @@ impl Default for KvTransferConfig {
     }
 }
 
-impl KvTransferConfig {
-    /// The planner policy for this block. `enabled` follows `mode`.
-    pub fn transfer_policy(&self) -> TransferPolicy {
-        TransferPolicy {
-            enabled: self.mode != KvTransferMode::Off,
-            min_prefix_blocks: self.min_prefix_blocks,
-            source_load_threshold: self.source_load_threshold,
-            // Active transfers must never run on a shared cache identity alone.
-            require_capability: self.require_capability || self.mode == KvTransferMode::Active,
-            prefill_us_per_token: self.prefill_us_per_token,
-            transfer_fixed_ms: self.transfer_fixed_ms,
-            transfer_us_per_token: self.transfer_us_per_token,
-            margin: self.margin,
+impl PeerFetchConfig {
+    /// True when the margin is in (0, 1] and every cost constant is finite and >= 0.
+    pub fn cost_constants_valid(&self) -> bool {
+        peer_fetch_cost_constants_valid(
+            self.margin,
+            self.prefill_us_per_token,
+            self.transfer_fixed_ms,
+            self.transfer_us_per_token,
+        )
+    }
+}
+
+/// The numeric rule shared by `PeerFetchConfig` and the planner policy built
+/// from it.
+pub fn peer_fetch_cost_constants_valid(
+    margin: f64,
+    prefill_us_per_token: f64,
+    transfer_fixed_ms: f64,
+    transfer_us_per_token: f64,
+) -> bool {
+    [
+        prefill_us_per_token,
+        transfer_fixed_ms,
+        transfer_us_per_token,
+    ]
+    .into_iter()
+    .all(|value| value.is_finite() && value >= 0.0)
+        && margin.is_finite()
+        && margin > 0.0
+        && margin <= 1.0
+}
+
+/// One worker's declared KV transfer capability, as written in config.
+///
+/// Besides engine-reported capabilities, the operator can state one per worker
+/// URL. Nothing here is verified against the engine: a wrong entry makes the
+/// planner's `Incompatible` check wrong, so a fingerprint must be identical on
+/// workers with the same model, KV dtype, TP/PP shape, block size and
+/// quantization, and different otherwise. Shadow mode does not need this at all
+/// when `require_capability` is false.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StaticTransferCapability {
+    #[serde(default = "default_true")]
+    pub can_export: bool,
+    #[serde(default = "default_true")]
+    pub can_import: bool,
+    /// Transport name, e.g. "nixl".
+    pub connector: String,
+    pub connector_version: String,
+    /// Operator-chosen label; equal labels mean compatible KV layouts.
+    pub layout_fingerprint: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl StaticTransferCapability {
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("connector", &self.connector),
+            ("connector_version", &self.connector_version),
+            ("layout_fingerprint", &self.layout_fingerprint),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("{name} is empty"));
+            }
         }
+        Ok(())
     }
 }
 
@@ -1553,7 +1608,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.4,
                 static_kv_event_sources: Default::default(),
-                kv_transfer: None,
+                peer_fetch: None,
             },
         );
         config.pd_kv_event_sources.insert(
@@ -2513,52 +2568,39 @@ mod tests {
     }
 
     #[test]
-    fn kv_transfer_is_off_by_default_and_round_trips() {
+    fn peer_fetch_is_off_by_default_and_round_trips() {
         let policy: PolicyConfig = serde_json::from_str(r#"{"type":"kv_aware"}"#).unwrap();
-        let PolicyConfig::KvAware { kv_transfer, .. } = &policy else {
+        let PolicyConfig::KvAware { peer_fetch, .. } = &policy else {
             panic!("expected kv_aware");
         };
-        assert!(kv_transfer.is_none());
+        assert!(peer_fetch.is_none());
         // No block is emitted when absent, so old and new configs match.
         assert!(!serde_json::to_string(&policy)
             .unwrap()
-            .contains("kv_transfer"));
+            .contains("peer_fetch"));
 
-        let defaults: KvTransferConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(defaults, KvTransferConfig::default());
-        assert_eq!(defaults.mode, KvTransferMode::Off);
-        assert_eq!(
-            defaults.transfer_policy(),
-            TransferPolicy {
-                enabled: false,
-                min_prefix_blocks: 64,
-                source_load_threshold: 1,
-                require_capability: false,
-                prefill_us_per_token: 50.0,
-                transfer_fixed_ms: 5.0,
-                transfer_us_per_token: 5.0,
-                margin: 0.8,
-            }
-        );
+        let defaults: PeerFetchConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults, PeerFetchConfig::default());
+        assert_eq!(defaults.mode, PeerFetchMode::Off);
+        assert!(defaults.cost_constants_valid());
 
-        let json = r#"{"type":"kv_aware","kv_transfer":{"mode":"shadow","min_prefix_blocks":8,
+        let json = r#"{"type":"kv_aware","peer_fetch":{"mode":"shadow","min_prefix_blocks":8,
             "margin":0.5,"capabilities":{"http://a":{"connector":"nixl",
             "connector_version":"1","layout_fingerprint":"fp"}}}}"#;
         let parsed: PolicyConfig = serde_json::from_str(json).unwrap();
         let again: PolicyConfig =
             serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
         for config in [parsed, again] {
-            let PolicyConfig::KvAware { kv_transfer, .. } = config else {
+            let PolicyConfig::KvAware { peer_fetch, .. } = config else {
                 panic!("expected kv_aware");
             };
-            let block = kv_transfer.unwrap();
-            assert_eq!(block.mode, KvTransferMode::Shadow);
+            let block = peer_fetch.unwrap();
+            assert_eq!(block.mode, PeerFetchMode::Shadow);
             assert_eq!((block.min_prefix_blocks, block.margin), (8, 0.5));
             assert_eq!(block.capabilities["http://a"].layout_fingerprint, "fp");
-            assert!(block.transfer_policy().enabled);
         }
 
-        assert!(serde_json::from_str::<KvTransferConfig>(r#"{"mode":"shadow","typo":1}"#).is_err());
-        assert!(serde_json::from_str::<KvTransferConfig>(r#"{"mode":"loud"}"#).is_err());
+        assert!(serde_json::from_str::<PeerFetchConfig>(r#"{"mode":"shadow","typo":1}"#).is_err());
+        assert!(serde_json::from_str::<PeerFetchConfig>(r#"{"mode":"loud"}"#).is_err());
     }
 }

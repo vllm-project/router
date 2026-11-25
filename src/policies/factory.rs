@@ -1,13 +1,13 @@
 //! Factory for creating load balancing policies
 
-use super::kv_transfer_capability::parse_static_capabilities;
-use super::CostRuleTransferPlanner;
+use super::peer_fetch_capability::parse_static_capabilities;
+use super::CostRulePeerFetchPlanner;
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, CostParams, KvAffinityTable,
-    KvAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy,
-    RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
+    KvAwarePolicy, LoadBalancingPolicy, PeerFetchRules, PowerOfTwoPolicy, RandomPolicy,
+    RendezvousHashPolicy, RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
 };
-use crate::config::types::{KvTransferConfig, KvTransferMode};
+use crate::config::types::{PeerFetchConfig, PeerFetchMode};
 use crate::config::PolicyConfig;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -52,7 +52,7 @@ impl PolicyFactory {
                 kv_penalty_host,
                 kv_penalty_external,
                 kv_penalty_disk,
-                kv_transfer,
+                peer_fetch,
                 ..
             } => {
                 let mut policy = KvAwarePolicy::new(CostParams {
@@ -68,9 +68,9 @@ impl PolicyFactory {
                 if let Some(table) = kv_affinity_table {
                     policy = policy.with_shared_affinity(Arc::clone(table));
                 }
-                Arc::new(Self::apply_kv_transfer(
+                Arc::new(Self::apply_peer_fetch_config(
                     policy,
-                    kv_transfer.as_deref(),
+                    peer_fetch.as_deref(),
                     None,
                 ))
             }
@@ -91,12 +91,12 @@ impl PolicyFactory {
     /// In active mode, `peer_fetch_enabled` is the kill switch flag to share
     /// (the registry passes its own so one switch covers every policy it
     /// builds); `None` gives the policy a flag of its own.
-    pub(crate) fn apply_kv_transfer(
+    pub(crate) fn apply_peer_fetch_config(
         policy: KvAwarePolicy,
-        config: Option<&KvTransferConfig>,
+        config: Option<&PeerFetchConfig>,
         peer_fetch_enabled: Option<&Arc<AtomicBool>>,
     ) -> KvAwarePolicy {
-        let Some(config) = config.filter(|c| c.mode != KvTransferMode::Off) else {
+        let Some(config) = config.filter(|c| c.mode != PeerFetchMode::Off) else {
             return policy;
         };
         // Validation rejects bad capability tables at startup; a failure here
@@ -104,15 +104,15 @@ impl PolicyFactory {
         let capabilities = match parse_static_capabilities(&config.capabilities) {
             Ok(capabilities) => capabilities,
             Err(error) => {
-                tracing::warn!(%error, "ignoring invalid kv_transfer capabilities");
+                tracing::warn!(%error, "ignoring invalid peer_fetch capabilities");
                 Default::default()
             }
         };
-        let policy = policy.with_transfer_planner(Arc::new(CostRuleTransferPlanner {
-            policy: config.transfer_policy(),
+        let policy = policy.with_transfer_planner(Arc::new(CostRulePeerFetchPlanner {
+            policy: PeerFetchRules::from(config),
         }));
         policy.register_static_capabilities(capabilities);
-        if config.mode == KvTransferMode::Active {
+        if config.mode == PeerFetchMode::Active {
             return match peer_fetch_enabled {
                 Some(flag) => {
                     policy.with_shared_peer_fetch(config.max_inflight_per_source, Arc::clone(flag))
@@ -185,7 +185,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-                kv_transfer: None,
+                peer_fetch: None,
             },
             None,
         );
@@ -217,7 +217,7 @@ mod tests {
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.3,
             static_kv_event_sources: Default::default(),
-            kv_transfer: None,
+            peer_fetch: None,
         };
 
         // Without a shared table the factory-built policy must NOT report

@@ -12,12 +12,13 @@ use parking_lot::Mutex;
 use rand::Rng;
 use sha2::{Digest as _, Sha256};
 
-use super::kv_transfer::{
-    PeerEndpoint, PeerFetchGrant, PeerFetchLimiter, PeerInput, TransferCapability, TransferOutcome,
-    TransferPlan, TransferPlanner, TransferPlannerInput, TransferSkip,
+use super::peer_fetch::{
+    PeerEndpoint, PeerFetchGrant, PeerFetchLimiter, PeerFetchOutcome, PeerFetchPlan,
+    PeerFetchPlanner, PeerFetchPlannerInput, PeerFetchRequestOutcome, PeerFetchSkip, PeerInput,
+    TransferCapability,
 };
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
-use crate::core::Worker;
+use crate::core::{ConnectionMode, Worker};
 use crate::kv_index::{
     CacheKey, MatchQuery, PeerLookupRecord, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo,
 };
@@ -40,12 +41,13 @@ pub enum KvRequestTokens<'a> {
 
 /// Request-local placement qualification; it restricts credit, not candidacy.
 #[derive(Clone, Copy)]
-pub(crate) struct QualifiedKvInput<'a> {
-    pub(crate) tokens: KvRequestTokens<'a>,
-    pub(crate) eligibility: Option<&'a [bool]>,
-    /// `false` keeps worker selection but plans no peer fetch, so the request
-    /// takes no source permit.
-    pub(crate) transfer: bool,
+pub struct QualifiedKvInput<'a> {
+    pub tokens: KvRequestTokens<'a>,
+    pub eligibility: Option<&'a [bool]>,
+    /// Whether transfer planning may run after destination selection.
+    /// `false` still picks the destination but plans no source to fetch
+    /// from, so the request takes no source permit.
+    pub allow_transfer_plan: bool,
 }
 
 impl QualifiedKvInput<'_> {
@@ -156,24 +158,21 @@ pub trait KvAwareOps: Send + Sync {
     /// slice, before health filtering. The built-in policy treats `None` as
     /// unrestricted. Implementers without this extension return `None` without
     /// querying or reserving, rather than silently ignoring a supplied mask.
-    #[allow(clippy::too_many_arguments)]
     fn select_worker_with_qualified_inputs(
         &self,
         workers: &[Arc<dyn Worker>],
-        tokens: KvRequestTokens<'_>,
+        input: QualifiedKvInput<'_>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
-        eligibility: Option<&[bool]>,
-        _transfer: bool,
     ) -> Option<KvSelectionReceipt> {
-        if eligibility.is_some() {
+        if input.eligibility.is_some() {
             return None;
         }
         self.select_worker_with_inputs(
             workers,
-            tokens,
+            input.tokens,
             lora_name,
             cache_salt,
             affinity_key,
@@ -984,11 +983,11 @@ pub struct KvAwarePolicy {
     selection_lock: Mutex<()>,
     /// Test-only: the plan of the latest successful selection.
     #[cfg(test)]
-    last_transfer_plan: Mutex<Option<TransferPlan>>,
+    last_transfer_plan: Mutex<Option<PeerFetchPlan>>,
     /// Every registration gets a new generation, including load-only targets.
     next_generation: AtomicU64,
     /// Opt-in transfer planner; `None` leaves selection untouched.
-    transfer_planner: Option<Arc<dyn TransferPlanner>>,
+    transfer_planner: Option<Arc<dyn PeerFetchPlanner>>,
     /// Peer KV transfer registration per worker URL. Writers replace the whole
     /// `Arc` under `selection_lock`; readers clone it and see one consistent
     /// capability/endpoint pair. A capability without an endpoint can be
@@ -996,7 +995,7 @@ pub struct KvAwarePolicy {
     peer_regs: DashMap<String, Arc<PeerRegistration>>,
     /// Source of `PeerRegistration::epoch`; starts at 1.
     next_peer_epoch: AtomicU64,
-    /// Source of `TransferPlan::plan_id`; starts at 1 so 0 means unassigned.
+    /// Source of `PeerFetchPlan::plan_id`; starts at 1 so 0 means unassigned.
     next_transfer_plan_id: AtomicU64,
     /// Active-mode peer fetch; `None` unless the policy was built active.
     peer_fetch: Option<PeerFetchState>,
@@ -1164,13 +1163,14 @@ impl KvAwarePolicy {
 
     /// Enable transfer planning. Plans are attached to receipts
     /// but never change routing.
-    pub(crate) fn with_transfer_planner(mut self, planner: Arc<dyn TransferPlanner>) -> Self {
+    pub(crate) fn with_transfer_planner(mut self, planner: Arc<dyn PeerFetchPlanner>) -> Self {
         self.transfer_planner = Some(planner);
         self
     }
 
     /// Whether a shadow transfer planner is installed.
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn has_transfer_planner(&self) -> bool {
         self.transfer_planner.is_some()
     }
@@ -1234,8 +1234,11 @@ impl KvAwarePolicy {
     ///
     /// A static capability for the worker wins over the engine record (an
     /// operator override); the address is still stored. With `None`, only an
-    /// engine-sourced capability is removed.
-    pub fn apply_peer_lookup(&self, worker_url: &str, record: Option<&PeerLookupRecord>) {
+    /// engine-sourced capability is removed. Tests only: production applies
+    /// records through `apply_peer_lookup_locked`.
+    #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn apply_peer_lookup(&self, worker_url: &str, record: Option<&PeerLookupRecord>) {
         let _guard = self.selection_lock.lock();
         self.apply_peer_lookup_locked(worker_url, record);
     }
@@ -1291,7 +1294,7 @@ impl KvAwarePolicy {
     }
 
     /// Register a pre-validated capability table (see
-    /// `kv_transfer_capability::parse_static_capabilities`). Workers not in the
+    /// `peer_fetch_capability::parse_static_capabilities`). Workers not in the
     /// table keep whatever they had.
     pub fn register_static_capabilities(
         &self,
@@ -1505,7 +1508,7 @@ impl KvAwarePolicy {
             QualifiedKvInput {
                 tokens: KvRequestTokens::Shared(token_ids),
                 eligibility: None,
-                transfer: true,
+                allow_transfer_plan: true,
             },
             lora_name,
             cache_salt,
@@ -1556,7 +1559,7 @@ impl KvAwarePolicy {
             QualifiedKvInput {
                 tokens,
                 eligibility: None,
-                transfer: true,
+                allow_transfer_plan: true,
             },
             lora_name,
             cache_salt,
@@ -1708,9 +1711,9 @@ impl KvAwarePolicy {
             // source unregisters in between, the grant finds no endpoint and
             // the request goes out unchanged.
             let transfer = self.transfer_planner.as_deref().and_then(|planner| {
-                if !input.transfer {
-                    crate::metrics::RouterMetrics::record_kv_transfer_plan(
-                        TransferSkip::PromptLogprobs.label(),
+                if !input.allow_transfer_plan {
+                    crate::metrics::RouterMetrics::record_peer_fetch_plan(
+                        PeerFetchSkip::PromptLogprobs.label(),
                     );
                     return None;
                 }
@@ -1729,9 +1732,12 @@ impl KvAwarePolicy {
                 *self.last_transfer_plan.lock() =
                     transfer.as_ref().map(|(transfer, _)| transfer.clone());
             }
-            let peer_fetch = transfer
-                .as_ref()
-                .and_then(|(transfer, planned)| self.peer_fetch_grant(transfer, planned));
+            let grpc_destination = workers
+                .get(worker_index)
+                .is_some_and(|w| w.connection_mode() == ConnectionMode::Grpc);
+            let peer_fetch = transfer.as_ref().and_then(|(transfer, planned)| {
+                self.peer_fetch_grant(transfer, planned, grpc_destination)
+            });
             return Some(KvSelectionReceipt {
                 worker_index,
                 new_prefill_tokens,
@@ -1752,8 +1758,9 @@ impl KvAwarePolicy {
     /// and the limiter, which synchronize themselves.
     fn peer_fetch_grant(
         &self,
-        transfer: &TransferPlan,
+        transfer: &PeerFetchPlan,
         planned: &PlannedPeers<'_>,
+        grpc_destination: bool,
     ) -> Option<PeerFetchGrant> {
         let state = self
             .peer_fetch
@@ -1761,8 +1768,8 @@ impl KvAwarePolicy {
             .filter(|state| state.enabled.load(Ordering::Acquire))?;
         // The HTTP send path cannot add fetch params for a gRPC destination,
         // so a slot taken here would be held for nothing.
-        if crate::backend::is_grpc_url(planned.destination.url) {
-            crate::metrics::RouterMetrics::record_kv_transfer_request("grpc_destination");
+        if grpc_destination {
+            PeerFetchRequestOutcome::GrpcDestination.record();
             return None;
         }
         // Discovery or unregistration may have replaced either worker's
@@ -1773,7 +1780,7 @@ impl KvAwarePolicy {
             ("destination", &planned.destination),
         ] {
             if !self.planned_peer_is_current(peer) {
-                crate::metrics::RouterMetrics::record_kv_transfer_request("registration_changed");
+                PeerFetchRequestOutcome::RegistrationChanged.record();
                 tracing::debug!(
                     plan_id = transfer.plan_id,
                     changed = side,
@@ -1788,11 +1795,11 @@ impl KvAwarePolicy {
             .as_ref()
             .and_then(|reg| reg.endpoint.clone())
         else {
-            crate::metrics::RouterMetrics::record_kv_transfer_request("no_peer_endpoint");
+            PeerFetchRequestOutcome::NoPeerEndpoint.record();
             return None;
         };
         let Some(permit) = state.limiter.try_acquire(planned.source.url) else {
-            crate::metrics::RouterMetrics::record_kv_transfer_request("inflight_cap");
+            PeerFetchRequestOutcome::InflightCap.record();
             return None;
         };
         Some(PeerFetchGrant { endpoint, permit })
@@ -1824,20 +1831,20 @@ impl KvAwarePolicy {
     #[allow(clippy::too_many_arguments)]
     fn plan_transfer_for_pick<'w>(
         &self,
-        planner: &dyn TransferPlanner,
+        planner: &dyn PeerFetchPlanner,
         workers: &'w [Arc<dyn Worker>],
         plan: &SelectionPlan,
         candidates: &[CandidateView<'_>],
         position: usize,
         used_binding: bool,
         excluded: &dyn Fn(usize) -> bool,
-    ) -> Option<(TransferPlan, PlannedPeers<'w>)> {
+    ) -> Option<(PeerFetchPlan, PlannedPeers<'w>)> {
         let mut registrations: Vec<Option<Arc<PeerRegistration>>> = Vec::new();
         let outcome = if used_binding {
-            TransferOutcome::skip(TransferSkip::SessionBinding)
+            PeerFetchOutcome::skip(PeerFetchSkip::SessionBinding)
         } else if !plan.has_tokens {
             // Also covers the load-only fallback attempt.
-            TransferOutcome::skip(TransferSkip::MissingTokens)
+            PeerFetchOutcome::skip(PeerFetchSkip::MissingTokens)
         } else {
             // Clone each registration's `Arc` so no map ref is held while
             // planning; writers replace whole records, so each peer's
@@ -1863,7 +1870,7 @@ impl KvAwarePolicy {
                     excluded: excluded(i),
                 })
                 .collect();
-            planner.plan(&TransferPlannerInput {
+            planner.plan(&PeerFetchPlannerInput {
                 peers: &peers,
                 picked: position,
                 destination_hits: plan.peer_hits[position].as_deref(),
@@ -1871,11 +1878,11 @@ impl KvAwarePolicy {
             })
         };
         if let Some(estimate) = &outcome.estimate {
-            crate::metrics::RouterMetrics::record_kv_transfer_estimated_cost_ms(
+            crate::metrics::RouterMetrics::record_peer_fetch_estimated_cost_ms(
                 "fetch",
                 estimate.fetch_ms,
             );
-            crate::metrics::RouterMetrics::record_kv_transfer_estimated_cost_ms(
+            crate::metrics::RouterMetrics::record_peer_fetch_estimated_cost_ms(
                 "wait",
                 estimate.wait_ms,
             );
@@ -1883,8 +1890,8 @@ impl KvAwarePolicy {
         match outcome.result {
             Ok(mut transfer) => {
                 transfer.plan_id = self.next_transfer_plan_id.fetch_add(1, Ordering::Relaxed);
-                crate::metrics::RouterMetrics::record_kv_transfer_plan("planned");
-                crate::metrics::RouterMetrics::record_kv_transfer_estimated_saved_ms(
+                crate::metrics::RouterMetrics::record_peer_fetch_plan("planned");
+                crate::metrics::RouterMetrics::record_peer_fetch_estimated_saved_ms(
                     transfer.estimated_saved_prefill_ms,
                 );
                 tracing::debug!(
@@ -1915,7 +1922,7 @@ impl KvAwarePolicy {
                 planned.map(|planned| (transfer, planned))
             }
             Err(skip) => {
-                crate::metrics::RouterMetrics::record_kv_transfer_plan(skip.label());
+                crate::metrics::RouterMetrics::record_peer_fetch_plan(skip.label());
                 tracing::debug!(skip = skip.label(), "KV transfer plan skipped");
                 None
             }
@@ -2551,22 +2558,16 @@ impl KvAwareOps for KvAwarePolicy {
     fn select_worker_with_qualified_inputs(
         &self,
         workers: &[Arc<dyn Worker>],
-        tokens: KvRequestTokens<'_>,
+        input: QualifiedKvInput<'_>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
-        eligibility: Option<&[bool]>,
-        transfer: bool,
     ) -> Option<KvSelectionReceipt> {
         KvAwarePolicy::select_worker_with_qualified_inputs(
             self,
             workers,
-            QualifiedKvInput {
-                tokens,
-                eligibility,
-                transfer,
-            },
+            input,
             lora_name,
             cache_salt,
             affinity_key,
@@ -2589,9 +2590,10 @@ impl KvAwareOps for KvAwarePolicy {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl KvAwarePolicy {
     /// Plan of the latest successful selection (`None` when none was made).
-    fn last_transfer_plan(&self) -> Option<TransferPlan> {
+    fn last_transfer_plan(&self) -> Option<PeerFetchPlan> {
         self.last_transfer_plan.lock().clone()
     }
 }
@@ -2730,13 +2732,15 @@ mod tests {
                     .unwrap()
                     .select_worker_with_qualified_inputs(
                         &workers,
-                        KvRequestTokens::Shared(Some(&ids)),
+                        QualifiedKvInput {
+                            tokens: KvRequestTokens::Shared(Some(&ids)),
+                            eligibility: Some(mask),
+                            allow_transfer_plan: true,
+                        },
                         None,
                         None,
                         None,
                         excluded,
-                        Some(mask),
-                        true,
                     )
                     .unwrap_or_else(|| panic!("{case}: no worker selected for {mask:?}"))
             };
@@ -2766,7 +2770,7 @@ mod tests {
                             QualifiedKvInput {
                                 tokens: KvRequestTokens::Shared(Some(&ids)),
                                 eligibility: Some(&mask),
-                                transfer: true,
+                                allow_transfer_plan: true,
                             },
                             None,
                             None,
@@ -3703,13 +3707,15 @@ mod tests {
             assert!(ops
                 .select_worker_with_qualified_inputs(
                     &workers,
-                    KvRequestTokens::Shared(Some(&[1, 2])),
+                    QualifiedKvInput {
+                        tokens: KvRequestTokens::Shared(Some(&[1, 2])),
+                        eligibility,
+                        allow_transfer_plan: true,
+                    },
                     None,
                     None,
                     None,
                     &[],
-                    eligibility,
-                    true,
                 )
                 .is_none());
         }
@@ -4654,13 +4660,15 @@ mod tests {
         }
     }
 
-    fn transfer_policy() -> crate::policies::TransferPolicy {
-        crate::policies::TransferPolicy {
+    fn transfer_policy() -> crate::policies::PeerFetchRules {
+        crate::policies::PeerFetchRules {
             enabled: true,
             min_prefix_blocks: 4,
             require_capability: false,
             transfer_fixed_ms: 0.0,
-            ..crate::config::types::KvTransferConfig::default().transfer_policy()
+            ..crate::policies::PeerFetchRules::from(
+                &crate::config::types::PeerFetchConfig::default(),
+            )
         }
     }
 
@@ -4713,7 +4721,7 @@ mod tests {
         );
         if planner {
             policy =
-                policy.with_transfer_planner(Arc::new(crate::policies::CostRuleTransferPlanner {
+                policy.with_transfer_planner(Arc::new(crate::policies::CostRulePeerFetchPlanner {
                     policy: transfer_policy(),
                 }));
         }
@@ -4908,7 +4916,7 @@ mod tests {
     fn plan_for_grant<'w>(
         policy: &KvAwarePolicy,
         workers: &'w [Arc<dyn Worker>],
-    ) -> (TransferPlan, PlannedPeers<'w>) {
+    ) -> (PeerFetchPlan, PlannedPeers<'w>) {
         let ids = transfer_ids();
         let plan = policy
             .prepare_selection(
@@ -4916,7 +4924,7 @@ mod tests {
                 QualifiedKvInput {
                     tokens: KvRequestTokens::Shared(Some(&ids)),
                     eligibility: None,
-                    transfer: true,
+                    allow_transfer_plan: true,
                 },
                 None,
                 None,
@@ -4947,7 +4955,7 @@ mod tests {
             .render()
             .lines()
             .find(|line| {
-                line.starts_with("vllm_router_kv_transfer_requests_total")
+                line.starts_with("vllm_router_peer_fetch_requests_total")
                     && line.contains("outcome=\"registration_changed\"")
             })
             .and_then(|line| line.rsplit(' ').next())
@@ -4958,14 +4966,14 @@ mod tests {
     /// `registration_changed` count.
     fn assert_grant_refused_as_changed(
         policy: &KvAwarePolicy,
-        transfer: &TransferPlan,
+        transfer: &PeerFetchPlan,
         planned: &PlannedPeers<'_>,
     ) {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _metrics = metrics::set_default_local_recorder(&recorder);
         assert_eq!(registration_changed_count(&handle), 0);
-        assert!(policy.peer_fetch_grant(transfer, planned).is_none());
+        assert!(policy.peer_fetch_grant(transfer, planned, false).is_none());
         assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
         assert_eq!(registration_changed_count(&handle), 1);
     }
@@ -5024,7 +5032,9 @@ mod tests {
     fn grant_uses_the_planned_endpoint_when_nothing_changed() {
         let (policy, workers) = planned_grant_fixture();
         let (transfer, planned) = plan_for_grant(&policy, &workers);
-        let grant = policy.peer_fetch_grant(&transfer, &planned).expect("grant");
+        let grant = policy
+            .peer_fetch_grant(&transfer, &planned, false)
+            .expect("grant");
         assert_eq!(&*grant.endpoint.engine_id, "engine-a");
         assert_eq!(grant.endpoint.port, 5600);
         assert_eq!(
@@ -5045,7 +5055,9 @@ mod tests {
         let epoch = policy.peer_regs.get("http://a").unwrap().epoch;
         policy.apply_peer_lookup("http://a", Some(&engine_record("engine-a", "fp", 5600)));
         assert_eq!(policy.peer_regs.get("http://a").unwrap().epoch, epoch);
-        let grant = policy.peer_fetch_grant(&transfer, &planned).expect("grant");
+        let grant = policy
+            .peer_fetch_grant(&transfer, &planned, false)
+            .expect("grant");
         assert_eq!(&*grant.endpoint.engine_id, "engine-a");
         assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
     }
@@ -5077,7 +5089,7 @@ mod tests {
                 QualifiedKvInput {
                     tokens: KvRequestTokens::Shared(Some(&ids)),
                     eligibility: None,
-                    transfer: true,
+                    allow_transfer_plan: true,
                 },
                 None,
                 None,
@@ -5116,7 +5128,7 @@ mod tests {
                 QualifiedKvInput {
                     tokens: KvRequestTokens::Shared(Some(&ids)),
                     eligibility: None,
-                    transfer: false,
+                    allow_transfer_plan: false,
                 },
                 None,
                 None,
@@ -5222,7 +5234,7 @@ mod tests {
                 ..CostParams::default()
             },
         )
-        .with_transfer_planner(Arc::new(crate::policies::CostRuleTransferPlanner {
+        .with_transfer_planner(Arc::new(crate::policies::CostRulePeerFetchPlanner {
             policy: transfer_policy(),
         }));
         let blocks: Vec<_> = KvAwarePolicy::local_hashes(a_prompt, 2)
@@ -5276,7 +5288,7 @@ mod tests {
     ) -> (
         KvSelectionReceipt,
         Vec<RoutableTarget>,
-        Option<TransferPlan>,
+        Option<PeerFetchPlan>,
     ) {
         let (policy, workers, targets) = per_worker_transfer_fixture(&a_prompt);
         let mut inputs = WorkerTokenInputs::new();
@@ -5340,12 +5352,13 @@ mod tests {
     fn shadow_plan_requires_registered_capabilities_when_configured() {
         let ids = transfer_ids();
         let (mut policy, workers, _) = transfer_fixture(true);
-        policy = policy.with_transfer_planner(Arc::new(crate::policies::CostRuleTransferPlanner {
-            policy: crate::policies::TransferPolicy {
-                require_capability: true,
-                ..transfer_policy()
-            },
-        }));
+        policy =
+            policy.with_transfer_planner(Arc::new(crate::policies::CostRulePeerFetchPlanner {
+                policy: crate::policies::PeerFetchRules {
+                    require_capability: true,
+                    ..transfer_policy()
+                },
+            }));
         let receipt = policy
             .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
             .unwrap();
@@ -5437,7 +5450,7 @@ mod tests {
     }
 
     fn kv_aware_config(
-        kv_transfer: Option<crate::config::types::KvTransferConfig>,
+        peer_fetch: Option<crate::config::types::PeerFetchConfig>,
     ) -> crate::config::PolicyConfig {
         crate::config::PolicyConfig::KvAware {
             router_temperature: 0.0,
@@ -5445,14 +5458,14 @@ mod tests {
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.3,
             static_kv_event_sources: Default::default(),
-            kv_transfer: kv_transfer.map(Box::new),
+            peer_fetch: peer_fetch.map(Box::new),
         }
     }
 
     fn transfer_block(
-        mode: crate::config::types::KvTransferMode,
-    ) -> crate::config::types::KvTransferConfig {
-        crate::config::types::KvTransferConfig {
+        mode: crate::config::types::PeerFetchMode,
+    ) -> crate::config::types::PeerFetchConfig {
+        crate::config::types::PeerFetchConfig {
             mode,
             min_prefix_blocks: 4,
             transfer_fixed_ms: 0.0,
@@ -5468,7 +5481,7 @@ mod tests {
 
     #[test]
     fn factory_builds_a_planner_only_for_shadow_mode() {
-        use crate::config::types::KvTransferMode::{Off, Shadow};
+        use crate::config::types::PeerFetchMode::{Off, Shadow};
         for (config, expect_planner) in [
             (kv_aware_config(None), false),
             (kv_aware_config(Some(transfer_block(Off))), false),
@@ -5492,10 +5505,10 @@ mod tests {
 
     #[test]
     fn configured_capabilities_reach_the_policy_only_in_shadow_mode() {
-        use crate::config::types::KvTransferMode::{Off, Shadow};
+        use crate::config::types::PeerFetchMode::{Off, Shadow};
         let capabilities = HashMap::from([(
             "http://a".to_string(),
-            crate::policies::kv_transfer_capability::StaticTransferCapability {
+            crate::config::types::StaticTransferCapability {
                 can_export: true,
                 can_import: false,
                 connector: "nixl".into(),
@@ -5519,12 +5532,12 @@ mod tests {
 
     #[test]
     fn shadow_mode_from_config_picks_exactly_what_off_picks() {
-        use crate::config::types::KvTransferMode::{Off, Shadow};
+        use crate::config::types::PeerFetchMode::{Off, Shadow};
         let ids = transfer_ids();
         let mut picks = Vec::new();
         for mode in [Off, Shadow] {
             let (base, workers, _) = transfer_fixture(false);
-            let policy = crate::policies::PolicyFactory::apply_kv_transfer(
+            let policy = crate::policies::PolicyFactory::apply_peer_fetch_config(
                 base,
                 Some(&transfer_block(mode)),
                 None,

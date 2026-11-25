@@ -17,11 +17,12 @@ use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 use crate::policies::kv_aware_policy;
-use crate::policies::KvRequestTokens;
+use crate::policies::PeerFetchRequestOutcome;
 use crate::policies::{
     kv_aware_ops, AffinityKey, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy,
     PeerEndpoint, PeerFetchPermit, PolicyRegistry,
 };
+use crate::policies::{KvRequestTokens, QualifiedKvInput};
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
@@ -1422,13 +1423,11 @@ impl Router {
         available: &[Arc<dyn Worker>],
         text: Option<&str>,
         headers: Option<&HeaderMap>,
-        token_ids: KvRequestTokens<'_>,
-        eligibility: Option<&[bool]>,
+        input: QualifiedKvInput<'_>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
-        transfer: bool,
     ) -> Option<SelectedWorker> {
         if available.is_empty() {
             return None;
@@ -1444,13 +1443,11 @@ impl Router {
             // rewrite a still-valid binding.
             let receipt = kv_aware.select_worker_with_qualified_inputs(
                 available,
-                token_ids,
+                input,
                 lora_name,
                 cache_salt,
                 affinity_key,
                 excluded_workers,
-                eligibility,
-                transfer,
             )?;
             return Some(SelectedWorker {
                 worker: available.get(receipt.worker_index)?.clone(),
@@ -1463,7 +1460,12 @@ impl Router {
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
             cache.select_worker_with_inputs(
-                available, token_ids, model_id, lora_name, cache_salt, "regular",
+                available,
+                input.tokens,
+                model_id,
+                lora_name,
+                cache_salt,
+                "regular",
             )?
         } else {
             policy.select_worker_with_headers(available, text, request_headers.as_ref())?
@@ -1707,7 +1709,7 @@ impl Router {
                     });
                 // The engine computes every prompt token for these requests, so
                 // a peer fetch could not help: keep placement, plan no fetch.
-                let transfer = !wants_prompt_logprobs(typed_req.grpc_request());
+                let allow_transfer_plan = !wants_prompt_logprobs(typed_req.grpc_request());
                 let selected_worker = if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
@@ -1731,13 +1733,15 @@ impl Router {
                     let kv_receipt = kv_aware_ops(policy.as_ref()).and_then(|kv_aware| {
                         kv_aware.select_worker_with_qualified_inputs(
                             std::slice::from_ref(&worker),
-                            request_tokens,
+                            QualifiedKvInput {
+                                tokens: request_tokens,
+                                eligibility: eligibility.as_deref(),
+                                allow_transfer_plan,
+                            },
                             lora_name,
                             cache_salt,
                             affinity_key.as_ref(),
                             &[],
-                            eligibility.as_deref(),
-                            transfer,
                         )
                     });
                     Some(SelectedWorker { worker, kv_receipt })
@@ -1751,13 +1755,15 @@ impl Router {
                             text
                         }),
                         headers,
-                        request_tokens,
-                        eligibility.as_deref(),
+                        QualifiedKvInput {
+                            tokens: request_tokens,
+                            eligibility: eligibility.as_deref(),
+                            allow_transfer_plan,
+                        },
                         lora_name,
                         cache_salt,
                         affinity_key.as_ref(),
                         &excluded_workers,
-                        transfer,
                     )
                 };
                 let SelectedWorker { worker, kv_receipt } = match selected_worker {
@@ -1973,7 +1979,7 @@ impl Router {
     /// Count an active-mode outcome; anything but `Applied` means the request
     /// goes out without a fetch, so its source slot is freed right away.
     fn record_peer_fetch(outcome: PeerFetchApply, load: &RequestLoadGuard) {
-        RouterMetrics::record_kv_transfer_request(outcome.label());
+        PeerFetchRequestOutcome::from(outcome).record();
         if outcome != PeerFetchApply::Applied {
             load.release_peer_fetch();
         }
@@ -3361,6 +3367,7 @@ impl RouterTrait for Router {
             if *method == Method::POST {
                 Self::record_peer_fetch(apply_peer_fetch(&mut body, source), load);
             } else {
+                debug_assert!(false, "peer fetch planned for a non-POST request");
                 load.release_peer_fetch();
             }
         }
@@ -3702,7 +3709,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-                kv_transfer: None,
+                peer_fetch: None,
             },
             worker_startup_timeout_secs: 5,
             ..Default::default()
@@ -3797,7 +3804,7 @@ mod tests {
                     }}))
                     .unwrap(),
                 ),
-                kv_transfer: None,
+                peer_fetch: None,
             },
             worker_startup_timeout_secs: 5,
             ..Default::default()
@@ -3920,7 +3927,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
-                    kv_transfer: None,
+                    peer_fetch: None,
                 },
                 worker_startup_timeout_secs: 5,
                 worker_startup_check_interval_secs: 1,
@@ -4700,7 +4707,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
-                    kv_transfer: None,
+                    peer_fetch: None,
                 }
             }));
             router.policy_registry.on_worker_added(
@@ -5557,7 +5564,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-                kv_transfer: None,
+                peer_fetch: None,
             }));
         router
     }
@@ -6011,7 +6018,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-                kv_transfer: None,
+                peer_fetch: None,
             }));
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "messages": [{"role": "user", "content": "hello"}]
@@ -6059,7 +6066,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-                kv_transfer: None,
+                peer_fetch: None,
             }));
 
         let request = serde_json::json!({"messages": []});
@@ -6839,7 +6846,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
-                    kv_transfer: None,
+                    peer_fetch: None,
                 }));
             let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
                 "messages": [{"role": "user", "content": "hello"}], "stream": streaming,
@@ -6905,7 +6912,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-                kv_transfer: None,
+                peer_fetch: None,
             }));
         router.retry_config.max_retries = 0;
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
@@ -7143,13 +7150,15 @@ mod tests {
                     &router.available_workers(None),
                     Some(r#"{"prompt": "test"}"#),
                     Some(&header_map),
-                    KvRequestTokens::Shared(None),
-                    None,
+                    QualifiedKvInput {
+                        tokens: KvRequestTokens::Shared(None),
+                        eligibility: None,
+                        allow_transfer_plan: true,
+                    },
                     None,
                     None,
                     None,
                     &[],
-                    true,
                 )
                 .expect("Should select a worker");
             selected_urls.push(worker.worker.url().to_string());
@@ -7185,13 +7194,15 @@ mod tests {
                 &router.available_workers(None),
                 Some(r#"{"prompt": "test"}"#),
                 None,
-                KvRequestTokens::Shared(None),
-                None,
+                QualifiedKvInput {
+                    tokens: KvRequestTokens::Shared(None),
+                    eligibility: None,
+                    allow_transfer_plan: true,
+                },
                 None,
                 None,
                 None,
                 &[],
-                true,
             )
             .expect("Should select the remaining healthy worker");
 
@@ -7218,13 +7229,15 @@ mod tests {
             &router.available_workers(None),
             Some(r#"{"prompt": "test"}"#),
             None,
-            KvRequestTokens::Shared(None),
-            None,
+            QualifiedKvInput {
+                tokens: KvRequestTokens::Shared(None),
+                eligibility: None,
+                allow_transfer_plan: true,
+            },
             None,
             None,
             None,
             &[],
-            true,
         );
         assert!(
             result.is_none(),
@@ -7242,13 +7255,15 @@ mod tests {
                     &router.available_workers(None),
                     Some(r#"{"prompt": "test"}"#),
                     None,
-                    KvRequestTokens::Shared(None),
-                    None,
+                    QualifiedKvInput {
+                        tokens: KvRequestTokens::Shared(None),
+                        eligibility: None,
+                        allow_transfer_plan: true,
+                    },
                     None,
                     None,
                     None,
                     excluded,
-                    true,
                 )
                 .expect("Should select a worker")
                 .worker
@@ -7275,13 +7290,15 @@ mod tests {
                 &router.available_workers(None),
                 Some(r#"{"prompt": "test"}"#),
                 Some(&header_map),
-                KvRequestTokens::Shared(None),
-                None,
+                QualifiedKvInput {
+                    tokens: KvRequestTokens::Shared(None),
+                    eligibility: None,
+                    allow_transfer_plan: true,
+                },
                 None,
                 None,
                 None,
                 &[],
-                true,
             ) {
                 worker_urls_seen.insert(worker.worker.url().to_string());
             }

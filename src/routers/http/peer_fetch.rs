@@ -9,7 +9,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::policies::PeerEndpoint;
+use crate::policies::{PeerEndpoint, PeerFetchRequestOutcome};
 use crate::protocols::spec::GrpcRequestRef;
 
 /// What happened when peer fetch params were applied to a body.
@@ -27,14 +27,13 @@ pub(super) enum PeerFetchApply {
     InvalidBody,
 }
 
-impl PeerFetchApply {
-    /// Value of the `outcome` label on `vllm_router_kv_transfer_requests_total`.
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            Self::Applied => "sent",
-            Self::ClientParamsPresent => "client_params_present",
-            Self::PromptLogprobs => "prompt_logprobs",
-            Self::InvalidBody => "invalid_body",
+impl From<PeerFetchApply> for PeerFetchRequestOutcome {
+    fn from(apply: PeerFetchApply) -> Self {
+        match apply {
+            PeerFetchApply::Applied => Self::Sent,
+            PeerFetchApply::ClientParamsPresent => Self::ClientParamsPresent,
+            PeerFetchApply::PromptLogprobs => Self::PromptLogprobs,
+            PeerFetchApply::InvalidBody => Self::InvalidBody,
         }
     }
 }
@@ -96,7 +95,8 @@ pub(super) fn apply_peer_fetch(body: &mut Value, source: &PeerEndpoint) -> PeerF
     PeerFetchApply::Applied
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -180,7 +180,10 @@ mod tests {
             );
             assert_eq!(body, original);
         }
-        assert_eq!(PeerFetchApply::PromptLogprobs.label(), "prompt_logprobs");
+        assert_eq!(
+            PeerFetchRequestOutcome::from(PeerFetchApply::PromptLogprobs).label(),
+            "prompt_logprobs"
+        );
     }
 
     #[test]

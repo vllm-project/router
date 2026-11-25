@@ -1,51 +1,11 @@
-//! Declaring a worker's [`TransferCapability`] in router config.
-//!
-//! Besides engine-reported capabilities, the operator can state one per worker
-//! URL. Nothing here is verified against the engine: a
-//! wrong entry makes the planner's `Incompatible` check wrong, so a fingerprint
-//! must be identical on workers with the same model, KV dtype, TP/PP shape,
-//! block size and quantization, and different otherwise. Shadow mode does not
-//! need this at all when `require_capability` is false.
+//! Turns the operator-declared capability table (`StaticTransferCapability`,
+//! defined and validated in `config`) into planner [`TransferCapability`]s.
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-
-use super::kv_transfer::TransferCapability;
-
-/// One worker's declared capability, as written in config.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct StaticTransferCapability {
-    #[serde(default = "default_true")]
-    pub can_export: bool,
-    #[serde(default = "default_true")]
-    pub can_import: bool,
-    /// Transport name, e.g. "nixl".
-    pub connector: String,
-    pub connector_version: String,
-    /// Operator-chosen label; equal labels mean compatible KV layouts.
-    pub layout_fingerprint: String,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl StaticTransferCapability {
-    pub fn validate(&self) -> Result<(), String> {
-        for (name, value) in [
-            ("connector", &self.connector),
-            ("connector_version", &self.connector_version),
-            ("layout_fingerprint", &self.layout_fingerprint),
-        ] {
-            if value.trim().is_empty() {
-                return Err(format!("{name} is empty"));
-            }
-        }
-        Ok(())
-    }
-}
+use super::peer_fetch::TransferCapability;
+use crate::config::types::StaticTransferCapability;
+use crate::config::validate_static_transfer_capabilities;
 
 impl TryFrom<&StaticTransferCapability> for TransferCapability {
     type Error = String;
@@ -62,22 +22,24 @@ impl TryFrom<&StaticTransferCapability> for TransferCapability {
     }
 }
 
-/// Validate a whole `worker_url -> capability` table up front, so a typo
-/// fails at startup rather than silently disabling transfers for one worker.
+/// Convert a whole `worker_url -> capability` table, failing on the first
+/// invalid entry with the worker named.
 pub fn parse_static_capabilities(
     table: &HashMap<String, StaticTransferCapability>,
 ) -> Result<HashMap<String, TransferCapability>, String> {
+    validate_static_transfer_capabilities(table)?;
     table
         .iter()
         .map(|(url, config)| {
             TransferCapability::try_from(config)
                 .map(|capability| (url.clone(), capability))
-                .map_err(|error| format!("kv_transfer capability for {url}: {error}"))
+                .map_err(|error| format!("peer_fetch capability for {url}: {error}"))
         })
         .collect()
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -100,7 +62,7 @@ mod tests {
         assert!(parsed.can_export && parsed.can_import);
 
         assert!(serde_json::from_str::<StaticTransferCapability>(
-            r#"{"connector":"nixl","connector_version":"1","layout_fingerprint":"x","can_exprot":true}"#,
+            r#"{"connector":"nixl","connector_version":"1","layout_fingerprint":"x","unknown_field":true}"#,
         )
         .is_err());
     }

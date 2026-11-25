@@ -84,26 +84,26 @@ pub fn init_metrics() {
         "KV-aware placement lookups and reasons for skipping them"
     );
     describe_counter!(
-        "vllm_router_kv_transfer_plans_total",
+        "vllm_router_peer_fetch_plans_total",
         "KV transfer planner outcomes (planned or the reason no plan was made)"
     );
     describe_counter!(
-        "vllm_router_kv_transfer_requests_total",
+        "vllm_router_peer_fetch_requests_total",
         "Active-mode KV transfer requests: sent with peer fetch params, or why not \
          (no_peer_endpoint, inflight_cap, grpc_destination, registration_changed, \
          client_params_present, prompt_logprobs, invalid_body)"
     );
     describe_gauge!(
-        "vllm_router_kv_transfer_peer_fetch_enabled",
+        "vllm_router_peer_fetch_enabled",
         "Active-mode peer KV fetch kill switch: 1 when enabled, 0 when disabled \
-         through /kv_transfer/peer_fetch"
+         through /peer_fetch"
     );
     describe_histogram!(
-        "vllm_router_kv_transfer_estimated_saved_ms",
+        "vllm_router_peer_fetch_estimated_saved_ms",
         "Estimated prefill milliseconds saved by a planned KV transfer"
     );
     describe_histogram!(
-        "vllm_router_kv_transfer_estimated_cost_ms",
+        "vllm_router_peer_fetch_estimated_cost_ms",
         "Estimated milliseconds of the fetch and wait paths when the transfer cost rule was evaluated"
     );
     describe_counter!(
@@ -555,8 +555,8 @@ fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuild
         builder = set(builder, name, REQUEST_BUCKETS);
     }
     for name in [
-        "vllm_router_kv_transfer_estimated_saved_ms",
-        "vllm_router_kv_transfer_estimated_cost_ms",
+        "vllm_router_peer_fetch_estimated_saved_ms",
+        "vllm_router_peer_fetch_estimated_cost_ms",
     ] {
         builder = set(builder, name, MILLISECOND_BUCKETS);
     }
@@ -597,26 +597,25 @@ impl RouterMetrics {
     pub fn record_kv_placement_lookup(result: &'static str) {
         counter!("vllm_router_kv_placement_lookups_total", "result" => result).increment(1);
     }
-    pub fn record_kv_transfer_plan(outcome: &'static str) {
-        counter!("vllm_router_kv_transfer_plans_total", "outcome" => outcome).increment(1);
+    pub fn record_peer_fetch_plan(outcome: &'static str) {
+        counter!("vllm_router_peer_fetch_plans_total", "outcome" => outcome).increment(1);
     }
-    /// Active-mode outcome for a planned request: `sent`, `no_peer_endpoint`,
-    /// `inflight_cap`, `registration_changed`, `client_params_present`,
-    /// `prompt_logprobs` or `invalid_body`.
-    pub fn record_kv_transfer_request(outcome: &'static str) {
-        counter!("vllm_router_kv_transfer_requests_total", "outcome" => outcome).increment(1);
+    /// Active-mode outcome for a planned request. Call through
+    /// `PeerFetchRequestOutcome::record`, which owns the label set.
+    pub fn record_peer_fetch_request(outcome: &'static str) {
+        counter!("vllm_router_peer_fetch_requests_total", "outcome" => outcome).increment(1);
     }
     /// State of the active-mode peer fetch kill switch (1 enabled, 0 disabled).
-    pub fn set_kv_transfer_peer_fetch_enabled(enabled: bool) {
-        gauge!("vllm_router_kv_transfer_peer_fetch_enabled").set(if enabled { 1.0 } else { 0.0 });
+    pub fn set_peer_fetch_enabled(enabled: bool) {
+        gauge!("vllm_router_peer_fetch_enabled").set(if enabled { 1.0 } else { 0.0 });
     }
     /// Estimated prefill milliseconds saved by a planned transfer.
-    pub fn record_kv_transfer_estimated_saved_ms(saved_ms: f64) {
-        histogram!("vllm_router_kv_transfer_estimated_saved_ms").record(saved_ms);
+    pub fn record_peer_fetch_estimated_saved_ms(saved_ms: f64) {
+        histogram!("vllm_router_peer_fetch_estimated_saved_ms").record(saved_ms);
     }
     /// Estimated cost of the two compared paths; `path` is `fetch` or `wait`.
-    pub fn record_kv_transfer_estimated_cost_ms(path: &'static str, cost_ms: f64) {
-        histogram!("vllm_router_kv_transfer_estimated_cost_ms", "path" => path).record(cost_ms);
+    pub fn record_peer_fetch_estimated_cost_ms(path: &'static str, cost_ms: f64) {
+        histogram!("vllm_router_peer_fetch_estimated_cost_ms", "path" => path).record(cost_ms);
     }
     pub fn record_kv_routing_input(transport: &'static str, result: &'static str) {
         counter!("vllm_router_kv_routing_inputs_total", "transport" => transport, "result" => result).increment(1);

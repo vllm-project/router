@@ -13,8 +13,8 @@ mod consistent_hash;
 mod factory;
 pub(crate) mod hash_key;
 mod kv_aware;
-mod kv_transfer;
-pub mod kv_transfer_capability;
+mod peer_fetch;
+pub mod peer_fetch_capability;
 mod power_of_two;
 mod random;
 mod registry;
@@ -33,13 +33,14 @@ pub use kv_aware::{
     cost_components, kv_aware_ops, AffinityKey, AffinityRecord, CandidateView, CostComponents,
     CostDecision, CostParams, InMemorySlotManager, KvAffinityTable, KvAwareOps, KvAwarePolicy,
     KvRequestSlot, KvRequestTokens, KvSelectionReceipt, LoadProvider, LoadSample,
-    MultiplicativeScorer, Picker, PrefillWorkEstimate, Scorer, SelectionError, SlotManager,
-    StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits, WorkerTokenInputs,
+    MultiplicativeScorer, Picker, PrefillWorkEstimate, QualifiedKvInput, Scorer, SelectionError,
+    SlotManager, StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits,
+    WorkerTokenInputs,
 };
 #[cfg(test)]
-pub(crate) use kv_transfer::PeerFetchLimiter;
-pub(crate) use kv_transfer::{CostRuleTransferPlanner, PeerFetchPermit};
-pub use kv_transfer::{PeerEndpoint, TransferCapability, TransferPolicy};
+pub(crate) use peer_fetch::PeerFetchLimiter;
+pub(crate) use peer_fetch::{CostRulePeerFetchPlanner, PeerFetchPermit, PeerFetchRequestOutcome};
+pub use peer_fetch::{PeerEndpoint, PeerFetchRules, TransferCapability};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::{PeerFetchPolicyStatus, PeerFetchStatus, PolicyRegistry};

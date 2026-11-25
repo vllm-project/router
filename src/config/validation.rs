@@ -1,6 +1,5 @@
 use super::*;
-use crate::config::types::{KvTransferConfig, KvTransferMode};
-use crate::policies::kv_transfer_capability::parse_static_capabilities;
+use crate::config::types::{PeerFetchConfig, PeerFetchMode};
 use crate::program_scheduling::ProgramBindingStrategy;
 
 /// Configuration validator
@@ -462,7 +461,7 @@ impl ConfigValidator {
                 kv_penalty_external,
                 kv_penalty_disk,
                 static_kv_event_sources,
-                kv_transfer,
+                peer_fetch,
             } => {
                 if !router_temperature.is_finite() || *router_temperature < 0.0 {
                     return Err(ConfigError::InvalidValue {
@@ -487,8 +486,8 @@ impl ConfigValidator {
                 for (worker, source) in static_kv_event_sources.iter() {
                     source.validate(worker)?;
                 }
-                if let Some(kv_transfer) = kv_transfer {
-                    Self::validate_kv_transfer(kv_transfer)?;
+                if let Some(peer_fetch) = peer_fetch {
+                    Self::validate_peer_fetch(peer_fetch)?;
                 }
             }
             PolicyConfig::PowerOfTwo {
@@ -726,8 +725,8 @@ impl ConfigValidator {
             let plans = |policy: &PolicyConfig| {
                 matches!(
                     policy,
-                    PolicyConfig::KvAware { kv_transfer: Some(kv_transfer), .. }
-                        if kv_transfer.mode != KvTransferMode::Off
+                    PolicyConfig::KvAware { peer_fetch: Some(peer_fetch), .. }
+                        if peer_fetch.mode != PeerFetchMode::Off
                 )
             };
             if plans(&config.policy)
@@ -735,8 +734,8 @@ impl ConfigValidator {
                 || decode_policy.as_ref().is_some_and(plans)
             {
                 return Err(ConfigError::IncompatibleConfig {
-                    reason: "kv_transfer planning is not supported with PD routing yet; \
-                             set kv_transfer.mode to off or use regular mode"
+                    reason: "peer_fetch planning is not supported with PD routing yet; \
+                             set peer_fetch.mode to off or use regular mode"
                         .to_string(),
                 });
             }
@@ -746,8 +745,8 @@ impl ConfigValidator {
         let active = |policy: &PolicyConfig| {
             matches!(
                 policy,
-                PolicyConfig::KvAware { kv_transfer: Some(kv_transfer), .. }
-                    if kv_transfer.mode == KvTransferMode::Active
+                PolicyConfig::KvAware { peer_fetch: Some(peer_fetch), .. }
+                    if peer_fetch.mode == PeerFetchMode::Active
             )
         };
         if active(&config.policy) {
@@ -759,7 +758,7 @@ impl ConfigValidator {
             };
             if has_grpc_url || config.connection_mode == ConnectionMode::Grpc {
                 return Err(ConfigError::IncompatibleConfig {
-                    reason: "kv_transfer.mode=active needs HTTP workers; grpc:// workers are not supported"
+                    reason: "peer_fetch.mode=active needs HTTP workers; grpc:// workers are not supported"
                         .to_string(),
                 });
             }
@@ -1001,19 +1000,19 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate the `kv_aware` `kv_transfer` block. A capabilities table is
+    /// Validate the `kv_aware` `peer_fetch` block. A capabilities table is
     /// ignored (but not required to be absent) when the mode is off.
-    fn validate_kv_transfer(config: &KvTransferConfig) -> ConfigResult<()> {
-        if config.mode == KvTransferMode::Active && config.max_inflight_per_source == 0 {
+    fn validate_peer_fetch(config: &PeerFetchConfig) -> ConfigResult<()> {
+        if config.mode == PeerFetchMode::Active && config.max_inflight_per_source == 0 {
             return Err(ConfigError::InvalidValue {
-                field: "kv_transfer.max_inflight_per_source".to_string(),
+                field: "peer_fetch.max_inflight_per_source".to_string(),
                 value: "0".to_string(),
                 reason: "must be greater than 0 in active mode".to_string(),
             });
         }
-        if !config.transfer_policy().valid() {
+        if !config.cost_constants_valid() {
             return Err(ConfigError::InvalidValue {
-                field: "kv_transfer".to_string(),
+                field: "peer_fetch".to_string(),
                 value: format!(
                     "margin={}, prefill_us_per_token={}, transfer_fixed_ms={}, \
                      transfer_us_per_token={}",
@@ -1026,10 +1025,10 @@ impl ConfigValidator {
                     .to_string(),
             });
         }
-        if config.mode != KvTransferMode::Off {
-            parse_static_capabilities(&config.capabilities).map_err(|error| {
+        if config.mode != PeerFetchMode::Off {
+            validate_static_transfer_capabilities(&config.capabilities).map_err(|error| {
                 ConfigError::InvalidValue {
-                    field: "kv_transfer.capabilities".to_string(),
+                    field: "peer_fetch.capabilities".to_string(),
                     value: format!("{} entries", config.capabilities.len()),
                     reason: error,
                 }
@@ -1613,7 +1612,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-                kv_transfer: None,
+                peer_fetch: None,
             },
         );
 
@@ -1774,7 +1773,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-                kv_transfer: None,
+                peer_fetch: None,
             },
         );
         config.pd_kv_event_sources.insert(
@@ -1891,7 +1890,7 @@ mod tests {
         assert!(err.contains("requires a kv_aware prefill policy"), "{err}");
     }
 
-    fn kv_transfer_config(block: KvTransferConfig) -> RouterConfig {
+    fn peer_fetch_config(block: PeerFetchConfig) -> RouterConfig {
         RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["http://a:8000".to_string()],
@@ -1902,18 +1901,16 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-                kv_transfer: Some(Box::new(block)),
+                peer_fetch: Some(Box::new(block)),
             },
         )
     }
 
-    fn bad_capability() -> std::collections::HashMap<
-        String,
-        crate::policies::kv_transfer_capability::StaticTransferCapability,
-    > {
+    fn bad_capability(
+    ) -> std::collections::HashMap<String, crate::config::types::StaticTransferCapability> {
         std::collections::HashMap::from([(
             "http://a:8000".to_string(),
-            crate::policies::kv_transfer_capability::StaticTransferCapability {
+            crate::config::types::StaticTransferCapability {
                 can_export: true,
                 can_import: true,
                 connector: " ".to_string(),
@@ -1924,52 +1921,52 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_kv_transfer() {
-        let block = |mode| KvTransferConfig {
+    fn test_validate_peer_fetch() {
+        let block = |mode| PeerFetchConfig {
             mode,
             ..Default::default()
         };
-        for mode in [KvTransferMode::Off, KvTransferMode::Shadow] {
-            ConfigValidator::validate(&kv_transfer_config(block(mode))).unwrap();
+        for mode in [PeerFetchMode::Off, PeerFetchMode::Shadow] {
+            ConfigValidator::validate(&peer_fetch_config(block(mode))).unwrap();
         }
 
         // Active mode is accepted, with a positive per-source cap.
-        ConfigValidator::validate(&kv_transfer_config(block(KvTransferMode::Active))).unwrap();
-        let mut bad = block(KvTransferMode::Active);
+        ConfigValidator::validate(&peer_fetch_config(block(PeerFetchMode::Active))).unwrap();
+        let mut bad = block(PeerFetchMode::Active);
         bad.max_inflight_per_source = 0;
-        let error = ConfigValidator::validate(&kv_transfer_config(bad)).unwrap_err();
+        let error = ConfigValidator::validate(&peer_fetch_config(bad)).unwrap_err();
         assert!(
             error.to_string().contains("max_inflight_per_source"),
             "{error}"
         );
 
         for margin in [0.0, 1.5, f64::NAN] {
-            let mut bad = block(KvTransferMode::Shadow);
+            let mut bad = block(PeerFetchMode::Shadow);
             bad.margin = margin;
-            assert!(ConfigValidator::validate(&kv_transfer_config(bad)).is_err());
+            assert!(ConfigValidator::validate(&peer_fetch_config(bad)).is_err());
         }
-        let mut bad = block(KvTransferMode::Shadow);
+        let mut bad = block(PeerFetchMode::Shadow);
         bad.transfer_us_per_token = -1.0;
-        assert!(ConfigValidator::validate(&kv_transfer_config(bad)).is_err());
+        assert!(ConfigValidator::validate(&peer_fetch_config(bad)).is_err());
 
-        let mut bad = block(KvTransferMode::Shadow);
+        let mut bad = block(PeerFetchMode::Shadow);
         bad.capabilities = bad_capability();
-        let error = ConfigValidator::validate(&kv_transfer_config(bad.clone())).unwrap_err();
+        let error = ConfigValidator::validate(&peer_fetch_config(bad.clone())).unwrap_err();
         assert!(error.to_string().contains("http://a:8000"), "{error}");
         // The same table is ignored when the planner is off.
-        bad.mode = KvTransferMode::Off;
-        ConfigValidator::validate(&kv_transfer_config(bad)).unwrap();
+        bad.mode = PeerFetchMode::Off;
+        ConfigValidator::validate(&peer_fetch_config(bad)).unwrap();
     }
 
     #[test]
-    fn test_kv_transfer_planning_is_rejected_in_pd_mode() {
+    fn test_peer_fetch_planning_is_rejected_in_pd_mode() {
         let kv_aware = |mode| PolicyConfig::KvAware {
             router_temperature: 0.0,
             kv_penalty_host: 0.8,
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.3,
             static_kv_event_sources: Default::default(),
-            kv_transfer: Some(Box::new(KvTransferConfig {
+            peer_fetch: Some(Box::new(PeerFetchConfig {
                 mode,
                 ..Default::default()
             })),
@@ -1986,7 +1983,7 @@ mod tests {
                 main,
             )
         };
-        let shadow = || kv_aware(KvTransferMode::Shadow);
+        let shadow = || kv_aware(PeerFetchMode::Shadow);
         for config in [
             pd(None, None, shadow()),
             pd(Some(shadow()), None, PolicyConfig::RoundRobin),
@@ -1999,41 +1996,41 @@ mod tests {
             );
         }
         // Off stays accepted, and regular mode still accepts shadow.
-        ConfigValidator::validate(&pd(None, None, kv_aware(KvTransferMode::Off))).unwrap();
-        ConfigValidator::validate(&kv_transfer_config(KvTransferConfig {
-            mode: KvTransferMode::Shadow,
+        ConfigValidator::validate(&pd(None, None, kv_aware(PeerFetchMode::Off))).unwrap();
+        ConfigValidator::validate(&peer_fetch_config(PeerFetchConfig {
+            mode: PeerFetchMode::Shadow,
             ..Default::default()
         }))
         .unwrap();
     }
 
     #[test]
-    fn test_kv_transfer_active_rejects_grpc_workers() {
-        let active = || KvTransferConfig {
-            mode: KvTransferMode::Active,
+    fn test_peer_fetch_active_rejects_grpc_workers() {
+        let active = || PeerFetchConfig {
+            mode: PeerFetchMode::Active,
             ..Default::default()
         };
-        let mut config = kv_transfer_config(active());
+        let mut config = peer_fetch_config(active());
         config.mode = RoutingMode::Regular {
             worker_urls: vec!["grpc://a:50051".to_string(), "grpc://b:50051".to_string()],
         };
         let error = ConfigValidator::validate(&config).unwrap_err().to_string();
         assert!(error.contains("needs HTTP workers"), "{error}");
 
-        let mut config = kv_transfer_config(active());
+        let mut config = peer_fetch_config(active());
         config.connection_mode = ConnectionMode::Grpc;
         let error = ConfigValidator::validate(&config).unwrap_err().to_string();
         assert!(error.contains("needs HTTP workers"), "{error}");
 
         // Shadow with gRPC workers and active with HTTP workers stay accepted.
-        let mut shadow = kv_transfer_config(KvTransferConfig {
-            mode: KvTransferMode::Shadow,
+        let mut shadow = peer_fetch_config(PeerFetchConfig {
+            mode: PeerFetchMode::Shadow,
             ..Default::default()
         });
         shadow.mode = RoutingMode::Regular {
             worker_urls: vec!["grpc://b:50051".to_string()],
         };
         ConfigValidator::validate(&shadow).unwrap();
-        ConfigValidator::validate(&kv_transfer_config(active())).unwrap();
+        ConfigValidator::validate(&peer_fetch_config(active())).unwrap();
     }
 }
