@@ -7,6 +7,7 @@ Run only against an allocated test deployment. No server is started or stopped.
 import argparse
 import asyncio
 import json
+import sys
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -14,10 +15,10 @@ from pathlib import Path
 
 import aiohttp
 
-if __package__:
-    from .completion_validation import validate_single_completion
-else:  # The harness invokes this file directly, without installing a tests package.
-    from completion_validation import validate_single_completion
+if not __package__:  # Support direct invocation by the eval-container harness.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from tests.python.helpers.completion_validation import validate_single_completion
 
 
 class DisconnectUntested(ValueError):

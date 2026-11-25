@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 from aiohttp import web
 
-from ..helpers import pd_lifecycle
-from ..helpers.pd_lifecycle import probe
+from ..e2e.pd_disagg_vllm import pd_lifecycle
+from ..e2e.pd_disagg_vllm.pd_lifecycle import probe
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
@@ -122,7 +122,10 @@ async def exercise(fault=None, output=None, cli=False, fragment=None, levels=(1,
         if cli:
             process = await asyncio.create_subprocess_exec(
                 sys.executable,
-                str(Path(__file__).resolve().parents[1] / "helpers/pd_lifecycle.py"),
+                str(
+                    Path(__file__).resolve().parents[1]
+                    / "e2e/pd_disagg_vllm/pd_lifecycle.py"
+                ),
                 "--router-url",
                 f"http://127.0.0.1:{port}",
                 "--model",

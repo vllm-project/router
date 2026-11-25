@@ -358,7 +358,7 @@ if [[ ${RUN_PD_LIFECYCLE} == true ]]; then
   # Probe settings are arguments to this shell, never shell source.
   # Run the probe first intentionally: LM-eval then checks useful recovery load
   # after active disconnects, while a lifecycle failure preserves first cause.
-  python3 tests/python/helpers/pd_lifecycle.py \\
+  python3 tests/python/e2e/pd_disagg_vllm/pd_lifecycle.py \\
     --router-url http://127.0.0.1:${ROUTER_PORT} \\
     --model ${MODEL_NAMES} \\
     --concurrency "\$1" \\
