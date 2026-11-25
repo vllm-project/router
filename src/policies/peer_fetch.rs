@@ -26,7 +26,7 @@ use crate::kv_index::{CacheKey, RoutableTarget, StorageTier, TierMatch};
 /// Cost constants are placeholders until calibrated; they shape which transfers
 /// are planned and never affect which worker is picked.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PeerFetchRules {
+pub(crate) struct PeerFetchRules {
     pub enabled: bool,
     /// Minimum blocks the source holds beyond the destination.
     pub min_prefix_blocks: u32,

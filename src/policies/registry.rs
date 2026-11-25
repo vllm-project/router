@@ -58,7 +58,7 @@ pub struct PolicyRegistry {
 
 /// Peer fetch kill switch state, as reported by the admin endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PeerFetchStatus {
+pub(crate) struct PeerFetchStatus {
     /// The registry's shared flag.
     pub enabled: bool,
     /// Distinct active-mode `kv_aware` policy instances; empty when no
@@ -68,7 +68,7 @@ pub struct PeerFetchStatus {
 
 /// One active-mode `kv_aware` policy instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PeerFetchPolicyStatus {
+pub(crate) struct PeerFetchPolicyStatus {
     /// Model ids mapped to this instance, sorted.
     pub models: Vec<String>,
     /// Whether this instance is the registry's default policy.
@@ -334,7 +334,9 @@ impl PolicyRegistry {
     /// will build, so it takes effect for selections made after the call;
     /// in-flight fetches finish normally. Policies not built active are
     /// unaffected. Returns the resulting status.
-    pub fn set_peer_fetch_enabled(&self, enabled: bool) -> PeerFetchStatus {
+    #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(crate) fn set_peer_fetch_enabled(&self, enabled: bool) -> PeerFetchStatus {
         let _guard = self
             .peer_fetch_lock
             .lock()
@@ -350,7 +352,10 @@ impl PolicyRegistry {
     /// state at warn. The check, the store, the status, the gauge and the
     /// log happen under one lock, so concurrent callers are applied one after
     /// the other and the gauge always matches the flag.
-    pub fn set_peer_fetch_enabled_if_active(&self, enabled: bool) -> Option<PeerFetchStatus> {
+    pub(crate) fn set_peer_fetch_enabled_if_active(
+        &self,
+        enabled: bool,
+    ) -> Option<PeerFetchStatus> {
         let _guard = self
             .peer_fetch_lock
             .lock()
@@ -377,7 +382,7 @@ impl PolicyRegistry {
     /// policy instance (default and per-model), with the models mapped to
     /// each. PD prefill/decode policies are not built by the registry and
     /// are not listed.
-    pub fn peer_fetch_status(&self) -> PeerFetchStatus {
+    pub(crate) fn peer_fetch_status(&self) -> PeerFetchStatus {
         let enabled = self.peer_fetch_enabled.load(Ordering::Acquire);
         let mut entries: Vec<(Arc<dyn LoadBalancingPolicy>, PeerFetchPolicyStatus)> = Vec::new();
         let mut add = |policy: &Arc<dyn LoadBalancingPolicy>, model: Option<&str>| {

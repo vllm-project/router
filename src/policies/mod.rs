@@ -39,11 +39,12 @@ pub use kv_aware::{
 };
 #[cfg(test)]
 pub(crate) use peer_fetch::PeerFetchLimiter;
+pub(crate) use peer_fetch::PeerFetchRules;
 pub(crate) use peer_fetch::{CostRulePeerFetchPlanner, PeerFetchPermit, PeerFetchRequestOutcome};
-pub use peer_fetch::{PeerEndpoint, PeerFetchRules, TransferCapability};
+pub use peer_fetch::{PeerEndpoint, TransferCapability};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
-pub use registry::{PeerFetchPolicyStatus, PeerFetchStatus, PolicyRegistry};
+pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
 pub use sticky_least_loaded::StickyLeastLoadedPolicy;
