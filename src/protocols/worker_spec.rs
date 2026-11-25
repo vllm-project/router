@@ -135,21 +135,4 @@ pub struct WorkerErrorResponse {
     pub code: String,
 }
 
-/// Server info response from /get_server_info endpoint
-#[derive(Debug, Clone, Deserialize)]
-pub struct ServerInfo {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_path: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub priority: Option<u32>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost: Option<f32>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_type: Option<String>,
-}
+pub use crate::kv_index::discovery::ServerInfo;

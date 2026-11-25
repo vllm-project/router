@@ -26,3 +26,35 @@ pub enum ConfigError {
 
 /// Result type for configuration operations
 pub type ConfigResult<T> = Result<T, ConfigError>;
+
+pub use crate::kv_index::config::{
+    parse_pd_kv_events, parse_static_kv_event_sources, KvSourceOptions,
+};
+
+/// Parse the explicit Prefill-to-Decode allowlist for a mixed P/D pool.
+pub fn parse_pd_worker_pairs(
+    specs: &[String],
+) -> ConfigResult<std::collections::HashMap<String, Vec<String>>> {
+    let mut pairs = std::collections::HashMap::new();
+    for spec in specs {
+        let invalid = || ConfigError::ValidationFailed {
+            reason: format!(
+                "--pd-pair expects one PREFILL=DECODE[,DECODE...] entry per Prefill, got '{spec}'"
+            ),
+        };
+        let (prefill, decodes) = spec.split_once('=').ok_or_else(invalid)?;
+        let prefill = prefill.trim();
+        let decodes: Vec<_> = decodes
+            .split(',')
+            .map(str::trim)
+            .map(str::to_owned)
+            .collect();
+        if prefill.is_empty()
+            || decodes.iter().any(String::is_empty)
+            || pairs.insert(prefill.to_owned(), decodes).is_some()
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(pairs)
+}

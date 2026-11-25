@@ -1,15 +1,18 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig, RetryConfig,
-    RouterConfig, RoutingMode, TraceConfig,
+    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
+    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
 use vllm_router_rs::service_discovery::ServiceDiscoveryConfig;
 
 type PrefillArgs = (String, Option<u16>);
+
 fn split_prefill_args_from_others(
     args: impl IntoIterator<Item = String>,
 ) -> Result<(Vec<PrefillArgs>, Vec<String>), String> {
@@ -87,8 +90,11 @@ This launcher enables starting a router with individual worker instances. It is 
 multi-node setups or when you want to start workers and router separately.
 
 Examples:
-  # Regular mode
+  # Regular mode (HTTP reverse-proxy of OpenAI messages)
   vllm-router --worker-urls http://worker1:8000 http://worker2:8000
+
+  # Regular mode with a vLLM rust Inference worker (router sends token_ids)
+  vllm-router --worker-urls grpc://worker1:50051
 
   # vLLM PD mode with pure service discovery (workers register themselves)
   vllm-router --vllm-pd-disaggregation \
@@ -101,6 +107,9 @@ Examples:
 
 "#)]
 struct CliArgs {
+    /// E+PD or E/P/D encoder orchestration as JSON (encoder_urls, consumer_zmq_addrs).
+    #[arg(long)]
+    epd_config: Option<String>,
     /// Host address to bind the router server
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -109,13 +118,24 @@ struct CliArgs {
     #[arg(long, default_value_t = 30000)]
     port: u16,
 
-    /// List of worker URLs (e.g., http://worker1:8000 http://worker2:8000)
+    /// List of worker URLs (`http(s)://` reverse-proxy, or `grpc://` Inference)
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
-    /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    /// Load balancing policy to use. kv_aware uses stage-specific load profiles in PD mode.
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
     policy: String,
+
+    /// Enable Program-level scheduling independently of the request-level
+    /// load-balancing policy. Defaults to verified exact counts with estimation fallback.
+    #[arg(long, default_value_t = false)]
+    enable_program_scheduling: bool,
+
+    /// Optional JSON object overriding Program-level scheduling defaults.
+    /// Requires --enable-program-scheduling. Use {"token_count_mode":"estimated"}
+    /// for compatible byte-estimated counts; HTTP text tokenization is opt-in.
+    #[arg(long)]
+    program_scheduling_config_json: Option<String>,
 
     /// Enable vLLM PD (Prefill-Decode) disaggregated mode with vLLM-specific two-stage processing
     #[arg(long, default_value_t = false)]
@@ -130,12 +150,26 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
 
-    /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    /// Restrict a Prefill worker to its compatible Decode workers in a mixed P/D pool.
+    #[arg(long = "pd-pair", action = ArgAction::Append, value_name = "PREFILL=DECODE[,DECODE...]")]
+    pd_pair: Vec<String>,
+
+    /// Static KV event publishers for KV-aware prefill or decode workers.
+    /// Specify "URL=ZMQ_PUB_ENDPOINT[,ENDPOINT...]" once per worker in DP-rank
+    /// order. Block size defaults to 16.
+    /// Use the shared KV event replay, block size and model options for static sources.
+    #[arg(
+        long = "pd-kv-events",
+        action = ArgAction::Append,
+        value_name = "URL=ENDPOINT[,ENDPOINT...]"
+    )]
+    pd_kv_events: Vec<String>,
+    /// Specific policy for prefill nodes in PD mode. kv_aware uses the prefill load profile.
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
     prefill_policy: Option<String>,
 
-    /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    /// Specific policy for decode nodes in PD mode (defaults to --policy).
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup
@@ -162,9 +196,47 @@ struct CliArgs {
     #[arg(long, default_value_t = 120)]
     eviction_interval: u64,
 
-    /// Maximum size of the approximation tree for cache-aware routing
-    #[arg(long, default_value_t = 67108864)] // 2^26
+    /// Per-worker character budget in each model tree (enforced at cache eviction)
+    #[arg(long, default_value_t = 1 << 25)]
     max_tree_size: usize,
+
+    /// Softmax temperature for kv_aware (0 selects the minimum cost).
+    #[arg(long, default_value_t = 0.0)]
+    router_temperature: f64,
+
+    /// Enable kv_aware session affinity and set its idle TTL in seconds.
+    /// P/D uses decode-only soft affinity based on pending plus active requests.
+    /// Omit to disable session affinity while keeping KV-aware routing enabled.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=31_536_000))]
+    kv_aware_session_affinity_ttl_secs: Option<u64>,
+    /// Static KV event publishers for regular kv_aware workers.
+    #[arg(long = "kv-event-source", action = ArgAction::Append, value_name = "WORKER_URL=ENDPOINT[,ENDPOINT...]")]
+    kv_event_source: Vec<String>,
+    /// Optional ZMQ replay endpoints, one per DP rank, keyed by worker URL.
+    #[arg(long = "kv-event-replay-source", action = ArgAction::Append, value_name = "WORKER_URL=ENDPOINT[,ENDPOINT...]")]
+    kv_event_replay_source: Vec<String>,
+    /// Topics for static KV event publishers in DP-rank order.
+    #[arg(long, action = ArgAction::Append, value_name = "WORKER_URL=TOPIC[,TOPIC...]")]
+    kv_event_topic: Vec<String>,
+    /// KV cache block size for static event publishers.
+    #[arg(long, default_value_t = 16)]
+    kv_event_block_size: u32,
+    /// Shared model identity for workers using static event publishers.
+    #[arg(long)]
+    kv_event_model: Option<String>,
+    /// Require complete KV event recovery or a worker KV clear to restore placement credit.
+    #[arg(long, default_value_t = false)]
+    kv_event_strict_recovery: bool,
+    /// KV cache layouts for colocated or P/D workers, keyed by worker URL.
+    #[arg(long)]
+    kv_hybrid_layout: Option<std::path::PathBuf>,
+    /// Transfer credit for host-resident KV blocks.
+    #[arg(long, default_value_t = 0.8)]
+    kv_penalty_host: f64,
+    #[arg(long, default_value_t = 0.6)]
+    kv_penalty_external: f64,
+    #[arg(long, default_value_t = 0.3)]
+    kv_penalty_disk: f64,
 
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
@@ -266,6 +338,12 @@ struct CliArgs {
     /// Request timeout in seconds
     #[arg(long, default_value_t = 1800)]
     request_timeout_secs: u64,
+
+    /// Idle timeout in seconds for pooled backend HTTP connections. Should be
+    /// lower than the backend's keep-alive timeout (vLLM defaults to 5s); 0
+    /// disables connection reuse entirely
+    #[arg(long, default_value_t = vllm_router_rs::server::DEFAULT_POOL_IDLE_TIMEOUT_SECS)]
+    pool_idle_timeout_secs: u64,
 
     /// Maximum number of concurrent requests allowed
     #[arg(long, default_value_t = 32768)]
@@ -386,15 +464,31 @@ impl CliArgs {
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
             },
+            "kv_aware" => PolicyConfig::KvAware {
+                router_temperature: self.router_temperature,
+                kv_penalty_host: self.kv_penalty_host,
+                kv_penalty_external: self.kv_penalty_external,
+                kv_penalty_disk: self.kv_penalty_disk,
+                static_kv_event_sources: Box::default(),
+            },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5, // Default value
             },
             "consistent_hash" => PolicyConfig::ConsistentHash {
                 virtual_nodes: 160, // Default value
             },
+            "sticky_least_loaded" => PolicyConfig::StickyLeastLoaded,
             "rendezvous_hash" => PolicyConfig::RendezvousHash,
             _ => PolicyConfig::RoundRobin, // Fallback
         }
+    }
+
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn parse_pd_kv_events(
+        specs: &[String],
+    ) -> ConfigResult<HashMap<String, vllm_router_rs::config::PdKvEventSources>> {
+        vllm_router_rs::config::parse_pd_kv_events(specs)
     }
 
     /// Convert CLI arguments to RouterConfig
@@ -480,8 +574,30 @@ impl CliArgs {
             }
         };
 
+        let kv_sources = vllm_router_rs::config::KvSourceOptions {
+            layout: self.kv_hybrid_layout.as_deref(),
+            publishers: &self.kv_event_source,
+            pd_publishers: &self.pd_kv_events,
+            replay: &self.kv_event_replay_source,
+            topics: &self.kv_event_topic,
+            block_size: self.kv_event_block_size,
+            model: self.kv_event_model.as_deref(),
+        }
+        .load(&mode)?;
+
         // Main policy
-        let policy = self.parse_policy(&self.policy);
+        let mut policy = self.parse_policy(&self.policy);
+        if let PolicyConfig::KvAware {
+            static_kv_event_sources: configured,
+            ..
+        } = &mut policy
+        {
+            **configured = kv_sources.regular;
+        } else if !kv_sources.regular.is_empty() {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "--kv-event-source and --kv-hybrid-layout require --policy kv_aware in regular mode".to_string(),
+            });
+        }
 
         // Service discovery configuration
         let discovery = if self.service_discovery {
@@ -519,9 +635,25 @@ impl CliArgs {
             Vec::new()
         };
 
+        let program_scheduling = ProgramSchedulingConfig::resolve(
+            self.enable_program_scheduling,
+            self.program_scheduling_config_json.as_deref(),
+        )?;
+
         // Build RouterConfig
         Ok(RouterConfig {
+            epd: self
+                .epd_config
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|e| vllm_router_rs::config::ConfigError::ValidationFailed {
+                    reason: format!("Invalid --epd-config: {e}"),
+                })?,
             mode,
+            pd_kv_event_sources: kv_sources.pd,
+            pd_worker_pairs: vllm_router_rs::config::parse_pd_worker_pairs(&self.pd_pair)?,
+            kv_event_strict_recovery: self.kv_event_strict_recovery,
             policy,
             connection_mode,
             host: self.host.clone(),
@@ -561,6 +693,7 @@ impl CliArgs {
             },
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
+            kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
             health_check: HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
@@ -577,6 +710,7 @@ impl CliArgs {
             enable_profiling: self.profile,
             profile_timeout_secs: 10, // Default profiling timeout
             kv_connector: self.kv_connector,
+            program_scheduling,
         })
     }
 
@@ -619,6 +753,7 @@ impl CliArgs {
             service_discovery_config,
             prometheus_config,
             request_timeout_secs: self.request_timeout_secs,
+            pool_idle_timeout_secs: self.pool_idle_timeout_secs,
             request_id_headers: if self.request_id_headers.is_empty() {
                 None
             } else {
@@ -736,9 +871,142 @@ Provide --worker-urls or PD flags as usual.",
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn documented_kv_layout_examples_pass_cli_validation() {
+        let guide = include_str!("../docs/load_balancing/kv_aware.md").replace("\r\n", "\n");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let worker = "http://127.0.0.1:8000";
+        let example = guide
+            .split("\n```json\n")
+            .skip(1)
+            .map(|block| block.split_once("\n```").expect("unclosed JSON example").0)
+            .find(|example| {
+                serde_json::from_str::<serde_json::Value>(example)
+                    .expect("invalid JSON example")
+                    .get(worker)
+                    .is_some_and(|layout| layout.get("ranks").is_some())
+            })
+            .expect("missing worker layout example");
+        std::fs::write(&path, example).unwrap();
+        for pd in [false, true] {
+            let mut cli = vec![
+                "vllm-router",
+                "--policy",
+                "kv_aware",
+                "--kv-hybrid-layout",
+                path.to_str().unwrap(),
+            ];
+            let prefill = if pd {
+                cli.extend([
+                    "--vllm-pd-disaggregation",
+                    "--decode",
+                    "http://127.0.0.1:8001",
+                ]);
+                vec![(worker.to_owned(), None)]
+            } else {
+                cli.extend(["--worker-urls", worker]);
+                Vec::new()
+            };
+            let config = CliArgs::try_parse_from(cli)
+                .unwrap()
+                .to_router_config(prefill)
+                .unwrap();
+            config.validate().unwrap_or_else(|error| {
+                panic!("invalid worker layout example: {error}\n{example}")
+            });
+            assert!(config.pd_worker_pairs.is_empty());
+        }
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--vllm-pd-disaggregation",
+            "--prefill-policy",
+            "kv_aware",
+            "--decode",
+            "http://127.0.0.1:8001",
+            "--pd-pair",
+            "http://127.0.0.1:8000=http://127.0.0.1:8001",
+        ])
+        .unwrap();
+        let config = args
+            .to_router_config(vec![(worker.to_owned(), None)])
+            .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.pd_worker_pairs[worker], ["http://127.0.0.1:8001"]);
+        assert!(config.pd_kv_event_sources.is_empty());
+    }
+
+    #[test]
+    fn static_event_options_admit_plain_attention_without_layout() {
+        let worker = "http://127.0.0.1:8000";
+        for pd in [false, true] {
+            let mut cli = vec![
+                "vllm-router",
+                "--policy",
+                "kv_aware",
+                "--kv-event-topic",
+                "http://127.0.0.1:8000=boot-1",
+                "--kv-event-replay-source",
+                "http://127.0.0.1:8000=tcp://127.0.0.1:5558",
+                "--kv-event-model",
+                "qwen3",
+            ];
+            let prefill = if pd {
+                cli.extend([
+                    "--vllm-pd-disaggregation",
+                    "--decode",
+                    "http://127.0.0.1:8001",
+                    "--pd-kv-events",
+                ]);
+                vec![(worker.to_owned(), None)]
+            } else {
+                cli.extend(["--worker-urls", worker, "--kv-event-source"]);
+                Vec::new()
+            };
+            cli.push("http://127.0.0.1:8000=tcp://127.0.0.1:5557");
+            let config = CliArgs::try_parse_from(cli)
+                .unwrap()
+                .to_router_config(prefill)
+                .unwrap();
+            config.validate().unwrap();
+            let layout = if pd {
+                config.pd_kv_event_sources[worker].hybrid.as_ref().unwrap()
+            } else {
+                let PolicyConfig::KvAware {
+                    static_kv_event_sources,
+                    ..
+                } = &config.policy
+                else {
+                    unreachable!()
+                };
+                static_kv_event_sources[worker].hybrid.as_ref().unwrap()
+            };
+            assert_eq!(layout.ranks[0].publisher_topic.as_deref(), Some("boot-1"));
+            assert_eq!(layout.ranks[0].groups[0].block_size, 16);
+        }
+    }
+
+    #[test]
+    fn parses_pd_kv_aware_with_affinity_ttl() {
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--prefill-policy",
+            "kv_aware",
+            "--decode-policy",
+            "kv_aware",
+            "--kv-aware-session-affinity-ttl-secs",
+            "1800",
+        ])
+        .unwrap();
+        assert_eq!(args.prefill_policy.as_deref(), Some("kv_aware"));
+        assert_eq!(args.decode_policy.as_deref(), Some("kv_aware"));
+        assert_eq!(args.kv_aware_session_affinity_ttl_secs, Some(1800));
+    }
 
     #[test]
     fn parses_wasm_middleware_options() {
@@ -823,5 +1091,36 @@ mod tests {
 
         assert_eq!(prefill, vec![("http://prefill:8000".to_string(), None)]);
         assert_eq!(other, ["vllm-router", "65536"]);
+    }
+
+    #[test]
+    fn parses_pd_kv_events_specs() {
+        let specs = [
+            "http://prefill:8000=tcp://prefill:5557".to_string(),
+            "http://prefill2:8000=tcp://prefill2:5557, tcp://prefill2:5559".to_string(),
+        ]
+        .to_vec();
+        let sources = CliArgs::parse_pd_kv_events(&specs).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources["http://prefill:8000"].endpoints,
+            vec!["tcp://prefill:5557".to_string()]
+        );
+        assert_eq!(sources["http://prefill:8000"].block_size, 16);
+        // The space after ',' is intentional: exercises endpoint trimming.
+        assert_eq!(
+            sources["http://prefill2:8000"].endpoints,
+            vec![
+                "tcp://prefill2:5557".to_string(),
+                "tcp://prefill2:5559".to_string()
+            ]
+        );
+
+        for bad in ["no-endpoint", "http://p:8000=", "=tcp://p:5557"] {
+            assert!(
+                CliArgs::parse_pd_kv_events(&[bad.to_string()]).is_err(),
+                "should reject '{bad}'"
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple mock vLLM server for testing the router's transparent proxy feature.
+HTTP mock vLLM server for the router's transparent-proxy tests.
 
 Usage:
     python mock_vllm_server.py [--port PORT] [--host HOST]

@@ -330,7 +330,8 @@ pub struct CircuitBreakerStats {
     pub time_since_last_state_change: Duration,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::thread;
