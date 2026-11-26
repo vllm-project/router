@@ -14,9 +14,9 @@ use rand::Rng;
 use sha2::{Digest as _, Sha256};
 
 use super::peer_fetch::{
-    PeerEndpoint, PeerFetchGrant, PeerFetchLimiter, PeerFetchOutcome, PeerFetchPlan,
-    PeerFetchPlanner, PeerFetchPlannerInput, PeerFetchRequestOutcome, PeerFetchSkip, PeerInput,
-    TransferCapability,
+    PeerEndpoint, PeerFetchCostPath, PeerFetchGrant, PeerFetchLimiter, PeerFetchOutcome,
+    PeerFetchPlan, PeerFetchPlanOutcome, PeerFetchPlanner, PeerFetchPlannerInput,
+    PeerFetchRequestOutcome, PeerFetchSkip, PeerInput, TransferCapability,
 };
 use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
 use crate::core::{ConnectionMode, Worker};
@@ -1887,9 +1887,7 @@ impl KvAwarePolicy {
             // the request goes out unchanged.
             let transfer = self.transfer_planner.as_deref().and_then(|planner| {
                 if !input.allow_transfer_plan {
-                    crate::metrics::RouterMetrics::record_peer_fetch_plan(
-                        PeerFetchSkip::PromptLogprobs.label(),
-                    );
+                    PeerFetchPlanOutcome::Skipped(PeerFetchSkip::PromptLogprobs).record();
                     return None;
                 }
                 self.plan_transfer_for_pick(
@@ -2056,19 +2054,13 @@ impl KvAwarePolicy {
             })
         };
         if let Some(estimate) = &outcome.estimate {
-            crate::metrics::RouterMetrics::record_peer_fetch_estimated_cost_ms(
-                "fetch",
-                estimate.fetch_ms,
-            );
-            crate::metrics::RouterMetrics::record_peer_fetch_estimated_cost_ms(
-                "wait",
-                estimate.wait_ms,
-            );
+            PeerFetchCostPath::Fetch.record(estimate.fetch_ms);
+            PeerFetchCostPath::Wait.record(estimate.wait_ms);
         }
         match outcome.result {
             Ok(mut transfer) => {
                 transfer.plan_id = self.next_transfer_plan_id.fetch_add(1, Ordering::Relaxed);
-                crate::metrics::RouterMetrics::record_peer_fetch_plan("planned");
+                PeerFetchPlanOutcome::Planned.record();
                 crate::metrics::RouterMetrics::record_peer_fetch_estimated_saved_ms(
                     transfer.estimated_saved_prefill_ms,
                 );
@@ -2100,7 +2092,7 @@ impl KvAwarePolicy {
                 planned.map(|planned| (transfer, planned))
             }
             Err(skip) => {
-                crate::metrics::RouterMetrics::record_peer_fetch_plan(skip.label());
+                PeerFetchPlanOutcome::Skipped(skip).record();
                 tracing::debug!(skip = skip.label(), "KV transfer plan skipped");
                 None
             }

@@ -715,6 +715,8 @@ impl RouterMetrics {
     pub fn record_kv_placement_lookup(result: &'static str) {
         kv_placement_lookup_counter(result).increment(1);
     }
+    /// Planner outcome for one selection. Call through
+    /// `PeerFetchPlanOutcome::record`, which owns the label set.
     pub fn record_peer_fetch_plan(outcome: &'static str) {
         counter!("vllm_router_peer_fetch_plans_total", "outcome" => outcome).increment(1);
     }
@@ -731,7 +733,8 @@ impl RouterMetrics {
     pub fn record_peer_fetch_estimated_saved_ms(saved_ms: f64) {
         histogram!("vllm_router_peer_fetch_estimated_saved_ms").record(saved_ms);
     }
-    /// Estimated cost of the two compared paths; `path` is `fetch` or `wait`.
+    /// Estimated cost of the two compared paths. Call through
+    /// `PeerFetchCostPath::record`, which owns the label set.
     pub fn record_peer_fetch_estimated_cost_ms(path: &'static str, cost_ms: f64) {
         histogram!("vllm_router_peer_fetch_estimated_cost_ms", "path" => path).record(cost_ms);
     }

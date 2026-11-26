@@ -268,6 +268,51 @@ impl PeerFetchSkip {
     }
 }
 
+/// One selection's planner outcome: the `outcome` label on
+/// `vllm_router_peer_fetch_plans_total`. Every value of that label comes
+/// from here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerFetchPlanOutcome {
+    Planned,
+    Skipped(PeerFetchSkip),
+}
+
+impl PeerFetchPlanOutcome {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Skipped(skip) => skip.label(),
+        }
+    }
+
+    pub(crate) fn record(self) {
+        crate::metrics::RouterMetrics::record_peer_fetch_plan(self.label());
+    }
+}
+
+/// Which estimate a `vllm_router_peer_fetch_estimated_cost_ms` sample is: the
+/// `path` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerFetchCostPath {
+    /// The destination fetches the prefix from the source (`fetch_ms`).
+    Fetch,
+    /// The request waits on the source instead (`wait_ms`).
+    Wait,
+}
+
+impl PeerFetchCostPath {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::Wait => "wait",
+        }
+    }
+
+    pub(crate) fn record(self, cost_ms: f64) {
+        crate::metrics::RouterMetrics::record_peer_fetch_estimated_cost_ms(self.label(), cost_ms);
+    }
+}
+
 /// Active-mode outcome for a planned request: the `outcome` label on
 /// `vllm_router_peer_fetch_requests_total`. The policy records the four
 /// outcomes that stop a fetch grant; the HTTP send path records the rest.
@@ -1555,28 +1600,57 @@ mod tests {
     }
 
     #[test]
-    fn skip_labels_are_stable_and_distinct() {
-        let all = [
-            PeerFetchSkip::Disabled,
-            PeerFetchSkip::NoPeer,
-            PeerFetchSkip::UnverifiedIdentity,
-            PeerFetchSkip::UnknownDestinationInput,
-            PeerFetchSkip::PickedHoldsLongestPrefix,
-            PeerFetchSkip::PrefixTooShort,
-            PeerFetchSkip::SourceNotBusy,
-            PeerFetchSkip::SourceExcluded,
-            PeerFetchSkip::Incompatible,
-            PeerFetchSkip::CostRule,
-            PeerFetchSkip::SessionBinding,
-            PeerFetchSkip::MissingTokens,
-        ];
-        let labels: std::collections::HashSet<_> = all.iter().map(|s| s.label()).collect();
-        assert_eq!(labels.len(), all.len());
-        assert_eq!(PeerFetchSkip::CostRule.label(), "cost_rule");
+    fn plan_outcome_labels_are_stable_and_distinct() {
+        // Every `plans_total` outcome; dashboards and the docs tables match on
+        // these strings.
+        let labels: Vec<_> = [
+            PeerFetchPlanOutcome::Planned,
+            PeerFetchPlanOutcome::Skipped(PeerFetchSkip::Disabled),
+            PeerFetchPlanOutcome::Skipped(PeerFetchSkip::MisalignedInput),
+            PeerFetchPlanOutcome::Skipped(PeerFetchSkip::NoPeer),
+            PeerFetchPlanOutcome::Skipped(PeerFetchSkip::UnverifiedIdentity),
+            PeerFetchPlanOutcome::Skipped(PeerFetchSkip::UnknownDestinationInput),
+            PeerFetchPlanOutcome::Skipped(PeerFetchSkip::PickedHoldsLongestPrefix),
+            PeerFetchPlanOutcome::Skipped(PeerFetchSkip::PrefixTooShort),
+            PeerFetchPlanOutcome::Skipped(PeerFetchSkip::SourceNotBusy),
+            PeerFetchPlanOutcome::Skipped(PeerFetchSkip::SourceExcluded),
+            PeerFetchPlanOutcome::Skipped(PeerFetchSkip::Incompatible),
+            PeerFetchPlanOutcome::Skipped(PeerFetchSkip::CostRule),
+            PeerFetchPlanOutcome::Skipped(PeerFetchSkip::SessionBinding),
+            PeerFetchPlanOutcome::Skipped(PeerFetchSkip::MissingTokens),
+            PeerFetchPlanOutcome::Skipped(PeerFetchSkip::PromptLogprobs),
+        ]
+        .into_iter()
+        .map(PeerFetchPlanOutcome::label)
+        .collect();
         assert_eq!(
-            PeerFetchSkip::UnknownDestinationInput.label(),
-            "unknown_destination_input"
+            labels,
+            [
+                "planned",
+                "disabled",
+                "misaligned_input",
+                "no_peer",
+                "unverified_identity",
+                "unknown_destination_input",
+                "picked_holds_longest_prefix",
+                "prefix_too_short",
+                "source_not_busy",
+                "source_excluded",
+                "incompatible",
+                "cost_rule",
+                "session_binding",
+                "missing_tokens",
+                "prompt_logprobs",
+            ]
         );
+        let distinct: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(distinct.len(), labels.len());
+    }
+
+    #[test]
+    fn cost_path_labels_are_stable() {
+        assert_eq!(PeerFetchCostPath::Fetch.label(), "fetch");
+        assert_eq!(PeerFetchCostPath::Wait.label(), "wait");
     }
 
     #[test]
