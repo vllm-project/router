@@ -62,11 +62,9 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
         "model": model.path().to_str().unwrap(), "prompt": [4, 5, 6]
     }))
     .unwrap();
-    let lowered = vllm_router_rs::backend::prepare_grpc_completion(&req).unwrap();
-    let prepared = on
-        .prepare_token_ids(lowered.chat, lowered.token_ids, lowered.emit_token_ids)
-        .await
-        .unwrap();
+    let mut prepared = on.prepare_completions(&req).await.unwrap();
+    assert_eq!(prepared.len(), 1);
+    let prepared = prepared.pop().unwrap();
     assert_eq!(prepared.tokenized.token_ids.as_ref(), &[4, 5, 6]);
     assert_eq!(prepared.tokenized.cached_tokens, 0);
     assert_eq!(prepared.tokenized.encode_ms, 0.0);

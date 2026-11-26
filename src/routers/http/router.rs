@@ -1886,16 +1886,25 @@ impl Router {
                 Some(crate::backend::WorkerPoolKind::Grpc),
                 Some(GrpcRequestRef::Completion(completion)),
             ) if route == "/v1/completions" => {
-                let lowered = match crate::backend::prepare_grpc_completion(completion) {
-                    Ok(lowered) => lowered,
-                    Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
-                };
-                match self
-                    .frontend
-                    .prepare_token_ids(lowered.chat, lowered.token_ids, lowered.emit_token_ids)
-                    .await
-                {
-                    Ok(prepared) => Some(prepared),
+                // Count sequences from the raw prompt, without lowering:
+                // lowering allocates the text or token ids just to count
+                // them, then `prepare_completions` below would lower the
+                // same request again. A batch is rejected before any
+                // tokenization — dispatching more than one sequence is
+                // Stage 3's fan-out — and a tokenizer error can no longer
+                // mask the 400.
+                if completion.prompt.len() != 1 {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "gRPC /v1/completions does not support batched prompts yet",
+                    )
+                        .into_response();
+                }
+                match self.frontend.prepare_completions(completion).await {
+                    Ok(mut prepared) => {
+                        // The count check above guarantees exactly one.
+                        Some(prepared.pop().unwrap())
+                    }
                     Err(error) => {
                         return (prepare_error_status(&error), error.to_string()).into_response();
                     }

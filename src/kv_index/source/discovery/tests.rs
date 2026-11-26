@@ -1576,6 +1576,53 @@ async fn static_sources_skip_http_discovery() {
     server.abort();
 }
 
+#[tokio::test]
+async fn nixl_prefill_discovers_mooncake_compressed_truncation() {
+    let app = axum::Router::new().route(
+        "/server_info",
+        axum::routing::get(|| async {
+            // Exercise a cold metadata response that exceeds the prior 750 ms budget.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            axum::Json(serde_json::json!({
+                "vllm_config": {"kv_transfer_config": {"kv_connector": "MooncakeHybridConnector"}}
+            }))
+        }),
+    );
+    let (worker, server) = spawn_metrics_only_worker(app).await;
+    let (endpoint, replay, _publisher, _replay) = layout_endpoints();
+    let layout = capability(
+        "deepseek-v4",
+        "kv-prefill",
+        8,
+        serde_json::json!([{
+            "group_idx": 0, "kind": "mla_attention", "spec_type": "MLAAttentionSpec",
+            "block_size": 512, "prefix_cacheable": true, "prefix_replay_tokens": 0,
+            "tokens_per_state": "4", "cache_role": "sparse"
+        }]),
+    );
+    let sources = HashMap::from([(
+        worker.clone(),
+        crate::config::types::PdKvEventSources {
+            endpoints: vec![endpoint],
+            replay_endpoints: Some(vec![replay]),
+            block_size: 8,
+            model: Some("deepseek-v4".into()),
+            hybrid: Some(layout),
+        },
+    )]);
+    let (supervisor, _signals) = KvIndexSupervisor::new_pd(reqwest::Client::new(), sources);
+
+    let discovery = supervisor
+        .discover_for_role(&worker, Some(KvConnector::Nixl))
+        .await;
+    assert!(discovery.sources.is_ok());
+    assert_eq!(
+        discovery.server_info.unwrap().mooncake_truncates_compressed,
+        Some(true)
+    );
+    server.abort();
+}
+
 /// A rank-pinned static source takes its rank from the worker URL, so two
 /// DP ranks never share one index even when both declare one endpoint.
 #[tokio::test]
