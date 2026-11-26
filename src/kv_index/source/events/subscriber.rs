@@ -224,7 +224,6 @@ impl Subscriber {
         ctx: &zmq::Context,
         mut applied_seq: i64,
         watermarks: &mut ReplayWatermarks,
-        queued_live_after_gap: Option<&(i64, Vec<u8>)>,
         live_events: &LiveEventBuffer,
         socket: &mut Option<zmq::Socket>,
         idle_reconcile: bool,
@@ -286,13 +285,14 @@ impl Subscriber {
                         }
                         // The first live batch after a gap can finish a contiguous
                         // replay when the publisher has not buffered that batch yet.
-                        if let Some((seq, payload)) = queued_live_after_gap.filter(|(seq, _)| {
-                            *seq == next_expected_seq && Some(*seq) == watermarks.required_live_seq
-                        }) {
-                            self.apply_next_batch(*seq, payload)
-                                .map_err(|_| ReplayError::Rejected)?;
-                            record_replay_payload(live_events, &topic, *seq, payload)?;
-                            applied_seq = *seq;
+                        if watermarks.required_live_seq == Some(next_expected_seq)
+                            && live_events
+                                .apply_gap_trigger(next_expected_seq, |payload| {
+                                    self.apply_next_batch(next_expected_seq, payload)
+                                })
+                                .map_err(|_| ReplayError::Rejected)?
+                        {
+                            applied_seq = next_expected_seq;
                             next_expected_seq += 1;
                         }
                         if !watermarks.covers_required_sequences(next_expected_seq) {
@@ -314,12 +314,6 @@ impl Subscriber {
                             return Err(ReplayError::Rejected);
                         }
                         waiting_for_replay_clear = true;
-                    }
-                    if queued_live_after_gap.is_some_and(|(live_seq, live_payload)| {
-                        *live_seq == seq && live_payload.as_slice() != payload
-                    }) {
-                        warn!(%topic, seq, "KV replay conflicts with the queued live batch");
-                        return Err(ReplayError::Rejected);
                     }
                     if idle_reconcile && next_expected_seq == requested_start_seq {
                         self.suspend(Reason::IdleCatchup)
@@ -430,7 +424,6 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
             let mut disconnected = false;
             let mut reconnect = false;
             let mut watermarks = ReplayWatermarks::default();
-            let mut queued_live_after_gap = None;
             let mut replay_failures = 0;
             let mut monitor_error = None;
 
@@ -468,7 +461,6 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     }
                     disconnected = true;
                     watermarks = ReplayWatermarks::default();
-                    queued_live_after_gap = None;
                     replay_failures = 0;
                     applied_seq = -1;
                     bootstrap = false;
@@ -520,7 +512,6 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             &ctx,
                             applied_seq,
                             &mut watermarks,
-                            queued_live_after_gap.as_ref(),
                             &live_events,
                             &mut replay_socket,
                             idle_reconcile,
@@ -584,7 +575,6 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         } else {
                             Reason::ReplayApplied
                         };
-                        queued_live_after_gap = None;
                         if suspended || (idle_reconcile && advanced) {
                             if subscriber.resume(applied_seq, reason).is_err() {
                                 break;
@@ -609,7 +599,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             // The replay must cover any discarded live data.
                             watermarks.required_live_seq = watermarks
                                 .required_live_seq
-                                .max(live_events.discard_all(topic.as_bytes()));
+                                .max(live_events.discard_buffered_frames(topic.as_bytes()));
                         } else {
                             replay_failures += 1;
                         }
@@ -647,9 +637,6 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             live_events.reset();
                         } else if !overflow {
                             live_events.clear_fingerprints();
-                        }
-                        if !overflow {
-                            queued_live_after_gap = None;
                         }
                         if had_credit {
                             subscriber.invalidated("replay lost continuity");
@@ -702,7 +689,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             Ok,
                         );
                     match received {
-                        Ok((mut frames, is_replayed_duplicate)) => {
+                        Ok((frames, is_replayed_duplicate)) => {
                             let seq = match live_sequence(&frames, topic.as_bytes()) {
                                 Ok(Some(seq)) if (0..i64::MAX).contains(&seq) => seq,
                                 Ok(None) => {
@@ -797,8 +784,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                 );
                                 suspended = true;
                                 if can_replay {
-                                    queued_live_after_gap =
-                                        Some((seq, frames.pop().expect("validated live payload")));
+                                    live_events.push_gap_trigger(seq, frames);
                                 }
                                 break 'live_batch (Some(seq), true, applied_seq);
                             }

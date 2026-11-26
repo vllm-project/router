@@ -51,6 +51,8 @@ pub(super) struct LiveEventBuffer {
 #[derive(Default)]
 struct LiveEventBufferState {
     frames: VecDeque<QueuedLiveFrame>,
+    // While set, the trigger is the first frame in the queue.
+    gap_trigger_seq: Option<i64>,
     bytes: usize,
     recent_by_seq: HashMap<i64, [u8; 32]>,
     queued_by_seq: HashMap<i64, QueuedSequence>,
@@ -80,16 +82,7 @@ impl LiveEventBuffer {
     pub(super) fn push(&self, frames: Vec<Vec<u8>>, topic: &[u8]) -> bool {
         let mut state = self.state.lock();
         if let Some(seq) = valid_live_seq(&frames, topic) {
-            let replay_fingerprint = state.recent_by_seq.get(&seq).copied();
-            state
-                .queued_by_seq
-                .entry(seq)
-                .or_insert(QueuedSequence {
-                    frame_count: 0,
-                    replay_fingerprint,
-                    had_replay_conflict: false,
-                })
-                .frame_count += 1;
+            state.track_queued_sequence(seq);
         }
         state.bytes += frame_bytes(&frames);
         state.frames.push_back(QueuedLiveFrame {
@@ -97,6 +90,35 @@ impl LiveEventBuffer {
             payload_fingerprint: None,
         });
         state.frames.len() >= MAX_PENDING_LIVE_FRAMES || state.bytes >= super::MAX_KV_EVENT_BYTES
+    }
+
+    pub(super) fn push_gap_trigger(&mut self, seq: i64, frames: Vec<Vec<u8>>) {
+        let state = self.state.get_mut();
+        debug_assert!(state.gap_trigger_seq.is_none());
+        state.gap_trigger_seq = Some(seq);
+        state.track_queued_sequence(seq);
+        state.bytes += frame_bytes(&frames);
+        state.frames.push_front(QueuedLiveFrame {
+            frames,
+            payload_fingerprint: None,
+        });
+    }
+
+    /// An already disputed trigger must be matched by replay itself.
+    pub(super) fn apply_gap_trigger<E>(
+        &self,
+        seq: i64,
+        apply: impl FnOnce(&[u8]) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let mut state = self.state.lock();
+        if state.gap_trigger_seq != Some(seq) || state.queued_by_seq[&seq].had_replay_conflict {
+            return Ok(false);
+        }
+        let trigger = state.frames.front_mut().expect("queued gap trigger");
+        apply(&trigger.frames[2])?;
+        let fingerprint = trigger.payload_fingerprint();
+        state.remember_replay_fingerprint(seq, fingerprint);
+        Ok(true)
     }
 
     /// Check a queued copy before releasing its fingerprint reference.
@@ -125,16 +147,31 @@ impl LiveEventBuffer {
         *self.state.get_mut() = LiveEventBufferState::default();
     }
 
-    /// Discard the queue and its fingerprints, returning the highest valid sequence lost.
-    pub(super) fn discard_all(&mut self, topic: &[u8]) -> Option<i64> {
-        let highest = self
-            .state
-            .get_mut()
+    /// Free the replay buffer after overflow, retaining the gap trigger and its conflict status.
+    pub(super) fn discard_buffered_frames(&mut self, topic: &[u8]) -> Option<i64> {
+        let state = self.state.get_mut();
+        let highest = state
             .frames
             .iter()
+            .skip(usize::from(state.gap_trigger_seq.is_some()))
             .filter_map(|queued| valid_live_seq(&queued.frames, topic))
             .max();
-        self.reset();
+        if let Some(seq) = state.gap_trigger_seq {
+            state.frames.truncate(1);
+            state.bytes = frame_bytes(&state.frames[0].frames);
+            state
+                .queued_by_seq
+                .retain(|&queued_seq, _| queued_seq == seq);
+            let trigger = state
+                .queued_by_seq
+                .get_mut(&seq)
+                .expect("queued gap trigger");
+            trigger.frame_count = 1;
+            trigger.replay_fingerprint = None;
+            state.recent_by_seq.clear();
+        } else {
+            *state = LiveEventBufferState::default();
+        }
         highest
     }
 
@@ -145,20 +182,28 @@ impl LiveEventBuffer {
     ) -> Result<(), ConflictingReplayFingerprint> {
         let fingerprint = Sha256::digest(payload).into();
         let mut state = self.state.lock();
+        if state.gap_trigger_seq == Some(seq)
+            && state
+                .frames
+                .front_mut()
+                .expect("queued gap trigger")
+                .payload_fingerprint()
+                != fingerprint
+        {
+            state
+                .queued_by_seq
+                .get_mut(&seq)
+                .expect("queued gap trigger")
+                .had_replay_conflict = true;
+            return Err(ConflictingReplayFingerprint);
+        }
         if state
             .fingerprint(seq)
             .is_some_and(|known| known != fingerprint)
         {
             return Err(ConflictingReplayFingerprint);
         }
-        if let Some(queued) = state.queued_by_seq.get_mut(&seq) {
-            queued.replay_fingerprint = Some(fingerprint);
-        }
-        state.recent_by_seq.insert(seq, fingerprint);
-        if state.recent_by_seq.len() > RECENT_FINGERPRINT_LIMIT {
-            let floor = seq.saturating_sub((RECENT_FINGERPRINT_LIMIT / 2) as i64);
-            state.recent_by_seq.retain(|seq, _| *seq >= floor);
-        }
+        state.remember_replay_fingerprint(seq, fingerprint);
         Ok(())
     }
 
@@ -234,6 +279,11 @@ impl LiveEventBuffer {
         if let Some(error) = error {
             return Err(error);
         }
+        if let Some(seq) = state.gap_trigger_seq.take() {
+            let trigger = state.frames.pop_front().expect("queued gap trigger");
+            release_frame(&mut state.queued_by_seq, seq);
+            state.bytes -= frame_bytes(&trigger.frames);
+        }
         if let Some(clear_seq) = clear_seq {
             state.frames.retain(|queued| {
                 let Some(seq) =
@@ -251,6 +301,29 @@ impl LiveEventBuffer {
 }
 
 impl LiveEventBufferState {
+    fn track_queued_sequence(&mut self, seq: i64) {
+        let replay_fingerprint = self.recent_by_seq.get(&seq).copied();
+        self.queued_by_seq
+            .entry(seq)
+            .or_insert(QueuedSequence {
+                frame_count: 0,
+                replay_fingerprint,
+                had_replay_conflict: false,
+            })
+            .frame_count += 1;
+    }
+
+    fn remember_replay_fingerprint(&mut self, seq: i64, fingerprint: [u8; 32]) {
+        if let Some(queued) = self.queued_by_seq.get_mut(&seq) {
+            queued.replay_fingerprint = Some(fingerprint);
+        }
+        self.recent_by_seq.insert(seq, fingerprint);
+        if self.recent_by_seq.len() > RECENT_FINGERPRINT_LIMIT {
+            let floor = seq.saturating_sub((RECENT_FINGERPRINT_LIMIT / 2) as i64);
+            self.recent_by_seq.retain(|seq, _| *seq >= floor);
+        }
+    }
+
     fn fingerprint(&self, seq: i64) -> Option<[u8; 32]> {
         self.queued_by_seq
             .get(&seq)

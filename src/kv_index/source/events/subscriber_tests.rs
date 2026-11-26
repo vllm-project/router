@@ -700,6 +700,7 @@ async fn repeated_live_buffer_overflow_does_not_exhaust_replay() {
 async fn replay_requires_continuous_history_and_valid_topic_rank_and_payload() {
     let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
     let empty = batch_payload(&[]);
+    let clear = batch_payload(&[KVEvent::AllBlocksCleared(Default::default())]);
     let bad_rank = event_payload(1.0, &[], Some(1));
 
     for failure in [
@@ -746,13 +747,27 @@ async fn replay_requires_continuous_history_and_valid_topic_rank_and_payload() {
             _ => unreachable!(),
         }
         tcp.reply(&request, END_SEQ, &[]);
-        let retry = tcp.request(0).await;
+        let mut retry = tcp.request(0).await;
         assert_eq!(credit(&index), 0, "bad replay exposed credit: {failure}");
+        if failure == "conflicting_live_batch" {
+            tcp.history(&retry, &[(3, &clear), (4, &store)]);
+            retry = tcp.request(0).await;
+            assert_eq!(
+                credit(&index),
+                0,
+                "replay skipped the conflicting gap trigger"
+            );
+        }
         tcp.reply(&retry, 0, &store);
         wait_until(|| next_seq(&index) == Some(1)).await;
         assert_eq!(credit(&index), 0, "open replay exposed credit: {failure}");
-        let tail = [(1, empty.as_slice()), (2, &empty), (3, &empty)];
-        tcp.history(&retry, &tail[..if failure == "middle_gap" { 3 } else { 2 }]);
+        let tail = [(1, empty.as_slice()), (2, &empty), (3, &empty), (4, &empty)];
+        let tail_len = match failure {
+            "conflicting_live_batch" => 4,
+            "middle_gap" => 3,
+            _ => 2,
+        };
+        tcp.history(&retry, &tail[..tail_len]);
         wait_until(|| credit(&index) == 4).await;
     }
 }
