@@ -452,9 +452,7 @@ impl KvIndexSupervisor {
             let lifecycle = self.lifecycle_for_worker(worker_url);
             (owner, lifecycle)
         };
-        let mut discovery = self.discover(worker_url).await;
-        self.probe_admission_hashes(worker_url, &mut discovery)
-            .await;
+        let discovery = self.discover(worker_url).await;
         let models = discovery.base_models.clone();
         let hashes = observed
             .as_ref()
@@ -477,9 +475,12 @@ impl KvIndexSupervisor {
         Ok((installation?, models))
     }
 
-    /// Prepare metadata once; P/D refresh fingerprints and installs this same snapshot.
+    /// Discover worker metadata and available hashes for a new registration.
     pub(crate) async fn discover(&self, worker_url: &str) -> WorkerDiscovery {
-        self.discover_for_role(worker_url, None).await
+        let mut discovery = self.discover_for_role(worker_url, None).await;
+        self.probe_admission_hashes(worker_url, &mut discovery)
+            .await;
+        discovery
     }
 
     async fn discover_for_role(

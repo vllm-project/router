@@ -1992,6 +1992,12 @@ async fn registration_only_scrapes_hashes_for_usable_http_sources() {
     supervisor.on_worker_added(url).await.unwrap();
 
     let mut discovered = supervisor.discover(url).await;
+    let configs = discovered.engine_cache_configs.take().unwrap();
+    assert_eq!(
+        configs[&0].prefix_caching_hash_algo.as_deref(),
+        Some("sha256_cbor")
+    );
+
     let grpc_url = url.replacen("http://", "grpc://", 1);
     supervisor
         .probe_admission_hashes(&grpc_url, &mut discovered)
@@ -2004,18 +2010,18 @@ async fn registration_only_scrapes_hashes_for_usable_http_sources() {
     let requests = || worker.requests.metrics.load(Ordering::Relaxed);
     assert_eq!(
         requests(),
-        1,
+        2,
         "gRPC and unchanged descriptors skip the scrape"
     );
 
     let sources = std::mem::replace(&mut *worker.sources.lock(), serde_json::json!([]));
     lifecycle.state.lock().trusted = false;
     assert!(probe().await.is_err());
-    assert_eq!(requests(), 1, "failed source probe");
+    assert_eq!(requests(), 2, "failed source probe");
 
     *worker.sources.lock() = sources;
     assert!(probe().await.unwrap().worker.engine_cache_configs.is_some());
-    assert_eq!(requests(), 2, "usable source for re-admission");
+    assert_eq!(requests(), 3, "usable source for re-admission");
 }
 
 #[tokio::test]
