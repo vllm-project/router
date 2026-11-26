@@ -1192,11 +1192,12 @@ pub enum PeerFetchMode {
     Active,
 }
 
-/// Settings for the KV transfer planner. `PeerFetchRules::from(&config)` (in
+/// Settings for the peer fetch planner. `PeerFetchRules::from(&config)` (in
 /// `policies::peer_fetch`) is the only way to build a planner policy:
-/// `enabled` is derived from `mode`, and
-/// `require_capability` defaults to `false` so shadow measurement works without
-/// declared capabilities.
+/// `enabled` is derived from `mode`. The planner checks worker capability in
+/// both modes, so a default shadow run predicts active mode;
+/// `ignore_capability` (shadow only) drops the check to measure what peer
+/// fetch would save once capabilities are declared.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PeerFetchConfig {
@@ -1207,7 +1208,9 @@ pub struct PeerFetchConfig {
     pub prefill_us_per_token: f64,
     pub transfer_fixed_ms: f64,
     pub transfer_us_per_token: f64,
-    pub require_capability: bool,
+    /// Shadow mode only: plan on a shared cache identity alone, without the
+    /// capability check. Validation rejects it in active mode.
+    pub ignore_capability: bool,
     /// Active mode: most peer fetches in flight against one source worker.
     /// Requests over the cap are sent without peer params.
     pub max_inflight_per_source: usize,
@@ -1226,7 +1229,7 @@ impl Default for PeerFetchConfig {
             prefill_us_per_token: 50.0,
             transfer_fixed_ms: 5.0,
             transfer_us_per_token: 5.0,
-            require_capability: false,
+            ignore_capability: false,
             max_inflight_per_source: 4,
             capabilities: HashMap::new(),
         }
@@ -1271,8 +1274,8 @@ pub fn peer_fetch_cost_constants_valid(
 /// URL. Nothing here is verified against the engine: a wrong entry makes the
 /// planner's `Incompatible` check wrong, so a fingerprint must be identical on
 /// workers with the same model, KV dtype, TP/PP shape, block size and
-/// quantization, and different otherwise. Shadow mode does not need this at all
-/// when `require_capability` is false.
+/// quantization, and different otherwise. A shadow run with
+/// `ignore_capability` does not need this at all.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StaticTransferCapability {

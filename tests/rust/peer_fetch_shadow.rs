@@ -235,7 +235,9 @@ impl Options {
             session_ttl_secs: None,
             transfer: PeerFetchConfig {
                 mode: PeerFetchMode::Shadow,
-                require_capability: false,
+                // These scenarios plan on cache identity alone unless a test
+                // opts into capabilities.
+                ignore_capability: true,
                 ..PeerFetchConfig::default()
             },
             peers: BTreeMap::new(),
@@ -250,9 +252,9 @@ impl Options {
     }
 
     /// Capabilities come only from the engines' `peer_lookup` records: no
-    /// static config, `require_capability` on.
+    /// static config, capability checked.
     fn with_engine_capabilities(mut self, peers: &[(&'static str, PeerLookupMock)]) -> Self {
-        self.transfer.require_capability = true;
+        self.transfer.ignore_capability = false;
         self.peers = peers.iter().cloned().collect();
         self
     }
@@ -783,7 +785,7 @@ async fn removal_events_drop_credit_and_restore_recovers_it() {
 
 // ---------------------------------------------------------------------------
 // Engine-reported capabilities (`peer_lookup` in /kv_event_sources), with
-// `require_capability: true` and no static `peer_fetch.capabilities`. Same
+// the capability check on and no static `peer_fetch.capabilities`. Same
 // setup as scenario 1: A holds 100 blocks and is busy, B is idle and cold.
 // ---------------------------------------------------------------------------
 
@@ -1042,7 +1044,7 @@ async fn s15_inflight_cap_holds_until_the_stream_ends() {
 async fn s16_source_without_an_address_is_not_fetched_from() {
     let mut options = Options::new(&[("a", "m"), ("b", "m")]);
     options.transfer.mode = PeerFetchMode::Active;
-    options.transfer.require_capability = true;
+    options.transfer.ignore_capability = false;
     // No engine records at all; the capabilities are added below, once the
     // mock URLs are known.
     let (fx, prompt) = {

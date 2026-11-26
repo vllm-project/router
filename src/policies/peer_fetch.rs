@@ -59,8 +59,10 @@ impl From<&PeerFetchConfig> for PeerFetchRules {
             enabled: config.mode != PeerFetchMode::Off,
             min_prefix_blocks: config.min_prefix_blocks,
             source_load_threshold: config.source_load_threshold,
-            // Active transfers must never run on a shared cache identity alone.
-            require_capability: config.require_capability || config.mode == PeerFetchMode::Active,
+            // Active transfers must never run on a shared cache identity alone,
+            // so only shadow can drop the check (validation also rejects
+            // `ignore_capability` in active mode).
+            require_capability: config.mode == PeerFetchMode::Active || !config.ignore_capability,
             prefill_us_per_token: config.prefill_us_per_token,
             transfer_fixed_ms: config.transfer_fixed_ms,
             transfer_us_per_token: config.transfer_us_per_token,
@@ -692,9 +694,12 @@ mod tests {
     }
 
     /// A policy as the config builds it, with the given mode.
+    /// Most fixtures declare no capabilities, so shadow drops the check; tests
+    /// of the check itself set `require_capability` on the rules.
     fn policy_for(mode: PeerFetchMode) -> PeerFetchRules {
         PeerFetchRules::from(&PeerFetchConfig {
             mode,
+            ignore_capability: mode == PeerFetchMode::Shadow,
             ..Default::default()
         })
     }
@@ -705,6 +710,25 @@ mod tests {
 
     fn disabled() -> PeerFetchRules {
         policy_for(PeerFetchMode::Off)
+    }
+
+    /// Both modes check capability by default, so shadow predicts active.
+    /// `ignore_capability` drops the check in shadow only: active mode keeps
+    /// it even if validation was bypassed.
+    #[test]
+    fn capability_is_checked_unless_shadow_ignores_it() {
+        let rules = |mode, ignore_capability| {
+            PeerFetchRules::from(&PeerFetchConfig {
+                mode,
+                ignore_capability,
+                ..Default::default()
+            })
+            .require_capability
+        };
+        assert!(rules(PeerFetchMode::Shadow, false));
+        assert!(rules(PeerFetchMode::Active, false));
+        assert!(!rules(PeerFetchMode::Shadow, true));
+        assert!(rules(PeerFetchMode::Active, true));
     }
 
     fn view<'a>(

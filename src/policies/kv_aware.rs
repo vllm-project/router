@@ -6623,6 +6623,9 @@ mod tests {
             mode,
             min_prefix_blocks: 4,
             transfer_fixed_ms: 0.0,
+            // The fixture registers no capabilities, so shadow plans on cache
+            // identity alone; active mode cannot drop the check.
+            ignore_capability: mode == crate::config::types::PeerFetchMode::Shadow,
             ..Default::default()
         }
     }

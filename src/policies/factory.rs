@@ -108,6 +108,12 @@ impl PolicyFactory {
                 Default::default()
             }
         };
+        if config.ignore_capability {
+            tracing::warn!(
+                "peer_fetch shadow mode is ignoring worker capability: plans may include \
+                 pairs that active mode rejects as `incompatible`"
+            );
+        }
         let policy = policy.with_transfer_planner(Arc::new(CostRulePeerFetchPlanner {
             policy: PeerFetchRules::from(config),
         }));

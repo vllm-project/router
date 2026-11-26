@@ -237,7 +237,7 @@ struct CliArgs {
     kv_penalty_external: f64,
     #[arg(long, default_value_t = 0.3)]
     kv_penalty_disk: f64,
-    /// KV transfer planner for kv_aware: off, shadow (plan and report only), or
+    /// Peer fetch planner for kv_aware: off, shadow (plan and report only), or
     /// active (send kv_transfer_params so the destination engine fetches the prefix).
     #[arg(long, default_value = "off", value_parser = ["off", "shadow", "active"])]
     peer_fetch_mode: String,
@@ -259,9 +259,10 @@ struct CliArgs {
     /// Estimated transfer cost in microseconds per token.
     #[arg(long, default_value_t = 5.0)]
     peer_fetch_us_per_token: f64,
-    /// Require declared worker capability before planning a transfer.
+    /// Shadow mode only: plan without checking worker capability, to measure
+    /// what peer fetch would save once capabilities are declared.
     #[arg(long)]
-    peer_fetch_require_capability: bool,
+    peer_fetch_ignore_capability: bool,
     /// Active mode: most peer fetches in flight against one source worker.
     #[arg(long, default_value_t = 4)]
     peer_fetch_max_inflight_per_source: usize,
@@ -499,7 +500,7 @@ impl CliArgs {
             prefill_us_per_token: self.peer_fetch_prefill_us_per_token,
             transfer_fixed_ms: self.peer_fetch_fixed_ms,
             transfer_us_per_token: self.peer_fetch_us_per_token,
-            require_capability: self.peer_fetch_require_capability,
+            ignore_capability: self.peer_fetch_ignore_capability,
             max_inflight_per_source: self.peer_fetch_max_inflight_per_source,
             capabilities: HashMap::new(),
         }))
@@ -1236,7 +1237,7 @@ mod tests {
             "2.5",
             "--peer-fetch-us-per-token",
             "7",
-            "--peer-fetch-require-capability",
+            "--peer-fetch-ignore-capability",
             "--peer-fetch-max-inflight-per-source",
             "2",
         ])
@@ -1251,7 +1252,7 @@ mod tests {
                 prefill_us_per_token: 40.0,
                 transfer_fixed_ms: 2.5,
                 transfer_us_per_token: 7.0,
-                require_capability: true,
+                ignore_capability: true,
                 max_inflight_per_source: 2,
                 capabilities: HashMap::new(),
             }

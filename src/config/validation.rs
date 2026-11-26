@@ -924,6 +924,15 @@ impl ConfigValidator {
                 reason: "must be greater than 0 in active mode".to_string(),
             });
         }
+        if config.mode == PeerFetchMode::Active && config.ignore_capability {
+            return Err(ConfigError::InvalidValue {
+                field: "peer_fetch.ignore_capability".to_string(),
+                value: "true".to_string(),
+                reason: "is a shadow-mode measurement option; active mode always checks \
+                         worker capability"
+                    .to_string(),
+            });
+        }
         if !config.cost_constants_valid() {
             return Err(ConfigError::InvalidValue {
                 field: "peer_fetch".to_string(),
@@ -2133,6 +2142,16 @@ mod tests {
 
         // Active mode is accepted, with a positive per-source cap.
         ConfigValidator::validate(&peer_fetch_config(block(PeerFetchMode::Active))).unwrap();
+
+        // Dropping the capability check is a shadow-only measurement option.
+        let ignoring = |mode| PeerFetchConfig {
+            ignore_capability: true,
+            ..block(mode)
+        };
+        ConfigValidator::validate(&peer_fetch_config(ignoring(PeerFetchMode::Shadow))).unwrap();
+        let error = ConfigValidator::validate(&peer_fetch_config(ignoring(PeerFetchMode::Active)))
+            .unwrap_err();
+        assert!(error.to_string().contains("ignore_capability"));
         let mut bad = block(PeerFetchMode::Active);
         bad.max_inflight_per_source = 0;
         let error = ConfigValidator::validate(&peer_fetch_config(bad)).unwrap_err();
