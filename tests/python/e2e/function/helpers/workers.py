@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 from tests.python.e2e.function.helpers import launch
 from tests.python.e2e.function.helpers.worker_logs import SubprocessLogPump
@@ -59,6 +60,12 @@ def spawn_two_vllm_rs_grpc_workers(
 
     kv_on = kv_aware_kv_events_enabled()
     replay_on = kv_on and kv_aware_kv_events_replay_enabled()
+    # The auto-discovered full-attention layout expects vLLM's default hash root.
+    kv_event_env = (
+        {"PYTHONHASHSEED": None, "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": "0"}
+        if kv_on
+        else None
+    )
     port_count = 8 if replay_on else (6 if kv_on else 4)
     ports = launch.find_distinct_available_ports(port_count)
     http_a, grpc_a, http_b, grpc_b = ports[:4]
@@ -99,11 +106,13 @@ def spawn_two_vllm_rs_grpc_workers(
             base_gpu_id=gpu_a,
             kv_events_zmq_port=zmq_a,
             kv_events_replay_port=replay_a,
+            kv_events_topic=uuid4().hex if kv_on else None,
             extra_argv=serve_extra,
             endpoint_bind=endpoint_bind,
             replay_host=replay_host,
             prefer_vllm_serve=prefer_vllm_serve,
             capture_output=True,
+            extra_env=kv_event_env,
         )
         worker_a = SimpleNamespace(
             proc=proc_a,
@@ -138,11 +147,13 @@ def spawn_two_vllm_rs_grpc_workers(
             base_gpu_id=gpu_b,
             kv_events_zmq_port=zmq_b,
             kv_events_replay_port=replay_b,
+            kv_events_topic=uuid4().hex if kv_on else None,
             extra_argv=serve_extra,
             endpoint_bind=endpoint_bind,
             replay_host=replay_host,
             prefer_vllm_serve=prefer_vllm_serve,
             capture_output=True,
+            extra_env=kv_event_env,
         )
         worker_b = SimpleNamespace(
             proc=proc_b,

@@ -267,6 +267,7 @@ def popen_launch_vllm_rs_grpc_worker(
     base_gpu_id: int | list[int] = 0,
     kv_events_zmq_port: int | None = None,
     kv_events_replay_port: int | None = None,
+    kv_events_topic: str | None = None,
     extra_argv: list[str] | None = None,
     endpoint_bind: str = "*",
     replay_host: str = "127.0.0.1",
@@ -274,7 +275,7 @@ def popen_launch_vllm_rs_grpc_worker(
     capture_output: bool = False,
     hash_seed: str | None = None,
     log_file: TextIO | None = None,
-    extra_env: dict[str, str] | None = None,
+    extra_env: dict[str, str | None] | None = None,
 ) -> subprocess.Popen:
     """``vllm-rs serve`` with HTTP + ``--grpc-port``.
 
@@ -283,9 +284,14 @@ def popen_launch_vllm_rs_grpc_worker(
 
     Set ``hash_seed`` to publish full, reproducible KV hashes. Stdout and
     stderr go to ``log_file`` or, with ``capture_output``, a log pump PIPE.
+    Values of ``None`` in ``extra_env`` remove inherited variables.
     """
     kind, prefix = resolve_worker_serve_launch(prefer_vllm_serve=prefer_vllm_serve)
-    env = {**os.environ, **(extra_env or {})}
+    env = {
+        key: value
+        for key, value in {**os.environ, **(extra_env or {})}.items()
+        if value is not None
+    }
     env["CUDA_VISIBLE_DEVICES"] = _cuda_visible_devices(base_gpu_id)
     serve_tail = list(extra_argv or [])
     if kv_events_zmq_port is not None and "--kv-events-config" not in serve_tail:
@@ -296,6 +302,7 @@ def popen_launch_vllm_rs_grpc_worker(
                 replay_port=kv_events_replay_port,
                 endpoint_bind=endpoint_bind,
                 replay_host=replay_host,
+                topic=kv_events_topic,
             ),
         ]
     cmd = [

@@ -24,7 +24,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "e2e: mark as end-to-end test")
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def kv_aware_two_workers():
     """``vllm-rs serve`` ×2; health via each worker OpenAI ``/health`` port."""
     from tests.python.e2e.function.helpers.workers import (
@@ -46,7 +46,7 @@ def kv_aware_two_workers():
         terminate_workers(workers)
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def kv_aware_router(kv_aware_two_workers):
     """Router with ``--worker-urls`` (regular mode requires workers at startup)."""
     from tests.python.e2e.function.helpers.router import (
@@ -130,6 +130,8 @@ def hybrid_kv_aware_stack(request, tmp_path):
             ]
         )
     mamba_groups = any(group["kind"] == "mamba" for group in rank["groups"])
+    # NIXL leaves the last prompt token on Decode for Mamba models.
+    prefill_backoff = int(pd and mamba_groups)
 
     with ExitStack() as cleanup:
         for index in range(worker_count):
@@ -152,6 +154,7 @@ def hybrid_kv_aware_stack(request, tmp_path):
                 transfer = {
                     "kv_connector": "NixlConnector",
                     "kv_role": "kv_consumer" if is_decode else "kv_producer",
+                    "kv_load_failure_policy": "fail",
                 }
                 worker_args.extend(["--kv-transfer-config", json.dumps(transfer)])
             grpc_port = extra_ports[0] if extra_ports else None
@@ -214,7 +217,9 @@ def hybrid_kv_aware_stack(request, tmp_path):
             if is_decode:
                 continue
             ready_log = log_path.read_text(encoding="utf-8", errors="replace")
-            sizes = re.search(r"kv cache group sizes \((\d+(?:,\s*\d+)*)\)", ready_log)
+            sizes = re.search(
+                r"kv cache group sizes [\[(](\d+(?:,\s*\d+)*),?[)\]]", ready_log
+            )
             assert sizes, f"{url}: missing KV cache group sizes in {log_path}"
             block_sizes = tuple(int(size) for size in sizes[1].split(","))
             assert len(block_sizes) == len(rank["groups"]), (
@@ -265,4 +270,5 @@ def hybrid_kv_aware_stack(request, tmp_path):
             cache_block_size=cache_block_size,
             max_model_len=engine_params["max_model_len"],
             speculative_tokens=rank["speculative_tokens"],
+            prefill_backoff=prefill_backoff,
         )

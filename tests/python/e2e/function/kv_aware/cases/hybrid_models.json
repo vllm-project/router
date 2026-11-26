@@ -10,7 +10,9 @@
       "prefix_caching_hash_algo": "sha256_cbor",
       "prefix_match_unit": 16,
       "max_model_len": 4096,
-      "max_num_batched_tokens": 4096
+      "max_num_batched_tokens": 4096,
+      "max_num_seqs": 8,
+      "kv_cache_memory_bytes": 4294967296
     },
     "router_params": {
       "--kv-hybrid-layout": {
@@ -92,7 +94,8 @@
                   {"kind": "mamba", "mamba_cache_mode": "align"},
                   {"kind": "full_attention"}
                 ],
-                "hash_lookahead_tokens": 1
+                "hash_lookahead_tokens": 0,
+                "tail_drop_groups": [3]
               }
             ]
           }
@@ -101,11 +104,11 @@
       "dspark": {
         "deployments": ["colocated", "1p1d_nixl"],
         "worker_params": {
+          "max_num_seqs": 512,
           "speculative_config": {
             "method": "dspark",
             "model": "RedHatAI/Qwen3.8-27B-speculator.dspark",
             "num_speculative_tokens": 8,
-            "disable_lookahead_block_hashes": true,
             "disable_eagle_block_drop": true
           }
         },
@@ -221,7 +224,6 @@
           "speculative_config": {
             "method": "mtp",
             "num_speculative_tokens": 3,
-            "disable_lookahead_block_hashes": true,
             "disable_eagle_block_drop": true
           }
         },
@@ -301,8 +303,7 @@
       "trust_remote_code": true,
       "tensor_parallel_size": 2,
       "kv_cache_dtype": "fp8",
-      "block_size": 128,
-      "swa_bounded_replay": true
+      "block_size": 128
     },
     "router_params": {
       "--kv-hybrid-layout": {
@@ -313,11 +314,11 @@
             "hash_seed": "0",
             "speculative_tokens": 0,
             "groups": [
-              {"kind": "sliding_window_mla", "sliding_window": 128, "prefix_replay_tokens": 128},
-              {"kind": "sliding_window_mla", "sliding_window": 128, "prefix_replay_tokens": 128},
-              {"kind": "sliding_window_mla", "sliding_window": 128, "prefix_replay_tokens": 128},
-              {"kind": "sliding_window_mla", "sliding_window": 128, "prefix_replay_tokens": 128},
-              {"kind": "sliding_window_mla", "sliding_window": 128, "prefix_replay_tokens": 128},
+              {"kind": "sliding_window_mla", "sliding_window": 128},
+              {"kind": "sliding_window_mla", "sliding_window": 128},
+              {"kind": "sliding_window_mla", "sliding_window": 128},
+              {"kind": "sliding_window_mla", "sliding_window": 128},
+              {"kind": "sliding_window_mla", "sliding_window": 128},
               {"kind": "mla_attention", "cache_role": "sparse", "tokens_per_state": "2"},
               {"kind": "scratch", "tokens_per_state": "1"}
             ]

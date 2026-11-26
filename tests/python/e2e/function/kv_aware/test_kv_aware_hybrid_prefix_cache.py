@@ -1,11 +1,12 @@
 """Compare Router KV credit with actual reuse on hybrid model worker pairs.
 
-Set ROUTER_BIN to a binary that includes PR #493 and run with vLLM 0.33.0.
+Set ROUTER_BIN to a binary that includes PR #493 and run with vLLM 0.30.0.
 Each case uses two workers with the GPUs per replica set by its tensor
 parallel size. Use `-k` to select a model, protocol, or variant.
 The 1P1D cases require NixlConnector on both workers.
 Set the model's `local_model_env` from cases/hybrid_models.json to use a local
-checkpoint. The DeepSeek V4 Pro NVFP4 case targets Blackwell GPUs.
+checkpoint.
+The DeepSeek V4 Pro NVFP4 case targets Blackwell GPUs.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ _PD_PREFIX_DECISION = re.compile(
 )
 _WORKER_COUNTER = re.compile(
     r"^(vllm:(?:prefix_cache_(?:queries|hits)(?:_total)?|"
+    r"external_prefix_cache_hits_total|"
     r"nixl_bytes_transferred_(?:sum|count)|"
     r"nixl_num_(?:failed_transfers|failed_notifications|kv_expired_reqs)_total|"
     r"spec_decode_num_drafts_total))(?:\{[^\n]*\})?[ \t]+(\S+)",
@@ -47,6 +49,7 @@ _NIXL_TRANSFERS = (
     "vllm:nixl_bytes_transferred_count",
     "vllm:nixl_bytes_transferred_sum",
 )
+_EXTERNAL_PREFIX_HITS = "vllm:external_prefix_cache_hits_total"
 _NIXL_ERRORS = (
     "vllm:nixl_num_failed_transfers_total",
     "vllm:nixl_num_failed_notifications_total",
@@ -123,6 +126,9 @@ def _complete(
     body = response.json()
     request_id = response.headers.get("x-request-id") or body["id"]
     assert body["choices"], f"{request_id}: missing completion"
+    assert all(
+        choice["finish_reason"] in ("stop", "length") for choice in body["choices"]
+    ), f"{request_id}: unexpected completion finish: {body['choices']}"
     usage = body["usage"]
     assert usage["prompt_tokens"] == len(tokens), f"{request_id}: {usage}"
     return request_id, usage
@@ -157,7 +163,7 @@ def _wait_worker_cache_hits(
     prompt_tokens: int,
     request_id: str,
 ) -> int:
-    # The query counter includes every prompt token, even for a cold miss.
+    # The query counter includes every token queried by this worker, even on a miss.
     # Wait for it to account for this request before reading the hit delta.
     deadline = time.monotonic() + kv_aware_request_log_poll_sec()
     while time.monotonic() < deadline:
@@ -187,7 +193,9 @@ def _wait_for_counter_increases(
 
 
 def _prefix_probes(stack):
-    prompts = build_hybrid_prefix_requests(stack.cache_block_size)
+    prompts = build_hybrid_prefix_requests(
+        stack.cache_block_size, prefill_backoff=stack.prefill_backoff
+    )
     max_tokens = stack.speculative_tokens + 2 if stack.speculative_tokens else 1
     longest_prompt = max(map(len, prompts.values()))
     assert longest_prompt + max_tokens <= stack.max_model_len, (
@@ -340,8 +348,9 @@ def test_kv_aware_hybrid_prefix_reuse_1p1d_nixl(hybrid_kv_aware_stack):
             )
             assert len(matches) == 1, f"{probe} {request_id}: {matches}"
             router_credit = int(matches[0]["credit"])
+            prefill_tokens = len(tokens) - stack.prefill_backoff
             prefill_credit = _wait_worker_cache_hits(
-                session, prefill_url, prefill_baseline, len(tokens), request_id
+                session, prefill_url, prefill_baseline, prefill_tokens, request_id
             )
             assert 0 <= prefill_credit < len(tokens), (
                 f"{probe} {request_id}: {prefill_credit}"
@@ -357,7 +366,12 @@ def test_kv_aware_hybrid_prefix_reuse_1p1d_nixl(hybrid_kv_aware_stack):
                 flush=True,
             )
 
-        activity = {name: decode_before[name] for name in _NIXL_TRANSFERS}
+        # The Rust frontend can report external hits with empty NIXL byte
+        # histograms. A failed KV load fails the completion.
+        transfers = (
+            (_EXTERNAL_PREFIX_HITS,) if stack.protocol == "grpc" else _NIXL_TRANSFERS
+        )
+        activity = {name: decode_before[name] for name in transfers}
         if stack.speculative_tokens:
             activity[_DRAFTS] = decode_before[_DRAFTS]
         _wait_for_counter_increases(session, decode_url, activity)

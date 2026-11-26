@@ -20,7 +20,7 @@ Optional environment (see also ``function/helpers/launch.py``):
   ``1`` is rejected: ``vllm serve`` cannot be a ``grpc://`` worker.
 - Worker serve extras (shell-split, first set wins):
   ``KV_AWARE_WORKER_SERVE_EXTRA``, ``VLLM_SERVE_EXTRA``, ``VLLM_RS_SERVE_EXTRA``;
-  default ``--enable-prefix-caching`` when all unset.
+  defaults to the worker arguments in ``cases/qwen3_0_6b.json`` when all unset.
 - ``KV_AWARE_KV_EVENTS``: ``1`` (default) append ``--kv-events-config`` per worker; ``0`` to disable.
 - ``KV_AWARE_KV_EVENTS_REPLAY``: ``1`` (default) add ``replay_endpoint`` per worker (DEALER replay).
 - ``KV_AWARE_KV_EVENTS_ENDPOINT_BIND``: PUB bind in JSON ``endpoint`` (default ``*`` → ``tcp://*:port``).

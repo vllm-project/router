@@ -2,5 +2,5 @@
   "model": "Qwen/Qwen3-0.6B",
   "worker_count": 2,
   "protocol": "grpc",
-  "worker_args": ["--enable-prefix-caching"]
+  "worker_args": ["--enable-prefix-caching", "--prefix-caching-hash-algo", "sha256_cbor"]
 }

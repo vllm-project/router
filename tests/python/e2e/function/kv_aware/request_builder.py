@@ -29,15 +29,19 @@ def lane_reuse_user(lane: str, *, round_index: int = 1) -> str:
     )
 
 
-def build_hybrid_prefix_requests(block_size: int) -> dict[str, list[int]]:
+def build_hybrid_prefix_requests(
+    block_size: int, *, prefill_backoff: int = 0
+) -> dict[str, list[int]]:
     """Build the priming prompts and token-ID probes for the hybrid reuse test."""
     prefix = list(range(1000, 1000 + 3 * block_size + block_size // 2))
     # The partial request keeps two complete cache pages.
     partial_prefix = prefix[: 2 * block_size]
+    # Leave a new token on Prefill after NIXL reserves the tail for Decode.
+    partial_tail = list(range(4003, 4004 + prefill_backoff))
     return {
         "partial_prime": [*partial_prefix, 4000],
         "warm_prime": [*prefix, 4001],
         "warm": [*prefix, 4002],
-        "partial": [*partial_prefix, 4003],
+        "partial": [*partial_prefix, *partial_tail],
         "cold": list(range(5000, 5001 + block_size)),
     }
