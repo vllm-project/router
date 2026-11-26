@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from case_loader import cell_run_suffix, router_policy_result_path
 from tests.python.e2e.perf.result_metadata import add_missing_metadata
+from tests.python.e2e.perf.router_policy.replay_validation import validate_replay
 
 if TYPE_CHECKING:
     from stack_launcher import RouterPolicyStack
@@ -107,6 +108,9 @@ def emit_run_summary(
                     + ", ".join(stats["missing_latency_metrics"]),
                     flush=True,
                 )
+            elif stats.get("replay_validation", {}).get("errors"):
+                for error in stats["replay_validation"]["errors"]:
+                    print(f"DIAGNOSTIC replay completeness: {error}", flush=True)
             elif stats.get("router_policy_checks", {}).get("errors"):
                 for error in stats["router_policy_checks"]["errors"]:
                     print(f"DIAGNOSTIC {error}", flush=True)
@@ -534,6 +538,7 @@ def write_calibration(
         ),
         "prefill": _prefill_metrics(run),
         "router_policy_checks": _router_policy_checks(run),
+        "replay_validation": validate_replay(result_dir, rows, task_num=case.task_num),
     }
     missing_metrics = [
         metric
@@ -550,6 +555,8 @@ def write_calibration(
         stats["ok"] = False
         stats["missing_latency_metrics"] = missing_metrics
     if stats["router_policy_checks"]["errors"]:
+        stats["ok"] = False
+    if stats["replay_validation"]["errors"]:
         stats["ok"] = False
     stats = add_missing_metadata(
         stats,

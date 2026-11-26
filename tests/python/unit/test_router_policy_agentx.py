@@ -153,7 +153,7 @@ def test_agentx_slice_matches_manifest_and_pd_cases():
     for filename in (
         "pd_disagg_cache_aware.json",
         "pd_disagg_kv_aware.json",
-        "pd_disagg_kv_aware_affinity.json",
+        "pd_disagg_round_robin.json",
     ):
         case = json.loads((SUITE / "cases" / filename).read_text(encoding="utf-8"))
         assert case["runtime"]["trace_type"] == "agentX"
@@ -181,7 +181,7 @@ def test_agentx_slice_matches_manifest_and_pd_cases():
             "replay_agentX.yaml",
         ),
         (
-            "pd_disagg_kv_aware_affinity",
+            "pd_disagg_round_robin",
             "agentX",
             "/v1/completions",
             "replay_agentX.yaml",

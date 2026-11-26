@@ -45,6 +45,9 @@ def test_calibration_counts_filtered_samples(summary_module, tmp_path, monkeypat
     ]
     result = tmp_path / "result"
     result.mkdir()
+    _write_replay_artifacts(tmp_path, [1] * len(rows))
+    for i, row in enumerate(rows):
+        row.update(request_id=f"request-{i}-0", session_id=f"session-{i}")
     (result / "requests.jsonl").write_text(
         "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
     )
@@ -105,6 +108,7 @@ def calibration_run(tmp_path, monkeypatch):
     monkeypatch.setattr(case_loader, "PERF_RESULTS_DIR", tmp_path / "published")
     monkeypatch.setenv(case_loader.RUN_SUFFIX_ENV, "unit_test")
     (tmp_path / "result").mkdir()
+    _write_replay_artifacts(tmp_path, [1])
     (tmp_path / "after").mkdir()
     (tmp_path / "after/router.prom").write_text(
         'vllm_router_kv_placement_lookups_total{result="miss"} 1\n'
@@ -117,7 +121,7 @@ def calibration_run(tmp_path, monkeypatch):
         scenario="pd_disagg_kv_aware_affinity",
         prefill_count=2,
         concurrency=16,
-        task_num=8,
+        task_num=1,
         worker_count=0,
     )
     return SimpleNamespace(case=case, out=tmp_path)
@@ -142,6 +146,8 @@ def test_invalid_measurements_fail_before_publication(
     prefix = "pd_disagg" if prefill_count else "pd_merge"
     run.case.scenario = f"{prefix}_kv_aware_affinity"
     row = dict(
+        request_id="request-0-0",
+        session_id="session-0",
         status="success",
         ttft_seconds=0.1,
         latency_seconds=0.5,
@@ -247,7 +253,14 @@ def test_publication_schema_and_precomputed_jct(
     prefix = "pd_disagg" if prefill_count else "pd_merge"
     run.case.scenario = f"{prefix}_kv_aware_affinity"
     result = run.out / "result"
-    row = dict(status="success", ttft_seconds=0.1, latency_seconds=0.5, output_tokens=3)
+    row = dict(
+        request_id="request-0-0",
+        session_id="session-0",
+        status="success",
+        ttft_seconds=0.1,
+        latency_seconds=0.5,
+        output_tokens=3,
+    )
     (result / "requests.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
     duration = dict(mean=1.5, p50=1.4, p95=2.0, p99=2.1)
     if jct_count is not None:
@@ -268,7 +281,7 @@ def test_publication_schema_and_precomputed_jct(
         run, result_dir=result, replay_rc=0, wall_seconds=1, stalled=False
     )
     published = case_loader.router_policy_result_path(
-        run.case.scenario, 16, 8, "unit_test"
+        run.case.scenario, 16, run.case.task_num, "unit_test"
     )
     stats = json.loads(published.read_text(encoding="utf-8"))
     assert stats["ok"] is True
@@ -325,6 +338,8 @@ def prefill_run(calibration_run):
     run = calibration_run
     run.case.worker_count = 4
     row = dict(
+        request_id="request-0-0",
+        session_id="session-0",
         status="success",
         ttft_seconds=0.1,
         latency_seconds=0.5,
@@ -351,6 +366,227 @@ def _calibrate_prefill(summary_module, run):
         stalled=False,
     )
     return json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
+
+
+def _write_replay_artifacts(out, requests_per_task):
+    """Create independent pre-run inventory and plan, then return complete facts."""
+    tasks, sources, rows = [], [], []
+    for i, count in enumerate(requests_per_task):
+        planned, source = [], []
+        for j in range(count):
+            key, request_id = f"source-{i}-{j}", f"request-{i}-{j}"
+            source.append({"key": key, "replay_kind": "request"})
+            planned.append(
+                {
+                    "source_key": key,
+                    "node_type": "request",
+                    "runtime_request_id": request_id,
+                }
+            )
+            rows.append(
+                dict(
+                    request_id=request_id,
+                    session_id=f"session-{i}",
+                    status="success",
+                    ttft_seconds=0.1,
+                    latency_seconds=0.5,
+                    output_tokens=3,
+                    duration_seconds=1.0,
+                )
+            )
+        tasks.append(
+            {
+                "source_session_id": f"source-{i}",
+                "runtime_session_id": f"session-{i}",
+                "requests": planned,
+            }
+        )
+        sources.append(
+            {"source_session_id": f"source-{i}", "replayable": True, "requests": source}
+        )
+    result = out / "result"
+    (result / "replay-plan.json").write_text(
+        json.dumps({"tasks": tasks}), encoding="utf-8"
+    )
+    (result / "replay-source-analysis.json").write_text(
+        json.dumps({"sessions": sources}), encoding="utf-8"
+    )
+    return rows
+
+
+@pytest.mark.parametrize("prefill_count", [0, 2], ids=["tracelab_28", "agentx_64"])
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "subset",
+        "extra",
+        "duplicate",
+        "missing_id",
+        "empty_id",
+        "invalid_id",
+        "wrong_id",
+        "wrong_session",
+    ],
+)
+def test_incomplete_replay_fails_before_publication(
+    summary_module, prefill_run, prefill_count, corruption, capsys
+):
+    run = prefill_run
+    run.case.prefill_count = prefill_count
+    run.case.task_num = 8
+    counts = [8] * 8 if prefill_count else [4] * 4 + [3] * 4
+    rows = _write_replay_artifacts(run.out, counts)
+    if corruption == "subset":
+        rows = rows[:1]
+    elif corruption == "extra":
+        rows.append({**rows[-1], "request_id": "extra-request"})
+    elif corruption == "duplicate":
+        rows[-1] = rows[0].copy()
+    elif corruption == "missing_id":
+        del rows[-1]["request_id"]
+    elif corruption == "empty_id":
+        rows[-1]["request_id"] = " \t"
+    elif corruption == "invalid_id":
+        rows[-1]["request_id"] = 42
+    elif corruption == "wrong_id":
+        rows[-1]["request_id"] = "unexpected-request"
+    else:
+        rows[-1]["session_id"] = "wrong-session"
+    (run.out / "result/requests.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
+    )
+    with pytest.raises(SystemExit, match="1"):
+        _calibrate_prefill(summary_module, run)
+    stats = json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
+    assert stats["requests"] == stats["success"] == len(rows)
+    assert stats["ok"] is False
+    assert stats["replay_validation"]["expected_requests"] == sum(counts)
+    assert "DIAGNOSTIC replay completeness:" in capsys.readouterr().out
+    assert not list((run.out / "published").rglob("*.json"))
+
+
+@pytest.mark.parametrize("prefill_count", [0, 2], ids=["tracelab_28", "agentx_64"])
+def test_complete_replay_publishes_all_requests(
+    summary_module, prefill_run, prefill_count
+):
+    run = prefill_run
+    run.case.prefill_count = prefill_count
+    run.case.task_num = 8
+    run.case.scenario = (
+        f"{'pd_disagg' if prefill_count else 'pd_merge'}_kv_aware_affinity"
+    )
+    counts = [8] * 8 if prefill_count else [4] * 4 + [3] * 4
+    rows = _write_replay_artifacts(run.out, counts)
+    (run.out / "result/requests.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in reversed(rows)), encoding="utf-8"
+    )
+    stats = _calibrate_prefill(summary_module, run)
+    assert stats["ok"] is True
+    assert stats["replay_validation"] == {
+        "expected_requests": sum(counts),
+        "observed_requests": sum(counts),
+        "distinct_request_ids": sum(counts),
+        "errors": [],
+    }
+    published = case_loader.router_policy_result_path(
+        run.case.scenario, 16, 8, "unit_test"
+    )
+    assert published.read_bytes() == (run.out / "calibration.json").read_bytes()
+
+
+@pytest.mark.parametrize(
+    "artifact", ["replay-plan.json", "replay-source-analysis.json"]
+)
+@pytest.mark.parametrize("corruption", ["missing", "invalid_json", "invalid_root"])
+def test_invalid_replay_artifacts_prevent_publication(
+    summary_module, prefill_run, artifact, corruption
+):
+    path = prefill_run.out / "result" / artifact
+    if corruption == "missing":
+        path.unlink()
+    else:
+        path.write_text(
+            "{" if corruption == "invalid_json" else "null", encoding="utf-8"
+        )
+    with pytest.raises(SystemExit, match="1"):
+        _calibrate_prefill(summary_module, prefill_run)
+    stats = json.loads(
+        (prefill_run.out / "calibration.json").read_text(encoding="utf-8")
+    )
+    assert stats["replay_validation"]["errors"][0].startswith(
+        "invalid replay plan/source inventory:"
+    )
+    assert not list((prefill_run.out / "published").rglob("*.json"))
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing_task", "missing_request", "duplicate_id", "missing_source_cycle"],
+)
+def test_incomplete_plan_cannot_define_a_smaller_expected_load(
+    summary_module, prefill_run, corruption
+):
+    run = prefill_run
+    run.case.task_num = 2
+    rows = _write_replay_artifacts(run.out, [2, 2])
+    path = run.out / "result/replay-plan.json"
+    plan = json.loads(path.read_text(encoding="utf-8"))
+    if corruption == "missing_task":
+        plan["tasks"].pop()
+        rows = rows[:2]
+    elif corruption == "missing_request":
+        plan["tasks"][-1]["requests"].pop()
+        rows.pop()
+    elif corruption == "duplicate_id":
+        plan["tasks"][-1]["requests"][-1]["runtime_request_id"] = rows[0]["request_id"]
+        rows[-1]["request_id"] = rows[0]["request_id"]
+    else:
+        plan["tasks"][-1]["source_session_id"] = "source-0"
+        for j, node in enumerate(plan["tasks"][-1]["requests"]):
+            node["source_key"] = f"source-0-{j}"
+    path.write_text(json.dumps(plan), encoding="utf-8")
+    (run.out / "result/requests.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
+    )
+    with pytest.raises(SystemExit, match="1"):
+        _calibrate_prefill(summary_module, run)
+    stats = json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
+    assert stats["replay_validation"]["errors"]
+    assert not list((run.out / "published").rglob("*.json"))
+
+
+def test_replay_allows_repeated_source_cycles_and_unmeasured_timing_nodes(
+    summary_module, prefill_run
+):
+    run = prefill_run
+    run.case.task_num = 2
+    rows = _write_replay_artifacts(run.out, [1, 1])
+    result = run.out / "result"
+    analysis = json.loads(
+        (result / "replay-source-analysis.json").read_text(encoding="utf-8")
+    )
+    analysis["sessions"] = analysis["sessions"][:1]
+    analysis["sessions"][0]["requests"].append(
+        {"key": "timer", "replay_kind": "timing_dependency"}
+    )
+    plan = json.loads((result / "replay-plan.json").read_text(encoding="utf-8"))
+    for task in plan["tasks"]:
+        task["source_session_id"] = "source-0"
+        task["requests"][0]["source_key"] = "source-0-0"
+        task["requests"].append(
+            {"source_key": "timer", "node_type": "timing_dependency"}
+        )
+    (result / "replay-source-analysis.json").write_text(
+        json.dumps(analysis), encoding="utf-8"
+    )
+    (result / "replay-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    (result / "requests.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
+    )
+    stats = _calibrate_prefill(summary_module, run)
+    assert stats["ok"] is True
+    assert stats["replay_validation"]["expected_requests"] == 2
+    assert stats["replay_validation"]["errors"] == []
 
 
 @pytest.mark.parametrize("prefill_count", [0, 2], ids=["pd_merge", "pd_disagg"])
@@ -407,7 +643,7 @@ def test_verified_kv_lookup_allows_publication(
     else:
         assert checks["affinity"]["stage"] == ("decode" if prefill_count else "regular")
     published = case_loader.router_policy_result_path(
-        run.case.scenario, 16, 8, "unit_test"
+        run.case.scenario, 16, run.case.task_num, "unit_test"
     )
     assert published.read_bytes() == (run.out / "calibration.json").read_bytes()
 
@@ -572,7 +808,7 @@ def test_prefill_deltas_exclude_decode_and_copy_to_results(summary_module, prefi
         "unavailable_metrics": [],
     }
     published = case_loader.router_policy_result_path(
-        run.case.scenario, 16, 8, "unit_test"
+        run.case.scenario, 16, run.case.task_num, "unit_test"
     )
     assert published.read_bytes() == (run.out / "calibration.json").read_bytes()
 

@@ -6,7 +6,7 @@ Each **scenario JSON** under `cases/` is one routing scenario. `benchmark_params
 - **agentinfer** — install via **`pip install …whl`** (or `uv pip install …whl`) into the **same env as pytest** (no source checkout). Replay YAML is loaded from the installed package when a cell starts. Optional: `runtime.replay_config`; optional `runtime.agent_infer` for source dev.
 - **`workers`** — engine count and per-worker serve args (KV, max_model_len, optional `gpu_memory_utilization`, optional `kv_cache_metrics` / `kv_cache_metrics_sample` → vLLM `--kv-cache-metrics`, …)
 - **`router_params`** — policy, gRPC, penalties, balance thresholds
-- **`benchmark_params`** — `max-concurrency` (`[8]`), task-num, and the rest of the replay settings. pytest asserts **all** replay rows in `requests.jsonl` are `success` (no fixed request count)
+- **`benchmark_params`** — `max-concurrency` (`[8]`), task-num, and the rest of the replay settings. pytest requires **all** replay requests to succeed and match the complete replay plan.
 
 All six scenarios use eight replay sessions with serial requests within each
 session. `c8` denotes the configured session-concurrency limit; the request
@@ -84,7 +84,7 @@ cells have separate output files.
 | `pd_merge_kv_aware_affinity` | `kv_aware_aff` | `pd_merged` |
 | `pd_disagg_cache_aware` | `cache_aware` | `pd_disaggregated` |
 | `pd_disagg_kv_aware` | `kv_aware` | `pd_disaggregated` |
-| `pd_disagg_kv_aware_affinity` | `kv_aware_aff` | `pd_disaggregated` |
+| `pd_disagg_round_robin` | `round_robin` | `pd_disaggregated` |
 
 Result JSON includes `scenario`, `topology`, and `router_policy`. The existing
 `arm` field also identifies the routing policy for historical consumers.
@@ -104,24 +104,38 @@ requests successful still fails if no valid TPOT samples remain (for example,
 all outputs have at most one token) or JCT durations are unavailable. Its
 `calibration.json` is retained for diagnosis.
 
-Both merged and disaggregated `kv_aware` / `kv_aware_aff` cells also validate
-router activity from the existing `after/router.prom` snapshot, scraped from
-the router's dedicated Prometheus port after replay. Each cell starts a fresh
-router, so these counters belong to that cell. The runner checks snapshot HTTP
-status codes before saving metrics.
+Before publication, `replay_validation` checks the persisted requests against
+AgentInfer's `result/replay-source-analysis.json` and `result/replay-plan.json`,
+which are written before measured requests start. Each planned task must contain
+all measured request keys from its source session. The configured task count,
+runtime session IDs, and request IDs must be valid; the pinned eight-session
+cases must cover their complete source cycle. Only `request` nodes are counted;
+timing dependencies do not generate measured request rows.
+
+Actual rows must have nonempty, globally unique `request_id` values and exactly
+match the planned `(session_id, request_id)` pairs. Missing or extra rows, wrong
+IDs, duplicates, and missing or malformed plan/source artifacts fail the cell
+and prevent dashboard publication. Expected counts come from the source
+inventory and selected plan, independently of `requests.jsonl` or its summary.
+The bundled workloads require 28 TraceLab requests or 64 AgentX requests; a
+TraceLab URL override is checked against its own inventory and plan. Counts and
+failure reasons are recorded in `replay_validation` in `calibration.json`.
+
+Merged `kv_aware` / `kv_aware_aff` cells and disaggregated `kv_aware` cells also
+validate router activity from the existing `after/router.prom` snapshot,
+scraped from the router's dedicated Prometheus port after replay. Each cell
+starts a fresh router, so these counters belong to that cell. The runner checks
+snapshot HTTP status codes before saving metrics.
 
 - Index liveness requires a nonzero
   `vllm_router_kv_placement_lookups_total{result="hit"}` or `result="miss"`.
   `index_unavailable`, `missing_tokens`, other fallback results, and nonzero
   `vllm_router_kv_routing_inputs_total` alone do not prove a verified index was
   queried. A miss is valid activity; a cache hit is not required.
-- Disaggregated affinity cells require a nonzero
-  `vllm_router_pd_affinity_decisions_total{stage="decode",outcome="bind"}` or
-  `outcome="sticky_hit"`. Decisions from the Prefill stage do not qualify.
-- Merged affinity cells use the existing regular-router metric instead:
+- Merged affinity cells require a nonzero regular-router counter:
   `vllm_router_prefix_routing_decisions_total{policy="kv_aware",stage="regular",outcome="sticky_hit"}`.
   Merged routing has no separate Decode-stage affinity counter.
-- `cache_aware` cells skip both checks.
+- `cache_aware` and `round_robin` cells skip both checks.
 
 Counts and diagnostic errors are recorded in `router_policy_checks`. Missing,
 zero, or invalid required counters fail the cell before dashboard publication,
@@ -158,12 +172,16 @@ counters.
 
 ## Buildkite nightly (L3)
 
-Two steps in [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml)
-run on `l4_4` (four L4 GPUs).
+The router policy steps in [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml)
+run on `l4_4` (four L4 GPUs per job).
 
 - `router-policy-perf-e2e` selects `pd_merge and c8` and runs the three merged scenarios.
-- `router-policy-pd-disagg-perf-e2e` selects `pd_disagg and c8` and runs the three
-  disaggregated scenarios. Failures in either step fail the Buildkite build.
+- `router-policy-pd-disagg-perf-e2e` selects `pd_disagg and c8` and runs
+  `cache_aware`, `kv_aware`, and `round_robin` sequentially in one four-GPU job.
+  The three scenarios share a 180-minute timeout and artifact upload. This
+  increases the previous 90-minute budget; the total runtime still needs
+  confirmation on the actual four-L4 lane. Failures in either router policy
+  job fail the Buildkite build.
 
 The PD cases use two prefill workers and two decode workers, each on its own
 GPU, with Rust gRPC frontends and NIXL KV transfer. Set `workers.prefill_count`

@@ -170,7 +170,7 @@ steps:
       - label: ":bar_chart: Perf · PD Disaggregated Router Policy (c8) Test"
         key: "router-policy-pd-disagg-perf-e2e"
         if: build.env("ROCM_ONLY") != "1"
-        timeout_in_minutes: 90
+        timeout_in_minutes: 180
         mirror_hardwares: l4_4
         depends_on:
           - "upload-nightly-pipeline"

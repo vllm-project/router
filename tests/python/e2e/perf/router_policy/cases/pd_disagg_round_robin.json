@@ -1,5 +1,5 @@
 {
-  "id": "pd_disagg_kv_aware_affinity",
+  "id": "pd_disagg_round_robin",
   "runtime": {
     "model": "Qwen/Qwen3-4B-Instruct-2507",
     "trace_path": "tests/python/e2e/perf/router_policy/data/agentx-ci-8x8.jsonl",
@@ -42,7 +42,6 @@
     "kv_penalty_external": 0.6,
     "kv_penalty_disk": 0.3,
     "worker_startup_timeout_secs": 60,
-    "policy": "kv_aware_aff",
-    "kv_aware_session_affinity_ttl_secs": 1800
+    "policy": "round_robin"
   }
 }
