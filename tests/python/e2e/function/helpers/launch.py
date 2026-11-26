@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import TextIO
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import requests
 
@@ -196,6 +197,7 @@ def kv_events_config_argv(
         "enable_kv_cache_events": True,
         "publisher": "zmq",
         "endpoint": f"tcp://{endpoint_bind}:{zmq_port}",
+        "topic": uuid4().hex,
     }
     if replay_port is not None:
         payload["replay_endpoint"] = f"tcp://{replay_host}:{replay_port}"
@@ -294,6 +296,11 @@ def popen_launch_vllm_rs_grpc_worker(
     }
     env["CUDA_VISIBLE_DEVICES"] = _cuda_visible_devices(base_gpu_id)
     serve_tail = list(extra_argv or [])
+    if kv_events_zmq_port is not None:
+        # The router discovers one full-attention group with the default hash root.
+        env.pop("PYTHONHASHSEED", None)
+        env["VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES"] = "0"
+        serve_tail.extend(("--prefix-caching-hash-algo", "sha256_cbor"))
     if kv_events_zmq_port is not None and "--kv-events-config" not in serve_tail:
         serve_tail = [
             *serve_tail,
