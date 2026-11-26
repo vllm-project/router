@@ -453,7 +453,7 @@ impl KvIndexSupervisor {
             (owner, lifecycle)
         };
         let mut discovery = self.discover(worker_url).await;
-        self.probe_admission_metadata(worker_url, &mut discovery, true)
+        self.probe_admission_hashes(worker_url, &mut discovery)
             .await;
         let models = discovery.base_models.clone();
         let hashes = observed

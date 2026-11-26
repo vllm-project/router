@@ -1932,6 +1932,17 @@ impl HashAdmissionWorker {
             let metrics = metrics.clone();
             move || metrics.lock().clone()
         });
+        let app = app
+            .route("/health", axum::routing::get(|| async { "ok" }))
+            .route(
+                "/v1/completions",
+                axum::routing::post(
+                    |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        assert_eq!(body["model"], "mock-alias");
+                        axum::Json(json!({"choices": []}))
+                    },
+                ),
+            );
         let (url, server) = source_boundary_worker_with_routes(
             app,
             json!({
@@ -1983,7 +1994,7 @@ async fn registration_only_scrapes_hashes_for_usable_http_sources() {
     let mut discovered = supervisor.discover(url).await;
     let grpc_url = url.replacen("http://", "grpc://", 1);
     supervisor
-        .probe_admission_metadata(&grpc_url, &mut discovered, true)
+        .probe_admission_hashes(&grpc_url, &mut discovered)
         .await;
     assert!(discovered.engine_cache_configs.is_none());
 
@@ -2005,14 +2016,6 @@ async fn registration_only_scrapes_hashes_for_usable_http_sources() {
     *worker.sources.lock() = sources;
     assert!(probe().await.unwrap().worker.engine_cache_configs.is_some());
     assert_eq!(requests(), 2, "usable source for re-admission");
-
-    *worker.metrics.lock() = METRICS_ONLY.replace("sha256_cbor", "sha256");
-    let mut discovered = supervisor.discover(url).await;
-    supervisor
-        .probe_admission_metadata(url, &mut discovered, false)
-        .await;
-    assert!(discovered.engine_cache_configs.is_some());
-    assert!(discovered.base_models.is_none());
 }
 
 #[tokio::test]
@@ -2037,23 +2040,44 @@ async fn load_only_registration_replaces_binding_and_preserves_model_aliases() {
     assert!(!old.active.load(Ordering::Acquire));
     assert!(supervisor.match_provider_for_worker(&worker.url).is_none());
 
-    let workers: Vec<Arc<dyn crate::core::Worker>> = vec![Arc::new(
-        crate::core::DPAwareWorker::new(worker.url.clone(), 0, 2, crate::core::WorkerType::Regular),
-    )];
-    for (model, eligible) in [
-        ("mock-model", true),
-        ("mock-alias", true),
-        ("control-alias", true),
-        ("adapter", false),
-        ("other", false),
-    ] {
-        assert_eq!(
-            supervisor.cache_eligible_workers(&workers, model),
-            Some(vec![eligible]),
-            "{model}"
-        );
-    }
-    assert!(models.unwrap().contains("mock-alias"));
+    let bases = std::slice::from_ref(&worker.url);
+    assert!(supervisor.worker_model_eligibility(bases, Some("mock-model"))[&worker.url]);
+    assert!(supervisor.worker_model_eligibility(bases, Some("control-alias"))[&worker.url]);
+    assert!(models.is_none());
+    assert_eq!(worker.requests.models.load(Ordering::Relaxed), 0);
+
+    use crate::config::{PolicyConfig, RouterConfig};
+    use crate::routers::{router::Router, RouterTrait};
+    let config = RouterConfig {
+        policy: PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        },
+        worker_startup_timeout_secs: 5,
+        ..Default::default()
+    };
+    let ctx = Arc::new(
+        crate::server::AppContext::new(config, reqwest::Client::new(), 10, None, vec![]).unwrap(),
+    );
+    let router = Router::new(vec![worker.url.clone()], &ctx).await.unwrap();
+    let registered = ctx.worker_registry.get_by_url(&worker.url).unwrap();
+    assert!(probe::worker_serves_base_model(
+        registered.as_ref(),
+        "mock-alias"
+    ));
+    assert!(!probe::worker_serves_base_model(
+        registered.as_ref(),
+        "adapter"
+    ));
+
+    let raw =
+        bytes::Bytes::from_static(br#"{"model":"mock-alias","prompt":[1,2,3],"max_tokens":1}"#);
+    let request = Arc::new(serde_json::from_slice(&raw).unwrap());
+    let response = router.route_completion_raw(None, request, raw, None).await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
     assert_eq!(worker.requests.models.load(Ordering::Relaxed), 1);
 }
 
