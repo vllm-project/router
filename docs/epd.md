@@ -220,12 +220,13 @@ transfer IDs.
 Encoder responses must be JSON objects. They may omit `ec_transfer_params` or
 set it to `null`. Any other report value must be a JSON object. When
 `item_indices` is present it must be a batch-local integer array with in-range,
-non-repeated positions. A non-object response, malformed report type,
-malformed indices, or non-numeric metadata fail the request with `502` before
-the consumer is called. The router keeps the raw media with its
+non-repeated positions. If a matched entry includes `metadata`, it must be a
+JSON object containing numeric arrays. A non-object response, malformed
+report type, malformed indices, or malformed metadata fail the request with
+`502` before the consumer is called. The router keeps the raw media with its
 content-derived UUID when the EC report is omitted or null, when it has no entry
-for the item, or when the entry has no non-empty placeholder metadata. It
-forwards the reported transfer handle when one exists.
+for the item, or when the entry omits `metadata` or sets it to `{}`. It forwards
+the reported transfer handle when one exists.
 Connector-specific fields under `ec_transfer_params` remain opaque and are
 passed through unchanged.
 Other request fields, including sampling options, pass through unchanged.

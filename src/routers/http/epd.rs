@@ -664,12 +664,17 @@ fn parse_batch_response(
             let Some((hash, reported)) = entry else {
                 return Ok(None);
             };
-            let metadata = reported
-                .get("metadata")
-                .and_then(Value::as_object)
-                .filter(|m| !m.is_empty())
-                .map(flatten_metadata)
-                .transpose()?;
+            let metadata = match reported.get("metadata") {
+                None => None,
+                Some(Value::Object(metadata)) if metadata.is_empty() => None,
+                Some(Value::Object(metadata)) => Some(flatten_metadata(metadata)?),
+                Some(_) => {
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        "Encoder metadata must be a JSON object".into(),
+                    ));
+                }
+            };
             Ok(Some(EncodedItem {
                 mm_hash: hash.clone(),
                 reported: reported.clone(),
@@ -1363,6 +1368,41 @@ mod tests {
             (StatusCode::OK, r#"{"ec_transfer_params":"report"}"#, false),
             (StatusCode::OK, r#"{"ec_transfer_params":42}"#, false),
             (StatusCode::OK, r#"{"ec_transfer_params":true}"#, false),
+            (
+                StatusCode::OK,
+                r#"{"ec_transfer_params":{"hash":{"item_indices":[0,1]}}}"#,
+                true,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"ec_transfer_params":{"hash":{"item_indices":[0,1],"metadata":{}}}}"#,
+                true,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"ec_transfer_params":{"hash":{"item_indices":[0,1],"metadata":null}}}"#,
+                false,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"ec_transfer_params":{"hash":{"item_indices":[0,1],"metadata":[]}}}"#,
+                false,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"ec_transfer_params":{"hash":{"item_indices":[0,1],"metadata":"bad"}}}"#,
+                false,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"ec_transfer_params":{"hash":{"item_indices":[0,1],"metadata":42}}}"#,
+                false,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"ec_transfer_params":{"hash":{"item_indices":[0,1],"metadata":true}}}"#,
+                false,
+            ),
         ] {
             let app = Router::new().route(
                 "/v1/chat/completions",

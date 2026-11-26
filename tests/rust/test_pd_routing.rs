@@ -268,10 +268,15 @@ mod test_pd_routing {
                 return (StatusCode::SERVICE_UNAVAILABLE, "injected encoder error").into_response();
             }
             let hash = body["messages"][0]["content"][0]["uuid"].as_str().unwrap();
+            let metadata = if body["model"] == "malformed-metadata" {
+                json!([1, 2, 3])
+            } else {
+                json!({"image_grid_thw": [[1, 2, 3]]})
+            };
             Json(json!({
                 "ec_transfer_params": {
                     (format!("engine-{hash}")): {
-                        "metadata": {"image_grid_thw": [[1, 2, 3]]},
+                        "metadata": metadata,
                         "peer_host": "encoder",
                         "peer_port": 4321,
                         "size_bytes": 128,
@@ -414,9 +419,13 @@ mod test_pd_routing {
             ("prefill-422", false, StatusCode::UNPROCESSABLE_ENTITY),
             ("missing-kv", false, StatusCode::INTERNAL_SERVER_ERROR),
             ("encoder-fail", false, StatusCode::SERVICE_UNAVAILABLE),
+            ("malformed-metadata", false, StatusCode::BAD_GATEWAY),
             ("bad-input", false, StatusCode::BAD_REQUEST),
         ] {
             seen.lock().unwrap().clear();
+            let circuit = encoder.circuit_breaker();
+            let successes_before = circuit.total_successes();
+            let failures_before = circuit.total_failures();
             let mut body = json!({
                 "model": model,
                 "stream": stream,
@@ -462,11 +471,15 @@ mod test_pd_routing {
             completed_batches += usize::from(model != "bad-input");
             assert_eq!(encoder.processed_requests(), completed_batches);
             assert_eq!(encoder.load(), 0);
+            if model == "malformed-metadata" {
+                assert_eq!(circuit.total_successes(), successes_before);
+                assert_eq!(circuit.total_failures(), failures_before + 1);
+            }
             assert_eq!(
                 phases,
                 match model {
                     "bad-input" => vec![],
-                    "encoder-fail" => vec!["E"],
+                    "encoder-fail" | "malformed-metadata" => vec!["E"],
                     "test" => vec!["E", "P", "D"],
                     _ => vec!["E", "P"],
                 }
