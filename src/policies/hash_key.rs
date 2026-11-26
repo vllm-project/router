@@ -9,10 +9,13 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::debug;
 
-/// HTTP header names to check for session ID (case-insensitive, checked in order)
+/// HTTP header names to check for session ID (case-insensitive, checked in order).
+/// Framework session headers follow the same precedence as
+/// `framework_identity_headers` (Claude → Codex → DeepSeek Harness → generic).
 pub(crate) const SESSION_HEADER_NAMES: &[&str] = &[
-    "x-deepseek-harness-session-id",
     "x-claude-code-session-id",
+    "session-id",
+    "x-deepseek-harness-session-id",
     "x-session-id",
     "x-user-id",
     "x-tenant-id",
@@ -24,7 +27,7 @@ pub(crate) const SESSION_HEADER_NAMES: &[&str] = &[
 /// Extract hash key with priority: HTTP headers > body fields > request content hash
 ///
 /// Priority order:
-/// 1. HTTP Headers: x-deepseek-harness-session-id, x-claude-code-session-id, x-session-id, x-user-id, x-tenant-id, x-correlation-id, x-request-id, x-trace-id
+/// 1. HTTP Headers: x-claude-code-session-id, session-id, x-deepseek-harness-session-id, x-session-id, x-user-id, x-tenant-id, x-correlation-id, x-request-id, x-trace-id
 /// 2. Body: session_params.session_id (nested)
 /// 3. Body: user field (OpenAI format)
 /// 4. Body: session_id (legacy)
@@ -66,8 +69,7 @@ pub(crate) fn extract_hash_key(
 /// release the session.
 ///
 /// Lookup order mirrors [`extract_hash_key`]:
-/// Lookup order mirrors [`extract_hash_key`]:
-/// 1. HTTP headers: x-deepseek-harness-session-id, x-claude-code-session-id, x-session-id, x-user-id, x-tenant-id, x-correlation-id, x-request-id, x-trace-id
+/// 1. HTTP headers: x-claude-code-session-id, session-id, x-deepseek-harness-session-id, x-session-id, x-user-id, x-tenant-id, x-correlation-id, x-request-id, x-trace-id
 /// 2. Body: session_params.session_id (nested)
 /// 3. Body: user (OpenAI format)
 /// 4. Body: session_id (legacy)

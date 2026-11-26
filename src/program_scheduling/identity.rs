@@ -587,8 +587,8 @@ fn context_duration(
 mod tests {
     use super::*;
     use crate::request_identity::{
-        resolve_stable_identity, CLAUDE_AGENT_HEADER, CODEX_THREAD_HEADER,
-        DSH_SESSION_HEADER, DSH_USER_HEADER, MAX_AGENTIC_CONTEXT_BYTES,
+        resolve_stable_identity, CLAUDE_AGENT_HEADER, CODEX_THREAD_HEADER, DSH_SESSION_HEADER,
+        MAX_AGENTIC_CONTEXT_BYTES,
     };
 
     #[test]
@@ -646,7 +646,7 @@ mod tests {
 
         let mut dsh_headers = HeaderMap::new();
         dsh_headers.insert(DSH_SESSION_HEADER, "dsh-session".parse().unwrap());
-        dsh_headers.insert(DSH_USER_HEADER, "anon-user".parse().unwrap());
+        dsh_headers.insert("x-deepseek-harness-user-id", "anon-user".parse().unwrap());
         let identity = ProgramIdentity::from_request(Some(&dsh_headers), None, Some("model"))
             .unwrap()
             .unwrap();

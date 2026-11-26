@@ -19,7 +19,6 @@ pub(crate) const CLAUDE_PARENT_AGENT_HEADER: &str = "x-claude-code-parent-agent-
 pub(crate) const CODEX_SESSION_HEADER: &str = "session-id";
 pub(crate) const CODEX_THREAD_HEADER: &str = "thread-id";
 pub(crate) const DSH_SESSION_HEADER: &str = "x-deepseek-harness-session-id";
-pub(crate) const DSH_USER_HEADER: &str = "x-deepseek-harness-user-id";
 pub(crate) const GENERIC_SESSION_HEADER: &str = "x-session-id";
 
 /// Provenance of a stable identity. Affinity routing preserves the source
