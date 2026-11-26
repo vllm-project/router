@@ -59,5 +59,4 @@ there is no separate manifest file. The expected SHA-256 is
 `faf79824c90ddb72774a6f5f018f67821f26c48743cd5171cfbcfe9e00855537`.
 The script verifies this digest before writing, and the case JSONs use the
 same value at replay startup. It stops after the twelfth eligible session and
-does not need to read the rest of the 1.85 GB source file. The `.gitattributes`
-rule keeps the slice's line endings fixed across platforms so the digest is stable.
+does not need to read the rest of the 1.85 GB source file.
