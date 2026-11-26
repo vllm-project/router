@@ -15,6 +15,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::kv_cost::{credited_tokens, request_prefill_tokens};
 pub use super::kv_cost::{CandidateView, CostParams, LoadSample, TransferCredits};
+use super::peer_directory::{PeerDirectory, PeerRegistration};
 use super::peer_fetch::{
     PeerEndpoint, PeerFetchCostPath, PeerFetchGrant, PeerFetchLimiter, PeerFetchOutcome,
     PeerFetchPlan, PeerFetchPlanOutcome, PeerFetchPlanner, PeerFetchPlannerInput,
@@ -984,36 +985,13 @@ pub struct KvAwarePolicy {
     next_generation: AtomicU64,
     /// Opt-in transfer planner; `None` leaves selection untouched.
     transfer_planner: Option<Arc<dyn PeerFetchPlanner>>,
-    /// Peer KV transfer registration per worker URL. Writers replace the whole
-    /// `Arc` under `selection_lock`; readers clone it and see one consistent
-    /// capability/endpoint pair. A capability without an endpoint can be
-    /// planned but not fetched.
-    peer_regs: DashMap<String, Arc<PeerRegistration>>,
-    /// Side-channel hosts the operator pinned per worker URL (normalized).
-    /// Static config only: engine records never set one, and a pin outlives
-    /// unregister like the static capability it came with.
-    trusted_hosts: DashMap<String, Arc<str>>,
-    /// Source of `PeerRegistration::epoch`; starts at 1.
-    next_peer_epoch: AtomicU64,
+    /// Peer transfer registrations; mutated under `selection_lock`, except
+    /// the lock-free `pin_trusted_host` (see `peer_directory`).
+    peers: PeerDirectory,
     /// Source of `PeerFetchPlan::plan_id`; starts at 1 so 0 means unassigned.
     next_transfer_plan_id: AtomicU64,
     /// Active-mode peer fetch; `None` unless the policy was built active.
     peer_fetch: Option<PeerFetchState>,
-}
-
-/// Everything the router knows about a worker's peer KV transfer ability,
-/// replaced as a whole so a reader sees one consistent registration.
-#[derive(Debug, Clone)]
-struct PeerRegistration {
-    /// Changes only when the contents change; from `next_peer_epoch`. The
-    /// grant compares it with the planned registration's to detect a change.
-    epoch: u64,
-    capability: Option<TransferCapability>,
-    endpoint: Option<PeerEndpoint>,
-    /// `capability` came from an engine record, not static config. Only such
-    /// a capability is dropped when re-discovery finds no record or the
-    /// worker is unregistered.
-    engine_owned: bool,
 }
 
 /// The registrations a transfer plan was checked against. The grant
@@ -1098,9 +1076,7 @@ impl KvAwarePolicy {
             last_transfer_plan: Mutex::new(None),
             next_generation: AtomicU64::new(1),
             transfer_planner: None,
-            peer_regs: DashMap::new(),
-            trusted_hosts: DashMap::new(),
-            next_peer_epoch: AtomicU64::new(1),
+            peers: PeerDirectory::new(),
             next_transfer_plan_id: AtomicU64::new(1),
             peer_fetch: None,
         }
@@ -1179,39 +1155,6 @@ impl KvAwarePolicy {
         self.transfer_planner.is_some()
     }
 
-    /// Replace `worker_url`'s registration with the given contents. Both parts
-    /// empty removes it; unchanged contents keep the existing `Arc` and epoch.
-    /// The caller holds `selection_lock`.
-    fn store_peer_reg_locked(
-        &self,
-        worker_url: &str,
-        capability: Option<TransferCapability>,
-        endpoint: Option<PeerEndpoint>,
-        engine_owned: bool,
-    ) {
-        if capability.is_none() && endpoint.is_none() {
-            self.peer_regs.remove(worker_url);
-            return;
-        }
-        if let Some(current) = self.peer_regs.get(worker_url) {
-            if current.capability == capability
-                && current.endpoint == endpoint
-                && current.engine_owned == engine_owned
-            {
-                return;
-            }
-        }
-        self.peer_regs.insert(
-            worker_url.to_owned(),
-            Arc::new(PeerRegistration {
-                epoch: self.next_peer_epoch.fetch_add(1, Ordering::AcqRel),
-                capability,
-                endpoint,
-                engine_owned,
-            }),
-        );
-    }
-
     /// Declare what a worker can do for KV transfer. Replaced on re-register;
     /// the worker's reported endpoint is kept.
     /// Survives `unregister_target`: only engine-reported capabilities are
@@ -1223,12 +1166,8 @@ impl KvAwarePolicy {
     ) {
         let worker_url = worker_url.into();
         let _guard = self.selection_lock.lock();
-        let endpoint = self
-            .peer_regs
-            .get(&worker_url)
-            .and_then(|reg| reg.endpoint.clone());
-        // An explicit declaration is never engine-sourced.
-        self.store_peer_reg_locked(&worker_url, Some(capability), endpoint, false);
+        self.peers
+            .register_transfer_capability(&worker_url, capability);
     }
 
     /// Apply (or clear, with `None`) the engine's validated peer-lookup record
@@ -1252,36 +1191,14 @@ impl KvAwarePolicy {
         if !self.targets.contains_key(worker_url) {
             return;
         }
-        let current = self.peer_regs.get(worker_url).map(|reg| Arc::clone(&reg));
-        let (current_capability, engine_owned) = match current.as_deref() {
-            Some(reg) => (reg.capability.clone(), reg.engine_owned),
-            None => (None, false),
-        };
-        let Some(record) = record else {
-            let capability = if engine_owned {
-                None
-            } else {
-                current_capability
-            };
-            self.store_peer_reg_locked(worker_url, capability, None, false);
-            return;
-        };
-        let endpoint = PeerEndpoint::from(record);
-        if current_capability.is_some() && !engine_owned {
-            self.store_peer_reg_locked(worker_url, current_capability, Some(endpoint), false);
-            return;
-        }
-        let capability = TransferCapability::from_engine_record(record);
-        self.store_peer_reg_locked(worker_url, Some(capability), Some(endpoint), true);
+        self.peers.apply_lookup(worker_url, record);
     }
 
     /// Where `worker_url` accepts peer KV fetches, if its engine reported a
     /// valid record. A capability without an address can be planned but not
     /// fetched; active mode requires this on the source.
     pub fn peer_endpoint(&self, worker_url: &str) -> Option<PeerEndpoint> {
-        self.peer_regs
-            .get(worker_url)
-            .and_then(|reg| reg.endpoint.clone())
+        self.peers.peer_endpoint(worker_url)
     }
 
     /// Register a pre-validated capability table (see
@@ -1293,21 +1210,9 @@ impl KvAwarePolicy {
     ) {
         for (url, (capability, pin)) in capabilities {
             if let Some(pin) = pin {
-                self.trusted_hosts.insert(url.clone(), pin);
+                self.peers.pin_trusted_host(url.clone(), pin);
             }
             self.register_transfer_capability(url, capability);
-        }
-    }
-
-    /// Whether `endpoint` may be handed to a destination as the fetch source
-    /// for `source_url`. The engine's reported address is not verified, so it
-    /// must be the host the operator pinned for that worker or, without a pin,
-    /// the host of the worker URL the operator registered.
-    fn endpoint_is_trusted(&self, source_url: &str, endpoint: &PeerEndpoint) -> bool {
-        let reported = super::peer_fetch::normalize_host(&endpoint.host);
-        match self.trusted_hosts.get(source_url) {
-            Some(pin) => *reported == **pin,
-            None => super::peer_fetch::host_of(source_url).is_some_and(|host| host == reported),
         }
     }
 
@@ -1375,13 +1280,7 @@ impl KvAwarePolicy {
         let _guard = self.selection_lock.lock();
         // Static capabilities are operator config and outlive the worker; only
         // an engine-reported one is dropped with it.
-        let kept = self
-            .peer_regs
-            .get(worker_url)
-            .map(|reg| Arc::clone(&reg))
-            .filter(|reg| !reg.engine_owned)
-            .and_then(|reg| reg.capability.clone());
-        self.store_peer_reg_locked(worker_url, kept, None, false);
+        self.peers.drop_engine_owned(worker_url);
         if let Some((_, binding)) = self.targets.remove(worker_url) {
             if let Some(slot_manager) = &self.slot_manager {
                 slot_manager.unregister_target(&binding.target);
@@ -1799,7 +1698,7 @@ impl KvAwarePolicy {
     /// qualifying source reports what it always did. `None` (not counted) in
     /// shadow mode. The endpoint comes from the registration the planner
     /// checked, never a fresh lookup. Does not need `selection_lock`: it reads
-    /// `peer_regs`, `targets` and the limiter, which synchronize themselves.
+    /// `peers`, `targets` and the limiter, which synchronize themselves.
     fn peer_fetch_grant(
         &self,
         transfer: &PeerFetchPlan,
@@ -1884,7 +1783,7 @@ impl KvAwarePolicy {
         else {
             return Err(PeerFetchRequestOutcome::NoPeerEndpoint);
         };
-        if !self.endpoint_is_trusted(source.url, &endpoint) {
+        if !self.peers.endpoint_is_trusted(source.url, &endpoint) {
             tracing::warn!(
                 plan_id,
                 source = source.url,
@@ -1903,9 +1802,9 @@ impl KvAwarePolicy {
     /// match what the planner saw. Both absent counts as unchanged, and a
     /// never-registered worker (generation 0) must still be unregistered.
     fn planned_peer_is_current(&self, peer: &PlannedPeer<'_>) -> bool {
-        let epoch_matches = match (self.peer_regs.get(peer.url), &peer.registration) {
+        let epoch_matches = match (self.peers.epoch_of(peer.url), &peer.registration) {
             (None, None) => true,
-            (Some(current), Some(planned)) => current.epoch == planned.epoch,
+            (Some(current), Some(planned)) => current == planned.epoch,
             _ => false,
         };
         epoch_matches
@@ -1946,11 +1845,7 @@ impl KvAwarePolicy {
             registrations = plan
                 .healthy
                 .iter()
-                .map(|&index| {
-                    self.peer_regs
-                        .get(workers[index].url())
-                        .map(|reg| Arc::clone(&reg))
-                })
+                .map(|&index| self.peers.registration(workers[index].url()))
                 .collect();
             let peers: Vec<PeerInput<'_>> = candidates
                 .iter()
@@ -5905,6 +5800,7 @@ mod tests {
     /// The capability recorded for `url`, whatever its source.
     fn capability_of(policy: &KvAwarePolicy, url: &str) -> Option<TransferCapability> {
         policy
+            .peers
             .peer_regs
             .get(url)
             .and_then(|reg| reg.capability.clone())
@@ -5912,28 +5808,31 @@ mod tests {
 
     /// Whether any worker's capability came from an engine record.
     fn any_engine_owned(policy: &KvAwarePolicy) -> bool {
-        policy.peer_regs.iter().any(|reg| reg.engine_owned)
+        policy.peers.peer_regs.iter().any(|reg| reg.engine_owned)
     }
 
     /// Pin `url`'s side-channel host, as `--peer-fetch-capability` would, so a
     /// fixture address that is not the worker URL's host passes the trust check.
     fn pin_host(policy: &KvAwarePolicy, url: &str, host: &str) {
-        policy.trusted_hosts.insert(url.to_owned(), Arc::from(host));
+        policy
+            .peers
+            .trusted_hosts
+            .insert(url.to_owned(), Arc::from(host));
     }
 
     /// Replace only the endpoint of `url`'s record, with a new `Arc` and epoch.
     fn set_endpoint(policy: &KvAwarePolicy, url: &str, endpoint: Option<PeerEndpoint>) {
-        let current = policy.peer_regs.get(url).map(|reg| Arc::clone(&reg));
+        let current = policy.peers.peer_regs.get(url).map(|reg| Arc::clone(&reg));
         let capability = current.as_ref().and_then(|reg| reg.capability.clone());
         let engine_owned = current.as_ref().is_some_and(|reg| reg.engine_owned);
         if capability.is_none() && endpoint.is_none() {
-            policy.peer_regs.remove(url);
+            policy.peers.peer_regs.remove(url);
             return;
         }
-        policy.peer_regs.insert(
+        policy.peers.peer_regs.insert(
             url.to_owned(),
             Arc::new(PeerRegistration {
-                epoch: policy.next_peer_epoch.fetch_add(1, Ordering::AcqRel),
+                epoch: policy.peers.next_peer_epoch.fetch_add(1, Ordering::AcqRel),
                 capability,
                 endpoint,
                 engine_owned,
@@ -6177,11 +6076,11 @@ mod tests {
     fn grant_skips_when_source_was_reregistered_after_planning() {
         let (policy, workers) = planned_grant_fixture();
         let (transfer, planned) = plan_for_grant(&policy, &workers);
-        let epoch = policy.peer_regs.get("http://a").unwrap().epoch;
+        let epoch = policy.peers.peer_regs.get("http://a").unwrap().epoch;
         let generation = policy.targets.get("http://a").unwrap().generation;
         // Same target, same record: only the generation moves.
         policy.register_target("http://a", transfer.source.clone());
-        assert_eq!(policy.peer_regs.get("http://a").unwrap().epoch, epoch);
+        assert_eq!(policy.peers.peer_regs.get("http://a").unwrap().epoch, epoch);
         assert!(policy.targets.get("http://a").unwrap().generation > generation);
         assert_grant_refused_as_changed(&policy, &transfer, &planned);
     }
@@ -6230,9 +6129,9 @@ mod tests {
     fn grant_survives_an_identical_record_being_reapplied() {
         let (policy, workers) = planned_grant_fixture();
         let (transfer, planned) = plan_for_grant(&policy, &workers);
-        let epoch = policy.peer_regs.get("http://a").unwrap().epoch;
+        let epoch = policy.peers.peer_regs.get("http://a").unwrap().epoch;
         policy.apply_peer_lookup("http://a", Some(&engine_record("engine-a", "fp", 5600)));
-        assert_eq!(policy.peer_regs.get("http://a").unwrap().epoch, epoch);
+        assert_eq!(policy.peers.peer_regs.get("http://a").unwrap().epoch, epoch);
         let grant = policy
             .peer_fetch_grant(&transfer, &planned, false)
             .expect("grant");
@@ -6558,7 +6457,7 @@ mod tests {
             plan.bindings[position].generation,
             policy.targets.get("http://a").unwrap().generation
         );
-        let current = Arc::clone(&policy.peer_regs.get("http://a").expect("record"));
+        let current = Arc::clone(&policy.peers.peer_regs.get("http://a").expect("record"));
         assert_eq!(&*current.endpoint.as_ref().unwrap().engine_id, "engine-a");
         // The planner clones the same Arc the registration stored.
         let (_, planned) = plan_for_grant(&policy, &workers);
@@ -6683,6 +6582,7 @@ mod tests {
         policy.unregister_target("http://10.0.0.1:8000");
         assert_eq!(
             policy
+                .peers
                 .trusted_hosts
                 .get("http://10.0.0.1:8000")
                 .as_deref()
