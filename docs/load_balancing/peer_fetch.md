@@ -1,6 +1,6 @@
 # Peer fetch for kv_aware
 
-**Terms.** *Peer fetch* is this feature: the router plans whether a picked worker should fetch a prefix from a peer (`--peer-fetch-*`, `peer_fetch:`, `vllm_router_peer_fetch_*`) and, in active mode, tells the engine to do it through `kv_transfer_params`. *KV transfer* elsewhere in the router means the PD connector and the tier credits (`--kv-penalty-*`).
+**Terms.** *Peer fetch* is this feature: the router plans whether a picked worker should fetch a prefix from a peer (`--peer-fetch-*`, `peer_fetch:`, `vllm_router_peer_fetch_*`) and, in active mode, tells the engine to do it through `kv_transfer_params`. *KV transfer* elsewhere in the router means the PD connector and the tier credits (`--kv-penalty-*`). In the code, the *transfer planner* (`transfer_planner`, `plan_transfer`) is the peer fetch planner, and a *transfer plan* (`PeerFetchPlan`, `last_transfer_plan`) is one planned peer fetch: source, destination and the block range to fetch.
 
 ## What it does
 
@@ -39,10 +39,10 @@ sequenceDiagram
         R->>R: 11. count vllm_router_peer_fetch_requests_total{outcome}
     end
     D-->>C: response
-    R->>R: 12. free the in-flight slot when the request ends
+    R->>R: 12. free the in-flight slot at the response's first output frame (decode start), or when the request ends
 ```
 
-Steps 1 to 7 are the same in shadow and active mode. Steps 8b to 12 exist only in active mode.
+Steps 1 to 7 are the same in shadow and active mode, except that a shadow run with `ignore_capability` skips the capability check in step 5. Steps 8b to 12 exist only in active mode.
 
 ## Decision flow
 
@@ -52,9 +52,11 @@ Checks run in this order. The first one that fails gives the outcome label.
 
 | Check | Outcome label |
 |---|---|
-| The client set `prompt_logprobs` or `prompt_logprob_token_ids` (the engine computes every prompt token for these, so it reads no external KV; the request still gets its KV-aware worker but takes no source permit) | `prompt_logprobs` |
+| The client set `prompt_logprobs` or `prompt_logprob_token_ids` (the engine computes every prompt token for these, so it reads no external KV; the request still gets its KV-aware worker but takes no source permit). Typed path (`route_typed_request`) only, see below | `prompt_logprobs` |
 | The pick came from a session binding | `session_binding` |
 | The request has no token ids to match | `missing_tokens` |
+
+The transparent proxy path (`route_transparent`) does not run the `prompt_logprobs` check: there such a request is planned like any other, so shadow mode counts it under its planner outcome (`planned` included), and active mode catches it later as `vllm_router_peer_fetch_requests_total{outcome="prompt_logprobs"}`.
 
 **Planner, request level (`plan_transfer`, `peer_fetch.rs`):**
 
@@ -73,7 +75,7 @@ Checks run in this order. The first one that fails gives the outcome label.
 | # | Check | Outcome label |
 |---|---|---|
 | 1 | Peer was excluded for this request (retry) | `source_excluded` |
-| 2 | `require_capability` is on and source cannot send to destination | `incompatible` |
+| 2 | Source cannot send to destination (skipped in shadow with `ignore_capability`) | `incompatible` |
 | 3 | Peer's prefix is not longer than the destination's | `picked_holds_longest_prefix` |
 | 4 | Peer holds fewer than `min_prefix_blocks` extra blocks | `prefix_too_short` |
 | 5 | Peer has fewer than `source_load_threshold` active requests | `source_not_busy` |
@@ -128,14 +130,16 @@ Points 1, 2 and 4 all favour `planned`. Calibrate the constants against a measur
 
 ## Modes and settings
 
-| Mode | `require_capability` | What a plan needs | What happens to a planned request |
+| Mode | `ignore_capability` | What a plan needs | What happens to a planned request |
 |---|---|---|---|
 | `off` | any | (no planner) | nothing |
-| `shadow` | `false` | shared cache identity only | counted, request unchanged |
-| `shadow` | `true` | plus: source can export, destination can import, same connector, version and layout fingerprint | counted, request unchanged |
-| `active` | forced `true` | same as above | counted; then see below |
+| `shadow` | `false` (default) | shared cache identity, plus: source can export, destination can import, same connector, version and layout fingerprint | counted, request unchanged |
+| `shadow` | `true` | shared cache identity only | counted, request unchanged |
+| `active` | `false` (`true` is rejected at startup) | same as default shadow | counted; then see below |
 
-In `active` mode a planned request goes through these checks, in order. Each failure is counted on `vllm_router_peer_fetch_requests_total{outcome}` and the request is sent unchanged. Only POST requests reach these checks: the router reads token ids only from POST bodies, so any other method stops at `missing_tokens` in `plans_total` and never takes a source slot.
+A default shadow run makes the plans active mode would make, so its rate predicts active mode. `--peer-fetch-ignore-capability` answers a different question: how much peer fetch would save once every worker declares a compatible capability. The router logs a warning each time it builds a policy with it set: at startup, and again for each `kv_aware` policy created later from a worker's policy hint. Without it, `plans_total{outcome="incompatible"}` shows how often the capability check decided the outcome. It is counted once per selection, and only when no peer failed a later check (3 to 7, see "Which reason is reported"), so it undercounts the selections the check blocked.
+
+In `active` mode a planned request goes through these checks, in order. Each failure is counted on `vllm_router_peer_fetch_requests_total{outcome}` and the request is sent unchanged. Only POST requests reach these checks: the router reads token ids only from POST bodies, so any other method ends at `session_binding` (when it already has a session binding) or `missing_tokens` in `plans_total`, and never takes a source slot.
 
 | Check | Outcome |
 |---|---|
@@ -150,7 +154,7 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 
 **Where capabilities come from.**
 - *Engine-reported:* a worker's `peer_lookup` record on `/kv_event_sources` gives both a capability and a peer address (host, port, engine id, TP/DCP/PP sizes). The record is described below.
-- *Static:* `--peer-fetch-capability WORKER_URL=JSON` (repeatable; `peer_fetch.capabilities` in a config file) gives a capability only. A static entry wins over the engine's capability for the same worker, but the router still stores the address from the engine's `peer_lookup` record. In active mode a static source is fetchable when its engine reports that address, and ends as `no_peer_endpoint` when it does not. Example:
+- *Static:* `--peer-fetch-capability WORKER_URL=JSON` (repeatable) gives a capability only. It is the only way to set `peer_fetch.capabilities`: the router reads no config file, and the Python launcher has no peer fetch options. A static entry wins over the engine's capability for the same worker, but the router still stores the address from the engine's `peer_lookup` record. In active mode a static source is fetchable when its engine reports that address, and ends as `no_peer_endpoint` when it does not. Example:
 
   ```bash
   --peer-fetch-capability 'http://10.0.0.1:8000={"connector":"nixl","connector_version":"1","layout_fingerprint":"llama70b-fp8-tp8-b16"}'
@@ -190,12 +194,12 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 | `tp_size` | integer | 1 or more | Sent as `tp_size` |
 | `dcp_size` | integer | 1 or more | Sent as `dcp_size` |
 | `pp_size` | integer | 1 or more | Sent as `pp_size` |
-| `connector` | string | not blank | Capability: must equal the other worker's when capabilities are required (always in `active`) |
-| `connector_version` | string | not blank | Capability: must equal the other worker's when capabilities are required (always in `active`) |
-| `layout_fingerprint` | string | not blank | Capability: must equal the other worker's when capabilities are required (always in `active`) |
+| `connector` | string | not blank | Capability: must equal the other worker's, unless a shadow run sets `ignore_capability` |
+| `connector_version` | string | not blank | Capability: must equal the other worker's, unless a shadow run sets `ignore_capability` |
+| `layout_fingerprint` | string | not blank | Capability: must equal the other worker's, unless a shadow run sets `ignore_capability` |
 
 - Every field is required. A missing field reads as `false`, `""` or `0` and fails validation.
-- Strings are compared and sent exactly as reported; the router does not trim them.
+- `connector`, `connector_version` and `layout_fingerprint` are trimmed before they are compared, the same as a static capability's, so `"nixl "` matches `"nixl"`. The address fields are sent exactly as reported.
 - An engine record gives the worker a capability that can both export and import.
 - The address fields are passed through to the destination's `kv_transfer_params`, together with `"do_remote_prefill": true` and `"peer_lookup": true`. The router does not interpret the sizes.
 - Unknown keys are ignored. A `null` or absent `peer_lookup` means no record.
@@ -243,7 +247,7 @@ Both return the state after the call:
 |---|---|
 | 200 | `GET`, or a `POST` that set the state |
 | 400 | The `POST` body is not a JSON object with a boolean `enabled`; the body is `{"error": "..."}` |
-| 401 | API keys are configured and the request has no accepted key. Checked before the body is read |
+| 401 | API keys are configured and the request has no accepted key. Checked before the body is parsed, so a bad body is a 400 only after authorization |
 | 409 | No policy is in active mode: `{"error": "no policy in active mode"}`. The state is not changed |
 
 Each successful `POST` is logged at `WARN` with the new state and sets `vllm_router_peer_fetch_enabled`.
@@ -259,5 +263,5 @@ Each successful `POST` is logged at `WARN` with the new state and sets `vllm_rou
 | `vllm_router_peer_fetch_plans_total` | `outcome` | One per selection: `planned` or a skip label from the tables above |
 | `vllm_router_peer_fetch_requests_total` | `outcome` | Active mode only, one per planned request: `sent`, `grpc_destination`, `registration_changed`, `no_peer_endpoint`, `inflight_cap`, `client_params_present`, `prompt_logprobs`, `invalid_body` |
 | `vllm_router_peer_fetch_estimated_saved_ms` | none | `saved_ms` of each planned transfer |
-| `vllm_router_peer_fetch_estimated_cost_ms` | `path` = `fetch` or `wait` | Both estimates, whenever the cost rule was evaluated |
+| `vllm_router_peer_fetch_estimated_cost_ms` | `path` = `fetch` or `wait` | Both estimates, for the peer whose outcome is reported; peers that reach the cost rule and are passed over leave no sample |
 | `vllm_router_peer_fetch_enabled` | none | Gauge: 1 while the kill switch lets active-mode policies fetch, 0 while it stops them. Set at startup when the main policy is in active mode, and on each successful `POST /peer_fetch` |

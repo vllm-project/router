@@ -85,11 +85,11 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "vllm_router_peer_fetch_plans_total",
-        "KV transfer planner outcomes (planned or the reason no plan was made)"
+        "Peer fetch planner outcomes (planned or the reason no plan was made)"
     );
     describe_counter!(
         "vllm_router_peer_fetch_requests_total",
-        "Active-mode KV transfer requests: sent with peer fetch params, or why not \
+        "Active-mode peer fetch requests: sent with peer fetch params, or why not \
          (no_peer_endpoint, inflight_cap, grpc_destination, registration_changed, \
          client_params_present, prompt_logprobs, invalid_body)"
     );
@@ -100,7 +100,7 @@ pub fn init_metrics() {
     );
     describe_histogram!(
         "vllm_router_peer_fetch_estimated_saved_ms",
-        "Estimated prefill milliseconds saved by a planned KV transfer"
+        "Estimated prefill milliseconds saved by a planned peer fetch"
     );
     describe_histogram!(
         "vllm_router_peer_fetch_estimated_cost_ms",
