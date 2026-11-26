@@ -316,6 +316,28 @@ Use vLLM `0.34.1rc0` or later over HTTP with `tencent/Hy4-flash-FP8` (FP8) or `t
 </details>
 
 <details>
+<summary>Ascend · HY4 Flash</summary>
+
+Use the HY4 Flash vLLM-Ascend image over HTTP.
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 64,
+  "speculative_tokens": 0,
+  "declared_groups": 1,
+  "groups": [
+    {"kind": "mla_attention", "block_size": 64, "cache_role": "sparse", "tokens_per_state": "1"}
+  ]
+}
+```
+
+- For colocated DFly with five speculative tokens, set `speculative_tokens` to `5`, `hash_lookahead_tokens` to `0`, and `tail_drop_groups` to `[]`.
+- For P/D, use the Prefill worker URL and set `--kv-connector mooncake-v2`.
+
+</details>
+
+<details>
 <summary>GPU · DeepSeek-V4-Flash-0731</summary>
 
 ```json
@@ -613,7 +635,7 @@ Both the Rust and Python launchers accept these options. Configure vLLM workers 
 | `--decode` | `URL`, repeatable | No workers | Register a Decode worker. |
 | `--prefill-policy` | Policy name | Inherits `--policy` | Set `kv_aware` to score Prefill prefix reuse. |
 | `--decode-policy` | Policy name | Inherits `--policy` | Set `kv_aware` to route Decode by context load. Enable Decode KV events to credit cache reuse. |
-| `--kv-connector` | `nixl`, `mooncake`, or `moriio` | `nixl` | Match the connector used by the P/D workers. MoRI-IO requires vLLM ZMQ discovery. |
+| `--kv-connector` | `nixl`, `mooncake`, `mooncake-v2`, or `moriio` | `nixl` | Use `mooncake-v2` with Ascend `MooncakeConnectorV2`. MoRI-IO requires vLLM ZMQ discovery. |
 | `--vllm-discovery-address` | `HOST:PORT` | Unset | Listen for vLLM ZMQ worker registration when using P/D discovery. Use explicit URLs for gRPC P/D. |
 | `--pd-pair` | `PREFILL=DECODE[,DECODE...]`, repeatable | All peers in one compatible pool | Restrict a mixed pool to the declared P/D pairs. Supply one entry per Prefill. |
 | `--kv-hybrid-layout` | JSON file path | Unset | Supply cache groups, hashing, and reuse rules when the Router cannot derive them or read them from the worker. |

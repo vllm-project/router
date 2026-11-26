@@ -291,11 +291,12 @@ impl Router {
             kv_connector: match self.kv_connector.to_ascii_lowercase().as_str() {
                 "nixl" => config::KvConnector::Nixl,
                 "mooncake" => config::KvConnector::Mooncake,
+                "mooncake-v2" => config::KvConnector::MooncakeV2,
                 "moriio" => config::KvConnector::MoriIO,
                 other => {
                     return Err(config::ConfigError::ValidationFailed {
                         reason: format!(
-                            "Invalid kv_connector '{}': expected 'nixl', 'mooncake', or 'moriio'",
+                            "Invalid kv_connector '{}': expected 'nixl', 'mooncake', 'mooncake-v2', or 'moriio'",
                             other
                         ),
                     });

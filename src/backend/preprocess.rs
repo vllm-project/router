@@ -2,6 +2,7 @@
 //! Loaded models share optional L0 (exact) and L1 (prefix) encoding caches.
 
 use crate::core::Worker;
+use crate::kv_index::request_hash::ImagePrefix;
 use crate::metrics::RouterMetrics;
 use crate::policies::WorkerTokenInputs;
 use http::HeaderMap;
@@ -35,7 +36,7 @@ use vllm_chat::{
 /// frontend: HTTP workers can have different templates and tokenizer settings.
 enum HttpKvInput {
     Direct(Arc<[Vec<u32>]>),
-    Render { path: &'static str },
+    Render { path: &'static str, image: bool },
 }
 
 fn dense_token_ids(value: &serde_json::Value) -> Result<Vec<u32>, &'static str> {
@@ -75,6 +76,13 @@ pub(crate) const ADAPTER_FIELDS: [&str; 3] =
 fn http_cache_identity(
     fields: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), &'static str> {
+    http_cache_identity_for_render(fields, false).map(|_| ())
+}
+
+fn http_cache_identity_for_render(
+    fields: &serde_json::Map<String, serde_json::Value>,
+    allow_image: bool,
+) -> Result<bool, &'static str> {
     // The event index cannot identify multimodal/embedding or prompt-adapter
     // cache keys from token IDs alone. HTTP adapter names also need an explicit
     // mapping to the names carried by KV events before they can earn credit.
@@ -92,18 +100,21 @@ fn http_cache_identity(
             return Err("unsupported_cache_identity");
         }
     }
+    let mut image = false;
     if let Some(messages) = fields.get("messages").and_then(serde_json::Value::as_array) {
         for message in messages {
             if let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) {
-                if parts.iter().any(|part| {
-                    part.get("type").and_then(serde_json::Value::as_str) != Some("text")
-                }) {
-                    return Err("multimodal_input");
+                for part in parts {
+                    match part.get("type").and_then(serde_json::Value::as_str) {
+                        Some("text") => {}
+                        Some("image_url") if allow_image && !image => image = true,
+                        _ => return Err("multimodal_input"),
+                    }
                 }
             }
         }
     }
-    Ok(())
+    Ok(image)
 }
 
 /// Requests whose cache-read semantics have not been verified must not earn
@@ -278,9 +289,10 @@ fn cache_read_fallback(
 }
 
 fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &'static str> {
-    if let Some(fields) = body.as_object() {
-        http_cache_identity(fields)?;
-    }
+    let image = match body.as_object() {
+        Some(fields) => http_cache_identity_for_render(fields, route == "/v1/chat/completions")?,
+        None => false,
+    };
     let path = match route {
         "/v1/completions" => {
             if body
@@ -326,19 +338,24 @@ fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &
         }
         _ => return Err("unsupported_route"),
     };
-    Ok(HttpKvInput::Render { path })
+    Ok(HttpKvInput::Render { path, image })
 }
 
 /// Whether pricing needs a backend `/render`: a string/chat body does, a
 /// direct token-id input does not.
-pub(crate) fn http_input_requires_render(body: &serde_json::Value, route: &str) -> bool {
-    matches!(http_kv_input(body, route), Ok(HttpKvInput::Render { .. }))
+pub(crate) fn http_input_requires_render(
+    body: &serde_json::Value,
+    route: &str,
+    render_images: bool,
+) -> bool {
+    matches!(http_kv_input(body, route), Ok(HttpKvInput::Render { image, .. }) if render_images || !image)
 }
 
 /// Backend-effective prompts, shared by colocated and PD routing policies.
 #[derive(Clone)]
 pub(crate) struct HttpTokenInput {
     pub prompts: Arc<[Vec<u32>]>,
+    pub image: Option<ImagePrefix>,
     pub source: &'static str,
 }
 
@@ -355,11 +372,13 @@ pub(crate) fn router_token_inputs(
     };
     let input = checked.map(|()| HttpTokenInput {
         prompts: prompts.clone(),
+        image: None,
         source: "prepared",
     });
     urls.into_iter().map(|url| (url, input.clone())).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_http_token_inputs(
     client: &Client,
     mut urls: Vec<String>,
@@ -368,6 +387,7 @@ pub(crate) async fn prepare_http_token_inputs(
     headers: Option<&HeaderMap>,
     api_key: Option<&str>,
     budget: Duration,
+    render_images: bool,
 ) -> std::collections::HashMap<String, Result<HttpTokenInput, &'static str>> {
     use futures_util::{stream, StreamExt};
     urls.sort();
@@ -376,6 +396,12 @@ pub(crate) async fn prepare_http_token_inputs(
         Ok(input) => input,
         Err(reason) => return urls.into_iter().map(|url| (url, Err(reason))).collect(),
     };
+    if !render_images && matches!(input, HttpKvInput::Render { image: true, .. }) {
+        return urls
+            .into_iter()
+            .map(|url| (url, Err("multimodal_input")))
+            .collect();
+    }
     if let HttpKvInput::Direct(prompts) = input {
         return urls
             .into_iter()
@@ -384,13 +410,14 @@ pub(crate) async fn prepare_http_token_inputs(
                     url,
                     Ok(HttpTokenInput {
                         prompts: prompts.clone(),
+                        image: None,
                         source: "token_ids",
                     }),
                 )
             })
             .collect();
     }
-    let HttpKvInput::Render { path } = input else {
+    let HttpKvInput::Render { path, image } = input else {
         unreachable!()
     };
     let expected_prompts = if route == "/v1/completions" {
@@ -415,10 +442,14 @@ pub(crate) async fn prepare_http_token_inputs(
             let tokenize_fallback = &tokenize_fallback;
             async move {
                 let result = async {
-                    let (prompts, source) =
+                    let (prompts, source, image) =
                         match http_input_json(client, &url, path, body, headers, api_key).await {
-                            Ok(rendered) => (http_rendered_tokens(&rendered)?, "render"),
-                            Err("render_unavailable") => {
+                            Ok(rendered) if image => {
+                                let (tokens, image) = http_rendered_image(&rendered)?;
+                                (Arc::from(vec![tokens]), "render", Some(image))
+                            }
+                            Ok(rendered) => (http_rendered_tokens(&rendered)?, "render", None),
+                            Err("render_unavailable") if !image => {
                                 let requests = tokenize_fallback
                                     .get_or_init(|| http_tokenize_fallback(body, route))
                                     .as_ref()
@@ -444,14 +475,18 @@ pub(crate) async fn prepare_http_token_inputs(
                                     }
                                     prompts.push(ids);
                                 }
-                                (Arc::from(prompts), "tokenize")
+                                (Arc::from(prompts), "tokenize", None)
                             }
                             Err(reason) => return Err(reason),
                         };
                     if prompts.len() != expected_prompts {
                         return Err("invalid_preparation_response");
                     }
-                    Ok(HttpTokenInput { prompts, source })
+                    Ok(HttpTokenInput {
+                        prompts,
+                        source,
+                        image,
+                    })
                 }
                 .await;
                 (url, result)
@@ -591,6 +626,32 @@ fn http_rendered_tokens(body: &serde_json::Value) -> Result<Arc<[Vec<u32>]>, &'s
     Ok(Arc::from(prompts))
 }
 
+fn http_rendered_image(body: &serde_json::Value) -> Result<(Vec<u32>, ImagePrefix), &'static str> {
+    let tokens = dense_token_ids(&body["token_ids"])?;
+    let features = &body["features"];
+    let image = (|| {
+        let hashes = features["mm_hashes"].as_object()?;
+        let placeholders = features["mm_placeholders"].as_object()?;
+        if hashes.len() != 1 || placeholders.len() != 1 {
+            return None;
+        }
+        let [hash] = hashes.get("image")?.as_array()?.as_slice() else {
+            return None;
+        };
+        let [placement] = placeholders.get("image")?.as_array()?.as_slice() else {
+            return None;
+        };
+        ImagePrefix::new(
+            hash.as_str()?,
+            placement["offset"].as_u64()?.try_into().ok()?,
+            placement["length"].as_u64()?.try_into().ok()?,
+            tokens.len(),
+        )
+    })()
+    .ok_or("invalid_image_cache_identity")?;
+    Ok((tokens, image))
+}
+
 /// Prepare request-local token evidence without serializing the completion.
 /// A non-Direct plan returns no evidence and must not complete a preparation
 /// OnceCell: a later retry may need the ordinary Worker preparation path.
@@ -638,6 +699,7 @@ pub(crate) fn prepare_completion_direct_inputs(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_http_kv_inputs(
     client: &Client,
     workers: &[Arc<dyn Worker>],
@@ -646,19 +708,33 @@ pub(crate) async fn prepare_http_kv_inputs(
     route: &str,
     api_key: Option<&str>,
     budget: Duration,
+    render_images: bool,
 ) -> WorkerTokenInputs {
     let urls = workers
         .iter()
         .map(|worker| worker.base_url().to_owned())
         .collect();
-    let results =
-        prepare_http_token_inputs(client, urls, body, route, headers, api_key, budget).await;
+    let results = prepare_http_token_inputs(
+        client,
+        urls,
+        body,
+        route,
+        headers,
+        api_key,
+        budget,
+        render_images,
+    )
+    .await;
     let mut inputs = WorkerTokenInputs::new();
     for (url, result) in results {
         match result {
             Ok(input) => {
                 RouterMetrics::record_kv_routing_input("http", input.source);
-                inputs.insert(url, input.prompts);
+                if let Some(image) = input.image {
+                    inputs.insert_image(url, input.prompts, image);
+                } else {
+                    inputs.insert(url, input.prompts);
+                }
             }
             Err(reason) => {
                 RouterMetrics::record_kv_routing_input("http", reason);
@@ -1279,6 +1355,7 @@ mod tests {
             None,
             None,
             Duration::from_secs(1),
+            false,
         )
         .await;
         assert_eq!(
@@ -1669,11 +1746,35 @@ mod tests {
             };
             assert!(super::http_tokenize_fallback(&body, route).is_none());
         }
-        assert!(http_kv_input(&json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"image"}}]}]}),"/v1/chat/completions").is_err());
         assert!(http_rendered_tokens(
             &json!({"token_ids":[1,2],"features":{"mm_hashes":{"image":["x"]}}})
         )
         .is_err());
+    }
+
+    #[test]
+    fn single_image_routing_requires_worker_rendered_identity() {
+        use serde_json::json;
+
+        let image = json!({"type":"image_url","image_url":{"url":"image"}});
+        let body = json!({"messages":[{"role":"user","content":[image.clone()]}]});
+        assert!(matches!(
+            super::http_kv_input(&body, "/v1/chat/completions"),
+            Ok(super::HttpKvInput::Render { image: true, .. })
+        ));
+        let both = json!({"messages":[{"role":"user","content":[image.clone(),image]}]});
+        assert!(super::http_kv_input(&both, "/v1/chat/completions").is_err());
+
+        let mut rendered = json!({
+            "token_ids":[1,2,3],
+            "features":{
+                "mm_hashes":{"image":["a".repeat(64)]},
+                "mm_placeholders":{"image":[{"offset":1,"length":2}]}
+            }
+        });
+        assert_eq!(super::http_rendered_image(&rendered).unwrap().0, [1, 2, 3]);
+        rendered["features"]["mm_placeholders"]["image"][0]["length"] = json!(3);
+        assert!(super::http_rendered_image(&rendered).is_err());
     }
     use super::*;
     use std::path::{Path, PathBuf};

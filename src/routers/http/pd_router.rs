@@ -642,14 +642,15 @@ impl PdRouterBase {
             results
                 .into_iter()
                 .map(|(base, result)| {
-                    let (prompts, reason) = match result {
-                        Ok(input) => (Some(input.prompts), None),
-                        Err(reason) => (None, Some(reason)),
+                    let (prompts, image, reason) = match result {
+                        Ok(input) => (Some(input.prompts), input.image, None),
+                        Err(reason) => (None, None, Some(reason)),
                     };
                     (
                         base,
                         PdPrefillInput {
                             prompts,
+                            image,
                             work_by_rank: HashMap::new(),
                             allow_credit: false,
                             fallback_reason: reason,
@@ -678,7 +679,8 @@ impl PdRouterBase {
             results
                 .into_iter()
                 .filter_map(|(base, result)| match result {
-                    Ok(input) => Some((base, input.prompts)),
+                    Ok(input) if input.image.is_none() => Some((base, input.prompts)),
+                    Ok(_) => None,
                     Err(reason) => {
                         crate::metrics::RouterMetrics::record_kv_routing_input("pd_decode", reason);
                         None
@@ -711,6 +713,7 @@ impl PdRouterBase {
                     headers,
                     self.api_key.as_deref(),
                     Duration::from_secs(1),
+                    false,
                 )
                 .await
             }
@@ -1393,6 +1396,7 @@ impl PdRouterBase {
                         .then(|| decode_policy.clone()),
                     ctx.router_config.kv_event_strict_recovery,
                     ctx.router_config.program_scheduling.is_none(),
+                    ctx.router_config.epd.is_none(),
                 )
                 .await,
             )
@@ -2780,6 +2784,7 @@ mod admission_tests {
                     worker.base_url().to_owned(),
                     super::super::pd_types::PdPrefillInput {
                         prompts: Some(Arc::from(vec![tokens.to_vec()])),
+                        image: None,
                         work_by_rank: HashMap::from([(
                             worker.dp_rank(),
                             kv_aware_ops(policy).unwrap().estimate_prefill_work(

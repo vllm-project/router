@@ -577,7 +577,7 @@ impl VllmPDRouter {
                 MORIIO_TRANSFER_PREFIX,
                 Uuid::new_v4().simple()
             )),
-            KvConnector::Nixl => None,
+            KvConnector::Nixl | KvConnector::MooncakeV2 => None,
         }
     }
 
@@ -649,7 +649,7 @@ impl VllmPDRouter {
                     }))
                 }
             }
-            KvConnector::Nixl => Ok(json!({
+            KvConnector::Nixl | KvConnector::MooncakeV2 => Ok(json!({
                 "do_remote_decode": true,
                 "do_remote_prefill": false,
                 "remote_engine_id": serde_json::Value::Null,
@@ -727,6 +727,12 @@ impl VllmPDRouter {
                     Some(params)
                 }
             }
+            KvConnector::MooncakeV2 => prefill_response_json?
+                .get("kv_transfer_params")
+                .filter(|params| {
+                    params.get("do_remote_prefill").and_then(Value::as_bool) == Some(true)
+                })
+                .cloned(),
             KvConnector::Nixl => {
                 if let Some(json) = prefill_response_json {
                     let kvt = json.get("kv_transfer_params")?;
@@ -1267,6 +1273,7 @@ impl VllmPDRouter {
             .iter()
             .filter(|_| prefill_policy.name() == "cache_aware")
             .flat_map(|inputs| inputs.iter())
+            .filter(|(_, input)| input.image.is_none())
             .filter_map(|(base, input)| {
                 input
                     .prompts
@@ -1341,7 +1348,7 @@ impl VllmPDRouter {
                             .is_none()
                     })
             }
-            KvConnector::Mooncake => true,
+            KvConnector::Mooncake | KvConnector::MooncakeV2 => true,
             KvConnector::MoriIO => false,
         }
     }
@@ -1435,7 +1442,7 @@ impl VllmPDRouter {
                     )
                     .await
                 {
-                    tokens.extend(new_tokens);
+                    tokens.merge(new_tokens);
                 }
                 // The pool can change while that await runs: re-read it and
                 // reapply the same health/model/pin filters used above.
@@ -2561,6 +2568,13 @@ impl VllmPDRouter {
             Some(&request_id),
         ) {
             decode_request["kv_transfer_params"] = params;
+        } else if self.kv_connector == KvConnector::MooncakeV2 {
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+            return Err(PDRouterError::NetworkError {
+                message: "Prefill returned no Mooncake V2 KV handoff".into(),
+            });
         } else {
             warn!(
                 "No kv_transfer_params for prefill {}, decode will proceed without them",
@@ -2778,6 +2792,17 @@ impl VllmPDRouter {
             Some(&request_id),
         );
         if decode_params.is_none() {
+            if self.kv_connector == KvConnector::MooncakeV2 {
+                attempt.release();
+                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    "Prefill returned no Mooncake V2 KV handoff",
+                )
+                    .into_response();
+            }
             warn!(
                 "No kv_transfer_params for prefill {}, decode will proceed without them",
                 prefill_base_url
@@ -2931,7 +2956,7 @@ impl VllmPDRouter {
                 .get_nixl_push_identity(prefill_worker.base_url(), prefill_worker.dp_rank())
                 .is_some(),
             KvConnector::MoriIO => self.moriio_transfer_mode() == Some(MoriIOTransferMode::Write),
-            KvConnector::Mooncake => false,
+            KvConnector::Mooncake | KvConnector::MooncakeV2 => false,
         };
         if !concurrent {
             return None;
@@ -4429,6 +4454,7 @@ mod tests {
                 Some(Arc::new(crate::policies::KvAwarePolicy::default())),
                 None,
                 false,
+                true,
                 true,
             )
             .await,
@@ -7340,6 +7366,40 @@ mod tests {
         // Verify the KvConnector::Nixl variant exists and is the default.
         let connector = KvConnector::default();
         assert_eq!(connector, KvConnector::Nixl);
+    }
+
+    #[tokio::test]
+    async fn mooncake_v2_forwards_the_prefill_handoff() {
+        let mut router = test_vllm_pd_router().await;
+        router.kv_connector = KvConnector::MooncakeV2;
+        assert!(router.generate_transfer_id().is_none());
+        let params = router
+            .build_prefill_kv_transfer_params(None, None, None, None)
+            .unwrap();
+        assert_eq!(params["do_remote_decode"], true);
+        assert_eq!(params["do_remote_prefill"], false);
+
+        let worker = crate::core::BasicWorker::new(
+            "http://prefill".into(),
+            crate::core::WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+        let handoff = json!({
+            "do_remote_prefill": true,
+            "remote_block_ids": [[0, 1]],
+            "remote_engine_id": "prefill",
+            "remote_request_id": "request",
+            "remote_num_prompt_tokens": 65
+        });
+        let decode_params = |response: &Value| {
+            router.build_decode_kv_transfer_params(&worker, Some(response), None, None)
+        };
+        assert_eq!(
+            decode_params(&json!({"kv_transfer_params": handoff})),
+            Some(handoff)
+        );
+        assert_eq!(decode_params(&json!({})), None);
     }
 
     // --- MoRI-IO WRITE mode parameter tests ---

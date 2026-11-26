@@ -167,6 +167,7 @@ pub(super) type Loads = HashMap<(Stage, PdEndpoint), PdLoadSample>;
 #[derive(Debug, Clone)]
 pub struct PdPrefillInput {
     pub prompts: Option<Arc<[Vec<u32>]>>,
+    pub(crate) image: Option<crate::kv_index::request_hash::ImagePrefix>,
     /// Per-rank placement snapshot.
     /// Hashing and index queries are completed before the admission lock.
     pub work_by_rank: HashMap<Option<usize>, crate::policies::PrefillWorkEstimate>,

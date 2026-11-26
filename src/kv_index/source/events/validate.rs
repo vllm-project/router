@@ -1,6 +1,6 @@
 //! Event-shape admission, separate from structural decoding and transport.
 use crate::kv_index::layout::{CacheGroup, GroupRule};
-use crate::kv_index::request_hash::SequenceHash;
+use crate::kv_index::request_hash::{is_image_hash, SequenceHash};
 use crate::kv_index::wire::{BlockStored, ExternalBlockHash, KVEvent};
 use crate::kv_index::SourceError;
 
@@ -40,6 +40,22 @@ fn complete_blocks(store: &BlockStored) -> bool {
         == Some(store.token_ids.len())
 }
 
+pub(super) fn image_block_keys(key: &rmpv::Value) -> Option<Vec<(&str, i64)>> {
+    let features = key.as_array().filter(|features| !features.is_empty())?;
+    features
+        .iter()
+        .map(|feature| {
+            let [hash, offset] = feature.as_array()?.as_slice() else {
+                return None;
+            };
+            Some((
+                hash.as_str().filter(|hash| is_image_hash(hash))?,
+                offset.as_i64()?,
+            ))
+        })
+        .collect()
+}
+
 /// Return false for a secondary page size that proves no prefix evidence.
 pub(super) fn validate_store(
     group: &CacheGroup,
@@ -73,7 +89,10 @@ pub(super) fn validate_store(
         if keys.len() != store.block_hashes.len() {
             return Err(SourceError::InvalidBatch);
         }
-        if let Some((first, rest)) = keys.split_first() {
+        let image_only = keys
+            .iter()
+            .all(|key| key.is_nil() || image_block_keys(key).is_some());
+        if let Some((first, rest)) = keys.split_first().filter(|_| !image_only) {
             if !rest.iter().all(rmpv::Value::is_nil) {
                 return Err(SourceError::InvalidBatch);
             }

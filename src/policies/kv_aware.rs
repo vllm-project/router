@@ -15,6 +15,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
+use crate::kv_index::request_hash::ImagePrefix;
 use crate::kv_index::{
     CacheKey, PromptKey, RequestHashCache, RoutableTarget, SharedPrefixLookup, StorageTier,
     TierMatch, WorkerKvInfo,
@@ -25,7 +26,62 @@ pub use crate::kv_index::TieredMatchProvider;
 
 /// Exact prompt sequences rendered by each HTTP backend. DP ranks share their
 /// base URL's input; separate prompts in a batch never form one prefix chain.
-pub type WorkerTokenInputs = HashMap<String, Arc<[Vec<u32>]>>;
+#[derive(Debug, Clone, Default)]
+pub struct WorkerTokenInputs {
+    prompts: HashMap<String, Arc<[Vec<u32>]>>,
+    images: HashMap<String, ImagePrefix>,
+}
+
+impl WorkerTokenInputs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, worker: String, prompts: Arc<[Vec<u32>]>) {
+        self.images.remove(&worker);
+        self.prompts.insert(worker, prompts);
+    }
+
+    pub(crate) fn insert_image(
+        &mut self,
+        worker: String,
+        prompts: Arc<[Vec<u32>]>,
+        image: ImagePrefix,
+    ) {
+        self.prompts.insert(worker.clone(), prompts);
+        self.images.insert(worker, image);
+    }
+
+    pub(crate) fn merge(&mut self, inputs: Self) {
+        self.images
+            .retain(|worker, _| !inputs.prompts.contains_key(worker));
+        self.images.extend(inputs.images);
+        self.prompts.extend(inputs.prompts);
+    }
+}
+
+impl std::ops::Deref for WorkerTokenInputs {
+    type Target = HashMap<String, Arc<[Vec<u32>]>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.prompts
+    }
+}
+
+impl FromIterator<(String, Arc<[Vec<u32>]>)> for WorkerTokenInputs {
+    fn from_iter<I: IntoIterator<Item = (String, Arc<[Vec<u32>]>)>>(iter: I) -> Self {
+        Self {
+            prompts: iter.into_iter().collect(),
+            images: HashMap::new(),
+        }
+    }
+}
+
+impl<const N: usize> From<[(String, Arc<[Vec<u32>]>); N]> for WorkerTokenInputs {
+    fn from(entries: [(String, Arc<[Vec<u32>]>); N]) -> Self {
+        entries.into_iter().collect()
+    }
+}
 
 #[derive(Clone, Copy)]
 pub enum KvRequestTokens<'a> {
@@ -86,6 +142,13 @@ impl<'a> WorkerPrompts<'a> {
 }
 
 impl<'a> KvRequestTokens<'a> {
+    pub(crate) fn image_for(self, worker: &dyn Worker) -> Option<&'a ImagePrefix> {
+        match self {
+            Self::PerWorker(inputs) => inputs.images.get(worker.base_url()),
+            Self::Shared(_) => None,
+        }
+    }
+
     pub(crate) fn prompts_for(self, worker: &dyn Worker) -> WorkerPrompts<'a> {
         match self {
             Self::Shared(Some(ids)) => WorkerPrompts::Single(ids),
@@ -1019,9 +1082,13 @@ pub struct PromptHashes<'a> {
     hashes: RequestHashCache<'a>,
 }
 
-impl PromptHashes<'_> {
+impl<'a> PromptHashes<'a> {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn register_image(&mut self, tokens: &'a [u32], image: &'a ImagePrefix) {
+        self.hashes.register_image(tokens, image);
     }
 
     fn set_stage_targets(
@@ -1648,6 +1715,14 @@ impl KvAwarePolicy {
         let mut lookups = crate::metrics::PlacementLookups::default();
         let mut query_cache = PromptHashes::default();
         query_cache.hashes.stop_at_gap = self.prefix_scoring;
+        for (&index, prompt) in healthy.iter().zip(&prompts) {
+            if let (Some(tokens), Some(image)) = (
+                prompt.single(),
+                input.tokens.image_for(workers[index].as_ref()),
+            ) {
+                query_cache.register_image(tokens, image);
+            }
+        }
         query_cache.hashes.single_target = healthy
             .iter()
             .zip(&prompts)
@@ -1659,6 +1734,7 @@ impl KvAwarePolicy {
         let shared_miss = if self.prefix_scoring
             && has_tokens
             && !query_cache.hashes.single_target
+            && !query_cache.hashes.has_images()
             && lora_name.is_none()
             && credit_fallback.is_none()
         {

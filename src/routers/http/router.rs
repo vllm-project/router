@@ -2076,6 +2076,7 @@ impl Router {
                                         route,
                                         self.api_key.as_deref(),
                                         Duration::from_secs(1),
+                                        kv_ops.is_some(),
                                     )
                                     .await,
                                 ),
@@ -3685,6 +3686,7 @@ impl RouterTrait for Router {
                     path,
                     self.api_key.as_deref(),
                     Duration::from_secs(1),
+                    kv_ops.is_some(),
                 )
                 .await,
             )

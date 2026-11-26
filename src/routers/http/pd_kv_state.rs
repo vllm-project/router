@@ -41,6 +41,7 @@ pub(super) struct PdKvState {
     targets: Mutex<HashMap<String, TargetRegistration>>,
     worker_pairs: Option<HashMap<String, HashSet<String>>>,
     allow_hybrid_layouts: bool,
+    render_images: bool,
     nixl_decode_replay: bool,
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
     credit_gate: Mutex<()>,
@@ -67,6 +68,7 @@ impl PdKvState {
         decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
         strict_recovery: bool,
         allow_hybrid_layouts: bool,
+        render_images: bool,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
         state.worker_pairs = (!pairs.is_empty()).then(|| {
@@ -77,6 +79,7 @@ impl PdKvState {
         });
         state.api_key = api_key;
         state.allow_hybrid_layouts = allow_hybrid_layouts;
+        state.render_images = render_images;
         state.nixl_decode_replay = connector == KvConnector::Nixl;
         state.supervisor.set_api_key(state.api_key.clone());
         state.supervisor.set_strict_recovery(strict_recovery);
@@ -126,6 +129,7 @@ impl PdKvState {
             targets: Mutex::new(HashMap::new()),
             worker_pairs: None,
             allow_hybrid_layouts: true,
+            render_images: true,
             nixl_decode_replay: false,
             #[cfg(all(test, feature = "cpu", feature = "ready"))]
             credit_gate: Mutex::new(()),
@@ -362,8 +366,8 @@ impl PdKvState {
         // and direct token-id prompts price without a `/render` fan-out.
         let decode_expected = (!defer_decode || self.worker_pairs.is_some())
             && kv_aware_ops(decode_policy.as_ref()).is_some();
-        let decode_requires_render =
-            router_prompts.is_none() && http_input_requires_render(request, route);
+        let decode_requires_render = router_prompts.is_none()
+            && http_input_requires_render(request, route, self.render_images);
         let decode_priced_here = decode_expected
             && !decode_requires_render
             && self.all_priceable(decode_workers, request, &allow_credit);
@@ -433,6 +437,7 @@ impl PdKvState {
                     headers,
                     self.api_key.as_deref(),
                     Duration::from_secs(1),
+                    self.render_images,
                 )
                 .await
             }
@@ -453,13 +458,14 @@ impl PdKvState {
                     allow_credit.get(&base).copied().unwrap_or(false),
                 )
             });
-            let (prompts, fallback_reason, source) = match result {
-                Ok(input) => (Some(input.prompts), fallback, input.source),
-                Err(reason) => (None, Some(reason), reason),
+            let (prompts, image, fallback_reason, source) = match result {
+                Ok(input) => (Some(input.prompts), input.image, fallback, input.source),
+                Err(reason) => (None, None, Some(reason), reason),
             };
             crate::metrics::RouterMetrics::record_kv_routing_input("pd", source);
             let input = PdPrefillInput {
                 prompts,
+                image,
                 work_by_rank: HashMap::new(),
                 allow_credit: fallback_reason.is_none(),
                 fallback_reason,
@@ -481,11 +487,11 @@ impl PdKvState {
             .iter()
             .filter_map(|worker| {
                 let input = prepared.get(worker.base_url())?;
-                Some((
-                    worker.as_ref(),
-                    input.prompts.as_deref()?,
-                    input.allow_credit,
-                ))
+                let prompts = input.prompts.as_deref()?;
+                if let ([tokens], Some(image)) = (prompts, input.image.as_ref()) {
+                    hashes.register_image(tokens, image);
+                }
+                Some((worker.as_ref(), prompts, input.allow_credit))
             })
             .collect();
         inputs
@@ -518,14 +524,21 @@ impl PdKvState {
             .filter_map(|worker| {
                 let result = results.get(worker.base_url())?;
                 match result {
-                    Ok(input) => Some((
-                        worker.as_ref(),
-                        input.prompts.as_ref(),
-                        allow_credit
-                            .get(worker.base_url())
-                            .copied()
-                            .unwrap_or(false),
-                    )),
+                    Ok(input) => {
+                        if let ([tokens], Some(image)) =
+                            (input.prompts.as_ref(), input.image.as_ref())
+                        {
+                            hashes.register_image(tokens, image);
+                        }
+                        Some((
+                            worker.as_ref(),
+                            input.prompts.as_ref(),
+                            allow_credit
+                                .get(worker.base_url())
+                                .copied()
+                                .unwrap_or(false),
+                        ))
+                    }
                     Err(reason) => {
                         crate::metrics::RouterMetrics::record_kv_routing_input("pd_decode", reason);
                         None
@@ -564,7 +577,9 @@ impl PdKvState {
         let kv = kv_aware_ops(policy.as_ref())?;
         // Same no-render rule as admission: the commit path must not pay a
         // second fan-out for ids that cannot have changed.
-        if router_prompts.is_none() && http_input_requires_render(request, route) {
+        if router_prompts.is_none()
+            && http_input_requires_render(request, route, self.render_images)
+        {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
             return None;
         }
@@ -1185,6 +1200,7 @@ mod kv_input_tests {
             Some(prefill_policy.clone()),
             Some(decode_policy.clone()),
             false,
+            true,
             true,
         )
         .await;
