@@ -16,6 +16,9 @@ Field semantics, defaults, and metric definitions are in
 does not restate them; it covers order of operations, decision thresholds, and
 the failure modes that are easy to mistake for "no benefit".
 
+For a sample invocation, replay commands, and a deployment decision table, see
+[Tuning DeepSeek V4 Flash on Ascend A3](../../../docs/program_scheduling/ascend-a3-deepseek-v4-flash.md).
+
 ## Scope and deployment shapes
 
 This procedure applies to Program scheduling on the Router's internal-DP path,
