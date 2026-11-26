@@ -122,7 +122,8 @@ struct LoadTrackedBody {
 struct RequestLoadState {
     worker: Option<Arc<dyn Worker>>,
     kv_slot: Option<KvRequestSlot>,
-    /// Active-mode peer fetch slot against the source; freed with the load.
+    /// Active-mode peer fetch slot against the source. Freed when decode
+    /// begins (the fetch ends during prefill) or, at the latest, with the load.
     peer_permit: Option<PeerFetchPermit>,
     released: AtomicBool,
 }
@@ -185,10 +186,13 @@ impl RequestLoadGuard {
         self.state.worker.is_some()
     }
 
+    /// Prefill is over, so any peer fetch has finished: free its slot now
+    /// rather than holding it through decode.
     fn begin_decode(&self) {
         if let Some(slot) = &self.state.kv_slot {
             slot.begin_decode();
         }
+        self.release_peer_fetch();
     }
 
     fn release(&self) {
@@ -3937,8 +3941,9 @@ impl RouterTrait for Router {
         };
 
         // Active mode: only POST bodies on the generation routes carry
-        // `kv_transfer_params`, and the permit lives in `load` (kept until the
-        // response body ends), so without a guard there is no slot to hold.
+        // `kv_transfer_params`, and the permit lives in `load` (freed at the
+        // first output frame, or when the response body ends), so without a
+        // guard there is no slot to hold.
         let mut body = body;
         if let (Some(source), Some(load)) = (&peer_fetch, &load) {
             if *method == Method::POST {
@@ -4203,6 +4208,15 @@ mod tests {
         let dropped = guard(&limiter);
         assert_eq!(limiter.inflight("http://a"), 1);
         drop(dropped);
+        assert_eq!(limiter.inflight("http://a"), 0);
+
+        // The fetch ends during prefill: the first output token frees the slot
+        // while the response keeps streaming.
+        let decoding = guard(&limiter);
+        decoding.begin_decode();
+        assert_eq!(limiter.inflight("http://a"), 0);
+        assert!(limiter.try_acquire("http://a").is_some());
+        decoding.release();
         assert_eq!(limiter.inflight("http://a"), 0);
     }
 

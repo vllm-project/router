@@ -984,14 +984,15 @@ async fn s14_active_mode_sends_peer_params_to_the_destination_only() {
     fx.finish().await;
 }
 
-/// 15: the source's in-flight cap counts a fetch until its response body ends.
-/// With `max_inflight_per_source = 1`, a streaming request that got a fetch and
-/// whose body is not drained holds the only slot, so the next planned request
-/// goes out unchanged (`inflight_cap`); draining the body frees the slot and a
+/// 15: the source's in-flight cap counts a fetch until the response's first
+/// output frame (decode start) or, failing that, until its body ends. With
+/// `max_inflight_per_source = 1`, a streaming request that got a fetch and
+/// whose body is not read yet holds the only slot, so the next planned request
+/// goes out unchanged (`inflight_cap`); reading the body frees the slot and a
 /// third request is sent again. A third worker keeps an idle, cold destination
 /// available while the first request occupies the other.
 #[tokio::test]
-async fn s15_inflight_cap_holds_until_the_stream_ends() {
+async fn s15_inflight_cap_holds_until_the_response_is_read() {
     let mut options = Options::new(&[("a", "m"), ("b", "m"), ("c", "m")]).active(&[
         ("a", PeerLookupMock::new("fp")),
         ("b", PeerLookupMock::new("fp")),
@@ -1032,6 +1033,77 @@ async fn s15_inflight_cap_holds_until_the_stream_ends() {
     let (status, sent) = request_outcomes_of(fx.complete(&prompt, None)).await;
     assert_eq!(status, 200);
     assert_eq!(sent, outcomes(&[("sent", 1)]));
+    fx.finish().await;
+}
+
+/// 15b: the fetch ends during prefill, so the source's slot is freed at the
+/// response's first output frame, not at the end of the stream. With
+/// `max_inflight_per_source = 1`, a stream whose first frame has been read but
+/// whose tail is still held open no longer blocks the source: the next planned
+/// request is fetched (`sent`), not refused (`inflight_cap`).
+#[tokio::test]
+async fn s15b_slot_is_freed_at_the_first_output_frame() {
+    use http_body_util::BodyExt as _;
+
+    let mut options = Options::new(&[("a", "m"), ("b", "m"), ("c", "m")]).active(&[
+        ("a", PeerLookupMock::new("fp")),
+        ("b", PeerLookupMock::new("fp")),
+        ("c", PeerLookupMock::new("fp")),
+    ]);
+    options.transfer.max_inflight_per_source = 1;
+    let (fx, prompt) = active_fixture(33, options).await;
+    for instance in ["a", "b", "c"] {
+        fx.mock(instance).split_streams();
+    }
+    let policy = kv_policy(&fx);
+    let kv = policy
+        .as_any()
+        .downcast_ref::<KvAwarePolicy>()
+        .expect("kv_aware policy");
+    let source_url = fx.mock("a").url.clone();
+
+    // First request: fetched; the slot is held until output starts.
+    let (response, sent) = request_outcomes_of(fx.open_stream(&prompt)).await;
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(sent, outcomes(&[("sent", 1)]));
+    assert_eq!(kv.peer_fetch_inflight(&source_url), 1);
+
+    // Read the first output frame only; the mock holds the stream's tail.
+    let mut body = response.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(10), body.frame())
+        .await
+        .expect("first frame in time")
+        .expect("a first frame")
+        .expect("frame ok");
+    let first = first.into_data().expect("data frame");
+    assert!(
+        std::str::from_utf8(&first)
+            .unwrap()
+            .contains("\"text\":\"ok\""),
+        "{first:?}"
+    );
+    assert_eq!(
+        kv.peer_fetch_inflight(&source_url),
+        0,
+        "the slot is freed at the first output frame"
+    );
+
+    // Second request, while the first stream is still open: fetched.
+    let (status, sent) = request_outcomes_of(fx.complete(&prompt, None)).await;
+    assert_eq!(status, 200);
+    assert_eq!(sent, outcomes(&[("sent", 1)]));
+
+    // The first stream was open all along: its tail is still held.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), body.frame())
+            .await
+            .is_err(),
+        "the first stream must still be open"
+    );
+    for instance in ["a", "b", "c"] {
+        fx.mock(instance).release_stream_tails();
+    }
+    let _ = body.collect().await;
     fx.finish().await;
 }
 

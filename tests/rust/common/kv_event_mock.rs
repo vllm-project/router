@@ -23,6 +23,11 @@
 //! drop), which keeps the router's per-worker `active_requests` /
 //! `active_prefill_tokens` counters raised for as long as a test needs.
 //!
+//! After [`KvEventMock::split_streams`], a `"stream": true` completion is
+//! answered as server-sent events: one output frame at once, then the closing
+//! `[DONE]` only after [`KvEventMock::release_stream_tails`] (or drop), so a
+//! test can hold a stream open after its first output frame.
+//!
 //! The marker is `priority` (a real completions field the router models) rather
 //! than an invented one: the router withholds KV placement credit from requests
 //! carrying fields it does not understand, which would change the routing under
@@ -172,6 +177,10 @@ struct MockState {
     /// `false` while held requests must wait; `true` releases them.
     release: watch::Sender<bool>,
     held_inflight: AtomicUsize,
+    /// Answer streaming completions as SSE with a held tail (see `split_streams`).
+    split_streams: AtomicBool,
+    /// `false` while split stream tails must wait; `true` releases them.
+    tail_release: watch::Sender<bool>,
     completions: AtomicUsize,
     fail_next: AtomicUsize,
     /// JSON body of every completion request, in arrival order.
@@ -223,6 +232,7 @@ impl KvEventMock {
             .expect("utf8 endpoint");
 
         let (release, _) = watch::channel(false);
+        let (tail_release, _) = watch::channel(false);
         let state = Arc::new(MockState {
             config: config.clone(),
             peer_lookup: Mutex::new(config.peer_lookup.clone()),
@@ -230,6 +240,8 @@ impl KvEventMock {
             replay_endpoint,
             release,
             held_inflight: AtomicUsize::new(0),
+            split_streams: AtomicBool::new(false),
+            tail_release,
             completions: AtomicUsize::new(0),
             fail_next: AtomicUsize::new(0),
             bodies: Mutex::new(Vec::new()),
@@ -443,11 +455,23 @@ impl KvEventMock {
     pub fn release_held(&self) {
         self.state.release.send_replace(true);
     }
+
+    /// Answer later `"stream": true` completions as SSE: the first output frame
+    /// at once, the closing `[DONE]` only after `release_stream_tails`.
+    pub fn split_streams(&self) {
+        self.state.split_streams.store(true, Ordering::Release);
+    }
+
+    /// Let every held stream tail finish.
+    pub fn release_stream_tails(&self) {
+        self.state.tail_release.send_replace(true);
+    }
 }
 
 impl Drop for KvEventMock {
     fn drop(&mut self) {
         self.state.release.send_replace(true);
+        self.state.tail_release.send_replace(true);
         let _ = self.commands.send(Command::Shutdown);
         if let Some(thread) = self.publisher.take() {
             let _ = thread.join();
@@ -656,6 +680,11 @@ async fn completions(State(state): State<Arc<MockState>>, body: Bytes) -> Respon
     if let Some(failure) = admit(&state, &body).await {
         return failure;
     }
+    let streaming = serde_json::from_slice::<Value>(&body)
+        .is_ok_and(|value| value["stream"].as_bool() == Some(true));
+    if streaming && state.split_streams.load(Ordering::Acquire) {
+        return split_stream(&state);
+    }
     Json(json!({
         "id": "cmpl-mock",
         "object": "text_completion",
@@ -665,6 +694,35 @@ async fn completions(State(state): State<Arc<MockState>>, body: Bytes) -> Respon
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
     }))
     .into_response()
+}
+
+/// One output frame now; `[DONE]` once the test releases stream tails.
+fn split_stream(state: &MockState) -> Response {
+    use futures_util::StreamExt as _;
+    let first = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "cmpl-mock",
+            "object": "text_completion",
+            "created": 0,
+            "model": state.config.model,
+            "choices": [{"index": 0, "text": "ok", "finish_reason": null}],
+        })
+    );
+    let mut tail = state.tail_release.subscribe();
+    let stream =
+        futures_util::stream::once(
+            async move { Ok::<_, std::convert::Infallible>(Bytes::from(first)) },
+        )
+        .chain(futures_util::stream::once(async move {
+            let _ = tail.wait_for(|released| *released).await;
+            Ok(Bytes::from_static(b"data: [DONE]\n\n"))
+        }));
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
 }
 
 async fn chat_completions(State(state): State<Arc<MockState>>, body: Bytes) -> Response {
