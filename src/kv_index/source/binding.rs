@@ -12,12 +12,25 @@ use smallvec::SmallVec;
 #[derive(Clone)]
 pub(in crate::kv_index) struct SourceLease {
     pub(in crate::kv_index) gate: Arc<Mutex<()>>,
-    pub(in crate::kv_index) active: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
+    hash_fenced: Arc<AtomicBool>,
 }
 
 impl SourceLease {
+    pub(in crate::kv_index) fn new(active: Arc<AtomicBool>) -> Self {
+        Self {
+            gate: Arc::new(Mutex::new(())),
+            active,
+            hash_fenced: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(in crate::kv_index) fn fence_hash(&self) {
+        self.hash_fenced.store(true, Ordering::Release);
+    }
+
     pub(in crate::kv_index) fn is_active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
+        self.active.load(Ordering::Acquire) && !self.hash_fenced.load(Ordering::Acquire)
     }
 
     pub(in crate::kv_index) fn with_active<T>(&self, operation: impl FnOnce() -> T) -> Option<T> {

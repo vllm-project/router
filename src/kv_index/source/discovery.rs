@@ -445,8 +445,7 @@ impl KvIndexSupervisor {
                 .await
                 .map(|info| (info, None));
         }
-        // Discovery awaits without the owner lock. A failed/stale re-add must
-        // leave the prior registration and its observed placement intact.
+        // Check the observed owner again after discovery before changing its bindings.
         let (observed, lifecycle) = {
             let workers = self.installed.workers.lock();
             let owner = workers.get(worker_url).map(|worker| worker.active.clone());
@@ -457,9 +456,25 @@ impl KvIndexSupervisor {
         self.probe_admission_metadata(worker_url, &mut discovery, true)
             .await;
         let models = discovery.base_models.clone();
-        let info =
-            self.install_observed_worker(worker_url, discovery, observed, Some(lifecycle), None)?;
-        Ok((info, models))
+        let hashes = observed
+            .as_ref()
+            .and_then(|_| discovery.engine_cache_configs.clone());
+        let installation = self.install_observed_worker(
+            worker_url,
+            discovery,
+            observed,
+            Some(lifecycle.clone()),
+            None,
+        );
+        if !installation
+            .as_ref()
+            .is_ok_and(|info| info.cache_key.is_some())
+        {
+            if let Some(hashes) = hashes {
+                self.fence_failed_registration(worker_url, &lifecycle, &hashes);
+            }
+        }
+        Ok((installation?, models))
     }
 
     /// Prepare metadata once; P/D refresh fingerprints and installs this same snapshot.

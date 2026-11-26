@@ -39,6 +39,10 @@ pub(super) struct WorkerDescriptor {
 }
 
 impl WorkerDescriptor {
+    pub(super) fn layout(&self) -> Option<&CacheCapabilities> {
+        self.hybrid.as_ref()
+    }
+
     pub(super) fn has_nonplain_layout(&self) -> bool {
         self.hybrid
             .as_ref()

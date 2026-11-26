@@ -733,10 +733,7 @@ fn retired_source_cannot_reactivate_a_shared_domain() {
     let active = Arc::new(AtomicBool::new(true));
     let old = index(8)
         .with_shared_index(shared.clone())
-        .with_source_binding(SourceLease {
-            active: active.clone(),
-            gate: Arc::new(parking_lot::Mutex::new(())),
-        });
+        .with_source_binding(SourceLease::new(active.clone()));
     old.begin_replay(0);
     old.apply_batch(0, &qwen_batch()).unwrap();
     active.store(false, Ordering::Release);

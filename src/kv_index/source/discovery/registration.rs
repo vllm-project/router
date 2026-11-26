@@ -4,7 +4,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use super::lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
@@ -333,10 +332,7 @@ impl KvIndexSupervisor {
         let mut indexes = HashMap::default();
         for ev in event_sources {
             let rank = ev.dp_rank;
-            let lease = crate::kv_index::source::binding::SourceLease {
-                gate: Arc::new(Mutex::new(())),
-                active: active.clone(),
-            };
+            let lease = crate::kv_index::source::binding::SourceLease::new(active.clone());
             let index = Arc::new(
                 bindings
                     .remove(&rank)

@@ -1904,7 +1904,7 @@ struct HashAdmissionWorker {
     sources: Arc<Mutex<serde_json::Value>>,
     requests: Arc<MetadataRequests>,
     _server: AbortTestServer,
-    _sockets: Vec<(String, String, zmq::Socket, zmq::Socket)>,
+    sockets: Vec<(String, String, zmq::Socket, zmq::Socket)>,
 }
 
 impl HashAdmissionWorker {
@@ -1950,7 +1950,7 @@ impl HashAdmissionWorker {
             sources,
             requests,
             _server: AbortTestServer(server),
-            _sockets: sockets,
+            sockets,
         }
     }
 }
@@ -2055,6 +2055,45 @@ async fn load_only_registration_replaces_binding_and_preserves_model_aliases() {
     }
     assert!(models.unwrap().contains("mock-alias"));
     assert_eq!(worker.requests.models.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn failed_reregistration_revokes_only_the_incompatible_rank() {
+    let worker = HashAdmissionWorker::start(2, METRICS_ONLY).await;
+    let supervisor = &worker.supervisor;
+    let url = worker.url.as_str();
+    assert_eq!(
+        supervisor.on_worker_added(url).await.unwrap().ranks.len(),
+        2
+    );
+    let provider = supervisor.match_provider_for_worker(url).unwrap();
+    let prompt = [1; 17];
+    let hit = |rank| !provider.matches(&prompt, 16, None, rank).is_empty();
+    let mut store = full_store(&prompt[..16], 16, None);
+    store.block_hashes[0] = crate::kv_index::wire::ExternalBlockHash::Bytes(
+        crate::kv_index::request_hash::BlockKeyGenerator::from_seed(16, "vllm-none-hash")
+            .plain_root_block(&prompt[..16])
+            .unwrap()
+            .to_vec(),
+    );
+    let events = [KVEvent::BlockStored(store)];
+    for (rank, (_, _, publisher, replay)) in worker.sockets.iter().enumerate() {
+        let topic = format!("kv/admission/{rank}");
+        boundary_subscription(publisher, &topic, true).await;
+        finish_empty_startup_replay(replay).await;
+        let payload = event_payload(1.0, &events, Some(rank as u32));
+        live_frame(publisher, topic.as_bytes(), 0, &payload);
+    }
+    wait_for(|| hit(0) && hit(1)).await;
+
+    *worker.metrics.lock() = METRICS_ONLY.replace("sha256_cbor", "sha256");
+    worker.sources.lock()["1"]["replay_endpoint"] = "tcp://127.0.0.1:invalid".into();
+    let error = supervisor.on_worker_added(url).await.unwrap_err();
+    assert!(error.contains("invalid KV replay endpoint"), "{error}");
+    assert!(!hit(0));
+    assert!(hit(1));
+    assert!(!supervisor.workers_have_cache_bindings([(url, 0)].into_iter()));
+    assert!(supervisor.workers_have_cache_bindings([(url, 1)].into_iter()));
 }
 
 #[tokio::test]
