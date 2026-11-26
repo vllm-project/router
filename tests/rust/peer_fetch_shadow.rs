@@ -984,6 +984,34 @@ async fn s14_active_mode_sends_peer_params_to_the_destination_only() {
     fx.finish().await;
 }
 
+/// 14b: a request with `prompt_logprobs` is placed like any other but never
+/// planned: the engine computes every prompt token for it, so a fetch cannot
+/// help. The plan counter reports `prompt_logprobs`, no fetch is attempted
+/// (the request counter is unchanged), and the destination gets the client's
+/// body untouched.
+#[tokio::test]
+async fn s14b_prompt_logprobs_request_is_not_planned_in_active_mode() {
+    let (fx, prompt) = active_fixture(
+        33,
+        Options::new(&[("a", "m"), ("b", "m")]).active(&both_report_fp()),
+    )
+    .await;
+    let body = json!({"prompt": prompt, "max_tokens": 1, "prompt_logprobs": 1});
+
+    let ((status, plans), sent) =
+        request_outcomes_of(outcomes_of(fx.post("/v1/completions", body.clone(), None))).await;
+    assert_eq!(status, 200);
+    assert_eq!(plans, outcomes(&[("prompt_logprobs", 1)]));
+    assert!(sent.is_empty(), "{sent:?}");
+
+    // Placement is unchanged: the idle destination B still gets the request,
+    // exactly as the client sent it.
+    let b_bodies = fx.mock("b").bodies();
+    assert_eq!(b_bodies.len(), 1);
+    assert_eq!(b_bodies[0], body);
+    fx.finish().await;
+}
+
 /// 15: the source's in-flight cap counts a fetch until the response's first
 /// output frame (decode start) or, failing that, until its body ends. With
 /// `max_inflight_per_source = 1`, a streaming request that got a fetch and

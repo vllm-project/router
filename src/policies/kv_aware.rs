@@ -6006,8 +6006,29 @@ mod tests {
         assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
     }
 
+    /// Value of `metric{outcome="<outcome>"}` in a rendered Prometheus exposition.
+    fn outcome_count(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+        metric: &str,
+        outcome: &str,
+    ) -> u64 {
+        let label = format!("outcome=\"{outcome}\"");
+        handle
+            .render()
+            .lines()
+            .find(|line| line.starts_with(metric) && line.contains(&label))
+            .and_then(|line| line.rsplit(' ').next())
+            .map_or(0, |value| value.parse().expect("counter value"))
+    }
+
+    const PLANS_TOTAL: &str = "vllm_router_peer_fetch_plans_total";
+    const REQUESTS_TOTAL: &str = "vllm_router_peer_fetch_requests_total";
+
     #[test]
     fn grpc_destination_plans_but_takes_no_slot() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let (policy, workers, _) = transfer_fixture_with_urls(true, ["http://a", "grpc://b"]);
         let policy = policy.with_shared_peer_fetch(4, Arc::new(AtomicBool::new(true)));
         set_endpoint(&policy, "http://a", Some(peer_endpoint("engine-a", 5600)));
@@ -6016,6 +6037,44 @@ mod tests {
         assert!(policy.last_transfer_plan().is_some());
         assert!(receipt.peer_fetch.is_none());
         assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+        assert_eq!(
+            outcome_count(&handle, REQUESTS_TOTAL, "grpc_destination"),
+            1
+        );
+    }
+
+    /// A salted request skips the KV lookup, so the destination's residency is
+    /// unknown, not empty: the planner must report `unknown_destination_input`
+    /// rather than reason from an empty hit list (`no_peer` and friends).
+    #[test]
+    fn salted_request_reports_unknown_destination_input() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (policy, workers, _) = active_fixture(4);
+        let receipt = policy
+            .select_worker_with_receipt(
+                &workers,
+                Some(&transfer_ids()),
+                None,
+                Some("tenant"),
+                None,
+                &[],
+            )
+            .unwrap();
+        assert!(receipt.peer_fetch.is_none());
+        assert!(policy.last_transfer_plan().is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+        assert_eq!(
+            outcome_count(&handle, PLANS_TOTAL, "unknown_destination_input"),
+            1
+        );
+
+        // An empty salt is no salt: the same request is planned.
+        let _ = policy
+            .select_worker_with_receipt(&workers, Some(&transfer_ids()), None, Some(""), None, &[])
+            .unwrap();
+        assert!(policy.last_transfer_plan().is_some());
     }
 
     #[test]
@@ -6265,6 +6324,9 @@ mod tests {
 
     #[test]
     fn a_request_that_skips_transfer_keeps_its_worker_but_takes_no_permit() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let (policy, workers, _) = active_fixture(1);
         let ids = transfer_ids();
         let skipped = policy
@@ -6284,6 +6346,7 @@ mod tests {
         assert!(skipped.peer_fetch.is_none());
         assert!(policy.last_transfer_plan().is_none());
         assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+        assert_eq!(outcome_count(&handle, PLANS_TOTAL, "prompt_logprobs"), 1);
 
         // Same worker as a request that may fetch, and the cap is still free.
         let fetching = select(&policy, &workers);

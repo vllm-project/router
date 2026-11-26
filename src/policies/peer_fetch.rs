@@ -1845,4 +1845,37 @@ mod tests {
     fn zero_cap_admits_nothing() {
         assert!(PeerFetchLimiter::new(0).try_acquire("a").is_none());
     }
+
+    #[test]
+    fn limiter_is_atomic_under_contention() {
+        use std::sync::atomic::AtomicUsize;
+        use std::thread;
+        use std::time::Duration;
+
+        let limiter = PeerFetchLimiter::new(4);
+        let holders = Arc::new(AtomicUsize::new(0)); // threads holding a permit
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        thread::scope(|scope| {
+            for _ in 0..16 {
+                let (limiter, holders, max_seen) = (
+                    Arc::clone(&limiter),
+                    Arc::clone(&holders),
+                    Arc::clone(&max_seen),
+                );
+                scope.spawn(move || {
+                    for _ in 0..4_000 {
+                        if let Some(permit) = limiter.try_acquire("a") {
+                            let inside = holders.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_seen.fetch_max(inside, Ordering::SeqCst);
+                            thread::sleep(Duration::from_micros(5));
+                            holders.fetch_sub(1, Ordering::SeqCst);
+                            drop(permit);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(limiter.inflight("a"), 0);
+        assert!(max_seen.load(Ordering::SeqCst) <= 4);
+    }
 }
