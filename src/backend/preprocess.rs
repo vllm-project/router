@@ -508,11 +508,17 @@ async fn http_input_json(
 /// occupancy fallback for its whole multi-minute flight. Stacks serving big
 /// contexts raise this to cover their largest body.
 ///
+/// Floored at 1s and capped at `MAX_PREPARATION_TIMEOUT_SECS`: the request
+/// path computes `tokio::time::Instant::now() + budget`, which an
+/// out-of-range Duration panics.
+///
 /// Kept as a per-router value (held by PdRouterBase and PdKvState) rather
 /// than process-wide state: one process can embed several routers, and a
 /// later construction must not rewrite the budget of an already-running one.
+const MAX_PREPARATION_TIMEOUT_SECS: u64 = 3600;
+
 pub(crate) fn preparation_budget(secs: u64) -> Duration {
-    Duration::from_secs(secs.max(1))
+    Duration::from_secs(secs.clamp(1, MAX_PREPARATION_TIMEOUT_SECS))
 }
 
 pub(crate) fn http_tokenize_fallback(
@@ -1193,11 +1199,19 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     #[test]
-    fn preparation_budget_floors_at_one_second() {
-        use super::preparation_budget;
+    fn preparation_budget_floors_caps_and_stays_instant_addable() {
+        use super::{preparation_budget, MAX_PREPARATION_TIMEOUT_SECS};
         use std::time::Duration;
         assert_eq!(preparation_budget(0), Duration::from_secs(1));
         assert_eq!(preparation_budget(5), Duration::from_secs(5));
+        assert_eq!(
+            preparation_budget(u64::MAX),
+            Duration::from_secs(MAX_PREPARATION_TIMEOUT_SECS)
+        );
+        // The request path computes `tokio::time::Instant::now() + budget`;
+        // the cap must keep that add representable for any accepted input.
+        let deadline = tokio::time::Instant::now() + preparation_budget(u64::MAX);
+        assert!(deadline > tokio::time::Instant::now());
     }
 
     #[test]

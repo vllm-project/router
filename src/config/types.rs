@@ -50,7 +50,10 @@ pub struct RouterConfig {
     /// Per-call budget (seconds) for pre-dispatch token preparation
     /// (/render, then the /tokenize fallback). Default 1 preserves upstream
     /// behavior; large-prompt stacks raise it to cover their largest body
-    /// (a ~400K-token prompt renders in ~1s on our serving stack).
+    /// (a ~400K-token prompt renders in ~1s on our serving stack). Effective
+    /// values are floored at 1s and capped at 3600s: the request path adds
+    /// the resolved budget to a Tokio Instant, which oversized values would
+    /// panic.
     #[serde(default = "default_preparation_timeout_secs")]
     pub preparation_timeout_secs: u64,
     /// The api key used for the authorization with the worker
