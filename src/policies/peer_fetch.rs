@@ -20,7 +20,7 @@ use dashmap::DashMap;
 
 use super::kv_aware::{request_prefill_tokens_with_device_prefix, CandidateView, CostParams};
 use crate::config::types::{peer_fetch_cost_constants_valid, PeerFetchConfig, PeerFetchMode};
-use crate::kv_index::{CacheKey, RoutableTarget, StorageTier, TierMatch};
+use crate::kv_index::{CacheKey, PeerLookupRecord, RoutableTarget, StorageTier, TierMatch};
 
 /// Opt-in planner configuration, built from `PeerFetchConfig` via `From`.
 /// Cost constants are placeholders until calibrated; they shape which transfers
@@ -94,6 +94,20 @@ impl TransferCapability {
             && self.connector_version == destination.connector_version
             && self.layout_fingerprint == destination.layout_fingerprint
     }
+
+    /// The capability an engine's `peer_lookup` record grants: export and
+    /// import, with the compared strings trimmed exactly as a static
+    /// declaration's are, so `"nixl "` and `"nixl"` match whichever side
+    /// reported them.
+    pub(crate) fn from_engine_record(record: &PeerLookupRecord) -> Self {
+        TransferCapability {
+            can_export: true,
+            can_import: true,
+            connector: record.connector.trim().into(),
+            connector_version: record.connector_version.trim().into(),
+            layout_fingerprint: record.layout_fingerprint.trim().into(),
+        }
+    }
 }
 
 /// Where an engine rank accepts peer KV fetches, as it reported in its
@@ -107,6 +121,34 @@ pub struct PeerEndpoint {
     pub tp_size: u32,
     pub dcp_size: u32,
     pub pp_size: u32,
+}
+
+/// The address half of an engine's `peer_lookup` record. These strings are
+/// sent back to the engine, so they are passed through untrimmed.
+impl From<&PeerLookupRecord> for PeerEndpoint {
+    fn from(record: &PeerLookupRecord) -> Self {
+        PeerEndpoint {
+            engine_id: Arc::from(record.engine_id.as_str()),
+            host: Arc::from(record.side_channel_host.as_str()),
+            port: record.side_channel_port,
+            tp_size: record.tp_size,
+            dcp_size: record.dcp_size,
+            pp_size: record.pp_size,
+        }
+    }
+}
+
+/// Store the peer fetch kill switch and keep the
+/// `vllm_router_peer_fetch_enabled` gauge and the warn log in step with it.
+/// Every writer of the flag goes through here so the gauge always matches.
+pub(crate) fn store_peer_fetch_enabled(flag: &AtomicBool, enabled: bool) {
+    flag.store(enabled, Ordering::Release);
+    crate::metrics::RouterMetrics::set_peer_fetch_enabled(enabled);
+    tracing::warn!(
+        enabled,
+        "peer fetch {} for all active-mode kv_aware policies",
+        if enabled { "enabled" } else { "disabled" }
+    );
 }
 
 /// Caps how many peer fetches may be in flight against one source at a time.
@@ -1597,6 +1639,43 @@ mod tests {
         let plan = plan_many(&peers, &enabled()).unwrap();
         assert_eq!(plan.credited_tokens, 1600);
         assert_eq!(plan.estimated_saved_prefill_ms, 32.0);
+    }
+
+    #[test]
+    fn engine_and_static_capabilities_trim_alike() {
+        let record = |connector: &str| PeerLookupRecord {
+            engine_id: " engine-a ".into(),
+            side_channel_host: "10.0.0.1".into(),
+            side_channel_port: 5600,
+            tp_size: 1,
+            dcp_size: 1,
+            pp_size: 1,
+            connector: connector.into(),
+            connector_version: "1 ".into(),
+            layout_fingerprint: " fp".into(),
+        };
+        let declared = |connector: &str| {
+            TransferCapability::try_from(&crate::config::types::StaticTransferCapability {
+                can_export: true,
+                can_import: true,
+                connector: connector.into(),
+                connector_version: "1".into(),
+                layout_fingerprint: "fp".into(),
+            })
+            .unwrap()
+        };
+
+        // A stray space matches in either direction.
+        let engine = TransferCapability::from_engine_record(&record("nixl "));
+        assert!(engine.can_send_to(&declared("nixl")));
+        assert!(declared("nixl ").can_send_to(&engine));
+        assert_eq!(engine, declared("nixl"));
+
+        // The address is sent back to the engine as reported.
+        assert_eq!(
+            &*PeerEndpoint::from(&record("nixl")).engine_id,
+            " engine-a "
+        );
     }
 
     #[test]

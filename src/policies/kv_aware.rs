@@ -1402,25 +1402,12 @@ impl KvAwarePolicy {
             self.store_peer_reg_locked(worker_url, capability, None, false);
             return;
         };
-        let endpoint = PeerEndpoint {
-            engine_id: Arc::from(record.engine_id.as_str()),
-            host: Arc::from(record.side_channel_host.as_str()),
-            port: record.side_channel_port,
-            tp_size: record.tp_size,
-            dcp_size: record.dcp_size,
-            pp_size: record.pp_size,
-        };
+        let endpoint = PeerEndpoint::from(record);
         if current_capability.is_some() && !engine_owned {
             self.store_peer_reg_locked(worker_url, current_capability, Some(endpoint), false);
             return;
         }
-        let capability = TransferCapability {
-            can_export: true,
-            can_import: true,
-            connector: Arc::from(record.connector.as_str()),
-            connector_version: Arc::from(record.connector_version.as_str()),
-            layout_fingerprint: Arc::from(record.layout_fingerprint.as_str()),
-        };
+        let capability = TransferCapability::from_engine_record(record);
         self.store_peer_reg_locked(worker_url, Some(capability), Some(endpoint), true);
     }
 
