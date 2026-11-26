@@ -46,8 +46,7 @@ pub enum Mode {
 /// JSON object, but it is not JSON.
 pub const INVALID_JSON_BODY: &str = "{\"choices\": [not json";
 
-/// The first event of the SSE reply. With `BreakBody`, the stream breaks
-/// after it.
+/// The first event of the SSE reply.
 pub const SSE_FIRST_EVENT: &str =
     "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A\"}}]}\n\n";
 
@@ -260,18 +259,18 @@ impl Mock {
         );
     }
 
-    /// `[socket close]` / `[encoder abort]`: the one request is still open.
-    /// A check of the state now, with no wait.
-    pub fn expect_open(&self) {
+    /// `[socket close]` / `[encoder abort]`: exactly `count` requests have
+    /// arrived and all are still open. A check of the state now, with no wait.
+    pub fn expect_open(&self, count: usize) {
         assert_eq!(
             self.requests().len(),
-            1,
-            "[dispatch] {}: expected exactly one request",
+            count,
+            "[dispatch] {}: expected the number of requests to be {count}",
             self.0.name
         );
         assert!(
             self.ends().is_empty(),
-            "[{}] {}: expected the request to be still open, got {:?}",
+            "[{}] {}: expected every request to be still open, got {:?}",
             self.observation(),
             self.0.name,
             self.ends()
@@ -289,8 +288,7 @@ impl Mock {
         );
     }
 
-    /// The reply body as (content type, first part, rest). The stall modes
-    /// send the first part at once and hold the rest.
+    /// The reply body as (content type, first part, rest).
     fn body(&self, request: &Value, mode: Mode) -> (&'static str, String, String) {
         let generates = matches!(self.0.role, Role::Decode | Role::PrefillDecode);
         if generates && request["stream"] == true {
@@ -385,7 +383,7 @@ fn prefill_reply(push: bool) -> Value {
     json!({"kv_transfer_params": kv})
 }
 
-/// The axum handler for `serve`: every mode but `HangUp`.
+/// The axum handler for `serve`.
 async fn handle(State(mock): State<Mock>, Json(request): Json<Value>) -> Response {
     let life = mock.arrive(request.clone());
     let mode = mock.mode();
@@ -436,8 +434,7 @@ pub async fn serve(mock: &Mock) -> (String, JoinHandle<()>) {
     (url, server)
 }
 
-/// Serves the mock on a raw TCP socket, for `Mode::HangUp`: axum cannot close
-/// a connection before the status line. Only `Reply` and `HangUp` work here.
+/// Serves the mock on a raw TCP socket.
 pub async fn serve_raw(mock: &Mock) -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());

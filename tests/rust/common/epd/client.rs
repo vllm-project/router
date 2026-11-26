@@ -71,6 +71,18 @@ pub async fn next_chunk(body: &mut BodyDataStream) -> String {
     String::from_utf8(chunk.to_vec()).unwrap()
 }
 
+const SSE_EVENT_DELIMITER: &str = "\n\n";
+
+/// `[client]`: the response body up to the end of its first SSE event. One
+/// event can come in more than one chunk.
+pub async fn first_event(body: &mut BodyDataStream) -> String {
+    let mut text = String::new();
+    while !text.contains(SSE_EVENT_DELIMITER) {
+        text.push_str(&next_chunk(body).await);
+    }
+    text
+}
+
 /// `[client]`: the rest of a response body, and whether it ended with an
 /// error.
 pub async fn rest_of_body(mut body: BodyDataStream) -> (String, bool) {

@@ -196,7 +196,7 @@ mod decode_disconnect {
         let response = answer(rig.send(two_images_stream())).await;
         assert_eq!(response.status(), StatusCode::OK, "[client]");
         let mut body = response.into_body().into_data_stream();
-        let first = next_chunk(&mut body).await;
+        let first = first_event(&mut body).await;
         assert_eq!(first, SSE_FIRST_EVENT, "[client] first event");
         decode.release();
         let (rest, broken) = rest_of_body(body).await;
@@ -268,10 +268,8 @@ mod decode_disconnect {
             rig.decode.wait_requests(1).await;
             rig.decode.release();
             rig.decode.expect_completed().await;
-            // gap: tokio::join! waits for P's whole reply, so D's failure
-            // neither answers the client nor stops P.
             expect_waiting(&mut client).await;
-            rig.consumer.expect_open();
+            rig.consumer.expect_open(1);
             rig.expect_no_cancel().await;
             rig.consumer.release();
             let response = answer(client).await;
