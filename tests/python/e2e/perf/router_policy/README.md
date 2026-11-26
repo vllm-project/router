@@ -50,6 +50,17 @@ Before replay, the cell runner **removes `result/`** if it already exists. The c
 
 Worker and router processes are started with `perf/process.py` (`launch_worker` once per worker, then `launch_router`). Pytest hides the stderr stream unless the invocation uses **`-sv`**.
 
+All six scenarios use the same vLLM 0.30.0 KV-event contract described in the
+[KV-aware worker requirements](https://github.com/vllm-project/router/blob/main/docs/load_balancing/kv_aware.md#worker-requirements).
+Each case sets `workers.per_worker.prefix_caching_hash_algo` to `sha256_cbor`;
+the launcher passes `--prefix-caching-hash-algo sha256_cbor` after the `vllm-rs`
+`--` separator. Workers receive `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` so events
+carry complete 32-byte hashes. Every worker start gets a fresh UUID topic in
+`--kv-events-config`, alongside the reserved live and replay endpoints. This
+also applies to both Prefill and Decode in PD cells. The newer `instance_topic`
+option is not used because vLLM 0.30.0 does not support it. The effective flags
+and topic are retained in `engine*.log.command.json`.
+
 When replay exits, [`log_summary.py`](log_summary.py) writes **`calibration.json`** (TTFT, TPOT, JCT, concurrency, task count, and the other cell stats); when the cell is ok, the same JSON is copied to `tests/python/e2e/results/perf/router_policy/<scenario>_<run_suffix>/c<concurrency>_t<task_num>.json` and prints **`--- cell summary ---`**, **`STATS`**, and **`ARTIFACTS`** on stdout. Quantile blocks (`ttft_s`, `tpot_ms`, `jct_s`) include `n`, the actual number of samples used for that metric, which can differ from `success`. TTFT excludes missing timings; TPOT also excludes missing latency and outputs with at most one token. JCT counts the duration samples used; precomputed JCT preserves `n` or `count`, or reports `n: null` when unknown. Empty sample sets report `n: 0`. Cell-level request counts remain in `requests` and `success`. **`ARTIFACTS`** lists the run directory and the results JSON path (`results_json`). Workers and the router are stopped after that.
 
 Layout matches **`perf/grpc`**: case JSON + [`case_loader.py`](case_loader.py) + [`stack_launcher.py`](stack_launcher.py). [`log_summary.py`](log_summary.py) writes the stats and prints the cell summary.

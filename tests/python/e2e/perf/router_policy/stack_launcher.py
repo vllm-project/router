@@ -29,6 +29,7 @@ import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import yaml
@@ -113,6 +114,7 @@ def open_cell(case: RouterPolicyCase, *, out_dir: Path | None) -> RouterPolicySt
         "VLLM_ROUTER_MODEL": case.model,
         "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "8"),
         "TOKENIZERS_PARALLELISM": "false",
+        "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": "0",
         "RUST_LOG": os.environ.get("RUST_LOG", "info"),
         "AGENTX_TASK_STAGGER": str(case.task_stagger),
     }
@@ -282,6 +284,7 @@ def engine_command(run: RouterPolicyStack, i: int):
         "max_num_seqs": pw.get("max_num_seqs", 16),
         "max_num_batched_tokens": pw.get("max_num_batched_tokens", 32768),
         "enable_prefix_caching": True,
+        "prefix_caching_hash_algo": pw.get("prefix_caching_hash_algo", "sha256_cbor"),
         "dtype": pw.get("dtype", "bfloat16"),
         "gpu_memory_utilization": pw.get("gpu_memory_utilization"),
         "kv_cache_metrics": bool(pw.get("kv_cache_metrics")),
@@ -314,6 +317,8 @@ def engine_command(run: RouterPolicyStack, i: int):
         "endpoint": f"tcp://127.0.0.1:{ports['kv_pub'][i]}",
         "replay_endpoint": f"tcp://127.0.0.1:{ports['kv_replay'][i]}",
         "buffer_steps": 10000,
+        # vLLM 0.30 has no instance_topic option; use a fresh topic per start.
+        "topic": uuid4().hex,
     }
     return vllm_rs_serve_cmd(
         run.case.vllm_rs,

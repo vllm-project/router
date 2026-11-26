@@ -12,10 +12,78 @@ import yaml
 
 from tests.python.e2e.perf.router_policy import case_loader
 from tests.python.e2e.perf.router_policy.data.extract_agentx_ci import extract
-from tests.python.e2e.perf.router_policy.stack_launcher import runtime_config, snapshot
+from tests.python.e2e.perf.router_policy.stack_launcher import (
+    engine_command,
+    open_cell,
+    runtime_config,
+    snapshot,
+)
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 SUITE = Path(case_loader.__file__).resolve().parent
+
+
+@pytest.fixture(
+    params=sorted((SUITE / "cases").glob("*.json")), ids=lambda path: path.stem
+)
+def worker_case(request, monkeypatch, tmp_path):
+    monkeypatch.setattr(case_loader, "_vllm_rs_bin", lambda: "vllm-rs")
+    monkeypatch.setattr(
+        case_loader,
+        "packaged_replay_agentx_yaml",
+        lambda trace_type: tmp_path / "replay.yaml",
+    )
+    return case_loader.load_router_policy_case(request.param, concurrency=8)
+
+
+def test_router_policy_workers_use_portable_kv_hashes(worker_case):
+    count = worker_case.worker_count
+    ports = {
+        name: [base + i for i in range(count)]
+        for name, base in (
+            ("http", 31000),
+            ("grpc", 32000),
+            ("kv_pub", 33000),
+            ("kv_replay", 34000),
+        )
+    }
+    run = SimpleNamespace(case=worker_case, ports=ports)
+    topics = []
+    for i in range(count):
+        argv = engine_command(run, i)
+        engine = argv[argv.index("--") + 1 :]
+        assert "--prefix-caching-hash-algo" not in argv[: argv.index("--")]
+        assert engine[engine.index("--prefix-caching-hash-algo") + 1] == "sha256_cbor"
+        assert "--enable-prefix-caching" in engine
+        events = json.loads(engine[engine.index("--kv-events-config") + 1])
+        assert events["enable_kv_cache_events"] is True
+        assert events["publisher"] == "zmq"
+        assert events["endpoint"] == f"tcp://127.0.0.1:{ports['kv_pub'][i]}"
+        assert events["replay_endpoint"] == f"tcp://127.0.0.1:{ports['kv_replay'][i]}"
+        assert events["topic"]
+        assert "instance_topic" not in events  # Not available in vLLM 0.30.0.
+        topics.append(events["topic"])
+        if worker_case.prefill_count:
+            transfer = json.loads(engine[engine.index("--kv-transfer-config") + 1])
+            assert transfer["kv_role"] == (
+                "kv_producer" if i < worker_case.prefill_count else "kv_consumer"
+            )
+    assert len(set(topics)) == count
+    restarted = engine_command(run, 0)
+    events = json.loads(restarted[restarted.index("--kv-events-config") + 1])
+    assert events["topic"] not in topics
+
+
+def test_router_policy_worker_env_keeps_full_block_hashes(
+    worker_case, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", "1")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3")
+    run = open_cell(worker_case, out_dir=tmp_path)
+    try:
+        assert run.env["VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES"] == "0"
+    finally:
+        run.clients.close()
 
 
 @pytest.mark.parametrize("router_status", [200, 503])

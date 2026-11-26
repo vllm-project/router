@@ -26,6 +26,7 @@
       "cpu_kv_bytes": 0,
       "dtype": "bfloat16",
       "enable_prefix_caching": true,
+      "prefix_caching_hash_algo": "sha256_cbor",
       "kv_cache_metrics": true,
       "kv_cache_metrics_sample": 0.01
     },
